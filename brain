@@ -1,0 +1,12 @@
+#!/bin/bash
+# Wrapper script for the brain CLI — uses the project venv automatically.
+REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV_PYTHON="$REPO_DIR/.venv/bin/python3"
+
+if [ ! -f "$VENV_PYTHON" ]; then
+    echo "Error: Virtual environment not found at $REPO_DIR/.venv" >&2
+    echo "Run: python -m venv .venv && source .venv/bin/activate && pip install -e ." >&2
+    exit 1
+fi
+
+exec "$VENV_PYTHON" -m src.cli "$@"

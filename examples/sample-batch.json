@@ -1,0 +1,35 @@
+{
+  "batch_number": 90000,
+  "exported_at": "2026-01-15T09:05:00Z",
+  "source": "example-exporter",
+  "folder": "Inbox",
+  "emails": [
+    {
+      "message_id": "demo-0001",
+      "date_received": "2026-01-15T09:00:00Z",
+      "subject": "Kickoff notes",
+      "sender": { "name": "Alice Smith", "address": "alice@example.com" },
+      "to_recipients": [{ "name": "You", "address": "you@example.com" }],
+      "cc_recipients": [{ "name": "Bob Jones", "address": "bob@example.com" }],
+      "mailbox_name": "Inbox",
+      "content": "Let's ship the pilot by end of quarter. Bob owns the rollout; Alice will review the design on Friday.",
+      "conversation_id": "thread-demo-1",
+      "internet_message_id": "<demo-0001@example.com>"
+    },
+    {
+      "message_id": "demo-0002",
+      "date_received": "2026-01-16T14:30:00Z",
+      "subject": "Re: Kickoff notes",
+      "sender": { "name": "Bob Jones", "address": "bob@example.com" },
+      "to_recipients": [
+        { "name": "You", "address": "you@example.com" },
+        { "name": "Alice Smith", "address": "alice@example.com" }
+      ],
+      "cc_recipients": [],
+      "mailbox_name": "Inbox",
+      "content": "Rollout plan attached. Decision: we go with the phased launch, target date 2026-03-01.",
+      "conversation_id": "thread-demo-1",
+      "internet_message_id": "<demo-0002@example.com>"
+    }
+  ]
+}

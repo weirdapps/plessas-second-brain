@@ -1,0 +1,51 @@
+{
+  "scope": {
+    "kind": "channel",
+    "teamUuid": "11111111-aaaa-bbbb-cccc-222222222222",
+    "channelId": "19:abc222@thread.tacv2"
+  },
+  "messages": [],
+  "posts": [
+    {
+      "containerId": "19:abc222@thread.tacv2",
+      "id": "1717000000000",
+      "latestMessageTime": "2026-04-29T08:30:00Z",
+      "message": {
+        "messageType": "Text",
+        "contentType": "text",
+        "content": "Q2 cards roadmap — sharing the draft, please review.",
+        "imDisplayName": "Novak, Maria",
+        "from": "https://teams/contacts/8:orgid:aaaa-1111",
+        "composetime": "2026-04-29T08:00:00Z"
+      }
+    },
+    {
+      "containerId": "19:abc222@thread.tacv2",
+      "id": "1717000060000",
+      "latestMessageTime": "2026-04-29T08:30:00Z",
+      "message": {
+        "messageType": "Text",
+        "contentType": "text",
+        "content": "Looks good. Decision: ship by end of Q2.",
+        "imDisplayName": "Papadopoulos, Nikos",
+        "from": "https://teams/contacts/8:orgid:bbbb-2222",
+        "composetime": "2026-04-29T08:30:00Z",
+        "properties": {"replyChainId": "1717000000000"}
+      }
+    },
+    {
+      "containerId": "19:abc222@thread.tacv2",
+      "id": "1717000120000",
+      "latestMessageTime": "2026-04-29T09:00:00Z",
+      "message": {
+        "messageType": "Text",
+        "contentType": "html",
+        "content": "<p>Καλημέρα — <b>ROI</b> &gt; 15% when x &lt; 20.<br>See <i>R&amp;D</i> doc.</p>",
+        "imDisplayName": "Novak, Maria",
+        "from": "https://teams/contacts/8:orgid:aaaa-1111",
+        "composetime": "2026-04-29T09:00:00Z"
+      }
+    }
+  ],
+  "hasMore": false
+}

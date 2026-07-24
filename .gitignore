@@ -1,0 +1,30 @@
+data/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv
+venv
+.coverage
+.ruff_cache/
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# SQLite databases (brain.db etc, contains private email data)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Playwright MCP browser artifacts (runtime, created by chrome/playwright MCP)
+.playwright-mcp/

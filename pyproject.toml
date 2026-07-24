@@ -5,7 +5,7 @@ description = "Email second brain: extract, structure, and query institutional m
 requires-python = ">=3.12"
 dependencies = [
     "google-cloud-aiplatform>=1.162.0",
-    "anthropic[vertex]>=0.117.0",
+    "anthropic[vertex]>=0.120.0",
     "numpy>=2.5.1",
     "mcp[cli]>=1.28.1",
     "youtube-transcript-api>=1.2.0",

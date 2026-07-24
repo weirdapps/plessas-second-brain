@@ -1,0 +1,18 @@
+{
+  "team": {
+    "id": "11111111-aaaa-bbbb-cccc-222222222222",
+    "displayName": "Cards & Digital"
+  },
+  "channels": [
+    {
+      "id": "19:abc111@thread.tacv2",
+      "displayName": "General",
+      "description": "Auto-created general channel"
+    },
+    {
+      "id": "19:abc222@thread.tacv2",
+      "displayName": "Novak — Cards Strategy",
+      "description": "Cards strategy with Novak's team"
+    }
+  ]
+}

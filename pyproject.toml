@@ -1,0 +1,46 @@
+[project]
+name = "second-brain"
+version = "0.1.0"
+description = "Email second brain: extract, structure, and query institutional memory from Outlook, attachments, calendar, Teams, and Claude Code conversations"
+requires-python = ">=3.12"
+dependencies = [
+    "google-cloud-aiplatform>=1.161.0",
+    "anthropic[vertex]>=0.117.0",
+    "numpy>=2.5.1",
+    "mcp[cli]>=1.28.1",
+    "youtube-transcript-api>=1.2.0",
+    "pymupdf>=1.28.0",
+    "python-docx>=1.2.0",
+    "python-pptx>=1.0.2",
+    "openpyxl>=3.1.5",
+    "pytesseract>=0.3.13",
+    "pillow>=12.3.0",
+    # Excel binary format (.xlsb), read-only
+    "pyxlsb>=1.0.10",
+    # Legacy Excel (.xls); xlrd 2.0+ dropped .xlsx support, focuses exclusively on .xls
+    "xlrd>=2.0.1",
+    # OLE compound document parser, needed for .rpmsg (Rights-Protected Outlook MSG)
+    "compoundfiles>=0.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+# Use python -m src.cli instead
+# brain = "src.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+ignore = ["E501", "E722", "B904"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

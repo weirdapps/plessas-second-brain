@@ -14,12 +14,11 @@ and whitespace. Two names match only if ALL words match after normalization.
 import re
 import sqlite3
 import unicodedata
-from pathlib import Path
 
+from src.config import DEFAULT_DB
 from src.store.transliterate import canonical_name
 
-REPO_ROOT = Path(__file__).parent.parent.parent
-DB_PATH = REPO_ROOT / "data" / "brain.db"
+DB_PATH = DEFAULT_DB
 
 # Greek accent stripping map
 _ACCENT_MAP = str.maketrans(

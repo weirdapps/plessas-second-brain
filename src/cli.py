@@ -8,7 +8,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from src.config import DEFAULT_DB, EXTRACT_ENGINE, REPO_ROOT
+from src.config import DATA_ROOT, DEFAULT_DB, EXTRACT_ENGINE
 
 
 def format_email_result(email: dict, show_full: bool = False) -> str:
@@ -623,8 +623,8 @@ def cmd_load(args):
 
     print(f"Loading extractions into {db_path}...")
 
-    extracted_dir = REPO_ROOT / "data" / "extracted"
-    staging_dir = REPO_ROOT / "data" / "staging"
+    extracted_dir = DATA_ROOT / "extracted"
+    staging_dir = DATA_ROOT / "staging"
 
     count = load_extractions(db_path, str(extracted_dir), str(staging_dir))
 
@@ -648,7 +648,7 @@ def cmd_prune_staged(args):
     from src.store.loader import prune_staged_batches
 
     db_path = str(args.db)
-    staging_dir = REPO_ROOT / "data" / "staging"
+    staging_dir = DATA_ROOT / "staging"
 
     print(f"Scanning {staging_dir} against {db_path}...")
     pruned, freed = prune_staged_batches(db_path, str(staging_dir))
@@ -990,8 +990,8 @@ def cmd_sync(args):
     from src.store.loader import load_extractions
     from src.store.schema import get_connection as get_conn
 
-    extracted_dir = REPO_ROOT / "data" / "extracted"
-    staging_dir = REPO_ROOT / "data" / "staging"
+    extracted_dir = DATA_ROOT / "extracted"
+    staging_dir = DATA_ROOT / "staging"
     count = load_extractions(db_path, str(extracted_dir), str(staging_dir))
     print(f"Loaded {count} new emails")
 
@@ -1268,7 +1268,7 @@ def cmd_calendar_sync(args):
     """Sync calendar events from Outlook into the knowledge store."""
     from datetime import timedelta
 
-    from src.config import REPO_ROOT, USER_EMAIL_PATTERN
+    from src.config import USER_EMAIL_PATTERN
     from src.export.calendar_export import get_event_body, list_events, parse_event
     from src.extract.calendar_extractor import extract_event
     from src.store.calendar_loader import load_event, load_proxy_emails
@@ -1282,7 +1282,7 @@ def cmd_calendar_sync(args):
     conn = get_connection(db_path)
     run_migrations(conn)
 
-    proxy_emails = load_proxy_emails(str(REPO_ROOT / "data" / "canonical_people.json"))
+    proxy_emails = load_proxy_emails(str(DATA_ROOT / "canonical_people.json"))
 
     now = datetime.now()
     if args.backfill and args.since:
@@ -1386,7 +1386,7 @@ def cmd_import_people(args):
     from src.store.schema import get_connection
 
     db_path = str(args.db)
-    json_path = args.file or str(REPO_ROOT / "data" / "canonical_people.json")
+    json_path = args.file or str(DATA_ROOT / "canonical_people.json")
 
     with open(json_path) as f:
         canonical = json.load(f)

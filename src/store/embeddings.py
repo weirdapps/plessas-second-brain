@@ -13,13 +13,13 @@ from pathlib import Path
 
 import numpy as np
 
-from src.config import REPO_ROOT
+from src.config import DATA_ROOT
 
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_DIM = 3072
-EMBEDDINGS_FILE = REPO_ROOT / "data" / "embeddings.npz"
+EMBEDDINGS_FILE = DATA_ROOT / "embeddings.npz"
 BATCH_SIZE = 100  # Google API batch limit
-LOG_FILE = REPO_ROOT / "data" / "embeddings.log"
+LOG_FILE = DATA_ROOT / "embeddings.log"
 
 # Namespace offsets: emails (positive), attachments (negative), conversations (-2M and below)
 CONVERSATION_ID_OFFSET = -2_000_000

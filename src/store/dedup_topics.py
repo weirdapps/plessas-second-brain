@@ -12,13 +12,12 @@ Runs only under an explicit invocation (no cron); `--dry-run` rolls back.
 
 import sqlite3
 from collections import defaultdict
-from pathlib import Path
 
+from src.config import DEFAULT_DB
 from src.store.normalizer import normalize_topic
 from src.store.schema import get_connection
 
-REPO_ROOT = Path(__file__).parent.parent.parent
-DB_PATH = REPO_ROOT / "data" / "brain.db"
+DB_PATH = DEFAULT_DB
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:

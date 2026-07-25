@@ -8,7 +8,10 @@ import os
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent.parent
-DEFAULT_DB = REPO_ROOT / "data" / "brain.db"
+# Data root — override with BRAIN_DATA_DIR to point at a stable, checkout-independent
+# location (e.g. ~/.second-brain/data). Everything under data/ derives from this.
+DATA_ROOT = Path(os.environ.get("BRAIN_DATA_DIR", REPO_ROOT / "data"))
+DEFAULT_DB = DATA_ROOT / "brain.db"
 
 # User identity for extraction context and ownership detection.
 # BRAIN_USER_EMAIL_PATTERN is used to detect your sent emails in stale thread
@@ -27,15 +30,15 @@ GEMINI_MODEL = os.environ.get("BRAIN_GEMINI_MODEL", "gemini-2.5-flash")
 # Schema version — bump when adding migrations (must match number of migrations in schema.py)
 CURRENT_SCHEMA_VERSION = 14
 
-ATTACHMENTS_DIR = REPO_ROOT / "data" / "attachments"
-RAW_BATCH_DIR = REPO_ROOT / "data" / "raw"
+ATTACHMENTS_DIR = DATA_ROOT / "attachments"
+RAW_BATCH_DIR = DATA_ROOT / "raw"
 
 # Conversation memory
 CLAUDE_CODE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
-CONVERSATION_STAGING_DIR = REPO_ROOT / "data" / "staging" / "conversations"
+CONVERSATION_STAGING_DIR = DATA_ROOT / "staging" / "conversations"
 
 # SharePoint reference attachments
-SHAREPOINT_DATA_DIR = REPO_ROOT / "data" / "sharepoint"
+SHAREPOINT_DATA_DIR = DATA_ROOT / "sharepoint"
 
 # Host we hold an interactive SharePoint session for (captured via
 # `outlook-cli login --sharepoint-host <host>`). Auth failures on this host

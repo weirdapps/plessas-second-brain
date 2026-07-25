@@ -21,12 +21,12 @@ import sqlite3
 from collections import defaultdict
 from pathlib import Path
 
+from src.config import DEFAULT_DB
 from src.store.dedup_people import merge_person
 from src.store.schema import get_connection
 from src.store.transliterate import canonical_name
 
-REPO_ROOT = Path(__file__).parent.parent.parent
-DB_PATH = REPO_ROOT / "data" / "brain.db"
+DB_PATH = DEFAULT_DB
 
 # Skip pathologically large surname blocks — too ambiguous, O(n^2) blowup.
 MAX_BLOCK = 60

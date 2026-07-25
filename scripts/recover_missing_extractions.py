@@ -23,12 +23,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from src.config import DATA_ROOT, DEFAULT_DB  # noqa: E402
 from src.store.loader import load_single_email  # noqa: E402
 from src.store.schema import get_connection  # noqa: E402
 
-STAGING = REPO_ROOT / "data" / "staging"
-EXTRACTED = REPO_ROOT / "data" / "extracted"
-DB = REPO_ROOT / "data" / "brain.db"
+STAGING = DATA_ROOT / "staging"
+EXTRACTED = DATA_ROOT / "extracted"
+DB = DEFAULT_DB
 
 
 def build_staging_index() -> dict[str, dict]:

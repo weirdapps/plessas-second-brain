@@ -1,0 +1,808 @@
+#!/usr/bin/env python3
+"""
+Second Brain nightly health check.
+
+Queries all data sources, detects staleness and failures, attempts auto-fixes,
+and emails a status report. Designed to run via launchd at 23:55 daily.
+
+Usage:
+    python3 scripts/health_check.py              # print to stdout
+    python3 scripts/health_check.py --email      # also send via outlook-cli
+    python3 scripts/health_check.py --fix        # auto-fix issues then report
+    python3 scripts/health_check.py --email --fix # production mode
+"""
+
+import argparse
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.config import DEFAULT_DB, SHAREPOINT_HOST  # noqa: E402
+
+DB_PATH = DEFAULT_DB
+LOG_DIR = Path.home() / ".second-brain/logs"
+STATE_DIR = Path.home() / ".second-brain"
+LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
+SHAREPOINT_SESSION = Path.home() / ".outlook-cli" / "sharepoint-session.json"
+
+# launchd label prefix (macOS); override with BRAIN_LABEL_PREFIX. systemd units
+# (VPS) use the sb-* names in SYSTEMD_UNITS below and are unaffected by this.
+LABEL_PREFIX = os.environ.get("BRAIN_LABEL_PREFIX", "com.secondbrain")
+
+STALE_THRESHOLDS = {
+    "emails": timedelta(hours=6),
+    "teams": timedelta(hours=24),
+    "calendar": timedelta(days=2),
+    "conversations": timedelta(days=2),
+    "daily_sync": timedelta(hours=26),
+    "outlook_sync": timedelta(hours=3),
+    "attachments_llm": timedelta(days=3),
+}
+
+LAUNCHD_JOBS = {
+    f"{LABEL_PREFIX}.sync": "Hourly Outlook sync",
+    f"{LABEL_PREFIX}-sync": "Daily full sync",
+    f"{LABEL_PREFIX}.noon-catchup": "Noon catchup",
+    f"{LABEL_PREFIX}.teams-sync": "Teams sync",
+    f"{LABEL_PREFIX}.calendar-sync": "Calendar sync",
+    f"{LABEL_PREFIX}.attachments": "Attachment processing",
+    f"{LABEL_PREFIX}.auth-watch": "Auth watcher",
+    f"{LABEL_PREFIX}.curate-docs": "Document curation",
+    f"{LABEL_PREFIX}.reverse-ingest": "Reverse ingest",
+}
+
+# Linux/systemd counterpart. The VPS runs the same repo under `systemctl --user`;
+# the same logical jobs have different identifiers there (and Linux has no
+# launchctl at all, which is why the launchd path errors out on the VPS).
+SYSTEMD_UNITS = {
+    "sb-outlook-sync.service": "Hourly Outlook sync",
+    "sb-daily-sync.service": "Daily full sync",
+    "sb-noon-catchup.service": "Noon catchup",
+    "sb-teams-sync.service": "Teams sync",
+    "sb-calendar-sync.service": "Calendar sync",
+    "sb-attachments.service": "Attachment processing",
+    "sb-auth-watch.service": "Auth watcher",
+    "sb-curate-docs.service": "Document curation",
+    "sb-reverse-ingest.service": "Reverse ingest",
+}
+
+IS_MACOS = sys.platform == "darwin"
+
+# Platform-native identifiers for the jobs auto_fix needs to (re)start.
+AUTH_WATCH_JOB = f"{LABEL_PREFIX}.auth-watch" if IS_MACOS else "sb-auth-watch.service"
+LOADER_JOB = f"{LABEL_PREFIX}-sync" if IS_MACOS else "sb-daily-sync.service"
+
+
+def launchctl_bin() -> str:
+    """Absolute path to launchctl.
+
+    launchd-spawned jobs — and any invocation outside sb-health-check.sh — can
+    run with a minimal PATH that omits /bin, making a bare "launchctl" raise
+    FileNotFoundError. That silently turns every job into ERROR and disables
+    auto_fix(). Resolving the absolute path keeps both working regardless of PATH.
+    """
+    for candidate in ("/bin/launchctl", "/usr/bin/launchctl"):
+        if os.path.exists(candidate):
+            return candidate
+    return shutil.which("launchctl") or "launchctl"
+
+
+def systemctl_bin() -> str:
+    """Absolute path to systemctl (Linux/VPS), PATH-independent like launchctl_bin."""
+    for candidate in ("/usr/bin/systemctl", "/bin/systemctl"):
+        if os.path.exists(candidate):
+            return candidate
+    return shutil.which("systemctl") or "systemctl"
+
+
+def kick_job(label: str):
+    """(Re)start a scheduled job by its platform-native identifier:
+    `launchctl kickstart` on macOS, `systemctl --user start` on Linux (VPS)."""
+    if IS_MACOS:
+        uid = os.getuid()
+        return subprocess.run(
+            [launchctl_bin(), "kickstart", f"gui/{uid}/{label}"],
+            capture_output=True,
+            timeout=30,
+        )
+    return subprocess.run(
+        [systemctl_bin(), "--user", "start", label],
+        capture_output=True,
+        timeout=30,
+    )
+
+
+def get_db():
+    if not DB_PATH.exists():
+        return None
+    return sqlite3.connect(str(DB_PATH), timeout=10)
+
+
+def _age(ts):
+    """Age of a timestamp, handling both naive-local values (macOS sqlite) and
+    tz-aware UTC ones (the VPS stores Graph 'Z' timestamps). Without this, a UTC
+    'Z' value is compared against local now() — inflating every age by the UTC
+    offset (EEST = +3h) and tripping false STALE alerts on the VPS."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+    if dt.tzinfo is not None:
+        return datetime.now(UTC) - dt
+    return datetime.now() - dt
+
+
+def check_emails(db):
+    r = db.execute(
+        "SELECT COUNT(*), MAX(date_received) FROM emails WHERE message_id > 0"
+    ).fetchone()
+    total, latest = r[0], r[1]
+    recent_24h = db.execute(
+        "SELECT COUNT(*) FROM emails WHERE date_received > datetime('now', '-1 day') AND message_id > 0"
+    ).fetchone()[0]
+    recent_7d = db.execute(
+        "SELECT COUNT(*) FROM emails WHERE date_received > datetime('now', '-7 days') AND message_id > 0"
+    ).fetchone()[0]
+
+    age = _age(latest)
+
+    stale = age and age > STALE_THRESHOLDS["emails"]
+    return {
+        "name": "Emails",
+        "total": total,
+        "latest": latest,
+        "recent_24h": recent_24h,
+        "recent_7d": recent_7d,
+        "age": age,
+        "stale": stale,
+        "status": "STALE" if stale else "OK",
+    }
+
+
+def check_teams(db):
+    total = db.execute("SELECT COUNT(*) FROM teams_messages").fetchone()[0]
+    latest = db.execute("SELECT MAX(composed_at) FROM teams_messages").fetchone()[0]
+    chats = db.execute("SELECT COUNT(*) FROM teams_chats").fetchone()[0]
+    threads = db.execute("SELECT COUNT(*) FROM teams_threads").fetchone()[0]
+    recent_24h = db.execute(
+        "SELECT COUNT(*) FROM teams_messages WHERE composed_at > datetime('now', '-1 day')"
+    ).fetchone()[0]
+
+    age = _age(latest)
+
+    stale = age and age > STALE_THRESHOLDS["teams"]
+    return {
+        "name": "Teams",
+        "total": total,
+        "chats": chats,
+        "threads": threads,
+        "latest": latest,
+        "recent_24h": recent_24h,
+        "age": age,
+        "stale": stale,
+        "status": "STALE" if stale else "OK",
+    }
+
+
+def check_attachments(db):
+    total = db.execute("SELECT COUNT(*) FROM attachment_content").fetchone()[0]
+    extracted = db.execute(
+        "SELECT COUNT(*) FROM attachment_content WHERE extraction_status = 'extracted'"
+    ).fetchone()[0]
+    failed = db.execute(
+        "SELECT COUNT(*) FROM attachment_content WHERE extraction_status = 'failed'"
+    ).fetchone()[0]
+    llm_done = db.execute(
+        "SELECT COUNT(*) FROM attachment_content WHERE llm_status = 'extracted'"
+    ).fetchone()[0]
+    # "pending" = actionable Phase-2 queue only: extracted text still awaiting an
+    # LLM summary. Rows whose text extraction was skipped (no text) or failed
+    # (corrupt/encrypted) also carry llm_status='pending' but can never be
+    # summarized — counting them inflated the backlog to thousands of phantom items.
+    llm_pending = db.execute(
+        "SELECT COUNT(*) FROM attachment_content "
+        "WHERE extraction_status = 'extracted' AND llm_status = 'pending'"
+    ).fetchone()[0]
+    llm_no_text = db.execute(
+        "SELECT COUNT(*) FROM attachment_content "
+        "WHERE extraction_status IN ('skipped', 'failed') AND llm_status = 'pending'"
+    ).fetchone()[0]
+    llm_failed = db.execute(
+        "SELECT COUNT(*) FROM attachment_content WHERE llm_status = 'failed'"
+    ).fetchone()[0]
+    latest_llm = db.execute(
+        "SELECT MAX(llm_extracted_at) FROM attachment_content WHERE llm_status = 'extracted'"
+    ).fetchone()[0]
+
+    age = _age(latest_llm)
+
+    stale = age and age > STALE_THRESHOLDS["attachments_llm"]
+    pct = (extracted * 100 / total) if total > 0 else 0
+    return {
+        "name": "Attachments",
+        "total": total,
+        "text_extracted": extracted,
+        "text_failed": failed,
+        "text_pct": pct,
+        "llm_done": llm_done,
+        "llm_pending": llm_pending,
+        "llm_no_text": llm_no_text,
+        "llm_failed": llm_failed,
+        "latest_llm": latest_llm,
+        "age": age,
+        "stale": stale,
+        "status": "STALE" if stale else ("WARN" if llm_failed > 200 else "OK"),
+    }
+
+
+def check_images(db):
+    total = db.execute("SELECT COUNT(*) FROM inline_images").fetchone()[0]
+    classified = db.execute(
+        "SELECT COUNT(*) FROM inline_images WHERE vision_description IS NOT NULL"
+    ).fetchone()[0]
+    pct = (classified * 100 / total) if total > 0 else 0
+    return {
+        "name": "Inline Images",
+        "total": total,
+        "classified": classified,
+        "pct": pct,
+        "status": "WARN" if pct < 50 else "OK",
+    }
+
+
+def check_calendar(db):
+    total = db.execute("SELECT COUNT(*) FROM calendar_events").fetchone()[0]
+    latest = db.execute("SELECT MAX(end_at) FROM calendar_events").fetchone()[0]
+    return {
+        "name": "Calendar",
+        "total": total,
+        "latest": latest,
+        "status": "OK",
+    }
+
+
+def check_conversations(db):
+    total = db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+    turns = db.execute("SELECT COUNT(*) FROM conversation_turns").fetchone()[0]
+    latest = db.execute("SELECT MAX(started_at) FROM conversations").fetchone()[0]
+
+    age = _age(latest)
+
+    stale = age and age > STALE_THRESHOLDS["conversations"]
+    return {
+        "name": "Conversations",
+        "total": total,
+        "turns": turns,
+        "latest": latest,
+        "age": age,
+        "stale": stale,
+        "status": "STALE" if stale else "OK",
+    }
+
+
+def check_embeddings(db):
+    total_emails = db.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
+    import numpy as np
+
+    npz = DB_PATH.parent / "embeddings.npz"
+    if npz.exists():
+        d = np.load(str(npz), allow_pickle=True)
+        n = len(d["ids"]) if "ids" in d else 0
+        return {
+            "name": "Embeddings",
+            "embedded": n,
+            "total_emails": total_emails,
+            "status": "OK",
+        }
+    return {
+        "name": "Embeddings",
+        "embedded": 0,
+        "total_emails": total_emails,
+        "status": "WARN",
+    }
+
+
+def check_sharepoint(db):
+    try:
+        rows = db.execute(
+            "SELECT last_status, COUNT(*) FROM sharepoint_links GROUP BY last_status"
+        ).fetchall()
+        status_map = {r[0]: r[1] for r in rows}
+        ok = status_map.get("ok", 0)
+        exc = status_map.get("exception", 0)
+        stale = status_map.get("stale", 0)
+        total = ok + exc + stale
+        return {
+            "name": "SharePoint",
+            "ok": ok,
+            "exception": exc,
+            "stale": stale,
+            "total": total,
+            "status": "WARN" if exc > total * 0.3 else "OK",
+        }
+    except sqlite3.OperationalError:
+        return {"name": "SharePoint", "status": "N/A"}
+
+
+def check_sharepoint_token(path: Path = SHAREPOINT_SESSION, now: datetime | None = None):
+    """Surface an expired/expiring SharePoint session token.
+
+    The SharePoint bearer is a *separate* token from the Outlook mail session and
+    does not renew headlessly once fully expired — it needs an interactive
+    `outlook-cli login --sharepoint-host <host>`. When it lapses, mail keeps
+    working (its token still renews) while every SharePoint fetch fails with
+    SHAREPOINT_SESSION_MISSING. The file mtime stays fresh because the token-sync
+    job keeps copying the dead token, so mtime alone can't detect this — only the
+    embedded tokenExpiresAt can. This check makes that rot visible instead of
+    silent.
+    """
+    now = now or datetime.now(UTC)
+    if not path.exists():
+        return {"name": "SP Session", "status": "N/A"}
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        return {"name": "SP Session", "status": "WARN", "error": str(e)}
+
+    exp = data.get("tokenExpiresAt")
+    try:
+        dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return {"name": "SP Session", "status": "WARN", "error": f"bad tokenExpiresAt: {exp!r}"}
+
+    remaining = dt - now
+    if remaining.total_seconds() <= 0:
+        status = "FAIL"
+    elif remaining < timedelta(hours=24):
+        status = "WARN"
+    else:
+        status = "OK"
+    return {"name": "SP Session", "status": status, "expires_at": exp, "remaining": remaining}
+
+
+def check_documents(db):
+    total = db.execute("SELECT COUNT(*) FROM emails WHERE message_id < 0").fetchone()[0]
+    latest = db.execute("SELECT MAX(date_received) FROM emails WHERE message_id < 0").fetchone()[0]
+    return {
+        "name": "Documents",
+        "total": total,
+        "latest": latest,
+        "status": "OK",
+    }
+
+
+def _is_migrated(label: str, agents_dir: Path = LAUNCH_AGENTS_DIR) -> bool:
+    """Whether a launchd job was intentionally retired to the VPS.
+
+    When ingestion moved to the VPS, the Mac's ingestion plists were renamed to
+    `<label>.plist.disabled-migrated-to-vps`. Such a label is deliberately gone,
+    not broken — reporting it as NOT_LOADED read as a fault on every run.
+    """
+    disabled = agents_dir / f"{label}.plist.disabled-migrated-to-vps"
+    active = agents_dir / f"{label}.plist"
+    return disabled.exists() and not active.exists()
+
+
+def _check_jobs_launchd():
+    results = {}
+    for label, desc in LAUNCHD_JOBS.items():
+        try:
+            out = subprocess.run(
+                [launchctl_bin(), "list"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            for line in out.stdout.strip().split("\n"):
+                parts = line.split("\t")
+                if len(parts) == 3 and parts[2] == label:
+                    pid = parts[0]
+                    exit_code = parts[1]
+                    running = pid != "-" and pid != "0"
+                    ok = exit_code == "0"
+                    results[label] = {
+                        "desc": desc,
+                        "pid": pid,
+                        "exit_code": exit_code,
+                        "running": running,
+                        "status": "RUNNING"
+                        if running
+                        else ("OK" if ok else f"FAIL(exit={exit_code})"),
+                    }
+                    break
+            else:
+                results[label] = {
+                    "desc": desc,
+                    "status": "MIGRATED" if _is_migrated(label) else "NOT_LOADED",
+                }
+        except Exception as e:
+            results[label] = {"desc": desc, "status": f"ERROR: {e}"}
+    return results
+
+
+def _check_jobs_systemd():
+    results = {}
+    for unit, desc in SYSTEMD_UNITS.items():
+        try:
+            out = subprocess.run(
+                [
+                    systemctl_bin(),
+                    "--user",
+                    "show",
+                    unit,
+                    "--property=LoadState,ActiveState,SubState,Result,ExecMainStatus",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            props = dict(
+                line.split("=", 1) for line in out.stdout.strip().splitlines() if "=" in line
+            )
+            load = props.get("LoadState", "")
+            if load in ("", "not-found", "masked"):
+                results[unit] = {"desc": desc, "status": "NOT_LOADED"}
+                continue
+            active = props.get("ActiveState", "")
+            result = props.get("Result", "success")
+            exit_code = props.get("ExecMainStatus", "0")
+            running = active in ("active", "activating", "reloading")
+            # Trust systemd's own verdict (ActiveState/Result), NOT ExecMainStatus:
+            # after a `reset-failed`, Result reverts to "success" while
+            # ExecMainStatus stays stale at the last process's exit code. Timer
+            # oneshots sit inactive(dead)/Result=success between runs — healthy.
+            if active == "failed" or result not in ("success", ""):
+                status = f"FAIL(result={result})"
+            elif running:
+                status = "RUNNING"
+            else:
+                status = "OK"
+            results[unit] = {
+                "desc": desc,
+                "active": active,
+                "result": result,
+                "exit_code": exit_code,
+                "running": running,
+                "status": status,
+            }
+        except Exception as e:
+            results[unit] = {"desc": desc, "status": f"ERROR: {e}"}
+    return results
+
+
+def check_jobs():
+    """Scheduled-job status — launchd on macOS, systemd --user on Linux (VPS)."""
+    return _check_jobs_launchd() if IS_MACOS else _check_jobs_systemd()
+
+
+def check_sync_logs():
+    results = {}
+    log_files = {
+        "outlook_sync": LOG_DIR / "outlook-sync.log",
+        "daily_sync": LOG_DIR / "daily-sync.log",
+        "noon_catchup": LOG_DIR / "noon-catchup.log",
+        "teams_sync": LOG_DIR / "teams-sync.log",
+    }
+    for name, path in log_files.items():
+        if path.exists():
+            mtime = datetime.fromtimestamp(path.stat().st_mtime)
+            age = datetime.now() - mtime
+            results[name] = {
+                "path": str(path),
+                "last_modified": mtime.isoformat(),
+                "age": age,
+                "stale": age > STALE_THRESHOLDS.get(name, timedelta(days=1)),
+            }
+        else:
+            results[name] = {"path": str(path), "status": "MISSING"}
+    return results
+
+
+def check_sentinels():
+    results = {}
+    sentinels = {
+        "needs_reauth": STATE_DIR / "needs_reauth",
+        "needs_gcloud_reauth": STATE_DIR / "needs_gcloud_reauth",
+    }
+    for name, path in sentinels.items():
+        if path.exists():
+            mtime = datetime.fromtimestamp(path.stat().st_mtime)
+            results[name] = {
+                "present": True,
+                "since": mtime.isoformat(),
+                "status": "BLOCKING",
+            }
+        else:
+            results[name] = {"present": False, "status": "OK"}
+    return results
+
+
+def auto_fix(issues):
+    """Attempt to fix detected issues. Returns list of actions taken.
+
+    Platform-agnostic: kick_job() dispatches to launchctl (macOS) or
+    systemctl --user (Linux/VPS).
+    """
+    actions = []
+
+    for issue in issues:
+        if issue["type"] == "sentinel" and issue["name"] == "needs_reauth":
+            try:
+                kick_job(AUTH_WATCH_JOB)
+                actions.append("Kicked auth-watch to attempt silent renewal")
+            except Exception as e:
+                actions.append(f"Failed to kick auth-watch: {e}")
+
+        elif issue["type"] == "job_failed":
+            label = issue["label"]
+            try:
+                kick_job(label)
+                actions.append(f"Re-kicked {label}")
+            except Exception as e:
+                actions.append(f"Failed to kick {label}: {e}")
+
+        elif issue["type"] == "stale_data":
+            label = issue["label"]
+            try:
+                kick_job(label)
+                actions.append(f"Kicked {label} to drain staging ({issue['name']} stale)")
+            except Exception as e:
+                actions.append(f"Failed to kick {label}: {e}")
+
+    return actions
+
+
+def format_age(td):
+    if not td:
+        return "?"
+    total_secs = int(td.total_seconds())
+    if total_secs < 3600:
+        return f"{total_secs // 60}m"
+    if total_secs < 86400:
+        return f"{total_secs // 3600}h {(total_secs % 3600) // 60}m"
+    return f"{total_secs // 86400}d {(total_secs % 86400) // 3600}h"
+
+
+def build_report(checks, jobs, logs, sentinels, fix_actions):
+    now = datetime.now()
+    lines = []
+    issues = []
+
+    lines.append(f"Second Brain Health Report — {now.strftime('%Y-%m-%d %H:%M')}")
+    lines.append("=" * 55)
+
+    # Sentinels (blocking issues first)
+    blocking = [s for s, v in sentinels.items() if v.get("present")]
+    if blocking:
+        lines.append("")
+        lines.append("BLOCKING SENTINELS:")
+        for s in blocking:
+            lines.append(f"  {s}: present since {sentinels[s]['since']}")
+        issues.extend(blocking)
+
+    # Data sources
+    lines.append("")
+    lines.append("DATA SOURCES")
+    lines.append("-" * 55)
+    fmt = "{:<18} {:>8} {:>7} {:>6}"
+    lines.append(fmt.format("Source", "Count", "Age", "Status"))
+    lines.append("-" * 55)
+
+    for c in checks:
+        count = c.get("total", c.get("embedded", "?"))
+        age = format_age(c.get("age"))
+        status = c.get("status", "?")
+        extra = ""
+        if c["name"] == "Attachments":
+            extra = (
+                f" (LLM: {c.get('llm_done', 0):,} done, {c.get('llm_pending', 0):,} pending"
+                f", {c.get('llm_no_text', 0):,} no-text)"
+            )
+        elif c["name"] == "Inline Images":
+            extra = f" ({c.get('pct', 0):.0f}% classified)"
+        elif c["name"] == "Emails":
+            extra = f" ({c.get('recent_24h', 0)} today)"
+        elif c["name"] == "Teams":
+            extra = f" ({c.get('recent_24h', 0)} today)"
+        elif c["name"] == "SharePoint":
+            count = f"{c.get('ok', 0)}/{c.get('total', 0)}"
+            extra = f" ({c.get('exception', 0)} exceptions)"
+        elif c["name"] == "SP Session":
+            count = "—"
+            rem = c.get("remaining")
+            if c.get("status") == "N/A":
+                extra = " (no session file)"
+            elif rem is not None and rem.total_seconds() <= 0:
+                extra = (
+                    f" (EXPIRED {str(c.get('expires_at', ''))[:10]} — run: "
+                    f"outlook-cli login --sharepoint-host {SHAREPOINT_HOST})"
+                )
+            elif rem is not None:
+                extra = f" (expires in {format_age(rem)})"
+
+        count_str = f"{count:,}" if isinstance(count, int) else str(count)
+        lines.append(f"  {c['name']:<16} {count_str:>8} {age:>7}  {status}{extra}")
+
+        if status in ("STALE", "FAIL", "WARN"):
+            issues.append(f"{c['name']}: {status}")
+
+    # LaunchD jobs
+    lines.append("")
+    lines.append("SCHEDULED JOBS")
+    lines.append("-" * 55)
+    for label, info in sorted(jobs.items()):
+        desc = info.get("desc", label)
+        status = info.get("status", "?")
+        marker = "OK" if status in ("OK", "RUNNING") else status
+        lines.append(f"  {desc:<28} {marker}")
+        if "FAIL" in str(status):
+            issues.append(f"Job {desc}: {status}")
+
+    # Fix actions
+    if fix_actions:
+        lines.append("")
+        lines.append("AUTO-FIX ACTIONS TAKEN")
+        lines.append("-" * 55)
+        for a in fix_actions:
+            lines.append(f"  {a}")
+
+    # Summary
+    lines.append("")
+    lines.append("=" * 55)
+    if issues:
+        lines.append(f"ISSUES: {len(issues)}")
+        for i in issues:
+            lines.append(f"  - {i}")
+    else:
+        lines.append("ALL SYSTEMS HEALTHY")
+    lines.append("=" * 55)
+
+    return "\n".join(lines), issues
+
+
+def build_html(text_report, issues):
+    """Convert text report to styled HTML for email."""
+    status_color = "#006141" if not issues else "#AA0028"
+    status_text = (
+        "ALL HEALTHY" if not issues else f"{len(issues)} ISSUE{'S' if len(issues) > 1 else ''}"
+    )
+
+    pre_html = text_report.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    return f"""<div style="font-family: Aptos, Calibri, sans-serif; font-size: 12pt; color: #404040;">
+<span style="color: {status_color}; font-weight: bold;">Second Brain Status: {status_text}</span>
+<br><br>
+<pre style="font-family: 'SF Mono', 'Cascadia Code', Consolas, monospace; font-size: 10pt; color: #404040; background: #f5f5f5; padding: 16px; border-radius: 8px; overflow-x: auto;">{pre_html}</pre>
+</div>"""
+
+
+def send_email(html_body, issues):
+    """Send via outlook-cli (--html takes a file path). Requires HEALTH_EMAIL_TO."""
+    import tempfile
+
+    recipient = os.environ.get("HEALTH_EMAIL_TO")
+    if not recipient:
+        print("HEALTH_EMAIL_TO not set — skipping email.", file=sys.stderr)
+        return False
+
+    status = "healthy" if not issues else f"{len(issues)} issues"
+    subject = f"second brain health — {datetime.now().strftime('%Y-%m-%d')} — {status}"
+
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".html", prefix="sb-health-", delete=False)
+    try:
+        tmp.write(html_body)
+        tmp.close()
+
+        env = os.environ.copy()
+        # outlook-cli is a Node tool; if fnm manages Node, add its latest bin to PATH.
+        fnm_versions = Path.home() / ".local/share/fnm/node-versions"
+        if fnm_versions.is_dir():
+            node_bins = sorted(fnm_versions.glob("*/installation/bin"))
+            if node_bins:
+                env["PATH"] = f"{node_bins[-1]}:{env.get('PATH', '')}"
+
+        result = subprocess.run(
+            [
+                "outlook-cli",
+                "send-mail",
+                "--to",
+                recipient,
+                "--subject",
+                subject,
+                "--html",
+                tmp.name,
+                "--send-now",
+                "--no-open",
+                "--no-cc-self",
+                "--no-signature",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
+        if result.returncode != 0:
+            print(f"outlook-cli stderr: {result.stderr[:200]}", file=sys.stderr)
+        return result.returncode == 0
+    except Exception as e:
+        print(f"Email send failed: {e}", file=sys.stderr)
+        return False
+    finally:
+        os.unlink(tmp.name)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Second Brain health check")
+    parser.add_argument("--email", action="store_true", help="Send report via email")
+    parser.add_argument("--fix", action="store_true", help="Auto-fix detected issues")
+    args = parser.parse_args()
+
+    db = get_db()
+    if not db:
+        print("ERROR: Database not found", file=sys.stderr)
+        sys.exit(1)
+
+    checks = [
+        check_emails(db),
+        check_teams(db),
+        check_attachments(db),
+        check_images(db),
+        check_calendar(db),
+        check_conversations(db),
+        check_embeddings(db),
+        check_documents(db),
+        check_sharepoint(db),
+        check_sharepoint_token(),
+    ]
+    db.close()
+
+    jobs = check_jobs()
+    logs = check_sync_logs()
+    sentinels = check_sentinels()
+
+    # Detect fixable issues
+    fixable = []
+    for name, info in sentinels.items():
+        if info.get("present"):
+            fixable.append({"type": "sentinel", "name": name})
+    for label, info in jobs.items():
+        if "FAIL" in str(info.get("status", "")):
+            fixable.append({"type": "job_failed", "label": label})
+    # Stale-data backstop: if emails went stale, kick the loader so the next run
+    # drains staging. The hourly sync now loads every hour, so this should rarely
+    # fire — it's defense-in-depth for when the hourly load is skipped/failing.
+    for c in checks:
+        if c.get("stale") and c.get("name") == "Emails":
+            fixable.append(
+                {
+                    "type": "stale_data",
+                    "name": c["name"],
+                    "label": LOADER_JOB,
+                }
+            )
+
+    fix_actions = auto_fix(fixable) if args.fix else []
+
+    text_report, issues = build_report(checks, jobs, logs, sentinels, fix_actions)
+    print(text_report)
+
+    if args.email:
+        html = build_html(text_report, issues)
+        ok = send_email(html, issues)
+        if ok:
+            print("\nEmail sent successfully.")
+        else:
+            print("\nEmail send FAILED.", file=sys.stderr)
+            sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

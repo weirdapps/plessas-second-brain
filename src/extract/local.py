@@ -16,9 +16,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+from src.config import DATA_ROOT
+
 # Repo root
 REPO_ROOT = Path(__file__).parent.parent.parent
-DATA_DIR = REPO_ROOT / "data"
+DATA_DIR = DATA_ROOT
 STAGING_DIR = DATA_DIR / "staging"
 EXTRACTED_DIR = DATA_DIR / "extracted"
 STATE_FILE = DATA_DIR / "state" / "extract_state.json"

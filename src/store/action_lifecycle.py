@@ -14,12 +14,11 @@ Runs only under an explicit invocation (no cron); `--dry-run` rolls back.
 """
 
 import sqlite3
-from pathlib import Path
 
+from src.config import DEFAULT_DB
 from src.store.schema import get_connection
 
-REPO_ROOT = Path(__file__).parent.parent.parent
-DB_PATH = REPO_ROOT / "data" / "brain.db"
+DB_PATH = DEFAULT_DB
 
 DEFAULT_EXPIRE_DAYS = 180
 

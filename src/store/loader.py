@@ -483,12 +483,12 @@ def load_conversations(db_path: str) -> int:
     Returns:
         Number of conversations successfully loaded
     """
-    from src.config import REPO_ROOT
+    from src.config import DATA_ROOT
 
     from .schema import get_connection, run_migrations
 
-    staging_dir = REPO_ROOT / "data" / "staging" / "conversations"
-    extracted_dir = REPO_ROOT / "data" / "extracted" / "conversations"
+    staging_dir = DATA_ROOT / "staging" / "conversations"
+    extracted_dir = DATA_ROOT / "extracted" / "conversations"
 
     if not staging_dir.exists() or not extracted_dir.exists():
         return 0

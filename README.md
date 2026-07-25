@@ -136,7 +136,11 @@ The MCP server exposes 23 tools (all defined in `src/mcp_server.py`). Register t
 Requires Python 3.12+. For Microsoft 365 ingestion (mail, Teams, calendar, SharePoint) you also need [`outlook-cli`](https://github.com/weirdapps/outlook-access) and [`teams-cli`](https://github.com/weirdapps/teams-access) on `PATH` — both are open source. Everything else (local documents, URLs, YouTube, Claude Code conversations, or your own exporter) works without them.
 
 ```bash
+# HTTPS (no SSH key required):
+git clone https://github.com/weirdapps/plessas-second-brain.git
+# or, with SSH:
 git clone git@github.com:weirdapps/plessas-second-brain.git
+
 cd plessas-second-brain
 
 python3.12 -m venv .venv

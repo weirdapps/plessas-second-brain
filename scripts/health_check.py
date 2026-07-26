@@ -742,6 +742,11 @@ def send_email(html_body, issues):
 def main():
     parser = argparse.ArgumentParser(description="Second Brain health check")
     parser.add_argument("--email", action="store_true", help="Send report via email")
+    parser.add_argument(
+        "--email-if-issues",
+        action="store_true",
+        help="Send report via email only when unresolved issues remain (quiet on healthy runs)",
+    )
     parser.add_argument("--fix", action="store_true", help="Auto-fix detected issues")
     args = parser.parse_args()
 
@@ -794,7 +799,7 @@ def main():
     text_report, issues = build_report(checks, jobs, logs, sentinels, fix_actions)
     print(text_report)
 
-    if args.email:
+    if args.email or (args.email_if_issues and issues):
         html = build_html(text_report, issues)
         ok = send_email(html, issues)
         if ok:

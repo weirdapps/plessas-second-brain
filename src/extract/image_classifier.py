@@ -12,12 +12,24 @@ Stage 3 lives in image_vision.py to keep the LLM dependency optional.
 """
 
 import hashlib
+import logging
 import sqlite3
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
+
+logger = logging.getLogger(__name__)
+
+# Register HEIF/HEIC support so PIL can decode iPhone photos. If the optional
+# dependency is missing, HEIC images fall through to the decode-failure marker.
+try:
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except ImportError:  # pragma: no cover
+    pass
 
 
 class Classification(StrEnum):
@@ -100,9 +112,15 @@ def classify_stage1(
         if overridden or c != Classification.UNCLASSIFIED.value:
             return Classification(c)
 
-    # Stage 1a — dimensions
-    width, height = Image.open(img_path).size
+    # Stage 1a — dimensions. An image PIL cannot decode (corrupt, unsupported
+    # format such as HEIC without a plugin, or a decompression bomb) is recorded
+    # as a decode failure so the caller stops re-scanning it on every run.
     bytes_size = img_path.stat().st_size
+    try:
+        width, height = Image.open(img_path).size
+    except (UnidentifiedImageError, Image.DecompressionBombError, OSError) as e:
+        logger.warning("Undecodable image %s: %s", img_path, e)
+        return _store(conn, sha, Classification.NOISE, "decode_failed", 0, 0, bytes_size)
     if width < MIN_DIMENSION_PX or height < MIN_DIMENSION_PX:
         return _store(conn, sha, Classification.NOISE, "dimensions", width, height, bytes_size)
 

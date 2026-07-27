@@ -20,7 +20,8 @@ def mock_conn():
             last_status TEXT,
             last_attempt_at TIMESTAMP,
             file_name TEXT,
-            file_size INTEGER
+            file_size INTEGER,
+            attempts INTEGER NOT NULL DEFAULT 0
         );
 
         INSERT INTO sharepoint_links

@@ -39,6 +39,10 @@ def is_managed_sharepoint_host(url: str, managed_host: str) -> bool:
 
 FetchStatus = Literal["ok", "stale", "auth-required", "http-error", "exception"]
 
+# After this many consecutive failed fetch attempts, the retry pass gives up on a
+# link (treats it as permanently dead) instead of re-attempting it every night.
+MAX_SHAREPOINT_ATTEMPTS = 5
+
 
 @dataclass
 class SharepointFetchResult:
@@ -104,15 +108,18 @@ def record_link_in_db(
     now = datetime.now(UTC).isoformat()
     conn.execute(
         """INSERT INTO sharepoint_links
-           (url, message_id, fetched_at, fetched_path, last_status, last_attempt_at, file_name, file_size)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           (url, message_id, fetched_at, fetched_path, last_status, last_attempt_at,
+            file_name, file_size, attempts)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(url) DO UPDATE SET
              fetched_at = excluded.fetched_at,
              fetched_path = excluded.fetched_path,
              last_status = excluded.last_status,
              last_attempt_at = excluded.last_attempt_at,
              file_name = excluded.file_name,
-             file_size = excluded.file_size""",
+             file_size = excluded.file_size,
+             attempts = CASE WHEN excluded.last_status = 'ok'
+                             THEN 0 ELSE sharepoint_links.attempts + 1 END""",
         (
             url,
             message_id,
@@ -122,6 +129,7 @@ def record_link_in_db(
             now,
             file_name,
             file_size,
+            0 if status == "ok" else 1,
         ),
     )
     conn.commit()

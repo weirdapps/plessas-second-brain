@@ -47,6 +47,53 @@ def test_fetch_records_404_as_stale(mock_cli, tmp_path):
     assert result.http_status == 404
 
 
+def test_record_link_in_db_tracks_attempts(tmp_path):
+    """Failed attempts accumulate; a successful fetch resets the counter — so the
+    retry pass can give up on links that keep failing."""
+    conn = _setup_db(tmp_path)
+    record_link_in_db(conn, url="https://x", message_id="m1", status="stale")
+    record_link_in_db(conn, url="https://x", message_id="m1", status="http-error")
+    assert (
+        conn.execute("SELECT attempts FROM sharepoint_links WHERE url='https://x'").fetchone()[0]
+        == 2
+    )
+    record_link_in_db(
+        conn,
+        url="https://x",
+        message_id="m1",
+        status="ok",
+        fetched_path="/f",
+        file_name="f",
+        file_size=1,
+    )
+    assert (
+        conn.execute("SELECT attempts FROM sharepoint_links WHERE url='https://x'").fetchone()[0]
+        == 0
+    )
+
+
+def test_process_sharepoint_gives_up_after_max_attempts(tmp_path):
+    """A link that has already failed the max number of times is NOT retried."""
+    import argparse
+
+    from src.cli import cmd_process_sharepoint
+    from src.export.sharepoint_fetcher import MAX_SHAREPOINT_ATTEMPTS
+
+    conn = _setup_db(tmp_path)
+    conn.execute(
+        "INSERT INTO sharepoint_links (url, message_id, fetched_at, last_status, last_attempt_at, attempts) "
+        "VALUES ('https://dead', 'm', NULL, 'stale', '2026-05-01T00:00:00', ?)",
+        (MAX_SHAREPOINT_ATTEMPTS,),
+    )
+    conn.commit()
+    conn.close()
+
+    with patch("src.export.sharepoint_fetcher.fetch_sharepoint_link") as mock_fetch:
+        args = argparse.Namespace(db=str(tmp_path / "test.db"), since=None, limit=0, dry_run=False)
+        cmd_process_sharepoint(args)
+        assert not mock_fetch.called  # exhausted link is not retried
+
+
 def test_record_link_in_db_upserts(tmp_path):
     conn = _setup_db(tmp_path)
     record_link_in_db(

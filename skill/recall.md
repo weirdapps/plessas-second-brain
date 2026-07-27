@@ -59,7 +59,7 @@ mcp__second-brain__recall(query="4Q25 PGA", limit_per_kind=5)
 Drop to per-kind tools or CLI only when you need filters the unified tool doesn't expose (date range, status='completed', etc.):
 
 ```bash
-cd ~/SourceCode/second-brain
+cd ~/SourceCode/plessas-second-brain
 source .venv/bin/activate
 python -m src.cli query <type> <args> --limit 20 -v
 ```
@@ -123,7 +123,7 @@ After presenting results, suggest:
 
 ## Database Location
 
-`~/SourceCode/second-brain/data/brain.db`
+`~/SourceCode/plessas-second-brain/data/brain.db`
 
 ## Context API (Rich Queries)
 

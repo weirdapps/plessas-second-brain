@@ -12,7 +12,7 @@
 
 set -uo pipefail
 
-REPO_DIR="$HOME/SourceCode/second-brain"
+REPO_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
 # Activate virtualenv

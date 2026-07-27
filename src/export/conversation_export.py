@@ -34,7 +34,7 @@ def _workspace_from_dir_name(dir_name: str) -> str:
 def _project_name_from_workspace(workspace: str) -> str:
     """Extract a short project name from a workspace path.
 
-    e.g. '/Users/you/SourceCode/second-brain' → 'second-brain'
+    e.g. '/Users/you/SourceCode/plessas-second-brain' → 'plessas-second-brain'
     """
     parts = workspace.rstrip("/").split("/")
     return parts[-1] if parts else workspace

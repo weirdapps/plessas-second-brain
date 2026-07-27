@@ -21,7 +21,7 @@ fi
 touch "$cache_file"
 
 # Run in background, non-blocking
-BRAIN_DIR="$HOME/SourceCode/second-brain"
+BRAIN_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$BRAIN_DIR"
 nohup "$BRAIN_DIR/.venv/bin/python3" -m src.cli \
   ingest-conversation-incremental \

@@ -197,6 +197,26 @@ def test_run_backfill_with_limit(db: sqlite3.Connection, sample_image: Path):
     assert stats["classified"] == 2
 
 
+def test_run_backfill_unprocessed_only_skips_processed_messages(
+    db: sqlite3.Connection, sample_image: Path
+):
+    """With unprocessed_only=True, images from messages already recorded in
+    inline_image_occurrences are skipped, so the limited budget targets new work
+    instead of re-scanning the same newest images (cache-hits) every run."""
+    # msg-done: process it once so it gains an inline_image_occurrences row.
+    _insert_test_email_and_attachment(db, 1, "msg-done", "a@example.com", sample_image)
+    run_backfill(conn=db, run_vision=False)
+
+    # msg-new arrives later, never processed.
+    _insert_test_email_and_attachment(db, 2, "msg-new", "b@example.com", sample_image)
+    db.commit()
+
+    stats = run_backfill(conn=db, run_vision=False, unprocessed_only=True)
+
+    # msg-done already has an occurrence → skipped; only msg-new is scanned.
+    assert stats["scanned"] == 1
+
+
 def test_run_backfill_refreshes_signature_index(db: sqlite3.Connection, sample_image: Path):
     """run_backfill defers per-image refresh, then rebuilds the sender index once."""
     # Same image from one sender across 3 emails -> 3 occurrences, 1 sha.

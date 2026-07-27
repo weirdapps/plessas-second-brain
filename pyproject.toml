@@ -21,6 +21,7 @@ dependencies = [
     "xlrd>=2.0.1",
     # OLE compound document parser, needed for .rpmsg (Rights-Protected Outlook MSG)
     "compoundfiles>=0.3",
+    "pillow-heif>=1.5.0",
 ]
 
 [project.optional-dependencies]

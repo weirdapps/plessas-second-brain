@@ -217,6 +217,41 @@ def test_run_backfill_unprocessed_only_skips_processed_messages(
     assert stats["scanned"] == 1
 
 
+def test_undecodable_image_is_recorded_not_infinitely_rescanned(
+    db: sqlite3.Connection, tmp_path: Path
+):
+    """An image file PIL cannot decode (corrupt / unsupported / decompression
+    bomb) is recorded as noise/decode_failed with an occurrence, so
+    unprocessed_only does not re-scan it every run forever."""
+    bad = tmp_path / "broken.png"
+    bad.write_bytes(b"this is definitely not a valid PNG")
+    _insert_test_email_and_attachment(db, 1, "msg-bad", "x@example.com", bad)
+
+    stats = run_backfill(conn=db, run_vision=False)
+    assert stats["scanned"] == 1
+
+    # Recorded as a decode failure (not silently dropped)...
+    row = db.execute("SELECT classification, classification_method FROM inline_images").fetchone()
+    assert tuple(row) == ("noise", "decode_failed")
+    # ...and a second unprocessed_only pass skips it (not re-scanned).
+    stats2 = run_backfill(conn=db, run_vision=False, unprocessed_only=True)
+    assert stats2["scanned"] == 0
+
+
+def test_heic_image_is_decoded_not_marked_failed(db: sqlite3.Connection, tmp_path: Path):
+    """With pillow-heif registered, an .heic image (iPhone default) is decoded and
+    classified normally rather than marked as a decode failure."""
+    pytest.importorskip("pillow_heif")
+    p = tmp_path / "photo.heic"
+    Image.new("RGB", (200, 200), "blue").save(p, format="HEIF")
+    _insert_test_email_and_attachment(db, 1, "msg-heic", "y@example.com", p)
+
+    run_backfill(conn=db, run_vision=False)
+
+    method = db.execute("SELECT classification_method FROM inline_images").fetchone()[0]
+    assert method != "decode_failed"  # decoded, not marked unprocessable
+
+
 def test_run_backfill_refreshes_signature_index(db: sqlite3.Connection, sample_image: Path):
     """run_backfill defers per-image refresh, then rebuilds the sender index once."""
     # Same image from one sender across 3 emails -> 3 occurrences, 1 sha.

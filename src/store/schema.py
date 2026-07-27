@@ -188,7 +188,7 @@ def create_database(db_path: str) -> sqlite3.Connection:
         )
     """)
 
-    # SharePoint link tracking (v9)
+    # SharePoint link tracking (v9; attempts added v16)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS sharepoint_links (
             url TEXT PRIMARY KEY,
@@ -198,7 +198,8 @@ def create_database(db_path: str) -> sqlite3.Connection:
             last_status TEXT,
             last_attempt_at TIMESTAMP,
             file_name TEXT,
-            file_size INTEGER
+            file_size INTEGER,
+            attempts INTEGER NOT NULL DEFAULT 0
         )
     """)
 
@@ -427,6 +428,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_commitments(conn)
     if current < 15:
         migrate_add_visioned_at(conn)
+    if current < 16:
+        migrate_add_sharepoint_attempts(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -448,6 +451,22 @@ def migrate_add_commitments(conn: sqlite3.Connection) -> None:
             to_person TEXT
         )
     """)
+    conn.commit()
+
+
+def migrate_add_sharepoint_attempts(conn: sqlite3.Connection) -> None:
+    """v16 — track consecutive failed fetch attempts per SharePoint link so the
+    retry pass can give up on permanently-dead links (not-found / access-denied)
+    instead of re-attempting them every night forever.
+    """
+    has_table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='sharepoint_links'"
+    ).fetchone()
+    if not has_table:
+        return
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(sharepoint_links)").fetchall()}
+    if "attempts" not in cols:
+        conn.execute("ALTER TABLE sharepoint_links ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
     conn.commit()
 
 

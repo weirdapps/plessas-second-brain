@@ -159,3 +159,49 @@ def test_process_sharepoint_skips_external_host_and_continues(mock_fetch, tmp_pa
     assert managed == ["ok"]
     # External URL is recorded distinctly (not as a re-loginable auth issue).
     assert external == ["unsupported-host"]
+
+
+@patch("src.export.sharepoint_fetcher.fetch_sharepoint_link")
+def test_process_sharepoint_retries_known_unfetched_link(mock_fetch, tmp_path):
+    """A link recorded earlier but never successfully fetched (fetched_at NULL,
+    status 'stale') must be retried on the next pass even when its source email
+    is no longer in the scanned window — otherwise old unfetched/stale links
+    never clear."""
+    import argparse
+
+    from src.cli import cmd_process_sharepoint
+    from src.export.sharepoint_fetcher import SharepointFetchResult
+    from src.store.schema import create_database, get_connection, run_migrations
+
+    url = "https://contoso.sharepoint.com/sites/foo/Estale"
+    db_path = tmp_path / "test.db"
+    conn = create_database(str(db_path))
+    run_migrations(conn)
+    # Previously-seen link that never fetched OK — and NO email in the DB
+    # references it, so the email scan alone would never re-reach it.
+    conn.execute(
+        """INSERT INTO sharepoint_links (url, message_id, fetched_at, last_status, last_attempt_at)
+           VALUES (?, ?, NULL, 'stale', '2026-05-01T00:00:00')""",
+        (url, "m-old"),
+    )
+    conn.commit()
+    conn.close()
+
+    mock_fetch.return_value = SharepointFetchResult(
+        url=url,
+        status="ok",
+        local_path=Path(str(tmp_path / "f.pdf")),
+        file_name="f.pdf",
+        file_size=10,
+    )
+
+    args = argparse.Namespace(db=str(db_path), since=None, limit=0, dry_run=False)
+    cmd_process_sharepoint(args)
+
+    conn = get_connection(str(db_path))
+    row = conn.execute(
+        "SELECT last_status, fetched_at FROM sharepoint_links WHERE url = ?", (url,)
+    ).fetchone()
+    conn.close()
+    assert row[0] == "ok"  # retried and succeeded
+    assert row[1] is not None  # fetched_at now populated

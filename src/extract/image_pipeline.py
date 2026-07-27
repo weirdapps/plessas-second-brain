@@ -134,6 +134,7 @@ def run_backfill(
     run_vision: bool = True,
     dry_run: bool = False,
     workers: int = 1,
+    unprocessed_only: bool = False,
 ) -> dict:
     """
     Backfill image classification for existing attachments.
@@ -148,6 +149,10 @@ def run_backfill(
             dedicated connection per worker thread (WAL + busy_timeout serialize
             the writes); requires a file-backed DB. Defaults to 1 (sequential,
             uses `conn`) so callers and tests are unaffected.
+        unprocessed_only: If True, skip attachments whose message already has
+            recorded image occurrences (i.e. processed on a prior run), so the
+            per-run limit targets new images and the backlog drains instead of
+            re-scanning the same newest images every run.
 
     Returns:
         Stats dict: {scanned, classified, missing, failed}
@@ -179,6 +184,13 @@ def run_backfill(
     if since:
         query += " AND e.date_received >= ?"
         params.append(since)
+
+    # Skip attachments whose message already has recorded image occurrences —
+    # i.e. images processed on a prior run. Lets the limited per-run budget
+    # target genuinely new images instead of re-scanning the same newest ones
+    # (dedup makes those cache-hits), and guarantees the backlog drains.
+    if unprocessed_only:
+        query += " AND a.message_id NOT IN (SELECT message_id FROM inline_image_occurrences)"
 
     query += " ORDER BY e.date_received DESC"
 

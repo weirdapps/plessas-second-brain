@@ -202,7 +202,7 @@ def create_database(db_path: str) -> sqlite3.Connection:
         )
     """)
 
-    # Inline image classifier tables (v10)
+    # Inline image classifier tables (v10; visioned_at added v15)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS inline_images (
             sha256 TEXT PRIMARY KEY,
@@ -213,6 +213,7 @@ def create_database(db_path: str) -> sqlite3.Connection:
             classification_method TEXT NOT NULL,
             classified_at TIMESTAMP NOT NULL,
             vision_description TEXT,
+            visioned_at TIMESTAMP,
             user_overridden BOOLEAN NOT NULL DEFAULT 0
         )
     """)
@@ -424,6 +425,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_calendar(conn)
     if current < 14:
         migrate_add_commitments(conn)
+    if current < 15:
+        migrate_add_visioned_at(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -445,6 +448,25 @@ def migrate_add_commitments(conn: sqlite3.Connection) -> None:
             to_person TEXT
         )
     """)
+    conn.commit()
+
+
+def migrate_add_visioned_at(conn: sqlite3.Connection) -> None:
+    """v15 — track when the Stage-3 vision pass last classified an image.
+
+    classified_at is written only at the Stage-1 INSERT and never touched by the
+    vision pass, so it froze at the last new-unique-image insert and misrepresented
+    freshness. visioned_at records the last vision LLM run. Nullable: historical
+    rows and heuristic-only (signature/noise) images never get a vision run.
+    """
+    has_table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='inline_images'"
+    ).fetchone()
+    if not has_table:
+        return
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(inline_images)").fetchall()}
+    if "visioned_at" not in cols:
+        conn.execute("ALTER TABLE inline_images ADD COLUMN visioned_at TIMESTAMP")
     conn.commit()
 
 

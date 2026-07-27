@@ -135,12 +135,16 @@ def classify_with_vision(img_path: Path, conn: sqlite3.Connection) -> tuple[Clas
     raw = resp.content[0].text
     label, desc = parse_vision_response(raw)
 
-    # Persist
+    # Persist. visioned_at records *when* vision ran (classified_at is only the
+    # Stage-1 insert time and never updated here), giving an honest freshness signal.
+    from datetime import UTC, datetime
+
     conn.execute(
         """UPDATE inline_images
-           SET classification = ?, classification_method = 'vision_llm', vision_description = ?
+           SET classification = ?, classification_method = 'vision_llm',
+               vision_description = ?, visioned_at = ?
            WHERE sha256 = ?""",
-        (label.value, desc, sha),
+        (label.value, desc, datetime.now(UTC).isoformat(), sha),
     )
     conn.commit()
     return label, desc

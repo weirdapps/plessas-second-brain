@@ -1,16 +1,17 @@
 """Tests for commitments: schema migration, loader storage, recall surfacing."""
 
+from src.config import CURRENT_SCHEMA_VERSION
 from src.store.loader import load_single_email
 from src.store.recall import recall
 from src.store.schema import create_database, get_schema_version, migrate_add_commitments
 
 
 class TestCommitmentsSchema:
-    def test_create_database_has_commitments_table_at_v14(self):
+    def test_create_database_has_commitments_table_at_current_version(self):
         conn = create_database(":memory:")
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert "commitments" in tables
-        assert get_schema_version(conn) == 14
+        assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION
         conn.close()
 
     def test_migration_is_idempotent(self):

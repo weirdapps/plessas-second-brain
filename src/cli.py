@@ -219,6 +219,7 @@ def cmd_process_images(args):
         run_vision=not args.no_vision,
         dry_run=args.dry_run,
         workers=args.workers,
+        unprocessed_only=not args.reprocess,
     )
 
     conn.close()
@@ -273,85 +274,108 @@ def cmd_process_sharepoint(args):
         print("  DRY RUN — scan and count only, no fetching")
     print()
 
-    # Get already-fetched URLs
-    existing_urls = {
-        r[0] for r in conn.execute("SELECT url FROM sharepoint_links WHERE fetched_at IS NOT NULL")
-    }
-
     stats = {
         "emails_scanned": 0,
         "urls_found": 0,
         "urls_new": 0,
+        "urls_retried": 0,
         "urls_fetched": 0,
         "urls_failed": 0,
         "urls_skipped_external": 0,
         "auth_required": False,
     }
 
-    # Scan emails
-    cursor = conn.execute(query, params)
-    for row in cursor:
-        email_id, message_id, content, date_received = row
-        stats["emails_scanned"] += 1
+    # URLs already fetched successfully — never re-fetch these.
+    existing_urls = {
+        r[0] for r in conn.execute("SELECT url FROM sharepoint_links WHERE fetched_at IS NOT NULL")
+    }
+    # URLs attempted this run (retry pass + scan) — avoids double-fetching a URL
+    # the email scan rediscovers after the retry pass already handled it.
+    attempted: set[str] = set()
 
-        urls = extract_sharepoint_urls(content)
-        if not urls:
-            continue
+    def _fetch_one(url: str, message_id: str) -> bool:
+        """Fetch + record one URL, updating outcome stats. Returns True on a
+        re-loginable (managed-host) auth failure so the caller stops the pass."""
+        print(f"  Fetching: {url}")
+        result = fetch_sharepoint_link(url, SHAREPOINT_DATA_DIR)
+        # An auth failure on an external tenant (a host we hold no session for)
+        # can never be fixed by our re-login, so record it distinctly and keep
+        # going instead of aborting the whole pass.
+        external_auth = result.status == "auth-required" and not is_managed_sharepoint_host(
+            url, SHAREPOINT_HOST
+        )
+        recorded_status = "unsupported-host" if external_auth else result.status
+        record_link_in_db(
+            conn,
+            url=url,
+            message_id=message_id,
+            status=recorded_status,
+            fetched_path=str(result.local_path) if result.local_path else None,
+            file_name=result.file_name,
+            file_size=result.file_size,
+        )
+        conn.commit()
 
-        stats["urls_found"] += len(urls)
+        if result.status == "ok":
+            print(f"    ✓ Saved: {result.file_name}")
+            stats["urls_fetched"] += 1
+        elif external_auth:
+            print("    ⤼ External host (no session) — skipping")
+            stats["urls_skipped_external"] += 1
+        elif result.status == "auth-required":
+            print("    ✗ Auth required (session expired) — breaking")
+            stats["auth_required"] = True
+            return True
+        else:
+            print(f"    ✗ {result.status}: {result.error_message or 'unknown error'}")
+            stats["urls_failed"] += 1
+        return False
 
-        for url in urls:
-            # Skip already-fetched URLs
-            if url in existing_urls:
-                continue
-
-            stats["urls_new"] += 1
-
-            # Dry run: just count
-            if args.dry_run:
-                continue
-
-            # Fetch the URL
-            print(f"  Fetching: {url}")
-            result = fetch_sharepoint_link(url, SHAREPOINT_DATA_DIR)
-
-            # An auth failure on an external tenant (a host we hold no session
-            # for) can never be fixed by our re-login, so skip it and keep
-            # going instead of aborting the whole pass. Record it distinctly
-            # so it isn't mistaken for a re-loginable session expiry.
-            external_auth = result.status == "auth-required" and not (
-                is_managed_sharepoint_host(url, SHAREPOINT_HOST)
-            )
-            recorded_status = "unsupported-host" if external_auth else result.status
-
-            # Record in database
-            record_link_in_db(
-                conn,
-                url=url,
-                message_id=message_id,
-                status=recorded_status,
-                fetched_path=str(result.local_path) if result.local_path else None,
-                file_name=result.file_name,
-                file_size=result.file_size,
-            )
-            conn.commit()
-
-            if result.status == "ok":
-                print(f"    ✓ Saved: {result.file_name}")
-                stats["urls_fetched"] += 1
-            elif external_auth:
-                print("    ⤼ External host (no session) — skipping")
-                stats["urls_skipped_external"] += 1
-            elif result.status == "auth-required":
-                print("    ✗ Auth required (session expired) — breaking")
-                stats["auth_required"] = True
+    # Retry pass: links seen before but never fetched OK (fetched_at NULL) or
+    # gone stale get re-attempted regardless of whether their source email is
+    # still inside the scan window — otherwise old failures never clear.
+    # 'unsupported-host' is a permanent external tenant, so it is excluded.
+    if not args.dry_run:
+        retry_rows = conn.execute(
+            "SELECT url, message_id FROM sharepoint_links "
+            "WHERE (fetched_at IS NULL OR last_status = 'stale') "
+            "AND COALESCE(last_status, '') != 'unsupported-host'"
+        ).fetchall()
+        if retry_rows:
+            print(f"Retrying {len(retry_rows)} previously unfetched/stale link(s)...")
+        for url, message_id in retry_rows:
+            attempted.add(url)
+            stats["urls_retried"] += 1
+            if _fetch_one(url, message_id):
                 break
-            else:
-                print(f"    ✗ {result.status}: {result.error_message or 'unknown error'}")
-                stats["urls_failed"] += 1
 
-        if stats["auth_required"]:
-            break
+    # Scan emails for new URLs (skip anything already fetched or attempted).
+    if not stats["auth_required"]:
+        cursor = conn.execute(query, params)
+        for row in cursor:
+            email_id, message_id, content, date_received = row
+            stats["emails_scanned"] += 1
+
+            urls = extract_sharepoint_urls(content)
+            if not urls:
+                continue
+
+            stats["urls_found"] += len(urls)
+
+            for url in urls:
+                if url in existing_urls or url in attempted:
+                    continue
+                attempted.add(url)
+                stats["urls_new"] += 1
+
+                if args.dry_run:
+                    continue
+
+                if _fetch_one(url, message_id):
+                    break
+
+            if stats["auth_required"]:
+                break
 
     conn.close()
 
@@ -1729,6 +1753,11 @@ def main():
     )
     parser_process_img.add_argument(
         "--dry-run", action="store_true", help="Count only, no classification"
+    )
+    parser_process_img.add_argument(
+        "--reprocess",
+        action="store_true",
+        help="Re-scan all images (default: only messages not yet processed)",
     )
     parser_process_img.add_argument(
         "--workers",

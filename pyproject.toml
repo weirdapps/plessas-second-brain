@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Email second brain: extract, structure, and query institutional memory from Outlook, attachments, calendar, Teams, and Claude Code conversations"
 requires-python = ">=3.12"
 dependencies = [
-    "google-cloud-aiplatform>=1.162.0",
+    "google-cloud-aiplatform>=1.163.0",
     "anthropic[vertex]>=0.120.0",
     "numpy>=2.5.1",
     "mcp[cli]>=1.28.1",

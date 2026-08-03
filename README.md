@@ -266,7 +266,7 @@ Full subcommand list: `python -m src.cli --help`.
 src/
   cli.py                       Command-line entry (`brain` wrapper points here)
   config.py                    Paths, env-driven settings, schema version
-  mcp_server.py                MCP server (FastMCP), 23 tools
+  mcp_server.py                MCP server (MCPServer, mcp SDK v2), 23 tools
   bridge.py                    Legacy JSON-over-CLI bridge (superseded by MCP)
   export/
     outlook_export.py          Hourly Outlook ingestion via outlook-cli

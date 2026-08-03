@@ -4,6 +4,10 @@ name: CI
     branches: [master]
   pull_request:
     branches: [master]
+  # dependabot-auto-merge.yml merges with GITHUB_TOKEN, and GitHub does not raise
+  # workflow events for pushes made with that token. Auto-merged bumps therefore
+  # land on master with no CI run on the resulting tip; this allows re-running it.
+  workflow_dispatch:
 jobs:
   lint:
     runs-on: ubuntu-latest

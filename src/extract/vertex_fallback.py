@@ -1,9 +1,10 @@
 """Auto-downgrade a Vertex AI Claude call when the model raises a policy refusal.
 
-Opus 4.7/4.8 occasionally raise a spurious `stop_reason == "refusal"` on benign work.
-Opus 4.6 does not. This helper retries such a call ONCE on the Opus 4.6 / europe-west1
-fallback tier — model AND region together, since a <=4.6 model lives in europe-west1
-(opus-4-6 @ eu would 429). Shared by every second-brain SDK extraction call site.
+Some Opus versions occasionally raise a spurious `stop_reason == "refusal"` on benign
+work. This helper retries such a call ONCE on the VERTEX_MODEL_FALLBACK_SDK /
+VERTEX_REGION_FALLBACK tier — model AND region together, since region is a function of
+model version (>=4.7 -> eu, <=4.6 -> europe-west1; a mismatched pair 429s). Shared by
+every second-brain SDK extraction call site.
 """
 
 import logging
@@ -17,7 +18,7 @@ def create_with_refusal_fallback(client: Any, *, model: str, **create_kwargs: An
     """Call ``client.messages.create(model=model, **create_kwargs)``.
 
     If the response stop_reason is ``"refusal"``, retry once on a fresh AnthropicVertex
-    client pinned to the Opus 4.6 / europe-west1 fallback tier and return that response.
+    client pinned to the configured fallback tier and return that response.
     On any non-refusal stop_reason (including ``max_tokens``), return the first response
     unchanged so existing callers keep their own handling.
     """
@@ -25,8 +26,8 @@ def create_with_refusal_fallback(client: Any, *, model: str, **create_kwargs: An
     if getattr(response, "stop_reason", None) != "refusal":
         return response
 
-    fb_model = os.environ.get("VERTEX_MODEL_FALLBACK_SDK", "claude-opus-4-6")
-    fb_region = os.environ.get("VERTEX_REGION_FALLBACK", "europe-west1")
+    fb_model = os.environ.get("VERTEX_MODEL_FALLBACK_SDK", "claude-opus-5")
+    fb_region = os.environ.get("VERTEX_REGION_FALLBACK", "eu")
     project = os.environ.get("VERTEX_SDK_PROJECT") or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
     logger.warning(
         "Vertex policy refusal on %s — downgrading to fallback %s @ %s",

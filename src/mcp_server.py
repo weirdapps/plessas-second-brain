@@ -6,12 +6,12 @@ Run: python -m src.mcp_server
 
 from datetime import UTC
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 from src.config import DEFAULT_DB
 from src.store.schema import get_connection
 
-mcp = FastMCP(
+mcp = MCPServer(
     "second-brain",
     instructions="Knowledge repository — query 41K+ emails, 22K+ attachment summaries, decisions, action items, and people context. Also includes conversation memory: search past Claude Code conversations, recall user preferences, and retrieve conversation context.",
 )

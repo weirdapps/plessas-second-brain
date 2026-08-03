@@ -31,7 +31,7 @@ CI (`.github/workflows/ci.yml`): `ruff check` + `ruff format --check`, then `pyt
 1. **Ingest** → raw content into `data/staging/batch-*.json`. The staging JSON shape is the source-agnostic contract (see "Bring your own source" in `README.md` and `examples/`). Microsoft 365 sources use the external, optional `outlook-cli` / `teams-cli` adapters.
 2. **Extract** → an LLM (Claude via Vertex AI by default, or `ANTHROPIC_API_KEY`; Gemini optional) produces structured JSON: summary, sentiment, urgency, topics, decisions, action items, people, key facts.
 3. **Load** → `src/store/loader.py` writes to SQLite with FTS5 indexes + embedding vectors + thread reconstruction. Migrations auto-run via `src/store/schema.py` (`CURRENT_SCHEMA_VERSION` in `src/config.py`).
-4. **Serve** → `src/mcp_server.py` (FastMCP) exposes the store as MCP tools; `src/cli.py` mirrors them for the terminal.
+4. **Serve** → `src/mcp_server.py` (`mcp.server.MCPServer`, mcp SDK v2) exposes the store as MCP tools; `src/cli.py` mirrors them for the terminal.
 
 ## Key conventions
 

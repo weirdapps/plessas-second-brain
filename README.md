@@ -178,7 +178,7 @@ Preferred credential path. Uses Application Default Credentials, no API key requ
 
 - `VERTEX_SDK_PROJECT` or `ANTHROPIC_VERTEX_PROJECT_ID`: GCP project id.
 - `VERTEX_SDK_REGION` or `CLOUD_ML_REGION`: region. Model-region pairing matters. Claude 4.7 and newer requires `eu`; 4.6 and older requires `europe-west1`. A mismatch returns HTTP 429.
-- `VERTEX_MODEL_FALLBACK_SDK` (default `claude-opus-4-6`) and `VERTEX_REGION_FALLBACK` (default `europe-west1`): auto-downgrade target on policy refusals.
+- `VERTEX_MODEL_FALLBACK_SDK` (default `claude-opus-5`, no `[1m]` suffix — the SDK rejects brackets) and `VERTEX_REGION_FALLBACK` (default `eu`): retry target on policy refusals. Set both together, or the retry hits the 429 described above.
 - `VERTEX_REGION_EMBED`: embedding region (default `europe-west1`).
 
 ### Alternative credentials

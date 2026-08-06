@@ -40,6 +40,12 @@ CONVERSATION_STAGING_DIR = DATA_ROOT / "staging" / "conversations"
 # SharePoint reference attachments
 SHAREPOINT_DATA_DIR = DATA_ROOT / "sharepoint"
 
+# Wall-clock budget for the sync's inline-image classification step. Vision calls
+# have unbounded latency (N images x LLM round-trip), so without a time box the
+# step can consume a scheduler's entire TimeoutStartSec and be SIGTERMed. Kept
+# well under the 30min systemd budget of sb-daily-sync / sb-noon-catchup.
+IMAGE_CLASSIFY_BUDGET_S = float(os.environ.get("BRAIN_IMAGE_CLASSIFY_BUDGET_S", 480))
+
 # News-reader SQLite database (external repo) — staged by `brain news-sync`.
 NEWS_DB_PATH = Path(os.environ.get("BRAIN_NEWS_DB", Path.home() / "SourceCode/news/data/news.db"))
 

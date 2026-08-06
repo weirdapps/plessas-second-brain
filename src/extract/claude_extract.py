@@ -15,6 +15,25 @@ CLAUDE_MODEL_BASE = os.environ.get("CLAUDE_EXTRACT_MODEL") or os.environ.get(
     "VERTEX_MODEL_EXTRACT", "claude-sonnet-4-6"
 )
 
+# 4096 truncated dense inputs: one news digest synthesis covers ~50 articles, so
+# its extraction JSON legitimately runs long and stopped mid-object.
+# attachment_pipeline already uses 8192 for the same reason.
+MAX_OUTPUT_TOKENS = 8192
+
+
+def _response_text(response) -> str:
+    """First text block of a response, skipping any leading thinking block.
+
+    Indexing content[0] assumed the first block carries .text. With extended
+    thinking the first block is a ThinkingBlock (.thinking, no .text), which
+    raised AttributeError and failed the extraction outright.
+    """
+    for block in response.content:
+        text = getattr(block, "text", None)
+        if text is not None:
+            return text
+    raise ValueError("LLM response contained no text block")
+
 
 # The extraction client is built once and shared across the whole run. A fresh
 # client per item makes google.auth fork `gcloud config get project` on every
@@ -98,11 +117,11 @@ def extract_one(email: dict) -> dict | None:
     response = create_with_refusal_fallback(
         client,
         model=model,
-        max_tokens=4096,
+        max_tokens=MAX_OUTPUT_TOKENS,
         messages=[{"role": "user", "content": prompt}],
     )
 
-    text = response.content[0].text
+    text = _response_text(response)
     if text.startswith("```"):
         lines = text.split("\n")
         text = "\n".join(lines[1:-1])
@@ -130,11 +149,11 @@ def extract_conversation(conversation: dict) -> dict | None:
     response = create_with_refusal_fallback(
         client,
         model=model,
-        max_tokens=4096,
+        max_tokens=MAX_OUTPUT_TOKENS,
         messages=[{"role": "user", "content": prompt}],
     )
 
-    text = response.content[0].text
+    text = _response_text(response)
     if text.startswith("```"):
         lines = text.split("\n")
         text = "\n".join(lines[1:-1])

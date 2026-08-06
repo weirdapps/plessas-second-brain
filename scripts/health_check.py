@@ -297,10 +297,13 @@ def check_images(db):
     # Work still WAITING, using the same predicate run_backfill(unprocessed_only=True)
     # selects on. Coverage % alone hid a growing backlog: it stayed flat at 88% while
     # the queue sat 200 deep, because the denominator grows with the numerator.
+    # The JOIN matters: run_backfill only sees attachments joinable to an email, so
+    # counting orphans (email_id NULL) inflates this permanently — 91 reported vs 2
+    # reachable on prod — and would trip the WARN for work that can never drain.
     pending = db.execute(
-        "SELECT COUNT(*) FROM attachments "
-        "WHERE mime_type LIKE 'image/%' AND file_path IS NOT NULL "
-        "AND message_id NOT IN (SELECT message_id FROM inline_image_occurrences)"
+        "SELECT COUNT(*) FROM attachments a JOIN emails e ON a.email_id = e.id "
+        "WHERE a.mime_type LIKE 'image/%' AND a.file_path IS NOT NULL "
+        "AND a.message_id NOT IN (SELECT message_id FROM inline_image_occurrences)"
     ).fetchone()[0]
     return {
         "name": "Inline Images",

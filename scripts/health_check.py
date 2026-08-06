@@ -23,13 +23,30 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.config import DEFAULT_DB, SHAREPOINT_HOST  # noqa: E402
+from src.config import DEFAULT_DB, NEWS_DB_PATH, SHAREPOINT_HOST  # noqa: E402
 
 DB_PATH = DEFAULT_DB
 LOG_DIR = Path.home() / ".second-brain/logs"
 STATE_DIR = Path.home() / ".second-brain"
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 SHAREPOINT_SESSION = Path.home() / ".outlook-cli" / "sharepoint-session.json"
+
+# Reverse-ingest input side: the roots cmd_reverse_ingest scans and the
+# extensions it ingests. Kept in sync with src/cli.py:cmd_reverse_ingest.
+DOCUMENT_ROOTS = [
+    Path("~/Documents/National").expanduser(),
+    Path("~/Documents/Personal").expanduser(),
+]
+INGESTABLE_EXTENSIONS = {".pdf", ".pptx", ".xlsx", ".docx", ".md", ".txt"}
+
+# Heartbeat written by the laptop-side push job after every successful push
+# (one ISO-8601 UTC line). Authoritative liveness signal for the document roots:
+# our own curate-docs job writes files into those same roots, so a fresh mtime
+# can be self-manufactured while the organic source is frozen.
+DOCUMENT_SYNC_STAMP = STATE_DIR / "document-sync.stamp"
+
+# Upstream news database — same path `brain news-sync` reads (honours BRAIN_NEWS_DB).
+NEWS_DB = NEWS_DB_PATH
 
 # launchd label prefix (macOS); override with BRAIN_LABEL_PREFIX. systemd units
 # (VPS) use the sb-* names in SYSTEMD_UNITS below and are unaffected by this.
@@ -43,6 +60,8 @@ STALE_THRESHOLDS = {
     "daily_sync": timedelta(hours=26),
     "outlook_sync": timedelta(hours=3),
     "attachments_llm": timedelta(days=3),
+    "document_roots": timedelta(days=14),
+    "news": timedelta(hours=12),
 }
 
 LAUNCHD_JOBS = {
@@ -140,16 +159,34 @@ def _age(ts):
     return datetime.now() - dt
 
 
+def _utc(ts):
+    """Parse a stored timestamp to an aware UTC datetime (naive values are local,
+    matching _age). Returns None for missing/unparseable values. Used by the
+    source-side checks, which compare two timestamps against an injectable now."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    return dt.astimezone(UTC)
+
+
 def check_emails(db):
-    r = db.execute(
-        "SELECT COUNT(*), MAX(date_received) FROM emails WHERE message_id > 0"
-    ).fetchone()
+    # `message_id > 0` excludes reverse-ingest documents, which carry NEGATIVE
+    # integer ids. It does NOT exclude the news source: SQLite ranks TEXT above
+    # INTEGER, so 'news:article:…' > 0 is true. Without the mailbox filter one
+    # fresh news row would mask stale mail and permanently silence this alarm
+    # (and the loader auto-fix keyed off it). Filtering on typeof() is not an
+    # option — 13k genuine mail rows carry text ids alongside 49k integer ones.
+    real_mail = "message_id > 0 AND (mailbox_name IS NULL OR mailbox_name <> 'News')"
+    r = db.execute(f"SELECT COUNT(*), MAX(date_received) FROM emails WHERE {real_mail}").fetchone()
     total, latest = r[0], r[1]
     recent_24h = db.execute(
-        "SELECT COUNT(*) FROM emails WHERE date_received > datetime('now', '-1 day') AND message_id > 0"
+        f"SELECT COUNT(*) FROM emails WHERE date_received > datetime('now', '-1 day') AND {real_mail}"
     ).fetchone()[0]
     recent_7d = db.execute(
-        "SELECT COUNT(*) FROM emails WHERE date_received > datetime('now', '-7 days') AND message_id > 0"
+        f"SELECT COUNT(*) FROM emails WHERE date_received > datetime('now', '-7 days') AND {real_mail}"
     ).fetchone()[0]
 
     age = _age(latest)
@@ -377,6 +414,167 @@ def check_documents(db):
         "latest": latest,
         "status": "OK",
     }
+
+
+def check_document_roots(roots=None, now=None, stamp: Path = DOCUMENT_SYNC_STAMP):
+    """Freshness of the reverse-ingest *input*, not its output.
+
+    check_documents only proves the job wrote rows; it stays green when the
+    document roots are a frozen copy (a disconnected mirror whose newest file
+    is months old) because the job still runs and still writes. This looks at
+    the source.
+
+    Liveness comes from DOCUMENT_SYNC_STAMP when it is readable: newest mtime
+    alone can be manufactured by our own curate-docs job, which mirrors
+    attachments into these very roots (filename is no discriminator — the
+    operator uses the same naming convention). Without a usable stamp we fall
+    back to the newest mtime among ingestable files and say so in the report.
+    """
+    roots = DOCUMENT_ROOTS if roots is None else [Path(r) for r in roots]
+    now = now or datetime.now(UTC)
+
+    per_root = []
+    missing = []
+    total = 0
+    newest = None
+    for root in roots:
+        if not root.is_dir():
+            missing.append(root.name)
+            per_root.append({"name": root.name, "files": 0, "age": None, "missing": True})
+            continue
+        files = 0
+        root_newest = None
+        for path in root.rglob("*"):
+            if path.suffix.lower() not in INGESTABLE_EXTENSIONS:
+                continue
+            try:
+                if not path.is_file():
+                    continue
+                mtime = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+            except OSError:
+                continue
+            files += 1
+            # Clamp to `now`, like check_news does with published_at: one
+            # clock-skewed file dated in the future would otherwise become the
+            # "newest input", making the age negative and the check OK forever.
+            if mtime > now:
+                continue
+            if root_newest is None or mtime > root_newest:
+                root_newest = mtime
+        total += files
+        if root_newest is not None and (newest is None or root_newest > newest):
+            newest = root_newest
+        per_root.append(
+            {
+                "name": root.name,
+                "files": files,
+                "age": None if root_newest is None else now - root_newest,
+                "missing": False,
+            }
+        )
+
+    age = None if newest is None else now - newest
+
+    stamp_at = None
+    if stamp is not None:
+        try:
+            # errors="replace": a clobbered/binary stamp must not raise —
+            # main() runs the checks unguarded, so one bad byte here would kill
+            # the whole nightly report and send no email at all.
+            stamp_at = _utc(Path(stamp).read_text(errors="replace").strip())
+        except OSError:
+            stamp_at = None
+    stamp_age = None if stamp_at is None else now - stamp_at
+    # A stamp dated in the future is a clock-skewed write, not evidence of a
+    # live source. Same clamp as the mtime scan above; without it one bad write
+    # pins this check to OK forever.
+    if stamp_age is not None and stamp_age < timedelta(0):
+        stamp_age = None
+
+    if stamp_age is None:
+        note = "no sync stamp — using file mtimes"
+        stale = age is not None and age > STALE_THRESHOLDS["document_roots"]
+    else:
+        note = None
+        stale = stamp_age > STALE_THRESHOLDS["document_roots"]
+    return {
+        "name": "Doc Roots",
+        "total": total,
+        "latest": None if newest is None else newest.isoformat(),
+        "age": age,
+        "stamp_age": stamp_age,
+        "roots": per_root,
+        "missing": missing,
+        "note": note,
+        "stale": stale,
+        "status": "STALE" if stale else ("WARN" if missing or age is None else "OK"),
+    }
+
+
+def check_news(db, news_db=None, now=None):
+    """Upstream news database vs. what actually reached the brain.
+
+    Same question as check_document_roots, other source: the news pipeline can
+    keep publishing while ingestion silently stops, and every downstream check
+    still passes. STALE means the source moved on and we did not. Never raises
+    — an absent upstream or a brain not backfilled yet is informational (N/A,
+    like SharePoint without a session file), since those are steady states that
+    would otherwise make every nightly report unhealthy. Only a corrupt/
+    unreadable upstream file is a WARN.
+    """
+    path = Path(news_db) if news_db else NEWS_DB
+    now = now or datetime.now(UTC)
+
+    ingested, latest = db.execute(
+        "SELECT COUNT(*), MAX(date_received) FROM emails WHERE mailbox_name = 'News'"
+    ).fetchone()
+    ingested_at = _utc(latest)
+    result = {
+        "name": "News",
+        "total": ingested,
+        "latest": latest,
+        "age": None if ingested_at is None else now - ingested_at,
+        "upstream_latest": None,
+        "lag": None,
+        "stale": False,
+        "status": "N/A",
+    }
+
+    if not path.exists():
+        result["note"] = "news db not found"
+        return result
+
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            # Clamp to `now`: some digest-pipeline rows carry published_at months
+            # in the future, and a naive MAX() would report permanent staleness.
+            article = con.execute(
+                "SELECT MAX(published_at) FROM articles WHERE published_at <= ?",
+                (now.isoformat(),),
+            ).fetchone()[0]
+            digest = con.execute("SELECT MAX(created_at) FROM digests").fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        result["note"] = f"news db unreadable: {e}"
+        result["status"] = "WARN"
+        return result
+
+    upstream = max((t for t in (article, digest) if _utc(t) is not None), key=_utc, default=None)
+    result["upstream_latest"] = upstream
+
+    if ingested == 0:
+        result["note"] = "no News rows ingested yet"
+        return result
+    if upstream is None or ingested_at is None:
+        result["note"] = "no upstream material"
+        return result
+
+    result["lag"] = _utc(upstream) - ingested_at
+    result["stale"] = result["lag"] > STALE_THRESHOLDS["news"]
+    result["status"] = "STALE" if result["stale"] else "OK"
+    return result
 
 
 def _is_migrated(label: str, agents_dir: Path = LAUNCH_AGENTS_DIR) -> bool:
@@ -615,6 +813,25 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
         elif c["name"] == "SharePoint":
             count = f"{c.get('ok', 0)}/{c.get('total', 0)}"
             extra = f" ({c.get('exception', 0)} exceptions)"
+        elif c["name"] == "Doc Roots":
+            if c.get("stale"):
+                signal = (
+                    f"last push {format_age(c['stamp_age'])} ago"
+                    if c.get("stamp_age") is not None
+                    else f"newest input {format_age(c.get('age'))} old"
+                )
+                extra = f" ({signal} — source may be disconnected)"
+            elif c.get("missing"):
+                extra = f" (missing: {', '.join(c['missing'])})"
+            else:
+                extra = " (" + ", ".join(f"{r['name']} {r['files']:,}" for r in c["roots"]) + ")"
+            if c.get("note"):
+                extra += f" ({c['note']})"
+        elif c["name"] == "News":
+            if c.get("stale"):
+                extra = f" (upstream {format_age(c.get('lag'))} ahead of last ingested)"
+            elif c.get("note"):
+                extra = f" ({c['note']})"
         elif c["name"] == "SP Session":
             count = "—"
             rem = c.get("remaining")
@@ -764,6 +981,8 @@ def main():
         check_conversations(db),
         check_embeddings(db),
         check_documents(db),
+        check_document_roots(),
+        check_news(db),
         check_sharepoint(db),
         check_sharepoint_token(),
     ]

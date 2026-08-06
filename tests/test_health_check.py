@@ -204,13 +204,14 @@ def test_check_attachments_pending_is_actionable_only(hc):
 
 
 def _images_db():
-    """In-memory DB with the three tables check_images reads."""
+    """In-memory DB with the tables check_images reads."""
     import sqlite3
 
     db = sqlite3.connect(":memory:")
     db.execute("CREATE TABLE inline_images (id INTEGER PRIMARY KEY, vision_description TEXT)")
+    db.execute("CREATE TABLE emails (id INTEGER PRIMARY KEY)")
     db.execute(
-        "CREATE TABLE attachments (id INTEGER PRIMARY KEY, message_id TEXT, "
+        "CREATE TABLE attachments (id INTEGER PRIMARY KEY, email_id INTEGER, message_id TEXT, "
         "mime_type TEXT, file_path TEXT)"
     )
     db.execute("CREATE TABLE inline_image_occurrences (message_id TEXT)")
@@ -218,19 +219,42 @@ def _images_db():
 
 
 def _queue(db, pending, done):
-    """Seed `pending` never-processed image attachments and `done` processed ones."""
+    """Seed `pending` never-processed image attachments and `done` processed ones,
+    each joined to a real email row (the pipeline only sees joinable rows)."""
+    email_id = 0
     for i in range(pending):
+        email_id += 1
+        db.execute("INSERT INTO emails (id) VALUES (?)", (email_id,))
         db.execute(
-            "INSERT INTO attachments (message_id, mime_type, file_path) VALUES (?,?,?)",
-            (f"pending-{i}", "image/png", f"/tmp/p{i}.png"),
+            "INSERT INTO attachments (email_id, message_id, mime_type, file_path) VALUES (?,?,?,?)",
+            (email_id, f"pending-{i}", "image/png", f"/tmp/p{i}.png"),
         )
     for i in range(done):
+        email_id += 1
+        db.execute("INSERT INTO emails (id) VALUES (?)", (email_id,))
         db.execute(
-            "INSERT INTO attachments (message_id, mime_type, file_path) VALUES (?,?,?)",
-            (f"done-{i}", "image/png", f"/tmp/d{i}.png"),
+            "INSERT INTO attachments (email_id, message_id, mime_type, file_path) VALUES (?,?,?,?)",
+            (email_id, f"done-{i}", "image/png", f"/tmp/d{i}.png"),
         )
         db.execute("INSERT INTO inline_image_occurrences (message_id) VALUES (?)", (f"done-{i}",))
     db.commit()
+
+
+def test_check_images_excludes_orphaned_attachments(hc):
+    """run_backfill JOINs attachments to emails, so an attachment with no email row
+    can never be picked up. Counting it inflates the queue permanently and would
+    eventually trip the WARN for work that cannot drain — on prod this was 91
+    reported vs 2 actually reachable."""
+    db = _images_db()
+    _queue(db, pending=2, done=0)
+    # Orphan: valid message_id and file, but no joinable email row.
+    db.execute(
+        "INSERT INTO attachments (email_id, message_id, mime_type, file_path) "
+        "VALUES (NULL, 'orphan', 'image/png', '/tmp/o.png')"
+    )
+    db.commit()
+
+    assert hc.check_images(db)["pending"] == 2
 
 
 def test_check_images_reports_pending_queue_depth(hc):

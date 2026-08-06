@@ -2,6 +2,7 @@
 Tests for image pipeline orchestrator.
 """
 
+import itertools
 import sqlite3
 from collections.abc import Generator
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+from src.extract import image_pipeline
 from src.extract.image_pipeline import (
     compute_position_in_body,
     process_single_image,
@@ -250,6 +252,46 @@ def test_heic_image_is_decoded_not_marked_failed(db: sqlite3.Connection, tmp_pat
 
     method = db.execute("SELECT classification_method FROM inline_images").fetchone()[0]
     assert method != "decode_failed"  # decoded, not marked unprocessable
+
+
+def test_run_backfill_defers_remaining_work_at_deadline(
+    db: sqlite3.Connection, sample_image: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """With deadline_s set, the backfill stops starting new images once the budget is
+    spent and reports the rest as deferred — instead of running past the caller's
+    systemd timeout and being SIGTERMed mid-flight."""
+    for i in range(5):
+        _insert_test_email_and_attachment(
+            db, i + 1, f"dl-msg-{i:03d}", "t@example.com", sample_image
+        )
+
+    # Fake monotonic clock: each consultation advances 1s, so a 2s budget runs out
+    # partway through the 5 images regardless of how fast the real work is.
+    ticks = itertools.count()
+    monkeypatch.setattr(image_pipeline.time, "monotonic", lambda: next(ticks))
+
+    stats = run_backfill(conn=db, run_vision=False, deadline_s=2)
+
+    assert stats["classified"] < 5, "should have stopped before working the whole list"
+    assert stats["deferred"] > 0
+    # Every scanned image is accounted for — nothing silently vanishes.
+    assert stats["classified"] + stats["failed"] + stats["deferred"] == stats["scanned"]
+
+
+def test_run_backfill_without_deadline_processes_everything(
+    db: sqlite3.Connection, sample_image: Path
+):
+    """deadline_s=None (the default) keeps the pre-existing behaviour: no time box,
+    nothing deferred."""
+    for i in range(3):
+        _insert_test_email_and_attachment(
+            db, i + 1, f"nodl-msg-{i:03d}", "t@example.com", sample_image
+        )
+
+    stats = run_backfill(conn=db, run_vision=False)
+
+    assert stats["classified"] == 3
+    assert stats["deferred"] == 0
 
 
 def test_run_backfill_refreshes_signature_index(db: sqlite3.Connection, sample_image: Path):

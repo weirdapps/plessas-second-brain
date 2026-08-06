@@ -40,6 +40,9 @@ CONVERSATION_STAGING_DIR = DATA_ROOT / "staging" / "conversations"
 # SharePoint reference attachments
 SHAREPOINT_DATA_DIR = DATA_ROOT / "sharepoint"
 
+# News-reader SQLite database (external repo) — staged by `brain news-sync`.
+NEWS_DB_PATH = Path(os.environ.get("BRAIN_NEWS_DB", Path.home() / "SourceCode/news/data/news.db"))
+
 # Host we hold an interactive SharePoint session for (captured via
 # `outlook-cli login --sharepoint-host <host>`). Auth failures on this host
 # mean the session expired and a re-login fixes them; auth failures on any

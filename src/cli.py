@@ -8,7 +8,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from src.config import DATA_ROOT, DEFAULT_DB, EXTRACT_ENGINE
+from src.config import DATA_ROOT, DEFAULT_DB, EXTRACT_ENGINE, NEWS_DB_PATH
 
 
 def format_email_result(email: dict, show_full: bool = False) -> str:
@@ -1117,6 +1117,7 @@ def cmd_sync(args):
             run_vision=True,
             dry_run=False,
             workers=4,
+            unprocessed_only=True,
         )
         img_conn.close()
         classified = img_stats.get("classified", 0)
@@ -1377,6 +1378,90 @@ def cmd_calendar_sync(args):
     print(f"  Unchanged:  {stats['skipped_unchanged']}")
     print(f"  Extracted:  {stats['extracted']}")
     print(f"  Failed:     {stats['failed']}")
+
+
+def _staged_news_ids(staging_dir: Path) -> set[str]:
+    """news:* message_ids already sitting in staging batches (unreadable files skipped)."""
+    import json
+
+    staged: set[str] = set()
+    for batch_file in sorted(staging_dir.glob("batch-*.json")):
+        try:
+            records = json.loads(batch_file.read_text(encoding="utf-8"))["emails"]
+            staged.update(
+                r["message_id"] for r in records if str(r.get("message_id", "")).startswith("news:")
+            )
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            continue
+    return staged
+
+
+def cmd_news_sync(args):
+    """Stage news-reader syntheses and articles as batches for the next sync."""
+    import tempfile
+
+    from src.export.news_export import PIPELINES, export_news
+    from src.store.schema import get_connection
+
+    news_db = Path(args.news_db)
+    if not news_db.exists():
+        print(f"Error: news database not found: {news_db}")
+        sys.exit(1)
+
+    pipelines = args.pipeline or list(PIPELINES)
+    staging_dir = DATA_ROOT / "staging"
+
+    # Already-loaded or already-staged news items, so re-runs skip them
+    exported_ids = _staged_news_ids(staging_dir)
+    db_path = str(args.db)
+    if Path(db_path).exists():
+        try:
+            conn = get_connection(db_path)
+            rows = conn.execute(
+                "SELECT message_id FROM emails WHERE message_id LIKE 'news:%'"
+            ).fetchall()
+            exported_ids |= {r[0] for r in rows}
+            conn.close()
+        except Exception:
+            pass
+
+    print(f"News sync: {news_db}")
+    print(f"  Pipelines: {', '.join(pipelines)}")
+    print(f"  Relevance >= {args.relevance}, limit {args.limit or 'none'}")
+    print(f"  {len(exported_ids)} news items already loaded or staged (will skip)")
+
+    if args.dry_run:
+        # Export into a throwaway directory to count what would be staged
+        with tempfile.TemporaryDirectory() as tmp_staging:
+            preview = export_news(
+                news_db=news_db,
+                staging_dir=Path(tmp_staging),
+                relevance_threshold=args.relevance,
+                pipelines=pipelines,
+                exported_ids=exported_ids,
+                limit=args.limit,
+            )
+        print("\nDRY RUN — nothing written.")
+        print(f"  Would stage syntheses: {preview['syntheses']}")
+        print(f"  Would stage articles: {preview['articles']}")
+        print(f"  Would skip (already exported): {preview['skipped']}")
+        return
+
+    result = export_news(
+        news_db=news_db,
+        staging_dir=staging_dir,
+        relevance_threshold=args.relevance,
+        pipelines=pipelines,
+        exported_ids=exported_ids,
+        limit=args.limit,
+    )
+
+    print(f"\nSyntheses: {result['syntheses']}")
+    print(f"Articles: {result['articles']}")
+    print(f"Skipped: {result['skipped']}")
+    print(f"Batch files: {len(result['batch_files'])}")
+    for batch_file in result["batch_files"]:
+        print(f"  {batch_file}")
 
 
 def cmd_migrate(args):
@@ -1984,6 +2069,41 @@ def main():
         "--skip-extraction", action="store_true", help="Skip LLM body extraction"
     )
     parser_cal.set_defaults(func=cmd_calendar_sync)
+
+    # news-sync command (stages batches only; `sync` drains them)
+    from src.export.news_export import DEFAULT_RELEVANCE_THRESHOLD, PIPELINES
+
+    parser_news = subparsers.add_parser(
+        "news-sync", help="Stage news-reader digests and articles into data/staging"
+    )
+    parser_news.add_argument(
+        "--news-db",
+        type=Path,
+        default=NEWS_DB_PATH,
+        help=f"News database path (default: {NEWS_DB_PATH})",
+    )
+    parser_news.add_argument(
+        "--relevance",
+        type=int,
+        default=DEFAULT_RELEVANCE_THRESHOLD,
+        help=f"Minimum article relevance score (default: {DEFAULT_RELEVANCE_THRESHOLD})",
+    )
+    parser_news.add_argument(
+        "--pipeline",
+        action="append",
+        choices=PIPELINES,
+        help="Pipeline to include, repeatable (default: all)",
+    )
+    parser_news.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Max total records to stage, syntheses first (default: 0 = all)",
+    )
+    parser_news.add_argument(
+        "--dry-run", action="store_true", help="Report what would be staged, write nothing"
+    )
+    parser_news.set_defaults(func=cmd_news_sync)
 
     # Migrate command
     parser_migrate = subparsers.add_parser("migrate", help="Run database migrations")

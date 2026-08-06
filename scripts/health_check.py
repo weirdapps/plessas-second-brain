@@ -64,6 +64,14 @@ STALE_THRESHOLDS = {
     "news": timedelta(hours=12),
 }
 
+# Inline-image queue depth that means the pipeline is no longer keeping up.
+# Step 8 of the sync is time-boxed (BRAIN_IMAGE_CLASSIFY_BUDGET_S, default 8min)
+# and drains ~50 images per run across two full syncs a day. A heavy news day can
+# deposit more than that, so a few hundred pending is a spike that clears on the
+# next quiet day; a sustained queue past this line is not draining and wants a
+# manual `brain process-images` pass or more budget.
+IMAGE_QUEUE_WARN = 500
+
 LAUNCHD_JOBS = {
     f"{LABEL_PREFIX}.sync": "Hourly Outlook sync",
     f"{LABEL_PREFIX}-sync": "Daily full sync",
@@ -286,12 +294,21 @@ def check_images(db):
         "SELECT COUNT(*) FROM inline_images WHERE vision_description IS NOT NULL"
     ).fetchone()[0]
     pct = (classified * 100 / total) if total > 0 else 0
+    # Work still WAITING, using the same predicate run_backfill(unprocessed_only=True)
+    # selects on. Coverage % alone hid a growing backlog: it stayed flat at 88% while
+    # the queue sat 200 deep, because the denominator grows with the numerator.
+    pending = db.execute(
+        "SELECT COUNT(*) FROM attachments "
+        "WHERE mime_type LIKE 'image/%' AND file_path IS NOT NULL "
+        "AND message_id NOT IN (SELECT message_id FROM inline_image_occurrences)"
+    ).fetchone()[0]
     return {
         "name": "Inline Images",
         "total": total,
         "classified": classified,
         "pct": pct,
-        "status": "WARN" if pct < 50 else "OK",
+        "pending": pending,
+        "status": "WARN" if pct < 50 or pending > IMAGE_QUEUE_WARN else "OK",
     }
 
 
@@ -805,7 +822,7 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
                 f", {c.get('llm_no_text', 0):,} no-text)"
             )
         elif c["name"] == "Inline Images":
-            extra = f" ({c.get('pct', 0):.0f}% classified)"
+            extra = f" ({c.get('pct', 0):.0f}% classified, {c.get('pending', 0):,} queued)"
         elif c["name"] == "Emails":
             extra = f" ({c.get('recent_24h', 0)} today)"
         elif c["name"] == "Teams":

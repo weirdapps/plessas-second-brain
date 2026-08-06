@@ -4,6 +4,7 @@ Image pipeline orchestrator — connects classifier stages to database.
 
 import logging
 import sqlite3
+import time
 from pathlib import Path
 
 from src.extract.image_classifier import (
@@ -135,6 +136,7 @@ def run_backfill(
     dry_run: bool = False,
     workers: int = 1,
     unprocessed_only: bool = False,
+    deadline_s: float | None = None,
 ) -> dict:
     """
     Backfill image classification for existing attachments.
@@ -153,15 +155,21 @@ def run_backfill(
             recorded image occurrences (i.e. processed on a prior run), so the
             per-run limit targets new images and the backlog drains instead of
             re-scanning the same newest images every run.
+        deadline_s: Optional wall-clock budget in seconds. Once spent, no further
+            images are STARTED and the rest are returned as `deferred`; images
+            already in flight run to completion. Lets a caller under an external
+            timeout (systemd `TimeoutStartSec`) return cleanly with partial work
+            instead of being SIGTERMed mid-flight. None = no time box.
 
     Returns:
-        Stats dict: {scanned, classified, missing, failed}
+        Stats dict: {scanned, classified, missing, failed, deferred}
     """
     stats = {
         "scanned": 0,
         "classified": 0,
         "missing": 0,
         "failed": 0,
+        "deferred": 0,
     }
 
     # Build query
@@ -224,6 +232,11 @@ def run_backfill(
     if dry_run:
         return stats
 
+    deadline = None if deadline_s is None else time.monotonic() + deadline_s
+
+    def _out_of_time() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
     def _process(row, work_conn) -> bool:
         attachment_id, file_path, filename, message_id, sender_address, content, _ = row
         position = compute_position_in_body(content, filename)
@@ -257,18 +270,25 @@ def run_backfill(
 
         from src.store.schema import get_connection
 
-        def worker(row) -> bool:
+        def worker(row) -> str:
+            # Checked per task rather than per submission: queued tasks drain
+            # instantly once the budget is spent, so the pool closes promptly.
+            if _out_of_time():
+                return "deferred"
             c = get_connection(db_file)
             try:
-                return _process(row, c)
+                return "classified" if _process(row, c) else "failed"
             finally:
                 c.close()
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            for ok in ex.map(worker, todo):
-                stats["classified" if ok else "failed"] += 1
+            for outcome in ex.map(worker, todo):
+                stats[outcome] += 1
     else:
         for row in todo:
+            if _out_of_time():
+                stats["deferred"] += 1
+                continue
             ok = _process(row, conn)
             stats["classified" if ok else "failed"] += 1
 

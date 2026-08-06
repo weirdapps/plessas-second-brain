@@ -203,6 +203,85 @@ def test_check_attachments_pending_is_actionable_only(hc):
     assert r["llm_done"] == 3
 
 
+def _images_db():
+    """In-memory DB with the three tables check_images reads."""
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE inline_images (id INTEGER PRIMARY KEY, vision_description TEXT)")
+    db.execute(
+        "CREATE TABLE attachments (id INTEGER PRIMARY KEY, message_id TEXT, "
+        "mime_type TEXT, file_path TEXT)"
+    )
+    db.execute("CREATE TABLE inline_image_occurrences (message_id TEXT)")
+    return db
+
+
+def _queue(db, pending, done):
+    """Seed `pending` never-processed image attachments and `done` processed ones."""
+    for i in range(pending):
+        db.execute(
+            "INSERT INTO attachments (message_id, mime_type, file_path) VALUES (?,?,?)",
+            (f"pending-{i}", "image/png", f"/tmp/p{i}.png"),
+        )
+    for i in range(done):
+        db.execute(
+            "INSERT INTO attachments (message_id, mime_type, file_path) VALUES (?,?,?)",
+            (f"done-{i}", "image/png", f"/tmp/d{i}.png"),
+        )
+        db.execute("INSERT INTO inline_image_occurrences (message_id) VALUES (?)", (f"done-{i}",))
+    db.commit()
+
+
+def test_check_images_reports_pending_queue_depth(hc):
+    """Step 8 drains a time-boxed slice per sync run, so the queue can grow between
+    runs. The report must show how much work is WAITING, not just coverage % — the
+    old row showed 88% classified every day while the queue sat 200 deep."""
+    db = _images_db()
+    db.execute("INSERT INTO inline_images (vision_description) VALUES ('a cat')")
+    _queue(db, pending=7, done=3)
+
+    r = hc.check_images(db)
+
+    assert r["pending"] == 7, "queue depth = image attachments never run through the pipeline"
+
+
+def test_check_images_ignores_non_image_and_pathless_attachments(hc):
+    """Queue depth must use the same predicate run_backfill does, or the report
+    counts work the pipeline will never pick up."""
+    db = _images_db()
+    db.execute(
+        "INSERT INTO attachments (message_id, mime_type, file_path) "
+        "VALUES ('a', 'application/pdf', '/tmp/a.pdf')"
+    )
+    db.execute(
+        "INSERT INTO attachments (message_id, mime_type, file_path) VALUES ('b', 'image/png', NULL)"
+    )
+    db.commit()
+
+    assert hc.check_images(db)["pending"] == 0
+
+
+def test_check_images_warns_when_queue_stops_draining(hc):
+    """A queue deeper than the sync can clear is degradation, not an outage: WARN
+    (visible in the report) rather than FAIL (pages as if something is broken)."""
+    db = _images_db()
+    db.execute("INSERT INTO inline_images (vision_description) VALUES ('a cat')")
+    _queue(db, pending=hc.IMAGE_QUEUE_WARN + 1, done=0)
+
+    assert hc.check_images(db)["status"] == "WARN"
+
+
+def test_check_images_ok_while_queue_is_draining(hc):
+    """A transient spike after a heavy news day self-corrects on a quiet one — it
+    must not warn, or the report nags on every busy day and gets ignored."""
+    db = _images_db()
+    db.execute("INSERT INTO inline_images (vision_description) VALUES ('a cat')")
+    _queue(db, pending=hc.IMAGE_QUEUE_WARN - 1, done=0)
+
+    assert hc.check_images(db)["status"] == "OK"
+
+
 # --- Source-side freshness ---------------------------------------------------
 # The daily reverse-ingest job reported OK every day while its document roots
 # were a frozen copy (newest real document two months old). Every check passed:

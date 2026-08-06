@@ -8,7 +8,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from src.config import DATA_ROOT, DEFAULT_DB, EXTRACT_ENGINE, NEWS_DB_PATH
+from src.config import (
+    DATA_ROOT,
+    DEFAULT_DB,
+    EXTRACT_ENGINE,
+    IMAGE_CLASSIFY_BUDGET_S,
+    NEWS_DB_PATH,
+)
 
 
 def format_email_result(email: dict, show_full: bool = False) -> str:
@@ -1110,6 +1116,10 @@ def cmd_sync(args):
 
         img_conn = get_conn(db_path)
         run_mig(img_conn)
+        # Time-boxed: 200 vision calls at 4 workers is ~30min, which is the whole
+        # systemd TimeoutStartSec for sb-daily-sync / sb-noon-catchup — step 8 was
+        # spending the entire budget and getting SIGTERMed. Cap it so the sync
+        # always returns cleanly; the leftover drains on the next run.
         img_stats = run_backfill(
             conn=img_conn,
             since=None,
@@ -1118,12 +1128,19 @@ def cmd_sync(args):
             dry_run=False,
             workers=4,
             unprocessed_only=True,
+            deadline_s=IMAGE_CLASSIFY_BUDGET_S,
         )
         img_conn.close()
         classified = img_stats.get("classified", 0)
         missing = img_stats.get("missing", 0)
-        if classified > 0 or missing > 0:
-            print(f"  Classified: {classified}, remaining: {missing}")
+        deferred = img_stats.get("deferred", 0)
+        # `missing` = file gone from disk; `deferred` = budget spent, work requeued.
+        # The old line printed `missing` under the label "remaining", which read as
+        # "backlog empty: 0" every day while the queue was 200 deep. Queue depth is
+        # reported by health_check.check_images (WARN past IMAGE_QUEUE_WARN); this
+        # line just says what THIS run did.
+        if classified > 0 or missing > 0 or deferred > 0:
+            print(f"  Classified: {classified}, deferred: {deferred}, missing files: {missing}")
         else:
             print("  No unclassified images")
     except Exception as e:

@@ -29,7 +29,7 @@ DB_PATH = DEFAULT_DB
 LOG_DIR = Path.home() / ".second-brain/logs"
 STATE_DIR = Path.home() / ".second-brain"
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
-SHAREPOINT_SESSION = Path.home() / ".outlook-cli" / "sharepoint-session.json"
+SHAREPOINT_SESSION = Path.home() / ".sharepoint-cli" / "session.json"
 
 # Reverse-ingest input side: the roots cmd_reverse_ingest scans and the
 # extensions it ingests. Kept in sync with src/cli.py:cmd_reverse_ingest.
@@ -394,7 +394,7 @@ def check_sharepoint_token(path: Path = SHAREPOINT_SESSION, now: datetime | None
 
     The SharePoint bearer is a *separate* token from the Outlook mail session and
     does not renew headlessly once fully expired — it needs an interactive
-    `outlook-cli login --sharepoint-host <host>`. When it lapses, mail keeps
+    `sharepoint-cli login --host <host>`. When it lapses, mail keeps
     working (its token still renews) while every SharePoint fetch fails with
     SHAREPOINT_SESSION_MISSING. The file mtime stays fresh because the token-sync
     job keeps copying the dead token, so mtime alone can't detect this — only the
@@ -860,7 +860,7 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
             elif rem is not None and rem.total_seconds() <= 0:
                 extra = (
                     f" (EXPIRED {str(c.get('expires_at', ''))[:10]} — run: "
-                    f"outlook-cli login --sharepoint-host {SHAREPOINT_HOST})"
+                    f"sharepoint-cli login --host {SHAREPOINT_HOST})"
                 )
             elif rem is not None:
                 extra = f" (expires in {format_age(rem)})"

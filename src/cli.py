@@ -399,7 +399,7 @@ def cmd_process_sharepoint(args):
             print(f"  External hosts skipped (no session): {stats['urls_skipped_external']}")
     if stats["auth_required"]:
         print(
-            f"\n⚠ Auth required — run 'outlook-cli login --sharepoint-host {SHAREPOINT_HOST}' and retry"
+            f"\n⚠ Auth required — run 'sharepoint-cli login --host {SHAREPOINT_HOST}' and retry"
         )
 
 

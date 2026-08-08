@@ -50,7 +50,7 @@ IMAGE_CLASSIFY_BUDGET_S = float(os.environ.get("BRAIN_IMAGE_CLASSIFY_BUDGET_S", 
 NEWS_DB_PATH = Path(os.environ.get("BRAIN_NEWS_DB", Path.home() / "SourceCode/news/data/news.db"))
 
 # Host we hold an interactive SharePoint session for (captured via
-# `outlook-cli login --sharepoint-host <host>`). Auth failures on this host
+# `sharepoint-cli login --host <host>`). Auth failures on this host
 # mean the session expired and a re-login fixes them; auth failures on any
 # other host are external tenants we cannot authenticate to, and are skipped
 # rather than aborting a fetch pass.

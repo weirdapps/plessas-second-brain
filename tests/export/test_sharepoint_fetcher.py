@@ -16,35 +16,115 @@ def _setup_db(tmp_path: Path) -> sqlite3.Connection:
     return conn
 
 
-@patch("src.export.sharepoint_fetcher.run_outlook_cli")
-def test_fetch_calls_download_sharepoint_link(mock_cli, tmp_path):
-    mock_cli.return_value = {
-        "saved": [{"path": str(tmp_path / "f.pdf"), "name": "f.pdf", "size": 100}],
-        "skipped": [],
-    }
+def _cli_ok(filename="f.pdf", size=100):
+    """sharepoint-cli `get --out` writes the bytes itself and returns metadata."""
+
+    def _run(args, host, **_kw):
+        out = Path(args[args.index("--out") + 1])
+        out.write_bytes(b"x" * size)
+        return {
+            "source": args[1],
+            "size": size,
+            "contentType": "application/pdf",
+            "outPath": str(out),
+            "filename": filename,
+        }
+
+    return _run
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_fetch_invokes_sharepoint_cli_get(mock_cli, tmp_path):
+    mock_cli.side_effect = _cli_ok()
     result = fetch_sharepoint_link(
         url="https://x.sharepoint.com/sites/foo/Eabc",
         out_dir=tmp_path,
     )
     assert result.status == "ok"
+    # Saved under the server-supplied name, inside out_dir.
     assert result.local_path == tmp_path / "f.pdf"
+    assert result.local_path.exists()
     args = mock_cli.call_args[0][0]
-    assert args[0] == "download-sharepoint-link"
+    assert args[0] == "get"
     assert "--out" in args
 
 
-@patch("src.export.sharepoint_fetcher.run_outlook_cli")
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_fetch_passes_the_urls_own_host(mock_cli, tmp_path):
+    """--host is required, and for an absolute URL it must be that URL's host,
+    not the managed one, or external tenants would be misrouted."""
+    mock_cli.side_effect = _cli_ok()
+    fetch_sharepoint_link(url="https://partner.sharepoint.com/:x:/s/Org/abc", out_dir=tmp_path)
+    assert mock_cli.call_args.kwargs["host"] == "partner.sharepoint.com"
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_fetch_leaves_no_temp_file_on_success(mock_cli, tmp_path):
+    mock_cli.side_effect = _cli_ok()
+    fetch_sharepoint_link(url="https://x.sharepoint.com/a", out_dir=tmp_path)
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".sp-")] == []
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
 def test_fetch_records_404_as_stale(mock_cli, tmp_path):
-    mock_cli.return_value = {
-        "saved": [],
-        "skipped": [{"url": "x", "reason": "not-found", "status": 404}],
-    }
-    result = fetch_sharepoint_link(
-        url="https://x.sharepoint.com/missing",
-        out_dir=tmp_path,
+    from src.export.sharepoint_cli import SharepointCliError
+
+    mock_cli.side_effect = SharepointCliError(
+        exit_code=5,
+        stderr='{"error":"not_found","message":"SharePoint 404","status":404}',
+        retryable=True,
     )
+    result = fetch_sharepoint_link(url="https://x.sharepoint.com/missing", out_dir=tmp_path)
     assert result.status == "stale"
     assert result.http_status == 404
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".sp-")] == []
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_fetch_maps_auth_required(mock_cli, tmp_path):
+    """Exit 4 must surface as auth-required so a managed-host failure still
+    prompts a re-login rather than being buried as a generic error."""
+    from src.export.sharepoint_cli import SharepointCliAuthRequired
+
+    mock_cli.side_effect = SharepointCliAuthRequired("session gone")
+    result = fetch_sharepoint_link(url="https://x.sharepoint.com/a", out_dir=tmp_path)
+    assert result.status == "auth-required"
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_fetch_maps_access_denied_to_http_error(mock_cli, tmp_path):
+    from src.export.sharepoint_cli import SharepointCliError
+
+    mock_cli.side_effect = SharepointCliError(
+        exit_code=5, stderr='{"error":"access_denied","status":403}', retryable=True
+    )
+    assert fetch_sharepoint_link("https://x.sharepoint.com/a", tmp_path).status == "http-error"
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_fetch_falls_back_to_url_name_when_server_sends_none(mock_cli, tmp_path):
+    def _run(args, host, **_kw):
+        Path(args[args.index("--out") + 1]).write_bytes(b"data")
+        return {"size": 4}
+
+    mock_cli.side_effect = _run
+    result = fetch_sharepoint_link("https://x.sharepoint.com/sites/foo/%CE%AD%CE%BA.pdf", tmp_path)
+    assert result.file_name == "έκ.pdf"
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_fetch_never_escapes_out_dir_via_filename(mock_cli, tmp_path):
+    """A server-supplied filename is untrusted input: it must be basenamed."""
+
+    def _run(args, host, **_kw):
+        Path(args[args.index("--out") + 1]).write_bytes(b"x")
+        return {"size": 1, "filename": "../../escaped.pdf"}
+
+    mock_cli.side_effect = _run
+    result = fetch_sharepoint_link("https://x.sharepoint.com/a", tmp_path)
+    assert result.local_path is not None
+    assert result.local_path.parent == tmp_path
+    assert result.local_path.name == "escaped.pdf"
 
 
 def test_record_link_in_db_tracks_attempts(tmp_path):

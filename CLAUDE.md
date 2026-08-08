@@ -41,3 +41,19 @@ CI (`.github/workflows/ci.yml`): `ruff check` + `ruff format --check`, then `pyt
 - **Staging batches**: `data/staging/batch-NNNNN.json`; same shape regardless of source, so extract + load are source-agnostic.
 - **Thread identity**: primary = Outlook `ConversationId`; fallback = subject normalization stripping English (`Re:` / `Fwd:` / `FW:`) and Greek (`Απ:` / `Πρ:`) prefixes.
 - **Privacy**: `data/` is gitignored; `scripts/pii-gauntlet.sh` blocks personal data from tracked files — keep it green before every push.
+
+## M365 access: two CLIs, not one (2026-08-08)
+
+- **Mail, calendar, attachments** go through `src/export/outlook_cli.py` ->
+  `outlook-cli`. Unchanged.
+- **SharePoint reference attachments** go through `src/export/sharepoint_cli.py`
+  -> `sharepoint-cli` (`~/SourceCode/sharepoint-access`), reading
+  `~/.sharepoint-cli/session.json`. Overridable with `SHAREPOINT_CLI_PATH`.
+
+`sharepoint_fetcher.py` is the adapter and keeps the original `FetchStatus`
+vocabulary, so the `sharepoint_links` table and the `sharepoint_index` MCP tool
+are unaffected. `scripts/health_check.py` watches the new session path.
+
+It previously did `session["bearer"]`, but this tenant is MCAS-gated and issues
+no SharePoint bearer, so that path had been failing with `KeyError: 'bearer'`.
+Auth is cookie-based now.

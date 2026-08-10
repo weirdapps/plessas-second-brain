@@ -11,11 +11,13 @@ closed per item (it is a shared, long-lived instance closed at process exit).
 """
 
 import types
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+import google.auth.exceptions as gauth
 import pytest
 
 from src.extract import claude_extract
+from src.llm_policy import MAX_ATTEMPTS, ReauthResult
 
 
 @pytest.fixture(autouse=True)
@@ -152,3 +154,38 @@ def test_extraction_asks_for_enough_output_tokens(monkeypatch):
     claude_extract.extract_one({"message_id": "m1"})
 
     assert captured["max_tokens"] >= 8192
+
+
+def test_an_auth_error_triggers_one_reauth_then_succeeds(monkeypatch):
+    calls = []
+
+    class FakeMessages:
+        def create(self, **kw):
+            calls.append(kw)
+            if len(calls) == 1:
+                raise gauth.RefreshError("invalid_grant: Bad Request")
+            return type("R", (), {"stop_reason": "end_turn", "content": [type("C", (), {"text": "{}"})()]})()
+
+    fake = type("Client", (), {"messages": FakeMessages()})()
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (fake, "m"))
+    monkeypatch.setattr("src.extract.parser.parse_extraction", lambda text, **k: {})
+    with patch.object(claude_extract, "reauth", return_value=ReauthResult.SUCCEEDED) as mock_reauth:
+        claude_extract.extract_one({"id": "1", "subject": "s", "body": "b", "message_id": "1"})
+    assert len(calls) == 2
+    assert mock_reauth.call_count == 1
+
+
+def test_repeated_auth_errors_stop_at_the_cap(monkeypatch):
+    calls = []
+
+    class FakeMessages:
+        def create(self, **kw):
+            calls.append(kw)
+            raise gauth.RefreshError("invalid_grant: Bad Request")
+
+    fake = type("Client", (), {"messages": FakeMessages()})()
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (fake, "m"))
+    with patch.object(claude_extract, "reauth", return_value=ReauthResult.SUCCEEDED):
+        with pytest.raises(gauth.RefreshError):
+            claude_extract.extract_one({"id": "1", "subject": "s", "body": "b"})
+    assert len(calls) <= MAX_ATTEMPTS

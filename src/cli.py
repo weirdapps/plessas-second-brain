@@ -15,6 +15,7 @@ from src.config import (
     IMAGE_CLASSIFY_BUDGET_S,
     NEWS_DB_PATH,
 )
+from src.llm_deadline import install_llm_deadline_for_this_process
 
 
 def format_email_result(email: dict, show_full: bool = False) -> str:
@@ -398,9 +399,7 @@ def cmd_process_sharepoint(args):
         if stats["urls_skipped_external"]:
             print(f"  External hosts skipped (no session): {stats['urls_skipped_external']}")
     if stats["auth_required"]:
-        print(
-            f"\n⚠ Auth required — run 'sharepoint-cli login --host {SHAREPOINT_HOST}' and retry"
-        )
+        print(f"\n⚠ Auth required — run 'sharepoint-cli login --host {SHAREPOINT_HOST}' and retry")
 
 
 def cmd_reverse_ingest(args):
@@ -2202,6 +2201,12 @@ def main():
 
     # Execute command
     try:
+        # Before any command runs, so the shared policy's budget test reflects this
+        # unit's real TimeoutStartSec instead of resolve_deadline's flat 900s default.
+        # A no-op off systemd, and inside the try on purpose: a unit whose timeout
+        # cannot fund one worst-case LLM call raises here, and exiting 1 with the
+        # reason on stderr is the loud refusal that beats a SIGTERM later.
+        install_llm_deadline_for_this_process()
         args.func(args)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

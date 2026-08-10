@@ -114,6 +114,52 @@ def reset_client_cache():
     _cached_client_and_model = None
 
 
+# Process-wide latch: once a re-auth has FAILED, no other worker repeats the wait.
+#
+# On Linux reauth() has no local remedy and polls for PUSH_WAIT_SECONDS (1020s) waiting
+# for the Mac's token push. call_with_policy runs per item, and three of its call sites
+# drive a ThreadPoolExecutor (local.py:397, attachment_pipeline.py:361,
+# image_pipeline.py:284). Without a latch each worker in turn pays its own full wait, so
+# four workers spend 68 minutes discovering, four times over, the one fact the first
+# worker already established in 17: the push is not coming.
+#
+# The lock is held ACROSS the reauth() call, not merely around the flag reads. A
+# check-then-call that releases the lock in between latches nothing: llm_policy's
+# _REAUTH_LOCK already serialises reauth() internally, so a second worker has passed the
+# flag check and is parked inside _REAUTH_LOCK long before the first worker fails 1020s
+# later. It would then acquire that lock and repeat the whole wait, which is precisely
+# the behaviour this exists to prevent. Holding across the call therefore adds no
+# serialisation that _REAUTH_LOCK was not already imposing.
+_reauth_latch_lock = threading.Lock()
+_reauth_failed = False
+
+
+def reset_reauth_latch() -> None:
+    """Clear the failed-reauth latch. For tests, which share one process."""
+    global _reauth_failed
+    with _reauth_latch_lock:
+        _reauth_failed = False
+
+
+def _reauth_unless_latched(*, is_linux: bool) -> ReauthResult | None:
+    """Run reauth() unless an earlier one already failed. None means "skipped, latched".
+
+    Only FAILED latches. SUCCEEDED and SKIPPED both leave the flag clear on purpose:
+    the credential is good as of now, so a worker that hits an unrelated auth error
+    later deserves its own full attempt rather than inheriting a verdict that has
+    stopped being true. Preserving that is what keeps the one affordable wait available
+    to the 30-minute units.
+    """
+    global _reauth_failed
+    with _reauth_latch_lock:
+        if _reauth_failed:
+            return None
+        result = reauth(is_linux=is_linux)
+        if result is ReauthResult.FAILED:
+            _reauth_failed = True
+        return result
+
+
 def call_with_policy(fn, *, max_call_seconds: float) -> object:
     """Run fn() under the shared retry/reauth policy.
 
@@ -162,7 +208,14 @@ def call_with_policy(fn, *, max_call_seconds: float) -> object:
             return last_response
 
         if decision.action in (Action.REAUTH_RETRY, Action.WAIT_FOR_PUSH):
-            if reauth(is_linux=is_linux) is not ReauthResult.SKIPPED:
+            result = _reauth_unless_latched(is_linux=is_linux)
+            if result is None:
+                # Latched: another worker already waited the full push window and it
+                # did not arrive. Fail this item now instead of spending the same wait
+                # again — the run's remaining budget belongs to items that can still
+                # succeed. No with_reauth_used() here: nothing was spent.
+                break
+            if result is not ReauthResult.SKIPPED:
                 attempt = attempt.with_reauth_used()
             continue
 
@@ -172,9 +225,11 @@ def call_with_policy(fn, *, max_call_seconds: float) -> object:
             continue
 
         # GIVE_UP or UNRECOVERABLE_AUTH: stop looping
-        if last_exc is not None:
-            raise last_exc
-        return last_response
+        break
+
+    if last_exc is not None:
+        raise last_exc
+    return last_response
 
 
 def extract_one(email: dict) -> dict | None:

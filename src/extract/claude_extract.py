@@ -7,7 +7,18 @@ Drop-in replacement for the Gemini extractor in local.py.
 import os
 import sys
 import threading
+import time
 from pathlib import Path
+
+from src.llm_policy import (
+    Action,
+    Attempt,
+    ReauthResult,
+    decide,
+    reauth,
+    resolve_deadline,
+    running_on_linux,
+)
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 # Default model — Vertex AI requires '@' separator, direct API uses '-'
@@ -103,6 +114,69 @@ def reset_client_cache():
     _cached_client_and_model = None
 
 
+def call_with_policy(fn, *, max_call_seconds: float) -> object:
+    """Run fn() under the shared retry/reauth policy.
+
+    fn is a zero-argument callable that performs a single SDK request and returns
+    the response or raises.  Returns the response when the policy says RETURN, or
+    raises the last exception when the policy gives up.  Both extract_one and
+    extract_conversation route through this so that auth failures trigger a re-auth
+    and a retry rather than propagating immediately.
+
+    now is always time.time() (wall clock), never time.monotonic().
+    PTS_LLM_DEADLINE is wall-clock arithmetic; a monotonic now (~1e5) against an
+    epoch deadline (~1.7e9) would make the budget check permanently false, silently
+    disabling the whole deadline mechanism.
+    """
+    # Local import: policy_bridge imports reset_client_cache from this module, so a
+    # top-level import would create a circular dependency.  By the time this function
+    # runs, claude_extract is fully initialised and the deferred import resolves cleanly.
+    from src.extract.policy_bridge import classify_exception
+
+    deadline = resolve_deadline(time.time(), os.environ)
+    attempt = Attempt()
+    last_exc: BaseException | None = None
+    last_response: object = None
+    is_linux = running_on_linux()
+
+    while True:
+        last_exc = None
+        last_response = None
+        try:
+            last_response = fn()
+        except Exception as exc:
+            last_exc = exc
+
+        outcome = classify_exception(last_exc, last_response)
+        attempt = attempt.bump(outcome)
+        decision = decide(
+            outcome,
+            attempt,
+            now=time.time(),  # wall clock: PTS_LLM_DEADLINE is epoch-based
+            deadline=deadline,
+            max_call_seconds=max_call_seconds,
+            is_linux=is_linux,
+        )
+
+        if decision.action is Action.RETURN:
+            return last_response
+
+        if decision.action in (Action.REAUTH_RETRY, Action.WAIT_FOR_PUSH):
+            if reauth() is not ReauthResult.SKIPPED:
+                attempt = attempt.with_reauth_used()
+            continue
+
+        if decision.action is Action.PLAIN_RETRY:
+            if decision.sleep_s > 0:
+                time.sleep(decision.sleep_s)
+            continue
+
+        # GIVE_UP or UNRECOVERABLE_AUTH: stop looping
+        if last_exc is not None:
+            raise last_exc
+        return last_response
+
+
 def extract_one(email: dict) -> dict | None:
     """Extract structured data from a single email using Claude."""
     sys.path.insert(0, str(REPO_ROOT))
@@ -110,16 +184,22 @@ def extract_one(email: dict) -> dict | None:
     from src.extract.prompt import build_extraction_prompt
     from src.extract.vertex_fallback import create_with_refusal_fallback
 
-    # Shared client — do not close it here (see _get_client_and_model).
-    client, model = _get_client_and_model()
     prompt = build_extraction_prompt(email)
 
-    response = create_with_refusal_fallback(
-        client,
-        model=model,
-        max_tokens=MAX_OUTPUT_TOKENS,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    # _do_call calls _get_client_and_model() on each attempt so that a successful
+    # reauth (which calls reset_client_cache) is picked up on the retry rather than
+    # silently reusing the stale in-memory credential.  Do not close the returned
+    # client — it is the shared, long-lived instance (see _get_client_and_model).
+    def _do_call():
+        current_client, current_model = _get_client_and_model()
+        return create_with_refusal_fallback(
+            current_client,
+            model=current_model,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+    response = call_with_policy(_do_call, max_call_seconds=120.0)
 
     text = _response_text(response)
     if text.startswith("```"):
@@ -142,16 +222,22 @@ def extract_conversation(conversation: dict) -> dict | None:
     from src.extract.prompt import build_conversation_extraction_prompt
     from src.extract.vertex_fallback import create_with_refusal_fallback
 
-    # Shared client — do not close it here (see _get_client_and_model).
-    client, model = _get_client_and_model()
     prompt = build_conversation_extraction_prompt(conversation)
 
-    response = create_with_refusal_fallback(
-        client,
-        model=model,
-        max_tokens=MAX_OUTPUT_TOKENS,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    # _do_call calls _get_client_and_model() on each attempt so that a successful
+    # reauth (which calls reset_client_cache) is picked up on the retry rather than
+    # silently reusing the stale in-memory credential.  Do not close the returned
+    # client — it is the shared, long-lived instance (see _get_client_and_model).
+    def _do_call():
+        current_client, current_model = _get_client_and_model()
+        return create_with_refusal_fallback(
+            current_client,
+            model=current_model,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+    response = call_with_policy(_do_call, max_call_seconds=120.0)
 
     text = _response_text(response)
     if text.startswith("```"):

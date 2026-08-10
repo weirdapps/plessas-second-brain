@@ -181,6 +181,22 @@ def _parse_retry_delay(exc: Exception) -> int | None:
     return 3600  # default 1h if we can't parse
 
 
+def _should_quota_pause(exc: Exception) -> bool:
+    """Return True for genuine quota exhaustion, False for auth and other errors.
+
+    Routes through classify_exception so an expired credential is never confused
+    with a rate-limit hit: the quota pause cannot fix an expired credential, and
+    the sentinel that would summon a fix is never written when auth errors are
+    swallowed into the quota sleep.
+    """
+    from src.extract.policy_bridge import classify_exception
+    from src.llm_policy import Outcome
+
+    if classify_exception(exc, None) is Outcome.AUTH_REAUTH_REQUIRED:
+        return False
+    return _parse_retry_delay(exc) is not None
+
+
 def extract_inline(
     email: dict, api_key: str | None, max_retries: int = 3, engine: str = "gemini"
 ) -> tuple[str, dict | None, bool]:
@@ -192,6 +208,7 @@ def extract_inline(
     For Gemini: uses SIGALRM-based timeout (main thread only).
     For Claude: relies on SDK's built-in HTTP timeout (no SIGALRM).
     """
+    global _shutdown
     msg_id = str(email.get("message_id", "unknown"))
     is_quota = False
     use_alarm = (engine != "claude") and threading.current_thread() is threading.main_thread()
@@ -220,8 +237,7 @@ def extract_inline(
         except Exception as e:
             if use_alarm:
                 signal.alarm(0)
-            retry_delay = _parse_retry_delay(e)
-            if retry_delay is not None:
+            if _should_quota_pause(e):
                 is_quota = True
                 if attempt < max_retries - 1:
                     log(
@@ -231,6 +247,17 @@ def extract_inline(
                     continue
                 else:
                     return (msg_id, None, True)
+            from src.extract.policy_bridge import classify_exception
+            from src.llm_policy import Outcome
+            if classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED:
+                from src.extract.vertex_auth import touch_sentinel
+                log(
+                    f"Auth failure on msg {msg_id}: credential expired; "
+                    "writing reauth sentinel and stopping."
+                )
+                touch_sentinel()
+                _shutdown = True
+                return (msg_id, None, False)
             if attempt < max_retries - 1:
                 time.sleep(2 ** (attempt + 1))
             else:
@@ -316,7 +343,8 @@ def run_extraction(workers: int = 1, limit: int = 0, engine: str | None = None):
                 i += 1
             else:
                 total_failed += 1
-                consecutive_failures += 1
+                if is_quota:
+                    consecutive_failures += 1
                 log(f"FAILED msg {msg_id}")
 
                 if consecutive_failures >= CONSECUTIVE_FAIL_THRESHOLD:
@@ -397,7 +425,8 @@ def run_extraction(workers: int = 1, limit: int = 0, engine: str | None = None):
                     else:
                         with _state_lock:
                             total_failed += 1
-                            consecutive_failures += 1
+                            if is_quota:
+                                consecutive_failures += 1
                         log(f"FAILED msg {msg_id}")
 
                     with _state_lock:

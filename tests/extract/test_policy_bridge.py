@@ -72,6 +72,21 @@ def test_no_exception_and_no_response_is_empty():
     assert classify_exception(None, None) is Outcome.EMPTY
 
 
+def test_a_bare_quota_string_is_rate_limit_not_api_error():
+    # A plain exception from a non-Anthropic Vertex path (e.g. Gemini) carrying
+    # the 429 or RESOURCE_EXHAUSTED marker gets the rate-limit retry posture
+    # (cap 3, 60s base) rather than the API_ERROR cap-2 fallback.
+    exc = Exception("429 RESOURCE_EXHAUSTED")
+    assert classify_exception(exc, None) is Outcome.RATE_LIMIT
+
+
+def test_auth_type_check_beats_the_rate_limit_string_widener():
+    # An auth exception whose message matches the quota pattern must classify as
+    # auth, not rate-limit: the isinstance check runs before either string widener.
+    exc = gauth.RefreshError("429 RESOURCE_EXHAUSTED")
+    assert classify_exception(exc, None) is Outcome.AUTH_REAUTH_REQUIRED
+
+
 def test_reset_client_cache_is_registered_as_a_post_reauth_callback():
     from src import llm_policy
     from src.extract import (

@@ -18,12 +18,15 @@ import logging
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from src import llm_deadline
+from src.cli import main as cli_main
 
 # TimeoutStartSec of every scheduled unit, and the budget each one yields once the
 # 210s reserve (max_call 120 + shutdown grace 90) is held back.
@@ -471,6 +474,61 @@ def test_agreement_between_table_and_systemd_warns_about_nothing(monkeypatch, ca
         deadline = llm_deadline.install_llm_deadline("sb-daily-sync", now=1_000_000.0)
     assert deadline == 1_001_590.0
     assert caplog.text == ""
+
+
+# ------------------------------------------------------------------------- CLI wiring
+
+
+def test_the_cli_installs_the_deadline_before_running_a_command():
+    """src/cli.py must call the hook, and call it BEFORE dispatching.
+
+    Order is load-bearing. ``call_with_policy`` reads PTS_LLM_DEADLINE at its first
+    invocation, so a hook that ran after the command would leave the whole run on the
+    policy's flat 900s default while looking perfectly wired.
+
+    Would this pass with the behaviour removed? No, and this is the only test that
+    catches it. Deleting the ``install_llm_deadline_for_this_process()`` line from
+    src/cli.py disconnects the entire feature, and every other test in this file stays
+    green because they all call the module directly. Under that mutation ``order`` is
+    ["command"] and the assertion fails.
+    """
+    order = []
+    with (
+        patch(
+            "src.cli.install_llm_deadline_for_this_process",
+            side_effect=lambda: order.append("deadline"),
+        ),
+        patch("src.cli.cmd_stats", side_effect=lambda args: order.append("command")),
+        patch.object(sys, "argv", ["brain", "stats"]),
+    ):
+        cli_main()
+
+    assert order == ["deadline", "command"]
+
+
+def test_a_starved_unit_stops_the_cli_with_a_nonzero_exit(capsys):
+    """A unit that cannot fund one worst-case call refuses to run, loudly.
+
+    Would this pass with the behaviour removed? No. Catching the RuntimeError and
+    carrying on, or installing the deadline outside the try where it would surface as
+    a bare traceback rather than the CLI's own error path, changes the exit code or
+    the stderr text that this asserts. The command must also not run.
+    """
+    ran = []
+    with (
+        patch(
+            "src.cli.install_llm_deadline_for_this_process",
+            side_effect=RuntimeError("unit 'sb-x' cannot fund a single LLM call: ..."),
+        ),
+        patch("src.cli.cmd_stats", side_effect=lambda args: ran.append("command")),
+        patch.object(sys, "argv", ["brain", "stats"]),
+    ):
+        with pytest.raises(SystemExit) as exc:
+            cli_main()
+
+    assert exc.value.code == 1
+    assert "cannot fund a single LLM call" in capsys.readouterr().err
+    assert ran == []
 
 
 # ------------------------------------------------------------------------ drift guard

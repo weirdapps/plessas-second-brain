@@ -20,6 +20,24 @@ from src.extract.claude_extract import reset_client_cache
 from src.extract.vertex_auth import is_vertex_auth_error
 from src.llm_policy import Outcome, register_post_reauth
 
+_RATE_LIMIT_PATTERNS = ("429", "resource_exhausted")
+
+
+def _is_rate_limit_error(err: object) -> bool:
+    """Secondary string widener for quota / rate-limit errors.
+
+    Mirrors ``vertex_auth.is_vertex_auth_error`` for auth: the SDK type checks
+    handle ``anthropic.RateLimitError`` and ``anthropic.OverloadedError``; this
+    catches plain exceptions from non-Anthropic Vertex paths (e.g. Gemini) that
+    carry the HTTP 429 or gRPC RESOURCE_EXHAUSTED status in their message.
+
+    MUST run after all type checks and after the auth widener so that an auth
+    exception whose message happens to contain "429" is classified as auth, not
+    as rate-limit.
+    """
+    msg = str(err).lower()
+    return any(p in msg for p in _RATE_LIMIT_PATTERNS)
+
 
 def classify_exception(exc: BaseException | None, response: object | None) -> Outcome:
     """Map one SDK outcome to a policy Outcome. Types first, strings second."""
@@ -32,10 +50,14 @@ def classify_exception(exc: BaseException | None, response: object | None) -> Ou
             return Outcome.RATE_LIMIT
         if isinstance(exc, anthropic.APITimeoutError):
             return Outcome.TIMEOUT
-        # Secondary widening. Kept because it already catches the case that
-        # happens, and because a wrapped or re-raised error can lose its type.
+        # Secondary wideners — type checks always run first; strings catch only
+        # wrapped or re-raised exceptions that have lost their original type.
+        # Ordering: auth widener before rate-limit widener so an auth exception
+        # whose message contains "429" is classified as auth, not rate-limit.
         if is_vertex_auth_error(exc):
             return Outcome.AUTH_REAUTH_REQUIRED
+        if _is_rate_limit_error(exc):
+            return Outcome.RATE_LIMIT
         return Outcome.API_ERROR
 
     if response is None:

@@ -184,17 +184,14 @@ def _parse_retry_delay(exc: Exception) -> int | None:
 def _should_quota_pause(exc: Exception) -> bool:
     """Return True for genuine quota exhaustion, False for auth and other errors.
 
-    Routes through classify_exception so an expired credential is never confused
-    with a rate-limit hit: the quota pause cannot fix an expired credential, and
-    the sentinel that would summon a fix is never written when auth errors are
-    swallowed into the quota sleep.
+    Delegates to classify_exception, which now has a secondary rate-limit string
+    widener matching the auth widener's shape.  An auth exception cannot reach
+    RATE_LIMIT because type checks run before either string widener.
     """
     from src.extract.policy_bridge import classify_exception
     from src.llm_policy import Outcome
 
-    if classify_exception(exc, None) is Outcome.AUTH_REAUTH_REQUIRED:
-        return False
-    return _parse_retry_delay(exc) is not None
+    return classify_exception(exc, None) is Outcome.RATE_LIMIT
 
 
 def extract_inline(

@@ -362,12 +362,25 @@ def install_llm_deadline_for_this_process() -> float | None:
     changing how a process identifies its unit touches ``_detect_systemd_unit`` and
     nothing else — every function below it takes a unit NAME.
 
-    Also gives this module's logger a handler when nothing else has configured logging,
-    which is the case under ``src/cli.py``. Without it the budget line — the only record
-    of which budget a run is actually under — is dropped by the root logger, while the
-    drift WARNING still surfaces via logging's last-resort handler, so the failure is
-    invisible and one-sided. Scoped to this logger rather than ``basicConfig``: this
-    module has no business switching on INFO for every other library in the process.
+    THE LOGGING HANDLER BELOW IS A DELIBERATE LOCAL CHOICE, not an oversight of failing
+    to configure logging globally. ``src/cli.py`` configures none, so without a handler
+    the budget INFO line — the only record of which budget a run is actually under — is
+    swallowed by the root logger, while the drift WARNING still reaches stderr through
+    logging's last-resort handler. That asymmetry is the worst of the options: the loud
+    case stays loud and the quiet case disappears, so "log what was actually installed"
+    silently stops being true in production while looking fine in tests.
+
+    ``logging.basicConfig`` in ``main()`` is formally the entrypoint's job and was
+    considered and rejected: it would switch INFO on for every module across all ten VPS
+    units at once, a far larger behavioural change than this task should carry. Scoping
+    one handler to one logger is the smaller blast radius.
+
+    IDEMPOTENT. The ``logger.handlers`` half of the guard is what makes repeated calls in
+    one process safe: without it, a second call would stack a second StreamHandler and
+    every subsequent line would be emitted twice. The root-handlers half defers to any
+    real logging configuration, so when one exists this adds nothing and the record
+    propagates normally.
+
     The unit wrappers redirect stderr into the per-unit log file, so that is where it
     lands.
     """

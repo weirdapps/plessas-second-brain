@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -183,6 +184,115 @@ def test_an_unknown_unit_gets_no_budget():
     any number at all — the guessed budget this design refuses — makes this None fail.
     """
     assert llm_deadline._llm_budget_seconds("sb-invented", 120.0) is None
+
+
+# ------------------------------------------------------------------ unit detection
+
+# Exactly what /proc/self/cgroup contained on the VPS on 2026-08-11, cgroup v2.
+CGROUP_V2 = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/{unit}.service\n"
+
+
+def _cgroup_file(base, contents: str) -> Path:
+    base.mkdir(parents=True, exist_ok=True)
+    f = base / "cgroup"
+    f.write_text(contents)
+    return f
+
+
+def test_the_unit_comes_from_the_cgroup(tmp_path):
+    """Would this pass with the behaviour removed? No. Returning None unconditionally —
+    which is what an entrypoint with no way to identify itself is reduced to — fails
+    this, and with it every deadline in production.
+    """
+    path = _cgroup_file(tmp_path, CGROUP_V2.format(unit="sb-daily-sync"))
+    assert llm_deadline._detect_systemd_unit(path) == "sb-daily-sync"
+
+
+def test_two_units_running_identical_argv_are_told_apart(tmp_path):
+    """The reason detection is not the CLI subcommand. sb-noon-catchup and
+    sb-outlook-sync both invoke `src.cli sync --engine claude --workers 8
+    --skip-export`, byte for byte, and their timeouts differ by 1200s. Nothing in argv
+    separates them; the cgroup does, and the budgets that come out must differ.
+
+    Would this pass with the behaviour removed? No. Any argv-derived mapping gives both
+    units the same answer, so one of these two assertions is wrong whichever value it
+    picks. This test is the specification of the design decision.
+    """
+    noon = _cgroup_file(tmp_path / "a", CGROUP_V2.format(unit="sb-noon-catchup"))
+    outlook = _cgroup_file(tmp_path / "b", CGROUP_V2.format(unit="sb-outlook-sync"))
+
+    assert llm_deadline._detect_systemd_unit(noon) == "sb-noon-catchup"
+    assert llm_deadline._detect_systemd_unit(outlook) == "sb-outlook-sync"
+    assert llm_deadline._llm_budget_seconds("sb-noon-catchup", 120.0) == 1590
+    assert llm_deadline._llm_budget_seconds("sb-outlook-sync", 120.0) == 390
+
+
+def test_the_enclosing_user_manager_slice_is_not_mistaken_for_the_unit(tmp_path):
+    """Every cgroup path contains `user@1000.service`, which also ends in `.service`.
+
+    Would this pass with the behaviour removed? No. Returning the first `.service`
+    segment found without checking it against the timeout table yields "user@1000"
+    here instead of None — and, worse, on a real unit it would depend on scan order.
+    """
+    path = _cgroup_file(
+        tmp_path, "0::/user.slice/user-1000.slice/user@1000.service/app.slice/other.service\n"
+    )
+    assert llm_deadline._detect_systemd_unit(path) is None
+
+
+def test_a_hand_run_over_ssh_has_no_unit(tmp_path):
+    """An interactive session sits in a session-N.scope, not a .service.
+
+    Would this pass with the behaviour removed? No. Falling back to any default unit
+    when no match is found gives a hand-run somebody else's budget.
+    """
+    path = _cgroup_file(tmp_path, "0::/user.slice/user-1000.slice/session-42.scope\n")
+    assert llm_deadline._detect_systemd_unit(path) is None
+
+
+def test_cgroup_v1_multi_line_layout_also_resolves(tmp_path):
+    """v1 writes one line per controller. Scanning every segment of every line covers
+    both versions; a v2-only parser that split on "::" would return None here.
+    """
+    path = _cgroup_file(
+        tmp_path,
+        "12:pids:/user.slice/user-1000.slice/sb-teams-sync.service\n"
+        "3:memory:/user.slice/user-1000.slice/sb-teams-sync.service\n",
+    )
+    assert llm_deadline._detect_systemd_unit(path) == "sb-teams-sync"
+
+
+def test_no_proc_filesystem_means_no_unit(tmp_path):
+    """Every developer Mac takes this path.
+
+    Would this pass with the behaviour removed? No. Letting the OSError escape instead
+    of catching it makes this raise, which would break the CLI on macOS outright.
+    """
+    assert llm_deadline._detect_systemd_unit(tmp_path / "absent") is None
+
+
+def test_the_entrypoint_hook_installs_nothing_off_systemd(monkeypatch):
+    """The hook is what src/cli.py calls, so it must be inert on a Mac and in CI.
+
+    Would this pass with the behaviour removed? No. A hook that guessed a unit rather
+    than accepting None would set PTS_LLM_DEADLINE on every developer machine.
+    """
+    monkeypatch.setattr(llm_deadline, "_detect_systemd_unit", lambda *a, **k: None)
+    assert llm_deadline.install_llm_deadline_for_this_process() is None
+    assert "PTS_LLM_DEADLINE" not in os.environ
+
+
+def test_the_entrypoint_hook_installs_the_detected_units_budget(monkeypatch):
+    """Would this pass with the behaviour removed? No. A hook that ignored the detected
+    unit, or dropped the install call, leaves PTS_LLM_DEADLINE unset.
+    """
+    monkeypatch.setattr(llm_deadline, "_detect_systemd_unit", lambda *a, **k: "sb-attachments")
+    monkeypatch.setattr(llm_deadline.subprocess, "run", _no_systemctl)
+    installed = llm_deadline.install_llm_deadline_for_this_process()
+    assert installed == pytest.approx(float(os.environ["PTS_LLM_DEADLINE"]))
+    # 3600 - 210. Compared against the clock the hook itself read, since it takes no
+    # `now`; the window is milliseconds and the tolerance is a second.
+    assert installed - time.time() == pytest.approx(3390, abs=1.0)
 
 
 # ----------------------------------------------------------------- duration parsing

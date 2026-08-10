@@ -15,6 +15,7 @@ from src.llm_policy import (
     Attempt,
     ReauthResult,
     decide,
+    default_adc_probe,
     reauth,
     resolve_deadline,
     running_on_linux,
@@ -133,12 +134,30 @@ def reset_client_cache():
 _reauth_latch_lock = threading.Lock()
 _reauth_failed = False
 
+# THE LATCH GUARDS THE WAIT, NOT THE QUESTION. reauth() opens with a probe of its own and
+# returns SKIPPED without waiting when the credential is already good, but the latch
+# short-circuits above it, so once latched nothing asks again: a worker's wait fails at
+# t=1620, the Mac pushes at t=1700, and every remaining item of a 3600s run fails against
+# a credential that has been valid for half an hour. Probing in the latched branch keeps
+# the cheap half of reauth() reachable while the expensive half stays latched.
+#
+# THROTTLED, because "cheap" is relative. default_adc_probe forks gcloud: measured at
+# 0.94s on the VPS, against a 1020s wait. Cheap per call, but the latched branch is
+# reached once per remaining ITEM, so an unthrottled probe would charge a backlog of a
+# thousand attachments a thousand seconds of a 3390s budget to re-answer a question whose
+# answer changes at most once every fifteen minutes (the Mac's push interval). One probe
+# per minute bounds the cost by the run's wall clock instead of its item count, and still
+# notices a recovery within a minute of it happening.
+_LATCHED_PROBE_INTERVAL_SECONDS = 60.0
+_last_latched_probe_at = float("-inf")
+
 
 def reset_reauth_latch() -> None:
     """Clear the failed-reauth latch. For tests, which share one process."""
-    global _reauth_failed
+    global _reauth_failed, _last_latched_probe_at
     with _reauth_latch_lock:
         _reauth_failed = False
+        _last_latched_probe_at = float("-inf")
 
 
 def _reauth_unless_latched(*, is_linux: bool) -> ReauthResult | None:
@@ -149,11 +168,38 @@ def _reauth_unless_latched(*, is_linux: bool) -> ReauthResult | None:
     later deserves its own full attempt rather than inheriting a verdict that has
     stopped being true. Preserving that is what keeps the one affordable wait available
     to the 30-minute units.
+
+    A LATCHED CALLER STILL PROBES, on the throttle described above. A probe that comes
+    back good means the credential CHANGED after the wait failed, which is materially
+    different from reauth()'s own opening SKIPPED, where nothing is known to have moved:
+    the ADC file on disk now holds a refresh token the cached AnthropicVertex client has
+    never seen. So the latch clears and the cached client is dropped, and the result is
+    SUCCEEDED rather than SKIPPED.
+
+    Both of those matter. Without the cache drop the retry reuses the dead credential in
+    memory and the recovery is invisible, which is the whole reason reset_client_cache is
+    registered as a post-reauth callback (see policy_bridge). Calling it directly is not a
+    layering shortcut: it is this module's own cache, and llm_policy exposes no public way
+    to fire the callback list. It is, however, the one place that would need revisiting if
+    a second post-reauth callback were ever registered.
+
+    SUCCEEDED, not SKIPPED, because the caller spends the auth budget only on the former.
+    Returning SKIPPED here would leave reauth_used clear, so an auth error on the very
+    next attempt would find the latch freshly cleared and enter the full 1020s wait, which
+    is exactly the outcome the latch exists to prevent.
     """
-    global _reauth_failed
+    global _reauth_failed, _last_latched_probe_at
     with _reauth_latch_lock:
         if _reauth_failed:
-            return None
+            since = time.monotonic() - _last_latched_probe_at
+            if since < _LATCHED_PROBE_INTERVAL_SECONDS:
+                return None
+            _last_latched_probe_at = time.monotonic()
+            if not default_adc_probe():
+                return None
+            _reauth_failed = False
+            reset_client_cache()
+            return ReauthResult.SUCCEEDED
         result = reauth(is_linux=is_linux)
         if result is ReauthResult.FAILED:
             _reauth_failed = True

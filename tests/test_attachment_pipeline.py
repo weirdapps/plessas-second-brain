@@ -1,6 +1,12 @@
 import os
 import sqlite3
 import tempfile
+from unittest.mock import patch
+
+import google.auth.exceptions as gauth
+
+from src.extract import claude_extract
+from src.llm_policy import ReauthResult
 
 
 def _create_test_db(db_path):
@@ -69,3 +75,61 @@ def test_phase1_is_resumable():
 
         stats2 = run_phase1(db_path, limit=10)
         assert stats2["processed"] == 0  # nothing new to process
+
+
+def test_extract_one_attachment_auth_error_triggers_reauth(monkeypatch):
+    """One auth error triggers reauth; the second call succeeds.
+
+    Before the fix: RefreshError is caught by the broad except in
+    _extract_one_attachment and serialised to an error string — the policy
+    loop never ran, so the auth watcher's sentinel was written for a genuine
+    first-try failure even though a retry would have succeeded.
+    After the fix: call_with_policy retries after reauth; only a genuine
+    terminal failure (after all retries) reaches the broad except.
+
+    running_on_linux is pinned False (macOS path) so decide() chooses
+    REAUTH_RETRY instead of giving up immediately with UNRECOVERABLE_AUTH.
+
+    Mutation checks:
+    - Remove call_with_policy (bare create): RefreshError caught by broad
+      except, error is not None, assert error is None fails.
+    - Remove the retry (loop exits after 1): len(calls) == 1, not 2.
+    """
+    from src.extract.attachment_pipeline import _extract_one_attachment
+
+    calls = []
+
+    class FakeMessages:
+        def create(self, **kw):
+            calls.append(kw)
+            if len(calls) == 1:
+                raise gauth.RefreshError("invalid_grant: Bad Request")
+            return type("R", (), {
+                "stop_reason": "end_turn",
+                "content": [type("C", (), {"text": '{"summary": "ok"}'})()],
+            })()
+
+    fake = type("Client", (), {"messages": FakeMessages()})()
+    # _extract_one_attachment uses a lazy import of _get_client_and_model from
+    # claude_extract, so patching it there is the correct interception point.
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (fake, "m"))
+    monkeypatch.setattr(claude_extract, "running_on_linux", lambda: False)
+    monkeypatch.setattr(
+        "src.extract.attachment_prompt.build_attachment_prompt",
+        lambda **kw: "test prompt",
+    )
+    monkeypatch.setattr(
+        "src.extract.parser.parse_extraction",
+        lambda text, **kw: {
+            "summary": "ok", "language": "en",
+            "topics": [], "decisions": [], "action_items": [], "key_facts": [],
+        },
+    )
+
+    row = (1, 2, "some extracted text", "test.txt", "text/plain", 3, "Test email", "2026-01-01")
+    with patch.object(claude_extract, "reauth", return_value=ReauthResult.SUCCEEDED):
+        ac_id, email_id, extraction, error = _extract_one_attachment(row)
+
+    assert error is None
+    assert extraction is not None
+    assert len(calls) == 2

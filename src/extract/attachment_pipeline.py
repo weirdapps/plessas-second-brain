@@ -156,14 +156,12 @@ def run_phase1(
 def _extract_one_attachment(row):
     """Worker: call LLM for a single attachment. Returns (ac_id, result_dict) or (ac_id, error)."""
     from src.extract.attachment_prompt import build_attachment_prompt
-    from src.extract.claude_extract import _get_client_and_model
+    from src.extract.claude_extract import _get_client_and_model, call_with_policy
     from src.extract.parser import parse_extraction
 
     ac_id, att_id, text, filename, mime_type, email_id, email_subject, email_date = row
 
     try:
-        client, model = _get_client_and_model()
-
         prompt = build_attachment_prompt(
             extracted_text=text,
             filename=filename,
@@ -172,16 +170,23 @@ def _extract_one_attachment(row):
             email_date=email_date,
         )
 
-        response = client.messages.create(
-            model=model,
-            # Dense documents (large spreadsheets/decks) yield long extraction
-            # JSON; 2048 truncated it mid-structure on ~40K-char docs, so every
-            # such attachment failed with "Expecting ',' delimiter". Give the
-            # structured output room to complete; parse_extraction additionally
-            # salvages any residual truncation rather than dropping the summary.
-            max_tokens=8192,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        # _do_call re-fetches the client on every attempt so a successful reauth
+        # (which calls reset_client_cache) is picked up by the retry rather than
+        # silently reusing the stale credential.
+        def _do_call():
+            cur_client, cur_model = _get_client_and_model()
+            return cur_client.messages.create(
+                model=cur_model,
+                # Dense documents (large spreadsheets/decks) yield long extraction
+                # JSON; 2048 truncated it mid-structure on ~40K-char docs, so every
+                # such attachment failed with "Expecting ',' delimiter". Give the
+                # structured output room to complete; parse_extraction additionally
+                # salvages any residual truncation rather than dropping the summary.
+                max_tokens=8192,
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+        response = call_with_policy(_do_call, max_call_seconds=120.0)
         # Do not close: this is the shared client from _get_client_and_model.
 
         raw_text = response.content[0].text

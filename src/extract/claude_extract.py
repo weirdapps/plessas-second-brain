@@ -162,7 +162,7 @@ def call_with_policy(fn, *, max_call_seconds: float) -> object:
             return last_response
 
         if decision.action in (Action.REAUTH_RETRY, Action.WAIT_FOR_PUSH):
-            if reauth() is not ReauthResult.SKIPPED:
+            if reauth(is_linux=is_linux) is not ReauthResult.SKIPPED:
                 attempt = attempt.with_reauth_used()
             continue
 

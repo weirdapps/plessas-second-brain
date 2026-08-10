@@ -47,6 +47,12 @@ UNIT_TIMEOUT_AND_BUDGET = {
 # token-push wait only to a budget at or above this.
 WAIT_NEEDS_SECONDS = 1140
 
+# The module logger's level before any test in this file has run. Captured at import,
+# which pytest does for every module during collection, i.e. before the first test.
+# _clean_deadline_env restores this; test_the_handler_tests_do_not_leak_the_loggers_level
+# is what proves it still does.
+LOGGER_LEVEL_AT_IMPORT = logging.getLogger(llm_deadline.__name__).level
+
 
 @pytest.fixture(autouse=True)
 def _clean_deadline_env():
@@ -55,10 +61,20 @@ def _clean_deadline_env():
     monkeypatch cannot undo a variable the code under test created, so pop it by hand
     on both sides. Without this, the first test to install a deadline makes every later
     test exercise the setdefault-kept branch instead of the one it meant to.
+
+    THE LOGGER'S LEVEL IS THE SAME KIND OF STATE. ``install_llm_deadline_for_this_process``
+    calls ``logger.setLevel(logging.INFO)`` when it installs its handler, and that outlives
+    the test: monkeypatch restores the ``handlers`` list the handler tests replaced, but
+    nothing restores a level the code under test set on a logger the test never touched.
+    Left behind, it turns this module into a session-wide side effect that surfaces as an
+    unrelated caplog assertion failing depending on file order.
     """
+    logger = logging.getLogger(llm_deadline.__name__)
+    level = logger.level
     os.environ.pop("PTS_LLM_DEADLINE", None)
     yield
     os.environ.pop("PTS_LLM_DEADLINE", None)
+    logger.setLevel(level)
 
 
 def _fake_systemctl(stdout: str, returncode: int = 0):
@@ -117,6 +133,41 @@ def test_each_unit_gets_its_own_budget(unit, timeout, budget):
     status quo this task exists to replace — matches none of the ten.
     """
     assert llm_deadline._llm_budget_seconds(unit, 120.0, unit_timeout_seconds=timeout) == budget
+
+
+@pytest.mark.parametrize(
+    ("unit", "budget"), [(u, b) for u, (_, b) in UNIT_TIMEOUT_AND_BUDGET.items()]
+)
+def test_the_checked_in_timeout_table_is_what_production_actually_reads(unit, budget):
+    """Same ten budgets, but with the timeout coming from _UNIT_TIMEOUT_SECONDS itself.
+
+    NO ``unit_timeout_seconds`` OVERRIDE, and that omission is the entire test. The
+    parametrised test above feeds the timeout in from this file's own table, so it
+    exercises the subtraction and never once reads the module's table — which is the only
+    checked-in record of what the ten production units are actually configured with, and
+    is what the no-override path in ``install_llm_deadline`` reads on the VPS.
+
+    Would this pass with the behaviour removed? No, and it was a measured gap: mutating
+    each of the ten entries to 999 in turn left SIX green — sb-calendar-sync,
+    sb-conversation-sync, sb-curate-docs, sb-news-sync, sb-reverse-ingest and
+    sb-teams-sync, every unit not separately named in another test. Under this test any
+    one of those mutations yields 789 against its literal and fails.
+    """
+    assert llm_deadline._llm_budget_seconds(unit, 120.0) == budget
+
+
+def test_the_timeout_table_holds_exactly_the_ten_scheduled_units():
+    """Set equality, so an ADDED key is caught as well as a changed or renamed one.
+
+    The per-unit test above cannot see a spurious eleventh entry: nothing asks about a
+    unit it does not know. A unit invented in the table but absent from the estate would
+    hand a real budget to whatever later acquires that name.
+
+    Would this pass with the behaviour removed? No. Adding any key to
+    _UNIT_TIMEOUT_SECONDS, or deleting one, fails the comparison; renaming one fails both
+    this and the per-unit test.
+    """
+    assert set(llm_deadline._UNIT_TIMEOUT_SECONDS) == set(UNIT_TIMEOUT_AND_BUDGET)
 
 
 def test_every_scheduled_unit_has_a_positive_margin():
@@ -358,6 +409,25 @@ def test_the_hook_defers_to_existing_logging_configuration(monkeypatch):
     llm_deadline.install_llm_deadline_for_this_process()
 
     assert logger.handlers == []
+
+
+def test_the_handler_tests_do_not_leak_the_loggers_level():
+    """The two tests above install a handler; one of them also sets the level to INFO.
+
+    ORDER IS THE MECHANISM, deliberately. This must sit immediately after the two tests
+    that take the handler-install branch, because a level leak is only observable from a
+    LATER test — a fixture's teardown cannot be watched from inside the test it tears
+    down. pytest runs a module's tests in definition order and this project pins no
+    randomiser, so the position is the assertion.
+
+    Would this pass with the behaviour removed? No. Delete the ``logger.setLevel(level)``
+    line from _clean_deadline_env and
+    test_the_hook_does_not_stack_log_handlers_when_called_repeatedly leaves the level at
+    INFO (20) where it was NOTSET (0), and this reads 20 == 0. That leak is benign inside
+    this file and is not benign outside it: an INFO level on a module logger that no other
+    test set makes an unrelated caplog assertion elsewhere pass or fail on file order.
+    """
+    assert logging.getLogger(llm_deadline.__name__).level == LOGGER_LEVEL_AT_IMPORT
 
 
 # ----------------------------------------------------------------- duration parsing

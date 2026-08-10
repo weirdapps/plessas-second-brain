@@ -1,9 +1,11 @@
 """Auth-retry policy tests for calendar_extractor.
 
 Before the fix: a single auth error in extract_event escapes the function
-and aborts the entire cmd_calendar_sync run — every later event is lost.
-After the fix: call_with_policy retries after reauth so one bad event does
-not kill the run.
+un-retried, so that event is lost. cmd_calendar_sync does catch it — the
+per-event try/except at src/cli.py:1375 counts it as `failed` and moves on —
+so the run survives, but the event is silently dropped rather than recovered.
+After the fix: call_with_policy reauths and retries, so a recoverable auth
+error costs a retry instead of an event.
 """
 
 from unittest.mock import patch
@@ -17,12 +19,14 @@ from src.llm_policy import ReauthResult
 _LONG_BODY = "A" * 60
 
 
-def test_one_bad_event_does_not_kill_the_whole_sync(monkeypatch):
+def test_one_bad_event_is_recovered_rather_than_dropped(monkeypatch):
     """One auth error triggers reauth; the second call succeeds.
 
-    Before the fix: RefreshError escapes from extract_event (no retry);
-    cmd_calendar_sync has no per-event guard, so the whole run aborts and
-    every later event is lost.
+    Before the fix: RefreshError escapes from extract_event with no retry.
+    cmd_calendar_sync's per-event try/except (src/cli.py:1375, pre-existing and
+    untouched by this branch) catches it, so the run continues — the cost is the
+    event, not the sync. That guard is why this test asserts on extract_event's
+    own return value rather than on a whole run.
     After the fix: call_with_policy retries after reauth and returns a result.
 
     running_on_linux is pinned False so decide() chooses REAUTH_RETRY (macOS

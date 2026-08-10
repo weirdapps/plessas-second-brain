@@ -9,7 +9,16 @@ from src.llm_policy import Outcome
 def test_a_local_refresh_failure_is_auth():
     # The one that actually happens: raised before any request is issued, so it
     # never reaches the Anthropic SDK's exception hierarchy.
-    exc = gauth.RefreshError("invalid_grant: Bad Request")
+    # Message is deliberately chosen to NOT match _AUTH_PATTERNS, so only the
+    # isinstance(exc, gauth.RefreshError) type check can save this test.
+    exc = gauth.RefreshError("token expired")
+    assert classify_exception(exc, None) is Outcome.AUTH_REAUTH_REQUIRED
+
+
+def test_the_string_widener_catches_a_wrapped_auth_error():
+    # A non-gauth, non-anthropic exception whose message matches _AUTH_PATTERNS;
+    # the type checks above all miss it, so only is_vertex_auth_error() saves it.
+    exc = RuntimeError("reauthentication is needed")
     assert classify_exception(exc, None) is Outcome.AUTH_REAUTH_REQUIRED
 
 
@@ -25,6 +34,13 @@ def test_a_permission_denied_is_auth():
 
 def test_a_rate_limit_is_not_auth():
     exc = anthropic.RateLimitError.__new__(anthropic.RateLimitError)
+    assert classify_exception(exc, None) is Outcome.RATE_LIMIT
+
+
+def test_an_overloaded_error_is_a_rate_limit():
+    # OverloadedError (529) shares the rate-limit retry posture (cap 3, 60s base)
+    # but is NOT a subclass of RateLimitError; it needs its own isinstance branch.
+    exc = anthropic.OverloadedError.__new__(anthropic.OverloadedError)
     assert classify_exception(exc, None) is Outcome.RATE_LIMIT
 
 
@@ -47,6 +63,13 @@ def test_a_max_tokens_stop_is_truncated_not_retryable():
 def test_a_normal_response_is_ok():
     resp = type("R", (), {"stop_reason": "end_turn"})()
     assert classify_exception(None, resp) is Outcome.OK
+
+
+def test_no_exception_and_no_response_is_empty():
+    # Both None means the caller received nothing; one retry is warranted.
+    # Previously returned OK, which would fool decide() into treating a missing
+    # extraction as a success.
+    assert classify_exception(None, None) is Outcome.EMPTY
 
 
 def test_reset_client_cache_is_registered_as_a_post_reauth_callback():

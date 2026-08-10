@@ -246,8 +246,10 @@ def extract_inline(
                     return (msg_id, None, True)
             from src.extract.policy_bridge import classify_exception
             from src.llm_policy import Outcome
+
             if classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED:
                 from src.extract.vertex_auth import touch_sentinel
+
                 log(
                     f"Auth failure on msg {msg_id}: credential expired; "
                     "writing reauth sentinel and stopping."

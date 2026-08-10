@@ -169,7 +169,9 @@ def test_an_auth_error_triggers_one_reauth_then_succeeds(monkeypatch):
             calls.append(kw)
             if len(calls) == 1:
                 raise gauth.RefreshError("invalid_grant: Bad Request")
-            return type("R", (), {"stop_reason": "end_turn", "content": [type("C", (), {"text": "{}"})()]})()
+            return type(
+                "R", (), {"stop_reason": "end_turn", "content": [type("C", (), {"text": "{}"})()]}
+            )()
 
     fake = type("Client", (), {"messages": FakeMessages()})()
     monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (fake, "m"))
@@ -266,10 +268,14 @@ def test_reauth_receives_the_same_is_linux_as_decide(monkeypatch):
             calls.append(kw)
             if len(calls) == 1:
                 raise gauth.RefreshError("invalid_grant: Bad Request")
-            return type("R", (), {
-                "stop_reason": "end_turn",
-                "content": [type("C", (), {"text": "{}"})()],
-            })()
+            return type(
+                "R",
+                (),
+                {
+                    "stop_reason": "end_turn",
+                    "content": [type("C", (), {"text": "{}"})()],
+                },
+            )()
 
     fake = type("Client", (), {"messages": FakeMessages()})()
     monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (fake, "m"))

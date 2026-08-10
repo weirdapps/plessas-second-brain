@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import time
+from pathlib import Path
 
 from src.llm_policy import MAX_ATTEMPTS, ROW_CAPS, backoff
 
@@ -62,6 +63,62 @@ MAX_CALL_SECONDS = 120.0
 _MAX_REACHABLE_BACKOFF_SECONDS = max(
     backoff(n, outcome) for outcome in ROW_CAPS for n in range(1, MAX_ATTEMPTS)
 )
+
+
+_CGROUP_PATH = Path("/proc/self/cgroup")
+_SERVICE_SUFFIX = ".service"
+
+
+def _detect_systemd_unit(cgroup_path: Path = _CGROUP_PATH) -> str | None:
+    """The systemd unit this process is running under, or None when there isn't one.
+
+    HOW THE PROCESS KNOWS WHICH UNIT IT IS, and why the obvious answer does not work.
+    news had a ``--profile`` argument; here the units run shell wrappers that invoke a
+    Python entrypoint, and unit-file changes were withdrawn from the spec, so the
+    candidate was the CLI subcommand. It cannot answer the question. THREE units invoke
+    ``src.cli sync``, and two of them pass byte-identical argv:
+
+        sb-daily-sync   (1800)  sync --engine claude --workers 8
+        sb-noon-catchup (1800)  sync --engine claude --workers 8 --skip-export
+        sb-outlook-sync ( 600)  sync --engine claude --workers 8 --skip-export
+
+    So argv maps ``sync`` to both 1800 and 600 with nothing to choose between them.
+    Taking the larger over-budgets sb-outlook-sync by 1200s, which is the SIGKILL-with-
+    nothing-written case this whole mechanism exists to prevent. Taking the smaller
+    silently denies the token-push wait to the two 30-minute units that can most afford
+    it. Neither reading is right and argv offers no third. Two units do not run
+    ``src.cli`` at all, which a subcommand table could not reach in any case.
+
+    The cgroup answers it exactly. Under a systemd user manager the process's cgroup
+    path ends in its own unit. Verified on the VPS on 2026-08-11, cgroup v2:
+
+        0::/user.slice/user-1000.slice/user@1000.service/app.slice/sb-daily-sync.service
+
+    It survives the two layers of bash wrapper between the unit and Python, because
+    children inherit their parent's cgroup — also verified, through a nested
+    bash -> bash -> child. It needs no unit-file change, no new CLI argument and no
+    wrapper edit.
+
+    Returns None wherever the answer is not certain: no ``/proc`` (every developer Mac),
+    or no segment matching a known unit (CI, and a hand-run over SSH, which sits in a
+    ``session-N.scope``). Membership in ``_UNIT_TIMEOUT_SECONDS`` is what rejects that
+    noise, and it is also what rejects the ``user@1000.service`` slice that every path
+    above contains.
+    """
+    try:
+        raw = cgroup_path.read_text()
+    except OSError:
+        return None
+    # cgroup v2 writes a single "0::<path>" line; v1 writes several
+    # "N:controller:<path>" lines. Scanning every segment of every line, innermost
+    # first, covers both without branching on the version.
+    for line in raw.splitlines():
+        for segment in reversed(line.split("/")):
+            if segment.endswith(_SERVICE_SUFFIX):
+                unit = segment[: -len(_SERVICE_SUFFIX)]
+                if unit in _UNIT_TIMEOUT_SECONDS:
+                    return unit
+    return None
 
 
 def _parse_systemd_duration(s: str) -> int | None:
@@ -279,3 +336,28 @@ def install_llm_deadline(
         _MAX_REACHABLE_BACKOFF_SECONDS,
     )
     return deadline
+
+
+def install_llm_deadline_for_this_process() -> float | None:
+    """Entrypoint hook: work out this process's unit and install its deadline.
+
+    The one line an entrypoint calls. Detection is deliberately behind this seam, so
+    changing how a process identifies its unit touches ``_detect_systemd_unit`` and
+    nothing else — every function below it takes a unit NAME.
+
+    Also gives this module's logger a handler when nothing else has configured logging,
+    which is the case under ``src/cli.py``. Without it the budget line — the only record
+    of which budget a run is actually under — is dropped by the root logger, while the
+    drift WARNING still surfaces via logging's last-resort handler, so the failure is
+    invisible and one-sided. Scoped to this logger rather than ``basicConfig``: this
+    module has no business switching on INFO for every other library in the process.
+    The unit wrappers redirect stderr into the per-unit log file, so that is where it
+    lands.
+    """
+    logger = logging.getLogger(__name__)
+    if not logging.getLogger().handlers and not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(message)s"))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    return install_llm_deadline(_detect_systemd_unit())

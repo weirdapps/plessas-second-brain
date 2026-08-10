@@ -281,6 +281,46 @@ def test_a_credential_that_comes_back_is_noticed_without_repeating_the_wait(monk
     assert claude_extract._cached_client_and_model is None
 
 
+def test_a_recovery_that_does_not_stick_still_costs_only_one_wait(monkeypatch):
+    """ADC probes good, the call fails auth anyway. The run must not buy a second wait.
+
+    This is the case that separates SUCCEEDED from SKIPPED, and nothing else does. In the
+    happy recovery above, the retry succeeds and the policy returns before the difference
+    can show: both results produce one wait and one response, so that test passes under
+    either. Here the credential probes good but the call still 401s — a project or region
+    problem wearing an auth error's clothes, or a push that landed half-written — and the
+    two diverge. SUCCEEDED spends the auth budget, so ``attempt.reauth_used`` makes the
+    next auth failure UNRECOVERABLE_AUTH and terminal. SKIPPED spends nothing, so the very
+    next failure finds a freshly cleared latch and walks into a full 1020s wait, which is
+    the outcome the latch exists to prevent and the reason the probe was allowed through
+    it in the first place.
+
+    Would this pass with the behaviour removed? No. Return ReauthResult.SKIPPED from the
+    recovered branch and ``reauth_calls`` reads 2 rather than 1. That mutation survived
+    every other test in this file.
+    """
+    monkeypatch.setenv("PTS_LLM_DEADLINE", repr(time.time() + BUDGET_SECONDS))
+    monkeypatch.setattr(claude_extract, "running_on_linux", lambda: True)
+
+    recovered = []
+    monkeypatch.setattr(claude_extract, "default_adc_probe", lambda: bool(recovered))
+
+    reauth_calls: list[dict] = []
+
+    def failing_reauth(**kwargs):
+        reauth_calls.append(kwargs)
+        return ReauthResult.FAILED
+
+    with patch.object(claude_extract, "reauth", side_effect=failing_reauth):
+        with pytest.raises(gauth.RefreshError):
+            claude_extract.call_with_policy(_always_auth_fails, max_call_seconds=120.0)
+        recovered.append(True)
+        with pytest.raises(gauth.RefreshError):
+            claude_extract.call_with_policy(_always_auth_fails, max_call_seconds=120.0)
+
+    assert len(reauth_calls) == 1
+
+
 def test_a_latched_probe_that_still_fails_does_not_reopen_the_wait(monkeypatch):
     """Probing is not un-latching. A dead credential must still cost nothing.
 

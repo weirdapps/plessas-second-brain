@@ -108,30 +108,35 @@ def classify_with_vision(img_path: Path, conn: sqlite3.Connection) -> tuple[Clas
 
     img_b64, media_type = _encode_image_for_vision(img_path)
 
-    from src.extract.claude_extract import _get_client_and_model
+    from src.extract.claude_extract import _get_client_and_model, call_with_policy
 
-    client, model = _get_client_and_model()
-
-    resp = client.messages.create(
-        model=model,
-        max_tokens=MAX_TOKENS,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": img_b64,
+    # _do_call re-fetches the client on every attempt so a successful reauth
+    # (which calls reset_client_cache) is picked up by the retry rather than
+    # silently reusing the stale credential.
+    def _do_call():
+        cur_client, cur_model = _get_client_and_model()
+        return cur_client.messages.create(
+            model=cur_model,
+            max_tokens=MAX_TOKENS,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": img_b64,
+                            },
                         },
-                    },
-                    {"type": "text", "text": VISION_PROMPT},
-                ],
-            }
-        ],
-    )
+                        {"type": "text", "text": VISION_PROMPT},
+                    ],
+                }
+            ],
+        )
+
+    resp = call_with_policy(_do_call, max_call_seconds=120.0)
     raw = resp.content[0].text
     label, desc = parse_vision_response(raw)
 

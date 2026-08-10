@@ -242,3 +242,46 @@ def test_linux_auth_error_gives_up_immediately_without_reauth(monkeypatch):
             claude_extract.extract_one({"id": "1", "subject": "s", "body": "b"})
     assert len(calls) == 1
     assert mock_reauth.call_count == 0
+
+
+def test_reauth_receives_the_same_is_linux_as_decide(monkeypatch):
+    """reauth(is_linux=...) and decide(is_linux=...) must use the same value.
+
+    call_with_policy computes is_linux = running_on_linux() and passes it to
+    decide().  If reauth() is called without is_linux=is_linux, the two can
+    disagree silently: on a VPS decide() sees True (WAIT_FOR_PUSH) while
+    reauth() auto-detects and runs the macOS gcloud script instead of polling.
+
+    running_on_linux is pinned False (macOS path) so the budget admits one
+    reauth, and the captured kwargs must carry is_linux=False.
+
+    Mutation check: reverting reauth(is_linux=is_linux) to bare reauth() leaves
+    reauth_calls[0] empty, making reauth_calls[0]["is_linux"] raise KeyError.
+    """
+    calls = []
+    reauth_calls = []
+
+    class FakeMessages:
+        def create(self, **kw):
+            calls.append(kw)
+            if len(calls) == 1:
+                raise gauth.RefreshError("invalid_grant: Bad Request")
+            return type("R", (), {
+                "stop_reason": "end_turn",
+                "content": [type("C", (), {"text": "{}"})()],
+            })()
+
+    fake = type("Client", (), {"messages": FakeMessages()})()
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (fake, "m"))
+    monkeypatch.setattr(claude_extract, "running_on_linux", lambda: False)
+    monkeypatch.setattr("src.extract.parser.parse_extraction", lambda text, **k: {})
+
+    def _capturing_reauth(**kwargs):
+        reauth_calls.append(kwargs)
+        return ReauthResult.SUCCEEDED
+
+    with patch.object(claude_extract, "reauth", side_effect=_capturing_reauth):
+        claude_extract.extract_one({"id": "1", "subject": "s", "body": "b", "message_id": "1"})
+
+    assert len(reauth_calls) == 1
+    assert reauth_calls[0]["is_linux"] is False

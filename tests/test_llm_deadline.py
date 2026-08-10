@@ -316,6 +316,50 @@ def test_the_entrypoint_hook_installs_the_detected_units_budget(monkeypatch):
     assert installed - time.time() == pytest.approx(3390, abs=1.0)
 
 
+def test_the_hook_does_not_stack_log_handlers_when_called_repeatedly(monkeypatch):
+    """The handler install is idempotent: N calls, at most one handler.
+
+    Nothing stops a process calling the hook more than once — an entrypoint that grew a
+    second call, or a test module invoking it per case. Each extra StreamHandler would
+    duplicate every subsequent line, so a log that exists to be read becomes a log that
+    is read twice and trusted less.
+
+    Would this pass with the behaviour removed? No. Dropping the `not logger.handlers`
+    half of the guard — keeping only the root-handlers check, which is the natural way
+    to write it if idempotency is not in mind — makes the third call leave 3 handlers
+    and this assertion reads 1.
+    """
+    logger = logging.getLogger(llm_deadline.__name__)
+    monkeypatch.setattr(llm_deadline, "_detect_systemd_unit", lambda *a, **k: None)
+    # Strip both the root's handlers and this logger's, so the install branch is the one
+    # actually taken. pytest installs a root handler of its own, which would otherwise
+    # short-circuit the guard and make this test vacuous.
+    monkeypatch.setattr(logging.getLogger(), "handlers", [])
+    monkeypatch.setattr(logger, "handlers", [])
+
+    for _ in range(3):
+        llm_deadline.install_llm_deadline_for_this_process()
+
+    assert len(logger.handlers) == 1
+
+
+def test_the_hook_defers_to_existing_logging_configuration(monkeypatch):
+    """When real logging config exists, add nothing and let the record propagate.
+
+    Would this pass with the behaviour removed? No. Dropping the root-handlers half of
+    the guard installs a private handler alongside the application's own, so every line
+    from this module is emitted twice under any process that called basicConfig.
+    """
+    logger = logging.getLogger(llm_deadline.__name__)
+    monkeypatch.setattr(llm_deadline, "_detect_systemd_unit", lambda *a, **k: None)
+    monkeypatch.setattr(logging.getLogger(), "handlers", [logging.NullHandler()])
+    monkeypatch.setattr(logger, "handlers", [])
+
+    llm_deadline.install_llm_deadline_for_this_process()
+
+    assert logger.handlers == []
+
+
 # ----------------------------------------------------------------- duration parsing
 
 

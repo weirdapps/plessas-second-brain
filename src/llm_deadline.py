@@ -12,6 +12,18 @@ is executing. That is not cosmetic in either direction:
     TimeoutStartSec of 300. A 900s budget lets the policy plan retries the unit will be
     SIGTERMed in the middle of.
 
+THREE SEPARATE QUESTIONS, answered by three separate mechanisms. They are easy to
+conflate on a later read, and conflating them is how a budget quietly becomes wrong:
+
+  1. WHICH unit is this process?      ``_detect_systemd_unit`` reads /proc/self/cgroup.
+     Exact membership in the table below, never a prefix or a glob. No unit, no
+     deadline; a guessed unit is worse than none.
+  2. WHAT SHOULD its timeout be?      ``_UNIT_TIMEOUT_SECONDS``, the checked-in table.
+     This is the expected value, and the thing a reviewer can read.
+  3. WHAT IS its timeout right now?   ``_query_systemd_timeout`` asks systemd, gated on
+     LoadState. The SMALLER of (2) and (3) wins, with a warning naming both, because
+     the dangerous drift is a unit whose timeout was cut while the table was not.
+
 Ported from news's ``main.py`` (``_deadline_reserve_seconds``, ``_llm_budget_seconds``,
 ``_query_systemd_timeout``, ``install_llm_deadline``), which this mirrors deliberately
 rather than reinventing. ``src/llm_policy.py`` is a vendored copy under a SHA drift
@@ -116,6 +128,11 @@ def _detect_systemd_unit(cgroup_path: Path = _CGROUP_PATH) -> str | None:
         for segment in reversed(line.split("/")):
             if segment.endswith(_SERVICE_SUFFIX):
                 unit = segment[: -len(_SERVICE_SUFFIX)]
+                # EXACT table key. Not a prefix, not an `sb-*` glob. A future
+                # sb-something-new.service has no entry, so its real TimeoutStartSec is
+                # unknown and it must get no deadline rather than the wrong one — the
+                # same "no unit, no guess" rule as everywhere else here. This is also
+                # what rejects the enclosing user@1000.service slice.
                 if unit in _UNIT_TIMEOUT_SECONDS:
                     return unit
     return None

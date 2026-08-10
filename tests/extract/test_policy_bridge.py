@@ -56,4 +56,10 @@ def test_reset_client_cache_is_registered_as_a_post_reauth_callback():
         policy_bridge,  # noqa: F401 — side-effect: registers reset_client_cache
     )
 
-    assert claude_extract.reset_client_cache in llm_policy._POST_REAUTH
+    count = llm_policy._POST_REAUTH.count(claude_extract.reset_client_cache)
+    assert count == 1, (
+        f"reset_client_cache registered {count} time(s); expected exactly 1. "
+        "A count of 2 means policy_bridge was imported under two different module "
+        "names (e.g. both 'src.extract.policy_bridge' and 'extract.policy_bridge') "
+        "causing the module-level register_post_reauth call to execute twice."
+    )

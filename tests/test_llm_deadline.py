@@ -243,6 +243,24 @@ def test_the_enclosing_user_manager_slice_is_not_mistaken_for_the_unit(tmp_path)
     assert llm_deadline._detect_systemd_unit(path) is None
 
 
+def test_a_future_sb_unit_absent_from_the_table_gets_no_deadline(tmp_path):
+    """Membership is an exact table key, never a prefix or a glob.
+
+    A `sb-something-new.service` added to the estate later has no entry here, so its
+    real TimeoutStartSec is unknown. It must get no deadline rather than the wrong one:
+    matching on the `sb-` prefix would hand it whatever budget the lookup fell through
+    to, which is the guessed budget this design refuses.
+
+    Would this pass with the behaviour removed? No, and it was a genuine gap — nothing
+    caught this before. Relaxing the check to `unit.startswith("sb-")` leaves all 754
+    other tests green, including the user@1000 one above, because "user@1000" and
+    "other" fail a prefix test for unrelated reasons. Only an sb-prefixed name that is
+    absent from the table separates exact membership from a glob.
+    """
+    path = _cgroup_file(tmp_path, CGROUP_V2.format(unit="sb-something-new"))
+    assert llm_deadline._detect_systemd_unit(path) is None
+
+
 def test_a_hand_run_over_ssh_has_no_unit(tmp_path):
     """An interactive session sits in a session-N.scope, not a .service.
 

@@ -32,11 +32,10 @@ WORKERS = 4
 # derived from the code it is checking cannot fail when that code's numbers move.
 BUDGET_SECONDS = 5000
 
-# Long enough that a thread has every opportunity to travel from the barrier to the
-# latch while the first worker is still inside reauth(), and short enough to keep the
-# suite fast. Thread handoff here is microseconds; this is four orders of magnitude
-# more. A latch that released its lock before calling reauth() would let all four
-# workers through this window.
+# Ceiling on how long the first worker is held inside reauth(), NOT the mechanism that
+# detects a broken latch. See second_entrant_or_timeout: the first worker leaves the
+# instant a second one arrives, so a broken latch is caught by arrival, not by outliving
+# a sleep. This bound only stops a passing run from hanging.
 HOLD_SECONDS = 0.5
 
 
@@ -66,27 +65,44 @@ def test_concurrent_workers_pay_the_push_wait_only_once(monkeypatch):
         did before: each of the four workers invokes it once before its Attempt's
         reauth_used flag stops it, so ``reauth_calls`` lands at 4.
       * Keep the flag but release the lock before calling reauth (check-then-call):
-        the barrier guarantees all four arrive while the flag is still clear, so all
-        four pass the check and all four enter reauth. Also 4. This is the mutation
-        that matters, because it is what an implementation guarding only the flag
-        reads would look like, and it is invisible without forced overlap.
+        all four pass the check while the flag is still clear and all four enter
+        reauth. Also 4. This is the mutation that matters, because it is what an
+        implementation guarding only the flag reads would look like, and it is
+        invisible without forced overlap.
 
-    The barrier is what makes the second mutation detectable rather than a coin flip.
-    It also fails the test outright if fewer than WORKERS threads arrive, so the run
-    cannot quietly degrade into a sequential one that proves nothing.
+    TWO SYNCHRONISATION POINTS, BOTH FORCED RATHER THAN HOPED FOR. An earlier test in
+    this project passed eight times out of eight with its mutex removed, purely on GIL
+    scheduling, so neither of these is a sleep:
+
+      * ``at_the_latch``, a Barrier(WORKERS) inside fn(), makes all four workers reach
+        the latch simultaneously. If fewer arrive it raises and the test fails, so the
+        run cannot quietly degrade into a sequential one that proves nothing.
+      * ``second_entrant_or_timeout``, a Barrier(2) inside the stub reauth, holds the
+        first worker until a SECOND worker enters. That inverts the detection: a broken
+        latch is caught the instant another worker arrives, not by whether it happens to
+        arrive inside a fixed sleep window. Under the correct latch nobody else ever
+        enters, the barrier times out, and the test passes; under either mutation the
+        second entrant releases it immediately and the count is already wrong. The
+        failing path is therefore fast and certain rather than racing a timer.
     """
     monkeypatch.setenv("PTS_LLM_DEADLINE", repr(time.time() + BUDGET_SECONDS))
     # CI is ubuntu-latest and development is macOS; pin the branch under test.
     monkeypatch.setattr(claude_extract, "running_on_linux", lambda: True)
 
     at_the_latch = threading.Barrier(WORKERS, timeout=10)
+    second_entrant_or_timeout = threading.Barrier(2, timeout=HOLD_SECONDS)
     reauth_calls: list[dict] = []
     calls_lock = threading.Lock()
 
     def slow_failing_reauth(**kwargs):
         with calls_lock:
             reauth_calls.append(kwargs)
-        threading.Event().wait(HOLD_SECONDS)
+        try:
+            # Returns only when another worker also gets in here, which the latch is
+            # supposed to make impossible. BrokenBarrierError is the PASSING path.
+            second_entrant_or_timeout.wait()
+        except threading.BrokenBarrierError:
+            pass
         return ReauthResult.FAILED
 
     def worker(_):

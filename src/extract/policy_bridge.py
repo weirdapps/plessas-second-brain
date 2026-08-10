@@ -28,7 +28,7 @@ def classify_exception(exc: BaseException | None, response: object | None) -> Ou
             return Outcome.AUTH_REAUTH_REQUIRED
         if isinstance(exc, anthropic.AuthenticationError | anthropic.PermissionDeniedError):
             return Outcome.AUTH_REAUTH_REQUIRED
-        if isinstance(exc, anthropic.RateLimitError):
+        if isinstance(exc, anthropic.RateLimitError | anthropic.OverloadedError):
             return Outcome.RATE_LIMIT
         if isinstance(exc, anthropic.APITimeoutError):
             return Outcome.TIMEOUT
@@ -37,6 +37,9 @@ def classify_exception(exc: BaseException | None, response: object | None) -> Ou
         if is_vertex_auth_error(exc):
             return Outcome.AUTH_REAUTH_REQUIRED
         return Outcome.API_ERROR
+
+    if response is None:
+        return Outcome.EMPTY
 
     stop = getattr(response, "stop_reason", None)
     if stop == "refusal":

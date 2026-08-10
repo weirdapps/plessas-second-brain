@@ -88,10 +88,14 @@ def test_classify_with_vision_auth_error_triggers_reauth(tmp_path, monkeypatch):
             calls.append(kw)
             if len(calls) == 1:
                 raise gauth.RefreshError("invalid_grant: Bad Request")
-            return type("R", (), {
-                "stop_reason": "end_turn",
-                "content": [type("C", (), {"text": "CONTENT: a red square"})()],
-            })()
+            return type(
+                "R",
+                (),
+                {
+                    "stop_reason": "end_turn",
+                    "content": [type("C", (), {"text": "CONTENT: a red square"})()],
+                },
+            )()
 
     fake = type("Client", (), {"messages": FakeMessages()})()
     # classify_with_vision does a lazy import of _get_client_and_model from

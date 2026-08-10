@@ -104,10 +104,14 @@ def test_extract_one_attachment_auth_error_triggers_reauth(monkeypatch):
             calls.append(kw)
             if len(calls) == 1:
                 raise gauth.RefreshError("invalid_grant: Bad Request")
-            return type("R", (), {
-                "stop_reason": "end_turn",
-                "content": [type("C", (), {"text": '{"summary": "ok"}'})()],
-            })()
+            return type(
+                "R",
+                (),
+                {
+                    "stop_reason": "end_turn",
+                    "content": [type("C", (), {"text": '{"summary": "ok"}'})()],
+                },
+            )()
 
     fake = type("Client", (), {"messages": FakeMessages()})()
     # _extract_one_attachment uses a lazy import of _get_client_and_model from
@@ -121,8 +125,12 @@ def test_extract_one_attachment_auth_error_triggers_reauth(monkeypatch):
     monkeypatch.setattr(
         "src.extract.parser.parse_extraction",
         lambda text, **kw: {
-            "summary": "ok", "language": "en",
-            "topics": [], "decisions": [], "action_items": [], "key_facts": [],
+            "summary": "ok",
+            "language": "en",
+            "topics": [],
+            "decisions": [],
+            "action_items": [],
+            "key_facts": [],
         },
     )
 

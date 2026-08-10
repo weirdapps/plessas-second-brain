@@ -41,10 +41,14 @@ def test_one_bad_event_does_not_kill_the_whole_sync(monkeypatch):
             calls.append(kw)
             if len(calls) == 1:
                 raise gauth.RefreshError("invalid_grant: Bad Request")
-            return type("R", (), {
-                "stop_reason": "end_turn",
-                "content": [type("C", (), {"text": "{}"})()],
-            })()
+            return type(
+                "R",
+                (),
+                {
+                    "stop_reason": "end_turn",
+                    "content": [type("C", (), {"text": "{}"})()],
+                },
+            )()
 
     fake = type("Client", (), {"messages": FakeMessages()})()
     # Patch _get_client_and_model at calendar_extractor's module level (it is a

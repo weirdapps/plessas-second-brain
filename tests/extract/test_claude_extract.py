@@ -17,7 +17,7 @@ import google.auth.exceptions as gauth
 import pytest
 
 from src.extract import claude_extract
-from src.llm_policy import MAX_ATTEMPTS, ReauthResult
+from src.llm_policy import ReauthResult
 
 
 @pytest.fixture(autouse=True)
@@ -176,6 +176,19 @@ def test_an_auth_error_triggers_one_reauth_then_succeeds(monkeypatch):
 
 
 def test_repeated_auth_errors_stop_at_the_cap(monkeypatch):
+    """Auth fails twice and the policy gives up after exactly two SDK calls.
+
+    Call sequence when every create() raises RefreshError and reauth returns SUCCEEDED:
+      1. Call 1 → RefreshError → AUTH_REAUTH_REQUIRED → REAUTH_RETRY.
+         reauth() returns SUCCEEDED (not SKIPPED), so with_reauth_used() sets the
+         one-shot latch.
+      2. Call 2 → RefreshError → AUTH_REAUTH_REQUIRED → decide() sees reauth_used=True
+         → UNRECOVERABLE_AUTH immediately (before the global total cap).
+         Loop gives up and re-raises the RefreshError.
+
+    Total SDK calls: 2.  A mutation that cuts retries to one call (while keeping the
+    raise) leaves len(calls)==1, which kills this assertion.
+    """
     calls = []
 
     class FakeMessages:
@@ -188,4 +201,4 @@ def test_repeated_auth_errors_stop_at_the_cap(monkeypatch):
     with patch.object(claude_extract, "reauth", return_value=ReauthResult.SUCCEEDED):
         with pytest.raises(gauth.RefreshError):
             claude_extract.extract_one({"id": "1", "subject": "s", "body": "b"})
-    assert len(calls) <= MAX_ATTEMPTS
+    assert len(calls) == 2

@@ -108,6 +108,15 @@ _RAW_EVENT = {
     ],
 }
 
+# WHAT list-calendar ACTUALLY RETURNS: a SUBSET, without Attendees or ResponseStatus. That
+# is why cmd_calendar_sync issues a second get-event call per changed event at all, and it
+# is the whole reason a failed fetch must write nothing rather than write 'pending' — the
+# event dict still in hand at that point is this one, and load_event replaces the attendee
+# rows wholesale from it. A fixture that returned the full event from both calls would make
+# that difference invisible, and did: it let "write pending on a fetch failure" survive
+# mutation testing until the fixture was corrected.
+_LIST_EVENT = {k: v for k, v in _RAW_EVENT.items() if k not in ("Attendees", "ResponseStatus")}
+
 
 def _calendar_db(tmp_path) -> str:
     """A v12 database, migrated up. The same shape tests/test_calendar_loader.py builds.
@@ -198,7 +207,7 @@ def _run_sync(
             return None
         return {**_RAW_EVENT, "Body": {"Content": body}}
 
-    monkeypatch.setattr(calendar_export, "list_events", lambda since, until: [_RAW_EVENT])
+    monkeypatch.setattr(calendar_export, "list_events", lambda since, until: [_LIST_EVENT])
     monkeypatch.setattr(calendar_export, "get_event_body", _body)
     monkeypatch.setattr(extractor, "extract_event", extract)
     args = _sync_args(db_path)

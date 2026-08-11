@@ -279,17 +279,20 @@ def test_the_wait_is_affordable_only_in_the_first_450_seconds_of_a_1800s_unit():
     lives in the vendored llm_policy and is pinned by test_llm_policy_drift instead; a
     change to it could not reach this file without that guard firing first.
 
-    The boundary is asserted from both sides, so a fencepost slip either way is caught.
+    The boundary is asserted from both sides with LITERAL elapsed times. It used to be
+    written as `budget - window >= WAIT_NEEDS_SECONDS` with `window = budget -
+    WAIT_NEEDS_SECONDS`, which reduces algebraically to `WAIT_NEEDS_SECONDS >=
+    WAIT_NEEDS_SECONDS` — true for every budget that exists, so it guarded nothing while
+    the docstring sold it as the fencepost guard. A false claim about what a test protects
+    is worse than no claim. The teeth are `budget == 1590` and the two literals below.
     """
     budget = llm_deadline._llm_budget_seconds("sb-daily-sync", llm_deadline.MAX_CALL_SECONDS)
     assert budget == 1590
 
-    # decide() grants the wait while `now + 1020 + 120 <= deadline`, i.e. while the elapsed
-    # part of the budget is at most 1590 - 1140.
-    window = budget - WAIT_NEEDS_SECONDS
-    assert window == 450
-    assert budget - window >= WAIT_NEEDS_SECONDS  # at t=450 the wait still fits
-    assert budget - (window + 1) < WAIT_NEEDS_SECONDS  # at t=451 it does not
+    # decide() grants the wait while `now + 1020 + 120 <= deadline`, i.e. while at least
+    # 1140s of the budget remain. At 450s elapsed 1140 remain and it fits; at 451, 1139.
+    assert budget - 450 >= 1140
+    assert budget - 451 < 1140
 
     # sb-attachments, the only 3600s unit, gets 2250s of the same window.
     attachments = llm_deadline._llm_budget_seconds("sb-attachments", llm_deadline.MAX_CALL_SECONDS)
@@ -816,6 +819,36 @@ def test_an_unusable_start_time_falls_back_to_this_process(monkeypatch, caplog, 
     a silent fallback to the buggy behaviour is the failure mode worth catching.
     """
     monkeypatch.setattr(llm_deadline.subprocess, "run", _fake_systemctl(stdout))
+    with caplog.at_level(logging.WARNING):
+        deadline = llm_deadline.install_llm_deadline("sb-daily-sync", now=1_000_000.0)
+    assert deadline == 1_001_590.0, why
+    assert "ExecMainStartTimestamp" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("run", "why"),
+    [
+        (_no_systemctl, "systemctl absent"),
+        (_fake_systemctl("", returncode=1), "systemctl exits non-zero"),
+        (_fake_systemctl("LoadState=not-found\nTimeoutStartUSec=1min 30s\n"), "unit not loaded"),
+    ],
+)
+def test_a_query_that_fails_outright_still_falls_back_and_says_so(monkeypatch, caplog, run, why):
+    """The whole query failing, not just the timestamp inside a good answer.
+
+    The three fallback cases above all hand back a WORKING systemctl describing a loaded
+    unit with a bad timestamp. These are the other shape: no answer at all, which is what a
+    systemd upgrade, a renamed unit or a LoadState change produces. It reaches the same
+    fallback by a different route — _query_systemd_unit returns _NO_UNIT_FACTS, so
+    start_time is None — and it silently reinstates the whole C1 regression, every process
+    in the unit back on its own clock, with nothing but a warning to say so.
+
+    Would this pass with the behaviour removed? No. Reading start_time without a None guard
+    raises TypeError on `None + budget`; dropping the warning leaves the second assertion
+    red, which is the point — a silent fallback to the per-process anchor is precisely the
+    failure this whole mechanism was added to remove.
+    """
+    monkeypatch.setattr(llm_deadline.subprocess, "run", run)
     with caplog.at_level(logging.WARNING):
         deadline = llm_deadline.install_llm_deadline("sb-daily-sync", now=1_000_000.0)
     assert deadline == 1_001_590.0, why

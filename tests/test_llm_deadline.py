@@ -48,6 +48,13 @@ UNIT_TIMEOUT_AND_BUDGET = {
 # token-push wait only to a budget at or above this.
 WAIT_NEEDS_SECONDS = 1140
 
+# Units whose wrapper never invokes src.cli, so install_llm_deadline_for_this_process never
+# runs for them and the policy keeps its own flat 900s default however generous their
+# TimeoutStartSec is. sb-curate-docs runs scripts/curate_documents_daily.py directly.
+# Read off the VPS on 2026-08-11 with `grep -c src.cli ~/.local/bin/sb-*.sh`: this is the
+# only one of the ten that returns 0.
+UNITS_NOT_ON_THE_CLI = {"sb-curate-docs"}
+
 # The module logger's level before any test in this file has run. Captured at import,
 # which pytest does for every module during collection, i.e. before the first test.
 # _clean_deadline_env restores this; test_the_handler_tests_do_not_leak_the_loggers_level
@@ -213,6 +220,15 @@ def test_every_scheduled_unit_has_a_positive_margin():
 def test_only_the_long_units_can_fund_a_token_push_wait():
     """Six units can afford the wait, four cannot. The split is the point of the port.
 
+    CAPABILITY, NOT PRACTICE. This is the set whose BUDGET clears the bar. One of the six,
+    sb-curate-docs, never gets that budget in production: its wrapper runs
+    scripts/curate_documents_daily.py and never touches src.cli, so the hook that installs
+    PTS_LLM_DEADLINE does not run and the policy applies its own flat 900s default.
+    Verified on the VPS on 2026-08-11 — `grep -c src.cli ~/.local/bin/sb-curate-docs.sh`
+    returns 0, while the other nine wrappers return 1, 2 or 3. Six is what the table
+    permits; five is what the estate actually does. Keeping the two apart here is what
+    stops the table quietly becoming a claim about production that nobody checked.
+
     Would this pass with the behaviour removed? No. Under today's flat 900s default,
     900 < 1140, so NO unit funds a wait and the qualifying set is empty rather than
     these six. Under a per-unit budget it is exactly these six.
@@ -231,6 +247,47 @@ def test_only_the_long_units_can_fund_a_token_push_wait():
         "sb-noon-catchup",
         "sb-reverse-ingest",
     }
+    assert funds_wait - UNITS_NOT_ON_THE_CLI == {
+        "sb-attachments",
+        "sb-daily-sync",
+        "sb-news-sync",
+        "sb-noon-catchup",
+        "sb-reverse-ingest",
+    }
+
+
+def test_the_wait_is_affordable_only_in_the_first_450_seconds_of_a_1800s_unit():
+    """The window is a consequence of the arithmetic; state it rather than leave it implicit.
+
+    A 1800s unit budgets 1590s and the wait needs 1140 (PUSH_WAIT 1020 + one 120s call), so
+    the reservation fits only while at least 1140s of the budget remain — the first 450
+    seconds of the run, and not one second more. After that the SAME auth error correctly
+    yields UNRECOVERABLE_AUTH instead, and that is the mechanism working, not failing: a
+    wait begun at t=451 would be cut short by SIGTERM with nothing written.
+
+    This is also why the anchor in _deadline_anchor is not a detail. Four of these units
+    run more than one src.cli process per invocation; anchored per process, a sibling
+    starting at t=1800 would believe it was inside its own first 450 seconds and take a
+    wait the unit has no room for at all.
+
+    Would this pass with the behaviour removed? It pins arithmetic rather than a branch, so
+    the mutations are to the numbers it depends on: any change to the reserve, to
+    PUSH_WAIT_SECONDS, or to MAX_CALL_SECONDS moves the window off 450 and the assertions
+    fail. The boundary is tested from both sides, so a fencepost slip in either direction
+    is caught.
+    """
+    budget = llm_deadline._llm_budget_seconds("sb-daily-sync", 120.0)
+    assert budget == 1590
+
+    # decide() grants the wait while `now + 1020 + 120 <= deadline`, i.e. while the elapsed
+    # part of the budget is at most 1590 - 1140.
+    window = budget - WAIT_NEEDS_SECONDS
+    assert window == 450
+    assert budget - window >= WAIT_NEEDS_SECONDS  # at t=450 the wait still fits
+    assert budget - (window + 1) < WAIT_NEEDS_SECONDS  # at t=451 it does not
+
+    # sb-attachments, the only 3600s unit, gets 2250s of the same window.
+    assert llm_deadline._llm_budget_seconds("sb-attachments", 120.0) - WAIT_NEEDS_SECONDS == 2250
 
 
 def test_a_unit_that_cannot_fund_one_call_refuses_to_run():

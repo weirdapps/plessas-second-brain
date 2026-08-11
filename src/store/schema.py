@@ -430,6 +430,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_visioned_at(conn)
     if current < 16:
         migrate_add_sharepoint_attempts(conn)
+    if current < 17:
+        migrate_add_calendar_llm_status(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -467,6 +469,73 @@ def migrate_add_sharepoint_attempts(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(sharepoint_links)").fetchall()}
     if "attempts" not in cols:
         conn.execute("ALTER TABLE sharepoint_links ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
+
+
+def migrate_add_calendar_llm_status(conn: sqlite3.Connection) -> None:
+    """v17 — record whether an event's extraction succeeded, so a failure can be retried.
+
+    cmd_calendar_sync decided "seen this already" from modified_at alone. On an extraction
+    failure it still upserted the event with the new modified_at, so the next run scored it
+    skipped_unchanged and the body_summary, decisions and action items were lost for good.
+    The column gives the change detector a second reason to re-offer an event, and mirrors
+    attachment_content.llm_status so both pipelines answer "does this still owe us an
+    extraction?" the same way.
+
+    Four values, and the two that are not in the attachment vocabulary earn their place:
+
+        extracted  the LLM ran and returned a result
+        pending    it failed in a way a re-auth would cure; re-offer it next run
+        failed     it failed permanently; a human is needed, do not re-offer
+        skipped    no extraction was ATTEMPTED: no body, under the 50-char floor, or
+                   --skip-extraction. Distinct from 'extracted' because it is not a
+                   result, and distinct from 'failed' because nothing went wrong. Without
+                   it, every short-bodied invite — most of them — would either be re-offered
+                   on every run forever or be recorded as though it had been summarised.
+
+    BACKFILL IS DELIBERATELY CONSERVATIVE. The column default is 'skipped', not the
+    attachment table's 'pending', because these rows already exist and nothing knows why
+    their body_extracted_at is NULL. Defaulting them to 'pending' would re-offer every
+    historical event the sync window still covers — seven days back and thirty forward, so
+    a few weeks of calendar rather than the whole archive — and it would do it inside a
+    unit with a 90s budget, for rows nobody has any reason to believe owe an extraction.
+    Rows that plainly did get a result are promoted to 'extracted'; the rest are left
+    alone.
+
+    ONE TRANSACTION, AND THE EXISTENCE CHECK IS INSIDE IT. Python's sqlite3 opens no
+    implicit transaction for DDL, so an unwrapped ALTER is durable the instant it runs
+    while the backfill waits for a commit. A crash in the gap leaves the archive
+    permanently mislabelled AND unrepairable, because a re-run sees the column and
+    short-circuits the UPDATE it never got to. The same gap is a race: two processes both
+    read "no column" and the second gets an uncaught duplicate-column error, which
+    sb-auth-watch.sh can produce by firing up to six units back to back with --no-block.
+    BEGIN IMMEDIATE takes the write lock before the PRAGMA read, so the check and the act
+    are atomic and the loser of the race re-reads and no-ops.
+
+    The commit first is not decoration: BEGIN inside an already-open implicit transaction
+    raises "cannot start a transaction within a transaction". The sixteen migrations above
+    share this shape and are deliberately left alone; this is about the one being added.
+    """
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        has_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='calendar_events'"
+        ).fetchone()
+        if has_table:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(calendar_events)")}
+            if "llm_status" not in cols:
+                conn.execute(
+                    "ALTER TABLE calendar_events "
+                    "ADD COLUMN llm_status TEXT NOT NULL DEFAULT 'skipped'"
+                )
+                conn.execute(
+                    "UPDATE calendar_events SET llm_status = 'extracted' "
+                    "WHERE body_extracted_at IS NOT NULL"
+                )
+    except Exception:
+        conn.rollback()
+        raise
     conn.commit()
 
 

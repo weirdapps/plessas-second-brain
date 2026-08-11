@@ -2,6 +2,8 @@
 
 import json
 
+from src.extract.claude_extract import _get_client_and_model, call_with_policy
+
 
 def parse_extraction_response(raw: str) -> dict:
     """
@@ -99,16 +101,18 @@ Extract the following as JSON:
 If the body is empty or contains only a Teams link with no agenda, return empty summary and empty arrays.
 Respond with ONLY the JSON object, no other text."""
 
-    # Call LLM — reuse the existing Vertex/API client factory
-    from src.extract.claude_extract import _get_client_and_model
+    # Call LLM under the shared retry/reauth policy.  _do_call re-fetches the
+    # client on every attempt so a successful reauth (which calls reset_client_cache)
+    # is picked up by the retry rather than silently reusing the stale credential.
+    def _do_call():
+        cur_client, cur_model = _get_client_and_model()
+        return cur_client.messages.create(
+            model=cur_model,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
 
-    client, model = _get_client_and_model()
-
-    response = client.messages.create(
-        model=model,
-        max_tokens=1024,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    response = call_with_policy(_do_call, max_call_seconds=120.0)
 
     # Extract text from response
     raw_text = response.content[0].text

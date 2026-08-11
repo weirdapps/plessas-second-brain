@@ -11,11 +11,13 @@ closed per item (it is a shared, long-lived instance closed at process exit).
 """
 
 import types
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+import google.auth.exceptions as gauth
 import pytest
 
 from src.extract import claude_extract
+from src.llm_policy import ReauthResult
 
 
 @pytest.fixture(autouse=True)
@@ -152,3 +154,140 @@ def test_extraction_asks_for_enough_output_tokens(monkeypatch):
     claude_extract.extract_one({"message_id": "m1"})
 
     assert captured["max_tokens"] >= 8192
+
+
+def test_an_auth_error_triggers_one_reauth_then_succeeds(monkeypatch):
+    """macOS path: one reauth fires, the retry succeeds, two SDK calls total.
+
+    running_on_linux is pinned False so this test asserts the macOS contract
+    regardless of the CI host platform.
+    """
+    calls = []
+
+    class FakeMessages:
+        def create(self, **kw):
+            calls.append(kw)
+            if len(calls) == 1:
+                raise gauth.RefreshError("invalid_grant: Bad Request")
+            return type(
+                "R", (), {"stop_reason": "end_turn", "content": [type("C", (), {"text": "{}"})()]}
+            )()
+
+    fake = type("Client", (), {"messages": FakeMessages()})()
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (fake, "m"))
+    monkeypatch.setattr(claude_extract, "running_on_linux", lambda: False)
+    monkeypatch.setattr("src.extract.parser.parse_extraction", lambda text, **k: {})
+    with patch.object(claude_extract, "reauth", return_value=ReauthResult.SUCCEEDED) as mock_reauth:
+        claude_extract.extract_one({"id": "1", "subject": "s", "body": "b", "message_id": "1"})
+    assert len(calls) == 2
+    assert mock_reauth.call_count == 1
+
+
+def test_repeated_auth_errors_stop_at_the_cap(monkeypatch):
+    """macOS path: auth fails twice, policy gives up after exactly two SDK calls.
+
+    running_on_linux is pinned False so this test asserts the macOS contract
+    regardless of the CI host platform.
+
+    Call sequence when every create() raises RefreshError and reauth returns SUCCEEDED:
+      1. Call 1 → RefreshError → AUTH_REAUTH_REQUIRED → REAUTH_RETRY.
+         reauth() returns SUCCEEDED (not SKIPPED), so with_reauth_used() sets the
+         one-shot latch.
+      2. Call 2 → RefreshError → AUTH_REAUTH_REQUIRED → decide() sees reauth_used=True
+         → UNRECOVERABLE_AUTH immediately (before the global total cap).
+         Loop gives up and re-raises the RefreshError.
+
+    Total SDK calls: 2.  A mutation that cuts retries to one call (while keeping the
+    raise) leaves len(calls)==1, which kills this assertion.
+    """
+    calls = []
+
+    class FakeMessages:
+        def create(self, **kw):
+            calls.append(kw)
+            raise gauth.RefreshError("invalid_grant: Bad Request")
+
+    fake = type("Client", (), {"messages": FakeMessages()})()
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (fake, "m"))
+    monkeypatch.setattr(claude_extract, "running_on_linux", lambda: False)
+    with patch.object(claude_extract, "reauth", return_value=ReauthResult.SUCCEEDED):
+        with pytest.raises(gauth.RefreshError):
+            claude_extract.extract_one({"id": "1", "subject": "s", "body": "b"})
+    assert len(calls) == 2
+
+
+def test_linux_auth_error_gives_up_immediately_without_reauth(monkeypatch):
+    """Linux path: the budget cannot fund a token-push wait, so UNRECOVERABLE_AUTH
+    fires on the first auth failure — one SDK call, reauth never invoked.
+
+    Budget arithmetic (PTS_LLM_DEADLINE unset on CI):
+      deadline  = now + DEFAULT_BUDGET_SECONDS          = now + 900
+      wait      = PUSH_INTERVAL_SECONDS + PUSH_TOLERANCE_SECONDS = 900 + 120 = 1020
+      check     = now + 1020 + max_call_seconds(120) > now + 900
+                = now + 1140 > now + 900  →  True  →  UNRECOVERABLE_AUTH
+
+    running_on_linux is pinned True so this test fails if the Linux branch is
+    accidentally disabled, regardless of the actual test host.
+    """
+    calls = []
+
+    class FakeMessages:
+        def create(self, **kw):
+            calls.append(kw)
+            raise gauth.RefreshError("invalid_grant: Bad Request")
+
+    fake = type("Client", (), {"messages": FakeMessages()})()
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (fake, "m"))
+    monkeypatch.setattr(claude_extract, "running_on_linux", lambda: True)
+    with patch.object(claude_extract, "reauth", return_value=ReauthResult.SUCCEEDED) as mock_reauth:
+        with pytest.raises(gauth.RefreshError):
+            claude_extract.extract_one({"id": "1", "subject": "s", "body": "b"})
+    assert len(calls) == 1
+    assert mock_reauth.call_count == 0
+
+
+def test_reauth_receives_the_same_is_linux_as_decide(monkeypatch):
+    """reauth(is_linux=...) and decide(is_linux=...) must use the same value.
+
+    call_with_policy computes is_linux = running_on_linux() and passes it to
+    decide().  If reauth() is called without is_linux=is_linux, the two can
+    disagree silently: on a VPS decide() sees True (WAIT_FOR_PUSH) while
+    reauth() auto-detects and runs the macOS gcloud script instead of polling.
+
+    running_on_linux is pinned False (macOS path) so the budget admits one
+    reauth, and the captured kwargs must carry is_linux=False.
+
+    Mutation check: reverting reauth(is_linux=is_linux) to bare reauth() leaves
+    reauth_calls[0] empty, making reauth_calls[0]["is_linux"] raise KeyError.
+    """
+    calls = []
+    reauth_calls = []
+
+    class FakeMessages:
+        def create(self, **kw):
+            calls.append(kw)
+            if len(calls) == 1:
+                raise gauth.RefreshError("invalid_grant: Bad Request")
+            return type(
+                "R",
+                (),
+                {
+                    "stop_reason": "end_turn",
+                    "content": [type("C", (), {"text": "{}"})()],
+                },
+            )()
+
+    fake = type("Client", (), {"messages": FakeMessages()})()
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (fake, "m"))
+    monkeypatch.setattr(claude_extract, "running_on_linux", lambda: False)
+    monkeypatch.setattr("src.extract.parser.parse_extraction", lambda text, **k: {})
+
+    def _capturing_reauth(**kwargs):
+        reauth_calls.append(kwargs)
+        return ReauthResult.SUCCEEDED
+
+    with patch.object(claude_extract, "reauth", side_effect=_capturing_reauth):
+        claude_extract.extract_one({"id": "1", "subject": "s", "body": "b", "message_id": "1"})
+
+    assert len(reauth_calls) == 1
+    assert reauth_calls[0]["is_linux"] is False

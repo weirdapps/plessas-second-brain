@@ -15,6 +15,7 @@ from src.config import (
     IMAGE_CLASSIFY_BUDGET_S,
     NEWS_DB_PATH,
 )
+from src.llm_deadline import install_llm_deadline_for_this_process
 
 
 def format_email_result(email: dict, show_full: bool = False) -> str:
@@ -398,9 +399,7 @@ def cmd_process_sharepoint(args):
         if stats["urls_skipped_external"]:
             print(f"  External hosts skipped (no session): {stats['urls_skipped_external']}")
     if stats["auth_required"]:
-        print(
-            f"\n⚠ Auth required — run 'sharepoint-cli login --host {SHAREPOINT_HOST}' and retry"
-        )
+        print(f"\n⚠ Auth required — run 'sharepoint-cli login --host {SHAREPOINT_HOST}' and retry")
 
 
 def cmd_reverse_ingest(args):
@@ -1316,6 +1315,9 @@ def cmd_calendar_sync(args):
     from src.config import USER_EMAIL_PATTERN
     from src.export.calendar_export import get_event_body, list_events, parse_event
     from src.extract.calendar_extractor import extract_event
+    from src.extract.policy_bridge import classify_exception
+    from src.extract.vertex_auth import touch_sentinel
+    from src.llm_policy import Outcome
     from src.store.calendar_loader import load_event, load_proxy_emails
     from src.store.schema import get_connection, run_migrations
 
@@ -1343,50 +1345,117 @@ def cmd_calendar_sync(args):
     raw_events = list_events(since, until_dt)
     print(f"  Fetched {len(raw_events)} events")
 
-    stats = {"loaded": 0, "skipped_unchanged": 0, "extracted": 0, "failed": 0}
+    stats = {
+        "loaded": 0,
+        "skipped_unchanged": 0,
+        "extracted": 0,
+        "failed": 0,
+        "deferred": 0,
+        "fetch_failed": 0,
+    }
 
     for raw in raw_events:
         event = parse_event(raw)
 
-        # Skip if unchanged (compare modified_at)
+        # Skip if unchanged AND we do not still owe it an extraction.
+        #
+        # modified_at alone was not enough. An event whose extraction failed was still
+        # upserted with the new modified_at, so on the next run it matched here, scored
+        # skipped_unchanged, and its body_summary, decisions and action items were gone for
+        # good — no retry, and nothing in the row saying one was owed. llm_status='pending'
+        # is that debt, and it is the only value that re-offers an unmodified event.
         existing = conn.execute(
-            "SELECT modified_at FROM calendar_events WHERE outlook_event_id = ?",
+            "SELECT modified_at, llm_status FROM calendar_events WHERE outlook_event_id = ?",
             (event["outlook_event_id"],),
         ).fetchone()
-        if existing and existing["modified_at"] == event.get("modified_at"):
+        if (
+            existing
+            and existing["modified_at"] == event.get("modified_at")
+            and existing["llm_status"] != "pending"
+        ):
             stats["skipped_unchanged"] += 1
             continue
 
         # Fetch full event (list-calendar returns a subset without Attendees,
         # ResponseStatus, IsRecurring etc. — get-event has everything)
-        body_html = ""
         body_raw = get_event_body(event["outlook_event_id"])
-        if body_raw and isinstance(body_raw, dict):
-            event = parse_event(body_raw)
-            body_obj = body_raw.get("Body", {})
-            if isinstance(body_obj, dict):
-                body_html = body_obj.get("Content", "")
+        if not isinstance(body_raw, dict):
+            # A FETCH FAILURE, NOT AN EMPTY BODY, and collapsing the two loses the event
+            # exactly the way a blank extraction did. get_event_body swallows everything
+            # and returns None, so an Outlook outage arrived here as body_html="", fell
+            # past the 50-char gate and was recorded 'skipped' — the one value that says
+            # nothing is owed and the one the change detector will never re-offer. Three
+            # runs and the summary was gone: run one defers on a dead gcloud, run two
+            # overwrites it with 'skipped' while Outlook is down, run three sees nothing
+            # to do. Not contrived either: sb-auth-watch.sh fires calendar-sync on
+            # `gcloud_or_outlook`, so the run dispatched to recover from an outage is
+            # precisely the one that can hit step two before Outlook is back.
+            #
+            # WRITING NOTHING IS THE FIX, and it is stronger than writing 'pending'.
+            # Leaving the row alone preserves its llm_status AND does not advance
+            # modified_at, so the change detector re-offers the event on both counts; a
+            # brand-new event simply has no row, which it also re-offers. It is the only
+            # option that does not DEGRADE what is already stored: `event` here is still
+            # the list-calendar subset, which carries no Attendees or ResponseStatus, and
+            # load_event replaces the attendee rows wholesale.
+            #
+            # This does not contradict the ruling that the facts are stored even when the
+            # extraction fails. That ruling is "a MODEL failure must not cost you API data
+            # you already have". This is its mirror: an API failure must not overwrite API
+            # data you already have with less of it.
+            print(
+                f"  Body fetch failed for {event.get('subject', '???')}; leaving the row "
+                f"untouched so the next run re-offers it",
+                file=sys.stderr,
+            )
+            stats["fetch_failed"] += 1
+            continue
 
-        # Extract
+        event = parse_event(body_raw)
+        body_obj = body_raw.get("Body", {})
+        body_html = body_obj.get("Content", "") if isinstance(body_obj, dict) else ""
+
+        # Extract. 'skipped' until something is actually attempted: no body and under the
+        # 50-char floor are "nothing was owed", not "nothing came back", and the fetch
+        # above succeeded so both are authoritative.
+        #
+        # --skip-extraction IS NOT AUTHORITATIVE. A run told not to extract has no basis
+        # for discharging a debt an earlier run recorded, so it must not write 'skipped'
+        # over a 'pending'. Latent today, because sb-calendar-sync.sh runs the command
+        # bare, and closed here because it is the same line.
         extraction = {"body_summary": "", "decisions": [], "action_items": []}
+        prior_status = existing["llm_status"] if existing else None
+        llm_status = "pending" if args.skip_extraction and prior_status == "pending" else "skipped"
         if not args.skip_extraction and body_html and len(body_html.strip()) >= 50:
             try:
                 extraction = extract_event(event, body_html)
+                llm_status = "extracted"
                 stats["extracted"] += 1
             except Exception as e:
+                # Same split, and the same classifier, as attachment_pipeline: a failure
+                # a re-auth would cure is a debt to retry, anything else needs a human.
+                # What reaches here has already exhausted call_with_policy's retries.
+                if classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED:
+                    llm_status = "pending"
+                    touch_sentinel()
+                    stats["deferred"] += 1
+                else:
+                    llm_status = "failed"
+                    stats["failed"] += 1
                 print(
-                    f"  Extraction failed for {event.get('subject', '???')}: {e}",
+                    f"  Extraction {llm_status} for {event.get('subject', '???')}: {e}",
                     file=sys.stderr,
                 )
-                stats["failed"] += 1
 
-        # Load
+        # Load. The facts go in regardless — they come from the API, not the model, so
+        # they are good even when the extraction that should have accompanied them is not.
         load_event(
             conn,
             event,
             extraction,
             user_email_pattern=USER_EMAIL_PATTERN,
             proxy_emails=proxy_emails,
+            llm_status=llm_status,
         )
         stats["loaded"] += 1
 
@@ -1395,6 +1464,8 @@ def cmd_calendar_sync(args):
     print(f"  Unchanged:  {stats['skipped_unchanged']}")
     print(f"  Extracted:  {stats['extracted']}")
     print(f"  Failed:     {stats['failed']}")
+    print(f"  Deferred:   {stats['deferred']}")
+    print(f"  Fetch fail: {stats['fetch_failed']}")
 
 
 def _staged_news_ids(staging_dir: Path) -> set[str]:
@@ -2202,6 +2273,12 @@ def main():
 
     # Execute command
     try:
+        # Before any command runs, so the shared policy's budget test reflects this
+        # unit's real TimeoutStartSec instead of resolve_deadline's flat 900s default.
+        # A no-op off systemd, and inside the try on purpose: a unit whose timeout
+        # cannot fund one worst-case LLM call raises here, and exiting 1 with the
+        # reason on stderr is the loud refusal that beats a SIGTERM later.
+        install_llm_deadline_for_this_process()
         args.func(args)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)

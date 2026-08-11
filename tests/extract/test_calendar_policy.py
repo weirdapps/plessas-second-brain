@@ -142,6 +142,19 @@ def _sync_args(db_path: str):
     )
 
 
+def _attendee_count(db_path: str) -> int:
+    """Attendees are the facts a failed fetch would silently destroy.
+
+    load_event replaces the attendee rows wholesale, and the list-calendar entry the
+    caller still holds after a failed get-event carries none — so a row rebuilt from it
+    would come back with zero.
+    """
+    conn = sqlite3.connect(db_path)
+    n = conn.execute("SELECT COUNT(*) FROM event_attendees").fetchone()[0]
+    conn.close()
+    return n
+
+
 def _row(db_path: str) -> sqlite3.Row:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -154,12 +167,25 @@ def _row(db_path: str) -> sqlite3.Row:
     return row
 
 
-def _run_sync(monkeypatch, db_path: str, body: str, extract, fetches: list | None = None):
+def _run_sync(
+    monkeypatch,
+    db_path: str,
+    body: str,
+    extract,
+    fetches: list | None = None,
+    *,
+    outlook_down: bool = False,
+    skip_extraction: bool = False,
+):
     """One cmd_calendar_sync run over one unchanged event, with the Outlook calls stubbed.
 
     Patched at their SOURCE modules: cmd_calendar_sync imports them inside the function
     body, so the name it binds is looked up at call time and the source module is the
     interception point.
+
+    ``outlook_down`` returns None from get_event_body, which is exactly what the real one
+    does on any error — it catches everything and logs. That indistinguishability from an
+    empty body is the bug the three-run tests below are about.
     """
     from src import cli
     from src.export import calendar_export
@@ -168,12 +194,16 @@ def _run_sync(monkeypatch, db_path: str, body: str, extract, fetches: list | Non
     def _body(event_id):
         if fetches is not None:
             fetches.append(event_id)
+        if outlook_down:
+            return None
         return {**_RAW_EVENT, "Body": {"Content": body}}
 
     monkeypatch.setattr(calendar_export, "list_events", lambda since, until: [_RAW_EVENT])
     monkeypatch.setattr(calendar_export, "get_event_body", _body)
     monkeypatch.setattr(extractor, "extract_event", extract)
-    cli.cmd_calendar_sync(_sync_args(db_path))
+    args = _sync_args(db_path)
+    args.skip_extraction = skip_extraction
+    cli.cmd_calendar_sync(args)
 
 
 def test_a_failed_extraction_leaves_the_facts_and_is_retried_by_the_next_run(monkeypatch, tmp_path):
@@ -278,6 +308,144 @@ def test_an_event_with_nothing_to_extract_is_not_re_offered(monkeypatch, tmp_pat
 
     _run_sync(monkeypatch, db_path, "too short", never_called, fetches)
     assert len(fetches) == 1
+
+
+def _failing_auth(event, body):
+    raise gauth.RefreshError("invalid_grant: Bad Request")
+
+
+def _succeeding(event, body):
+    return {"body_summary": "Reviewed the quarter", "decisions": [], "action_items": []}
+
+
+def test_a_failed_body_fetch_does_not_discharge_the_extraction_debt(monkeypatch, tmp_path):
+    """THREE runs, because the loss only becomes visible on the third.
+
+    The reviewer's sequence, and it is a real one: sb-auth-watch.sh fires calendar-sync on
+    `gcloud_or_outlook`, so the run dispatched to recover from an outage is precisely the
+    one that can execute while the OTHER dependency is still down.
+
+      run 1  Outlook up, gcloud dead   -> 'pending', correctly
+      run 2  gcloud back, Outlook down -> get_event_body returns None, which used to be
+                                          indistinguishable from an empty body: blank
+                                          body_html, past the 50-char gate, 'skipped'
+      run 3  both healthy              -> nothing owed, never re-offered, summary gone
+
+    A two-run test cannot see this. Run two's write looks locally reasonable — the event
+    has no body as far as the code can tell — and only run three reveals that the debt was
+    silently discharged by a failure.
+
+    Would this pass with the behaviour removed? No. Restore the old
+    ``if body_raw and isinstance(body_raw, dict)`` and let the loop fall through: run two
+    writes 'skipped' and the run-two assertion fails; even without it, run three never
+    calls the extractor and ``attempts`` reads 1 instead of 2. Writing 'pending' on the
+    fetch failure instead of writing nothing passes the status assertions but fails
+    ``attendees``: the row would be rebuilt from the list-calendar subset, which carries no
+    Attendees, wiping the ones already stored.
+    """
+    monkeypatch.setattr(vertex_auth, "GCLOUD_SENTINEL", tmp_path / "needs_gcloud_reauth")
+    db_path = _calendar_db(tmp_path)
+    attempts = []
+
+    def failing(event, body):
+        attempts.append(event)
+        return _failing_auth(event, body)
+
+    def succeeding(event, body):
+        attempts.append(event)
+        return _succeeding(event, body)
+
+    # Run 1 — Outlook up, gcloud dead.
+    _run_sync(monkeypatch, db_path, _LONG_BODY, failing)
+    assert _row(db_path)["llm_status"] == "pending"
+    attendees_after_run_1 = _attendee_count(db_path)
+    assert attendees_after_run_1 == 1
+
+    # Run 2 — gcloud back, Outlook down. The debt must survive a failure that says nothing
+    # about whether an extraction is owed.
+    _run_sync(monkeypatch, db_path, _LONG_BODY, succeeding, outlook_down=True)
+    assert _row(db_path)["llm_status"] == "pending"
+    assert _attendee_count(db_path) == attendees_after_run_1, (
+        "a failed fetch must not rebuild the row from the list-calendar subset"
+    )
+    assert len(attempts) == 1, "no body, so nothing to extract on run two"
+
+    # Run 3 — both healthy. The event must still be re-offered.
+    _run_sync(monkeypatch, db_path, _LONG_BODY, succeeding)
+    assert len(attempts) == 2, "run three must re-offer the event"
+    assert _row(db_path)["llm_status"] == "extracted"
+    assert _row(db_path)["body_summary"] == "Reviewed the quarter"
+
+
+def test_skip_extraction_does_not_discharge_a_debt_it_did_not_look_at(monkeypatch, tmp_path):
+    """Same shape, second route in: a run told not to extract must not record 'skipped'.
+
+    'skipped' means "nothing was owed". A --skip-extraction run has no basis for that
+    claim: it did not look. Writing it would discharge a debt an earlier run recorded and
+    the event would never be re-offered, which is the fetch-failure loss reached through a
+    flag instead of an outage.
+
+    Latent in production today, because sb-calendar-sync.sh runs the command bare. Closed
+    because it is the same line and the same mistake.
+
+    Would this pass with the behaviour removed? No. Drop the ``prior_status == "pending"``
+    arm and run two writes 'skipped', so run three finds nothing owed, never calls the
+    extractor, and ``attempts`` reads 1 rather than 2.
+    """
+    monkeypatch.setattr(vertex_auth, "GCLOUD_SENTINEL", tmp_path / "needs_gcloud_reauth")
+    db_path = _calendar_db(tmp_path)
+    attempts = []
+
+    def failing(event, body):
+        attempts.append(event)
+        return _failing_auth(event, body)
+
+    def succeeding(event, body):
+        attempts.append(event)
+        return _succeeding(event, body)
+
+    _run_sync(monkeypatch, db_path, _LONG_BODY, failing)
+    assert _row(db_path)["llm_status"] == "pending"
+
+    _run_sync(monkeypatch, db_path, _LONG_BODY, succeeding, skip_extraction=True)
+    assert _row(db_path)["llm_status"] == "pending"
+    assert len(attempts) == 1
+
+    _run_sync(monkeypatch, db_path, _LONG_BODY, succeeding)
+    assert len(attempts) == 2
+    assert _row(db_path)["llm_status"] == "extracted"
+
+
+def test_a_genuinely_short_body_still_discharges_the_debt(monkeypatch, tmp_path):
+    """The other side of the same boundary, so the fix is not "never downgrade pending".
+
+    A SUCCESSFUL fetch returning a short body is authoritative: the event really has
+    nothing worth summarising now, whatever it had before. 'skipped' is the honest record
+    and the event must stop being re-offered, or a body that shrank would be fetched
+    forever.
+
+    Would this pass with the behaviour removed? No. Preserving 'pending' whenever nothing
+    was attempted — the simpler, blunter version of the two fixes above — leaves this row
+    'pending' and ``fetches`` reads 2 because run three re-offers it again.
+    """
+    monkeypatch.setattr(vertex_auth, "GCLOUD_SENTINEL", tmp_path / "needs_gcloud_reauth")
+    db_path = _calendar_db(tmp_path)
+    fetches: list[str] = []
+
+    def failing(event, body):
+        return _failing_auth(event, body)
+
+    def never_called(event, body):
+        raise AssertionError("extract_event must not run on a sub-50-char body")
+
+    _run_sync(monkeypatch, db_path, _LONG_BODY, failing)
+    assert _row(db_path)["llm_status"] == "pending"
+
+    _run_sync(monkeypatch, db_path, "too short", never_called, fetches)
+    assert _row(db_path)["llm_status"] == "skipped"
+
+    _run_sync(monkeypatch, db_path, "too short", never_called, fetches)
+    assert len(fetches) == 1, "an authoritative empty body must stop the re-offering"
 
 
 def test_load_event_refuses_a_status_outside_the_vocabulary(tmp_path):

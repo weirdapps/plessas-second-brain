@@ -495,24 +495,47 @@ def migrate_add_calendar_llm_status(conn: sqlite3.Connection) -> None:
 
     BACKFILL IS DELIBERATELY CONSERVATIVE. The column default is 'skipped', not the
     attachment table's 'pending', because these rows already exist and nothing knows why
-    their body_extracted_at is NULL. Defaulting them to 'pending' would re-offer the entire
-    calendar history on the next run, inside a unit with a 90s budget. Rows that plainly
-    did get a result are promoted to 'extracted'; the rest are left alone.
+    their body_extracted_at is NULL. Defaulting them to 'pending' would re-offer every
+    historical event the sync window still covers — seven days back and thirty forward, so
+    a few weeks of calendar rather than the whole archive — and it would do it inside a
+    unit with a 90s budget, for rows nobody has any reason to believe owe an extraction.
+    Rows that plainly did get a result are promoted to 'extracted'; the rest are left
+    alone.
+
+    ONE TRANSACTION, AND THE EXISTENCE CHECK IS INSIDE IT. Python's sqlite3 opens no
+    implicit transaction for DDL, so an unwrapped ALTER is durable the instant it runs
+    while the backfill waits for a commit. A crash in the gap leaves the archive
+    permanently mislabelled AND unrepairable, because a re-run sees the column and
+    short-circuits the UPDATE it never got to. The same gap is a race: two processes both
+    read "no column" and the second gets an uncaught duplicate-column error, which
+    sb-auth-watch.sh can produce by firing up to six units back to back with --no-block.
+    BEGIN IMMEDIATE takes the write lock before the PRAGMA read, so the check and the act
+    are atomic and the loser of the race re-reads and no-ops.
+
+    The commit first is not decoration: BEGIN inside an already-open implicit transaction
+    raises "cannot start a transaction within a transaction". The sixteen migrations above
+    share this shape and are deliberately left alone; this is about the one being added.
     """
-    has_table = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='calendar_events'"
-    ).fetchone()
-    if not has_table:
-        return
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(calendar_events)").fetchall()}
-    if "llm_status" not in cols:
-        conn.execute(
-            "ALTER TABLE calendar_events ADD COLUMN llm_status TEXT NOT NULL DEFAULT 'skipped'"
-        )
-        conn.execute(
-            "UPDATE calendar_events SET llm_status = 'extracted' "
-            "WHERE body_extracted_at IS NOT NULL"
-        )
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        has_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='calendar_events'"
+        ).fetchone()
+        if has_table:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(calendar_events)")}
+            if "llm_status" not in cols:
+                conn.execute(
+                    "ALTER TABLE calendar_events "
+                    "ADD COLUMN llm_status TEXT NOT NULL DEFAULT 'skipped'"
+                )
+                conn.execute(
+                    "UPDATE calendar_events SET llm_status = 'extracted' "
+                    "WHERE body_extracted_at IS NOT NULL"
+                )
+    except Exception:
+        conn.rollback()
+        raise
     conn.commit()
 
 

@@ -1345,7 +1345,14 @@ def cmd_calendar_sync(args):
     raw_events = list_events(since, until_dt)
     print(f"  Fetched {len(raw_events)} events")
 
-    stats = {"loaded": 0, "skipped_unchanged": 0, "extracted": 0, "failed": 0, "deferred": 0}
+    stats = {
+        "loaded": 0,
+        "skipped_unchanged": 0,
+        "extracted": 0,
+        "failed": 0,
+        "deferred": 0,
+        "fetch_failed": 0,
+    }
 
     for raw in raw_events:
         event = parse_event(raw)
@@ -1371,19 +1378,54 @@ def cmd_calendar_sync(args):
 
         # Fetch full event (list-calendar returns a subset without Attendees,
         # ResponseStatus, IsRecurring etc. — get-event has everything)
-        body_html = ""
         body_raw = get_event_body(event["outlook_event_id"])
-        if body_raw and isinstance(body_raw, dict):
-            event = parse_event(body_raw)
-            body_obj = body_raw.get("Body", {})
-            if isinstance(body_obj, dict):
-                body_html = body_obj.get("Content", "")
+        if not isinstance(body_raw, dict):
+            # A FETCH FAILURE, NOT AN EMPTY BODY, and collapsing the two loses the event
+            # exactly the way a blank extraction did. get_event_body swallows everything
+            # and returns None, so an Outlook outage arrived here as body_html="", fell
+            # past the 50-char gate and was recorded 'skipped' — the one value that says
+            # nothing is owed and the one the change detector will never re-offer. Three
+            # runs and the summary was gone: run one defers on a dead gcloud, run two
+            # overwrites it with 'skipped' while Outlook is down, run three sees nothing
+            # to do. Not contrived either: sb-auth-watch.sh fires calendar-sync on
+            # `gcloud_or_outlook`, so the run dispatched to recover from an outage is
+            # precisely the one that can hit step two before Outlook is back.
+            #
+            # WRITING NOTHING IS THE FIX, and it is stronger than writing 'pending'.
+            # Leaving the row alone preserves its llm_status AND does not advance
+            # modified_at, so the change detector re-offers the event on both counts; a
+            # brand-new event simply has no row, which it also re-offers. It is the only
+            # option that does not DEGRADE what is already stored: `event` here is still
+            # the list-calendar subset, which carries no Attendees or ResponseStatus, and
+            # load_event replaces the attendee rows wholesale.
+            #
+            # This does not contradict the ruling that the facts are stored even when the
+            # extraction fails. That ruling is "a MODEL failure must not cost you API data
+            # you already have". This is its mirror: an API failure must not overwrite API
+            # data you already have with less of it.
+            print(
+                f"  Body fetch failed for {event.get('subject', '???')}; leaving the row "
+                f"untouched so the next run re-offers it",
+                file=sys.stderr,
+            )
+            stats["fetch_failed"] += 1
+            continue
 
-        # Extract. 'skipped' until something is actually attempted: no body, under the
-        # 50-char floor, or --skip-extraction are all "nothing was owed", not "nothing
-        # came back".
+        event = parse_event(body_raw)
+        body_obj = body_raw.get("Body", {})
+        body_html = body_obj.get("Content", "") if isinstance(body_obj, dict) else ""
+
+        # Extract. 'skipped' until something is actually attempted: no body and under the
+        # 50-char floor are "nothing was owed", not "nothing came back", and the fetch
+        # above succeeded so both are authoritative.
+        #
+        # --skip-extraction IS NOT AUTHORITATIVE. A run told not to extract has no basis
+        # for discharging a debt an earlier run recorded, so it must not write 'skipped'
+        # over a 'pending'. Latent today, because sb-calendar-sync.sh runs the command
+        # bare, and closed here because it is the same line.
         extraction = {"body_summary": "", "decisions": [], "action_items": []}
-        llm_status = "skipped"
+        prior_status = existing["llm_status"] if existing else None
+        llm_status = "pending" if args.skip_extraction and prior_status == "pending" else "skipped"
         if not args.skip_extraction and body_html and len(body_html.strip()) >= 50:
             try:
                 extraction = extract_event(event, body_html)
@@ -1423,6 +1465,7 @@ def cmd_calendar_sync(args):
     print(f"  Extracted:  {stats['extracted']}")
     print(f"  Failed:     {stats['failed']}")
     print(f"  Deferred:   {stats['deferred']}")
+    print(f"  Fetch fail: {stats['fetch_failed']}")
 
 
 def _staged_news_ids(staging_dir: Path) -> set[str]:

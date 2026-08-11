@@ -271,12 +271,17 @@ def test_the_wait_is_affordable_only_in_the_first_450_seconds_of_a_1800s_unit():
     wait the unit has no room for at all.
 
     Would this pass with the behaviour removed? It pins arithmetic rather than a branch, so
-    the mutations are to the numbers it depends on: any change to the reserve, to
-    PUSH_WAIT_SECONDS, or to MAX_CALL_SECONDS moves the window off 450 and the assertions
-    fail. The boundary is tested from both sides, so a fencepost slip in either direction
-    is caught.
+    the mutations are to the numbers the window is made of, and it catches two of the three
+    itself: _SHUTDOWN_GRACE_SECONDS 90 -> 120 makes it 420, and MAX_CALL_SECONDS 120 -> 150
+    makes it 420 as well. The second is why max_call is READ FROM THE MODULE here rather
+    than passed as the usual literal 120.0 — as an INPUT, which is what production passes,
+    while every expectation below stays a literal. The third number, PUSH_WAIT_SECONDS,
+    lives in the vendored llm_policy and is pinned by test_llm_policy_drift instead; a
+    change to it could not reach this file without that guard firing first.
+
+    The boundary is asserted from both sides, so a fencepost slip either way is caught.
     """
-    budget = llm_deadline._llm_budget_seconds("sb-daily-sync", 120.0)
+    budget = llm_deadline._llm_budget_seconds("sb-daily-sync", llm_deadline.MAX_CALL_SECONDS)
     assert budget == 1590
 
     # decide() grants the wait while `now + 1020 + 120 <= deadline`, i.e. while the elapsed
@@ -287,7 +292,8 @@ def test_the_wait_is_affordable_only_in_the_first_450_seconds_of_a_1800s_unit():
     assert budget - (window + 1) < WAIT_NEEDS_SECONDS  # at t=451 it does not
 
     # sb-attachments, the only 3600s unit, gets 2250s of the same window.
-    assert llm_deadline._llm_budget_seconds("sb-attachments", 120.0) - WAIT_NEEDS_SECONDS == 2250
+    attachments = llm_deadline._llm_budget_seconds("sb-attachments", llm_deadline.MAX_CALL_SECONDS)
+    assert attachments - WAIT_NEEDS_SECONDS == 2250
 
 
 def test_a_unit_that_cannot_fund_one_call_refuses_to_run():

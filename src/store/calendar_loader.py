@@ -5,6 +5,13 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+# The calendar_events.llm_status vocabulary. Defined here, next to the only writer, so
+# there is one spelling of each value; schema.migrate_add_calendar_llm_status explains what
+# each one means and why there are four rather than the attachment table's three.
+# 'pending' is load-bearing beyond bookkeeping: it is the ONLY value that makes
+# cmd_calendar_sync's change detector re-offer an event whose modified_at has not moved.
+LLM_STATUSES = ("extracted", "pending", "failed", "skipped")
+
 
 def load_proxy_emails(canonical_path: str) -> set[str]:
     """
@@ -82,9 +89,17 @@ def load_event(
     extraction: dict,
     user_email_pattern: str = "",
     proxy_emails: set[str] | None = None,
+    *,
+    llm_status: str,
 ) -> int:
     """
     UPSERT calendar event + attendees + decisions + action items.
+
+    The event's FACTS are written whatever ``llm_status`` says. Time, title, organiser and
+    attendees come from the Graph API rather than from a model, so they are good even when
+    the extraction that was supposed to accompany them failed, and withholding them would
+    lose data that was never in doubt. What ``llm_status`` governs is whether the ABSENCE of
+    an extraction is a finished state or a debt.
 
     Args:
         conn: Database connection
@@ -92,10 +107,17 @@ def load_event(
         extraction: Extraction dict with body_summary, decisions, action_items
         user_email_pattern: User email pattern for is_self_organized check
         proxy_emails: Optional set of proxy emails for is_self_organized check
+        llm_status: One of LLM_STATUSES. REQUIRED, and keyword-only, deliberately. A
+            default would be a default answer to "did the extraction succeed?", and a
+            caller that forgot to pass it would silently record a failure as a success —
+            which is the exact bug this column was added to fix.
 
     Returns:
         event_id
     """
+    if llm_status not in LLM_STATUSES:
+        raise ValueError(f"llm_status must be one of {LLM_STATUSES}, got {llm_status!r}")
+
     # Compute is_self_organized
     is_self_organized = _is_self_organized(
         event.get("organizer_email", ""), user_email_pattern, proxy_emails
@@ -114,8 +136,9 @@ def load_event(
             outlook_event_id, subject, organizer_email, organizer_name,
             start_at, end_at, location, is_recurring, recurrence_master_id,
             response_status, is_cancelled, is_self_organized,
-            created_at, modified_at, ingested_at, body_extracted_at, body_summary
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            created_at, modified_at, ingested_at, body_extracted_at, body_summary,
+            llm_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(outlook_event_id) DO UPDATE SET
             subject = excluded.subject,
             organizer_email = excluded.organizer_email,
@@ -132,7 +155,8 @@ def load_event(
             modified_at = excluded.modified_at,
             ingested_at = excluded.ingested_at,
             body_extracted_at = excluded.body_extracted_at,
-            body_summary = excluded.body_summary
+            body_summary = excluded.body_summary,
+            llm_status = excluded.llm_status
         """,
         (
             event["outlook_event_id"],
@@ -152,6 +176,7 @@ def load_event(
             now_utc,
             body_extracted_at,
             extraction.get("body_summary"),
+            llm_status,
         ),
     )
 

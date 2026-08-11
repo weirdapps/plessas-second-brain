@@ -185,7 +185,11 @@ def test_load_event_creates_rows(db_conn):
     db_conn.commit()
 
     event_id = load_event(
-        db_conn, SAMPLE_EVENT, SAMPLE_EXTRACTION, user_email_pattern="papadopoulos"
+        db_conn,
+        SAMPLE_EVENT,
+        SAMPLE_EXTRACTION,
+        user_email_pattern="papadopoulos",
+        llm_status="extracted",
     )
 
     # Verify calendar_events row
@@ -230,7 +234,11 @@ def test_upsert_updates_modified(db_conn):
 
     # First load
     event_id_1 = load_event(
-        db_conn, SAMPLE_EVENT, SAMPLE_EXTRACTION, user_email_pattern="papadopoulos"
+        db_conn,
+        SAMPLE_EVENT,
+        SAMPLE_EXTRACTION,
+        user_email_pattern="papadopoulos",
+        llm_status="extracted",
     )
 
     # Second load with updated subject and modified_at
@@ -239,7 +247,11 @@ def test_upsert_updates_modified(db_conn):
     updated_event["modified_at"] = "2026-05-01T10:00:00Z"
 
     event_id_2 = load_event(
-        db_conn, updated_event, SAMPLE_EXTRACTION, user_email_pattern="papadopoulos"
+        db_conn,
+        updated_event,
+        SAMPLE_EXTRACTION,
+        user_email_pattern="papadopoulos",
+        llm_status="extracted",
     )
 
     # Should be same event_id
@@ -281,6 +293,7 @@ def test_proxy_organizer(db_conn, proxy_config):
         SAMPLE_EXTRACTION,
         user_email_pattern="papadopoulos",
         proxy_emails=proxy_emails,
+        llm_status="extracted",
     )
 
     # Verify is_self_organized = 1

@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from src.extract.teams_pipeline import extract_threads
 
 
@@ -463,3 +465,119 @@ def test_call_llm_uses_shared_client_and_honors_model_override(monkeypatch):
     assert captured["client"] is fake_client  # delegated to the shared client
     assert captured["model"] == "claude-teams-override"  # kept teams model override
     fake_client.close.assert_not_called()  # never closes the shared client
+
+
+# ------------------------------------------- teams was the sixth, unpoliced, call site
+
+
+def test_call_llm_retries_through_the_policy_after_a_reauth(monkeypatch):
+    """Teams reached the SDK directly, so it had no retry, no re-auth and no deadline.
+
+    Every other LLM call site in the repo goes through call_with_policy. This one built its
+    request and called create_with_refusal_fallback, so a single stale ADC lost the thread
+    outright on a 600s unit. It even shared the client that reset_client_cache invalidates,
+    which meant it silently benefited from a re-auth some other pipeline triggered while
+    being structurally incapable of triggering one itself.
+
+    Would this pass with the behaviour removed? No. Restore the direct call and the first
+    RefreshError propagates out of _call_llm: `calls` reads 1 and the pytest.raises-free
+    call blows up instead of returning "RAW". The client re-fetch inside _do_call is pinned
+    too — hoist it back out of the callable, as it used to be, and `clients_fetched` reads
+    1, which is the shape that makes a successful reauth useless because the retry reuses
+    the credential that just expired.
+    """
+    from types import SimpleNamespace
+
+    import google.auth.exceptions as gauth
+
+    from src.extract import claude_extract, teams_pipeline
+    from src.llm_policy import ReauthResult
+
+    calls = []
+    clients_fetched = []
+
+    def fake_get_client():
+        clients_fetched.append(1)
+        return ("shared-client", "ignored-extract-model")
+
+    def fake_create(client, **kwargs):
+        calls.append(kwargs.get("model"))
+        if len(calls) == 1:
+            raise gauth.RefreshError("invalid_grant: Bad Request")
+        return SimpleNamespace(content=[SimpleNamespace(text="RAW")])
+
+    monkeypatch.setattr("src.extract.claude_extract._get_client_and_model", fake_get_client)
+    monkeypatch.setattr("src.extract.vertex_fallback.create_with_refusal_fallback", fake_create)
+    monkeypatch.setenv("BRAIN_TEAMS_MODEL", "claude-teams-override")
+    # macOS branch, so decide() answers the auth error with REAUTH_RETRY rather than the
+    # VPS's UNRECOVERABLE_AUTH on the first failure.
+    monkeypatch.setattr(claude_extract, "running_on_linux", lambda: False)
+    claude_extract.reset_reauth_latch()
+
+    with patch.object(claude_extract, "reauth", return_value=ReauthResult.SUCCEEDED):
+        out = teams_pipeline._call_llm("system", "user")
+
+    claude_extract.reset_reauth_latch()
+
+    assert out == "RAW"
+    assert len(calls) == 2, "the policy must retry the call after the reauth"
+    assert calls == ["claude-teams-override"] * 2, "the model override survives the retry"
+    assert len(clients_fetched) == 2, "each attempt must re-fetch the client"
+
+
+# Every exception type classify_exception routes to AUTH_REAUTH_REQUIRED, plus one it does
+# not. The two anthropic types are built with __new__ because their __init__ wants a live
+# httpx response; the classifier reads the type, never the body.
+_TEAMS_TERMINAL_FAILURES = [
+    ("RefreshError", "pending"),
+    ("AuthenticationError", "pending"),
+    ("PermissionDeniedError", "pending"),
+    ("ValueError", "failed"),
+]
+
+
+def _terminal_exception(name):
+    import anthropic
+    import google.auth.exceptions as gauth
+
+    if name == "RefreshError":
+        return gauth.RefreshError("invalid_grant: Bad Request")
+    if name == "ValueError":
+        return ValueError("bad json on line 5")
+    cls = getattr(anthropic, name)
+    return cls.__new__(cls)
+
+
+@pytest.mark.parametrize(("exc_name", "expected_status"), _TEAMS_TERMINAL_FAILURES)
+def test_a_surviving_failure_is_labelled_by_the_classifier_not_by_a_string(
+    db, monkeypatch, tmp_path, exc_name, expected_status
+):
+    """Same fix as attachment_pipeline: the persistence decision follows the classifier.
+
+    The consequence differs from attachments and is worth being precise about.
+    extract_threads selects ('pending','failed'), so a mislabelled row here WAS still
+    retried next run — the cost was the label and the sentinel, not the retry. A
+    re-authable outage read as a hard failure in the stats, and nothing touched the
+    sentinel that tells the estate a re-auth is owed.
+
+    Would this pass with the behaviour removed? No. Restore
+    ``if is_vertex_auth_error(e)`` — a pattern match over the message — and RefreshError
+    stays green on the "invalid_grant" pattern while AuthenticationError and
+    PermissionDeniedError, whose messages are empty, both write 'failed': two of the four
+    cases fail on the status and on the sentinel. Hardcoding the branch True flips the
+    ValueError control.
+    """
+    from src.extract import vertex_auth
+
+    sentinel = tmp_path / "needs_gcloud_reauth"
+    monkeypatch.setattr(vertex_auth, "GCLOUD_SENTINEL", sentinel)
+    monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "test-project")
+    _seed_thread(db)
+
+    with patch("src.extract.teams_pipeline._call_llm", side_effect=_terminal_exception(exc_name)):
+        result = extract_threads(db, workers=1)
+
+    status = db.execute("SELECT extraction_status FROM teams_threads").fetchone()[0]
+    assert status == expected_status
+    assert sentinel.exists() is (expected_status == "pending")
+    assert result["deferred" if expected_status == "pending" else "failed"] == 1

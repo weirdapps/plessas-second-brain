@@ -15,8 +15,10 @@ import json
 import sqlite3
 from datetime import UTC, datetime
 
+from src.extract.policy_bridge import classify_exception
 from src.extract.teams_prompt import build_prompt, parse_response
-from src.extract.vertex_auth import is_vertex_auth_error, touch_sentinel
+from src.extract.vertex_auth import touch_sentinel
+from src.llm_policy import Outcome
 
 # A "substantive" message is a non-system message above MIN_SUBSTANTIVE_LENGTH chars.
 # Channel posts are commonly single-message announcements (chatsvcagg /posts returns
@@ -143,7 +145,15 @@ def _extract_one_thread(conn: sqlite3.Connection, thread_id: int) -> str:
         raw = _call_llm(system_prompt, user_prompt)
         data = parse_response(raw)
     except Exception as e:
-        if is_vertex_auth_error(e):
+        # The classifier, not a pattern list. is_vertex_auth_error matches on the message,
+        # and two of the three types the policy calls re-authable —
+        # anthropic.AuthenticationError and PermissionDeniedError — carry nothing in theirs
+        # to match. Those were written 'failed', and extract_threads selects
+        # ('pending','failed'), so unlike attachments the row WAS still picked up next run.
+        # The cost was the label rather than the retry: a re-authable outage read as a hard
+        # failure in the stats and raised no sentinel, so nothing told the estate a re-auth
+        # was owed. Same fix, same classifier, as attachment_pipeline.
+        if classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED:
             # Vertex ADC expired. Mark pending so the next cron retries
             # automatically once the user re-auths. See vertex_auth.py.
             touch_sentinel()
@@ -228,32 +238,49 @@ def _generate_title(thread: dict, messages: list[dict]) -> str:
 
 
 def _call_llm(system_prompt: str, user_prompt: str) -> str:
-    """Invoke Vertex AI Claude via the shared extraction client.
+    """Invoke Vertex AI Claude via the shared extraction client, under the retry policy.
 
     Uses the process-wide shared client from claude_extract (built once, reused,
     never closed per call) so Teams extraction does not fork `gcloud config get
     project` once per thread. Teams keeps its own model override; model is a
     per-request arg, so one project/region-scoped client serves any model.
 
+    THIS WAS THE SIXTH CALL SITE AND THE ONLY UNPOLICED ONE. It called the SDK directly,
+    so Teams extraction had no retry, no re-auth and no deadline at all: a single 429 or a
+    stale ADC lost the thread outright, on a 600s unit. Worse in one specific way — it
+    already shared the client that ``reset_client_cache`` invalidates, so it benefited from
+    a re-auth triggered by some other pipeline in the same process while being structurally
+    incapable of triggering one itself. One unpoliced site reproduces in miniature the
+    divergence this whole port exists to end.
+
+    ``_do_call`` re-fetches the client on every attempt, exactly as extract_one,
+    attachment_pipeline, image_vision and calendar_extractor do, so a successful reauth
+    (which calls reset_client_cache) is picked up by the retry rather than silently reusing
+    the dead credential.
+
     Returns the raw text response.
     """
     import os
 
-    from src.extract.claude_extract import _get_client_and_model
+    from src.extract.claude_extract import _get_client_and_model, call_with_policy
     from src.extract.vertex_fallback import create_with_refusal_fallback
 
-    # Shared client — do not close it here (see claude_extract._get_client_and_model).
-    client, _ = _get_client_and_model()
     model = (
         os.environ.get("BRAIN_TEAMS_MODEL")
         or os.environ.get("VERTEX_MODEL_EXTRACT")
         or "claude-sonnet-4-6"
     )
-    resp = create_with_refusal_fallback(
-        client,
-        model=model,
-        max_tokens=2048,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
+
+    def _do_call():
+        # Shared client — do not close it here (see claude_extract._get_client_and_model).
+        client, _ = _get_client_and_model()
+        return create_with_refusal_fallback(
+            client,
+            model=model,
+            max_tokens=2048,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+
+    resp = call_with_policy(_do_call, max_call_seconds=120.0)
     return resp.content[0].text

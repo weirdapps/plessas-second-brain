@@ -78,6 +78,18 @@ def _capture_response(monkeypatch, curate, response):
     monkeypatch.setattr(curate, "create_with_refusal_fallback", lambda *a, **k: response)
 
 
+def _capture_kwargs(monkeypatch, curate, response):
+    """Record the kwargs each call site sends to the LLM."""
+    seen = {}
+
+    def fake(client, **kwargs):
+        seen.update(kwargs)
+        return response
+
+    monkeypatch.setattr(curate, "create_with_refusal_fallback", fake)
+    return seen
+
+
 def test_classify_reads_past_a_thinking_block(curate, monkeypatch):
     """A leading ThinkingBlock must not sink the classification."""
     _capture_response(
@@ -134,6 +146,49 @@ def test_classify_still_parses_a_plain_text_response(curate, monkeypatch):
         "folder": "Area/two",
         "confidence": "low",
     }
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(
+            lambda m: m.classify_one(
+                object(),
+                "model",
+                {
+                    "filename": "f.pdf",
+                    "subject": "",
+                    "sender": "",
+                    "date": "2026-08-11",
+                    "file_size": 1,
+                    "summary": "",
+                },
+            ),
+            id="classify_one",
+        ),
+        pytest.param(
+            lambda m: m.summarize_folder(object(), "model", "Area/one", "readme"),
+            id="summarize_folder",
+        ),
+    ],
+)
+def test_output_budget_leaves_room_after_thinking(curate, monkeypatch, call):
+    """max_tokens must fund the thinking budget AND the answer.
+
+    Observed on the VPS 2026-08-11 with the original max_tokens=300::
+
+        stop_reason: max_tokens
+        output_tokens: 300  thinking_tokens: 300
+        blocks: ['ThinkingBlock']
+
+    Extended thinking spends the same budget the answer draws on, so a ceiling
+    below the 1024-token minimum thinking budget can never return text. Both
+    call sites use the repo-wide MAX_OUTPUT_TOKENS so they cannot drift apart.
+    """
+    seen = _capture_kwargs(monkeypatch, curate, _Response(_TextBlock("{}")))
+    call(curate)
+    assert seen["max_tokens"] == curate.MAX_OUTPUT_TOKENS
+    assert seen["max_tokens"] > 1024
 
 
 def test_missing_taxonomy_file_exits_loud(tmp_path, monkeypatch):

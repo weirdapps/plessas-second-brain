@@ -29,10 +29,11 @@ from pathlib import Path
 
 # Make src.extract.* importable when run as a standalone script (scripts/ is sys.path[0]).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-# _response_text is the repo's single implementation of "first block that has
-# text". Imported rather than copied so this script cannot drift away from it
-# again the way it did while it lived untracked on the VPS.
-from src.extract.claude_extract import _response_text  # noqa: E402
+# _response_text and MAX_OUTPUT_TOKENS are the repo's single implementations of
+# "first block that has text" and "how much output to allow". Imported rather
+# than copied so this script cannot drift away from them again the way it did
+# while it lived untracked on the VPS.
+from src.extract.claude_extract import MAX_OUTPUT_TOKENS, _response_text  # noqa: E402
 from src.extract.vertex_fallback import create_with_refusal_fallback  # noqa: E402
 from src.llm_deadline import install_llm_deadline_for_this_process  # noqa: E402
 
@@ -190,7 +191,10 @@ def classify_one(client, model, c: dict) -> dict:
     response = create_with_refusal_fallback(
         client,
         model=model,
-        max_tokens=300,
+        # Extended thinking draws on the same budget as the answer, so the old
+        # 300 was spent entirely on thinking and the response carried no text
+        # block at all (stop_reason=max_tokens, thinking_tokens=300).
+        max_tokens=MAX_OUTPUT_TOKENS,
         messages=[{"role": "user", "content": prompt}],
     )
     text = _response_text(response).strip()
@@ -208,7 +212,7 @@ def summarize_folder(client, model, folder: str, readme_text: str) -> dict:
     response = create_with_refusal_fallback(
         client,
         model=model,
-        max_tokens=600,
+        max_tokens=MAX_OUTPUT_TOKENS,  # 600 left no room after thinking either
         messages=[
             {
                 "role": "user",

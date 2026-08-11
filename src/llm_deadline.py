@@ -215,9 +215,6 @@ def _parse_systemd_timestamp(s: str) -> float | None:
     Nothing here passes that flag (see _query_systemd_unit) but a future caller might.
     """
     s = s.strip()
-    # systemd prints "n/a" for a unit that has never run; some builds print a bare 0.
-    if not s or s in ("n/a", "0"):
-        return None
     if s.startswith("@"):
         try:
             return float(s[1:])
@@ -225,6 +222,10 @@ def _parse_systemd_timestamp(s: str) -> float | None:
             return None
     m = _TIMESTAMP_RE.match(s)
     if m is None:
+        # Everything that is not a timestamp lands here, including the empty string and
+        # the "n/a" systemd prints for a unit that has never run. Deliberately no separate
+        # guard for those two: the pattern already rejects them, so a guard would be a
+        # branch that no test could tell from its own absence.
         return None
     try:
         naive = datetime(*(int(g) for g in m.groups()))  # type: ignore[arg-type]

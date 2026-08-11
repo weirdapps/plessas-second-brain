@@ -29,6 +29,10 @@ from pathlib import Path
 
 # Make src.extract.* importable when run as a standalone script (scripts/ is sys.path[0]).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# _response_text is the repo's single implementation of "first block that has
+# text". Imported rather than copied so this script cannot drift away from it
+# again the way it did while it lived untracked on the VPS.
+from src.extract.claude_extract import _response_text  # noqa: E402
 from src.extract.vertex_fallback import create_with_refusal_fallback  # noqa: E402
 from src.llm_deadline import install_llm_deadline_for_this_process  # noqa: E402
 
@@ -189,7 +193,7 @@ def classify_one(client, model, c: dict) -> dict:
         max_tokens=300,
         messages=[{"role": "user", "content": prompt}],
     )
-    text = response.content[0].text.strip()
+    text = _response_text(response).strip()
     if text.startswith("```"):
         lines = text.split("\n")
         text = "\n".join(lines[1:-1] if lines[0].startswith("```") else lines[:-1])
@@ -212,7 +216,7 @@ def summarize_folder(client, model, folder: str, readme_text: str) -> dict:
             }
         ],
     )
-    text = response.content[0].text.strip()
+    text = _response_text(response).strip()
     if text.startswith("```"):
         lines = text.split("\n")
         text = "\n".join(lines[1:-1] if lines[0].startswith("```") else lines[:-1])

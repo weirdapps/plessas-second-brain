@@ -79,9 +79,10 @@ _UNIT_TIMEOUT_SECONDS: dict[str, int] = {
 _SHUTDOWN_GRACE_SECONDS = 90
 
 # Every ``call_with_policy`` call site in this repo passes 120.0: claude_extract's
-# extract_one and extract_conversation, attachment_pipeline, image_vision and
-# calendar_extractor. news reads the equivalent per profile from config; here it is
-# uniform, and test_max_call_seconds_matches_every_call_site fails if a site diverges.
+# extract_one and extract_conversation, attachment_pipeline, image_vision,
+# calendar_extractor and teams_pipeline. news reads the equivalent per profile from config;
+# here it is uniform, and test_max_call_seconds_matches_every_call_site fails if a site
+# diverges — it is also what caught teams_pipeline arriving as the sixth.
 MAX_CALL_SECONDS = 120.0
 
 # Largest single backoff decide() can actually emit: RATE_LIMIT at n=3, so 240s.

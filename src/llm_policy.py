@@ -341,6 +341,7 @@ def reauth(
     is_linux: bool | None = None,
     poll_interval: float = 30.0,
     sleep_fn: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
 ) -> ReauthResult:
     """Attempt a host re-auth. Serialised process-wide. Never trusts an exit code.
 
@@ -365,6 +366,13 @@ def reauth(
     FAILED. The default of None therefore detects the host here rather than assuming a
     Mac -- this function is already impure, so the detection costs it nothing. Only tests
     and callers that genuinely know better should pass a literal.
+
+    `clock` is a monotonic source, injected only so the Linux wait can be tested without
+    spending real time. The loop charges its budget the LARGER of the sleep it requested
+    and the wall clock this reports, which bounds the whole wait at PUSH_WAIT_SECONDS plus
+    one probe timeout. That max() is also what makes the parameter safe: the clock can only
+    shorten the wait, so a frozen or fake one degrades to counting sleep, and a caller who
+    injects `sleep_fn` and forgets `clock` still terminates.
     """
     probe = adc_probe or default_adc_probe
     if is_linux is None:
@@ -377,6 +385,7 @@ def reauth(
         if is_linux:
             waited = 0.0
             budget = PUSH_WAIT_SECONDS
+            started = clock()
             # A non-positive poll_interval freezes this loop: `step` is 0 so `waited`
             # never advances, or is negative and walks it backwards. Measured: 200,000
             # probes with poll_interval=0.0 and no progress. Clamp rather than raise --
@@ -390,6 +399,33 @@ def reauth(
                     for callback in _POST_REAUTH:
                         callback()
                     return ReauthResult.SUCCEEDED
+                # Charge the budget for the wall clock actually spent, not merely for the
+                # sleep requested. Each iteration also runs `probe()`, which in production is
+                # `default_adc_probe`: a subprocess with a 15s timeout. A network outage is
+                # both a plausible cause of the auth failure and precisely the case that makes
+                # every probe burn that timeout in full, so counting sleep alone took 34 polls
+                # to 1020 + 34*15 = 1530s against the PUSH_WAIT_SECONDS `decide()` reserved
+                # before granting the wait. On a 30-minute unit an auth error at t=440 passed
+                # the budget test and ran to t=1970, past TimeoutStartSec -- systemd killed the
+                # run this mechanism exists to save. Because `step` is clamped to the budget
+                # that remains AFTER this charge, the loop can now overrun only by the single
+                # probe already in flight when the budget runs out.
+                #
+                # max(), not assignment, and that is the whole reason a clock is safe here.
+                # Every test injects a `sleep_fn` that returns instantly, so a loop that
+                # trusted the clock alone would never advance and would poll until 1020
+                # seconds of REAL time had elapsed. The floor keeps `waited` at the sleep it
+                # asked for whenever the measured time is smaller -- which is every test and
+                # no production run, since a real `time.sleep(x)` always takes at least `x`,
+                # so on the VPS the measured value wins and this is a true wall-clock budget.
+                # The clock can only ever shorten the wait, never lengthen it, so injecting a
+                # frozen or fake one degrades to the old behaviour instead of hanging.
+                #
+                # Monotonic, and deliberately unlike `resolve_deadline()`: this is a DURATION,
+                # so an NTP step mid-wait must not stretch or collapse it. That function must
+                # use wall clock for the mirror-image reason -- it compares against
+                # PTS_LLM_DEADLINE, which has an epoch.
+                waited = max(waited, clock() - started)
             return ReauthResult.FAILED
 
         # Explicit argument wins over the env override, so tests are hermetic even on a

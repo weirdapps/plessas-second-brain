@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -91,6 +92,25 @@ def _fake_systemctl(stdout: str, returncode: int = 0):
 def _no_systemctl(*args, **kwargs):
     """systemctl absent, as on every developer Mac and in CI."""
     raise FileNotFoundError("systemctl")
+
+
+def _systemd_stamp(posix: float) -> str:
+    """Render a POSIX time the way systemctl renders ExecMainStartTimestamp.
+
+    Local time with a zone abbreviation, e.g. "Tue 2026-08-11 02:00:06 EEST", built from
+    the running machine's own zone so the round trip holds in CI (UTC) and in Athens
+    alike — which is exactly the property the parser relies on in production, where
+    systemctl inherits its environment from the process asking.
+    """
+    return datetime.fromtimestamp(posix).astimezone().strftime("%a %Y-%m-%d %H:%M:%S %Z")
+
+
+def _started_at(posix: float, timeout: str = "30min") -> str:
+    """A full `systemctl show` reply for a loaded unit that started at `posix`."""
+    return (
+        f"LoadState=loaded\nTimeoutStartUSec={timeout}\n"
+        f"ExecMainStartTimestamp={_systemd_stamp(posix)}\n"
+    )
 
 
 # --------------------------------------------------------------------------- reserve
@@ -474,7 +494,7 @@ def test_an_unknown_unit_is_ignored_even_though_systemctl_exits_zero(monkeypatch
         "run",
         _fake_systemctl("LoadState=not-found\nTimeoutStartUSec=1min 30s\n"),
     )
-    assert llm_deadline._query_systemd_timeout("sb-does-not-exist") is None
+    assert llm_deadline._query_systemd_unit("sb-does-not-exist") == llm_deadline._NO_UNIT_FACTS
 
 
 def test_a_loaded_unit_reports_its_timeout(monkeypatch):
@@ -487,23 +507,23 @@ def test_a_loaded_unit_reports_its_timeout(monkeypatch):
         "run",
         _fake_systemctl("LoadState=loaded\nTimeoutStartUSec=30min\n"),
     )
-    assert llm_deadline._query_systemd_timeout("sb-daily-sync") == 1800
+    assert llm_deadline._query_systemd_unit("sb-daily-sync").timeout_seconds == 1800
 
 
 def test_a_missing_systemctl_degrades_silently(monkeypatch):
     """Every developer Mac and every CI run takes this path.
 
     Would this pass with the behaviour removed? No. Letting FileNotFoundError escape,
-    rather than catching it, propagates out of _query_systemd_timeout and this call
+    rather than catching it, propagates out of _query_systemd_unit and this call
     raises instead of returning None.
     """
     monkeypatch.setattr(llm_deadline.subprocess, "run", _no_systemctl)
-    assert llm_deadline._query_systemd_timeout("sb-daily-sync") is None
+    assert llm_deadline._query_systemd_unit("sb-daily-sync") == llm_deadline._NO_UNIT_FACTS
 
 
 def test_a_nonzero_exit_degrades_silently(monkeypatch):
     monkeypatch.setattr(llm_deadline.subprocess, "run", _fake_systemctl("", returncode=1))
-    assert llm_deadline._query_systemd_timeout("sb-daily-sync") is None
+    assert llm_deadline._query_systemd_unit("sb-daily-sync") == llm_deadline._NO_UNIT_FACTS
 
 
 # ----------------------------------------------------------------------- installation
@@ -593,19 +613,183 @@ def test_a_raised_live_timeout_still_uses_the_smaller_table_value(monkeypatch):
 
 
 def test_agreement_between_table_and_systemd_warns_about_nothing(monkeypatch, caplog):
-    """Would this pass with the behaviour removed? No. Warning unconditionally, rather
+    """The healthy production shape: table agrees, and the unit's start is readable.
+
+    Would this pass with the behaviour removed? No. Warning unconditionally, rather
     than only on disagreement, makes every production run log a false drift alert;
-    caplog.text would be non-empty.
+    caplog.text would be non-empty. The same assertion now also catches an anchor
+    warning fired on a perfectly good timestamp.
     """
-    monkeypatch.setattr(
-        llm_deadline.subprocess,
-        "run",
-        _fake_systemctl("LoadState=loaded\nTimeoutStartUSec=30min\n"),
-    )
+    monkeypatch.setattr(llm_deadline.subprocess, "run", _fake_systemctl(_started_at(1_000_000.0)))
     with caplog.at_level(logging.WARNING):
         deadline = llm_deadline.install_llm_deadline("sb-daily-sync", now=1_000_000.0)
     assert deadline == 1_001_590.0
     assert caplog.text == ""
+
+
+# ------------------------------------------------------------------- the unit's clock
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # Exactly what the VPS printed for sb-attachments on 2026-08-11.
+        ("Tue 2026-08-11 02:00:06 EEST", "local"),
+        ("2026-08-11 02:00:06", "local"),  # no weekday, no zone
+        ("Tue 2026-08-11 02:00:06.500000 EEST", "local"),  # sub-second, truncated
+        ("@1786402806", 1786402806.0),  # `systemctl --timestamp=unix`
+        ("n/a", None),  # a unit that has never run
+        ("", None),
+        ("0", None),
+        ("garbage", None),
+        ("Tue 2026-13-45 02:00:06 EEST", None),  # month 13, day 45
+        ("@notanumber", None),
+    ],
+)
+def test_systemd_timestamps_parse(raw, expected):
+    """Would this pass with the behaviour removed? No. Returning None unconditionally —
+    which is what a parser that does not understand the VPS's own format is reduced to —
+    fails the four positive cases, and with them every anchored deadline in production.
+    Accepting "n/a" as a time, or letting the datetime constructor's ValueError escape on
+    month 13, fails the negative ones.
+    """
+    got = llm_deadline._parse_systemd_timestamp(raw)
+    if expected == "local":
+        # Compared against the same local-time construction the renderer uses, so the
+        # assertion holds in CI (UTC) and in Athens without hardcoding either.
+        assert got == datetime(2026, 8, 11, 2, 0, 6).astimezone().timestamp()
+    else:
+        assert got == expected
+
+
+def test_the_start_time_comes_from_the_same_query_as_the_timeout(monkeypatch):
+    """One systemctl call answers both. Two calls are two chances to disagree.
+
+    Would this pass with the behaviour removed? No. Dropping ExecMainStartTimestamp from
+    the property list leaves start_time None — systemctl prints only what it is asked for
+    — and the second assertion fails. Counting the calls catches the other shape of the
+    mutation, a second fork issued for the timestamp alone.
+    """
+    calls = []
+
+    def _run(*args, **kwargs):
+        calls.append(args[0])
+        return subprocess.CompletedProcess(
+            args=args, returncode=0, stdout=_started_at(1_000_000.0), stderr=""
+        )
+
+    monkeypatch.setattr(llm_deadline.subprocess, "run", _run)
+    facts = llm_deadline._query_systemd_unit("sb-daily-sync")
+
+    assert facts.timeout_seconds == 1800
+    assert facts.start_time == 1_000_000.0
+    assert len(calls) == 1
+    assert "ExecMainStartTimestamp" in calls[0]
+
+
+def test_two_processes_in_one_unit_converge_on_one_deadline(monkeypatch):
+    """THE PROPERTY THIS WHOLE ANCHOR EXISTS FOR, and the one nothing else asserts.
+
+    Six of the ten units run more than one src.cli process per invocation, sequentially,
+    inside a single TimeoutStartSec. sb-attachment-pass.sh runs process-attachments, then
+    process-images, then process-sharepoint. Nothing carries PTS_LLM_DEADLINE between them
+    — verified on the VPS, `grep -rl PTS_LLM_DEADLINE ~/.local/bin ~/scripts` is empty —
+    so each computes its own, and each must arrive at the same answer.
+
+    Would this pass with the behaviour removed? No, and this is the regression. Anchor at
+    `now`, as the branch did, and the sibling that starts 1800s in gets 1_004_190 against
+    the first process's 1_003_390: a deadline 800 seconds past the SIGKILL. At that point
+    an auth error at t=2700 passes decide()'s test that the budget can fund a 1020s
+    token-push wait, and systemd kills the unit 900 seconds into the wait, with nothing
+    written — the exact failure the module's docstring says it exists to prevent.
+    """
+    unit_start = 1_000_000.0
+    monkeypatch.setattr(
+        llm_deadline.subprocess, "run", _fake_systemctl(_started_at(unit_start, timeout="1h"))
+    )
+
+    first = llm_deadline.install_llm_deadline("sb-attachments", now=unit_start)
+    # The sibling is a fresh process that never inherited the variable, which is the
+    # whole reason it has to recompute one. Without this pop, setdefault would hand it
+    # the first process's value and the test would assert nothing.
+    os.environ.pop("PTS_LLM_DEADLINE", None)
+    second = llm_deadline.install_llm_deadline("sb-attachments", now=unit_start + 1800)
+
+    assert first == second == 1_003_390.0
+
+
+def test_a_late_starting_sibling_gets_only_the_time_the_unit_has_left(monkeypatch):
+    """The anchor is not just consistent, it is the RIGHT instant.
+
+    Would this pass with the behaviour removed? No. Anchoring at a fixed offset, or at the
+    unit start plus the budget of a fresh process, still satisfies the convergence test
+    above as long as both processes agree. Only this one pins that what they agree on is
+    the unit's own clock: 1590s of budget from a start 1500s ago leaves 90s, not 1590.
+    """
+    unit_start = 1_000_000.0
+    monkeypatch.setattr(llm_deadline.subprocess, "run", _fake_systemctl(_started_at(unit_start)))
+
+    deadline = llm_deadline.install_llm_deadline("sb-daily-sync", now=unit_start + 1500)
+
+    assert deadline == 1_001_590.0
+    assert deadline - (unit_start + 1500) == 90.0
+
+
+@pytest.mark.parametrize(
+    ("stdout", "why"),
+    [
+        ("LoadState=loaded\nTimeoutStartUSec=30min\n", "absent"),
+        ("LoadState=loaded\nTimeoutStartUSec=30min\nExecMainStartTimestamp=n/a\n", "never ran"),
+        ("LoadState=loaded\nTimeoutStartUSec=30min\nExecMainStartTimestamp=rubbish\n", "unparsed"),
+    ],
+)
+def test_an_unusable_start_time_falls_back_to_this_process(monkeypatch, caplog, stdout, why):
+    """No anchor is a per-process deadline again — the old behaviour, but logged.
+
+    Would this pass with the behaviour removed? No. Letting a None anchor through reads
+    `None + budget` and raises TypeError; defaulting it to 0.0, the other obvious slip,
+    puts the deadline in 1970 and every call is refused for the rest of the run. Dropping
+    the log alone leaves the first assertion green and the second red, which is the point:
+    a silent fallback to the buggy behaviour is the failure mode worth catching.
+    """
+    monkeypatch.setattr(llm_deadline.subprocess, "run", _fake_systemctl(stdout))
+    with caplog.at_level(logging.WARNING):
+        deadline = llm_deadline.install_llm_deadline("sb-daily-sync", now=1_000_000.0)
+    assert deadline == 1_001_590.0, why
+    assert "ExecMainStartTimestamp" in caplog.text
+
+
+def test_a_start_time_in_the_future_is_refused(monkeypatch, caplog):
+    """Clock skew must not buy budget.
+
+    Would this pass with the behaviour removed? No. Trusting it anchors at 1_000_600 and
+    yields 1_002_190 — 600s of budget the unit does not have, granted by an error nobody
+    would see. The fallback puts it back at 1_001_590.
+    """
+    monkeypatch.setattr(llm_deadline.subprocess, "run", _fake_systemctl(_started_at(1_000_600.0)))
+    with caplog.at_level(logging.WARNING):
+        deadline = llm_deadline.install_llm_deadline("sb-daily-sync", now=1_000_000.0)
+    assert deadline == 1_001_590.0
+    assert "future" in caplog.text
+
+
+def test_a_start_time_older_than_the_unit_itself_is_refused(monkeypatch, caplog):
+    """A timestamp from a previous activation, e.g. read by a lingering child.
+
+    systemd would have killed a 1800s unit that started 2000s ago, so a live process
+    reading that cannot be in that activation. Trusting it makes the deadline 200s in the
+    PAST, so every call is refused and the run does nothing while reporting success.
+
+    Would this pass with the behaviour removed? No. Without the staleness guard the
+    deadline is 999_800 — before `now` — and the first assertion fails. The boundary is
+    tested by the late-sibling case above, which sits inside the timeout at 1500s of 1800
+    and must keep its (small) real budget rather than take this fallback.
+    """
+    monkeypatch.setattr(llm_deadline.subprocess, "run", _fake_systemctl(_started_at(998_000.0)))
+    with caplog.at_level(logging.WARNING):
+        deadline = llm_deadline.install_llm_deadline("sb-daily-sync", now=1_000_000.0)
+    assert deadline == 1_001_590.0
+    assert "cannot be this activation" in caplog.text
 
 
 # ------------------------------------------------------------------------- CLI wiring

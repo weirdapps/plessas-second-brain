@@ -1315,6 +1315,9 @@ def cmd_calendar_sync(args):
     from src.config import USER_EMAIL_PATTERN
     from src.export.calendar_export import get_event_body, list_events, parse_event
     from src.extract.calendar_extractor import extract_event
+    from src.extract.policy_bridge import classify_exception
+    from src.extract.vertex_auth import touch_sentinel
+    from src.llm_policy import Outcome
     from src.store.calendar_loader import load_event, load_proxy_emails
     from src.store.schema import get_connection, run_migrations
 
@@ -1342,17 +1345,27 @@ def cmd_calendar_sync(args):
     raw_events = list_events(since, until_dt)
     print(f"  Fetched {len(raw_events)} events")
 
-    stats = {"loaded": 0, "skipped_unchanged": 0, "extracted": 0, "failed": 0}
+    stats = {"loaded": 0, "skipped_unchanged": 0, "extracted": 0, "failed": 0, "deferred": 0}
 
     for raw in raw_events:
         event = parse_event(raw)
 
-        # Skip if unchanged (compare modified_at)
+        # Skip if unchanged AND we do not still owe it an extraction.
+        #
+        # modified_at alone was not enough. An event whose extraction failed was still
+        # upserted with the new modified_at, so on the next run it matched here, scored
+        # skipped_unchanged, and its body_summary, decisions and action items were gone for
+        # good — no retry, and nothing in the row saying one was owed. llm_status='pending'
+        # is that debt, and it is the only value that re-offers an unmodified event.
         existing = conn.execute(
-            "SELECT modified_at FROM calendar_events WHERE outlook_event_id = ?",
+            "SELECT modified_at, llm_status FROM calendar_events WHERE outlook_event_id = ?",
             (event["outlook_event_id"],),
         ).fetchone()
-        if existing and existing["modified_at"] == event.get("modified_at"):
+        if (
+            existing
+            and existing["modified_at"] == event.get("modified_at")
+            and existing["llm_status"] != "pending"
+        ):
             stats["skipped_unchanged"] += 1
             continue
 
@@ -1366,26 +1379,41 @@ def cmd_calendar_sync(args):
             if isinstance(body_obj, dict):
                 body_html = body_obj.get("Content", "")
 
-        # Extract
+        # Extract. 'skipped' until something is actually attempted: no body, under the
+        # 50-char floor, or --skip-extraction are all "nothing was owed", not "nothing
+        # came back".
         extraction = {"body_summary": "", "decisions": [], "action_items": []}
+        llm_status = "skipped"
         if not args.skip_extraction and body_html and len(body_html.strip()) >= 50:
             try:
                 extraction = extract_event(event, body_html)
+                llm_status = "extracted"
                 stats["extracted"] += 1
             except Exception as e:
+                # Same split, and the same classifier, as attachment_pipeline: a failure
+                # a re-auth would cure is a debt to retry, anything else needs a human.
+                # What reaches here has already exhausted call_with_policy's retries.
+                if classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED:
+                    llm_status = "pending"
+                    touch_sentinel()
+                    stats["deferred"] += 1
+                else:
+                    llm_status = "failed"
+                    stats["failed"] += 1
                 print(
-                    f"  Extraction failed for {event.get('subject', '???')}: {e}",
+                    f"  Extraction {llm_status} for {event.get('subject', '???')}: {e}",
                     file=sys.stderr,
                 )
-                stats["failed"] += 1
 
-        # Load
+        # Load. The facts go in regardless — they come from the API, not the model, so
+        # they are good even when the extraction that should have accompanied them is not.
         load_event(
             conn,
             event,
             extraction,
             user_email_pattern=USER_EMAIL_PATTERN,
             proxy_emails=proxy_emails,
+            llm_status=llm_status,
         )
         stats["loaded"] += 1
 
@@ -1394,6 +1422,7 @@ def cmd_calendar_sync(args):
     print(f"  Unchanged:  {stats['skipped_unchanged']}")
     print(f"  Extracted:  {stats['extracted']}")
     print(f"  Failed:     {stats['failed']}")
+    print(f"  Deferred:   {stats['deferred']}")
 
 
 def _staged_news_ids(staging_dir: Path) -> set[str]:

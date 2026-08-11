@@ -231,6 +231,10 @@ def _parse_systemd_timestamp(s: str) -> float | None:
         naive = datetime(*(int(g) for g in m.groups()))  # type: ignore[arg-type]
     except ValueError:  # e.g. month 13, day 32
         return None
+    # `naive.timestamp()` alone would give the identical answer — a naive datetime is
+    # already interpreted as local time, with the same fold=0 tie-break — so this is an
+    # equivalent expression rather than an untested branch. Spelled out because the
+    # local-time reading is the load-bearing assumption of this whole function.
     return naive.astimezone().timestamp()
 
 

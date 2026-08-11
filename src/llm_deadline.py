@@ -12,7 +12,7 @@ is executing. That is not cosmetic in either direction:
     TimeoutStartSec of 300. A 900s budget lets the policy plan retries the unit will be
     SIGTERMed in the middle of.
 
-THREE SEPARATE QUESTIONS, answered by three separate mechanisms. They are easy to
+FOUR SEPARATE QUESTIONS, answered by four separate mechanisms. They are easy to
 conflate on a later read, and conflating them is how a budget quietly becomes wrong:
 
   1. WHICH unit is this process?      ``_detect_systemd_unit`` reads /proc/self/cgroup.
@@ -20,9 +20,24 @@ conflate on a later read, and conflating them is how a budget quietly becomes wr
      deadline; a guessed unit is worse than none.
   2. WHAT SHOULD its timeout be?      ``_UNIT_TIMEOUT_SECONDS``, the checked-in table.
      This is the expected value, and the thing a reviewer can read.
-  3. WHAT IS its timeout right now?   ``_query_systemd_timeout`` asks systemd, gated on
+  3. WHAT IS its timeout right now?   ``_query_systemd_unit`` asks systemd, gated on
      LoadState. The SMALLER of (2) and (3) wins, with a warning naming both, because
      the dangerous drift is a unit whose timeout was cut while the table was not.
+  4. WHEN DID THE UNIT START?         ``ExecMainStartTimestamp``, from the same query,
+     via ``_deadline_anchor``. The budget is the UNIT's, so the deadline has to count
+     from the UNIT's start, not from whichever of its processes happens to be asking.
+     Six of the ten units run more than one ``src.cli`` process per invocation and
+     nothing carries the deadline between them (``grep -rl PTS_LLM_DEADLINE
+     ~/.local/bin ~/scripts`` on the VPS returns nothing), so a per-process anchor
+     hands each sibling a fresh full budget measured from its own start.
+
+     Concretely, before this: sb-attachment-pass.sh runs process-attachments, then
+     process-images, then process-sharepoint inside one 3600s unit. Phase two starts at
+     t=1800 and anchors its 3390s budget there, so an auth error at t=2700 satisfies
+     2700 + 1020 + 120 <= 5190, the policy grants a token-push wait, and systemd
+     SIGKILLs 900 seconds into it. The flat 900s default this module replaces could
+     never fund a wait at all, so the branch that added the wait is the branch that
+     could kill a unit with it.
 
 Ported from news's ``main.py`` (``_deadline_reserve_seconds``, ``_llm_budget_seconds``,
 ``_query_systemd_timeout``, ``install_llm_deadline``), which this mirrors deliberately
@@ -35,7 +50,9 @@ import os
 import re
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 from src.llm_policy import MAX_ATTEMPTS, ROW_CAPS, backoff
 
@@ -171,8 +188,66 @@ def _parse_systemd_duration(s: str) -> int | None:
     return total if total > 0 else None
 
 
-def _query_systemd_timeout(unit: str) -> int | None:
-    """Ask systemd for a unit's TimeoutStartUSec. Returns seconds, or None on any failure.
+# "Tue 2026-08-11 02:00:06 EEST", the form the VPS emits. The leading weekday and the
+# trailing zone abbreviation are both optional and both DISCARDED — see
+# _parse_systemd_timestamp for why reading either would be a mistake.
+_TIMESTAMP_RE = re.compile(
+    r"^(?:\S+\s+)?(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:\s+\S+)?$"
+)
+
+
+def _parse_systemd_timestamp(s: str) -> float | None:
+    """Parse a systemd timestamp to POSIX seconds. None if absent or unrecognised.
+
+    LOCAL TIME, AND THAT IS NOT AN ASSUMPTION. systemctl is a client that renders the
+    timestamp itself, with the environment it inherits from THIS process, so its notion of
+    local time and Python's are the same by construction. The zone abbreviation is
+    therefore redundant, and parsing it would be worse than ignoring it: strptime's %Z
+    understands UTC, GMT and the running machine's own zone names and nothing else, so
+    "EEST" read on a UTC CI box fails outright. The weekday is dropped for the same reason
+    — it is locale-dependent output being fed to a locale-dependent parser.
+
+    The one hour a year that is genuinely ambiguous, the repeated hour at a DST fallback,
+    resolves through fold=0 to the earlier of the two instants. That makes the anchor
+    earlier, the budget shorter and the deadline sooner, which is the safe direction.
+
+    The "@1786402806" form is accepted because `systemctl --timestamp=unix` emits it.
+    Nothing here passes that flag (see _query_systemd_unit) but a future caller might.
+    """
+    s = s.strip()
+    # systemd prints "n/a" for a unit that has never run; some builds print a bare 0.
+    if not s or s in ("n/a", "0"):
+        return None
+    if s.startswith("@"):
+        try:
+            return float(s[1:])
+        except ValueError:
+            return None
+    m = _TIMESTAMP_RE.match(s)
+    if m is None:
+        return None
+    try:
+        naive = datetime(*(int(g) for g in m.groups()))  # type: ignore[arg-type]
+    except ValueError:  # e.g. month 13, day 32
+        return None
+    return naive.astimezone().timestamp()
+
+
+class _UnitFacts(NamedTuple):
+    """What one `systemctl show` says about a unit. Every field degrades to None."""
+
+    timeout_seconds: int | None
+    start_time: float | None
+
+
+_NO_UNIT_FACTS = _UnitFacts(None, None)
+
+
+def _query_systemd_unit(unit: str) -> _UnitFacts:
+    """Ask systemd for a unit's start timeout and its start time. None on any failure.
+
+    ONE CALL FOR BOTH FACTS, deliberately: they are read together, they must describe the
+    same activation, and a second fork is a second chance to disagree.
 
     Degrades silently on macOS, in CI, and anywhere systemctl is absent or the unit is
     unknown. A cross-check that raises is worse than the table drift it guards against.
@@ -184,6 +259,17 @@ def _query_systemd_timeout(unit: str) -> int | None:
     true value with LoadState=loaded. Trusting the exit code alone would make every
     developer Mac and every CI run adopt 90s as its unit timeout, drive the margin
     negative and refuse to run. Only a loaded unit's timeout means anything.
+
+    NO `--timestamp=unix`, though it would remove the parsing entirely. It is a global
+    systemctl option, so on a build that predates it systemctl exits non-zero and takes
+    the TimeoutStartUSec cross-check down with it — trading a parser for a silent loss of
+    the drift guard. Verified present on the VPS (systemd 259) and still not used.
+
+    ExecMainStartTimestamp is the start of the unit's main process. All ten sb units are
+    Type=oneshot with exactly one ExecStart and no ExecStartPre (verified on the VPS on
+    2026-08-11), so it coincides with InactiveExitTimestamp, i.e. with the instant
+    TimeoutStartSec begins counting. A unit that later grows an ExecStartPre, or a second
+    ExecStart line, would break that identity and should switch to InactiveExitTimestamp.
     """
     try:
         result = subprocess.run(
@@ -196,19 +282,24 @@ def _query_systemd_timeout(unit: str) -> int | None:
                 "LoadState",
                 "-p",
                 "TimeoutStartUSec",
+                "-p",
+                "ExecMainStartTimestamp",
             ],
             capture_output=True,
             text=True,
             timeout=5,
         )
         if result.returncode != 0:
-            return None
+            return _NO_UNIT_FACTS
         fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
         if fields.get("LoadState") != "loaded":
-            return None
-        return _parse_systemd_duration(fields.get("TimeoutStartUSec", ""))
+            return _NO_UNIT_FACTS
+        return _UnitFacts(
+            _parse_systemd_duration(fields.get("TimeoutStartUSec", "")),
+            _parse_systemd_timestamp(fields.get("ExecMainStartTimestamp", "")),
+        )
     except Exception:  # noqa: BLE001 - FileNotFoundError, TimeoutExpired, etc.
-        return None
+        return _NO_UNIT_FACTS
 
 
 def _deadline_reserve_seconds(max_call_seconds: float) -> float:
@@ -270,6 +361,64 @@ def _llm_budget_seconds(
     return budget
 
 
+def _deadline_anchor(
+    unit: str,
+    unit_start: float | None,
+    now: float,
+    unit_timeout_seconds: float | None,
+    logger: logging.Logger,
+) -> float:
+    """The instant the budget counts from: the unit's start, or this process's if unusable.
+
+    A WRONG ANCHOR IS WORSE THAN A PER-PROCESS ONE, which is why all three rejections
+    below fall back to ``now`` rather than to a repaired value. Anchoring too EARLY only
+    shortens the budget; anchoring too LATE is the SIGKILL this module exists to prevent,
+    and there is no way to tell one bad timestamp from the other.
+
+      * Absent or unparseable. The host does not offer the fact, or offers it in a shape
+        this build does not know. Logged, because the fallback silently restores exactly
+        the per-process behaviour that the anchoring exists to remove.
+      * In the future. Clock skew, or a timestamp from a different clock entirely. It
+        would push the deadline out by the whole error.
+      * Older than the unit's own timeout. Impossible for a live activation: systemd would
+        have killed the unit already, so a process still running and reading this must be
+        looking at a previous activation's timestamp — a lingering child, say. Without
+        this the budget goes negative and the run makes no calls at all while looking
+        perfectly healthy. Note the boundary is >=, and a process that starts LEGITIMATELY
+        late is unaffected: it is by definition still inside the timeout, so it correctly
+        gets the small remainder rather than a fresh full budget.
+    """
+    if unit_start is None:
+        logger.warning(
+            "unit '%s': no usable ExecMainStartTimestamp; anchoring the deadline at this "
+            "process's own start, so a sibling process in the same unit will get its own "
+            "full budget.",
+            unit,
+        )
+        return now
+    if unit_start > now:
+        logger.warning(
+            "unit '%s': ExecMainStartTimestamp %g is in the future (now %g); anchoring at "
+            "this process's own start instead.",
+            unit,
+            unit_start,
+            now,
+        )
+        return now
+    if unit_timeout_seconds is not None and now - unit_start >= unit_timeout_seconds:
+        logger.warning(
+            "unit '%s': ExecMainStartTimestamp %g is %gs old, at or past the unit's own "
+            "TimeoutStartSec of %gs, so it cannot be this activation; anchoring at this "
+            "process's own start instead.",
+            unit,
+            unit_start,
+            now - unit_start,
+            unit_timeout_seconds,
+        )
+        return now
+    return unit_start
+
+
 def install_llm_deadline(
     unit: str | None,
     now: float | None = None,
@@ -286,9 +435,16 @@ def install_llm_deadline(
     ``setdefault``, not assignment: an operator running a pass by hand, or a future
     runner that computes a better value, must still win.
 
-    Wall clock, not monotonic. PTS_LLM_DEADLINE is an absolute POSIX time and
+    ``now`` is THIS PROCESS's clock reading, not the origin of the budget. The budget
+    counts from the UNIT's start (see ``_deadline_anchor``), so that every process the
+    unit runs converges on the same absolute deadline. ``now`` is what the anchor is
+    sanity-checked against, and what it falls back to.
+
+    Wall clock, not monotonic, throughout. PTS_LLM_DEADLINE is an absolute POSIX time and
     ``resolve_deadline`` compares it against ``time.time()``; a monotonic value here
-    would switch the whole mechanism off silently.
+    would switch the whole mechanism off silently. ExecMainStartTimestamp is on that same
+    epoch, which is why it can serve as the anchor at all — systemd's separate
+    ``...TimestampMonotonic`` field cannot, and must not be substituted for it.
     """
     logger = logging.getLogger(__name__)
 
@@ -305,15 +461,17 @@ def install_llm_deadline(
     # SIGKILL with nothing written. Querying at startup catches that silently and safely.
     table_timeout = _UNIT_TIMEOUT_SECONDS.get(unit)
     effective_timeout: float | None = table_timeout
+    unit_start: float | None = None
     if table_timeout is not None:
-        systemd_timeout = _query_systemd_timeout(unit)
-        if systemd_timeout is not None and systemd_timeout != table_timeout:
-            effective_timeout = min(table_timeout, systemd_timeout)
+        facts = _query_systemd_unit(unit)
+        unit_start = facts.start_time
+        if facts.timeout_seconds is not None and facts.timeout_seconds != table_timeout:
+            effective_timeout = min(table_timeout, facts.timeout_seconds)
             logger.warning(
                 "unit '%s': live TimeoutStartSec=%gs disagrees with table value=%gs; "
                 "using the smaller (%gs). Update _UNIT_TIMEOUT_SECONDS to silence this.",
                 unit,
-                systemd_timeout,
+                facts.timeout_seconds,
                 table_timeout,
                 effective_timeout,
             )
@@ -327,7 +485,9 @@ def install_llm_deadline(
         )
         return None
 
-    deadline = (time.time() if now is None else now) + budget
+    now = time.time() if now is None else now
+    anchor = _deadline_anchor(unit, unit_start, now, effective_timeout, logger)
+    deadline = anchor + budget
     os.environ.setdefault("PTS_LLM_DEADLINE", repr(deadline))
     installed = float(os.environ["PTS_LLM_DEADLINE"])
     if installed != deadline:
@@ -343,13 +503,16 @@ def install_llm_deadline(
         )
         return installed
     logger.info(
-        "LLM budget for '%s': %gs (TimeoutStartSec=%gs - max_call=%gs - grace=%gs). "
+        "LLM budget for '%s': %gs (TimeoutStartSec=%gs - max_call=%gs - grace=%gs), "
+        "anchored at the unit's start, %gs ago, leaving %gs for this process. "
         "Largest backoff the policy can emit is %gs.",
         unit,
         budget,
         effective_timeout,
         max_call_seconds,
         _SHUTDOWN_GRACE_SECONDS,
+        now - anchor,
+        deadline - now,
         _MAX_REACHABLE_BACKOFF_SECONDS,
     )
     return deadline

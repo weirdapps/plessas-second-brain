@@ -15,7 +15,7 @@ from pathlib import Path
 
 from src.config import ATTACHMENTS_DIR, DEFAULT_DB
 from src.extract.attachment_extractors import extract_text_from_file
-from src.extract.vertex_auth import is_vertex_auth_error, touch_sentinel
+from src.extract.vertex_auth import touch_sentinel
 
 # Processing constants
 PHASE1_BATCH_SIZE = 50
@@ -154,16 +154,31 @@ def run_phase1(
 
 
 def _extract_one_attachment(row):
-    """Worker: call LLM for a single attachment. Returns (ac_id, result_dict) or (ac_id, error)."""
+    """Worker: call LLM for a single attachment.
+
+    Returns ``(ac_id, email_id, extraction, error, auth_error)``. On success ``error`` is
+    None and ``extraction`` is the parsed dict; on failure the reverse, with ``error``
+    serialised for the DB column.
+
+    ``auth_error`` EXISTS BECAUSE THE VERDICT CANNOT BE RECOVERED FROM THE STRING. The
+    caller writes ``pending`` for a re-authable failure and ``failed`` for a permanent
+    one, and only ``pending`` is ever selected again by run_phase2 — so a
+    misclassification here is not a cosmetic label, it is an item that is never retried.
+    The classifier answers from the exception TYPE, which exists only inside this except
+    block; two of the three auth types (anthropic.AuthenticationError and
+    PermissionDeniedError) carry nothing in their message that a pattern list can match,
+    so a string test applied downstream calls a recoverable 401 permanent. Decide it here,
+    with the exception in hand, and hand the answer on.
+    """
     from src.extract.attachment_prompt import build_attachment_prompt
-    from src.extract.claude_extract import _get_client_and_model
+    from src.extract.claude_extract import _get_client_and_model, call_with_policy
     from src.extract.parser import parse_extraction
+    from src.extract.policy_bridge import classify_exception
+    from src.llm_policy import Outcome
 
     ac_id, att_id, text, filename, mime_type, email_id, email_subject, email_date = row
 
     try:
-        client, model = _get_client_and_model()
-
         prompt = build_attachment_prompt(
             extracted_text=text,
             filename=filename,
@@ -172,16 +187,23 @@ def _extract_one_attachment(row):
             email_date=email_date,
         )
 
-        response = client.messages.create(
-            model=model,
-            # Dense documents (large spreadsheets/decks) yield long extraction
-            # JSON; 2048 truncated it mid-structure on ~40K-char docs, so every
-            # such attachment failed with "Expecting ',' delimiter". Give the
-            # structured output room to complete; parse_extraction additionally
-            # salvages any residual truncation rather than dropping the summary.
-            max_tokens=8192,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        # _do_call re-fetches the client on every attempt so a successful reauth
+        # (which calls reset_client_cache) is picked up by the retry rather than
+        # silently reusing the stale credential.
+        def _do_call():
+            cur_client, cur_model = _get_client_and_model()
+            return cur_client.messages.create(
+                model=cur_model,
+                # Dense documents (large spreadsheets/decks) yield long extraction
+                # JSON; 2048 truncated it mid-structure on ~40K-char docs, so every
+                # such attachment failed with "Expecting ',' delimiter". Give the
+                # structured output room to complete; parse_extraction additionally
+                # salvages any residual truncation rather than dropping the summary.
+                max_tokens=8192,
+                messages=[{"role": "user", "content": prompt}],
+            )
+
+        response = call_with_policy(_do_call, max_call_seconds=120.0)
         # Do not close: this is the shared client from _get_client_and_model.
 
         raw_text = response.content[0].text
@@ -190,10 +212,11 @@ def _extract_one_attachment(row):
             raw_text = "\n".join(lines[1:-1])
 
         extraction = parse_extraction(raw_text)
-        return (ac_id, email_id, extraction, None)
+        return (ac_id, email_id, extraction, None, False)
 
     except Exception as e:
-        return (ac_id, email_id, None, f"{type(e).__name__}: {str(e)[:500]}")
+        auth_error = classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED
+        return (ac_id, email_id, None, f"{type(e).__name__}: {str(e)[:500]}", auth_error)
 
 
 def run_phase2(
@@ -260,11 +283,16 @@ def run_phase2(
 
     stats = {"processed": 0, "extracted": 0, "failed": 0}
 
-    def _store_result(ac_id, email_id, extraction, error):
-        """Store a single result in the DB (called from main thread)."""
+    def _store_result(ac_id, email_id, extraction, error, auth_error):
+        """Store a single result in the DB (called from main thread).
+
+        ``auth_error`` is the worker's verdict, taken from the same classifier the retry
+        policy uses. Re-deriving it here from ``error`` — which is a string by the time it
+        arrives — is what made a surviving 401 permanent: see _extract_one_attachment.
+        """
         now = datetime.now().isoformat()
         if error:
-            if is_vertex_auth_error(error):
+            if auth_error:
                 # Vertex ADC expired. Mark pending so the next cron retries
                 # automatically once the user re-auths (auth-watch clears
                 # the sentinel on its next probe). See vertex_auth.py.
@@ -347,8 +375,8 @@ def run_phase2(
     if workers <= 1:
         # Sequential mode (original behavior)
         for row in rows:
-            ac_id, email_id, extraction, error = _extract_one_attachment(row)
-            _store_result(ac_id, email_id, extraction, error)
+            ac_id, email_id, extraction, error, auth_error = _extract_one_attachment(row)
+            _store_result(ac_id, email_id, extraction, error, auth_error)
             if stats["processed"] % PHASE2_BATCH_SIZE == 0:
                 time.sleep(PHASE2_COOLDOWN)
     else:
@@ -356,8 +384,8 @@ def run_phase2(
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(_extract_one_attachment, row): row for row in rows}
             for future in as_completed(futures):
-                ac_id, email_id, extraction, error = future.result()
-                _store_result(ac_id, email_id, extraction, error)
+                ac_id, email_id, extraction, error, auth_error = future.result()
+                _store_result(ac_id, email_id, extraction, error, auth_error)
 
     conn.commit()
     conn.close()

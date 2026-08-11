@@ -85,7 +85,14 @@ class TestTouchSentinel:
 
 
 class TestAttachmentPipelineDefersOnAuthError:
-    """Auth-error must mark llm_status='pending' (not 'failed') AND touch sentinel."""
+    """Auth-error must mark llm_status='pending' (not 'failed') AND touch sentinel.
+
+    DO NOT TRUST THIS AS A REGRESSION TEST. It re-implements the production branch inline
+    and asserts against its own copy, so it cannot detect a change in the real one: it
+    stayed green through both mutations of attachment_pipeline._store_result. The test with
+    teeth is tests/test_attachment_pipeline.py::
+    test_phase2_defers_every_auth_type_the_policy_calls_reauthable, which drives run_phase2.
+    """
 
     def test_auth_error_defers_and_touches_sentinel(self, tmp_path, monkeypatch):
         from src.extract import vertex_auth
@@ -134,7 +141,14 @@ class TestAttachmentPipelineDefersOnAuthError:
 
 
 class TestTeamsPipelineDefersOnAuthError:
-    """Auth-error must mark extraction_status='pending' (not 'failed') AND touch sentinel."""
+    """Auth-error must mark extraction_status='pending' (not 'failed') AND touch sentinel.
+
+    DO NOT TRUST THIS AS A REGRESSION TEST, for the same reason as the class above: it
+    duplicates the production branch rather than calling it, and it still asserts the
+    string matcher that teams_pipeline no longer uses. The test with teeth is
+    tests/teams/test_teams_pipeline.py::
+    test_a_surviving_failure_is_labelled_by_the_classifier_not_by_a_string.
+    """
 
     def test_auth_error_defers_and_touches_sentinel(self, tmp_path, monkeypatch):
         from src.extract import vertex_auth

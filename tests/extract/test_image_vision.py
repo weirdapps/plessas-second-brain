@@ -2,8 +2,12 @@ import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
+import google.auth.exceptions as gauth
+
+from src.extract import claude_extract
 from src.extract.image_classifier import Classification
 from src.extract.image_vision import classify_with_vision, parse_vision_response
+from src.llm_policy import ReauthResult
 from src.store.schema import create_database, run_migrations
 
 
@@ -53,3 +57,53 @@ def test_classify_with_vision_uses_cache(mock_get_client, tmp_path):
     assert label == Classification.CONTENT
     assert desc == "cached desc"
     assert not mock_get_client.called
+
+
+def test_classify_with_vision_auth_error_triggers_reauth(tmp_path, monkeypatch):
+    """One auth error triggers reauth; the second call succeeds.
+
+    Before the fix: RefreshError escapes classify_with_vision (no retry);
+    failures are invisible to the auth watcher because the broad handler in
+    attachment_pipeline is never reached from the vision path.
+    After the fix: call_with_policy retries after reauth.
+
+    running_on_linux is pinned False (macOS path) so decide() chooses
+    REAUTH_RETRY instead of giving up immediately with UNRECOVERABLE_AUTH.
+
+    Mutation checks:
+    - Remove call_with_policy (bare create): RefreshError propagates,
+      assert label == Classification.CONTENT is never reached.
+    - Remove the retry (loop exits after 1): len(calls) == 1, not 2.
+    """
+    from PIL import Image
+
+    img = tmp_path / "x.png"
+    Image.new("RGB", (10, 10), "red").save(img)
+    db = _setup_db(tmp_path)
+
+    calls = []
+
+    class FakeMessages:
+        def create(self, **kw):
+            calls.append(kw)
+            if len(calls) == 1:
+                raise gauth.RefreshError("invalid_grant: Bad Request")
+            return type(
+                "R",
+                (),
+                {
+                    "stop_reason": "end_turn",
+                    "content": [type("C", (), {"text": "CONTENT: a red square"})()],
+                },
+            )()
+
+    fake = type("Client", (), {"messages": FakeMessages()})()
+    # classify_with_vision does a lazy import of _get_client_and_model from
+    # claude_extract, so patching it there is the correct interception point.
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (fake, "m"))
+    monkeypatch.setattr(claude_extract, "running_on_linux", lambda: False)
+    with patch.object(claude_extract, "reauth", return_value=ReauthResult.SUCCEEDED):
+        label, desc = classify_with_vision(img, conn=db)
+
+    assert label == Classification.CONTENT
+    assert len(calls) == 2

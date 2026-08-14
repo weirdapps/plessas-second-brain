@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -45,12 +46,55 @@ INGESTABLE_EXTENSIONS = {".pdf", ".pptx", ".xlsx", ".docx", ".md", ".txt"}
 # can be self-manufactured while the organic source is frozen.
 DOCUMENT_SYNC_STAMP = STATE_DIR / "document-sync.stamp"
 
+# Counterpart to the heartbeat: written by the push job when a run FAILS (line 1
+# ISO-8601 UTC, line 2 the reason), removed when one succeeds. The stamp alone
+# records only successes and is judged against a 14-day window, so a job failing
+# on every run emits no signal until that window expires.
+DOCUMENT_SYNC_FAIL = STATE_DIR / "document-sync.fail"
+
 # Upstream news database — same path `brain news-sync` reads (honours BRAIN_NEWS_DB).
 NEWS_DB = NEWS_DB_PATH
 
 # launchd label prefix (macOS); override with BRAIN_LABEL_PREFIX. systemd units
 # (VPS) use the sb-* names in SYSTEMD_UNITS below and are unaffected by this.
-LABEL_PREFIX = os.environ.get("BRAIN_LABEL_PREFIX", "com.secondbrain")
+DEFAULT_LABEL_PREFIX = "com.secondbrain"
+
+# Suffixes used to read the prefix off installed plists. Only unambiguous ones:
+# ".teams-sync" and ".calendar-sync" also end in "-sync", so keying on that
+# suffix would truncate the prefix to "<prefix>.teams".
+_DISCOVERY_JOB_SUFFIXES = (
+    ".noon-catchup",
+    ".attachments",
+    ".auth-watch",
+    ".curate-docs",
+    ".reverse-ingest",
+)
+
+
+def detect_label_prefix(agents_dir: Path = LAUNCH_AGENTS_DIR) -> str:
+    """The launchd label prefix this machine actually uses.
+
+    BRAIN_LABEL_PREFIX wins when set; otherwise the prefix is read off the
+    installed plists. A hardcoded default cannot be right for both worlds: this
+    script ships to a public repo, so the shipped literal is generic and matched
+    nothing on the host that actually runs it — _is_migrated() then looked for
+    filenames that do not exist and reported all 9 migrated jobs as NOT_LOADED.
+    """
+    env = os.environ.get("BRAIN_LABEL_PREFIX")
+    if env:
+        return env
+    counts: Counter[str] = Counter()
+    for suffix in _DISCOVERY_JOB_SUFFIXES:
+        for path in agents_dir.glob(f"*{suffix}.plist*"):
+            prefix = path.name.split(f"{suffix}.plist", 1)[0]
+            if prefix:
+                counts[prefix] += 1
+    if not counts:
+        return DEFAULT_LABEL_PREFIX
+    return counts.most_common(1)[0][0]
+
+
+LABEL_PREFIX = detect_label_prefix()
 
 STALE_THRESHOLDS = {
     "emails": timedelta(hours=6),
@@ -436,7 +480,36 @@ def check_documents(db):
     }
 
 
-def check_document_roots(roots=None, now=None, stamp: Path = DOCUMENT_SYNC_STAMP):
+def _read_push_failure(marker: Path, last_success):
+    """(failing, reason) from the push job's failure marker.
+
+    A marker older than the last recorded success has been superseded by that
+    success and is ignored. An unparseable marker still counts as failing: its
+    existence is the evidence, and swallowing it would restore the blind spot
+    this marker exists to close.
+    """
+    try:
+        raw = Path(marker).read_text(errors="replace").strip()
+    except OSError:
+        return False, None
+    if not raw:
+        return False, None
+    lines = raw.splitlines()
+    reason = lines[1].strip() if len(lines) > 1 else None
+    failed_at = _utc(lines[0].strip())
+    if failed_at is None:
+        return True, reason or "unreadable failure marker"
+    if last_success is not None and failed_at <= last_success:
+        return False, None
+    return True, reason
+
+
+def check_document_roots(
+    roots=None,
+    now=None,
+    stamp: Path = DOCUMENT_SYNC_STAMP,
+    fail_marker: Path = DOCUMENT_SYNC_FAIL,
+):
     """Freshness of the reverse-ingest *input*, not its output.
 
     check_documents only proves the job wrote rows; it stays green when the
@@ -517,6 +590,16 @@ def check_document_roots(roots=None, now=None, stamp: Path = DOCUMENT_SYNC_STAMP
     else:
         note = None
         stale = stamp_age > STALE_THRESHOLDS["document_roots"]
+
+    # A failing push outranks both signals above. The stamp records only
+    # successes and is judged against a 14-day window, so a run that fails every
+    # time emits nothing until that window expires — 56 consecutive TCC denials
+    # reported OK for 8 days on exactly this path.
+    push_failing, fail_reason = _read_push_failure(fail_marker, stamp_at)
+    if push_failing:
+        stale = True
+        note = f"push FAILING: {fail_reason}" if fail_reason else "push FAILING"
+
     return {
         "name": "Doc Roots",
         "total": total,
@@ -527,6 +610,7 @@ def check_document_roots(roots=None, now=None, stamp: Path = DOCUMENT_SYNC_STAMP
         "missing": missing,
         "note": note,
         "stale": stale,
+        "push_failing": push_failing,
         "status": "STALE" if stale else ("WARN" if missing or age is None else "OK"),
     }
 
@@ -834,7 +918,15 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
             count = f"{c.get('ok', 0)}/{c.get('total', 0)}"
             extra = f" ({c.get('exception', 0)} exceptions)"
         elif c["name"] == "Doc Roots":
-            if c.get("stale"):
+            if c.get("push_failing"):
+                # The marker names the cause; hedging about a disconnected
+                # source on top of it would only bury the actual reason.
+                extra = (
+                    f" (last success {format_age(c['stamp_age'])} ago)"
+                    if c.get("stamp_age") is not None
+                    else ""
+                )
+            elif c.get("stale"):
                 signal = (
                     f"last push {format_age(c['stamp_age'])} ago"
                     if c.get("stamp_age") is not None

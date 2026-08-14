@@ -35,3 +35,35 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: PII gauntlet
         run: bash scripts/pii-gauntlet.sh
+  wrappers:
+    # Syntax-only gate over the archived scheduler wrappers. Parses each script
+    # with the interpreter its shebang names — sync-documents-to-vps.sh is run by
+    # /bin/zsh in production (the only shell holding Full Disk Access on that
+    # Mac), so checking it with bash would validate a shell that never runs it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
+      - name: Install zsh
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+      - name: Parse wrappers with their declared interpreter
+        run: |
+          rc=0
+          for f in scripts/wrappers/*/*.sh; do
+            shebang=$(head -1 "$f")
+            case "$shebang" in
+              '#!'*/bash*) checker=bash ;;
+              '#!'*/zsh*)  checker=zsh ;;
+              *)
+                echo "::error file=$f::missing or unrecognised shebang: ${shebang:-<empty>}"
+                rc=1
+                continue
+                ;;
+            esac
+            if "$checker" -n "$f"; then
+              echo "ok    $f ($checker -n)"
+            else
+              echo "::error file=$f::$checker -n failed"
+              rc=1
+            fi
+          done
+          exit $rc

@@ -8,7 +8,9 @@ For each attachment in a message:
 """
 
 import logging
+import mimetypes
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from src.export.outlook_cli import OutlookCliError, run_outlook_cli
@@ -104,3 +106,91 @@ def process_message_attachments(
             result.failed_sharepoint_urls.append((url, sp_result.status))
 
     return result
+
+
+def register_downloaded_attachments(
+    conn, base_dir: Path, limit: int | None = None, now: str | None = None
+) -> dict:
+    """Record `attachments` rows for files outlook-cli has already downloaded.
+
+    Downloading and recording are separate halves, and only the download half
+    was ever built for the outlook-cli path — `download_attachments_for_messages`
+    writes binaries to <base_dir>/<message_id>/ and returns. The recording half
+    lived exclusively in `export_sync_attachments`, which drives Mail.app over
+    AppleScript and is skipped off macOS. So the VPS accumulated 7,387 files
+    that no downstream stage could see, because every one of them reads the
+    table rather than the disk.
+
+    Idempotent and platform-independent: it diffs the tree against the table, so
+    it doubles as the backfill for everything already downloaded. Runs hourly
+    against a large tree, hence the single up-front query for what is already
+    known rather than a lookup per file.
+
+    `limit` caps rows registered per call. Step 6 of the sync runs Phase 1 and
+    Phase 2 unbounded over whatever this makes visible, so releasing a 7k-file
+    backlog in one pass would hand an unbounded LLM job to a unit with a
+    TimeoutStartSec. Bounded runs let the backlog drain instead; pass None for a
+    deliberate one-shot backfill outside the hourly path.
+    """
+    stamp = now or datetime.now().isoformat()
+    base_dir = Path(base_dir)
+    stats: dict = {"scanned": 0, "registered": 0, "deferred": 0, "ids": []}
+
+    if not base_dir.is_dir():
+        return stats
+
+    # Keyed by (message_id, filename), matching the table's own dedup identity:
+    # a message can gain another attachment on a later pass, so skipping whole
+    # directories on "message already seen" would miss it permanently.
+    known = {
+        (mid, name) for mid, name in conn.execute("SELECT message_id, filename FROM attachments")
+    }
+    emails = dict(conn.execute("SELECT message_id, id FROM emails"))
+
+    for msg_dir in sorted(base_dir.iterdir()):
+        if not msg_dir.is_dir():
+            continue
+        stats["scanned"] += 1
+        message_id = msg_dir.name
+
+        files = [
+            f
+            for f in sorted(msg_dir.iterdir())
+            if f.is_file() and (message_id, f.name) not in known
+        ]
+        if not files:
+            continue
+
+        # Attachments are downloaded post-commit, but a batch can still be in
+        # flight. Recording email_id NULL would orphan the row for good: the
+        # image and text pipelines JOIN emails, so it would never be picked up
+        # even once the email lands. Leave it on disk for a later pass instead.
+        email_id = emails.get(message_id)
+        if email_id is None:
+            stats["deferred"] += 1
+            continue
+
+        for f in files:
+            if limit is not None and stats["registered"] >= limit:
+                conn.commit()
+                return stats
+            cur = conn.execute(
+                """INSERT INTO attachments
+                   (email_id, message_id, filename, mime_type, file_size, file_path,
+                    is_inline, exported_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 0, ?)""",
+                (
+                    email_id,
+                    message_id,
+                    f.name,
+                    mimetypes.guess_type(f.name)[0] or "application/octet-stream",
+                    f.stat().st_size,
+                    str(f),
+                    stamp,
+                ),
+            )
+            stats["registered"] += 1
+            stats["ids"].append(cur.lastrowid)
+
+    conn.commit()
+    return stats

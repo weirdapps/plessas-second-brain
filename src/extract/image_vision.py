@@ -21,6 +21,24 @@ MAX_TOKENS = 150
 # PNG becomes a ~6 MB payload and 400s. Cap the base64 length with a margin.
 VISION_IMAGE_MAX_B64 = 5_000_000
 
+# Independent of the byte cap: the API also rejects any image with a side over
+# 8000 px. A full-page report screenshot is tall and flat-coloured, so it
+# compresses to a tiny PNG, clears the byte cap untouched, and still 400s.
+VISION_IMAGE_MAX_DIMENSION = 8000
+
+# Deliberate, bounded raise of Pillow's decompression-bomb guard, whose ~89 M px
+# default hard-refuses the report screenshots this pipeline exists to read
+# (measured on prod: 10610x32768 = 348 M px and 16237x32768 = 532 M px).
+#
+# Pillow WARNS above this value and only RAISES above 2x it, so the effective
+# admission ceiling is 550 M px. Decoding measured ~8.1 bytes/px, putting the
+# largest admitted image at ~4.5 GB peak — survivable on the 7 GB host because
+# `process-images` runs sequentially (--workers defaults to 1). Beyond that
+# Pillow raises DecompressionBombError, which the caller records as a visible
+# failure rather than an image that quietly never gets described.
+VISION_IMAGE_BOMB_LIMIT = 275_000_000
+Image.MAX_IMAGE_PIXELS = VISION_IMAGE_BOMB_LIMIT
+
 VISION_PROMPT = """\
 Classify this email-embedded image. Reply with EXACTLY one line:
 
@@ -48,18 +66,34 @@ def _guess_media_type(path: Path) -> str:
 def _encode_image_for_vision(img_path: Path) -> tuple[str, str]:
     """Return (base64_data, media_type) for the vision API.
 
-    Images at or under the size limit are sent as-is. Oversized images are
-    re-encoded as JPEG and progressively shrunk until they fit, so a 6 MB PNG
-    doesn't 400 the request ("image exceeds 5 MB maximum").
+    Images within BOTH limits are sent as-is. Oversized ones are re-encoded as
+    JPEG and progressively shrunk until they fit, so neither a 6 MB PNG
+    ("image exceeds 5 MB maximum") nor a tall screenshot ("image dimensions
+    exceed max allowed size: 8000 pixels") 400s the request.
+
+    The two caps are independent and a payload can breach either alone: a
+    16237x32768 report screenshot of flat UI colour is only ~1 MB as PNG, so
+    checking bytes first and returning early let exactly the images worth
+    describing through to a guaranteed 400.
     """
     raw = img_path.read_bytes()
+
+    with Image.open(io.BytesIO(raw)) as probe:
+        oversized_px = max(probe.size) > VISION_IMAGE_MAX_DIMENSION
+
     b64 = base64.b64encode(raw).decode()
-    if len(b64) <= VISION_IMAGE_MAX_B64:
+    if not oversized_px and len(b64) <= VISION_IMAGE_MAX_B64:
         return b64, _guess_media_type(img_path)
 
     im = Image.open(io.BytesIO(raw))
     if im.mode not in ("RGB", "L"):
         im = im.convert("RGB")
+
+    # thumbnail() preserves aspect ratio and is a no-op when already within
+    # bounds. A squashed report is an unreadable report, and the description is
+    # the entire product here.
+    if oversized_px:
+        im.thumbnail((VISION_IMAGE_MAX_DIMENSION, VISION_IMAGE_MAX_DIMENSION))
 
     for _ in range(12):
         buf = io.BytesIO()

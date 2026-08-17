@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from src.config import (
+    ATTACHMENTS_DIR,
     DATA_ROOT,
     DEFAULT_DB,
     EXTRACT_ENGINE,
@@ -16,6 +17,13 @@ from src.config import (
     NEWS_DB_PATH,
 )
 from src.llm_deadline import install_llm_deadline_for_this_process
+
+# Attachments registered per sync run. Step 6 runs Phase 1 (local parse) and
+# Phase 2 (one LLM call each) over exactly this set, inside a unit with a
+# TimeoutStartSec — so this is really a bound on that downstream work. At 200/run
+# the 7,387-file backlog left by the VPS cutover drains in under two days
+# without any pass risking a SIGTERM.
+ATTACHMENT_REGISTER_LIMIT = 200
 
 
 def format_email_result(email: dict, show_full: bool = False) -> str:
@@ -1040,7 +1048,26 @@ def cmd_sync(args):
             f"Attachments: {att_result['saved']} saved from {att_result['scanned']} messages scanned"
         )
     elif count > 0:
-        print("\nStep 3b: SKIPPED — outlook-cli already fetched attachments hourly.")
+        # outlook-cli fetched the BINARIES hourly; it never recorded them. Every
+        # downstream stage reads the attachments table, not the disk, so without
+        # this the files are invisible — 7,387 of them accumulated unseen between
+        # the 2026-06-30 VPS cutover and 2026-08-17. Bounded per run because
+        # Step 6 below runs Phase 1/2 unbounded over whatever becomes visible.
+        print("\nStep 3b: Registering attachments outlook-cli downloaded...")
+        from src.export.outlook_attachments import register_downloaded_attachments
+
+        conn_reg = get_conn(db_path)
+        try:
+            reg = register_downloaded_attachments(
+                conn_reg, ATTACHMENTS_DIR, limit=ATTACHMENT_REGISTER_LIMIT
+            )
+        finally:
+            conn_reg.close()
+        new_attachment_ids = reg["ids"]
+        print(
+            f"Attachments: {reg['registered']} registered from {reg['scanned']} message dirs"
+            f" ({reg['deferred']} awaiting their email)"
+        )
 
     # Step 4: Deduplicate people
     if count > 0:

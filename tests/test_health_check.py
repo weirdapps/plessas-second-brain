@@ -136,6 +136,81 @@ def test_sharepoint_token_missing_is_na(hc, tmp_path):
     assert hc.check_sharepoint_token(path=tmp_path / "nope.json")["status"] == "N/A"
 
 
+# --- SharePoint link tally ---------------------------------------------------
+# FetchStatus (src/export/sharepoint_fetcher.py) has five members, but the tally
+# summed only ok+exception+stale. 'http-error' — the status every HTTP failure
+# maps to — was dropped from the denominator, so prod printed "973/996" against
+# 1,016 real rows and called 20 unfetched links "0 exceptions". The tally must
+# be derived from the rows present, not from a hand-listed subset, so a status
+# added upstream later cannot silently vanish again.
+
+
+def _sp_db(**status_counts):
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE sharepoint_links (url TEXT, last_status TEXT)")
+    for status, n in status_counts.items():
+        for i in range(n):
+            db.execute(
+                "INSERT INTO sharepoint_links (url, last_status) VALUES (?,?)",
+                (f"https://x/{status}/{i}", status.replace("_", "-")),
+            )
+    db.commit()
+    return db
+
+
+def test_check_sharepoint_total_counts_every_status(hc):
+    """The prod bug: http-error rows existed but were absent from the total."""
+    db = _sp_db(ok=973, http_error=20, stale=23)
+
+    r = hc.check_sharepoint(db)
+
+    assert r["total"] == 1016, "denominator must be every row, not a listed subset"
+    assert r["ok"] == 973
+
+
+def test_check_sharepoint_reports_unfetched_links(hc):
+    """'0 exceptions' beside 43 unfetched links is a true statement that misleads.
+    The report needs the count of links that are not ok, whatever their status."""
+    db = _sp_db(ok=973, http_error=20, stale=23)
+
+    assert hc.check_sharepoint(db)["failed"] == 43
+
+
+def test_check_sharepoint_counts_unknown_status_as_failed(hc):
+    """Fail-closed: a status this function has never heard of is a problem until
+    proven otherwise. Fail-open is what hid http-error for weeks."""
+    db = _sp_db(ok=1, some_future_status=1)
+
+    r = hc.check_sharepoint(db)
+
+    assert r["total"] == 2
+    assert r["failed"] == 1
+
+
+def test_check_sharepoint_warns_when_most_links_are_unfetched(hc):
+    db = _sp_db(ok=6, http_error=4)
+
+    assert hc.check_sharepoint(db)["status"] == "WARN"
+
+
+def test_check_sharepoint_ok_on_a_small_failure_tail(hc):
+    """43-in-1,016 is a tail to watch, not a page at 23:50."""
+    db = _sp_db(ok=973, http_error=20, stale=23)
+
+    assert hc.check_sharepoint(db)["status"] == "OK"
+
+
+def test_report_shows_true_sharepoint_denominator(hc):
+    """End-to-end on the artefact actually read: the row must not print 973/996."""
+    db = _sp_db(ok=973, http_error=20, stale=23)
+    text, _ = hc.build_report([hc.check_sharepoint(db)], {}, {}, {}, [])
+
+    assert "973/1016" in text
+    assert "973/996" not in text
+
+
 # --- Migrated launchd jobs ---------------------------------------------------
 # The Mac is now a pull-only host: 9 ingestion jobs were disabled (renamed to
 # *.plist.disabled-migrated-to-vps) when ingestion moved to the VPS. They must
@@ -267,7 +342,10 @@ def _images_db():
     import sqlite3
 
     db = sqlite3.connect(":memory:")
-    db.execute("CREATE TABLE inline_images (id INTEGER PRIMARY KEY, vision_description TEXT)")
+    db.execute(
+        "CREATE TABLE inline_images (id INTEGER PRIMARY KEY, vision_description TEXT, "
+        "classification TEXT, classified_at TEXT, visioned_at TEXT)"
+    )
     db.execute("CREATE TABLE emails (id INTEGER PRIMARY KEY)")
     db.execute(
         "CREATE TABLE attachments (id INTEGER PRIMARY KEY, email_id INTEGER, message_id TEXT, "
@@ -363,6 +441,106 @@ def test_check_images_ok_while_queue_is_draining(hc):
     _queue(db, pending=hc.IMAGE_QUEUE_WARN - 1, done=0)
 
     assert hc.check_images(db)["status"] == "OK"
+
+
+# --- Vision-stage liveness ---------------------------------------------------
+# Prod ran 20 days with MAX(visioned_at) frozen at 2026-07-27 while the report
+# said OK every night: coverage sat at 88% because numerator and denominator
+# froze together, and `pending` stayed at 3 because rows that reach
+# inline_images already have an occurrence row. Neither signal has a time
+# dimension, so a fully stopped vision stage was indistinguishable from a quiet
+# one. The fix measures *aged unprocessed work* rather than a bare
+# MAX(visioned_at) age, so a genuinely quiet stretch stays silent.
+
+
+def _image_row(db, classification, days_old, visioned=False):
+    db.execute(
+        "INSERT INTO inline_images (vision_description, classification, classified_at, "
+        "visioned_at) VALUES (?,?,datetime('now', ?),?)",
+        (
+            "a cat" if visioned else None,
+            classification,
+            f"-{days_old} days",
+            "2026-07-27T23:08:09Z" if visioned else None,
+        ),
+    )
+    db.commit()
+
+
+def _visioned_baseline(db, n=9):
+    """Healthy history, so coverage % is not what decides the status. Without it a
+    one-row fixture sits at 0% classified and WARNs for the pre-existing reason,
+    which would let these tests pass whether or not the new signal works."""
+    for _ in range(n):
+        _image_row(db, "content", days_old=30, visioned=True)
+
+
+def test_check_images_warns_when_vision_stage_stops_producing(hc):
+    """An image eligible for vision that has sat undescribed past the threshold
+    means the stage is not running — the exact prod failure."""
+    db = _images_db()
+    _visioned_baseline(db)
+    _image_row(db, "content", days_old=20)
+
+    r = hc.check_images(db)
+
+    assert r["stuck"] == 1
+    assert r["status"] == "WARN"
+
+
+def test_check_images_ok_when_unvisioned_work_is_still_fresh(hc):
+    """Every run has in-flight images between arrival and description. Warning on
+    those would make the row cry wolf nightly and get ignored."""
+    db = _images_db()
+    _visioned_baseline(db)
+    _image_row(db, "content", days_old=0)
+
+    r = hc.check_images(db)
+
+    assert r["stuck"] == 0
+    assert r["status"] == "OK"
+
+
+def test_check_images_ignores_classes_vision_deliberately_skips(hc):
+    """signature/noise are filtered out before vision by design, so they stay
+    undescribed forever. Counting them would pin the row to WARN permanently."""
+    db = _images_db()
+    _visioned_baseline(db)
+    _image_row(db, "signature", days_old=90)
+    _image_row(db, "noise", days_old=90)
+
+    r = hc.check_images(db)
+
+    assert r["stuck"] == 0
+    assert r["status"] == "OK"
+
+
+def test_check_images_counts_unclassified_as_awaiting_vision(hc):
+    """The rows prod accumulated were 'unclassified' — arrived, never triaged.
+    Treating them as skippable would reproduce the blind spot exactly."""
+    db = _images_db()
+    _visioned_baseline(db)
+    _image_row(db, "unclassified", days_old=20)
+
+    assert hc.check_images(db)["stuck"] == 1
+
+
+def test_check_images_counts_unrecognised_class_as_awaiting_vision(hc):
+    """Fail-closed, same reasoning as the SharePoint tally: only the two classes
+    known to be skipped are excluded, so a class added later is visible work."""
+    db = _images_db()
+    _visioned_baseline(db)
+    _image_row(db, "some_new_class", days_old=20)
+
+    assert hc.check_images(db)["stuck"] == 1
+
+
+def test_check_images_reports_last_vision_output(hc):
+    """The report needs the timestamp to say *how long* the stage has been dark."""
+    db = _images_db()
+    _image_row(db, "content", days_old=20, visioned=True)
+
+    assert hc.check_images(db)["latest_vision"] == "2026-07-27T23:08:09Z"
 
 
 # --- Source-side freshness ---------------------------------------------------

@@ -9,9 +9,12 @@ from PIL import Image
 
 from src.extract.image_vision import (
     MAX_TOKENS,
+    VISION_DECODE_BYTES_PER_PIXEL,
     VISION_IMAGE_BOMB_LIMIT,
     VISION_IMAGE_MAX_B64,
     VISION_IMAGE_MAX_DIMENSION,
+    VisionDecodeTooLarge,
+    _decode_fits_in_memory,
     _encode_image_for_vision,
     _response_text,
 )
@@ -170,3 +173,51 @@ def test_token_budget_leaves_room_for_an_answer_after_thinking():
     """A live call spent 42 of its tokens thinking before writing 70 of answer.
     At the original 150 ceiling a longer deliberation truncates the answer away."""
     assert MAX_TOKENS >= 400
+
+
+# Decoding a 532 M px screenshot costs ~4.3 GB. The nightly image job runs alone
+# and can afford that on the 7 GB host; the hourly sync cannot — it already
+# peaks at 3-4.1 GB with up to 1 GB of swap, because Step 8 classifies images in
+# the same process as an embeddings rebuild. Raising Pillow's bomb ceiling to
+# reach these images therefore moved a real OOM into the hourly path. Gating on
+# memory actually free at decode time keeps one ceiling for both callers: the
+# same image is deferred under load and processed when the box is quiet.
+
+GB = 1_000_000_000
+
+
+def test_permits_a_decode_that_fits_the_free_memory():
+    """Quiet box: the largest observed screenshot must still get described."""
+    assert _decode_fits_in_memory(LARGEST_OBSERVED_PX, available=6 * GB)
+
+
+def test_refuses_a_decode_that_would_exhaust_the_host():
+    """Mid-sync, most of the box is already committed."""
+    assert not _decode_fits_in_memory(LARGEST_OBSERVED_PX, available=2 * GB)
+
+
+def test_small_images_are_unaffected_even_under_pressure():
+    """The ordinary case must never be gated, or the pipeline stalls under load."""
+    assert _decode_fits_in_memory(1920 * 1080, available=2 * GB)
+
+
+def test_keeps_a_reserve_rather_than_spending_all_free_memory():
+    """Sizing to exactly MemAvailable leaves nothing for everything else running."""
+    just_under_available = int(2 * GB / VISION_DECODE_BYTES_PER_PIXEL)
+
+    assert not _decode_fits_in_memory(just_under_available, available=2 * GB)
+
+
+def test_permits_the_decode_when_free_memory_cannot_be_measured():
+    """No /proc/meminfo (macOS dev, odd containers) must not block the pipeline."""
+    assert _decode_fits_in_memory(LARGEST_OBSERVED_PX, available=None)
+
+
+def test_encoder_refuses_an_image_it_cannot_safely_decode(tmp_path, monkeypatch):
+    """End to end: the gate has to fire before Pillow allocates, not after."""
+    p = tmp_path / "huge.png"
+    Image.new("RGB", (12000, 400), (250, 250, 250)).save(p, format="PNG")
+    monkeypatch.setattr("src.extract.image_vision._available_memory_bytes", lambda: 1024)
+
+    with pytest.raises(VisionDecodeTooLarge):
+        _encode_image_for_vision(p)

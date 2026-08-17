@@ -43,6 +43,47 @@ VISION_IMAGE_MAX_DIMENSION = 8000
 VISION_IMAGE_BOMB_LIMIT = 275_000_000
 Image.MAX_IMAGE_PIXELS = VISION_IMAGE_BOMB_LIMIT
 
+# Measured peak RSS while decoding and downscaling a 532 M px PNG: 4.33 GB.
+VISION_DECODE_BYTES_PER_PIXEL = 8.1
+
+# Never spend the last of the host's memory on one image. The bomb ceiling above
+# is a fixed worst case, but whether that worst case is affordable depends
+# entirely on the caller: the nightly image job runs alone on the 7 GB host and
+# can spare 4 GB, while the hourly sync classifies images in the same process as
+# an embeddings rebuild and already peaks at 3-4.1 GB with up to 1 GB of swap.
+# Gating on memory free at decode time keeps one ceiling for both — the same
+# screenshot is deferred under load and described when the box is quiet.
+VISION_DECODE_MEMORY_RESERVE = 1_500_000_000
+
+
+class VisionDecodeTooLarge(Exception):
+    """Decoding this image would not leave the host enough memory right now."""
+
+
+def _available_memory_bytes() -> int | None:
+    """MemAvailable, or None where it cannot be read (macOS dev, odd containers).
+
+    Unmeasurable memory must not block the pipeline, so callers treat None as
+    permissive — the same behaviour as before this gate existed.
+    """
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _decode_fits_in_memory(pixels: int, available: int | None = -1) -> bool:
+    """Whether decoding `pixels` leaves the reserve intact. -1 means "go measure"."""
+    if available == -1:
+        available = _available_memory_bytes()
+    if available is None:
+        return True
+    return pixels * VISION_DECODE_BYTES_PER_PIXEL <= available - VISION_DECODE_MEMORY_RESERVE
+
+
 VISION_PROMPT = """\
 Classify this email-embedded image. Reply with EXACTLY one line:
 
@@ -83,11 +124,21 @@ def _encode_image_for_vision(img_path: Path) -> tuple[str, str]:
     raw = img_path.read_bytes()
 
     with Image.open(io.BytesIO(raw)) as probe:
-        oversized_px = max(probe.size) > VISION_IMAGE_MAX_DIMENSION
+        width, height = probe.size
+        oversized_px = max(width, height) > VISION_IMAGE_MAX_DIMENSION
 
     b64 = base64.b64encode(raw).decode()
     if not oversized_px and len(b64) <= VISION_IMAGE_MAX_B64:
         return b64, _guess_media_type(img_path)
+
+    # Everything below decodes the full raster. Check the cost BEFORE Pillow
+    # allocates: probing size does not decode, so this is the last safe point.
+    if not _decode_fits_in_memory(width * height):
+        raise VisionDecodeTooLarge(
+            f"{img_path.name} is {width}x{height} (~"
+            f"{width * height * VISION_DECODE_BYTES_PER_PIXEL / 1e9:.1f} GB to decode); "
+            "deferring until the host has room"
+        )
 
     im = Image.open(io.BytesIO(raw))
     if im.mode not in ("RGB", "L"):

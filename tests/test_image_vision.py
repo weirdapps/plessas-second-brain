@@ -1,11 +1,26 @@
 """Tests for the vision Stage-3 helpers (image_vision)."""
 
 import base64
+import io
 import os
 
 from PIL import Image
 
-from src.extract.image_vision import VISION_IMAGE_MAX_B64, _encode_image_for_vision
+from src.extract.image_vision import (
+    VISION_IMAGE_BOMB_LIMIT,
+    VISION_IMAGE_MAX_B64,
+    VISION_IMAGE_MAX_DIMENSION,
+    _encode_image_for_vision,
+)
+
+# Measured dimensions of the two largest report screenshots found undescribed in
+# production. Both are full-page UI captures pasted into an email body, so both
+# are pinned to Outlook's 32768 px ceiling on the long edge.
+LARGEST_OBSERVED_PX = 16237 * 32768
+SECOND_LARGEST_OBSERVED_PX = 10610 * 32768
+
+# Pillow warns above MAX_IMAGE_PIXELS and only raises above 2x it.
+PILLOW_HARD_REFUSAL_MULTIPLIER = 2
 
 
 def test_small_image_passes_through_unchanged(tmp_path):
@@ -34,3 +49,73 @@ def test_oversized_image_is_downscaled_under_limit(tmp_path):
 
     assert media_type == "image/jpeg"
     assert len(b64) <= VISION_IMAGE_MAX_B64
+
+
+# The byte cap and the pixel cap are INDEPENDENT API limits, and the payload
+# guard above only enforces the byte one. A full-page report screenshot pasted
+# into an email body is tall and flat-coloured, so it compresses to a tiny PNG
+# and sails past the byte check untouched — then the API rejects it with
+# "At least one of the image dimensions exceed max allowed size: 8000 pixels".
+# Two such screenshots sat undescribed in production for weeks.
+
+
+def _decoded_size(b64: str) -> tuple[int, int]:
+    with Image.open(io.BytesIO(base64.b64decode(b64))) as im:
+        return im.size
+
+
+def test_tall_screenshot_is_downscaled_under_pixel_limit(tmp_path):
+    """Exceeds the pixel cap while well under the byte cap — the prod failure."""
+    p = tmp_path / "report.png"
+    Image.new("RGB", (400, VISION_IMAGE_MAX_DIMENSION + 2000), (250, 250, 250)).save(
+        p, format="PNG"
+    )
+
+    # Precondition: the byte guard alone would let this through untouched.
+    assert len(base64.b64encode(p.read_bytes())) <= VISION_IMAGE_MAX_B64
+
+    b64, _ = _encode_image_for_vision(p)
+
+    assert max(_decoded_size(b64)) <= VISION_IMAGE_MAX_DIMENSION
+
+
+def test_downscaling_preserves_aspect_ratio(tmp_path):
+    """A squashed report is an unreadable report — the description is the product."""
+    p = tmp_path / "wide.png"
+    Image.new("RGB", (VISION_IMAGE_MAX_DIMENSION + 4000, 3000), (250, 250, 250)).save(
+        p, format="PNG"
+    )
+
+    w, h = _decoded_size(_encode_image_for_vision(p)[0])
+
+    assert abs((w / h) - (12000 / 3000)) < 0.05
+
+
+def test_image_at_the_pixel_limit_is_left_alone(tmp_path):
+    """Only images actually over the line get re-encoded; the cap is inclusive."""
+    p = tmp_path / "exact.png"
+    Image.new("RGB", (VISION_IMAGE_MAX_DIMENSION, 10), (250, 250, 250)).save(p, format="PNG")
+
+    b64, media_type = _encode_image_for_vision(p)
+
+    assert media_type == "image/png"
+    assert base64.b64decode(b64) == p.read_bytes()
+
+
+# Calibration of the decompression-bomb ceiling. Asserted on arithmetic rather
+# than real 500 M px fixtures: allocating those in CI would cost ~4 GB per test.
+
+
+def test_bomb_limit_admits_the_real_report_screenshots():
+    """Pillow's ~89 M px default refuses both; tightening past this reinstates that."""
+    admitted = PILLOW_HARD_REFUSAL_MULTIPLIER * VISION_IMAGE_BOMB_LIMIT
+
+    assert LARGEST_OBSERVED_PX < admitted
+    assert SECOND_LARGEST_OBSERVED_PX < admitted
+
+
+def test_bomb_limit_keeps_the_largest_admitted_image_within_host_memory():
+    """7 GB host, sequential workers. Measured decode cost ~8.1 bytes/px."""
+    peak_gb = PILLOW_HARD_REFUSAL_MULTIPLIER * VISION_IMAGE_BOMB_LIMIT * 8.1 / 1e9
+
+    assert peak_gb < 5.0, f"largest admitted image would peak at {peak_gb:.1f} GB"

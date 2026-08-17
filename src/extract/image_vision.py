@@ -14,7 +14,11 @@ from src.extract.image_classifier import Classification, sha256_of_file
 
 logger = logging.getLogger(__name__)
 
-MAX_TOKENS = 150
+# Thinking tokens are drawn from this same budget before the answer is written:
+# a measured call spent 42 thinking, then 70 on a one-line description. At the
+# original 150 a longer deliberation truncates the answer away entirely, leaving
+# a response with no text block at all.
+MAX_TOKENS = 400
 
 # Anthropic measures the BASE64 payload (not the raw file) against a 5 MiB
 # (5,242,880-byte) per-image cap — base64 inflates bytes by ~4/3, so a 4.5 MB
@@ -113,6 +117,25 @@ def _encode_image_for_vision(img_path: Path) -> tuple[str, str]:
     return b64, "image/jpeg"
 
 
+def _response_text(resp) -> str:
+    """The model's answer, whatever precedes it in the content list.
+
+    Indexing content[0] assumed the answer came first. With extended thinking
+    the model emits a ThinkingBlock there and the answer lands at [1], so every
+    call raised "'ThinkingBlock' object has no attribute 'text'" — swallowed by
+    the caller and counted as success.
+    """
+    for block in resp.content:
+        text = getattr(block, "text", None)
+        if text:
+            return text
+    raise ValueError(
+        "vision response carried no text block "
+        f"(stop_reason={getattr(resp, 'stop_reason', 'unknown')!r}, "
+        f"blocks={[type(b).__name__ for b in resp.content]})"
+    )
+
+
 def parse_vision_response(text: str) -> tuple[Classification, str]:
     """
     Parse the LLM's response. Defensive: any non-conforming output → SIGNATURE
@@ -171,7 +194,7 @@ def classify_with_vision(img_path: Path, conn: sqlite3.Connection) -> tuple[Clas
         )
 
     resp = call_with_policy(_do_call, max_call_seconds=120.0)
-    raw = resp.content[0].text
+    raw = _response_text(resp)
     label, desc = parse_vision_response(raw)
 
     # Persist. visioned_at records *when* vision ran (classified_at is only the

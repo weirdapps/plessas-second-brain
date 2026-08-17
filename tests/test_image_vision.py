@@ -4,13 +4,16 @@ import base64
 import io
 import os
 
+import pytest
 from PIL import Image
 
 from src.extract.image_vision import (
+    MAX_TOKENS,
     VISION_IMAGE_BOMB_LIMIT,
     VISION_IMAGE_MAX_B64,
     VISION_IMAGE_MAX_DIMENSION,
     _encode_image_for_vision,
+    _response_text,
 )
 
 # Measured dimensions of the two largest report screenshots found undescribed in
@@ -119,3 +122,51 @@ def test_bomb_limit_keeps_the_largest_admitted_image_within_host_memory():
     peak_gb = PILLOW_HARD_REFUSAL_MULTIPLIER * VISION_IMAGE_BOMB_LIMIT * 8.1 / 1e9
 
     assert peak_gb < 5.0, f"largest admitted image would peak at {peak_gb:.1f} GB"
+
+
+# Reading the answer out of the response. `resp.content[0].text` held only while
+# the first block was the answer; with extended thinking the model emits a
+# ThinkingBlock first, so every single call died on
+# "'ThinkingBlock' object has no attribute 'text'" — and still counted as
+# success, because image_pipeline swallows the exception. A verified live
+# response carried ThinkingBlock at [0] and the description at [1].
+
+
+class _Block:
+    def __init__(self, text=None):
+        if text is not None:
+            self.text = text
+
+
+class _Resp:
+    def __init__(self, *blocks, stop_reason="end_turn"):
+        self.content = list(blocks)
+        self.stop_reason = stop_reason
+
+
+def test_reads_the_answer_past_a_thinking_block():
+    resp = _Resp(_Block(), _Block("CONTENT: a chart of Q3 revenue"))
+
+    assert _response_text(resp) == "CONTENT: a chart of Q3 revenue"
+
+
+def test_reads_the_answer_when_it_is_the_only_block():
+    """Thinking is not guaranteed; the no-thinking shape must keep working."""
+    resp = _Resp(_Block("DECORATION: a logo"))
+
+    assert _response_text(resp) == "DECORATION: a logo"
+
+
+def test_raises_a_diagnosable_error_when_no_text_block_came_back():
+    """Truncation mid-thinking yields thinking only. An AttributeError deep in a
+    swallowed handler is what hid this for weeks; the stop_reason is the clue."""
+    resp = _Resp(_Block(), stop_reason="max_tokens")
+
+    with pytest.raises(ValueError, match="max_tokens"):
+        _response_text(resp)
+
+
+def test_token_budget_leaves_room_for_an_answer_after_thinking():
+    """A live call spent 42 of its tokens thinking before writing 70 of answer.
+    At the original 150 ceiling a longer deliberation truncates the answer away."""
+    assert MAX_TOKENS >= 400

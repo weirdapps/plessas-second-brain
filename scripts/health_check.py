@@ -106,7 +106,16 @@ STALE_THRESHOLDS = {
     "attachments_llm": timedelta(days=3),
     "document_roots": timedelta(days=14),
     "news": timedelta(hours=12),
+    # Vision runs inside the daily attachment job, so three days is three missed
+    # runs. Measured against an image's own arrival, not against wall-clock
+    # MAX(visioned_at): a quiet stretch with no eligible images must stay silent.
+    "images_vision": timedelta(days=3),
 }
+
+# Classes the classifier filters out before vision by design — they stay
+# undescribed forever and are not a backlog. Everything else, including a class
+# added after this was written, counts as work the vision stage still owes.
+VISION_SKIPPED_CLASSES = ("signature", "noise")
 
 # Inline-image queue depth that means the pipeline is no longer keeping up.
 # Step 8 of the sync is time-boxed (BRAIN_IMAGE_CLASSIFY_BUDGET_S, default 8min)
@@ -349,13 +358,31 @@ def check_images(db):
         "WHERE a.mime_type LIKE 'image/%' AND a.file_path IS NOT NULL "
         "AND a.message_id NOT IN (SELECT message_id FROM inline_image_occurrences)"
     ).fetchone()[0]
+    # Vision-stage liveness. Neither signal above has a time dimension: coverage %
+    # freezes numerator and denominator together, and `pending` only sees images
+    # that never reached inline_images at all. So a vision stage that stopped
+    # producing looked identical to one with nothing to do — prod ran 20 days at
+    # "88% classified, 3 queued / OK" with MAX(visioned_at) stuck on 2026-07-27.
+    # Ageing each image against its OWN arrival (not wall-clock) keeps a genuinely
+    # quiet stretch silent while a stalled one is loud.
+    placeholders = ", ".join("?" * len(VISION_SKIPPED_CLASSES))
+    stuck = db.execute(
+        "SELECT COUNT(*) FROM inline_images WHERE vision_description IS NULL "
+        f"AND (classification IS NULL OR classification NOT IN ({placeholders})) "
+        "AND classified_at < datetime('now', ?)",
+        (*VISION_SKIPPED_CLASSES, f"-{STALE_THRESHOLDS['images_vision'].days} days"),
+    ).fetchone()[0]
+    latest_vision = db.execute("SELECT MAX(visioned_at) FROM inline_images").fetchone()[0]
     return {
         "name": "Inline Images",
         "total": total,
         "classified": classified,
         "pct": pct,
         "pending": pending,
-        "status": "WARN" if pct < 50 or pending > IMAGE_QUEUE_WARN else "OK",
+        "stuck": stuck,
+        "latest_vision": latest_vision,
+        "vision_age": _age(latest_vision),
+        "status": "WARN" if pct < 50 or pending > IMAGE_QUEUE_WARN or stuck else "OK",
     }
 
 
@@ -417,17 +444,23 @@ def check_sharepoint(db):
             "SELECT last_status, COUNT(*) FROM sharepoint_links GROUP BY last_status"
         ).fetchall()
         status_map = {r[0]: r[1] for r in rows}
+        # Derive the tally from the rows present rather than a hand-listed subset.
+        # FetchStatus has five members (src/export/sharepoint_fetcher.py) but this
+        # summed only ok+exception+stale, so 'http-error' — where every HTTP
+        # failure lands — was missing from the denominator: prod printed "973/996"
+        # against 1,016 real rows and called 20 unfetched links "0 exceptions".
+        # Fail-closed on anything that is not 'ok', so a status added upstream
+        # later shows up as a problem instead of silently disappearing again.
+        total = sum(status_map.values())
         ok = status_map.get("ok", 0)
-        exc = status_map.get("exception", 0)
-        stale = status_map.get("stale", 0)
-        total = ok + exc + stale
+        failed = total - ok
         return {
             "name": "SharePoint",
             "ok": ok,
-            "exception": exc,
-            "stale": stale,
+            "failed": failed,
+            "by_status": {s: n for s, n in status_map.items() if s != "ok"},
             "total": total,
-            "status": "WARN" if exc > total * 0.3 else "OK",
+            "status": "WARN" if failed > total * 0.3 else "OK",
         }
     except sqlite3.OperationalError:
         return {"name": "SharePoint", "status": "N/A"}
@@ -910,13 +943,23 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
             )
         elif c["name"] == "Inline Images":
             extra = f" ({c.get('pct', 0):.0f}% classified, {c.get('pending', 0):,} queued)"
+            if c.get("stuck"):
+                extra += (
+                    f" — {c['stuck']:,} awaiting vision, last output"
+                    f" {format_age(c.get('vision_age'))} ago"
+                )
         elif c["name"] == "Emails":
             extra = f" ({c.get('recent_24h', 0)} today)"
         elif c["name"] == "Teams":
             extra = f" ({c.get('recent_24h', 0)} today)"
         elif c["name"] == "SharePoint":
             count = f"{c.get('ok', 0)}/{c.get('total', 0)}"
-            extra = f" ({c.get('exception', 0)} exceptions)"
+            failed = c.get("failed", 0)
+            if failed:
+                breakdown = ", ".join(f"{n} {s}" for s, n in sorted(c.get("by_status", {}).items()))
+                extra = f" ({failed} unfetched: {breakdown})"
+            else:
+                extra = " (all fetched)"
         elif c["name"] == "Doc Roots":
             if c.get("push_failing"):
                 # The marker names the cause; hedging about a disconnected

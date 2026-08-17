@@ -6,7 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     "google-cloud-aiplatform>=1.164.0",
     # 0.120.2 is the first release whose mcp extra allows mcp SDK v2 (0.120.1 pinned <2).
-    "anthropic[vertex]>=0.120.2",
+    "anthropic[vertex]>=0.122.0",
     "numpy>=2.5.2",
     # v2 removed mcp.server.fastmcp; the server uses mcp.server.MCPServer.
     "mcp[cli]>=2.0.0",

@@ -339,3 +339,59 @@ def test_process_single_image_missing_file(db: sqlite3.Connection):
     )
 
     assert result is None
+
+
+# A vision call that raises left the Stage-1 UNCLASSIFIED result in place and
+# returned it, so run_backfill's `result is not None` counted the image as
+# CLASSIFIED. Every image in a run could fail and the job still exited 0 with
+# "Failed: 0" — which is exactly how a dead vision stage went unnoticed for
+# three weeks, and then a second time when every call died on
+# "'ThinkingBlock' object has no attribute 'text'". The row and its occurrence
+# are still recorded (they are real observations); only the accounting changes.
+
+
+def test_run_backfill_counts_a_failed_vision_call_as_failed(
+    db: sqlite3.Connection, stage3_image: Path, monkeypatch
+):
+    _insert_test_email_and_attachment(db, 1, "vis-fail-001", "a@example.com", stage3_image)
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("'ThinkingBlock' object has no attribute 'text'")
+
+    monkeypatch.setattr("src.extract.image_vision.classify_with_vision", _boom)
+
+    stats = run_backfill(conn=db, run_vision=True)
+
+    assert stats["failed"] == 1
+    assert stats["classified"] == 0
+
+
+def test_a_failed_vision_call_still_records_the_image(
+    db: sqlite3.Connection, stage3_image: Path, monkeypatch
+):
+    """Losing the Stage-1 row would also lose the sender-signature evidence."""
+    _insert_test_email_and_attachment(db, 1, "vis-fail-002", "a@example.com", stage3_image)
+
+    monkeypatch.setattr(
+        "src.extract.image_vision.classify_with_vision",
+        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("vertex 400")),
+    )
+
+    run_backfill(conn=db, run_vision=True)
+
+    assert db.execute("SELECT COUNT(*) FROM inline_images").fetchone()[0] == 1
+
+
+@pytest.fixture
+def stage3_image(tmp_path: Path) -> Path:
+    """An image Stage 1 leaves UNCLASSIFIED, so Stage 3 vision actually runs.
+
+    `sample_image` is a 200x200 flat fill, which Stage 1 rules out as noise
+    before vision is ever reached — a vision test built on it passes without
+    exercising vision at all.
+    """
+    import os
+
+    img_path = tmp_path / "stage3.png"
+    Image.frombytes("RGB", (600, 400), os.urandom(600 * 400 * 3)).save(img_path, "PNG")
+    return img_path

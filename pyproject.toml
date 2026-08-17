@@ -4,10 +4,10 @@ version = "0.1.0"
 description = "Email second brain: extract, structure, and query institutional memory from Outlook, attachments, calendar, Teams, and Claude Code conversations"
 requires-python = ">=3.12"
 dependencies = [
-    "google-cloud-aiplatform>=1.163.0",
+    "google-cloud-aiplatform>=1.164.0",
     # 0.120.2 is the first release whose mcp extra allows mcp SDK v2 (0.120.1 pinned <2).
     "anthropic[vertex]>=0.120.2",
-    "numpy>=2.5.1",
+    "numpy>=2.5.2",
     # v2 removed mcp.server.fastmcp; the server uses mcp.server.MCPServer.
     "mcp[cli]>=2.0.0",
     "youtube-transcript-api>=1.2.0",

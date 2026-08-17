@@ -17,6 +17,10 @@ from src.extract.image_classifier import (
 logger = logging.getLogger(__name__)
 
 
+class VisionFailed(Exception):
+    """Stage 3 could not describe the image. The Stage-1 row is still recorded."""
+
+
 def process_single_image(
     conn: sqlite3.Connection,
     attachment_id: int,
@@ -76,7 +80,12 @@ def process_single_image(
             classification, _ = classify_with_vision(img_path, conn)
         except Exception as e:
             logger.error(f"Vision classification failed for {img_path}: {e}")
-            # Keep UNCLASSIFIED result from Stage 1
+            # The Stage-1 row and its occurrence stay — they are real
+            # observations and the signature index is built from them. But the
+            # image did NOT get described, and reporting that as success is how
+            # a fully dead vision stage kept exiting 0 with "Failed: 0" for
+            # three weeks. Raise so the caller counts it as failed.
+            raise VisionFailed(str(e)) from e
 
     # Refresh signature index for this sender. Bulk callers (run_backfill) pass
     # refresh_index=False and refresh once per sender at the end instead — the

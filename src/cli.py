@@ -25,6 +25,13 @@ from src.llm_deadline import install_llm_deadline_for_this_process
 # without any pass risking a SIGTERM.
 ATTACHMENT_REGISTER_LIMIT = 200
 
+# LLM summaries attempted inside one sync. Registration and Phase 1 above are
+# local and cheap, but Phase 2 is one Vertex call per attachment, and calling it
+# unbounded is what SIGTERMed the 2026-08-18 01:00 run at the unit's 10-minute
+# TimeoutStartSec. The nightly sb-attachments job drains the remaining backlog
+# under its own 3390 s budget, so this only has to cover fresh mail.
+PHASE2_SYNC_LIMIT = 25
+
 
 def format_email_result(email: dict, show_full: bool = False) -> str:
     """Format a single email result for display.
@@ -1108,7 +1115,7 @@ def cmd_sync(args):
             f"  Phase 1: {p1_stats['extracted']} text extracted, "
             f"{p1_stats['failed']} failed, {p1_stats['skipped']} skipped"
         )
-        p2_stats = run_phase2(db_path, attachment_ids=scope_ids)
+        p2_stats = run_phase2(db_path, attachment_ids=scope_ids, limit=PHASE2_SYNC_LIMIT)
         print(f"  Phase 2: {p2_stats['extracted']} LLM extracted, {p2_stats['failed']} failed")
     else:
         print("  No new attachments to process")

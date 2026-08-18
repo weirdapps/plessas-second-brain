@@ -221,3 +221,42 @@ def test_encoder_refuses_an_image_it_cannot_safely_decode(tmp_path, monkeypatch)
 
     with pytest.raises(VisionDecodeTooLarge):
         _encode_image_for_vision(p)
+
+
+# _guess_media_type reads the FILENAME. Anything it does not recognise is
+# labelled image/png, so the API is told a lie it can check: a .tif attachment
+# came back "Image format image/png not supported" during the 2026-08-19
+# backlog drain. The corpus holds 12 .tif, 5 .jfif and ~58 extensionless
+# img-<uuid> files, none of which the extension can classify. The bytes can.
+
+
+def test_a_tiff_is_re_encoded_rather_than_mislabelled(tmp_path):
+    """TIFF is not an API-supported format at all, so it must be converted."""
+    p = tmp_path / "scan.tif"
+    Image.new("RGB", (80, 80), (200, 100, 50)).save(p, format="TIFF")
+
+    b64, media_type = _encode_image_for_vision(p)
+
+    assert media_type == "image/jpeg"
+    with Image.open(io.BytesIO(base64.b64decode(b64))) as im:
+        assert im.format == "JPEG"
+
+
+def test_content_wins_over_a_misleading_extension(tmp_path):
+    """Outlook writes .jfif and extensionless parts; the bytes are authoritative."""
+    p = tmp_path / "actually-a-jpeg.png"
+    Image.new("RGB", (80, 80), (10, 200, 90)).save(p, format="JPEG")
+
+    _, media_type = _encode_image_for_vision(p)
+
+    assert media_type == "image/jpeg"
+
+
+def test_an_extensionless_part_is_classified_by_its_bytes(tmp_path):
+    p = tmp_path / "img-7069cdbb-e54a-4bc1-acb4-1a3be761af0a"
+    Image.new("RGB", (80, 80), (5, 5, 200)).save(p, format="PNG")
+
+    b64, media_type = _encode_image_for_vision(p)
+
+    assert media_type == "image/png"
+    assert base64.b64decode(b64) == p.read_bytes()

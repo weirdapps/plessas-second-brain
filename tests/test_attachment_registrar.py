@@ -30,10 +30,12 @@ def db() -> Generator[sqlite3.Connection, None, None]:
     conn.close()
 
 
-def _email(conn, message_id: str, email_id: int | None = None) -> int:
+def _email(
+    conn, message_id: str, email_id: int | None = None, received: str = "2026-08-01T10:00:00Z"
+) -> int:
     cur = conn.execute(
         "INSERT INTO emails (message_id, date_received, subject) VALUES (?, ?, ?)",
-        (message_id, "2026-08-01T10:00:00Z", f"subject for {message_id}"),
+        (message_id, received, f"subject for {message_id}"),
     )
     conn.commit()
     return email_id or cur.lastrowid
@@ -198,3 +200,51 @@ def test_returns_the_ids_it_created(db, tmp_path):
     rows = [r[0] for r in db.execute("SELECT id FROM attachments ORDER BY id")]
     assert result["ids"] == rows
     assert len(result["ids"]) == 2
+
+
+# Splitting incremental from bulk. The hourly sync has TimeoutStartSec=600 and
+# is sized for a handful of new emails; letting it also chew the 9k-file
+# backfill is what made every scheduled run on 2026-08-18 overrun and get
+# SIGTERMed, with only the 90 s retry completing. `since` keeps the hourly path
+# on fresh mail only, while the nightly sb-attachments job (TimeoutStartSec=1h)
+# passes no `since` and drains everything.
+
+
+def test_since_registers_attachments_for_recent_mail(db, tmp_path):
+    _email(db, "AAMk-fresh", received="2026-08-18T09:00:00Z")
+    _downloaded(tmp_path, "AAMk-fresh", "today.png")
+
+    result = register_downloaded_attachments(db, tmp_path, since="2026-08-18T00:00:00Z")
+
+    assert result["registered"] == 1
+
+
+def test_since_leaves_the_backlog_for_the_bulk_pass(db, tmp_path):
+    """An old email's attachments must not be pulled into the hourly window."""
+    _email(db, "AAMk-old", received="2026-07-01T09:00:00Z")
+    _downloaded(tmp_path, "AAMk-old", "backlog.pdf")
+
+    result = register_downloaded_attachments(db, tmp_path, since="2026-08-18T00:00:00Z")
+
+    assert result["registered"] == 0
+    assert db.execute("SELECT COUNT(*) FROM attachments").fetchone()[0] == 0
+
+
+def test_bulk_pass_registers_the_backlog_too(db, tmp_path):
+    """No `since` is the nightly path: everything on disk, old and new."""
+    _email(db, "AAMk-old2", received="2026-07-01T09:00:00Z")
+    _email(db, "AAMk-new2", received="2026-08-18T09:00:00Z")
+    _downloaded(tmp_path, "AAMk-old2", "backlog.pdf")
+    _downloaded(tmp_path, "AAMk-new2", "today.png")
+
+    assert register_downloaded_attachments(db, tmp_path)["registered"] == 2
+
+
+def test_backlog_deferred_by_since_is_not_lost(db, tmp_path):
+    """Skipped for the window, not consumed — the bulk pass must still find it."""
+    _email(db, "AAMk-old3", received="2026-07-01T09:00:00Z")
+    _downloaded(tmp_path, "AAMk-old3", "backlog.pdf")
+
+    register_downloaded_attachments(db, tmp_path, since="2026-08-18T00:00:00Z")
+
+    assert register_downloaded_attachments(db, tmp_path)["registered"] == 1

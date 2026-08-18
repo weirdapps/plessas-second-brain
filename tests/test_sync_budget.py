@@ -71,3 +71,53 @@ def test_the_two_llm_bound_stages_are_budgeted_in_time_not_count():
     deadlines. A count reintroduces the bug the moment per-item cost changes."""
     assert isinstance(PHASE1_SYNC_DEADLINE_S, float)
     assert isinstance(PHASE2_SYNC_DEADLINE_S, float)
+
+
+# --- The Teams sync has the same shape and the same unit timeout -------------
+# Bounding only its pull was not enough: the run still died because Step 5 ran
+# with limit=0 and 804 threads came up pending the moment the full chat corpus
+# was restored. Asserting the sum is what stops that being discovered in
+# production ten minutes at a time.
+
+from src.cli import (  # noqa: E402
+    TEAMS_BOUND_OBSERVED_S,
+    TEAMS_DISCOVER_OBSERVED_S,
+    TEAMS_EMBED_OBSERVED_S,
+    TEAMS_EXTRACT_DEADLINE_S,
+    TEAMS_MRI_OBSERVED_S,
+    TEAMS_PULL_DEADLINE_S,
+    TEAMS_UNIT_TIMEOUT_S,
+)
+
+
+def _worst_case_teams_run_s() -> float:
+    return (
+        TEAMS_DISCOVER_OBSERVED_S
+        + TEAMS_PULL_DEADLINE_S
+        + TEAMS_BOUND_OBSERVED_S
+        + TEAMS_MRI_OBSERVED_S
+        + TEAMS_EXTRACT_DEADLINE_S
+        + TEAMS_EMBED_OBSERVED_S
+    )
+
+
+def test_teams_stage_budgets_fit_inside_the_unit_timeout():
+    worst = _worst_case_teams_run_s()
+
+    assert worst < TEAMS_UNIT_TIMEOUT_S, (
+        f"teams stages sum to {worst:.0f}s against a {TEAMS_UNIT_TIMEOUT_S:.0f}s timeout"
+    )
+
+
+def test_teams_sum_keeps_real_margin():
+    worst = _worst_case_teams_run_s()
+
+    assert worst < TEAMS_UNIT_TIMEOUT_S * 0.85, (
+        f"only {TEAMS_UNIT_TIMEOUT_S - worst:.0f}s of headroom"
+    )
+
+
+def test_teams_discover_is_budgeted_even_though_it_is_unbounded():
+    """Step 1 has no internal limit and measured 86.4 s against 1,219 chats. It
+    still has to be counted, or the sum silently understates the run."""
+    assert TEAMS_DISCOVER_OBSERVED_S >= 86.4

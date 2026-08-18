@@ -109,7 +109,11 @@ def process_message_attachments(
 
 
 def register_downloaded_attachments(
-    conn, base_dir: Path, limit: int | None = None, now: str | None = None
+    conn,
+    base_dir: Path,
+    limit: int | None = None,
+    now: str | None = None,
+    since: str | None = None,
 ) -> dict:
     """Record `attachments` rows for files outlook-cli has already downloaded.
 
@@ -126,11 +130,16 @@ def register_downloaded_attachments(
     against a large tree, hence the single up-front query for what is already
     known rather than a lookup per file.
 
-    `limit` caps rows registered per call. Step 6 of the sync runs Phase 1 and
-    Phase 2 unbounded over whatever this makes visible, so releasing a 7k-file
-    backlog in one pass would hand an unbounded LLM job to a unit with a
-    TimeoutStartSec. Bounded runs let the backlog drain instead; pass None for a
-    deliberate one-shot backfill outside the hourly path.
+    `limit` caps rows registered per call.
+
+    `since` restricts registration to mail received at or after that timestamp,
+    which is how the incremental and bulk callers are kept apart. The hourly
+    sync runs under TimeoutStartSec=600 and is sized for the handful of emails
+    that arrived in the last hour; asking it to also carry the backfill is what
+    made every scheduled run overrun and get SIGTERMed. It therefore passes a
+    recent `since`, while the nightly job (TimeoutStartSec=1h) passes none and
+    drains everything. Skipping for the window does not consume the directory —
+    the bulk pass still finds it.
     """
     stamp = now or datetime.now().isoformat()
     base_dir = Path(base_dir)
@@ -145,7 +154,12 @@ def register_downloaded_attachments(
     known = {
         (mid, name) for mid, name in conn.execute("SELECT message_id, filename FROM attachments")
     }
-    emails = dict(conn.execute("SELECT message_id, id FROM emails"))
+    if since:
+        emails = dict(
+            conn.execute("SELECT message_id, id FROM emails WHERE date_received >= ?", (since,))
+        )
+    else:
+        emails = dict(conn.execute("SELECT message_id, id FROM emails"))
 
     for msg_dir in sorted(base_dir.iterdir()):
         if not msg_dir.is_dir():

@@ -52,9 +52,40 @@ def is_managed_sharepoint_host(url: str, managed_host: str) -> bool:
 
 FetchStatus = Literal["ok", "stale", "auth-required", "http-error", "exception"]
 
-# After this many consecutive failed fetch attempts, the retry pass gives up on a
-# link (treats it as permanently dead) instead of re-attempting it every night.
+# After this many consecutive failed fetch attempts, the retry pass stops trying
+# a link every night. It is a throttle, not an abandonment — see the cool-off.
 MAX_SHAREPOINT_ATTEMPTS = 5
+
+# ...and after this long, a capped link is offered once more. Without it the cap
+# is permanent: between 2026-07-30 and 2026-08-10 this tenant's SharePoint auth
+# was broken (MCAS-gated, no bearer issued), so 43 links spent their attempts on
+# a fetcher that could not have succeeded and were never retried — still
+# unfetched nine days after the auth was fixed. Any outage lasting more than
+# five nightly runs would otherwise mean permanent loss, and the retry is cheap
+# because only exhausted links qualify.
+SHAREPOINT_RETRY_COOL_OFF_DAYS = 7
+
+
+def retry_candidates(conn, now: str | None = None) -> list:
+    """Links seen before but never fetched OK, that are due for another attempt.
+
+    Returns (url, message_id) rows. `attempts` throttles: past the cap a link is
+    rested rather than dropped, and offered again once the cool-off expires.
+    'unsupported-host' is a permanent external tenant and stays excluded.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    stamp = now or datetime.now(UTC).isoformat()
+    cutoff = (
+        datetime.fromisoformat(stamp) - timedelta(days=SHAREPOINT_RETRY_COOL_OFF_DAYS)
+    ).isoformat()
+    return conn.execute(
+        "SELECT url, message_id FROM sharepoint_links "
+        "WHERE (fetched_at IS NULL OR last_status = 'stale') "
+        "AND COALESCE(last_status, '') != 'unsupported-host' "
+        "AND (attempts < ? OR COALESCE(last_attempt_at, '') < ?)",
+        (MAX_SHAREPOINT_ATTEMPTS, cutoff),
+    ).fetchall()
 
 
 @dataclass

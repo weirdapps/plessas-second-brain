@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.export.sharepoint_fetcher import (
+    SharepointFetchResult,
     fetch_sharepoint_link,
     record_link_in_db,
 )
@@ -152,26 +153,51 @@ def test_record_link_in_db_tracks_attempts(tmp_path):
     )
 
 
-def test_process_sharepoint_gives_up_after_max_attempts(tmp_path):
-    """A link that has already failed the max number of times is NOT retried."""
-    import argparse
-
-    from src.cli import cmd_process_sharepoint
+def _insert_exhausted_link(conn, last_attempt_at):
     from src.export.sharepoint_fetcher import MAX_SHAREPOINT_ATTEMPTS
 
-    conn = _setup_db(tmp_path)
     conn.execute(
         "INSERT INTO sharepoint_links (url, message_id, fetched_at, last_status, last_attempt_at, attempts) "
-        "VALUES ('https://dead', 'm', NULL, 'stale', '2026-05-01T00:00:00', ?)",
-        (MAX_SHAREPOINT_ATTEMPTS,),
+        "VALUES ('https://dead', 'm', NULL, 'stale', ?, ?)",
+        (last_attempt_at, MAX_SHAREPOINT_ATTEMPTS),
     )
     conn.commit()
     conn.close()
 
+
+def test_process_sharepoint_rests_a_link_that_just_hit_max_attempts(tmp_path):
+    """The cap still throttles: no re-attempt while the cool-off is running."""
+    import argparse
+    from datetime import UTC, datetime
+
+    from src.cli import cmd_process_sharepoint
+
+    _insert_exhausted_link(_setup_db(tmp_path), datetime.now(UTC).isoformat())
+
     with patch("src.export.sharepoint_fetcher.fetch_sharepoint_link") as mock_fetch:
         args = argparse.Namespace(db=str(tmp_path / "test.db"), since=None, limit=0, dry_run=False)
         cmd_process_sharepoint(args)
-        assert not mock_fetch.called  # exhausted link is not retried
+        assert not mock_fetch.called
+
+
+def test_process_sharepoint_retries_an_exhausted_link_after_the_cool_off(tmp_path):
+    """...but the cap must not be permanent. 43 links spent their attempts on a
+    fetcher broken by the MCAS bearer bug (2026-07-30 to 08-10) and were never
+    offered again, still unfetched nine days after the auth was fixed."""
+    import argparse
+    from datetime import UTC, datetime, timedelta
+
+    from src.cli import cmd_process_sharepoint
+    from src.export.sharepoint_fetcher import SHAREPOINT_RETRY_COOL_OFF_DAYS
+
+    long_ago = (datetime.now(UTC) - timedelta(days=SHAREPOINT_RETRY_COOL_OFF_DAYS + 1)).isoformat()
+    _insert_exhausted_link(_setup_db(tmp_path), long_ago)
+
+    with patch("src.export.sharepoint_fetcher.fetch_sharepoint_link") as mock_fetch:
+        mock_fetch.return_value = SharepointFetchResult(url="https://dead", status="stale")
+        args = argparse.Namespace(db=str(tmp_path / "test.db"), since=None, limit=0, dry_run=False)
+        cmd_process_sharepoint(args)
+        assert mock_fetch.called
 
 
 def test_record_link_in_db_upserts(tmp_path):

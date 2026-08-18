@@ -39,8 +39,14 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') — starting text extraction" >> "$LOG_FILE"
 "$PYTHON" -m src.cli process-attachments --phase 1 --deadline-s 900 >> "$LOG_FILE" 2>&1
 
 # Phase 2 = LLM summary pass. Workers=4 mirrors the teams-sync default.
+#
+# The llm_policy budget (3390 s) caps each CALL, not the loop, so on 2026-08-18
+# this ran from 20:16 until systemd killed the unit at 21:00. Budget for the
+# hour: registration + Phase 1 take ~16 min, leaving ~44; 30 here keeps room for
+# the image and SharePoint passes below.
 echo "$(date '+%Y-%m-%d %H:%M:%S') — starting attachment summary" >> "$LOG_FILE"
-"$PYTHON" -m src.cli process-attachments --phase 2 --workers 4 >> "$LOG_FILE" 2>&1
+"$PYTHON" -m src.cli process-attachments --phase 2 --workers 4 --deadline-s 1800 \
+  >> "$LOG_FILE" 2>&1
 
 # Image classification backfill (Stage 1 + Stage 3 vision)
 echo "$(date '+%Y-%m-%d %H:%M:%S') — starting image classification" >> "$LOG_FILE"

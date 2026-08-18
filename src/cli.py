@@ -23,7 +23,16 @@ from src.llm_deadline import install_llm_deadline_for_this_process
 # TimeoutStartSec — so this is really a bound on that downstream work. At 200/run
 # the 7,387-file backlog left by the VPS cutover drains in under two days
 # without any pass risking a SIGTERM.
-ATTACHMENT_REGISTER_LIMIT = 200
+ATTACHMENT_REGISTER_LIMIT = 50
+
+# The hourly sync only registers mail from this window. It runs under
+# TimeoutStartSec=600 and is sized for one hour of new email; carrying the
+# backfill as well is what made every scheduled run on 2026-08-18 overrun and
+# get SIGTERMed, with only the 90 s retry completing. The window has to clear
+# the overnight gap in the timer's schedule (22:00 -> 01:00 -> 07:00, so nine
+# hours) with room to spare. Bulk registration lives in `register-attachments`,
+# which the nightly job runs under a one-hour budget.
+ATTACHMENT_REGISTER_WINDOW_H = 48
 
 # LLM summaries attempted inside one sync. Phase 2 is one Vertex call per
 # attachment, and calling it unbounded is what SIGTERMed the 2026-08-18 01:00
@@ -212,6 +221,32 @@ def cmd_process_attachments(args):
         print(f"  Failed: {stats['failed']}")
 
     print("\nAttachment processing complete.")
+
+
+def cmd_register_attachments(args):
+    """Bulk-register attachments outlook-cli has already downloaded.
+
+    The counterpart to the hourly sync's Step 3b, which is deliberately confined
+    to a recent window so it fits TimeoutStartSec=600. This one has no window
+    and runs from the nightly job, whose budget is an hour, so the backlog left
+    by the 2026-06-30 VPS cutover drains here instead of starving the sync.
+    """
+    from src.export.outlook_attachments import register_downloaded_attachments
+    from src.store.schema import get_connection as get_conn
+
+    db_path = args.db or str(DEFAULT_DB)
+    print("Registering downloaded attachments...")
+    conn = get_conn(db_path)
+    try:
+        stats = register_downloaded_attachments(
+            conn, ATTACHMENTS_DIR, limit=args.limit if args.limit > 0 else None
+        )
+    finally:
+        conn.close()
+    print(
+        f"  Registered: {stats['registered']:,} from {stats['scanned']:,} message dirs\n"
+        f"  Awaiting their email: {stats['deferred']:,}"
+    )
 
 
 def cmd_process_images(args):
@@ -1069,12 +1104,20 @@ def cmd_sync(args):
         # the 2026-06-30 VPS cutover and 2026-08-17. Bounded per run because
         # Step 6 below runs Phase 1/2 unbounded over whatever becomes visible.
         print("\nStep 3b: Registering attachments outlook-cli downloaded...")
+        from datetime import UTC, timedelta
+
         from src.export.outlook_attachments import register_downloaded_attachments
 
+        window_start = (
+            datetime.now(UTC) - timedelta(hours=ATTACHMENT_REGISTER_WINDOW_H)
+        ).isoformat()
         conn_reg = get_conn(db_path)
         try:
             reg = register_downloaded_attachments(
-                conn_reg, ATTACHMENTS_DIR, limit=ATTACHMENT_REGISTER_LIMIT
+                conn_reg,
+                ATTACHMENTS_DIR,
+                limit=ATTACHMENT_REGISTER_LIMIT,
+                since=window_start,
             )
         finally:
             conn_reg.close()
@@ -1962,6 +2005,16 @@ def main():
         help="Number of concurrent LLM workers for phase 2 (default 1)",
     )
     parser_process_att.set_defaults(func=cmd_process_attachments)
+
+    # Bulk attachment registration (nightly counterpart to the sync's Step 3b)
+    parser_register_att = subparsers.add_parser(
+        "register-attachments",
+        help="Record DB rows for attachments outlook-cli already downloaded",
+    )
+    parser_register_att.add_argument(
+        "--limit", type=int, default=0, help="Max attachments to register (0 = no limit)"
+    )
+    parser_register_att.set_defaults(func=cmd_register_attachments)
 
     # Process images command
     parser_process_img = subparsers.add_parser(

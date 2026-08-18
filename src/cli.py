@@ -25,12 +25,20 @@ from src.llm_deadline import install_llm_deadline_for_this_process
 # without any pass risking a SIGTERM.
 ATTACHMENT_REGISTER_LIMIT = 200
 
-# LLM summaries attempted inside one sync. Registration and Phase 1 above are
-# local and cheap, but Phase 2 is one Vertex call per attachment, and calling it
-# unbounded is what SIGTERMed the 2026-08-18 01:00 run at the unit's 10-minute
-# TimeoutStartSec. The nightly sb-attachments job drains the remaining backlog
-# under its own 3390 s budget, so this only has to cover fresh mail.
+# LLM summaries attempted inside one sync. Phase 2 is one Vertex call per
+# attachment, and calling it unbounded is what SIGTERMed the 2026-08-18 01:00
+# run at the unit's 10-minute TimeoutStartSec. The nightly sb-attachments job
+# drains the remaining backlog under its own 3390 s budget, so this only has to
+# cover fresh mail.
 PHASE2_SYNC_LIMIT = 25
+
+# Wall-clock budget for Phase 1 inside one sync. Capping Phase 2 alone did not
+# stop the timeouts: Phase 1 is local, but "local" is not "fast" — OCR is the
+# most common extraction_method in this corpus and a single 30 MB .xlsb workbook
+# can run for minutes, so a 200-attachment batch that samples at 0.1 s each
+# still overran ten minutes. Count is not a proxy for time when per-item cost
+# spans three orders of magnitude; the deadline is.
+PHASE1_SYNC_DEADLINE_S = 180.0
 
 
 def format_email_result(email: dict, show_full: bool = False) -> str:
@@ -1109,11 +1117,18 @@ def cmd_sync(args):
     print("\nStep 6: Processing new attachment content...")
     # Scope to newly exported attachments only — avoids competing with background backfill
     scope_ids = new_attachment_ids or None
-    p1_stats = run_phase1(db_path, attachment_ids=scope_ids)
+    # Phase 1 runs UNSCOPED so the deadline can converge. Scoped to this run's
+    # own registrations, anything deferred for time would never be offered
+    # again — the next run scopes to its own new ids — and would sit without a
+    # content row forever. Unscoped, `ac.id IS NULL` re-selects it, and the
+    # `ORDER BY a.id` puts the leftovers first.
+    p1_stats = run_phase1(db_path, deadline_s=PHASE1_SYNC_DEADLINE_S)
     if p1_stats["processed"] > 0:
+        deferred = p1_stats.get("deferred", 0)
         print(
             f"  Phase 1: {p1_stats['extracted']} text extracted, "
             f"{p1_stats['failed']} failed, {p1_stats['skipped']} skipped"
+            + (f", {deferred} deferred (out of time)" if deferred else "")
         )
         p2_stats = run_phase2(db_path, attachment_ids=scope_ids, limit=PHASE2_SYNC_LIMIT)
         print(f"  Phase 2: {p2_stats['extracted']} LLM extracted, {p2_stats['failed']} failed")

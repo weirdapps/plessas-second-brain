@@ -340,3 +340,36 @@ def test_phase2_deferred_work_stays_pending_for_the_next_run():
         ).fetchone()[0]
         conn.close()
         assert pending == 2
+
+
+def test_phase2_deadline_also_applies_with_concurrent_workers(monkeypatch):
+    """The nightly runs --workers 4, i.e. the CONCURRENT branch. Filtering rows
+    into a pending list before submitting evaluates the deadline once, at t=0,
+    so every row is dispatched and the budget is a no-op — which is why
+    sb-attachments ran 35 minutes into a 30-minute cap on 2026-08-19. The
+    check has to happen inside the submitted task, as run_backfill already does.
+    """
+    from src.extract import attachment_pipeline
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "test.db")
+        _db_with_n_attachments(db_path, 8)
+        from src.extract.attachment_pipeline import run_phase1, run_phase2
+
+        run_phase1(db_path)
+
+        called = []
+
+        # The budget must expire DURING the run, not before it: deadline_s=0 is
+        # caught by any pre-flight filter and proves nothing.
+        def _slow(row):
+            time.sleep(0.15)
+            called.append(row)
+            return (row[0], None, {}, None, False)
+
+        monkeypatch.setattr(attachment_pipeline, "_extract_one_attachment", _slow)
+
+        stats = run_phase2(db_path, workers=2, deadline_s=0.2)
+
+        assert stats["deferred"] > 0, "budget expired mid-run but nothing was deferred"
+        assert len(called) < 8

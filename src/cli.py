@@ -66,6 +66,13 @@ IMAGE_CLASSIFY_SYNC_BUDGET_S = 90.0
 # extraction, load, registration, people dedup, embeddings rebuild.
 SYNC_FIXED_WORK_S = 180.0
 
+# Step 2 of the Teams sync, which has its own unit (sb-teams-sync,
+# TimeoutStartSec=600) and its own Steps 3-6 to pay for afterwards. A full pass
+# over the 1,207-chat inventory is ~9 min at a measured 0.45 s per chat, so the
+# pull rotates oldest-first and takes ~530 chats per run; at two runs an hour
+# every chat is read roughly every 70 minutes.
+TEAMS_PULL_DEADLINE_S = 240.0
+
 
 def format_email_result(email: dict, show_full: bool = False) -> str:
     """Format a single email result for display.
@@ -1316,9 +1323,16 @@ def cmd_teams_sync(args):
         )
 
         print("Step 2/6: pulling messages...")
-        p = pull_messages(conn, concurrency=args.concurrency or 2)
+        p = pull_messages(conn, concurrency=args.concurrency or 2, deadline_s=TEAMS_PULL_DEADLINE_S)
+        deferred = p.get("deferred", 0)
         print(
-            f"  {p['messages_inserted']} messages inserted across {p['chats_pulled']} chats; {p['errors']} errors"
+            f"  {p['messages_inserted']} messages inserted across {p['chats_pulled']} chats; "
+            f"{p['errors']} errors"
+            + (
+                f"; {deferred} chats deferred (out of time, next run takes them)"
+                if deferred
+                else ""
+            )
         )
     else:
         print("Steps 1+2 SKIPPED — --skip-pull set.")

@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from src.store.schema import create_database, migrate_add_teams, run_migrations
+from src.store.schema import (
+    create_database,
+    migrate_add_teams,
+    migrate_add_teams_last_pulled_at,
+    run_migrations,
+)
 
 FIXTURES_DIR = Path(__file__).parent.parent / "fixtures" / "teams"
 
@@ -24,6 +29,9 @@ def db(tmp_path):
     # no-op for fresh DBs. Apply the teams migration directly so the teams_*
     # tables exist for tests. (The migration itself is idempotent.)
     migrate_add_teams(conn)
+    # v18 adds teams_chats.last_pulled_at. Applied here for the same reason as
+    # migrate_add_teams: run_migrations above is a no-op on a freshly stamped DB.
+    migrate_add_teams_last_pulled_at(conn)
     yield conn
     conn.close()
 

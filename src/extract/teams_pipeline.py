@@ -13,6 +13,7 @@ detects extracted_at > embedding_at and re-embeds.
 
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime
 
 from src.extract.policy_bridge import classify_exception
@@ -30,7 +31,12 @@ MIN_SUBSTANTIVE_LENGTH = 20
 MIN_SUBSTANTIVE_TOTAL_CHARS = 100
 
 
-def extract_threads(conn: sqlite3.Connection, workers: int = 4, limit: int = 0) -> dict:
+def extract_threads(
+    conn: sqlite3.Connection,
+    workers: int = 4,
+    limit: int = 0,
+    deadline_s: float | None = None,
+) -> dict:
     """Extract structured knowledge for every dirty thread.
 
     Args:
@@ -38,6 +44,12 @@ def extract_threads(conn: sqlite3.Connection, workers: int = 4, limit: int = 0) 
         workers: concurrency for LLM calls. Phase 1 implements sequential
             (workers param accepted for forward-compat).
         limit: max threads to process this run; 0 = unlimited.
+        deadline_s: wall-clock budget. Once spent no further thread is STARTED
+            and the rest come back as `deferred`. `limit` cannot stand in for
+            this: the LLM policy allows up to 120 s per call, so even a dozen
+            threads can outlast sb-teams-sync's TimeoutStartSec=600 on their
+            own. Restoring the full chat corpus left 804 threads pending at
+            once, which is what SIGTERMed the unit.
 
     Returns:
         {"extracted": <int>, "failed": <int>, "skipped": <int>}
@@ -68,7 +80,13 @@ def extract_threads(conn: sqlite3.Connection, workers: int = 4, limit: int = 0) 
     skipped = 0
     deferred = 0
 
+    deadline = None if deadline_s is None else time.monotonic() + deadline_s
+
     for tid in thread_ids:
+        # Checked before dispatch; the thread stays 'pending' for the next run.
+        if deadline is not None and time.monotonic() >= deadline:
+            deferred += 1
+            continue
         outcome = _extract_one_thread(conn, tid)
         conn.commit()  # Per-thread checkpoint — survives crashes mid-run.
         if outcome == "extracted":

@@ -581,3 +581,35 @@ def test_a_surviving_failure_is_labelled_by_the_classifier_not_by_a_string(
     assert status == expected_status
     assert sentinel.exists() is (expected_status == "pending")
     assert result["deferred" if expected_status == "pending" else "failed"] == 1
+
+
+# Step 5 ran with limit=0 (unlimited) and one Vertex call per thread. Harmless
+# while the corpus was the 40 chats a mass ingest_disabled sweep had left, and
+# immediately fatal once all 1,207 were restored: 804 threads came up pending
+# and sb-teams-sync (TimeoutStartSec=600) was SIGTERMed. A count limit is no
+# safer — the LLM policy allows up to 120 s per call, so even 12 threads can
+# exceed the unit on their own.
+
+
+def test_extract_threads_stops_starting_work_once_the_deadline_passes(db, monkeypatch):
+    from src.extract import teams_pipeline
+
+    calls = []
+    monkeypatch.setattr(
+        teams_pipeline,
+        "_extract_one_thread",
+        lambda conn, tid: calls.append(tid) or "extracted",
+    )
+    for i in range(4):
+        db.execute(
+            "INSERT INTO teams_threads (chat_id, thread_kind, anchor_message_id, started_at, "
+            "ended_at, message_count, extraction_status) "
+            "VALUES (1, 'chat_session', ?, ?, ?, 1, 'pending')",
+            (f"m{i}", "2026-08-18T10:00:00", "2026-08-18T10:00:00"),
+        )
+    db.commit()
+
+    stats = teams_pipeline.extract_threads(db, workers=1, deadline_s=0)
+
+    assert calls == [], "no LLM call may start after the budget is spent"
+    assert stats["deferred"] == 4

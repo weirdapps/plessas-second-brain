@@ -385,21 +385,27 @@ fire_curate=0
 fire_teams=0
 fire_reverse=0
 fire_attachments=0
+# Mail was missing from this list. A reauth restored every other outlook-gated
+# job but left sb-outlook-sync waiting for its next tick, so the 2026-08-18
+# lapse cost four hours of mail instead of minutes — and the overnight schedule
+# (22:00 -> 01:00 -> 07:00) can stretch that to nine.
+fire_outlook_sync=0
 
 if [ "$GCLOUD_WAS_BLOCKED" = "1" ] && [ ! -f "$GCLOUD_SENTINEL" ]; then
   log "auth-trigger: gcloud ADC restored — queueing all gcloud-gated jobs"
   fire_daily=1; fire_calendar=1; fire_curate=1; fire_teams=1; fire_reverse=1; fire_attachments=1
+  fire_outlook_sync=1
 fi
 if [ "$OUTLOOK_WAS_BLOCKED" = "1" ] && [ ! -f "$SENTINEL" ]; then
   log "auth-trigger: outlook auth restored — queueing outlook-gated jobs"
-  fire_calendar=1; fire_curate=1; fire_reverse=1; fire_attachments=1
+  fire_calendar=1; fire_curate=1; fire_reverse=1; fire_attachments=1; fire_outlook_sync=1
 fi
 if [ "$TEAMS_WAS_BLOCKED" = "1" ] && [ ! -f "$TEAMS_SENTINEL" ]; then
   log "auth-trigger: teams auth restored — queueing teams-sync"
   fire_teams=1
 fi
 
-if [ "$fire_daily$fire_calendar$fire_curate$fire_teams$fire_reverse$fire_attachments" != "000000" ]; then
+if [ "$fire_daily$fire_calendar$fire_curate$fire_teams$fire_reverse$fire_attachments$fire_outlook_sync" != "0000000" ]; then
   echo "$(ts) — === auth-watch restoration trigger ===" >> "$TRIGGERED_LOG"
   [ "$fire_daily" = "1" ]       && trigger_job sb-daily-sync.sh        gcloud
   [ "$fire_calendar" = "1" ]    && trigger_job sb-calendar-sync.sh     gcloud_or_outlook
@@ -407,6 +413,7 @@ if [ "$fire_daily$fire_calendar$fire_curate$fire_teams$fire_reverse$fire_attachm
   [ "$fire_teams" = "1" ]       && trigger_job sb-teams-sync.sh        gcloud_or_teams
   [ "$fire_reverse" = "1" ]     && trigger_job sb-reverse-ingest.sh    gcloud_or_outlook
   [ "$fire_attachments" = "1" ] && trigger_job sb-attachment-pass.sh   gcloud_or_outlook
+  [ "$fire_outlook_sync" = "1" ] && trigger_job sb-outlook-sync.sh     gcloud_or_outlook
 fi
 
 exit 0

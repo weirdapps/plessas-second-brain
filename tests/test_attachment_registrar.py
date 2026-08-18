@@ -248,3 +248,62 @@ def test_backlog_deferred_by_since_is_not_lost(db, tmp_path):
     register_downloaded_attachments(db, tmp_path, since="2026-08-18T00:00:00Z")
 
     assert register_downloaded_attachments(db, tmp_path)["registered"] == 1
+
+
+# Apple Mail-era message ids are INTEGERS (50,270 such emails); the outlook-cli
+# era uses text ids. Directory names are always strings, so `emails.get("1000")`
+# missed an email stored as 1000 and 17,804 directories reported as "awaiting
+# their email" forever.
+#
+# The dedup set has the identical mismatch, and that is the dangerous half:
+# normalising only the email lookup would have re-registered 29,957 files the
+# macOS exporter had already recorded, then paid for Phase 2 on all of them.
+# Only 31 files were genuinely missing. Both sides normalise, or neither.
+
+
+def _email_int_id(conn, message_id: int) -> int:
+    cur = conn.execute(
+        "INSERT INTO emails (message_id, date_received, subject) VALUES (?, ?, ?)",
+        (message_id, "2026-03-01T10:00:00Z", "legacy"),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def test_registers_against_an_integer_message_id(db, tmp_path):
+    email_id = _email_int_id(db, 1000)
+    _downloaded(tmp_path, "1000", "legacy.pdf")
+
+    result = register_downloaded_attachments(db, tmp_path)
+
+    assert result["registered"] == 1
+    assert result["deferred"] == 0
+    assert db.execute("SELECT email_id FROM attachments").fetchone()[0] == email_id
+
+
+def test_does_not_duplicate_an_attachment_recorded_under_an_integer_id(db, tmp_path):
+    """The macOS exporter wrote message_id as an integer. Re-registering those
+    would have duplicated ~30k rows and re-billed Phase 2 for every one."""
+    _email_int_id(db, 1000)
+    _downloaded(tmp_path, "1000", "legacy.pdf")
+    db.execute(
+        "INSERT INTO attachments (email_id, message_id, filename, file_path, exported_at) "
+        "VALUES (1, 1000, 'legacy.pdf', '/old/path/legacy.pdf', '2026-03-01T10:00:00')"
+    )
+    db.commit()
+
+    result = register_downloaded_attachments(db, tmp_path)
+
+    assert result["registered"] == 0
+    assert db.execute("SELECT COUNT(*) FROM attachments").fetchone()[0] == 1
+
+
+def test_keeps_the_message_id_type_the_email_uses(db, tmp_path):
+    """Storing '1000' beside an existing 1000 would break every join on the
+    column — SQLite does not equate the two."""
+    _email_int_id(db, 1000)
+    _downloaded(tmp_path, "1000", "legacy.pdf")
+
+    register_downloaded_attachments(db, tmp_path)
+
+    assert db.execute("SELECT typeof(message_id) FROM attachments").fetchone()[0] == "integer"

@@ -53,3 +53,94 @@ def test_empty_input():
     """Handle empty and None input."""
     assert extract_sharepoint_urls("") == []
     assert extract_sharepoint_urls(None) == []
+
+
+# --- Abandoned links must get a second chance --------------------------------
+# The retry pass filters on `attempts < MAX_SHAREPOINT_ATTEMPTS`, which makes the
+# cap an ABANDONMENT rather than a throttle. Between 2026-07-30 and 2026-08-10
+# this tenant's SharePoint auth was broken (MCAS-gated, no bearer issued), so 43
+# links burned through their attempts against a fetcher that could not have
+# succeeded, and were never tried again — still unfetched nine days after the
+# auth was fixed. A cap that can never expire turns any outage longer than five
+# nightly runs into permanent data loss.
+
+
+def _sp_db():
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE sharepoint_links (url TEXT PRIMARY KEY, message_id TEXT, fetched_at TEXT,"
+        " fetched_path TEXT, last_status TEXT, last_attempt_at TEXT, file_name TEXT,"
+        " file_size INT, attempts INT DEFAULT 0)"
+    )
+    return db
+
+
+def _link(db, url, *, status, attempts, last_attempt):
+    db.execute(
+        "INSERT INTO sharepoint_links (url, message_id, fetched_at, last_status,"
+        " last_attempt_at, attempts) VALUES (?, 'm1', NULL, ?, ?, ?)",
+        (url, status, last_attempt, attempts),
+    )
+    db.commit()
+
+
+def _selected(db, now="2026-08-19T01:00:00+00:00"):
+    from src.export.sharepoint_fetcher import retry_candidates
+
+    return [r[0] for r in retry_candidates(db, now=now)]
+
+
+def test_a_link_under_the_cap_is_retried():
+    db = _sp_db()
+    _link(
+        db, "https://x/a", status="http-error", attempts=2, last_attempt="2026-08-18T23:00:00+00:00"
+    )
+
+    assert _selected(db) == ["https://x/a"]
+
+
+def test_a_link_at_the_cap_is_not_retried_immediately():
+    """The cap still throttles — nightly hammering of a dead link is what it is for."""
+    db = _sp_db()
+    _link(
+        db, "https://x/b", status="http-error", attempts=8, last_attempt="2026-08-18T23:00:00+00:00"
+    )
+
+    assert _selected(db) == []
+
+
+def test_a_link_at_the_cap_is_retried_after_the_cool_off():
+    """The 43 abandoned on a broken auth path: last tried 2026-08-10, cap hit."""
+    db = _sp_db()
+    _link(
+        db, "https://x/c", status="http-error", attempts=8, last_attempt="2026-08-10T23:00:13+00:00"
+    )
+
+    assert _selected(db) == ["https://x/c"]
+
+
+def test_an_already_fetched_link_is_never_retried():
+    db = _sp_db()
+    db.execute(
+        "INSERT INTO sharepoint_links (url, message_id, fetched_at, last_status, attempts)"
+        " VALUES ('https://x/d', 'm1', '2026-08-01T00:00:00+00:00', 'ok', 0)"
+    )
+    db.commit()
+
+    assert _selected(db) == []
+
+
+def test_an_unsupported_host_stays_excluded():
+    """A permanent external tenant is not a transient failure."""
+    db = _sp_db()
+    _link(
+        db,
+        "https://x/e",
+        status="unsupported-host",
+        attempts=1,
+        last_attempt="2026-07-01T00:00:00+00:00",
+    )
+
+    assert _selected(db) == []

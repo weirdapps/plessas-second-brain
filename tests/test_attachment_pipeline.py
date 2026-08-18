@@ -220,3 +220,77 @@ def test_phase2_defers_every_auth_type_the_policy_calls_reauthable(
 
     assert status == expected_status
     assert sentinel.exists() is (expected_status == "pending")
+
+
+# Phase 1 cost per attachment spans three orders of magnitude: a plain-text part
+# is ~0.1 s, while OCR (the single most common extraction_method on prod, 14,212
+# rows) or a 30 MB .xlsb workbook runs for minutes. A count limit therefore says
+# nothing about wall-clock, and sb-outlook-sync — TimeoutStartSec=10min — was
+# SIGTERMed repeatedly on 2026-08-18 inside a 200-attachment Phase 1 that a
+# 60-attachment sample had suggested would take six seconds. Same fix already
+# used by run_backfill: a wall-clock budget, checked between items so whatever
+# is in flight still finishes and gets committed.
+
+
+def _db_with_n_attachments(db_path, n):
+    from src.store.schema import create_database
+
+    conn = create_database(db_path)
+    conn.execute(
+        "INSERT INTO emails (message_id, date_received, subject) VALUES (1000, '2026-01-01', 'T')"
+    )
+    att_dir = os.path.join(os.path.dirname(db_path), "attachments", "1000")
+    os.makedirs(att_dir, exist_ok=True)
+    for i in range(n):
+        p = os.path.join(att_dir, f"f{i}.txt")
+        with open(p, "w") as f:
+            f.write("Body text long enough to clear the extraction threshold comfortably.")
+        conn.execute(
+            "INSERT INTO attachments (email_id, message_id, filename, mime_type, file_size,"
+            " file_path, exported_at) VALUES (1, 1000, ?, 'text/plain', 100, ?, '2026-01-01')",
+            (f"f{i}.txt", p),
+        )
+    conn.commit()
+    conn.close()
+
+
+def test_phase1_stops_starting_work_once_the_deadline_passes():
+    from src.extract.attachment_pipeline import run_phase1
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "test.db")
+        _db_with_n_attachments(db_path, 5)
+
+        stats = run_phase1(db_path, deadline_s=0)
+
+        assert stats["processed"] == 0
+        assert stats["deferred"] == 5
+
+
+def test_phase1_deferred_work_is_picked_up_by_the_next_run():
+    """Deferring must not consume the item — the backlog has to converge."""
+    from src.extract.attachment_pipeline import run_phase1
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "test.db")
+        _db_with_n_attachments(db_path, 3)
+
+        run_phase1(db_path, deadline_s=0)
+        stats = run_phase1(db_path)
+
+        assert stats["processed"] == 3
+        assert stats["deferred"] == 0
+
+
+def test_phase1_without_a_deadline_processes_everything():
+    """The nightly bulk path must keep its current unbounded behaviour."""
+    from src.extract.attachment_pipeline import run_phase1
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "test.db")
+        _db_with_n_attachments(db_path, 4)
+
+        stats = run_phase1(db_path)
+
+        assert stats["processed"] == 4
+        assert stats["deferred"] == 0

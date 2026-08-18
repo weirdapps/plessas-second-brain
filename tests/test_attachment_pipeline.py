@@ -294,3 +294,49 @@ def test_phase1_without_a_deadline_processes_everything():
 
         assert stats["processed"] == 4
         assert stats["deferred"] == 0
+
+
+def test_phase2_stops_starting_work_once_the_deadline_passes(monkeypatch):
+    """Phase 2 is network-bound: 25 calls looked modest and cost 6-8 minutes of
+    wall clock at ~15-25 s each, which is what kept SIGTERMing sb-outlook-sync
+    after Phase 1 was already bounded. Count is not a budget; time is."""
+    from src.extract import attachment_pipeline
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "test.db")
+        _db_with_n_attachments(db_path, 3)
+        from src.extract.attachment_pipeline import run_phase1, run_phase2
+
+        run_phase1(db_path)
+
+        called = []
+        monkeypatch.setattr(
+            attachment_pipeline,
+            "_extract_one_attachment",
+            lambda row: called.append(row) or (row[0], None, {}, None, False),
+        )
+
+        stats = run_phase2(db_path, deadline_s=0)
+
+        assert called == [], "no LLM call may start after the budget is spent"
+        assert stats["processed"] == 0
+        assert stats["deferred"] == 3
+
+
+def test_phase2_deferred_work_stays_pending_for_the_next_run():
+    """Deferring must leave llm_status='pending' so the nightly drain finds it."""
+    from src.extract.attachment_pipeline import run_phase1, run_phase2
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "test.db")
+        _db_with_n_attachments(db_path, 2)
+        run_phase1(db_path)
+
+        run_phase2(db_path, deadline_s=0)
+
+        conn = sqlite3.connect(db_path)
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM attachment_content WHERE llm_status = 'pending'"
+        ).fetchone()[0]
+        conn.close()
+        assert pending == 2

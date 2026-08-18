@@ -34,20 +34,37 @@ ATTACHMENT_REGISTER_LIMIT = 50
 # which the nightly job runs under a one-hour budget.
 ATTACHMENT_REGISTER_WINDOW_H = 48
 
-# LLM summaries attempted inside one sync. Phase 2 is one Vertex call per
-# attachment, and calling it unbounded is what SIGTERMed the 2026-08-18 01:00
-# run at the unit's 10-minute TimeoutStartSec. The nightly sb-attachments job
-# drains the remaining backlog under its own 3390 s budget, so this only has to
-# cover fresh mail.
-PHASE2_SYNC_LIMIT = 25
+# --- Wall-clock budget for one sync run ------------------------------------
+#
+# sb-outlook-sync runs under TimeoutStartSec=600. Bounding stages one at a time
+# against that number failed three times over (registration, then Phase 2 by
+# count, then Phase 1), because independent per-stage limits cannot sum to a
+# guarantee — each fix stopped one overrun and exposed the next. These budgets
+# are therefore stated together and their sum is asserted against the timeout
+# in tests/test_sync_budget.py.
+#
+# Every one is wall-clock, not a count. Count was wrong for both slow stages
+# and for opposite reasons: Phase 1 varies 1000x per item (a text part vs OCR
+# vs a 30 MB workbook), and Phase 2 is network-bound, so 25 calls read as
+# modest and cost 6-8 minutes. Anything deferred stays queued for the nightly
+# job, which has an hour.
+SYNC_UNIT_TIMEOUT_S = 600.0
 
-# Wall-clock budget for Phase 1 inside one sync. Capping Phase 2 alone did not
-# stop the timeouts: Phase 1 is local, but "local" is not "fast" — OCR is the
-# most common extraction_method in this corpus and a single 30 MB .xlsb workbook
-# can run for minutes, so a 200-attachment batch that samples at 0.1 s each
-# still overran ten minutes. Count is not a proxy for time when per-item cost
-# spans three orders of magnitude; the deadline is.
-PHASE1_SYNC_DEADLINE_S = 180.0
+PHASE1_SYNC_DEADLINE_S = 90.0
+PHASE2_SYNC_DEADLINE_S = 90.0
+
+# Step 8's default (IMAGE_CLASSIFY_BUDGET_S, 480 s) was sized for sb-daily-sync,
+# whose timeout is 30 minutes. Inherited here it claims 80% of the unit on its
+# own, which is why runs still died after Step 6 was bounded.
+# Trimmed to 90 s so the stage sum keeps 20% headroom (tests/test_sync_budget.py).
+# Cheapest place to take it from: the nightly job already runs
+# `process-images --limit 500` under an hour, so a short hourly slice only has
+# to keep fresh mail's images moving.
+IMAGE_CLASSIFY_SYNC_BUDGET_S = 90.0
+
+# Observed span for the stages that have no budget of their own: mail fetch,
+# extraction, load, registration, people dedup, embeddings rebuild.
+SYNC_FIXED_WORK_S = 180.0
 
 
 def format_email_result(email: dict, show_full: bool = False) -> str:
@@ -1173,8 +1190,12 @@ def cmd_sync(args):
             f"{p1_stats['failed']} failed, {p1_stats['skipped']} skipped"
             + (f", {deferred} deferred (out of time)" if deferred else "")
         )
-        p2_stats = run_phase2(db_path, attachment_ids=scope_ids, limit=PHASE2_SYNC_LIMIT)
-        print(f"  Phase 2: {p2_stats['extracted']} LLM extracted, {p2_stats['failed']} failed")
+        p2_stats = run_phase2(db_path, attachment_ids=scope_ids, deadline_s=PHASE2_SYNC_DEADLINE_S)
+        p2_deferred = p2_stats.get("deferred", 0)
+        print(
+            f"  Phase 2: {p2_stats['extracted']} LLM extracted, {p2_stats['failed']} failed"
+            + (f", {p2_deferred} deferred (out of time)" if p2_deferred else "")
+        )
     else:
         print("  No new attachments to process")
 
@@ -1211,6 +1232,10 @@ def cmd_sync(args):
         # systemd TimeoutStartSec for sb-daily-sync / sb-noon-catchup — step 8 was
         # spending the entire budget and getting SIGTERMed. Cap it so the sync
         # always returns cleanly; the leftover drains on the next run.
+        #
+        # IMAGE_CLASSIFY_BUDGET_S (480 s) was sized against those 30-minute units.
+        # The hourly sync only has 600 s in total, so inheriting it let Step 8
+        # claim 80% of the run on its own — take the smaller of the two.
         img_stats = run_backfill(
             conn=img_conn,
             since=None,
@@ -1219,7 +1244,7 @@ def cmd_sync(args):
             dry_run=False,
             workers=4,
             unprocessed_only=True,
-            deadline_s=IMAGE_CLASSIFY_BUDGET_S,
+            deadline_s=min(IMAGE_CLASSIFY_BUDGET_S, IMAGE_CLASSIFY_SYNC_BUDGET_S),
         )
         img_conn.close()
         classified = img_stats.get("classified", 0)

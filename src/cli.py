@@ -221,21 +221,32 @@ def cmd_process_attachments(args):
     file_type = getattr(args, "type", None)
     limit = args.limit or 0
 
+    # Bounds the run for a caller under an external timeout — the nightly job
+    # has TimeoutStartSec=1h and now carries the whole backfill, where a count
+    # limit is no safer than it was in the hourly sync.
+    deadline_s = getattr(args, "deadline_s", None)
+
     if phase is None or phase == 1:
         print("Phase 1: Local text extraction...")
-        stats = run_phase1(db_path, limit=limit, file_type=file_type)
+        stats = run_phase1(db_path, limit=limit, file_type=file_type, deadline_s=deadline_s)
         print(f"  Processed: {stats['processed']}")
         print(f"  Extracted: {stats['extracted']}")
         print(f"  Failed: {stats['failed']}")
         print(f"  Skipped: {stats['skipped']}")
+        if stats.get("deferred"):
+            print(f"  Deferred (out of time): {stats['deferred']}")
 
     if phase is None or phase == 2:
         workers = getattr(args, "workers", 1) or 1
         print(f"\nPhase 2: Vertex AI structured extraction (workers={workers})...")
-        stats = run_phase2(db_path, limit=limit, file_type=file_type, workers=workers)
+        stats = run_phase2(
+            db_path, limit=limit, file_type=file_type, workers=workers, deadline_s=deadline_s
+        )
         print(f"  Processed: {stats['processed']}")
         print(f"  Extracted: {stats['extracted']}")
         print(f"  Failed: {stats['failed']}")
+        if stats.get("deferred"):
+            print(f"  Deferred (out of time): {stats['deferred']}")
 
     print("\nAttachment processing complete.")
 
@@ -2028,6 +2039,13 @@ def main():
         type=int,
         default=1,
         help="Number of concurrent LLM workers for phase 2 (default 1)",
+    )
+    parser_process_att.add_argument(
+        "--deadline-s",
+        type=float,
+        default=None,
+        dest="deadline_s",
+        help="Wall-clock budget in seconds; remaining work is deferred to the next run",
     )
     parser_process_att.set_defaults(func=cmd_process_attachments)
 

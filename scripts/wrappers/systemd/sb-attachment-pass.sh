@@ -32,8 +32,11 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') — starting attachment registration" >> "$LO
 # Phase 1 = local text extraction. Previously left entirely to the hourly sync,
 # which cannot absorb a backlog: cost per attachment ranges from ~0.1 s for a
 # text part to minutes for OCR or a 30 MB workbook.
+# 900 s of this unit's 1 h. Same reasoning as the hourly sync: per-attachment
+# cost ranges from ~0.1 s to minutes, so only a wall-clock bound keeps the run
+# inside TimeoutStartSec. Leftovers stay unprocessed and are picked up tomorrow.
 echo "$(date '+%Y-%m-%d %H:%M:%S') — starting text extraction" >> "$LOG_FILE"
-"$PYTHON" -m src.cli process-attachments --phase 1 >> "$LOG_FILE" 2>&1
+"$PYTHON" -m src.cli process-attachments --phase 1 --deadline-s 900 >> "$LOG_FILE" 2>&1
 
 # Phase 2 = LLM summary pass. Workers=4 mirrors the teams-sync default.
 echo "$(date '+%Y-%m-%d %H:%M:%S') — starting attachment summary" >> "$LOG_FILE"

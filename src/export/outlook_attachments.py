@@ -151,15 +151,25 @@ def register_downloaded_attachments(
     # Keyed by (message_id, filename), matching the table's own dedup identity:
     # a message can gain another attachment on a later pass, so skipping whole
     # directories on "message already seen" would miss it permanently.
+    #
+    # message_id is stringified on BOTH sides because the corpus holds two eras:
+    # Apple Mail wrote INTEGER ids (50,270 emails), outlook-cli writes text ones,
+    # and a directory name is always a string. Normalising only the email lookup
+    # below would re-register the 29,957 files the macOS exporter already
+    # recorded and re-bill Phase 2 for each; normalising only here would keep
+    # deferring them. Genuinely missing: 31.
     known = {
-        (mid, name) for mid, name in conn.execute("SELECT message_id, filename FROM attachments")
+        (str(mid), name)
+        for mid, name in conn.execute("SELECT message_id, filename FROM attachments")
     }
+    # Values keep the email's OWN message_id, not the directory name: writing
+    # '1000' beside an existing integer 1000 would break every join on the
+    # column, since SQLite does not equate the two.
     if since:
-        emails = dict(
-            conn.execute("SELECT message_id, id FROM emails WHERE date_received >= ?", (since,))
-        )
+        rows = conn.execute("SELECT message_id, id FROM emails WHERE date_received >= ?", (since,))
     else:
-        emails = dict(conn.execute("SELECT message_id, id FROM emails"))
+        rows = conn.execute("SELECT message_id, id FROM emails")
+    emails = {str(mid): (mid, eid) for mid, eid in rows}
 
     for msg_dir in sorted(base_dir.iterdir()):
         if not msg_dir.is_dir():
@@ -179,10 +189,11 @@ def register_downloaded_attachments(
         # flight. Recording email_id NULL would orphan the row for good: the
         # image and text pipelines JOIN emails, so it would never be picked up
         # even once the email lands. Leave it on disk for a later pass instead.
-        email_id = emails.get(message_id)
-        if email_id is None:
+        found = emails.get(message_id)
+        if found is None:
             stats["deferred"] += 1
             continue
+        stored_message_id, email_id = found
 
         for f in files:
             if limit is not None and stats["registered"] >= limit:
@@ -195,7 +206,7 @@ def register_downloaded_attachments(
                    VALUES (?, ?, ?, ?, ?, ?, 0, ?)""",
                 (
                     email_id,
-                    message_id,
+                    stored_message_id,
                     f.name,
                     mimetypes.guess_type(f.name)[0] or "application/octet-stream",
                     f.stat().st_size,

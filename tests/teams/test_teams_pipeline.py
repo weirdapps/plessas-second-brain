@@ -594,6 +594,11 @@ def test_a_surviving_failure_is_labelled_by_the_classifier_not_by_a_string(
 def test_extract_threads_stops_starting_work_once_the_deadline_passes(db, monkeypatch):
     from src.extract import teams_pipeline
 
+    # extract_threads demands Vertex config before it looks at anything else.
+    # Every other test here sets it; omitting it passed locally only because a
+    # dev shell exports it, and failed in CI.
+    monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "test-project")
+
     calls = []
     monkeypatch.setattr(
         teams_pipeline,

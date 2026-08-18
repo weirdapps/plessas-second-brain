@@ -66,12 +66,32 @@ IMAGE_CLASSIFY_SYNC_BUDGET_S = 90.0
 # extraction, load, registration, people dedup, embeddings rebuild.
 SYNC_FIXED_WORK_S = 180.0
 
-# Step 2 of the Teams sync, which has its own unit (sb-teams-sync,
-# TimeoutStartSec=600) and its own Steps 3-6 to pay for afterwards. A full pass
-# over the 1,207-chat inventory is ~9 min at a measured 0.45 s per chat, so the
-# pull rotates oldest-first and takes ~530 chats per run; at two runs an hour
-# every chat is read roughly every 70 minutes.
-TEAMS_PULL_DEADLINE_S = 240.0
+# --- Wall-clock budget for one Teams sync run -------------------------------
+#
+# sb-teams-sync also runs under TimeoutStartSec=600, and restoring the full
+# 1,219-chat corpus turned every stage into real work at once. Bounding only
+# the pull was not enough — the run still died, because Step 5 had limit=0 and
+# 804 threads came up pending. Same rule as the Outlook budget above: state the
+# stages together and assert the sum (tests/test_sync_budget.py).
+#
+#   step 1 discover    90 s   measured 86.4 s, fixed cost, no budget of its own
+#   step 2 pull       150 s   ~330 of 1,219 chats at a measured 0.45 s each
+#   step 3 bound       10 s   measured 1.3 s, SQL only
+#   step 4 MRIs        40 s   already capped at 50 lookups/run
+#   step 5 extract    150 s   LLM per thread
+#   step 6 embed       30 s   local
+#                     ----
+#                     470 s of 600 s
+#
+# The pull rotates oldest-first, so every chat is read about every two hours,
+# and deferred threads stay pending for the next run.
+TEAMS_DISCOVER_OBSERVED_S = 90.0
+TEAMS_PULL_DEADLINE_S = 150.0
+TEAMS_BOUND_OBSERVED_S = 10.0
+TEAMS_MRI_OBSERVED_S = 40.0
+TEAMS_EXTRACT_DEADLINE_S = 150.0
+TEAMS_EMBED_OBSERVED_S = 30.0
+TEAMS_UNIT_TIMEOUT_S = 600.0
 
 
 def format_email_result(email: dict, show_full: bool = False) -> str:
@@ -1348,8 +1368,17 @@ def cmd_teams_sync(args):
     )
 
     print("Step 5/6: extracting threads...")
-    e = extract_threads(conn, workers=args.workers or 4, limit=args.limit or 0)
-    print(f"  {e['extracted']} extracted, {e['skipped']} skipped, {e['failed']} failed")
+    e = extract_threads(
+        conn,
+        workers=args.workers or 4,
+        limit=args.limit or 0,
+        deadline_s=TEAMS_EXTRACT_DEADLINE_S,
+    )
+    e_deferred = e.get("deferred", 0)
+    print(
+        f"  {e['extracted']} extracted, {e['skipped']} skipped, {e['failed']} failed"
+        + (f", {e_deferred} deferred (out of time)" if e_deferred else "")
+    )
 
     print("Step 6/6: embedding thread summaries...")
     n = build_teams_index(conn)

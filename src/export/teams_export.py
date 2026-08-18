@@ -7,6 +7,7 @@ import html as html_mod
 import json
 import re
 import sqlite3
+import time
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -136,6 +137,25 @@ def _is_permanent_error(err: BaseException) -> bool:
     return any(p in msg for p in _PERMANENT_ERROR_PATTERNS)
 
 
+# A 403 is only evidence about one chat if the rest of the run is fine. Teams
+# issues per-audience tokens, so a Graph-side lapse 403s EVERY chat — and
+# because the flag is one-way (recovery is a manual UPDATE), one such lapse
+# permanently dropped 1,179 of 1,219 chats on prod. Ingestion then reported
+# "0 messages inserted across 40 chats; 0 errors" every 30 minutes for 33 hours.
+# Above these bounds the run is treated as evidence about the SERVICE, not the
+# chats. The absolute floor keeps a tiny run (2 chats, 1 bad) from tripping it.
+PERMANENT_DISABLE_MAX_SHARE = 0.25
+PERMANENT_DISABLE_MIN_COUNT = 3
+
+
+def _is_systemic_failure(permanent_count: int, attempted: int) -> bool:
+    """Whether this run's permanent-looking errors indict the service, not the chats."""
+    if attempted <= 0:
+        return True
+    ceiling = max(PERMANENT_DISABLE_MIN_COUNT, attempted * PERMANENT_DISABLE_MAX_SHARE)
+    return permanent_count > ceiling
+
+
 def _classify_chat_kind(chat: dict) -> str | None:
     """Map a list-chats payload entry to teams_chats.chat_kind.
 
@@ -223,7 +243,9 @@ def _discover_chat_chats(conn: sqlite3.Connection) -> dict:
     return {"chats_inserted": inserted, "chats_updated": updated}
 
 
-def pull_messages(conn: sqlite3.Connection, concurrency: int = 2) -> dict:
+def pull_messages(
+    conn: sqlite3.Connection, concurrency: int = 2, deadline_s: float | None = None
+) -> dict:
     """Step 2: full pull of messages for every active chat.
 
     Active = (last_message_at within 12 months) OR (any messages already in DB).
@@ -236,9 +258,13 @@ def pull_messages(conn: sqlite3.Connection, concurrency: int = 2) -> dict:
         conn: open SQLite connection.
         concurrency: max parallel chats. Default 2 (mirrors outlook to avoid
             chatsvc 429 throttling).
+        deadline_s: Optional wall-clock budget. Once spent, no further chat is
+            STARTED and the rest come back as `deferred`. A full pass over the
+            restored 1,207-chat inventory is ~9 min at a measured 0.45 s each,
+            against sb-teams-sync's TimeoutStartSec=600.
 
     Returns:
-        {"chats_pulled": <int>, "messages_inserted": <int>, "errors": <int>}
+        {"chats_pulled", "messages_inserted", "errors", "deferred"}
     """
     now = datetime.now(UTC)
     cutoff_iso = now.replace(year=now.year - 1).isoformat()
@@ -254,6 +280,7 @@ def pull_messages(conn: sqlite3.Connection, concurrency: int = 2) -> dict:
             OR last_message_at >= ?
             OR EXISTS (SELECT 1 FROM teams_messages tm WHERE tm.chat_id = teams_chats.id)
           )
+        ORDER BY last_pulled_at IS NOT NULL, last_pulled_at
         """,
         (cutoff_iso,),
     ).fetchall()
@@ -261,12 +288,21 @@ def pull_messages(conn: sqlite3.Connection, concurrency: int = 2) -> dict:
     pulled = 0
     inserted = 0
     errors = 0
+    deferred = 0
+    deadline = None if deadline_s is None else time.monotonic() + deadline_s
+    # Disabling is decided after the run, not inside the loop: a Graph-wide auth
+    # lapse 403s every chat, and applying the flag per-chat turned one transient
+    # failure into 1,179 permanently dropped chats on prod.
+    permanent_candidates: list[int] = []
 
     # Concurrency wired in but defaulted to sequential for Phase 1 simplicity;
     # parallelism is a Phase 2 follow-up if throughput becomes an issue.
     _ = concurrency
 
     for chat in rows:
+        if deadline is not None and time.monotonic() >= deadline:
+            deferred += 1
+            continue
         try:
             # teams-cli list-messages has no --sync-state flag (channel reads via
             # chatsvcagg /posts don't expose a cursor). We always pull and rely on
@@ -289,6 +325,10 @@ def pull_messages(conn: sqlite3.Connection, concurrency: int = 2) -> dict:
                 ]
             payload = run_teams_cli(args)
             inserted += _persist_messages(conn, chat["id"], payload)
+            conn.execute(
+                "UPDATE teams_chats SET last_pulled_at = ? WHERE id = ?",
+                (datetime.now(UTC).isoformat(), chat["id"]),
+            )
             pulled += 1
         except TeamsCliAuthRequired:
             raise  # whole run is dead; let the orchestrator flip the sentinel
@@ -297,12 +337,9 @@ def pull_messages(conn: sqlite3.Connection, concurrency: int = 2) -> dict:
             import sys
 
             if _is_permanent_error(e):
-                conn.execute(
-                    "UPDATE teams_chats SET ingest_disabled = 1 WHERE id = ?",
-                    (chat["id"],),
-                )
+                permanent_candidates.append(chat["id"])
                 print(
-                    f"pull_messages: disabling chat {chat['teams_chat_id']} "
+                    f"pull_messages: candidate for disable {chat['teams_chat_id']} "
                     f"(permanent: {str(e)[:140]})",
                     file=sys.stderr,
                 )
@@ -312,8 +349,27 @@ def pull_messages(conn: sqlite3.Connection, concurrency: int = 2) -> dict:
                     file=sys.stderr,
                 )
 
+    attempted = pulled + errors
+    if permanent_candidates and _is_systemic_failure(len(permanent_candidates), attempted):
+        import sys as _sys
+
+        print(
+            f"pull_messages: {len(permanent_candidates)}/{attempted} chats returned a "
+            "permanent-looking error — treating as systemic (auth/service) and "
+            "disabling none",
+            file=_sys.stderr,
+        )
+    else:
+        for chat_id in permanent_candidates:
+            conn.execute("UPDATE teams_chats SET ingest_disabled = 1 WHERE id = ?", (chat_id,))
+
     conn.commit()
-    return {"chats_pulled": pulled, "messages_inserted": inserted, "errors": errors}
+    return {
+        "chats_pulled": pulled,
+        "messages_inserted": inserted,
+        "errors": errors,
+        "deferred": deferred,
+    }
 
 
 def _persist_messages(conn: sqlite3.Connection, chat_id: int, payload: dict) -> int:

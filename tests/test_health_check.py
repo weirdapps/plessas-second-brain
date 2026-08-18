@@ -1232,3 +1232,52 @@ def test_check_document_roots_survives_unreadable_stamp_bytes(hc, tmp_path):
 
     r = hc.check_document_roots(roots=[root], now=now, stamp=stamp, fail_marker=_no_fail(tmp_path))
     assert r["status"] == "OK", "undecodable stamp falls back to mtimes, never raises"
+
+
+# --- Teams chats silently dropped from ingestion -----------------------------
+# check_teams reported OK on message recency alone, so it stayed green while a
+# one-way ingest_disabled sweep cut the working set from 1,219 chats to 40. The
+# sync then printed "0 messages inserted across 40 chats; 0 errors" every 30
+# minutes for 33 hours and nothing anywhere said the corpus had shrunk.
+
+
+def _teams_db(enabled, disabled):
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE teams_messages (id INTEGER PRIMARY KEY, composed_at TEXT, chat_id INT)"
+    )
+    db.execute("CREATE TABLE teams_threads (id INTEGER PRIMARY KEY)")
+    db.execute("CREATE TABLE teams_chats (id INTEGER PRIMARY KEY, ingest_disabled INT DEFAULT 0)")
+    for _ in range(enabled):
+        db.execute("INSERT INTO teams_chats (ingest_disabled) VALUES (0)")
+    for _ in range(disabled):
+        db.execute("INSERT INTO teams_chats (ingest_disabled) VALUES (1)")
+    db.execute("INSERT INTO teams_messages (composed_at, chat_id) VALUES (datetime('now'), 1)")
+    db.commit()
+    return db
+
+
+def test_check_teams_counts_chats_dropped_from_ingestion(hc):
+    db = _teams_db(enabled=40, disabled=1179)
+
+    r = hc.check_teams(db)
+
+    assert r["chats_disabled"] == 1179
+    assert r["chats"] == 1219
+
+
+def test_check_teams_warns_when_most_of_the_corpus_is_disabled(hc):
+    """Fresh messages from the survivors must not mask a corpus that shrank 97%."""
+    db = _teams_db(enabled=40, disabled=1179)
+
+    assert hc.check_teams(db)["status"] == "WARN"
+
+
+def test_check_teams_tolerates_a_few_genuinely_unreadable_chats(hc):
+    """Archived teams and guest-only channels legitimately never read; warning on
+    those would make the row nag permanently."""
+    db = _teams_db(enabled=1200, disabled=19)
+
+    assert hc.check_teams(db)["status"] == "OK"

@@ -355,10 +355,10 @@ def cmd_process_sharepoint(args):
     """Scan emails for SharePoint URLs and fetch them."""
     from src.config import SHAREPOINT_DATA_DIR, SHAREPOINT_HOST
     from src.export.sharepoint_fetcher import (
-        MAX_SHAREPOINT_ATTEMPTS,
         fetch_sharepoint_link,
         is_managed_sharepoint_host,
         record_link_in_db,
+        retry_candidates,
     )
     from src.extract.sharepoint_url_scanner import extract_sharepoint_urls
     from src.store.schema import get_connection, run_migrations
@@ -457,13 +457,7 @@ def cmd_process_sharepoint(args):
     # still inside the scan window — otherwise old failures never clear.
     # 'unsupported-host' is a permanent external tenant, so it is excluded.
     if not args.dry_run:
-        retry_rows = conn.execute(
-            "SELECT url, message_id FROM sharepoint_links "
-            "WHERE (fetched_at IS NULL OR last_status = 'stale') "
-            "AND COALESCE(last_status, '') != 'unsupported-host' "
-            "AND attempts < ?",
-            (MAX_SHAREPOINT_ATTEMPTS,),
-        ).fetchall()
+        retry_rows = retry_candidates(conn)
         if retry_rows:
             print(f"Retrying {len(retry_rows)} previously unfetched/stale link(s)...")
         for url, message_id in retry_rows:

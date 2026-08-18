@@ -241,6 +241,7 @@ def _extract_one_attachment(row):
 def run_phase2(
     db_path: str | None = None,
     limit: int = 0,
+    deadline_s: float | None = None,
     file_type: str | None = None,
     attachment_ids: list[int] | None = None,
     workers: int = 1,
@@ -254,12 +255,20 @@ def run_phase2(
     Args:
         db_path: Path to database (defaults to DEFAULT_DB)
         limit: Max attachments to process (0 = no limit)
+        deadline_s: Optional wall-clock budget in seconds. Once spent, nothing
+            further is DISPATCHED and the rest are returned as `deferred`, left
+            at llm_status='pending' so the nightly drain still finds them.
+
+            A count limit is not a budget for this stage: it is network-bound,
+            so 25 calls read as modest and cost 6-8 minutes at ~15-25 s each.
+            That is what kept SIGTERMing sb-outlook-sync (TimeoutStartSec=600)
+            even after Phase 1 was bounded. Same contract as run_phase1.
         file_type: Filter by original MIME type
         attachment_ids: If given, only process these attachment IDs (for sync scoping)
         workers: Number of concurrent LLM workers (default 1)
 
     Returns:
-        Dict with processing stats.
+        Dict with processing stats: processed, extracted, failed, deferred.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -300,7 +309,11 @@ def run_phase2(
 
     rows = conn.execute(query, params).fetchall()
 
-    stats = {"processed": 0, "extracted": 0, "failed": 0}
+    stats = {"processed": 0, "extracted": 0, "failed": 0, "deferred": 0}
+    deadline = None if deadline_s is None else time.monotonic() + deadline_s
+
+    def _out_of_time() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
 
     def _store_result(ac_id, email_id, extraction, error, auth_error):
         """Store a single result in the DB (called from main thread).
@@ -394,6 +407,11 @@ def run_phase2(
     if workers <= 1:
         # Sequential mode (original behavior)
         for row in rows:
+            # Checked before dispatch: the row stays llm_status='pending', so the
+            # nightly drain picks it up rather than the work being lost.
+            if _out_of_time():
+                stats["deferred"] += 1
+                continue
             ac_id, email_id, extraction, error, auth_error = _extract_one_attachment(row)
             _store_result(ac_id, email_id, extraction, error, auth_error)
             if stats["processed"] % PHASE2_BATCH_SIZE == 0:
@@ -401,7 +419,13 @@ def run_phase2(
     else:
         # Concurrent mode: LLM calls in parallel, DB writes serialized
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_extract_one_attachment, row): row for row in rows}
+            pending_rows = []
+            for row in rows:
+                if _out_of_time():
+                    stats["deferred"] += 1
+                    continue
+                pending_rows.append(row)
+            futures = {executor.submit(_extract_one_attachment, row): row for row in pending_rows}
             for future in as_completed(futures):
                 ac_id, email_id, extraction, error, auth_error = future.result()
                 _store_result(ac_id, email_id, extraction, error, auth_error)

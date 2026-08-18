@@ -97,15 +97,25 @@ Be strict: a screenshot of a UI bug is CONTENT; a company logo is DECORATION.
 """
 
 
-def _guess_media_type(path: Path) -> str:
-    suffix = path.suffix.lower()
-    return {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-    }.get(suffix, "image/png")
+# The only formats the API accepts, keyed by Pillow's format name. Anything
+# absent here has to be re-encoded, not relabelled.
+_API_MEDIA_TYPES = {
+    "PNG": "image/png",
+    "JPEG": "image/jpeg",
+    "GIF": "image/gif",
+    "WEBP": "image/webp",
+}
+
+
+def _media_type_for(pillow_format: str | None) -> str | None:
+    """API media type for decoded bytes, or None when the format is unsupported.
+
+    Read from the BYTES, never the filename. The extension is not evidence:
+    Outlook writes .jfif parts and extensionless img-<uuid> ones, and a .tif
+    labelled image/png is a claim the API checks and rejects outright
+    ("Image format image/png not supported").
+    """
+    return _API_MEDIA_TYPES.get((pillow_format or "").upper())
 
 
 def _encode_image_for_vision(img_path: Path) -> tuple[str, str]:
@@ -125,11 +135,12 @@ def _encode_image_for_vision(img_path: Path) -> tuple[str, str]:
 
     with Image.open(io.BytesIO(raw)) as probe:
         width, height = probe.size
+        media_type = _media_type_for(probe.format)
         oversized_px = max(width, height) > VISION_IMAGE_MAX_DIMENSION
 
     b64 = base64.b64encode(raw).decode()
-    if not oversized_px and len(b64) <= VISION_IMAGE_MAX_B64:
-        return b64, _guess_media_type(img_path)
+    if media_type and not oversized_px and len(b64) <= VISION_IMAGE_MAX_B64:
+        return b64, media_type
 
     # Everything below decodes the full raster. Check the cost BEFORE Pillow
     # allocates: probing size does not decode, so this is the last safe point.

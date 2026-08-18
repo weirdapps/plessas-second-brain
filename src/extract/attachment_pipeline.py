@@ -419,15 +419,24 @@ def run_phase2(
     else:
         # Concurrent mode: LLM calls in parallel, DB writes serialized
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            pending_rows = []
-            for row in rows:
+            # Checked inside the task, not while submitting: a pre-flight filter
+            # evaluates the budget once at t=0, dispatches everything, and lets
+            # the pool run to completion — the deadline becomes a no-op, which is
+            # how sb-attachments ran 35 minutes into a 30-minute cap. Queued
+            # tasks now drain instantly once the budget is spent, so the pool
+            # closes promptly. Same shape as run_backfill's worker().
+            def _run_or_defer(row):
                 if _out_of_time():
+                    return None
+                return _extract_one_attachment(row)
+
+            futures = {executor.submit(_run_or_defer, row): row for row in rows}
+            for future in as_completed(futures):
+                outcome = future.result()
+                if outcome is None:
                     stats["deferred"] += 1
                     continue
-                pending_rows.append(row)
-            futures = {executor.submit(_extract_one_attachment, row): row for row in pending_rows}
-            for future in as_completed(futures):
-                ac_id, email_id, extraction, error, auth_error = future.result()
+                ac_id, email_id, extraction, error, auth_error = outcome
                 _store_result(ac_id, email_id, extraction, error, auth_error)
 
     conn.commit()

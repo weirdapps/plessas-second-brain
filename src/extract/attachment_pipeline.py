@@ -72,6 +72,7 @@ def run_phase1(
     limit: int = 0,
     file_type: str | None = None,
     attachment_ids: list[int] | None = None,
+    deadline_s: float | None = None,
 ) -> dict:
     """Run Phase 1: local text extraction for all unprocessed attachments.
 
@@ -80,9 +81,19 @@ def run_phase1(
         limit: Max attachments to process (0 = no limit)
         file_type: Filter by type: 'pdf', 'word', 'pptx', 'excel', 'image', 'eml', 'rpmsg'
         attachment_ids: If given, only process these attachment IDs (for sync scoping)
+        deadline_s: Optional wall-clock budget in seconds. Once spent, no further
+            attachments are STARTED and the rest are returned as `deferred`; the
+            one in flight runs to completion and is committed. None = no time box.
+
+            `limit` cannot serve this purpose: per-attachment cost spans three
+            orders of magnitude, from ~0.1 s for a text part to minutes for OCR
+            (the most common extraction_method here) or a 30 MB workbook. A
+            caller under an external timeout — sb-outlook-sync has
+            TimeoutStartSec=10min — needs to bound TIME, not count, or it gets
+            SIGTERMed mid-file. Same contract as run_backfill(deadline_s=...).
 
     Returns:
-        Dict with processing stats: processed, extracted, failed, skipped.
+        Dict with processing stats: processed, extracted, failed, skipped, deferred.
     """
     db_path = db_path or str(DEFAULT_DB)
     conn = sqlite3.connect(db_path, timeout=30)
@@ -122,9 +133,17 @@ def run_phase1(
     # Find attachments not yet in attachment_content
     rows = conn.execute(query, params).fetchall()
 
-    stats = {"processed": 0, "extracted": 0, "failed": 0, "skipped": 0}
+    stats = {"processed": 0, "extracted": 0, "failed": 0, "skipped": 0, "deferred": 0}
+    deadline = None if deadline_s is None else time.monotonic() + deadline_s
 
     for att_id, file_path, mime_type, _filename in rows:
+        # Checked before starting, never mid-file: extract_text_from_file has no
+        # interruption point, and abandoning a partial parse would leave the row
+        # unwritten and the work repeated next run.
+        if deadline is not None and time.monotonic() >= deadline:
+            stats["deferred"] += 1
+            continue
+
         result = extract_text_from_file(file_path, mime_type or "")
 
         conn.execute(

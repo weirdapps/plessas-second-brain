@@ -28,7 +28,7 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_EXTRACT_MODEL") or os.environ.get(
 GEMINI_MODEL = os.environ.get("BRAIN_GEMINI_MODEL", "gemini-2.5-flash")
 
 # Schema version — bump when adding migrations (must match number of migrations in schema.py)
-CURRENT_SCHEMA_VERSION = 17
+CURRENT_SCHEMA_VERSION = 18
 
 ATTACHMENTS_DIR = DATA_ROOT / "attachments"
 RAW_BATCH_DIR = DATA_ROOT / "raw"

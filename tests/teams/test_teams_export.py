@@ -450,3 +450,115 @@ def test_pull_messages_still_uses_team_channel_for_channel(db, fixture_loader):
     assert "--team" in captured_args[0]
     assert "--channel" in captured_args[0]
     assert "--chat" not in captured_args[0]
+
+
+# --- Systemic failure must not look like 1,167 permanent ones ----------------
+# _is_permanent_error treats "Graph 403" as a property of the CHAT, so a
+# Graph-wide auth lapse — which 403s every chat in the run — flipped
+# ingest_disabled on 1,179 of 1,219 chats in one sweep on prod. Nothing ever
+# clears the flag (recovery is a documented manual UPDATE), so Teams ingestion
+# silently shrank to the 40 survivors and reported "0 messages inserted across
+# 40 chats; 0 errors" every 30 minutes for 33 hours while real messages arrived.
+
+
+def _seed_chats(db, n, kind="group", disabled=0):
+    for i in range(n):
+        db.execute(
+            "INSERT INTO teams_chats (teams_chat_id, chat_kind, topic, ingest_disabled, "
+            "first_seen_at) VALUES (?, ?, ?, ?, ?)",
+            (
+                f"19:chat-{kind}-{i}@thread.v2",
+                kind,
+                f"chat {i}",
+                disabled,
+                "2026-08-01T00:00:00",
+            ),
+        )
+    db.commit()
+
+
+def _disabled_count(db):
+    return db.execute("SELECT COUNT(*) FROM teams_chats WHERE ingest_disabled = 1").fetchone()[0]
+
+
+def test_a_403_affecting_every_chat_disables_none_of_them(db):
+    """The signature of an auth problem, not of per-chat permissions."""
+    _seed_chats(db, 8)
+
+    with patch("src.export.teams_export.run_teams_cli") as mock:
+        mock.side_effect = RuntimeError("Graph 403 Forbidden")
+        pull_messages(db, concurrency=1)
+
+    assert _disabled_count(db) == 0
+
+
+def test_an_isolated_403_still_disables_that_one_chat(db):
+    """A genuinely unreadable chat must still be dropped, or every run keeps
+    hammering it — which is what the flag was introduced for."""
+    _seed_chats(db, 8)
+    bad = "19:chat-group-3@thread.v2"
+
+    def side_effect(args, **kw):
+        if args[-1] == bad:
+            raise RuntimeError("Graph 403 Forbidden")
+        return {"messages": []}
+
+    with patch("src.export.teams_export.run_teams_cli") as mock:
+        mock.side_effect = side_effect
+        pull_messages(db, concurrency=1)
+
+    rows = db.execute("SELECT teams_chat_id FROM teams_chats WHERE ingest_disabled = 1").fetchall()
+    assert [r["teams_chat_id"] for r in rows] == [bad]
+
+
+# --- Bounded, and covering every chat over time ------------------------------
+# Re-enabling the 1,167 makes the working set 1,207 chats at a measured
+# 0.45 s each — about 9 minutes against sb-teams-sync's TimeoutStartSec=600,
+# before Steps 3-6 run at all. So the pull needs a deadline; and with a deadline
+# it needs an order that rotates, or the same head is re-pulled forever and the
+# tail is never read.
+
+
+def test_pull_stops_starting_work_once_the_deadline_passes(db):
+    _seed_chats(db, 5)
+
+    with patch("src.export.teams_export.run_teams_cli") as mock:
+        mock.return_value = {"messages": []}
+        result = pull_messages(db, concurrency=1, deadline_s=0)
+
+    assert mock.call_count == 0
+    assert result["deferred"] == 5
+
+
+def test_pull_takes_the_least_recently_pulled_chats_first(db):
+    """Round-robin, so a deadline truncates the tail rather than starving it."""
+    _seed_chats(db, 4)
+    db.execute(
+        "UPDATE teams_chats SET last_pulled_at = ? WHERE teams_chat_id = ?",
+        ("2026-08-18T10:00:00", "19:chat-group-0@thread.v2"),
+    )
+    db.execute(
+        "UPDATE teams_chats SET last_pulled_at = ? WHERE teams_chat_id = ?",
+        ("2026-08-18T09:00:00", "19:chat-group-1@thread.v2"),
+    )
+    db.commit()
+
+    with patch("src.export.teams_export.run_teams_cli") as mock:
+        mock.return_value = {"messages": []}
+        pull_messages(db, concurrency=1)
+
+    pulled_order = [c.args[0][-1] for c in mock.call_args_list]
+    # Never-pulled first, then oldest stamp.
+    assert pulled_order[:2] == ["19:chat-group-2@thread.v2", "19:chat-group-3@thread.v2"]
+    assert pulled_order[2:] == ["19:chat-group-1@thread.v2", "19:chat-group-0@thread.v2"]
+
+
+def test_a_successful_pull_stamps_the_chat(db):
+    """Without the stamp the rotation cannot advance."""
+    _seed_chats(db, 1)
+
+    with patch("src.export.teams_export.run_teams_cli") as mock:
+        mock.return_value = {"messages": []}
+        pull_messages(db, concurrency=1)
+
+    assert db.execute("SELECT last_pulled_at FROM teams_chats").fetchone()[0] is not None

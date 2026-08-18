@@ -117,6 +117,11 @@ STALE_THRESHOLDS = {
 # added after this was written, counts as work the vision stage still owes.
 VISION_SKIPPED_CLASSES = ("signature", "noise")
 
+# Share of Teams chats sitting at ingest_disabled=1 that means ingestion has
+# quietly shrunk rather than skipped a few genuinely unreadable rooms. Prod hit
+# 97% (1,179 of 1,219) from a single Graph-wide 403 and stayed green for 33h.
+TEAMS_DISABLED_WARN_SHARE = 0.25
+
 # Inline-image queue depth that means the pipeline is no longer keeping up.
 # Step 8 of the sync is time-boxed (BRAIN_IMAGE_CLASSIFY_BUDGET_S, default 8min)
 # and drains ~50 images per run across two full syncs a day. A heavy news day can
@@ -269,6 +274,13 @@ def check_teams(db):
     total = db.execute("SELECT COUNT(*) FROM teams_messages").fetchone()[0]
     latest = db.execute("SELECT MAX(composed_at) FROM teams_messages").fetchone()[0]
     chats = db.execute("SELECT COUNT(*) FROM teams_chats").fetchone()[0]
+    # `ingest_disabled` is one-way — set on a permanent-looking error, cleared
+    # only by hand. A Graph-wide 403 therefore dropped 1,179 of 1,219 chats in a
+    # single sweep, and message recency alone stayed green on what the 40
+    # survivors still produced. Coverage has to be its own signal.
+    disabled = db.execute("SELECT COUNT(*) FROM teams_chats WHERE ingest_disabled = 1").fetchone()[
+        0
+    ]
     threads = db.execute("SELECT COUNT(*) FROM teams_threads").fetchone()[0]
     recent_24h = db.execute(
         "SELECT COUNT(*) FROM teams_messages WHERE composed_at > datetime('now', '-1 day')"
@@ -277,16 +289,27 @@ def check_teams(db):
     age = _age(latest)
 
     stale = age and age > STALE_THRESHOLDS["teams"]
+    # A handful of archived teams and guest-only channels are legitimately
+    # unreadable, so only a large share means ingestion has quietly shrunk.
+    coverage_lost = chats > 0 and disabled > chats * TEAMS_DISABLED_WARN_SHARE
+    if stale:
+        status = "STALE"
+    elif coverage_lost:
+        status = "WARN"
+    else:
+        status = "OK"
     return {
         "name": "Teams",
         "total": total,
         "chats": chats,
+        "chats_disabled": disabled,
         "threads": threads,
         "latest": latest,
         "recent_24h": recent_24h,
         "age": age,
         "stale": stale,
-        "status": "STALE" if stale else "OK",
+        "coverage_lost": coverage_lost,
+        "status": status,
     }
 
 
@@ -952,6 +975,11 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
             extra = f" ({c.get('recent_24h', 0)} today)"
         elif c["name"] == "Teams":
             extra = f" ({c.get('recent_24h', 0)} today)"
+            if c.get("coverage_lost"):
+                extra += (
+                    f" — {c['chats_disabled']:,} of {c.get('chats', 0):,} chats dropped"
+                    " from ingestion"
+                )
         elif c["name"] == "SharePoint":
             count = f"{c.get('ok', 0)}/{c.get('total', 0)}"
             failed = c.get("failed", 0)

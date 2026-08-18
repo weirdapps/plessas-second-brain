@@ -432,6 +432,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_sharepoint_attempts(conn)
     if current < 17:
         migrate_add_calendar_llm_status(conn)
+    if current < 18:
+        migrate_add_teams_last_pulled_at(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -537,6 +539,28 @@ def migrate_add_calendar_llm_status(conn: sqlite3.Connection) -> None:
         conn.rollback()
         raise
     conn.commit()
+
+
+def migrate_add_teams_last_pulled_at(conn: sqlite3.Connection) -> None:
+    """v18 — rotate the Teams pull instead of always reading the same head.
+
+    pull_messages had no ORDER BY and no time bound, which was survivable only
+    because a mass ingest_disabled sweep had shrunk the working set to 40 chats.
+    With all 1,207 restored, a full pass is ~9 minutes at a measured 0.45 s per
+    chat, against sb-teams-sync's TimeoutStartSec=600. Bounding the run without
+    ordering it would re-read the same head forever and never reach the tail;
+    ordering by this column oldest-first makes the deadline truncate a rotation
+    rather than starve one. Nullable: never-pulled chats sort first.
+    """
+    has_table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='teams_chats'"
+    ).fetchone()
+    if not has_table:
+        return
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(teams_chats)").fetchall()}
+    if "last_pulled_at" not in cols:
+        conn.execute("ALTER TABLE teams_chats ADD COLUMN last_pulled_at TEXT")
+        conn.commit()
 
 
 def migrate_add_visioned_at(conn: sqlite3.Connection) -> None:

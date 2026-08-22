@@ -338,6 +338,18 @@ def check_teams(db):
         last_pull, pull_supported = None, False
     pull_age = _age(last_pull)
 
+    # When the corpus shrank (v19). The count says 1,179 chats are gone; the
+    # date says whether they went in one instant — a Graph-wide outage — or a
+    # few at a time as rooms were archived. Diagnosing the August sweep needed a
+    # DB dig precisely because nothing recorded this. NULL on pre-v19 rows, and
+    # on any DB predating the column: never let a missing one kill the report.
+    try:
+        disabled_at = db.execute(
+            "SELECT MAX(ingest_disabled_at) FROM teams_chats WHERE ingest_disabled = 1"
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        disabled_at = None
+
     if not pull_supported:
         # Pre-v18 schema has no heartbeat; message recency is all there is.
         stale = bool(age and age > STALE_THRESHOLDS["teams"])
@@ -367,6 +379,7 @@ def check_teams(db):
         "age": age,
         "last_pull": last_pull,
         "pull_age": pull_age,
+        "disabled_at": disabled_at,
         "stale": stale,
         "coverage_lost": coverage_lost,
         "status": status,
@@ -1123,6 +1136,9 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
                     f" — {c['chats_disabled']:,} of {c.get('chats', 0):,} chats dropped"
                     " from ingestion"
                 )
+                # The date is what separates one bad sweep from slow attrition.
+                if c.get("disabled_at"):
+                    extra += f" (latest {str(c['disabled_at'])[:19]})"
         elif c["name"] == "SharePoint":
             count = f"{c.get('ok', 0)}/{c.get('total', 0)}"
             failed = c.get("failed", 0)

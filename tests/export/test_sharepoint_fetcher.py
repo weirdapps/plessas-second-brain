@@ -153,13 +153,21 @@ def test_record_link_in_db_tracks_attempts(tmp_path):
     )
 
 
-def _insert_exhausted_link(conn, last_attempt_at):
+def _insert_exhausted_link(conn, last_attempt_at, last_status="auth-required"):
+    """A link that has spent its whole attempt budget without ever fetching OK.
+
+    The status matters now. The MCAS bearer outage these tests describe failed
+    on auth, not on 404, so 'auth-required' is what that scenario actually
+    wrote — the previous hardcoded 'stale' was incidental. A never-fetched
+    'stale' means the document 404s and is gone, and is deliberately NOT
+    resurrected by the cool-off.
+    """
     from src.export.sharepoint_fetcher import MAX_SHAREPOINT_ATTEMPTS
 
     conn.execute(
         "INSERT INTO sharepoint_links (url, message_id, fetched_at, last_status, last_attempt_at, attempts) "
-        "VALUES ('https://dead', 'm', NULL, 'stale', ?, ?)",
-        (last_attempt_at, MAX_SHAREPOINT_ATTEMPTS),
+        "VALUES ('https://dead', 'm', NULL, ?, ?, ?)",
+        (last_status, last_attempt_at, MAX_SHAREPOINT_ATTEMPTS),
     )
     conn.commit()
     conn.close()
@@ -358,3 +366,22 @@ def test_process_sharepoint_retries_known_unfetched_link(mock_fetch, tmp_path):
     conn.close()
     assert row[0] == "ok"  # retried and succeeded
     assert row[1] is not None  # fetched_at now populated
+
+
+def test_process_sharepoint_never_resurrects_an_exhausted_404(tmp_path):
+    """End-to-end on the 23 links prod actually carries: every attempt returned
+    404, so the document is gone. The cool-off exists to rescue links an OUTAGE
+    abandoned, not to re-request a deleted file every seven days forever."""
+    import argparse
+    from datetime import UTC, datetime, timedelta
+
+    from src.cli import cmd_process_sharepoint
+    from src.export.sharepoint_fetcher import SHAREPOINT_RETRY_COOL_OFF_DAYS
+
+    long_ago = (datetime.now(UTC) - timedelta(days=SHAREPOINT_RETRY_COOL_OFF_DAYS + 1)).isoformat()
+    _insert_exhausted_link(_setup_db(tmp_path), long_ago, last_status="stale")
+
+    with patch("src.export.sharepoint_fetcher.fetch_sharepoint_link") as mock_fetch:
+        args = argparse.Namespace(db=str(tmp_path / "test.db"), since=None, limit=0, dry_run=False)
+        cmd_process_sharepoint(args)
+        assert not mock_fetch.called

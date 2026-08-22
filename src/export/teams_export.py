@@ -360,8 +360,16 @@ def pull_messages(
             file=_sys.stderr,
         )
     else:
+        # Stamp the moment, not just the flag. Without a date, a sweep that took
+        # 1,179 of 1,219 chats in one pass looks exactly like archived rooms
+        # accumulating a few at a time over months — and the clustering is the
+        # only thing that tells those two apart after the fact.
+        disabled_at = datetime.now(UTC).isoformat()
         for chat_id in permanent_candidates:
-            conn.execute("UPDATE teams_chats SET ingest_disabled = 1 WHERE id = ?", (chat_id,))
+            conn.execute(
+                "UPDATE teams_chats SET ingest_disabled = 1, ingest_disabled_at = ? WHERE id = ?",
+                (disabled_at, chat_id),
+            )
 
     conn.commit()
     return {

@@ -1271,6 +1271,7 @@ def _teams_db(
     seed_message=True,
     message_age_days=0,
     pulled_minutes_ago=5,
+    disabled_at=None,
 ):
     """Teams tables as prod shapes them.
 
@@ -1287,7 +1288,7 @@ def _teams_db(
     db.execute("CREATE TABLE teams_threads (id INTEGER PRIMARY KEY)")
     db.execute(
         "CREATE TABLE teams_chats (id INTEGER PRIMARY KEY, ingest_disabled INT DEFAULT 0, "
-        "last_pulled_at TEXT)"
+        "last_pulled_at TEXT, ingest_disabled_at TEXT)"
     )
     for _ in range(enabled):
         db.execute(
@@ -1296,7 +1297,11 @@ def _teams_db(
             (f"-{pulled_minutes_ago} minutes",),
         )
     for _ in range(disabled):
-        db.execute("INSERT INTO teams_chats (ingest_disabled, last_pulled_at) VALUES (1, NULL)")
+        db.execute(
+            "INSERT INTO teams_chats (ingest_disabled, last_pulled_at, ingest_disabled_at) "
+            "VALUES (1, NULL, ?)",
+            (disabled_at,),
+        )
     if seed_message:
         db.execute(
             "INSERT INTO teams_messages (composed_at, chat_id) VALUES "
@@ -1783,3 +1788,44 @@ def test_report_ignores_missing_logs_when_jobs_run_elsewhere(hc):
     _, issues = hc.build_report([], jobs, logs, {}, [])
 
     assert not any("news_sync" in str(i) for i in issues)
+
+
+# --- Dating the disable (schema v19) -----------------------------------------
+# The count alone says 1,179 chats are gone. The timestamp says they went in a
+# single instant, which is the difference between a Graph-wide outage and rooms
+# being archived one at a time. Diagnosing the August sweep took a DB dig
+# precisely because nothing recorded when it happened.
+
+
+def test_check_teams_reports_when_the_corpus_was_disabled(hc):
+    db = _teams_db(enabled=40, disabled=1179, disabled_at="2026-08-18T14:00:00Z")
+
+    r = hc.check_teams(db)
+
+    assert r["disabled_at"] == "2026-08-18T14:00:00Z"
+
+
+def test_check_teams_survives_a_db_without_the_disable_date(hc):
+    """Pre-v19 DBs lack the column; raising would kill the whole nightly run."""
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE teams_messages (id INTEGER PRIMARY KEY, composed_at TEXT)")
+    db.execute("CREATE TABLE teams_threads (id INTEGER PRIMARY KEY)")
+    db.execute(
+        "CREATE TABLE teams_chats (id INTEGER PRIMARY KEY, ingest_disabled INT DEFAULT 0, "
+        "last_pulled_at TEXT)"
+    )
+    db.execute("INSERT INTO teams_chats (ingest_disabled, last_pulled_at) VALUES (0, NULL)")
+    db.commit()
+
+    assert hc.check_teams(db)["disabled_at"] is None
+
+
+def test_report_dates_a_mass_disable(hc):
+    """End-to-end on the artefact actually read at 23:50."""
+    db = _teams_db(enabled=40, disabled=1179, disabled_at="2026-08-18T14:00:00Z")
+
+    text, _ = hc.build_report([hc.check_teams(db)], {}, {}, {}, [])
+
+    assert "2026-08-18" in text, "the report must say WHEN the corpus shrank"

@@ -96,3 +96,49 @@ def test_teams_messages_fts_trigger_keeps_index_in_sync(fresh_db):
     ).fetchall()
     assert len(rows) == 1
     conn.close()
+
+
+# --- v19: when a chat was dropped from ingestion -----------------------------
+# A single Graph-wide 403 flipped ingest_disabled=1 on 1,179 of 1,219 chats in
+# one sweep. The flag is one-way and there was no column recording WHEN it was
+# set, so the event could not be dated, its blast radius could not be bounded,
+# and a recurrence would be equally opaque. A mass disable clusters at one
+# instant; individually unreadable rooms do not.
+
+
+def test_migration_adds_ingest_disabled_at(fresh_db):
+    from src.store.schema import migrate_add_teams_ingest_disabled_at
+
+    conn = _open(fresh_db)
+    run_migrations(conn)
+    migrate_add_teams(conn)
+    migrate_add_teams_ingest_disabled_at(conn)
+
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(teams_chats)")}
+    assert "ingest_disabled_at" in cols
+
+
+def test_ingest_disabled_at_migration_is_idempotent(fresh_db):
+    """Migrations re-run on every CLI invocation; a second ALTER would raise
+    'duplicate column name' and take the whole command down with it."""
+    from src.store.schema import migrate_add_teams_ingest_disabled_at
+
+    conn = _open(fresh_db)
+    run_migrations(conn)
+    migrate_add_teams(conn)
+    migrate_add_teams_ingest_disabled_at(conn)
+    migrate_add_teams_ingest_disabled_at(conn)
+
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(teams_chats)")}
+    assert "ingest_disabled_at" in cols
+
+
+def test_ingest_disabled_at_migration_without_teams_tables_is_a_noop(fresh_db):
+    """A DB that predates Teams has no table to alter; raising here would break
+    every migration run on it."""
+    from src.store.schema import migrate_add_teams_ingest_disabled_at
+
+    conn = _open(fresh_db)
+    conn.execute("DROP TABLE IF EXISTS teams_chats")
+
+    migrate_add_teams_ingest_disabled_at(conn)  # must not raise

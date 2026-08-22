@@ -562,3 +562,40 @@ def test_a_successful_pull_stamps_the_chat(db):
         pull_messages(db, concurrency=1)
 
     assert db.execute("SELECT last_pulled_at FROM teams_chats").fetchone()[0] is not None
+
+
+# --- Dating a disable, not just recording one --------------------------------
+# ingest_disabled is one-way and carried no timestamp, so a sweep that took
+# 1,179 of 1,219 chats in one instant was indistinguishable, after the fact,
+# from archived rooms accumulating over months. The clustering is the evidence.
+
+
+def test_pull_messages_records_when_a_chat_was_disabled(db, fixture_loader):
+    chat_id = _seed_channel(db, fixture_loader)
+
+    with patch("src.export.teams_export.run_teams_cli") as mock:
+        mock.side_effect = Exception(
+            'teams-cli exit 5: {"message":"Team abc has no channel named \\"General\\""}'
+        )
+        pull_messages(db, concurrency=1)
+
+    row = db.execute(
+        "SELECT ingest_disabled, ingest_disabled_at FROM teams_chats WHERE id = ?", (chat_id,)
+    ).fetchone()
+    assert row["ingest_disabled"] == 1
+    assert row["ingest_disabled_at"] is not None, "a disable with no date cannot be diagnosed"
+
+
+def test_pull_messages_leaves_the_disable_date_unset_on_a_transient_error(db, fixture_loader):
+    """A throttle is not a disable, so it must not stamp one."""
+    chat_id = _seed_channel(db, fixture_loader)
+
+    with patch("src.export.teams_export.run_teams_cli") as mock:
+        mock.side_effect = Exception("HTTP_429 throttled, retry after 30s")
+        pull_messages(db, concurrency=1)
+
+    row = db.execute(
+        "SELECT ingest_disabled, ingest_disabled_at FROM teams_chats WHERE id = ?", (chat_id,)
+    ).fetchone()
+    assert row["ingest_disabled"] == 0
+    assert row["ingest_disabled_at"] is None

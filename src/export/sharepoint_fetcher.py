@@ -72,6 +72,16 @@ def retry_candidates(conn, now: str | None = None) -> list:
     Returns (url, message_id) rows. `attempts` throttles: past the cap a link is
     rested rather than dropped, and offered again once the cool-off expires.
     'unsupported-host' is a permanent external tenant and stays excluded.
+
+    One class of link is never resurrected: a 404 that has spent its whole
+    attempt budget without ever fetching OK. sharepoint-cli maps not_found onto
+    'stale' (_ERROR_STATUS), and a link that has NEVER succeeded cannot be
+    "stale" in the re-fetch sense, so never-fetched + capped + 'stale' is a
+    document that no longer exists. Prod carries 23 of them; without this they
+    re-enter the pool every cool-off, burn an attempt, 404 again and reset the
+    clock, forever. The gate is deliberately narrow — a 404 still gets its full
+    five attempts first (moved or briefly unshared files come back), and a link
+    that once fetched OK keeps re-fetching however often it has failed since.
     """
     from datetime import UTC, datetime, timedelta
 
@@ -83,7 +93,9 @@ def retry_candidates(conn, now: str | None = None) -> list:
         "SELECT url, message_id FROM sharepoint_links "
         "WHERE (fetched_at IS NULL OR last_status = 'stale') "
         "AND COALESCE(last_status, '') != 'unsupported-host' "
-        "AND (attempts < ? OR COALESCE(last_attempt_at, '') < ?)",
+        "AND (attempts < ? OR (COALESCE(last_attempt_at, '') < ? "
+        "                      AND NOT (fetched_at IS NULL "
+        "                               AND COALESCE(last_status, '') = 'stale')))",
         (MAX_SHAREPOINT_ATTEMPTS, cutoff),
     ).fetchall()
 

@@ -144,3 +144,63 @@ def test_an_unsupported_host_stays_excluded():
     )
 
     assert _selected(db) == []
+
+
+# --- A deleted document is not a transient failure ---------------------------
+# The cool-off exists so an AUTH outage cannot permanently abandon a link: 43
+# links burned their attempts against a fetcher that could not have succeeded.
+# But it resurrects every capped link indiscriminately, including the 23 whose
+# every attempt returned HTTP 404. Those re-enter the pool every 7 days, burn an
+# attempt, 404 again, and reset the clock — forever, for a document that no
+# longer exists. sharepoint-cli maps not_found -> 'stale' (_ERROR_STATUS), and a
+# link that has NEVER fetched OK cannot be "stale" in the re-fetch sense, so
+# never-fetched + capped + 'stale' is a gone document, not an outage victim.
+
+
+def test_a_404_link_at_the_cap_is_not_resurrected_by_the_cool_off():
+    """The 23 on prod: attempts exhausted, every one a 404, never fetched."""
+    db = _sp_db()
+    _link(
+        db, "https://x/gone", status="stale", attempts=6, last_attempt="2026-08-10T00:00:00+00:00"
+    )
+
+    assert _selected(db) == []
+
+
+def test_a_404_link_under_the_cap_is_still_retried():
+    """A 404 can mean moved or briefly unshared, so it gets its full budget of
+    attempts first — only an EXHAUSTED one is treated as gone."""
+    db = _sp_db()
+    _link(
+        db, "https://x/maybe", status="stale", attempts=2, last_attempt="2026-08-10T00:00:00+00:00"
+    )
+
+    assert _selected(db) == ["https://x/maybe"]
+
+
+def test_an_auth_outage_link_is_still_resurrected_by_the_cool_off():
+    """Regression guard: the reason the cool-off was added must survive intact."""
+    db = _sp_db()
+    _link(
+        db,
+        "https://x/authgone",
+        status="auth-required",
+        attempts=8,
+        last_attempt="2026-08-10T00:00:00+00:00",
+    )
+
+    assert _selected(db) == ["https://x/authgone"]
+
+
+def test_a_previously_fetched_link_that_went_stale_is_still_retried():
+    """The genuine 'upstream changed, re-fetch it' case. It has a fetched_at, so
+    the retirement rule must not touch it however many attempts it has spent."""
+    db = _sp_db()
+    db.execute(
+        "INSERT INTO sharepoint_links (url, message_id, fetched_at, last_status,"
+        " last_attempt_at, attempts) VALUES ('https://x/changed', 'm1',"
+        " '2026-07-01T00:00:00+00:00', 'stale', '2026-08-10T00:00:00+00:00', 8)"
+    )
+    db.commit()
+
+    assert _selected(db) == ["https://x/changed"]

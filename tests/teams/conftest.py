@@ -9,6 +9,7 @@ import pytest
 from src.store.schema import (
     create_database,
     migrate_add_teams,
+    migrate_add_teams_ingest_disabled_at,
     migrate_add_teams_last_pulled_at,
     run_migrations,
 )
@@ -32,6 +33,8 @@ def db(tmp_path):
     # v18 adds teams_chats.last_pulled_at. Applied here for the same reason as
     # migrate_add_teams: run_migrations above is a no-op on a freshly stamped DB.
     migrate_add_teams_last_pulled_at(conn)
+    # v19 adds teams_chats.ingest_disabled_at, same reason again.
+    migrate_add_teams_ingest_disabled_at(conn)
     yield conn
     conn.close()
 

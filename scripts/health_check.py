@@ -173,6 +173,14 @@ SYSTEMD_UNITS = {
     "sb-auth-watch.service": "Auth watcher",
     "sb-curate-docs.service": "Document curation",
     "sb-reverse-ingest.service": "Reverse ingest",
+    # Registered late. The VPS runs twelve sb-* units but only the nine above
+    # were listed, so these three had neither a job status nor a log-age signal
+    # — the same hand-listed-subset gap that hid http-error from the SharePoint
+    # tally. This dict is the source both check_jobs and check_sync_logs read,
+    # so anything absent from it is a job nobody is watching.
+    "sb-news-sync.service": "News sync",
+    "sb-conversation-sync.service": "Conversation sync",
+    "sb-health-check.service": "Health check",
 }
 
 IS_MACOS = sys.platform == "darwin"
@@ -1184,10 +1192,40 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
     # and the systemd path only runs on the VPS. Nine "MIGRATED" lines otherwise
     # read as nine healthy jobs, when a crashed, failed or masked VPS unit looks
     # exactly the same from here. Say so rather than implying coverage.
-    if jobs and all(info.get("status") == "MIGRATED" for info in jobs.values()):
+    jobs_elsewhere = bool(jobs) and all(info.get("status") == "MIGRATED" for info in jobs.values())
+    if jobs_elsewhere:
         lines.append("")
         lines.append("  NOTE: job health is not verifiable from this host — these jobs run on")
         lines.append("        the VPS and are asserted by the health check that runs there.")
+
+    # Job logs. This result used to be computed and dropped: build_report took
+    # `logs` and never read it, so a job holding a healthy systemd unit while
+    # writing nothing to its log raised no signal anywhere. Skipped entirely
+    # when the jobs run elsewhere — this host's log dir is then a
+    # pre-migration relic describing a machine that stopped running them.
+    # An ABSENT log carries no "stale" flag, so it used to be silence rather
+    # than a signal — the same shape as every other blind spot in this file.
+    # All twelve resolve on the VPS today, so a missing one is a real fault.
+    bad_logs = (
+        sorted(
+            (name, info)
+            for name, info in logs.items()
+            if info.get("stale") or info.get("status") == "MISSING"
+        )
+        if logs and not jobs_elsewhere
+        else []
+    )
+    if bad_logs:
+        lines.append("")
+        lines.append("JOB LOGS")
+        lines.append("-" * 55)
+        for name, info in bad_logs:
+            if info.get("status") == "MISSING":
+                lines.append(f"  {name:<28} MISSING ({info.get('path')})")
+                issues.append(f"Log {name}: missing")
+            else:
+                lines.append(f"  {name:<28} {format_age(info.get('age'))} since last write")
+                issues.append(f"Log {name}: stale")
 
     # Fix actions
     if fix_actions:

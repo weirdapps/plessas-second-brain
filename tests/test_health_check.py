@@ -58,7 +58,13 @@ def test_check_jobs_covers_all_logical_jobs_without_filenotfound(hc, monkeypatch
     descs = {info["desc"] for info in jobs.values()}
     assert "Hourly Outlook sync" in descs
     assert "Daily full sync" in descs
-    assert len(jobs) == 9
+    # Derived, not hardcoded: the two registries legitimately differ in size.
+    # The VPS gained news-sync, conversation-sync and the health check itself,
+    # while the Mac's launchd side stayed at the nine jobs that were migrated
+    # away — a literal here would fail on whichever platform it was not written
+    # for, and CI runs the systemd one.
+    expected = hc.LAUNCHD_JOBS if hc.IS_MACOS else hc.SYSTEMD_UNITS
+    assert len(jobs) == len(expected)
     for label, info in jobs.items():
         assert "No such file or directory" not in str(info.get("status", "")), (
             f"{label} hit a bare-binary FileNotFoundError"
@@ -1690,3 +1696,90 @@ def test_report_does_not_cry_unverifiable_when_jobs_are_real(hc):
     text, _ = hc.build_report([], jobs, {}, {}, [])
 
     assert "not verifiable from this host" not in text
+
+
+def test_job_registry_covers_every_unit_that_actually_runs(hc):
+    """SYSTEMD_UNITS is now the source both check_jobs and check_sync_logs read,
+    so a unit missing from it is a job nobody watches. The VPS runs twelve;
+    three — news-sync, conversation-sync and the health check itself — were
+    never registered, so they had neither a job status nor a log-age signal."""
+    for unit in (
+        "sb-news-sync.service",
+        "sb-conversation-sync.service",
+        "sb-health-check.service",
+    ):
+        assert unit in hc.SYSTEMD_UNITS, f"{unit} runs on the VPS but nothing watches it"
+
+
+def test_check_sync_logs_covers_the_late_registered_jobs(hc, tmp_path):
+    r = hc.check_sync_logs(log_dir=tmp_path)
+
+    for expected in ("news_sync", "conversation_sync"):
+        assert expected in r, f"{expected} log is unwatched"
+
+
+# --- The log check computed into the void ------------------------------------
+# build_report took `logs` as a parameter and never read it, so every log-age
+# signal check_sync_logs produced was discarded. A job that keeps its systemd
+# unit healthy while writing nothing to its log raised nothing anywhere.
+
+
+def _log_state(stale, name="outlook_sync"):
+    from datetime import timedelta
+
+    return {
+        name: {
+            "path": f"/x/{name}.log",
+            "last_modified": "2026-08-01T00:00:00",
+            "age": timedelta(hours=9),
+            "stale": stale,
+        }
+    }
+
+
+def test_report_surfaces_a_stale_job_log(hc):
+    jobs = {"a": {"desc": "Hourly Outlook sync", "status": "OK"}}
+
+    _, issues = hc.build_report([], jobs, _log_state(stale=True), {}, [])
+
+    assert any("outlook_sync" in str(i) for i in issues), "a stale log must reach the issue list"
+
+
+def test_report_stays_quiet_on_a_fresh_job_log(hc):
+    jobs = {"a": {"desc": "Hourly Outlook sync", "status": "OK"}}
+
+    _, issues = hc.build_report([], jobs, _log_state(stale=False), {}, [])
+
+    assert not any("outlook_sync" in str(i) for i in issues)
+
+
+def test_report_ignores_relic_logs_when_every_job_is_migrated(hc):
+    """This host's log dir is a pre-migration relic once the jobs moved — its
+    mtimes describe a machine that stopped running them months ago, so ageing
+    them would add a dozen permanent false issues to every Mac-side run."""
+    jobs = {f"j{i}": {"desc": f"Job {i}", "status": "MIGRATED"} for i in range(9)}
+
+    _, issues = hc.build_report([], jobs, _log_state(stale=True), {}, [])
+
+    assert not any("outlook_sync" in str(i) for i in issues)
+
+
+def test_report_surfaces_a_missing_job_log(hc):
+    """An absent log never got a 'stale' flag at all, so it produced silence
+    rather than a signal — the same shape as every other blind spot here. All
+    twelve logs resolve on the VPS today, so an absent one is a real fault."""
+    jobs = {"a": {"desc": "News sync", "status": "OK"}}
+    logs = {"news_sync": {"path": "/x/news-sync.log", "status": "MISSING"}}
+
+    _, issues = hc.build_report([], jobs, logs, {}, [])
+
+    assert any("news_sync" in str(i) for i in issues)
+
+
+def test_report_ignores_missing_logs_when_jobs_run_elsewhere(hc):
+    jobs = {f"j{i}": {"desc": f"Job {i}", "status": "MIGRATED"} for i in range(9)}
+    logs = {"news_sync": {"path": "/x/news-sync.log", "status": "MISSING"}}
+
+    _, issues = hc.build_report([], jobs, logs, {}, [])
+
+    assert not any("news_sync" in str(i) for i in issues)

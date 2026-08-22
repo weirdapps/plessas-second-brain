@@ -145,16 +145,34 @@ def test_sharepoint_token_missing_is_na(hc, tmp_path):
 # added upstream later cannot silently vanish again.
 
 
-def _sp_db(**status_counts):
+def _sp_db(attempted_days_ago=0, attempts=1, **status_counts):
+    """sharepoint_links as prod shapes it.
+
+    `fetched_at` is set only on 'ok' rows — it records a SUCCESSFUL fetch, so a
+    link that has never come back clean keeps it NULL no matter how many times
+    it was tried. `attempts`/`last_attempt_at` drive the retry throttle in
+    src/export/sharepoint_fetcher.py.
+    """
     import sqlite3
 
     db = sqlite3.connect(":memory:")
-    db.execute("CREATE TABLE sharepoint_links (url TEXT, last_status TEXT)")
+    db.execute(
+        "CREATE TABLE sharepoint_links (url TEXT, last_status TEXT, attempts INT, "
+        "last_attempt_at TEXT, fetched_at TEXT)"
+    )
     for status, n in status_counts.items():
+        last_status = status.replace("_", "-")
         for i in range(n):
             db.execute(
-                "INSERT INTO sharepoint_links (url, last_status) VALUES (?,?)",
-                (f"https://x/{status}/{i}", status.replace("_", "-")),
+                "INSERT INTO sharepoint_links (url, last_status, attempts, last_attempt_at, "
+                "fetched_at) VALUES (?,?,?,strftime('%Y-%m-%dT%H:%M:%SZ','now',?),?)",
+                (
+                    f"https://x/{status}/{i}",
+                    last_status,
+                    attempts,
+                    f"-{attempted_days_ago} days",
+                    "2026-01-01T00:00:00Z" if last_status == "ok" else None,
+                ),
             )
     db.commit()
     return db
@@ -1241,7 +1259,19 @@ def test_check_document_roots_survives_unreadable_stamp_bytes(hc, tmp_path):
 # minutes for 33 hours and nothing anywhere said the corpus had shrunk.
 
 
-def _teams_db(enabled, disabled):
+def _teams_db(
+    enabled,
+    disabled,
+    seed_message=True,
+    message_age_days=0,
+    pulled_minutes_ago=5,
+):
+    """Teams tables as prod shapes them.
+
+    `last_pulled_at` is the sync's own heartbeat: it is stamped on every poll
+    whether or not the chat produced a message, and is NULL on disabled chats
+    (prod: 12 NULLs against 12 ingest_disabled rows).
+    """
     import sqlite3
 
     db = sqlite3.connect(":memory:")
@@ -1249,12 +1279,24 @@ def _teams_db(enabled, disabled):
         "CREATE TABLE teams_messages (id INTEGER PRIMARY KEY, composed_at TEXT, chat_id INT)"
     )
     db.execute("CREATE TABLE teams_threads (id INTEGER PRIMARY KEY)")
-    db.execute("CREATE TABLE teams_chats (id INTEGER PRIMARY KEY, ingest_disabled INT DEFAULT 0)")
+    db.execute(
+        "CREATE TABLE teams_chats (id INTEGER PRIMARY KEY, ingest_disabled INT DEFAULT 0, "
+        "last_pulled_at TEXT)"
+    )
     for _ in range(enabled):
-        db.execute("INSERT INTO teams_chats (ingest_disabled) VALUES (0)")
+        db.execute(
+            "INSERT INTO teams_chats (ingest_disabled, last_pulled_at) VALUES "
+            "(0, strftime('%Y-%m-%dT%H:%M:%SZ','now',?))",
+            (f"-{pulled_minutes_ago} minutes",),
+        )
     for _ in range(disabled):
-        db.execute("INSERT INTO teams_chats (ingest_disabled) VALUES (1)")
-    db.execute("INSERT INTO teams_messages (composed_at, chat_id) VALUES (datetime('now'), 1)")
+        db.execute("INSERT INTO teams_chats (ingest_disabled, last_pulled_at) VALUES (1, NULL)")
+    if seed_message:
+        db.execute(
+            "INSERT INTO teams_messages (composed_at, chat_id) VALUES "
+            "(strftime('%Y-%m-%dT%H:%M:%SZ','now',?), 1)",
+            (f"-{message_age_days} days",),
+        )
     db.commit()
     return db
 
@@ -1281,3 +1323,370 @@ def test_check_teams_tolerates_a_few_genuinely_unreadable_chats(hc):
     db = _teams_db(enabled=1200, disabled=19)
 
     assert hc.check_teams(db)["status"] == "OK"
+
+
+# --- Lexical timestamp comparison against datetime('now') --------------------
+# Stored timestamps use the ISO 'T' separator ('2026-08-21T14:01:01.2980000Z');
+# SQLite's datetime('now', ...) renders 'YYYY-MM-DD HH:MM:SS' with a SPACE. A
+# bare `col > datetime('now','-1 day')` compares the two lexically, and at
+# position 11 'T' (0x54) sorts above ' ' (0x20) — so EVERY row sharing the
+# cutoff's date passed regardless of its time. Prod printed "(30 today)" beside
+# a Teams source silent for 28h, and inflated the email count to 108 against 35
+# real arrivals. Wrapping the column in datetime() normalises every stored form
+# (naive, 'Z', '+00:00', and 7 fractional digits) to the cutoff's own shape.
+
+_YESTERDAY_MIDNIGHT = "strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 day','start of day')"
+
+
+def test_check_teams_recent_count_excludes_earlier_same_day_messages(hc):
+    """A message from the cutoff's own date but earlier in the day is >24h old.
+    Counting it is what let a dead source advertise a day of phantom arrivals."""
+    db = _teams_db(enabled=10, disabled=0, seed_message=False)
+    db.execute(
+        f"INSERT INTO teams_messages (composed_at, chat_id) VALUES ({_YESTERDAY_MIDNIGHT}, 1)"
+    )
+    db.commit()
+
+    assert hc.check_teams(db)["recent_24h"] == 0
+
+
+def test_check_teams_recent_count_includes_genuinely_recent_messages(hc):
+    """Positive control: the fix must not simply zero the counter."""
+    db = _teams_db(enabled=10, disabled=0, seed_message=False)
+    db.execute(
+        "INSERT INTO teams_messages (composed_at, chat_id) VALUES "
+        "(strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 hour'), 1)"
+    )
+    db.commit()
+
+    assert hc.check_teams(db)["recent_24h"] == 1
+
+
+def test_check_emails_recent_count_excludes_earlier_same_day_mail(hc):
+    db = _emails_db([(1, None, None)])
+    db.execute(f"UPDATE emails SET date_received = {_YESTERDAY_MIDNIGHT}")
+    db.commit()
+
+    assert hc.check_emails(db)["recent_24h"] == 0
+
+
+def test_check_emails_recent_count_includes_genuinely_recent_mail(hc):
+    db = _emails_db([(1, None, None)])
+    db.execute("UPDATE emails SET date_received = strftime('%Y-%m-%dT%H:%M:%SZ','now','-1 hour')")
+    db.commit()
+
+    assert hc.check_emails(db)["recent_24h"] == 1
+
+
+# --- Teams: assert on the pipeline, not on the conversation ------------------
+# MAX(composed_at) measures whether COLLEAGUES were talking, not whether the
+# sync ran. Greek August and every weekend produce genuinely silent stretches —
+# two Saturdays in Aug 2026 recorded zero messages — so a 24h message-age
+# threshold pages on a healthy system and gets trained away. teams_chats
+# .last_pulled_at is written by the sync itself on every poll, so it separates
+# "nobody spoke" from "we stopped listening".
+
+
+def test_check_teams_ok_when_corpus_is_quiet_but_sync_is_polling(hc):
+    """Three silent days with every chat still polled is a quiet week, not a fault."""
+    db = _teams_db(enabled=1200, disabled=12, message_age_days=3, pulled_minutes_ago=30)
+
+    assert hc.check_teams(db)["status"] == "OK"
+
+
+def test_check_teams_stale_when_the_sync_stops_polling(hc):
+    """The signal that actually means broken: chats are no longer being pulled.
+
+    The message here is FRESH on purpose. Under the old rule a recent
+    composed_at cleared the row, so a sync that had stopped polling entirely
+    still read OK as long as one message had landed before it died.
+    """
+    db = _teams_db(enabled=1200, disabled=12, message_age_days=0, pulled_minutes_ago=60 * 30)
+
+    assert hc.check_teams(db)["status"] == "STALE"
+
+
+def test_check_teams_stale_when_no_chat_was_ever_polled(hc):
+    """Fail closed: chats on the books and not one heartbeat is a dead sync,
+    not an absence of evidence."""
+    db = _teams_db(enabled=5, disabled=0, pulled_minutes_ago=0)
+    db.execute("UPDATE teams_chats SET last_pulled_at = NULL")
+    db.commit()
+
+    assert hc.check_teams(db)["status"] == "STALE"
+
+
+def test_check_teams_falls_back_to_message_age_without_the_heartbeat_column(hc):
+    """A pre-v18 DB has no last_pulled_at. Raising OperationalError there would
+    kill the whole nightly report, so the check degrades to the old signal."""
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE teams_messages (id INTEGER PRIMARY KEY, composed_at TEXT)")
+    db.execute("CREATE TABLE teams_threads (id INTEGER PRIMARY KEY)")
+    db.execute("CREATE TABLE teams_chats (id INTEGER PRIMARY KEY, ingest_disabled INT DEFAULT 0)")
+    db.execute("INSERT INTO teams_chats (ingest_disabled) VALUES (0)")
+    db.execute(
+        "INSERT INTO teams_messages (composed_at) VALUES "
+        "(strftime('%Y-%m-%dT%H:%M:%SZ','now','-4 days'))"
+    )
+    db.commit()
+
+    assert hc.check_teams(db)["status"] == "STALE"
+
+
+def test_check_teams_reports_pull_age_for_the_report(hc):
+    db = _teams_db(enabled=10, disabled=0, pulled_minutes_ago=90)
+
+    assert hc.check_teams(db)["pull_age"] is not None
+
+
+# --- Calendar: hardcoded "OK" ------------------------------------------------
+# check_calendar queried MAX(end_at) — an EVENT END date, routinely months in
+# the future — then returned a literal "OK" without comparing anything. Sync
+# could stop for a year and the row would stay green off events already stored.
+# STALE_THRESHOLDS["calendar"] was defined and never read by anything.
+
+
+def _calendar_db(ingested_days_ago=None):
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE calendar_events (id INTEGER PRIMARY KEY, ingested_at TEXT, end_at TEXT)"
+    )
+    if ingested_days_ago is not None:
+        db.execute(
+            "INSERT INTO calendar_events (ingested_at, end_at) VALUES "
+            "(strftime('%Y-%m-%dT%H:%M:%SZ','now',?), '2099-01-01T00:00:00Z')",
+            (f"-{ingested_days_ago} days",),
+        )
+    db.commit()
+    return db
+
+
+def test_check_calendar_stale_when_ingestion_stops(hc):
+    """A far-future end_at must not keep this green after the sync dies."""
+    db = _calendar_db(ingested_days_ago=9)
+
+    assert hc.check_calendar(db)["status"] == "STALE"
+
+
+def test_check_calendar_fresh_is_ok(hc):
+    db = _calendar_db(ingested_days_ago=0)
+
+    assert hc.check_calendar(db)["status"] == "OK"
+
+
+def test_check_calendar_exposes_age_to_the_report(hc):
+    """The age column read '?' for every source that skipped this key, which is
+    precisely the set of sources that could not go red."""
+    db = _calendar_db(ingested_days_ago=1)
+
+    assert hc.check_calendar(db)["age"] is not None
+
+
+def test_check_calendar_empty_table_is_warn_not_ok(hc):
+    """No rows at all is a broken source, not a healthy quiet one."""
+    db = _calendar_db(ingested_days_ago=None)
+
+    assert hc.check_calendar(db)["status"] != "OK"
+
+
+# --- Embeddings: presence is not liveness ------------------------------------
+# check_embeddings asserted the .npz existed and had ids. A file written months
+# ago satisfies both forever, so a dead embedding stage was indistinguishable
+# from a current one.
+
+
+def _npz(tmp_path, age_days):
+    import os
+    import time
+
+    import numpy as np
+
+    path = tmp_path / "embeddings.npz"
+    np.savez(str(path), ids=np.array([1, 2, 3]))
+    stamp = time.time() - age_days * 86400
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_check_embeddings_stale_when_the_index_stops_rebuilding(hc, tmp_path):
+    db = _emails_db([(1, None, None)])
+
+    r = hc.check_embeddings(db, npz_path=_npz(tmp_path, age_days=30))
+
+    assert r["status"] == "STALE"
+
+
+def test_check_embeddings_fresh_is_ok(hc, tmp_path):
+    db = _emails_db([(1, None, None)])
+
+    r = hc.check_embeddings(db, npz_path=_npz(tmp_path, age_days=0))
+
+    assert r["status"] == "OK"
+
+
+def test_check_embeddings_exposes_age_to_the_report(hc, tmp_path):
+    db = _emails_db([(1, None, None)])
+
+    r = hc.check_embeddings(db, npz_path=_npz(tmp_path, age_days=1))
+
+    assert r["age"] is not None
+
+
+def test_check_embeddings_missing_index_is_warn(hc, tmp_path):
+    db = _emails_db([(1, None, None)])
+
+    r = hc.check_embeddings(db, npz_path=tmp_path / "absent.npz")
+
+    assert r["status"] == "WARN"
+
+
+# --- SharePoint: a frozen ratio cannot move ----------------------------------
+# check_sharepoint judged the share of rows whose last_status != 'ok'. If the
+# fetcher stops, no row changes, so the ratio is pinned and the row reads OK
+# forever. Ageing the *eligible* work is the signal: links past
+# MAX_SHAREPOINT_ATTEMPTS are resting by design (prod's 43 sit at 6-9 attempts
+# inside a 7-day cool-off) and must stay silent, but a link still inside its
+# retry budget that nobody has touched for days means the fetcher is not running.
+
+
+def test_check_sharepoint_stale_when_eligible_links_go_unattempted(hc):
+    db = _sp_db(ok=100, http_error=1, attempted_days_ago=9, attempts=1)
+
+    assert hc.check_sharepoint(db)["status"] == "STALE"
+
+
+def test_check_sharepoint_ok_when_only_capped_links_are_resting(hc):
+    """The real prod tail: attempts exhausted, waiting out the cool-off."""
+    db = _sp_db(ok=991, http_error=20, stale=23, attempted_days_ago=9, attempts=6)
+
+    assert hc.check_sharepoint(db)["status"] == "OK"
+
+
+def test_check_sharepoint_ok_when_eligible_links_were_tried_recently(hc):
+    db = _sp_db(ok=100, http_error=1, attempted_days_ago=0, attempts=1)
+
+    assert hc.check_sharepoint(db)["status"] == "OK"
+
+
+# --- Documents / sentinels / sync logs: hand-listed subsets ------------------
+
+
+def test_check_documents_exposes_age_to_the_report(hc):
+    db = _emails_db([(-1, "2026-08-01T10:00:00Z", None)])
+
+    assert hc.check_documents(db)["age"] is not None
+
+
+def test_check_sentinels_discovers_sentinels_added_later(hc, tmp_path):
+    """Two filenames were hardcoded, so any sentinel a future job writes is
+    invisible. Discovery must be by pattern, not by list."""
+    (tmp_path / "needs_sharepoint_reauth").write_text("")
+
+    r = hc.check_sentinels(state_dir=tmp_path)
+
+    assert any(info.get("present") for info in r.values()), "new sentinel must be seen"
+    assert "needs_sharepoint_reauth" in r
+
+
+def test_check_sentinels_reports_known_sentinels_absent(hc, tmp_path):
+    r = hc.check_sentinels(state_dir=tmp_path)
+
+    assert r["needs_reauth"]["present"] is False
+    assert r["needs_gcloud_reauth"]["present"] is False
+
+
+def test_check_sync_logs_covers_every_scheduled_job(hc, tmp_path):
+    """Four of twelve job logs were watched. A dead attachments or calendar job
+    raised nothing here because its log was simply not in the dict."""
+    r = hc.check_sync_logs(log_dir=tmp_path)
+
+    for expected in ("attachments", "calendar_sync", "reverse_ingest", "curate_docs"):
+        assert expected in r, f"{expected} log is unwatched"
+
+
+# --- Inline images: the measured age was never asserted on -------------------
+
+
+def test_check_images_exposes_age_to_the_report(hc):
+    """vision_age was computed and dropped into a key the report never reads,
+    so the age column printed '?' for the one source with a known outage."""
+    db = _images_db()
+    _visioned_baseline(db)
+
+    assert hc.check_images(db)["age"] is not None
+
+
+def test_sharepoint_attempt_cap_matches_the_fetcher(hc):
+    """health_check duplicates MAX_SHAREPOINT_ATTEMPTS because it loads without
+    the package. Pin the copy to the original: if the fetcher's cap moves, this
+    check would start ageing links that are legitimately resting, or stop
+    noticing ones that are not."""
+    import sys
+
+    sys.path.insert(0, str(HEALTH_CHECK_PATH.parent.parent))
+    from src.export.sharepoint_fetcher import MAX_SHAREPOINT_ATTEMPTS
+
+    assert hc.SHAREPOINT_MAX_ATTEMPTS == MAX_SHAREPOINT_ATTEMPTS
+
+
+def test_check_sharepoint_token_reports_capture_age(hc, tmp_path):
+    """The age column is the report's at-a-glance "is this source asserted on?"
+    signal — every '?' in it marked a check that could not go red. SP Session is
+    the one genuine exception (it asserts on time-to-expiry, not on age), so it
+    must still show its capture age rather than a bare '?' that reads identical
+    to a blind check."""
+    import json
+    from datetime import datetime, timedelta
+
+    p = tmp_path / "sharepoint-session.json"
+    p.write_text(
+        json.dumps(
+            {"capturedAt": "2026-07-01T00:00:00.000Z", "tokenExpiresAt": "2026-07-10T00:00:00.000Z"}
+        )
+    )
+
+    r = hc.check_sharepoint_token(path=p, now=datetime(2026, 7, 3, tzinfo=UTC))
+
+    assert r["age"] == timedelta(days=2)
+
+
+def test_check_sharepoint_token_without_capture_stamp_has_no_age(hc, tmp_path):
+    """Older session files predate capturedAt; missing it must not raise."""
+    from datetime import datetime
+
+    p = _write_sp_session(tmp_path, "2026-07-10T00:00:00.000Z")
+
+    r = hc.check_sharepoint_token(path=p, now=datetime(2026, 7, 3, tzinfo=UTC))
+
+    assert r["age"] is None
+    assert r["status"] == "OK"
+
+
+# --- Job health is not verifiable from the Mac -------------------------------
+# All nine ingestion plists were renamed .disabled-migrated-to-vps when
+# ingestion moved, so _check_jobs_launchd() reports "MIGRATED" for every one of
+# them and _check_jobs_systemd() never runs on this host. Nine lines of
+# "MIGRATED" read like nine verified jobs. They are nine unchecked ones: a VPS
+# unit that has crashed, failed or been masked renders identically. auto_fix is
+# inoperative here too, since nothing can ever reach "FAIL".
+
+
+def test_report_flags_that_migrated_jobs_are_unchecked(hc):
+    jobs = {f"j{i}": {"desc": f"Job {i}", "status": "MIGRATED"} for i in range(9)}
+
+    text, _ = hc.build_report([], jobs, {}, {}, [])
+
+    assert "not verifiable from this host" in text
+
+
+def test_report_does_not_cry_unverifiable_when_jobs_are_real(hc):
+    """On the VPS the same section is authoritative and must stay quiet."""
+    jobs = {"a": {"desc": "Job A", "status": "OK"}, "b": {"desc": "Job B", "status": "MIGRATED"}}
+
+    text, _ = hc.build_report([], jobs, {}, {}, [])
+
+    assert "not verifiable from this host" not in text

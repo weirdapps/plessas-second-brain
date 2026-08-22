@@ -99,7 +99,19 @@ LABEL_PREFIX = detect_label_prefix()
 STALE_THRESHOLDS = {
     "emails": timedelta(hours=6),
     "teams": timedelta(hours=24),
+    # How long the Teams sync may go without polling a single chat. The timer
+    # runs at :30 from 07:00 to 22:00 plus 01:00, so the widest legitimate gap
+    # is the 01:30 -> 07:30 overnight window; eight hours leaves two of slack.
+    # This is the signal that means "we stopped listening" — see check_teams,
+    # where message recency only means "nobody spoke".
+    "teams_pull": timedelta(hours=8),
     "calendar": timedelta(days=2),
+    # embeddings.npz is rewritten by every sync that loads new rows. Two days is
+    # a couple of missed daily runs, not a quiet afternoon.
+    "embeddings": timedelta(days=2),
+    # SharePoint fetches ride the daily sync. Applied to links still inside
+    # their retry budget, never to ones resting past MAX_SHAREPOINT_ATTEMPTS.
+    "sharepoint": timedelta(days=2),
     "conversations": timedelta(days=2),
     "daily_sync": timedelta(hours=26),
     "outlook_sync": timedelta(hours=3),
@@ -130,6 +142,12 @@ TEAMS_DISABLED_WARN_SHARE = 0.25
 # manual `brain process-images` pass or more budget.
 IMAGE_QUEUE_WARN = 500
 
+# Mirrors MAX_SHAREPOINT_ATTEMPTS in src/export/sharepoint_fetcher.py, which is
+# the source of truth — this script is loaded standalone (no package import), so
+# the value is duplicated here and pinned by a test that reads the real one.
+# Links at or past the cap are resting out their cool-off, not being neglected.
+SHAREPOINT_MAX_ATTEMPTS = 5
+
 LAUNCHD_JOBS = {
     f"{LABEL_PREFIX}.sync": "Hourly Outlook sync",
     f"{LABEL_PREFIX}-sync": "Daily full sync",
@@ -155,6 +173,14 @@ SYSTEMD_UNITS = {
     "sb-auth-watch.service": "Auth watcher",
     "sb-curate-docs.service": "Document curation",
     "sb-reverse-ingest.service": "Reverse ingest",
+    # Registered late. The VPS runs twelve sb-* units but only the nine above
+    # were listed, so these three had neither a job status nor a log-age signal
+    # — the same hand-listed-subset gap that hid http-error from the SharePoint
+    # tally. This dict is the source both check_jobs and check_sync_logs read,
+    # so anything absent from it is a job nobody is watching.
+    "sb-news-sync.service": "News sync",
+    "sb-conversation-sync.service": "Conversation sync",
+    "sb-health-check.service": "Health check",
 }
 
 IS_MACOS = sys.platform == "darwin"
@@ -248,11 +274,20 @@ def check_emails(db):
     real_mail = "message_id > 0 AND (mailbox_name IS NULL OR mailbox_name <> 'News')"
     r = db.execute(f"SELECT COUNT(*), MAX(date_received) FROM emails WHERE {real_mail}").fetchone()
     total, latest = r[0], r[1]
+    # datetime() around the column, not the bare column: stored values carry the
+    # ISO 'T' separator while datetime('now', ...) renders a SPACE, and lexical
+    # comparison puts 'T' (0x54) above ' ' (0x20). Every row sharing the cutoff's
+    # DATE therefore passed regardless of its time — prod read 108 arrivals
+    # against 35 real ones, and advertised "30 today" for a Teams source that had
+    # been silent for 28 hours. datetime() also normalises 'Z', '+00:00' and the
+    # 7-fractional-digit form Graph emits.
     recent_24h = db.execute(
-        f"SELECT COUNT(*) FROM emails WHERE date_received > datetime('now', '-1 day') AND {real_mail}"
+        f"SELECT COUNT(*) FROM emails WHERE datetime(date_received) > "
+        f"datetime('now', '-1 day') AND {real_mail}"
     ).fetchone()[0]
     recent_7d = db.execute(
-        f"SELECT COUNT(*) FROM emails WHERE date_received > datetime('now', '-7 days') AND {real_mail}"
+        f"SELECT COUNT(*) FROM emails WHERE datetime(date_received) > "
+        f"datetime('now', '-7 days') AND {real_mail}"
     ).fetchone()[0]
 
     age = _age(latest)
@@ -282,13 +317,36 @@ def check_teams(db):
         0
     ]
     threads = db.execute("SELECT COUNT(*) FROM teams_threads").fetchone()[0]
+    # datetime() on both sides — see check_emails for why the bare column lied.
     recent_24h = db.execute(
-        "SELECT COUNT(*) FROM teams_messages WHERE composed_at > datetime('now', '-1 day')"
+        "SELECT COUNT(*) FROM teams_messages "
+        "WHERE datetime(composed_at) > datetime('now', '-1 day')"
     ).fetchone()[0]
 
     age = _age(latest)
 
-    stale = age and age > STALE_THRESHOLDS["teams"]
+    # MAX(composed_at) measures whether COLLEAGUES were talking, which is not a
+    # property of this system. Greek August and every weekend produce genuinely
+    # silent stretches — two Saturdays in Aug 2026 recorded zero messages — so a
+    # message-age alarm pages on a healthy pipeline until it gets ignored.
+    # last_pulled_at is stamped by the sync on every poll whether or not the chat
+    # said anything, so it separates "nobody spoke" from "we stopped listening".
+    try:
+        last_pull = db.execute("SELECT MAX(last_pulled_at) FROM teams_chats").fetchone()[0]
+        pull_supported = True
+    except sqlite3.OperationalError:
+        last_pull, pull_supported = None, False
+    pull_age = _age(last_pull)
+
+    if not pull_supported:
+        # Pre-v18 schema has no heartbeat; message recency is all there is.
+        stale = bool(age and age > STALE_THRESHOLDS["teams"])
+    elif chats == 0:
+        stale = False
+    elif pull_age is None:
+        stale = True  # chats on the books and not one has ever been polled
+    else:
+        stale = pull_age > STALE_THRESHOLDS["teams_pull"]
     # A handful of archived teams and guest-only channels are legitimately
     # unreadable, so only a large share means ingestion has quietly shrunk.
     coverage_lost = chats > 0 and disabled > chats * TEAMS_DISABLED_WARN_SHARE
@@ -307,6 +365,8 @@ def check_teams(db):
         "latest": latest,
         "recent_24h": recent_24h,
         "age": age,
+        "last_pull": last_pull,
+        "pull_age": pull_age,
         "stale": stale,
         "coverage_lost": coverage_lost,
         "status": status,
@@ -392,7 +452,7 @@ def check_images(db):
     stuck = db.execute(
         "SELECT COUNT(*) FROM inline_images WHERE vision_description IS NULL "
         f"AND (classification IS NULL OR classification NOT IN ({placeholders})) "
-        "AND classified_at < datetime('now', ?)",
+        "AND datetime(classified_at) < datetime('now', ?)",
         (*VISION_SKIPPED_CLASSES, f"-{STALE_THRESHOLDS['images_vision'].days} days"),
     ).fetchone()[0]
     latest_vision = db.execute("SELECT MAX(visioned_at) FROM inline_images").fetchone()[0]
@@ -404,19 +464,33 @@ def check_images(db):
         "pending": pending,
         "stuck": stuck,
         "latest_vision": latest_vision,
-        "vision_age": _age(latest_vision),
+        # Keyed "age" because that is what build_report reads. Under its old name
+        # the report printed "?" here, so the one source with a known outage was
+        # also the one whose age was invisible.
+        "age": _age(latest_vision),
         "status": "WARN" if pct < 50 or pending > IMAGE_QUEUE_WARN or stuck else "OK",
     }
 
 
 def check_calendar(db):
     total = db.execute("SELECT COUNT(*) FROM calendar_events").fetchone()[0]
-    latest = db.execute("SELECT MAX(end_at) FROM calendar_events").fetchone()[0]
+    # MAX(end_at) is an event END date, routinely months in the future, so it
+    # stays high off events already stored no matter how long the sync has been
+    # dead — this row returned a literal "OK" and could not go red. ingested_at
+    # is stamped by the loader, so it is the only column here that ages when
+    # ingestion stops.
+    latest = db.execute("SELECT MAX(ingested_at) FROM calendar_events").fetchone()[0]
+    age = _age(latest)
+    stale = age is not None and age > STALE_THRESHOLDS["calendar"]
     return {
         "name": "Calendar",
         "total": total,
         "latest": latest,
-        "status": "OK",
+        "age": age,
+        "stale": stale,
+        # No parseable ingested_at at all means the column is empty or the table
+        # is — either way nothing here can be trusted as fresh.
+        "status": "STALE" if stale else ("WARN" if age is None else "OK"),
     }
 
 
@@ -439,25 +513,33 @@ def check_conversations(db):
     }
 
 
-def check_embeddings(db):
+def check_embeddings(db, npz_path: Path | None = None, now: datetime | None = None):
     total_emails = db.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
     import numpy as np
 
-    npz = DB_PATH.parent / "embeddings.npz"
-    if npz.exists():
-        d = np.load(str(npz), allow_pickle=True)
-        n = len(d["ids"]) if "ids" in d else 0
+    npz = npz_path or DB_PATH.parent / "embeddings.npz"
+    if not npz.exists():
         return {
             "name": "Embeddings",
-            "embedded": n,
+            "embedded": 0,
             "total_emails": total_emails,
-            "status": "OK",
+            "age": None,
+            "status": "WARN",
         }
+    d = np.load(str(npz), allow_pickle=True)
+    n = len(d["ids"]) if "ids" in d else 0
+    # Presence and vector count both freeze the instant the stage dies, so the
+    # two signals this check used could not tell a live index from one written
+    # months ago. The file's mtime is the only thing here that keeps moving.
+    age = (now or datetime.now()) - datetime.fromtimestamp(npz.stat().st_mtime)
+    stale = age > STALE_THRESHOLDS["embeddings"]
     return {
         "name": "Embeddings",
-        "embedded": 0,
+        "embedded": n,
         "total_emails": total_emails,
-        "status": "WARN",
+        "age": age,
+        "stale": stale,
+        "status": "STALE" if stale else "OK",
     }
 
 
@@ -477,13 +559,38 @@ def check_sharepoint(db):
         total = sum(status_map.values())
         ok = status_map.get("ok", 0)
         failed = total - ok
+        # A ratio cannot move once the fetcher stops: no row changes status, so
+        # the share of non-'ok' rows is pinned and this reads OK forever. Age the
+        # ELIGIBLE work instead. Links past MAX_SHAREPOINT_ATTEMPTS are resting
+        # inside their cool-off by design — prod's 43 sit at 6-9 attempts — and
+        # must stay silent, but a link still inside its retry budget that nobody
+        # has touched for days means the fetcher is not running at all.
+        overdue = db.execute(
+            "SELECT COUNT(*) FROM sharepoint_links "
+            "WHERE fetched_at IS NULL AND COALESCE(attempts, 0) < ? "
+            "AND (last_attempt_at IS NULL "
+            "     OR datetime(last_attempt_at) < datetime('now', ?))",
+            (SHAREPOINT_MAX_ATTEMPTS, f"-{STALE_THRESHOLDS['sharepoint'].days} days"),
+        ).fetchone()[0]
+        latest_attempt = db.execute("SELECT MAX(last_attempt_at) FROM sharepoint_links").fetchone()[
+            0
+        ]
+        if overdue:
+            status = "STALE"
+        elif failed > total * 0.3:
+            status = "WARN"
+        else:
+            status = "OK"
         return {
             "name": "SharePoint",
             "ok": ok,
             "failed": failed,
             "by_status": {s: n for s, n in status_map.items() if s != "ok"},
             "total": total,
-            "status": "WARN" if failed > total * 0.3 else "OK",
+            "overdue": overdue,
+            "age": _age(latest_attempt),
+            "stale": bool(overdue),
+            "status": status,
         }
     except sqlite3.OperationalError:
         return {"name": "SharePoint", "status": "N/A"}
@@ -522,7 +629,22 @@ def check_sharepoint_token(path: Path = SHAREPOINT_SESSION, now: datetime | None
         status = "WARN"
     else:
         status = "OK"
-    return {"name": "SP Session", "status": status, "expires_at": exp, "remaining": remaining}
+    # This row asserts on time-to-expiry, not on age, so it is the one legitimate
+    # blank in the age column — and a blank there is exactly how the checks that
+    # could NOT go red used to look. Showing when the session was captured keeps
+    # "'?' means nothing is being asserted" true as a reading of the report.
+    captured = data.get("capturedAt")
+    try:
+        age = now - datetime.fromisoformat(str(captured).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        age = None
+    return {
+        "name": "SP Session",
+        "status": status,
+        "expires_at": exp,
+        "remaining": remaining,
+        "age": age,
+    }
 
 
 def check_documents(db):
@@ -532,6 +654,13 @@ def check_documents(db):
         "name": "Documents",
         "total": total,
         "latest": latest,
+        "age": _age(latest),
+        # Deliberately not a staleness gate. These roots go months without a new
+        # file — 0 added in the 14 days to 2026-08-22 — so ageing the newest
+        # ingested document would page on the normal state of the source.
+        # Liveness for reverse-ingest is asserted by check_document_roots, which
+        # watches the sync stamp (job ran) and its failure marker (job failed)
+        # rather than the data. The age is exposed here for the report only.
         "status": "OK",
     }
 
@@ -841,13 +970,21 @@ def check_jobs():
     return _check_jobs_launchd() if IS_MACOS else _check_jobs_systemd()
 
 
-def check_sync_logs():
+def check_sync_logs(log_dir: Path | None = None):
+    """Log freshness for every scheduled job, derived from the job registry.
+
+    Four filenames used to be hand-listed, so five of the nine jobs — including
+    attachments and calendar-sync — had no log-age signal at all: a dead one
+    raised nothing here because its log simply was not in the dict. Names come
+    off SYSTEMD_UNITS on both platforms; the log basenames match the unit stems
+    (`sb-outlook-sync.service` -> `outlook-sync.log`) regardless of host.
+    """
+    log_dir = log_dir or LOG_DIR
     results = {}
     log_files = {
-        "outlook_sync": LOG_DIR / "outlook-sync.log",
-        "daily_sync": LOG_DIR / "daily-sync.log",
-        "noon_catchup": LOG_DIR / "noon-catchup.log",
-        "teams_sync": LOG_DIR / "teams-sync.log",
+        unit.removeprefix("sb-").removesuffix(".service").replace("-", "_"): log_dir
+        / f"{unit.removeprefix('sb-').removesuffix('.service')}.log"
+        for unit in SYSTEMD_UNITS
     }
     for name, path in log_files.items():
         if path.exists():
@@ -864,12 +1001,19 @@ def check_sync_logs():
     return results
 
 
-def check_sentinels():
+def check_sentinels(state_dir: Path | None = None):
+    """Blocking sentinels, discovered by pattern rather than by list.
+
+    Two filenames were hardcoded, so a `needs_*` file written by any job added
+    later was invisible — a blocking condition nobody would ever be told about.
+    The two known names stay in the set so they still report absent-and-OK when
+    the state dir is empty.
+    """
+    state_dir = state_dir or STATE_DIR
     results = {}
-    sentinels = {
-        "needs_reauth": STATE_DIR / "needs_reauth",
-        "needs_gcloud_reauth": STATE_DIR / "needs_gcloud_reauth",
-    }
+    known = ("needs_reauth", "needs_gcloud_reauth")
+    discovered = {p.name for p in state_dir.glob("needs_*")} if state_dir.exists() else set()
+    sentinels = {name: state_dir / name for name in sorted(discovered.union(known))}
     for name, path in sentinels.items():
         if path.exists():
             mtime = datetime.fromtimestamp(path.stat().st_mtime)
@@ -968,8 +1112,7 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
             extra = f" ({c.get('pct', 0):.0f}% classified, {c.get('pending', 0):,} queued)"
             if c.get("stuck"):
                 extra += (
-                    f" — {c['stuck']:,} awaiting vision, last output"
-                    f" {format_age(c.get('vision_age'))} ago"
+                    f" — {c['stuck']:,} awaiting vision, last output {format_age(c.get('age'))} ago"
                 )
         elif c["name"] == "Emails":
             extra = f" ({c.get('recent_24h', 0)} today)"
@@ -1045,6 +1188,44 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
         lines.append(f"  {desc:<28} {marker}")
         if "FAIL" in str(status):
             issues.append(f"Job {desc}: {status}")
+    # Every job MIGRATED means this host checked nothing: the plists are retired
+    # and the systemd path only runs on the VPS. Nine "MIGRATED" lines otherwise
+    # read as nine healthy jobs, when a crashed, failed or masked VPS unit looks
+    # exactly the same from here. Say so rather than implying coverage.
+    jobs_elsewhere = bool(jobs) and all(info.get("status") == "MIGRATED" for info in jobs.values())
+    if jobs_elsewhere:
+        lines.append("")
+        lines.append("  NOTE: job health is not verifiable from this host — these jobs run on")
+        lines.append("        the VPS and are asserted by the health check that runs there.")
+
+    # Job logs. This result used to be computed and dropped: build_report took
+    # `logs` and never read it, so a job holding a healthy systemd unit while
+    # writing nothing to its log raised no signal anywhere. Skipped entirely
+    # when the jobs run elsewhere — this host's log dir is then a
+    # pre-migration relic describing a machine that stopped running them.
+    # An ABSENT log carries no "stale" flag, so it used to be silence rather
+    # than a signal — the same shape as every other blind spot in this file.
+    # All twelve resolve on the VPS today, so a missing one is a real fault.
+    bad_logs = (
+        sorted(
+            (name, info)
+            for name, info in logs.items()
+            if info.get("stale") or info.get("status") == "MISSING"
+        )
+        if logs and not jobs_elsewhere
+        else []
+    )
+    if bad_logs:
+        lines.append("")
+        lines.append("JOB LOGS")
+        lines.append("-" * 55)
+        for name, info in bad_logs:
+            if info.get("status") == "MISSING":
+                lines.append(f"  {name:<28} MISSING ({info.get('path')})")
+                issues.append(f"Log {name}: missing")
+            else:
+                lines.append(f"  {name:<28} {format_age(info.get('age'))} since last write")
+                issues.append(f"Log {name}: stale")
 
     # Fix actions
     if fix_actions:

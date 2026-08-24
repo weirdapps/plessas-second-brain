@@ -292,3 +292,33 @@ class TestRecallHybridFusion:
         res = recall(recall_db, "unicornz9")
         assert isinstance(res["emails"], list)
         assert any(e["email_id"] == 1 for e in res["emails"])
+
+
+class TestRecallAttachmentsBucket:
+    """Attachment hits need their own kind, not burial inside `emails`.
+
+    query_by_keyword ranks attachment matches LAST in its source waterfall and
+    dedups them by email_id, so whenever the covering email also matches on its
+    own summary/content the attachment's far richer extracted text never
+    surfaces. Against the real DB, `recall("Brinks cash management proposal")`
+    returned four Brink's emails and not one of the three NBG_Proposal_CM.pdf
+    hits that search_attachments finds instantly.
+    """
+
+    def test_attachments_is_a_returned_kind(self, recall_db):
+        result = recall(recall_db, UNIQUE_KW)
+        assert "attachments" in result, "recall must expose attachments as its own kind"
+
+    def test_attachment_surfaces_even_when_parent_email_also_matches(self, recall_db):
+        # Give email 3 its own match, so the attachment is deduped out of `emails`.
+        recall_db.execute(
+            "UPDATE emails SET summary = ? WHERE id = 3",
+            (f"Carrier email now mentioning {UNIQUE_KW} itself",),
+        )
+        recall_db.commit()
+
+        result = recall(recall_db, UNIQUE_KW)
+
+        assert any(a["filename"] == "deck.pdf" for a in result["attachments"]), (
+            "attachment content must stay reachable when its parent email also matches"
+        )

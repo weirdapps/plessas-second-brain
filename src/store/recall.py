@@ -12,7 +12,7 @@ import sqlite3
 from src.store.context import get_person_context, get_topic_context
 from src.store.conversation_query import search_conversations_keyword
 from src.store.fusion import reciprocal_rank_fusion
-from src.store.query import _sanitize_fts5_query, query_by_keyword
+from src.store.query import _sanitize_fts5_query, query_by_keyword, search_attachments
 from src.store.teams_query import search_teams as _search_teams_q
 
 
@@ -213,8 +213,8 @@ def recall(
             MCP layer so recall itself carries no embedding dependency.
 
     Returns:
-        Dict with categorized hits across emails (incl. attachments + standalone
-        docs), conversations, decisions, actions, inline_images, and teams
+        Dict with categorized hits across emails (incl. standalone docs),
+        attachments, conversations, decisions, actions, inline_images, and teams
         threads, plus optional person_context and topic_context populated when
         the query matches a known person or topic. Always includes every kind
         key (empty list if no matches) so callers don't have to handle missing
@@ -237,6 +237,14 @@ def recall(
     else:
         conversations = []
 
+    # Attachments as their own kind. They DO feed the emails bucket via
+    # query_by_keyword, but last in its source waterfall and deduped by
+    # email_id — so an attachment whose parent email also matches is invisible,
+    # which is the common case (a one-line "see attached" carrying the real
+    # substance). This bucket surfaces the extracted text and LLM summary
+    # directly, with the filename the caller needs to cite.
+    attachments = search_attachments(conn, query, limit=limit_per_kind)
+
     decisions = _search_decisions(conn, query, limit_per_kind)
     actions = _search_actions(conn, query, limit_per_kind)
     commitments = _search_commitments(conn, query, limit_per_kind)
@@ -249,6 +257,7 @@ def recall(
 
     text_kinds = {
         "emails": emails,
+        "attachments": attachments,
         "conversations": conversations,
         "decisions": decisions,
         "actions": actions,

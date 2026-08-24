@@ -1973,6 +1973,8 @@ def cmd_stats(args):
     print("=" * 50)
     print()
     print(f"Total Emails:        {stats['total_emails']:,}")
+    print(f"Total News:          {stats['total_news_articles']:,}")
+    print(f"Total Documents:     {stats['total_documents']:,}")
     print(f"Total Topics:        {stats['total_topics']:,}")
     print(f"Total People:        {stats['total_people']:,}")
     print(f"Total Decisions:     {stats['total_decisions']:,}")

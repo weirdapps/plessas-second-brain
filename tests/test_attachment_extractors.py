@@ -439,3 +439,52 @@ def test_extract_xlsb_skips_ole_with_no_workbook(tmp_path):
     )
     assert "no Excel workbook stream" in result["error"]
     assert result["text"] is None
+
+
+def test_irm_protected_office_file_is_skipped_not_failed(tmp_path):
+    """IRM-protected Office files must classify as skipped, not as a zip failure.
+
+    Outlook hands these over with mime application/encrypted but a normal
+    .xlsx/.pptx filename. The dispatcher matched the extension branch first, so
+    they hit the zip-based Excel reader and recorded
+    "BadZipFile: File is not a zip file" as a hard extraction FAILURE — 750 rows
+    on the live DB. They are encrypted at rest: unextractable without IRM
+    rights, so they are a permanent skip, not a fault to keep counting.
+    """
+    from src.extract.attachment_extractors import extract_text_from_file
+
+    f = tmp_path / "Daily Report.xlsx"
+    f.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64)
+
+    result = extract_text_from_file(str(f), "application/encrypted")
+
+    assert result["status"] == "skipped"
+    assert "BadZipFile" not in (result["error"] or "")
+
+
+def test_legacy_doc_without_converter_is_skipped_not_failed(tmp_path, monkeypatch):
+    """A missing .doc converter is a platform gap, not an extraction fault.
+
+    _extract_doc shells out to `textutil`, which exists only on macOS. On the
+    Linux VPS every legacy .doc recorded
+    "[Errno 2] No such file or directory: 'textutil'" as status=failed — 21 rows
+    on the live DB, indistinguishable from genuinely corrupt files. With no
+    converter installed the content is simply unreachable here: report it as a
+    skip that names the reason.
+    """
+    import subprocess
+
+    from src.extract.attachment_extractors import _extract_doc
+
+    def _no_converter(*_args, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "textutil")
+
+    monkeypatch.setattr(subprocess, "run", _no_converter)
+
+    f = tmp_path / "memo.doc"
+    f.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 32)
+
+    result = _extract_doc(str(f))
+
+    assert result["status"] == "skipped"
+    assert "Errno 2" not in (result["error"] or "")

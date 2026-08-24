@@ -373,3 +373,26 @@ def test_phase2_deadline_also_applies_with_concurrent_workers(monkeypatch):
 
         assert stats["deferred"] > 0, "budget expired mid-run but nothing was deferred"
         assert len(called) < 8
+
+
+def test_pipeline_connection_uses_60s_busy_timeout():
+    """attachment_pipeline connections must tolerate a concurrent-writer stampede.
+
+    sb-auth-watch's restoration trigger starts six DB-writing sb-* units in the
+    same instant (observed 2026-08-24 11:00:28). schema.get_connection sets
+    busy_timeout=60000 for exactly this case, but this module rolled its own
+    sqlite3.connect(timeout=30) and got half of it — sb-attachments died with
+    "database is locked". Assert the module's connections match the standard.
+    """
+    from src.extract.attachment_pipeline import _connect
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = os.path.join(tmp, "brain.db")
+        _create_test_db(db_path)
+
+        conn = _connect(db_path)
+        try:
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 60000
+            assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        finally:
+            conn.close()

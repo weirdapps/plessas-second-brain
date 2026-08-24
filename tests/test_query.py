@@ -1315,3 +1315,37 @@ class TestImportPeople:
         assert row[0] == "Director"
         assert row[1] == "Test Dept"
         conn.close()
+
+
+def test_get_stats_separates_mail_from_news_and_documents():
+    """total_emails must mean real mail, not every row in the `emails` table.
+
+    News articles (mailbox_name='News') and ingested standalone documents
+    (message_id <= 0) share the `emails` table. Counting them as mail made the
+    stats tool report 74,424 against the health check's 65,363 for the same DB —
+    a 9,061 overstatement with no way for a caller to see the split.
+    """
+    conn = create_database(":memory:")
+    conn.execute(
+        "INSERT INTO emails (message_id, date_received, subject, mailbox_name) "
+        "VALUES (1, '2026-01-01', 'Real mail', 'Inbox')"
+    )
+    conn.execute(
+        "INSERT INTO emails (message_id, date_received, subject, mailbox_name) "
+        "VALUES (2, '2026-01-02', 'Also real', NULL)"
+    )
+    conn.execute(
+        "INSERT INTO emails (message_id, date_received, subject, mailbox_name) "
+        "VALUES (3, '2026-01-03', 'A news article', 'News')"
+    )
+    conn.execute(
+        "INSERT INTO emails (message_id, date_received, subject, mailbox_name) "
+        "VALUES (0, '2026-01-04', 'A standalone document', 'External')"
+    )
+    conn.commit()
+
+    stats = get_stats(conn)
+
+    assert stats["total_emails"] == 2
+    assert stats["total_news_articles"] == 1
+    assert stats["total_documents"] == 1

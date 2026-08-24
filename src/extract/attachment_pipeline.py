@@ -24,6 +24,23 @@ PHASE2_COOLDOWN = 3  # seconds between LLM batches
 LLM_MAX_TEXT = 50_000  # max chars sent to LLM
 
 
+def _connect(db_path: str) -> sqlite3.Connection:
+    """Open brain.db with the same concurrency settings as schema.get_connection.
+
+    sb-auth-watch's restoration trigger starts six DB-writing sb-* units in the
+    same instant (observed 2026-08-24 11:00:28), and this module's own 30s
+    timeout was half the 60s that get_connection deliberately sets for that
+    case — sb-attachments died with "database is locked". get_connection itself
+    is not reused here: it forces row_factory=Row and foreign_keys=ON, which
+    this module's tuple-indexed queries and cross-table writes do not expect.
+    """
+    conn = sqlite3.connect(db_path, timeout=60)
+    conn.execute("PRAGMA busy_timeout = 60000")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    return conn
+
+
 def _build_mime_type_conditions(file_type: str | None) -> tuple[str, list]:
     """Build SQL WHERE clause fragment and parameters for file type filter.
 
@@ -96,9 +113,7 @@ def run_phase1(
         Dict with processing stats: processed, extracted, failed, skipped, deferred.
     """
     db_path = db_path or str(DEFAULT_DB)
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA journal_mode = WAL")  # see schema.get_connection
-    conn.execute("PRAGMA synchronous = NORMAL")
+    conn = _connect(db_path)
     now = datetime.now().isoformat()
 
     # Build query with parameterized conditions
@@ -275,9 +290,7 @@ def run_phase2(
     from src.store.normalizer import find_or_create_topic
 
     db_path = db_path or str(DEFAULT_DB)
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA journal_mode = WAL")  # see schema.get_connection
-    conn.execute("PRAGMA synchronous = NORMAL")
+    conn = _connect(db_path)
 
     type_condition, type_params = _build_mime_type_conditions(file_type)
 
@@ -529,9 +542,7 @@ def ingest_document(
     if source_url:
         content_text += f"\nSource: {source_url}"
 
-    conn = sqlite3.connect(db_path, timeout=30)
-    conn.execute("PRAGMA journal_mode = WAL")  # see schema.get_connection
-    conn.execute("PRAGMA synchronous = NORMAL")
+    conn = _connect(db_path)
 
     # Idempotency: skip if this file was already ingested
     existing = conn.execute("SELECT id FROM emails WHERE message_id = ?", (message_id,)).fetchone()

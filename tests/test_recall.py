@@ -300,9 +300,9 @@ class TestRecallAttachmentsBucket:
     query_by_keyword ranks attachment matches LAST in its source waterfall and
     dedups them by email_id, so whenever the covering email also matches on its
     own summary/content the attachment's far richer extracted text never
-    surfaces. Against the real DB, `recall("Brinks cash management proposal")`
-    returned four Brink's emails and not one of the three NBG_Proposal_CM.pdf
-    hits that search_attachments finds instantly.
+    surfaces. Against the real DB, a vendor-proposal query returned four emails
+    from that vendor and none of the three matching PDF attachments, which
+    search_attachments finds instantly.
     """
 
     def test_attachments_is_a_returned_kind(self, recall_db):

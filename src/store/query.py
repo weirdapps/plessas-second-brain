@@ -832,14 +832,28 @@ def get_stats(conn: sqlite3.Connection) -> dict:
     """Return database statistics.
 
     Returns:
-        Dict with keys: total_emails, total_topics, total_people, total_decisions,
-        total_action_items, earliest_email, latest_email
+        Dict with keys: total_emails, total_news_articles, total_documents,
+        total_topics, total_people, total_decisions, total_action_items,
+        earliest_email, latest_email
     """
     stats = {}
 
-    # Count emails
-    cursor = conn.execute("SELECT COUNT(*) as count FROM emails")
+    # Count emails. News articles and ingested standalone documents share the
+    # `emails` table, so an unfiltered COUNT(*) is not a mail count: it read
+    # 74,424 against the health check's 65,363 on the same DB. Same predicate as
+    # scripts/health_check.py's `real_mail`, and the two extra keys keep the
+    # split visible instead of hiding 9,061 rows.
+    cursor = conn.execute(
+        "SELECT COUNT(*) as count FROM emails "
+        "WHERE message_id > 0 AND (mailbox_name IS NULL OR mailbox_name <> 'News')"
+    )
     stats["total_emails"] = cursor.fetchone()["count"]
+
+    cursor = conn.execute("SELECT COUNT(*) as count FROM emails WHERE mailbox_name = 'News'")
+    stats["total_news_articles"] = cursor.fetchone()["count"]
+
+    cursor = conn.execute("SELECT COUNT(*) as count FROM emails WHERE message_id <= 0")
+    stats["total_documents"] = cursor.fetchone()["count"]
 
     # Count topics
     cursor = conn.execute("SELECT COUNT(*) as count FROM topics")

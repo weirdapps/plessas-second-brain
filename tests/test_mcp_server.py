@@ -27,6 +27,7 @@ def mock_conn():
     conn.executescript("""
         CREATE TABLE emails (
             id INTEGER PRIMARY KEY,
+            message_id INTEGER,
             date_received TEXT,
             subject TEXT,
             summary TEXT,
@@ -34,6 +35,7 @@ def mock_conn():
             sender_address TEXT,
             sentiment TEXT,
             conversation_id TEXT,
+            mailbox_name TEXT,
             content TEXT
         );
         CREATE TABLE people (
@@ -110,8 +112,8 @@ def mock_conn():
 
         INSERT INTO people (id, name, email, role, department) VALUES
             (1, 'Alice Smith', 'alice@example.com', 'Director', 'Digital');
-        INSERT INTO emails (id, date_received, subject, summary, sender_name, sender_address, sentiment) VALUES
-            (1, '2026-03-01T10:00:00', 'Project update', 'Status update on cards migration', 'Alice Smith', 'alice@example.com', 'informational');
+        INSERT INTO emails (id, message_id, date_received, subject, summary, sender_name, sender_address, sentiment, mailbox_name) VALUES
+            (1, 1, '2026-03-01T10:00:00', 'Project update', 'Status update on cards migration', 'Alice Smith', 'alice@example.com', 'informational', 'Inbox');
         INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (1, 1, 'sender');
         INSERT INTO topics (id, name, display_name) VALUES (1, 'cards migration', 'Cards Migration');
         INSERT INTO email_topics (email_id, topic_id) VALUES (1, 1);

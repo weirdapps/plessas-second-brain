@@ -53,6 +53,21 @@ def extract_text_from_file(file_path: str, mime_type: str) -> dict:
             "error": f"File not found: {file_path}",
         }
 
+    # IRM/RMS-protected content arrives with mime application/encrypted but an
+    # ordinary .xlsx/.docx/.pptx name, so the extension branches below claimed
+    # it first and the zip-based readers logged "BadZipFile: File is not a zip
+    # file" as a hard FAILURE — 750 rows on the live DB. The bytes are encrypted
+    # at rest: no parser reads them without IRM rights, so this is a permanent
+    # skip, not a fault worth re-counting. .rpmsg still falls through to
+    # _extract_rpmsg, which recovers best-effort metadata from the OLE wrapper.
+    if mime_type == "application/encrypted" and ext != ".rpmsg":
+        return {
+            "text": None,
+            "method": None,
+            "status": "skipped",
+            "error": f"IRM-protected {ext or 'file'}: no extractable text without rights",
+        }
+
     try:
         if mime_type == "application/pdf" or ext == ".pdf":
             return _extract_pdf(file_path)
@@ -179,33 +194,51 @@ def _extract_docx(path: str) -> dict:
     return {"text": text, "method": "python-docx", "status": "extracted", "error": None}
 
 
+# Legacy .doc converters, tried in order. textutil is macOS-only, so on the
+# Linux VPS every .doc recorded "[Errno 2] No such file or directory:
+# 'textutil'" as status=failed — 21 rows, indistinguishable from genuinely
+# corrupt files. antiword/catdoc are the portable equivalents; when none is
+# installed the content is simply unreachable on this host, which is a skip.
+_DOC_CONVERTERS = (
+    ("textutil", ["textutil", "-convert", "txt", "-stdout"]),
+    ("antiword", ["antiword"]),
+    ("catdoc", ["catdoc"]),
+)
+
+
 def _extract_doc(path: str) -> dict:
-    """Extract text from legacy .doc files using textutil (macOS)."""
+    """Extract text from legacy .doc files via the first available converter."""
     import subprocess
 
-    try:
-        result = subprocess.run(
-            ["textutil", "-convert", "txt", "-stdout", path],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+    for method, argv in _DOC_CONVERTERS:
+        try:
+            result = subprocess.run(
+                [*argv, path],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except FileNotFoundError:
+            continue  # converter absent on this platform — try the next
+        except subprocess.TimeoutExpired as e:
+            return {"text": None, "method": method, "status": "failed", "error": str(e)}
+
         text = _truncate(result.stdout)
         if _apply_noise_filter(text):
             return {
                 "text": None,
-                "method": "textutil",
+                "method": method,
                 "status": "skipped",
                 "error": "Insufficient text extracted",
             }
-        return {
-            "text": text,
-            "method": "textutil",
-            "status": "extracted",
-            "error": None,
-        }
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-        return {"text": None, "method": "textutil", "status": "failed", "error": str(e)}
+        return {"text": text, "method": method, "status": "extracted", "error": None}
+
+    return {
+        "text": None,
+        "method": None,
+        "status": "skipped",
+        "error": "No legacy .doc converter available (textutil/antiword/catdoc)",
+    }
 
 
 def _extract_pptx(path: str) -> dict:

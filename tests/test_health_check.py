@@ -1829,3 +1829,138 @@ def test_report_dates_a_mass_disable(hc):
     text, _ = hc.build_report([hc.check_teams(db)], {}, {}, {}, [])
 
     assert "2026-08-18" in text, "the report must say WHEN the corpus shrank"
+
+
+# --- sb-brain-freshness Healthchecks ping --------------------------------------
+#
+# The check existed in Healthchecks from 2026-08-10 and nothing ever pinged it:
+# sb-health-check.sh contains no curl and no HC_PING_URL, and no code anywhere on
+# the box referenced the slug. It therefore sat red for fourteen days in total
+# silence, because Healthchecks alerts on the transition and not on the state.
+# health_check.py is the only place that computes the OK/WARN/STALE verdict, and
+# main() exits 0 whether or not there are issues, so a wrapper cannot key on the
+# exit code either. The ping belongs here.
+
+
+def _check(name, status):
+    return {"name": name, "status": status}
+
+
+def test_freshness_verdict_is_ok_when_nothing_is_stale(hc):
+    checks = [_check("Emails", "OK"), _check("Teams", "OK")]
+    ok, detail = hc.freshness_verdict(checks, {})
+    assert ok is True
+    assert detail == "2 sources fresh"
+
+
+def test_freshness_verdict_fails_and_names_every_stale_source(hc):
+    checks = [_check("Emails", "STALE"), _check("Teams", "OK"), _check("News", "STALE")]
+    ok, detail = hc.freshness_verdict(checks, {})
+    assert ok is False
+    assert detail == "stale: Emails, News"
+
+
+def test_warn_is_not_a_freshness_failure(hc):
+    """WARN is a quality signal the nightly email already carries in full.
+
+    Making it red here would fire the dead-man's switch on Teams coverage share
+    and inline-image queue depth, which self-resolve. Alert volume is the
+    standing problem, not alert sensitivity.
+    """
+    ok, _detail = hc.freshness_verdict([_check("Inline Images", "WARN")], {})
+    assert ok is True
+
+
+def test_a_blocking_sentinel_alone_is_not_a_freshness_failure(hc):
+    """Setting a needs_* sentinel is the sanctioned way to degrade gracefully.
+
+    Failing on it would hold this check red for the whole latch period, which is
+    exactly what the owner ruled out for the sync jobs' exit codes. If the latch
+    lasts long enough to matter, the affected source crosses its own STALE
+    threshold and the next line covers that.
+    """
+    sentinels = {"needs_teams_reauth": {"present": True, "since": "2026-08-24T22:01:48"}}
+    ok, _detail = hc.freshness_verdict([_check("Teams", "OK")], sentinels)
+    assert ok is True
+
+    ok, detail = hc.freshness_verdict([_check("Teams", "STALE")], sentinels)
+    assert ok is False
+    assert detail == "stale: Teams"
+
+
+def test_ping_freshness_is_a_no_op_without_hc_ping_url(hc, monkeypatch):
+    """The Mac runs this script too, and CI runs the tests. Neither may ping."""
+    monkeypatch.delenv("HC_PING_URL", raising=False)
+    called = []
+    monkeypatch.setattr(hc.subprocess, "run", lambda *a, **k: called.append(a))
+
+    assert hc.ping_freshness(True, "2 sources fresh") is False
+    assert called == []
+
+
+def test_ping_freshness_posts_the_success_url(hc, monkeypatch):
+    monkeypatch.setenv("HC_PING_URL", "http://127.0.0.1:8000/ping/KEY")
+    seen = {}
+
+    def _fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        seen["input"] = kwargs.get("input")
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(hc.subprocess, "run", _fake_run)
+
+    assert hc.ping_freshness(True, "12 sources fresh") is True
+    assert seen["cmd"][-1] == "http://127.0.0.1:8000/ping/KEY/sb-brain-freshness"
+    assert seen["input"] == "12 sources fresh"
+    assert "?create=1" not in seen["cmd"][-1], (
+        "auto-provision left eleven checks on the wrong default; do not add a twelfth"
+    )
+
+
+def test_ping_freshness_posts_the_fail_url_when_stale(hc, monkeypatch):
+    monkeypatch.setenv("HC_PING_URL", "http://127.0.0.1:8000/ping/KEY/")
+    seen = {}
+
+    def _fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(hc.subprocess, "run", _fake_run)
+
+    assert hc.ping_freshness(False, "stale: Emails") is True
+    assert seen["cmd"][-1] == "http://127.0.0.1:8000/ping/KEY/sb-brain-freshness/fail", (
+        "a trailing slash on HC_PING_URL must not produce a double slash"
+    )
+
+
+def test_ping_freshness_never_raises_and_never_echoes_curl_stderr(hc, monkeypatch, capsys):
+    """curl -fsS writes the failing URL to stderr, and that URL carries the ping key.
+
+    A ping is best-effort: an exception here must not take down the nightly
+    report, and the failing URL must never reach the log.
+    """
+    monkeypatch.setenv("HC_PING_URL", "http://127.0.0.1:8000/ping/SECRETKEY")
+
+    def _boom(*a, **k):
+        raise OSError("network down")
+
+    monkeypatch.setattr(hc.subprocess, "run", _boom)
+    assert hc.ping_freshness(True, "ok") is False
+
+    def _curl_fails(*a, **k):
+        return type(
+            "R",
+            (),
+            {
+                "returncode": 22,
+                "stdout": "",
+                "stderr": "curl: (22) http://127.0.0.1:8000/ping/SECRETKEY/x returned 404",
+            },
+        )()
+
+    monkeypatch.setattr(hc.subprocess, "run", _curl_fails)
+    assert hc.ping_freshness(True, "ok") is False
+
+    captured = capsys.readouterr()
+    assert "SECRETKEY" not in captured.err + captured.out
+    assert "curl exit 22" in captured.err

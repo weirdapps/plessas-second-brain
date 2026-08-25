@@ -280,7 +280,11 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
     """
     import os
 
-    from src.extract.claude_extract import _get_client_and_model, call_with_policy
+    from src.extract.claude_extract import (
+        _get_client_and_model,
+        _response_text,
+        call_with_policy,
+    )
     from src.extract.vertex_fallback import create_with_refusal_fallback
 
     model = (
@@ -301,4 +305,7 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
         )
 
     resp = call_with_policy(_do_call, max_call_seconds=120.0)
-    return resp.content[0].text
+    # Same leading-ThinkingBlock hazard as every other call site. No teams_threads row
+    # has hit it yet (extraction_error is NULL on all 6008), so this one is preventive:
+    # the sixth site should not be the one left indexing position 0.
+    return _response_text(resp)

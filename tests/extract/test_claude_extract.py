@@ -291,3 +291,51 @@ def test_reauth_receives_the_same_is_linux_as_decide(monkeypatch):
 
     assert len(reauth_calls) == 1
     assert reauth_calls[0]["is_linux"] is False
+
+
+# --- _response_text is the repo's single reader of a Claude response -----------
+#
+# Six call sites now route through it: extract_one, extract_conversation,
+# attachment_pipeline, calendar_extractor, teams_pipeline and
+# scripts/curate_documents_daily. image_vision keeps its own copy because its
+# message is vision-specific. The raise is the diagnostic surface: its string is
+# what lands in attachment_content.llm_error and in the sync logs.
+
+
+class _ThinkingBlock:
+    def __init__(self, thinking: str) -> None:
+        self.thinking = thinking
+
+
+def test_response_text_returns_the_first_text_block(monkeypatch):
+    resp = types.SimpleNamespace(
+        content=[_ThinkingBlock("..."), types.SimpleNamespace(text="answer")],
+        stop_reason="end_turn",
+    )
+    assert claude_extract._response_text(resp) == "answer"
+
+
+def test_response_text_names_the_shape_when_there_is_no_text_block():
+    """A bare "contained no text block" said nothing about WHY.
+
+    The two shapes that actually occur are a thinking-only response truncated at
+    max_tokens, and an empty content list. Both have to be distinguishable from
+    the persisted error string alone, with no access to the response object.
+    """
+    resp = types.SimpleNamespace(content=[_ThinkingBlock("...")], stop_reason="max_tokens")
+
+    with pytest.raises(ValueError) as excinfo:
+        claude_extract._response_text(resp)
+
+    message = str(excinfo.value)
+    assert "no text block" in message
+    assert "max_tokens" in message, "the stop_reason must survive into the log line"
+    assert "_ThinkingBlock" in message, "the block types must survive into the log line"
+
+
+def test_response_text_handles_an_empty_content_list():
+    """Zero blocks must raise the same diagnosable ValueError, never IndexError."""
+    resp = types.SimpleNamespace(content=[], stop_reason="max_tokens")
+
+    with pytest.raises(ValueError, match="no text block"):
+        claude_extract._response_text(resp)

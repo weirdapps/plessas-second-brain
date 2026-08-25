@@ -618,3 +618,67 @@ def test_extract_threads_stops_starting_work_once_the_deadline_passes(db, monkey
 
     assert calls == [], "no LLM call may start after the budget is spent"
     assert stats["deferred"] == 4
+
+
+# --- Regression: leading ThinkingBlock in the Teams thread response ------------
+#
+# _call_llm returned ``resp.content[0].text``, the same defect that cost 134
+# attachments and 86 calendar events. No teams_threads row has hit it yet
+# (extraction_error is NULL on all 6008), so this is preventive cover for the
+# sixth and last call site.
+
+
+class _ThinkingBlock:
+    def __init__(self, thinking: str) -> None:
+        self.thinking = thinking
+
+
+class _TextBlock:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _Response:
+    def __init__(self, *blocks, stop_reason="end_turn") -> None:
+        self.content = list(blocks)
+        self.stop_reason = stop_reason
+
+
+def _patch_teams_llm(monkeypatch, response):
+    from src.extract import claude_extract
+
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (object(), "m"))
+    monkeypatch.setattr(
+        "src.extract.vertex_fallback.create_with_refusal_fallback",
+        lambda *a, **k: response,
+    )
+
+
+def test_call_llm_reads_past_a_leading_thinking_block(monkeypatch):
+    """Mutation check: revert to resp.content[0].text and this raises AttributeError."""
+    from src.extract.teams_pipeline import _call_llm
+
+    _patch_teams_llm(
+        monkeypatch,
+        _Response(_ThinkingBlock("reading the thread"), _TextBlock('{"summary": "ok"}')),
+    )
+
+    assert _call_llm("sys", "user") == '{"summary": "ok"}'
+
+
+def test_call_llm_still_returns_a_plain_text_response(monkeypatch):
+    from src.extract.teams_pipeline import _call_llm
+
+    _patch_teams_llm(monkeypatch, _Response(_TextBlock('{"summary": "plain"}')))
+
+    assert _call_llm("sys", "user") == '{"summary": "plain"}'
+
+
+def test_call_llm_raises_diagnosably_on_a_thinking_only_response(monkeypatch):
+    """extract_threads' own try/except records this as extraction_error."""
+    from src.extract.teams_pipeline import _call_llm
+
+    _patch_teams_llm(monkeypatch, _Response(_ThinkingBlock("..."), stop_reason="max_tokens"))
+
+    with pytest.raises(ValueError, match="no text block"):
+        _call_llm("sys", "user")

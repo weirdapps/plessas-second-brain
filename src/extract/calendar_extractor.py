@@ -2,7 +2,7 @@
 
 import json
 
-from src.extract.claude_extract import _get_client_and_model, call_with_policy
+from src.extract.claude_extract import _get_client_and_model, _response_text, call_with_policy
 
 
 def parse_extraction_response(raw: str) -> dict:
@@ -114,8 +114,12 @@ Respond with ONLY the JSON object, no other text."""
 
     response = call_with_policy(_do_call, max_call_seconds=120.0)
 
-    # Extract text from response
-    raw_text = response.content[0].text
+    # First text block, never content[0]: extended thinking puts a ThinkingBlock there.
+    # 86 events failed this way between 2026-08-12 and 2026-08-24 (calendar-sync.log),
+    # on the same days as successful extractions, so the shape is intermittent rather
+    # than constant. Unlike attachments there is no llm_error column here, so the
+    # failure was visible only in the log.
+    raw_text = _response_text(response)
 
     # Parse response
     return parse_extraction_response(raw_text)

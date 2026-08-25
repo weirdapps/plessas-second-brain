@@ -205,7 +205,11 @@ def _extract_one_attachment(row):
     with the exception in hand, and hand the answer on.
     """
     from src.extract.attachment_prompt import build_attachment_prompt
-    from src.extract.claude_extract import _get_client_and_model, call_with_policy
+    from src.extract.claude_extract import (
+        _get_client_and_model,
+        _response_text,
+        call_with_policy,
+    )
     from src.extract.parser import parse_extraction
     from src.extract.policy_bridge import classify_exception
     from src.llm_policy import Outcome
@@ -240,7 +244,15 @@ def _extract_one_attachment(row):
         response = call_with_policy(_do_call, max_call_seconds=120.0)
         # Do not close: this is the shared client from _get_client_and_model.
 
-        raw_text = response.content[0].text
+        # _response_text, never content[0]. With extended thinking the model leads the
+        # content list with a ThinkingBlock, which carries .thinking and no .text, so
+        # content[0].text raised "'ThinkingBlock' object has no attribute 'text'".
+        # 134 attachments failed permanently that way between 2026-08-06 and 2026-08-25;
+        # llm_status='failed' is terminal because run_phase2 only re-selects 'pending'.
+        # A thinking-only response (max_tokens spent before any text) used to raise
+        # "IndexError: list index out of range" here, 3 rows; it now raises a ValueError
+        # naming stop_reason and the block types, which is diagnosable from llm_error.
+        raw_text = _response_text(response)
         if raw_text.startswith("```"):
             lines = raw_text.split("\n")
             raw_text = "\n".join(lines[1:-1])

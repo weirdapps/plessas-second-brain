@@ -396,3 +396,129 @@ def test_pipeline_connection_uses_60s_busy_timeout():
             assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         finally:
             conn.close()
+
+
+# --- Regression: leading ThinkingBlock in the Phase-2 response -----------------
+#
+# _extract_one_attachment read ``response.content[0].text``. With extended thinking
+# the model leads the content list with a ThinkingBlock, which exposes .thinking and
+# no .text, so every such call raised
+#
+#     AttributeError: 'ThinkingBlock' object has no attribute 'text'
+#
+# 134 rows in attachment_content.llm_error carried exactly that between 2026-08-06
+# and 2026-08-25. The status written is 'failed', and run_phase2 selects only
+# llm_status='pending', so each one was lost permanently rather than retried.
+
+
+class _ThinkingBlock:
+    """Stand-in for anthropic's ThinkingBlock: exposes .thinking, never .text."""
+
+    def __init__(self, thinking: str) -> None:
+        self.thinking = thinking
+
+
+class _TextBlock:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _Response:
+    def __init__(self, *blocks, stop_reason="end_turn") -> None:
+        self.content = list(blocks)
+        self.stop_reason = stop_reason
+
+
+def _run_one(row=None):
+    """Call the worker through a lazy import, as the auth test above does."""
+    from src.extract.attachment_pipeline import _extract_one_attachment
+
+    if row is None:
+        row = (1, 2, "some extracted text", "test.txt", "text/plain", 3, "Test email", "2026-01-01")
+    return _extract_one_attachment(row)
+
+
+def _patch_llm(monkeypatch, response):
+    """Point _extract_one_attachment's lazy imports at a fake client and parser."""
+
+    class FakeMessages:
+        def create(self, **kw):
+            return response
+
+    fake = type("Client", (), {"messages": FakeMessages()})()
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (fake, "m"))
+    monkeypatch.setattr(
+        "src.extract.attachment_prompt.build_attachment_prompt",
+        lambda **kw: "test prompt",
+    )
+    seen = {}
+
+    def _fake_parse(text, **kw):
+        seen["text"] = text
+        return {"summary": "ok", "language": "en"}
+
+    monkeypatch.setattr("src.extract.parser.parse_extraction", _fake_parse)
+    return seen
+
+
+def test_extract_one_attachment_reads_past_a_leading_thinking_block(monkeypatch):
+    """The 134-row production regression: a ThinkingBlock at [0] must not fail the row.
+
+    Mutation check: revert to ``response.content[0].text`` and this raises
+    AttributeError inside the broad except, so ``error`` is a string and the
+    ``error is None`` assertion fails.
+    """
+    seen = _patch_llm(
+        monkeypatch,
+        _Response(_ThinkingBlock("weighing the document"), _TextBlock('{"summary": "ok"}')),
+    )
+
+    _ac_id, _email_id, extraction, error, auth_error = _run_one()
+
+    assert error is None
+    assert extraction == {"summary": "ok", "language": "en"}
+    assert auth_error is False
+    assert seen["text"] == '{"summary": "ok"}', "must parse the text block, not the thinking block"
+
+
+def test_extract_one_attachment_still_parses_a_plain_text_response(monkeypatch):
+    """No thinking block, and a fenced payload: unchanged behaviour."""
+    seen = _patch_llm(
+        monkeypatch,
+        _Response(_TextBlock('```json\n{"summary": "ok"}\n```')),
+    )
+
+    _ac_id, _email_id, extraction, error, _auth = _run_one()
+
+    assert error is None
+    assert extraction["summary"] == "ok"
+    assert seen["text"] == '{"summary": "ok"}', "the fence must still be stripped"
+
+
+def test_extract_one_attachment_reports_a_thinking_only_response_diagnosably(monkeypatch):
+    """max_tokens spent entirely on thinking: no text block at all.
+
+    Before the fix this shape produced ``IndexError: list index out of range``
+    (3 rows, all image/png) or an AttributeError, neither of which said why.
+    The error string is what lands in attachment_content.llm_error, so it has to
+    name the stop_reason and the block types.
+    """
+    _patch_llm(monkeypatch, _Response(_ThinkingBlock("..."), stop_reason="max_tokens"))
+
+    _ac_id, _email_id, extraction, error, auth_error = _run_one()
+
+    assert extraction is None
+    assert auth_error is False, "a truncated response is not an auth failure"
+    assert error.startswith("ValueError: ")
+    assert "max_tokens" in error
+    assert "_ThinkingBlock" in error
+
+
+def test_extract_one_attachment_reports_an_empty_content_list_diagnosably(monkeypatch):
+    """Zero blocks must not resurrect the IndexError."""
+    _patch_llm(monkeypatch, _Response(stop_reason="max_tokens"))
+
+    _ac_id, _email_id, extraction, error, _auth = _run_one()
+
+    assert extraction is None
+    assert error.startswith("ValueError: "), f"IndexError is back: {error}"

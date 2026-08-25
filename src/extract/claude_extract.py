@@ -44,7 +44,16 @@ def _response_text(response) -> str:
         text = getattr(block, "text", None)
         if text is not None:
             return text
-    raise ValueError("LLM response contained no text block")
+    # Name the shape in the message. This string is what lands in
+    # attachment_content.llm_error and in the sync logs, and the bare version said
+    # nothing about WHY there was no text. image_vision's equivalent already carries
+    # stop_reason and block types, and that is exactly what made the vision case
+    # (stop_reason='max_tokens', blocks=['ThinkingBlock']) diagnosable from the log.
+    raise ValueError(
+        "LLM response contained no text block "
+        f"(stop_reason={getattr(response, 'stop_reason', 'unknown')!r}, "
+        f"blocks={[type(b).__name__ for b in response.content]})"
+    )
 
 
 # The extraction client is built once and shared across the whole run. A fresh

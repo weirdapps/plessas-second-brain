@@ -1281,6 +1281,88 @@ def build_html(text_report, issues):
 </div>"""
 
 
+# Healthchecks slug for the data-freshness signal, pinged only when --hc-ping is
+# passed. Distinct from the 'sb-health-check' check, which says only that the
+# reporter RAN: this one says the data the reporter looked at is fresh. The check
+# already exists in Healthchecks, so no '?create=1' here. Auto-provision is what
+# left eleven checks on the 'every minute / 1d timeout / UTC' default, and this
+# must not add a twelfth.
+FRESHNESS_SLUG = "sb-brain-freshness"
+
+
+def freshness_verdict(checks, sentinels):
+    """(ok, detail) for the data-freshness ping.
+
+    STALE only. Two things are deliberately NOT failures here:
+
+    WARN, because it is a quality signal (Teams coverage share, inline-image
+    queue depth) that the nightly email already carries in full, and because
+    alert volume is the standing problem: 64% of the Healthchecks mail in the 30
+    days to 2026-08-25 described a condition that self-resolved within two hours.
+    A dead-man's switch that fires on quality drift stops being read, which is
+    how a genuine 14-day red went unnoticed on this very check.
+
+    A blocking sentinel, because setting one is the sanctioned way to degrade
+    gracefully while a re-auth is pending. Failing on the sentinel would put this
+    check red for the whole latch period, which is precisely the outcome the
+    owner ruled out when the same question was asked of the sync jobs' exit
+    codes. If the latch lasts long enough to matter, the affected source crosses
+    its own STALE threshold (Teams: 24h on message recency, 8h on last poll) and
+    the ping goes red then, on evidence rather than on intent.
+
+    ``sentinels`` is accepted and unused for exactly that reason: the argument
+    documents the decision at the call site instead of hiding it.
+    """
+    stale = sorted(c["name"] for c in checks if c.get("status") == "STALE")
+    if stale:
+        return False, "stale: " + ", ".join(stale)
+    return True, f"{len(checks)} sources fresh"
+
+
+def ping_freshness(ok, detail, slug=FRESHNESS_SLUG):
+    """Fire-and-forget freshness ping. Never raises, never changes the exit code.
+
+    Same curl invocation as hc-success@.service, so the retry and timeout
+    behaviour is identical to every other ping on the box.
+
+    curl's own stderr is never printed: -fsS writes the failing URL into it, and
+    that URL carries the Healthchecks ping key. Only the exit code is logged.
+    """
+    base = os.environ.get("HC_PING_URL")
+    if not base:
+        print("HC_PING_URL not set, skipping freshness ping.", file=sys.stderr)
+        return False
+
+    url = f"{base.rstrip('/')}/{slug}" + ("" if ok else "/fail")
+    try:
+        result = subprocess.run(
+            [
+                "curl",
+                "-fsS",
+                "-m",
+                "10",
+                "--retry",
+                "3",
+                "-o",
+                "/dev/null",
+                "--data-binary",
+                "@-",
+                url,
+            ],
+            input=detail[:10000],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception as e:
+        print(f"Freshness ping failed: {type(e).__name__}", file=sys.stderr)
+        return False
+    if result.returncode != 0:
+        print(f"Freshness ping failed: curl exit {result.returncode}", file=sys.stderr)
+        return False
+    return True
+
+
 def send_email(html_body, issues):
     """Send via outlook-cli (--html takes a file path). Requires HEALTH_EMAIL_TO."""
     import tempfile
@@ -1345,6 +1427,14 @@ def main():
         help="Send report via email only when unresolved issues remain (quiet on healthy runs)",
     )
     parser.add_argument("--fix", action="store_true", help="Auto-fix detected issues")
+    parser.add_argument(
+        "--hc-ping",
+        action="store_true",
+        help=(
+            "Report data freshness to Healthchecks (needs HC_PING_URL). Off by default "
+            "so an ad-hoc manual run cannot reset the dead-man's switch."
+        ),
+    )
     args = parser.parse_args()
 
     db = get_db()
@@ -1397,6 +1487,11 @@ def main():
 
     text_report, issues = build_report(checks, jobs, logs, sentinels, fix_actions)
     print(text_report)
+
+    # Before the email, not after: a send_email failure exits 1, and the ping is
+    # the dead-man's switch for the data, not for the mail.
+    if args.hc_ping:
+        ping_freshness(*freshness_verdict(checks, sentinels))
 
     if args.email or (args.email_if_issues and issues):
         html = build_html(text_report, issues)

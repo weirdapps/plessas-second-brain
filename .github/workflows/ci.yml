@@ -34,7 +34,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
       - name: PII gauntlet
-        run: bash scripts/pii-gauntlet.sh
+        # --mode=ci, not the default doctor mode. Doctor mode treats a missing
+        # private denylist as a misconfiguration and fails, which is right on a
+        # workstation and wrong here: the denylist lives in a private repo and
+        # can never exist on a public runner. CI mode still runs every generic
+        # org-tell check and prints an explicit SKIP for the name-based ones, so
+        # this narrows nothing that CI was ever able to evaluate.
+        run: bash scripts/pii-gauntlet.sh --mode=ci
   wrappers:
     # Syntax-only gate over the archived scheduler wrappers. Parses each script
     # with the interpreter its shebang names — sync-documents-to-vps.sh is run by

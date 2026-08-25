@@ -31,3 +31,8 @@ venv
 
 # Superpowers SDD scratch (ledger, briefs, reports, review packages)
 .superpowers/
+
+# Coverage artefacts. `.coverage` is a file and `htmlcov/` a directory,
+# so both forms are needed; a bare `htmlcov` would not match the directory.
+.coverage.*
+htmlcov/

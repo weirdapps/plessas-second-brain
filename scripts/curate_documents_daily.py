@@ -70,7 +70,7 @@ NOISE_SUBJECT_PATTERNS = [
 # and NOISE_SENDERS are intentionally absent from this public file.
 # They live in a private configuration file that must be present at runtime.
 #
-# Canonical location: ~/SourceCode/claude-config/private/curate-taxonomy.py
+# Canonical location: a private config repo (path intentionally not published)
 # (synced from the private claude-config repo; auto-deployed to the VPS by
 # repo-autoupdate.timer at 05:43 UTC).  On a Mac with the standard claude-config
 # symlink setup, ~/.claude/private/curate-taxonomy.py resolves to the same file.

@@ -34,9 +34,7 @@ _INTEGRITY_RE = re.compile(
     r"INTEGRITY=\$\(\s*sqlite3\s+(?P<flags>.*?)\"\$LOCAL_DATA/brain\.db\"\s+'PRAGMA quick_check;'"
 )
 
-pytestmark = pytest.mark.skipif(
-    shutil.which("sqlite3") is None, reason="sqlite3 CLI not installed"
-)
+pytestmark = pytest.mark.skipif(shutil.which("sqlite3") is None, reason="sqlite3 CLI not installed")
 
 
 def _integrity_flags() -> list[str]:

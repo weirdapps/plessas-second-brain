@@ -112,12 +112,19 @@ fi
 # an integrity check. quick_check walks the b-trees and is the cheap form of
 # integrity_check (it skips the slow freelist and index-content passes).
 #
-# `-readonly`, NOT a `file:...?mode=ro` URI: macOS ships /usr/bin/sqlite3 built
-# without SQLITE_USE_URI, so the URI form returns "unable to open database file
-# (14)" on a perfectly healthy file. That would have made this check fail every
-# single run, which is the same bug as the one it is here to catch, pointed the
-# other way.
-INTEGRITY=$(sqlite3 -readonly "$LOCAL_DATA/brain.db" 'PRAGMA quick_check;' 2>&1 | head -3 | tr '\n' ' ')
+# Plain open: NOT `-readonly`, and NOT a `file:...?mode=ro` URI. Both of those
+# return "unable to open database file (14)" on a perfectly healthy file, for two
+# unrelated reasons:
+#   * the URI form, because macOS ships /usr/bin/sqlite3 without SQLITE_USE_URI;
+#   * `-readonly`, because brain.db is in WAL mode and the rsync above copies the
+#     database file alone, no `-shm`. A read-only open may not create the `-shm`
+#     it needs, so it cannot open a freshly copied WAL database at all.
+# `-readonly` shipped on 2026-08-25 and failed all 21 runs it ever made: exactly
+# the always-fails bug the URI note warns about, reached by a second road. Guard
+# against the third by asserting on a healthy file, not by reasoning about flags.
+# A read-write open recreates the `-shm`, and is how the MCP server opens this
+# file anyway, so the check now reads the copy the way its only consumer does.
+INTEGRITY=$(sqlite3 "$LOCAL_DATA/brain.db" 'PRAGMA quick_check;' 2>&1 | head -3 | tr '\n' ' ')
 if [ "${INTEGRITY% }" != "ok" ]; then
   log "ERROR: local brain.db FAILED integrity check: ${INTEGRITY}"
   INTEGRITY_RC=1

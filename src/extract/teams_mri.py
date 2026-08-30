@@ -122,6 +122,43 @@ def resolve_mris(conn: sqlite3.Connection, max_per_run: int = 50) -> dict:
             else:
                 retry_fail += 1
 
+    # Back-link every message whose sender is already in the cache, not just the
+    # ones the loop above happened to resolve this run. The per-MRI UPDATE inside
+    # the loop only saw the messages that existed at resolution time, and the
+    # candidate query deliberately skips MRIs already at status='resolved', so
+    # that MRI is never revisited; teams_export doesn't set the column at INSERT
+    # time either. Every message arriving after its sender was resolved therefore
+    # stayed NULL forever (measured: 10,210 rows, 42% of attributable traffic).
+    # Set-based and idempotent, and OUTSIDE the loop on purpose: the common case
+    # is a warm cache with nothing new to resolve, which is exactly when the
+    # arrears pile up.
+    #
+    # The EXISTS on people(id) is not decoration. sender_person_id REFERENCES
+    # people(id), and a teams_mri_resolution.person_id can outlive the people row
+    # that dedup merged away, so without it this statement plants a dangling
+    # foreign key. It guards both halves: the value written and the rows chosen.
+    conn.execute(
+        """
+        UPDATE teams_messages
+           SET sender_person_id = (
+                 SELECT r.person_id
+                   FROM teams_mri_resolution r
+                  WHERE r.mri = teams_messages.sender_mri
+                    AND r.status = 'resolved'
+                    AND r.person_id IS NOT NULL
+                    AND EXISTS (SELECT 1 FROM people p WHERE p.id = r.person_id)
+               )
+         WHERE sender_person_id IS NULL
+           AND sender_mri IN (
+                 SELECT r.mri
+                   FROM teams_mri_resolution r
+                  WHERE r.status = 'resolved'
+                    AND r.person_id IS NOT NULL
+                    AND EXISTS (SELECT 1 FROM people p WHERE p.id = r.person_id)
+               )
+        """
+    )
+
     conn.commit()
     return {
         "resolved": resolved,

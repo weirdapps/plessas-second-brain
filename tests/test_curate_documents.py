@@ -10,12 +10,20 @@ on 2026-08-11: every classification failed with
 
     classify error for id=31376: 'ThinkingBlock' object has no attribute 'text'
 
+Regression cover, too, for the two defects that made the job eat itself
+(measured 2026-08-30): it re-offered its own placed output back to itself
+through the reverse-ingest pipeline, and it marked a candidate processed
+BEFORE the soft-cap check, so a full folder destroyed the document instead of
+postponing it.
+
 The script loads its organisational taxonomy from a private file outside the
 repo, so these tests stand up a stub taxonomy under a temporary HOME and load
 the script the way tests/test_health_check.py loads its script.
 """
 
 import importlib.util
+import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -201,3 +209,301 @@ def test_missing_taxonomy_file_exits_loud(tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as excinfo:
         spec.loader.exec_module(module)
     assert "curate-taxonomy.py" in str(excinfo.value)
+
+
+# --- The feedback loop and the cap burn ----------------------------------
+
+
+class _FakeClient:
+    """AnthropicVertex stand-in: main() only ever calls close() on it."""
+
+    def close(self) -> None:
+        pass
+
+
+def _seed_candidate(conn, src_dir, *, row_id, filename, mailbox_name, message_id):
+    """Insert one candidate that satisfies every clause of the real query.
+
+    Only the columns query_new_candidates reads are modelled; the real schema
+    lives in src/store/schema.py and is far wider.
+    """
+    src = src_dir / f"{row_id}_{filename}"
+    src.write_bytes(b"pdf bytes")
+    conn.execute(
+        "INSERT INTO emails (id, message_id, date_received, sender_address, subject, mailbox_name) "
+        "VALUES (?, ?, '2026-08-11T09:00:00', 'someone@example.com', 'quarterly deck', ?)",
+        (row_id, message_id, mailbox_name),
+    )
+    conn.execute(
+        "INSERT INTO attachments "
+        "(id, email_id, filename, mime_type, file_size, file_path, is_inline) "
+        "VALUES (?, ?, ?, 'application/pdf', 900000, ?, 0)",
+        (row_id, row_id, filename, str(src)),
+    )
+    conn.execute(
+        "INSERT INTO attachment_content (attachment_id, summary, llm_status) "
+        "VALUES (?, ?, 'extracted')",
+        (row_id, "s" * 400),
+    )
+
+
+@pytest.fixture
+def brain(curate, tmp_path, monkeypatch):
+    """A three-table stand-in store, wired into the loaded script."""
+    db = tmp_path / "brain.db"
+    src_dir = tmp_path / "exported"
+    src_dir.mkdir()
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE emails (
+            id INTEGER PRIMARY KEY,
+            message_id INTEGER UNIQUE NOT NULL,
+            date_received TEXT NOT NULL,
+            sender_address TEXT,
+            subject TEXT,
+            mailbox_name TEXT
+        );
+        CREATE TABLE attachments (
+            id INTEGER PRIMARY KEY,
+            email_id INTEGER REFERENCES emails(id),
+            filename TEXT NOT NULL,
+            mime_type TEXT,
+            file_size INTEGER,
+            file_path TEXT NOT NULL,
+            is_inline INTEGER DEFAULT 0
+        );
+        CREATE TABLE attachment_content (
+            id INTEGER PRIMARY KEY,
+            attachment_id INTEGER NOT NULL,
+            summary TEXT,
+            llm_status TEXT NOT NULL DEFAULT 'pending'
+        );
+    """)
+    conn.commit()
+    monkeypatch.setattr(curate, "DB", db)
+    (curate.DOCS / "Area").mkdir(parents=True)
+    yield type("Brain", (), {"conn": conn, "src_dir": src_dir, "path": db})
+    conn.close()
+
+
+def _fill(curate, folder: str, count: int) -> None:
+    """Put `count` unrelated files in a managed folder, as the operator would."""
+    target = curate.DOCS / folder
+    target.mkdir(parents=True, exist_ok=True)
+    for i in range(count):
+        (target / f"existing_{i}.pdf").write_bytes(b"x")
+
+
+def _run(curate, monkeypatch, verdicts, max_new=30) -> list[int]:
+    """Drive main() end to end with a stubbed LLM.
+
+    Returns the candidate ids that actually reached the classifier, which is
+    what the forward-progress assertion turns on.
+    """
+    seen: list[int] = []
+
+    def fake_classify(client, model, c):
+        seen.append(c["id"])
+        return verdicts[c["id"]]
+
+    monkeypatch.setattr(curate, "install_llm_deadline_for_this_process", lambda: None)
+    monkeypatch.setattr(curate, "get_client", lambda: (_FakeClient(), "model"))
+    monkeypatch.setattr(curate, "classify_one", fake_classify)
+    monkeypatch.setattr(curate, "summarize_folder", lambda *a, **k: {"purpose": "stub"})
+    monkeypatch.setattr(sys, "argv", ["curate_documents_daily.py", "--max-new", str(max_new)])
+    assert curate.main() == 0
+    return seen
+
+
+def _state(curate) -> dict:
+    return json.loads(curate.STATE.read_text())
+
+
+def _placed(curate, folder: str) -> list[str]:
+    """Files this run copied in: not the operator's, not the generated README."""
+    target = curate.DOCS / folder
+    if not target.exists():
+        return []
+    return sorted(
+        f.name
+        for f in target.iterdir()
+        if not f.name.startswith("existing_") and f.name != "README.md"
+    )
+
+
+def test_reverse_ingested_output_is_not_a_candidate(curate, brain):
+    """curate's own placed files come back as mailbox_name='External' rows.
+
+    sb-reverse-ingest scans ~/Documents and loads every file it finds through
+    ingest_document(), which stamps a synthetic anchor with mailbox_name
+    'External' and a negative message_id. Those rows used to satisfy every
+    clause of the candidate query, so the job re-classified and re-placed its
+    own output under a second "[Document] " prefix.
+    """
+    _seed_candidate(
+        brain.conn,
+        brain.src_dir,
+        row_id=2,
+        filename="202608110900_placed_deck.pdf",
+        mailbox_name="External",
+        message_id=-4242424242,
+    )
+    brain.conn.commit()
+    assert curate.query_new_candidates(set(), 10) == []
+
+
+def test_a_normal_email_attachment_is_still_a_candidate(curate, brain):
+    """The exclusion must be narrow: real mail carries TEXT message_ids."""
+    _seed_candidate(
+        brain.conn,
+        brain.src_dir,
+        row_id=1,
+        filename="email_deck.pdf",
+        mailbox_name="Inbox",
+        message_id="AAMkADk1ZTRiexample",
+    )
+    _seed_candidate(
+        brain.conn,
+        brain.src_dir,
+        row_id=2,
+        filename="202608110900_placed_deck.pdf",
+        mailbox_name="External",
+        message_id=-4242424242,
+    )
+    brain.conn.commit()
+    assert [c["id"] for c in curate.query_new_candidates(set(), 10)] == [1]
+
+
+def test_a_parked_candidate_stops_being_retried_at_the_cap(curate, brain):
+    """The bound: headroom is no longer enough once the retries are spent.
+
+    attempts only climbs when several candidates chase the same nearly-full
+    folder in one run, so this is the backstop against that churn repeating
+    twice a day for good.
+    """
+    _seed_candidate(
+        brain.conn,
+        brain.src_dir,
+        row_id=1,
+        filename="email_deck.pdf",
+        mailbox_name="Inbox",
+        message_id="AAMkADk1ZTRiexample",
+    )
+    brain.conn.commit()
+    assert curate.DOCS.joinpath("Area/one").exists() is False  # all the headroom there is
+
+    spent = {"1": {"folder": "Area/one", "attempts": curate.MAX_DEFER_ATTEMPTS}}
+    assert curate.query_new_candidates(set(), 10, spent) == []
+    one_left = {"1": {"folder": "Area/one", "attempts": curate.MAX_DEFER_ATTEMPTS - 1}}
+    assert [c["id"] for c in curate.query_new_candidates(set(), 10, one_left)] == [1]
+
+
+def test_cap_rejected_candidate_is_deferred_not_burned(curate, brain, monkeypatch):
+    """A full folder is a fact about the DESTINATION, never about the document.
+
+    287 distinct documents were dropped and permanently flagged processed this
+    way in August 2026, because processed.add() ran before the cap check.
+    """
+    _seed_candidate(
+        brain.conn,
+        brain.src_dir,
+        row_id=1,
+        filename="email_deck.pdf",
+        mailbox_name="Inbox",
+        message_id="AAMkADk1ZTRiexample",
+    )
+    brain.conn.commit()
+    _fill(curate, "Area/one", curate.SOFT_CAPS["Area/one"])
+
+    assert _run(curate, monkeypatch, {1: {"folder": "Area/one", "confidence": "high"}}) == [1]
+
+    state = _state(curate)
+    assert state["processed_ids"] == []
+    assert state["deferred"]["1"]["folder"] == "Area/one"
+    assert state["deferred"]["1"]["attempts"] == 1
+    assert _placed(curate, "Area/one") == []
+
+
+def test_deferred_candidate_returns_when_the_folder_has_headroom(curate, brain, monkeypatch):
+    """Once the operator prunes the folder, the parked document must land."""
+    _seed_candidate(
+        brain.conn,
+        brain.src_dir,
+        row_id=1,
+        filename="email_deck.pdf",
+        mailbox_name="Inbox",
+        message_id="AAMkADk1ZTRiexample",
+    )
+    brain.conn.commit()
+    _fill(curate, "Area/one", curate.SOFT_CAPS["Area/one"])
+    verdicts = {1: {"folder": "Area/one", "confidence": "high"}}
+    _run(curate, monkeypatch, verdicts)
+
+    (curate.DOCS / "Area/one" / "existing_0.pdf").unlink()
+    assert _run(curate, monkeypatch, verdicts) == [1]
+
+    assert _placed(curate, "Area/one") == ["202608110900_email_deck.pdf"]
+    state = _state(curate)
+    assert state["processed_ids"] == [1]
+    assert state["deferred"] == {}
+
+
+def test_a_full_folder_does_not_stall_forward_progress(curate, brain, monkeypatch):
+    """The regression the naive fix would have caused.
+
+    Candidates are ordered id DESC, so a blocked candidate left in the main
+    stream is re-offered first on every run forever: no progress into the
+    thousands of never-seen candidates, and a wasted classification call per
+    run. Parking it must take it OUT of the stream while its folder is full.
+    """
+    _seed_candidate(
+        brain.conn,
+        brain.src_dir,
+        row_id=1,
+        filename="second_deck.pdf",
+        mailbox_name="Inbox",
+        message_id="AAMkADk1ZTRiexampleone",
+    )
+    _seed_candidate(
+        brain.conn,
+        brain.src_dir,
+        row_id=3,
+        filename="blocked_deck.pdf",
+        mailbox_name="Inbox",
+        message_id="AAMkADk1ZTRiexampletwo",
+    )
+    brain.conn.commit()
+    _fill(curate, "Area/one", curate.SOFT_CAPS["Area/one"])
+    verdicts = {
+        3: {"folder": "Area/one", "confidence": "high"},
+        1: {"folder": "Area/two", "confidence": "high"},
+    }
+
+    assert _run(curate, monkeypatch, verdicts, max_new=1) == [3]
+    assert _run(curate, monkeypatch, verdicts, max_new=1) == [1]
+
+    assert _placed(curate, "Area/two") == ["202608110900_second_deck.pdf"]
+    assert _state(curate)["deferred"]["3"]["attempts"] == 1
+
+
+def test_low_confidence_is_still_recorded_as_processed(curate, brain, monkeypatch):
+    """Unchanged semantics: a weak verdict is a property of the document."""
+    _seed_candidate(
+        brain.conn,
+        brain.src_dir,
+        row_id=1,
+        filename="email_deck.pdf",
+        mailbox_name="Inbox",
+        message_id="AAMkADk1ZTRiexample",
+    )
+    brain.conn.commit()
+    verdicts = {1: {"folder": "Area/one", "confidence": "low"}}
+
+    assert _run(curate, monkeypatch, verdicts) == [1]
+    state = _state(curate)
+    assert state["processed_ids"] == [1]
+    assert state["deferred"] == {}
+    assert _placed(curate, "Area/one") == []
+
+    # Second run must not re-decide it: no classification call at all.
+    assert _run(curate, monkeypatch, verdicts) == []

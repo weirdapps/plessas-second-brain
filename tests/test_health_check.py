@@ -14,7 +14,7 @@ check_jobs() now dispatches per-platform; these tests guard both.
 import importlib.util
 import os
 import sys
-from datetime import UTC
+from datetime import UTC, timedelta
 from pathlib import Path
 
 import pytest
@@ -565,6 +565,58 @@ def test_check_images_reports_last_vision_output(hc):
     _image_row(db, "content", days_old=20, visioned=True)
 
     assert hc.check_images(db)["latest_vision"] == "2026-07-27T23:08:09Z"
+
+
+# --- Coverage is a ceiling, not a shortfall ----------------------------------
+# `pct` divided descriptions by EVERY inline image, including the signature and
+# noise rows stage 1 short-circuits before vision is ever invoked. On prod that
+# printed "87% classified" against 937 rows that were never owed, reading as a
+# permanent 13% backlog that could only worsen as more signatures arrived. Worse,
+# it drove a `pct < 50` WARN: the exact "alarm on work that can never drain"
+# mistake already fixed for `pending`. Counts replace it.
+
+
+def test_check_images_reports_skipped_rows_as_policy_not_backlog(hc):
+    """The eligible population is fully described; the remainder is not owed."""
+    db = _images_db()
+    _image_row(db, "content", days_old=20, visioned=True)
+    _image_row(db, "content", days_old=20, visioned=True)
+    for _ in range(8):
+        _image_row(db, "signature", days_old=90)
+
+    r = hc.check_images(db)
+
+    assert r["skipped"] == 8
+    assert r["eligible"] == 2
+    assert r["described_eligible"] == 2
+    assert r["owed"] == 0, "nothing is owed when every eligible image is described"
+    assert r["status"] == "OK"
+
+
+def test_check_images_does_not_warn_on_a_corpus_that_is_mostly_signatures(hc):
+    """The regression this replaces: enough signatures drag `pct` under 50 and the
+    row goes WARN for ever, with a healthy pipeline and an empty queue."""
+    db = _images_db()
+    _image_row(db, "content", days_old=20, visioned=True)
+    for _ in range(20):
+        _image_row(db, "signature", days_old=90)
+
+    r = hc.check_images(db)
+
+    assert r["pct"] < 50, "fixture must reproduce the condition that used to trip the alarm"
+    assert r["status"] == "OK", "coverage below 50% is not a fault when the shortfall cannot drain"
+
+
+def test_check_images_still_counts_eligible_work_as_owed(hc):
+    """The counts must not be a softer alarm: eligible-but-undescribed is real."""
+    db = _images_db()
+    _image_row(db, "content", days_old=20, visioned=True)
+    _image_row(db, "unclassified", days_old=1)
+
+    r = hc.check_images(db)
+
+    assert r["owed"] == 1
+    assert r["skipped"] == 0
 
 
 # --- Source-side freshness ---------------------------------------------------
@@ -1577,6 +1629,48 @@ def test_check_sharepoint_ok_when_only_capped_links_are_resting(hc):
     assert hc.check_sharepoint(db)["status"] == "OK"
 
 
+# --- Abandoned links must be counted, not inferred from silence -------------
+# `overdue` deliberately ignores links past the attempt cap, on the grounds that
+# they are resting inside a cool-off. But a never-fetched link past the cap is
+# excluded from retry_candidates permanently, so it ages out of `overdue` and the
+# row returns to OK with the link still missing. Prod carried 23 of them for
+# weeks: not deleted documents, but URLs the extractor had mangled.
+
+
+def test_check_sharepoint_counts_links_it_has_given_up_on(hc):
+    db = _sp_db(attempts=5, ok=100, stale=23)
+
+    r = hc.check_sharepoint(db)
+
+    assert r["given_up"] == 23
+
+
+def test_check_sharepoint_does_not_count_links_still_inside_their_budget(hc):
+    """A link with retries left is queued work, not abandoned work."""
+    db = _sp_db(attempts=2, ok=100, stale=23)
+
+    assert hc.check_sharepoint(db)["given_up"] == 0
+
+
+def test_check_sharepoint_does_not_count_successful_links_as_given_up(hc):
+    """`fetched_at` is what distinguishes them: attempts alone would count a link
+    that failed four times and then succeeded."""
+    db = _sp_db(attempts=9, ok=100)
+
+    assert hc.check_sharepoint(db)["given_up"] == 0
+
+
+def test_report_names_given_up_links_as_no_longer_retried(hc):
+    """ "unfetched" reads as "not yet". For these it means never, and the report
+    has to say so or they stay indistinguishable from queued work."""
+    db = _sp_db(attempts=5, ok=100, stale=23)
+
+    report, _ = hc.build_report([hc.check_sharepoint(db)], {}, {}, {}, [])
+
+    assert "23 given up" in report
+    assert "no longer retried" in report
+
+
 def test_check_sharepoint_ok_when_eligible_links_were_tried_recently(hc):
     db = _sp_db(ok=100, http_error=1, attempted_days_ago=0, attempts=1)
 
@@ -1646,10 +1740,10 @@ def test_sharepoint_attempt_cap_matches_the_fetcher(hc):
 
 def test_check_sharepoint_token_reports_capture_age(hc, tmp_path):
     """The age column is the report's at-a-glance "is this source asserted on?"
-    signal — every '?' in it marked a check that could not go red. SP Session is
-    the one genuine exception (it asserts on time-to-expiry, not on age), so it
-    must still show its capture age rather than a bare '?' that reads identical
-    to a blind check."""
+    signal, and every '?' in it marked a check that could not go red. SP Session
+    must therefore show its capture age rather than a bare '?' that reads
+    identical to a blind check. (It now asserts on that age as well: see
+    test_sharepoint_token_warns_when_renewal_stops_though_expiry_is_far_off.)"""
     import json
     from datetime import datetime, timedelta
 
@@ -1675,6 +1769,64 @@ def test_check_sharepoint_token_without_capture_stamp_has_no_age(hc, tmp_path):
 
     assert r["age"] is None
     assert r["status"] == "OK"
+
+
+# --- A rolling session hides a dead renewer ----------------------------------
+# tokenExpiresAt is a five-day cookie that the laptop re-mints every 15 minutes,
+# so it reads ~5d whether renewal is healthy or stopped an hour ago, and only
+# begins to fall a full day after the renewer dies. Judged on expiry alone this
+# row stays green for four of the five days it has left. Capture age is the
+# signal with the short fuse, and it was displayed but never asserted on.
+
+
+def _sp_session(dir_path, expires_at, captured_at=None):
+    import json
+
+    p = dir_path / "sharepoint-session.json"
+    body = {"host": "contoso.sharepoint.com", "tokenExpiresAt": expires_at}
+    if captured_at is not None:
+        body["capturedAt"] = captured_at
+    p.write_text(json.dumps(body))
+    return p
+
+
+def test_sharepoint_token_warns_when_renewal_stops_though_expiry_is_far_off(hc, tmp_path):
+    """The blind spot: four days of runway left, and nobody renewing it."""
+    from datetime import datetime
+
+    now = datetime(2026, 7, 3, tzinfo=UTC)
+    p = _sp_session(tmp_path, "2026-07-07T00:00:00.000Z", captured_at="2026-07-01T00:00:00.000Z")
+
+    r = hc.check_sharepoint_token(path=p, now=now)
+
+    assert r["stale_capture"] is True
+    assert r["status"] == "WARN", "a session nobody is renewing must not read OK for four more days"
+
+
+def test_sharepoint_token_healthy_rolling_session_stays_quiet(hc, tmp_path):
+    """The steady state is permanently ~5d out and minutes old. If that is not
+    silent the row is noise every single night and stops being read at all."""
+    from datetime import datetime
+
+    now = datetime(2026, 7, 3, tzinfo=UTC)
+    p = _sp_session(tmp_path, "2026-07-08T00:00:00.000Z", captured_at="2026-07-02T23:45:00.000Z")
+
+    r = hc.check_sharepoint_token(path=p, now=now)
+
+    assert r["stale_capture"] is False
+    assert r["status"] == "OK"
+
+
+def test_sharepoint_token_warns_two_days_out_not_one(hc, tmp_path):
+    """Expiry inside 48h is a WARN even with a fresh capture. At a 15-minute
+    cadence, an expiry this close means renewal has been failing for three days;
+    the old 24h gate left a single day to notice and act."""
+    from datetime import datetime
+
+    now = datetime(2026, 7, 3, tzinfo=UTC)
+    p = _sp_session(tmp_path, "2026-07-04T12:00:00.000Z", captured_at="2026-07-02T23:45:00.000Z")
+
+    assert hc.check_sharepoint_token(path=p, now=now)["status"] == "WARN"
 
 
 # --- Job health is not verifiable from the Mac -------------------------------
@@ -1964,3 +2116,433 @@ def test_ping_freshness_never_raises_and_never_echoes_curl_stderr(hc, monkeypatc
     captured = capsys.readouterr()
     assert "SECRETKEY" not in captured.err + captured.out
     assert "curl exit 22" in captured.err
+
+
+# --- The migration marker did not survive a LaunchAgents rebuild -------------
+# _is_migrated() keyed suppression on a FILENAME. Every plist on this Mac was
+# re-laid on 2026-08-28 and the nine `*.plist.disabled-migrated-to-vps` markers
+# went with it, so all nine jobs reported NOT_LOADED, jobs_elsewhere went False,
+# and twelve pre-migration relic logs became twelve permanent false issues on
+# every Mac-side run. Underneath that noise the Mac asserted on nothing it
+# actually owns: db-pull had neither a job status nor a log-age signal, and a
+# failing pull is precisely what corrupted the replica on 2026-08-29.
+#
+# The replacement evidence has to be something the migrated topology PRODUCES,
+# and it has to be timestamped so the suppression expires instead of latching.
+
+
+def _replica(tmp_path, days_ago=0):
+    import os
+    from datetime import datetime, timedelta
+
+    p = tmp_path / "brain.db"
+    p.write_bytes(b"x")
+    when = (datetime.now() - timedelta(days=days_ago)).timestamp()
+    os.utime(p, (when, when))
+    return p
+
+
+def _migrated_label(hc):
+    """A label that is genuinely absent from the real LaunchAgents dir."""
+    return f"{hc.LABEL_PREFIX}.attachments"
+
+
+def test_is_migrated_accepts_a_freshly_received_replica(hc, tmp_path):
+    """A host whose corpus arrives by rsync is not the host that produced it."""
+    assert (
+        hc._is_migrated(
+            _migrated_label(hc),
+            agents_dir=hc.LAUNCH_AGENTS_DIR,
+            db_path=_replica(tmp_path),
+        )
+        is True
+    )
+
+
+def test_is_migrated_expires_when_the_replica_goes_stale(hc, tmp_path):
+    """Suppression must not latch. A Mac that stopped receiving a corpus has no
+    evidence anything runs anywhere and must go loud rather than stay quiet."""
+    assert (
+        hc._is_migrated(
+            _migrated_label(hc),
+            agents_dir=hc.LAUNCH_AGENTS_DIR,
+            db_path=_replica(tmp_path, days_ago=8),
+        )
+        is False
+    )
+
+
+def test_is_migrated_never_suppresses_a_job_this_host_owns(hc, tmp_path):
+    """db-pull IS the pull. Suppressing it on the strength of its own output
+    would make the one job the Mac still runs unfailable."""
+    for label in hc.LAUNCHD_LOCAL_JOBS:
+        assert (
+            hc._is_migrated(label, agents_dir=hc.LAUNCH_AGENTS_DIR, db_path=_replica(tmp_path))
+            is False
+        )
+
+
+def test_is_migrated_still_defers_to_an_installed_plist(hc, tmp_path):
+    """Unchanged guard: a Mac that still runs a job locally owns it, replica or no."""
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    label = f"{hc.LABEL_PREFIX}.attachments"
+    (agents / f"{label}.plist").write_text("x")
+
+    assert hc._is_migrated(label, agents_dir=agents) is False
+
+
+def test_is_migrated_ignores_host_state_when_the_agents_dir_is_overridden(hc, tmp_path):
+    """Guards a regression that CI structurally cannot see. Reading the real
+    replica whenever db_path defaults would make _is_migrated depend on whether
+    the developer's own laptop happens to be pulling: green on Linux CI, and
+    quietly reversing test_is_migrated_false_when_nothing on a Mac."""
+    assert hc._is_migrated("com.secondbrain.nope", agents_dir=tmp_path) is False
+
+
+def test_detect_label_prefix_reads_the_plist_a_migrated_mac_keeps(hc, tmp_path, monkeypatch):
+    """db-pull is the only second-brain plist left after migration, so it is the
+    only thing to read the prefix off. Discovery missed it, LABEL_PREFIX fell
+    back to the generic literal, and every derived label named a job that had
+    never existed on this machine."""
+    monkeypatch.delenv("BRAIN_LABEL_PREFIX", raising=False)
+    (tmp_path / "com.example.brain.db-pull.plist").write_text("x")
+
+    assert hc.detect_label_prefix(agents_dir=tmp_path) == "com.example.brain"
+
+
+def test_mac_registry_asserts_on_the_jobs_the_mac_owns(hc):
+    assert hc.LAUNCHD_LOCAL_JOBS, "the Mac still owns db-pull and the document push"
+    assert set(hc.LAUNCHD_LOCAL_JOBS) <= set(hc.LAUNCHD_JOBS)
+    assert set(hc.LAUNCHD_MIGRATED_JOBS).isdisjoint(hc.LAUNCHD_LOCAL_JOBS)
+
+
+def test_db_pull_threshold_spans_the_overnight_gap(hc):
+    """The pull fires 07:45..22:45, so the widest legitimate gap is 22:45 ->
+    07:45. Under nine hours reports a false stale log every single night; over a
+    day stops being an assertion at all."""
+    from datetime import timedelta
+
+    assert hc.STALE_THRESHOLDS["db_pull"] > timedelta(hours=9)
+    assert hc.STALE_THRESHOLDS["db_pull"] < timedelta(hours=24)
+    assert hc.MIGRATION_EVIDENCE_MAX_AGE > hc.STALE_THRESHOLDS["db_pull"], (
+        "the fast signal must fire before the suppression lifts, or one dead pull "
+        "produces ten issues instead of one"
+    )
+
+
+def _migrated_jobs(hc):
+    jobs = {f"j{i}": {"desc": f"Job {i}", "status": "MIGRATED"} for i in range(9)}
+    jobs["local"] = {"desc": next(iter(hc.LAUNCHD_LOCAL_JOBS.values())), "status": "OK"}
+    return jobs
+
+
+def test_relic_logs_stay_suppressed_once_the_local_job_is_registered(hc):
+    """jobs_elsewhere used to be all(MIGRATED). Registering db-pull, a job that
+    can never be MIGRATED, would have flipped it False and re-armed all twelve
+    relic logs."""
+    _, issues = hc.build_report([], _migrated_jobs(hc), _log_state(stale=True), {}, [])
+
+    assert not any("outlook_sync" in str(i) for i in issues)
+
+
+def test_the_local_job_log_is_exempt_from_the_relic_suppression(hc):
+    """The Mac must never go green by ceasing to look: the one log it owns
+    carries the timestamp assertion and has to survive the mute."""
+    from datetime import timedelta
+
+    logs = {
+        "outlook_sync": {"path": "/x/outlook-sync.log", "age": timedelta(days=78), "stale": True},
+        "db_pull": {"path": "/x/db-pull.log", "age": timedelta(hours=30), "stale": True},
+    }
+
+    _, issues = hc.build_report([], _migrated_jobs(hc), logs, {}, [])
+
+    assert any("db_pull" in str(i) for i in issues), "the Mac's own job log must still fail"
+    assert not any("outlook_sync" in str(i) for i in issues)
+
+
+def test_migration_suppression_cannot_reach_the_vps(hc):
+    """Nothing here may weaken the systemd path: _is_migrated is called from the
+    launchd branch alone and check_jobs dispatches on platform."""
+    import inspect
+
+    assert "_is_migrated" in inspect.getsource(hc._check_jobs_launchd)
+    assert "_is_migrated" not in inspect.getsource(hc._check_jobs_systemd)
+    assert "_replica_is_fresh" not in inspect.getsource(hc._check_jobs_systemd)
+
+
+# --- A replica cannot know what happened after it was taken ------------------
+# Every source age is derived from rows inside brain.db. On the Mac that file is
+# a copy pulled 07:45..22:45, so overnight the gap alone pushed Emails past its
+# 6h threshold and the Mac reported "Emails: STALE" every night with nothing
+# wrong. Ageing against the copy asks the only question a replica can answer.
+
+
+def _pull_stamp(tmp_path, hours_old):
+    """The stamp sb-db-pull.sh writes after a copy passes its integrity check."""
+    from datetime import datetime, timedelta
+
+    p = tmp_path / "db-pull.stamp"
+    when = datetime.now(UTC) - timedelta(hours=hours_old)
+    p.write_text(when.strftime("%Y-%m-%dT%H:%M:%S+00:00"))
+    return p
+
+
+def test_corpus_lag_is_zero_on_the_host_that_writes_the_database(hc, tmp_path):
+    """A stamp written moments ago discounts nothing worth mentioning."""
+    assert hc.corpus_lag(stamp=_pull_stamp(tmp_path, hours_old=0)) < timedelta(minutes=1)
+
+
+def test_corpus_lag_reports_the_age_of_a_pulled_replica(hc, tmp_path):
+    lag = hc.corpus_lag(stamp=_pull_stamp(tmp_path, hours_old=9))
+
+    assert timedelta(hours=8, minutes=45) < lag < timedelta(hours=9, minutes=15)
+
+
+def test_corpus_lag_never_goes_negative(hc, tmp_path):
+    """A clock-skewed mtime in the future would otherwise make every source look
+    fresher than it is, which is the one direction this must never fail in."""
+    assert hc.corpus_lag(stamp=_pull_stamp(tmp_path, hours_old=-5)) == timedelta(0)
+
+
+def test_corpus_lag_is_zero_when_there_is_no_stamp(hc, tmp_path):
+    assert hc.corpus_lag(stamp=tmp_path / "absent.stamp") == timedelta(0)
+
+
+def test_report_declares_that_ages_come_through_a_replica(hc, monkeypatch):
+    """Unlabelled, "Emails 4h" on a copy taken 6h ago reads as 4h when the truth
+    is 10h. The discount is only honest if the report says it applied one."""
+    monkeypatch.setattr(hc, "CORPUS_LAG", timedelta(hours=6))
+
+    report, _ = hc.build_report([], {}, {}, {}, [])
+
+    assert "AS OF the local replica" in report
+
+
+def test_report_stays_silent_about_a_replica_on_the_writing_host(hc, monkeypatch):
+    monkeypatch.setattr(hc, "CORPUS_LAG", timedelta(0))
+
+    report, _ = hc.build_report([], {}, {}, {}, [])
+
+    assert "AS OF the local replica" not in report
+
+
+def test_age_is_never_negative(hc, monkeypatch):
+    """On a pull host, anything written locally AFTER the last pull is newer than
+    the observation point (conversation capture does exactly that, and the row
+    rendered as "-261m"). Nonsense to read, and it compares as fresh anyway."""
+    from datetime import datetime
+
+    monkeypatch.setattr(hc, "CORPUS_LAG", timedelta(hours=5))
+    just_now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    assert hc._age(just_now) == timedelta(0)
+
+
+def test_age_discounts_the_replica_lag(hc, monkeypatch):
+    """The whole point: a row two hours old, seen through a copy taken five hours
+    ago, was two hours old when the copy was taken."""
+    from datetime import datetime
+
+    monkeypatch.setattr(hc, "CORPUS_LAG", timedelta(hours=5))
+    seven_hours_ago = (datetime.now(UTC) - timedelta(hours=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    assert timedelta(hours=1, minutes=55) < hc._age(seven_hours_ago) < timedelta(hours=2, minutes=5)
+
+
+def test_format_age_distinguishes_unknown_from_zero(hc):
+    """ "?" is this report's marker for "nothing is being asserted here", so a
+    clamped zero age must not borrow it: a timedelta is falsy at zero and the
+    freshest possible answer rendered identically to a blind check."""
+    assert hc.format_age(None) == "?"
+    assert hc.format_age(timedelta(0)) == "0m"
+
+
+# --- Curation runs, exits 0, and places nothing ------------------------------
+# Every folder hit its soft cap, so 40 of the last 44 runs placed zero documents
+# while the job ran cleanly and wrote its log. check_documents counts rows the
+# reverse-ingest wrote and check_document_roots watches the push heartbeat, so
+# nothing anywhere asked whether a document actually arrived. `deferred` is the
+# signal: candidates the cap turned away rather than silently marked done.
+
+
+def _curate_state(tmp_path, deferred=None, copied=None):
+    import json
+
+    p = tmp_path / "curate-state.json"
+    p.write_text(json.dumps({"deferred": deferred or {}, "copied": copied or []}))
+    return p
+
+
+def test_check_curation_is_quiet_when_nothing_is_blocked(hc, tmp_path):
+    state = _curate_state(tmp_path, copied=[{"id": 1, "classified_at": "2026-08-29T10:00:00Z"}])
+
+    r = hc.check_curation(state_path=state)
+
+    assert r["deferred"] == 0
+    assert r["blocked"] == 0
+    assert r["status"] == "OK"
+
+
+def test_check_curation_tolerates_ordinary_back_pressure(hc, tmp_path):
+    """A deferred candidate with retries left clears itself once a folder has
+    room. That is the mechanism working, not a fault."""
+    state = _curate_state(tmp_path, deferred={"7": {"folder": "retail", "attempts": 1}})
+
+    r = hc.check_curation(state_path=state)
+
+    assert r["deferred"] == 1
+    assert r["status"] == "OK"
+
+
+def test_check_curation_warns_once_candidates_run_out_of_retries(hc, tmp_path):
+    """Exhausted retries mean the document is being DROPPED, which is the
+    condition that went unnoticed for a month."""
+    state = _curate_state(
+        tmp_path,
+        deferred={
+            "7": {"folder": "retail", "attempts": hc.CURATE_MAX_DEFER_ATTEMPTS},
+            "8": {"folder": "retail", "attempts": 1},
+        },
+    )
+
+    r = hc.check_curation(state_path=state)
+
+    assert r["blocked"] == 1
+    assert r["status"] == "WARN"
+
+
+def test_check_curation_is_na_without_a_state_file(hc, tmp_path):
+    """The VPS has one; a machine that never runs curate must not invent a fault."""
+    assert hc.check_curation(state_path=tmp_path / "absent.json")["status"] == "N/A"
+
+
+def test_check_curation_survives_a_corrupt_state_file(hc, tmp_path):
+    """main() runs the checks unguarded, so one bad byte here would kill the
+    whole nightly report and send no email at all."""
+    p = tmp_path / "curate-state.json"
+    p.write_text("{not json")
+
+    assert hc.check_curation(state_path=p)["status"] == "WARN"
+
+
+def test_curate_defer_cap_matches_the_real_one(hc):
+    """Duplicated because health_check.py is loaded standalone. Pin it to the
+    source of truth so the two cannot drift into disagreeing about what
+    "out of retries" means."""
+    import re
+    from pathlib import Path
+
+    src = (Path(hc.__file__).parent / "curate_documents_daily.py").read_text()
+    m = re.search(r"^MAX_DEFER_ATTEMPTS\s*=\s*(\d+)", src, re.MULTILINE)
+    assert m, "could not find MAX_DEFER_ATTEMPTS in curate_documents_daily.py"
+    assert hc.CURATE_MAX_DEFER_ATTEMPTS == int(m.group(1))
+
+
+def test_report_names_the_curation_blockage(hc, tmp_path):
+    state = _curate_state(
+        tmp_path, deferred={"7": {"folder": "retail", "attempts": hc.CURATE_MAX_DEFER_ATTEMPTS}}
+    )
+
+    report, issues = hc.build_report([hc.check_curation(state_path=state)], {}, {}, {}, [])
+
+    assert "out of retries" in report
+    assert any("Curation" in str(i) for i in issues)
+
+
+# --- Downloaded is not the same as registered --------------------------------
+# outlook-cli writes binaries into data/attachments/<message_id>/ and a separate
+# pass registers them. That pass defers any directory whose message_id has no row
+# in `emails`, so a directory whose email never loaded is deferred for ever. Prod
+# accumulated 3,396 of them, 7.23 GB, growing ~20/day and invisible to every
+# search, while check_attachments counted attachment_content rows and stayed
+# perfectly consistent. An attachment exists when the table says so.
+
+
+def _attachments_db(root=None, *registered):
+    """A DB where each name in  has an attachments row whose
+    file_path points into that directory, which is what the registrar writes."""
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE emails (id INTEGER PRIMARY KEY, message_id TEXT)")
+    db.execute("CREATE TABLE attachments (id INTEGER PRIMARY KEY, message_id, file_path TEXT)")
+    for m in registered:
+        db.execute("INSERT INTO emails (message_id) VALUES (?)", (str(m),))
+        db.execute(
+            "INSERT INTO attachments (message_id, file_path) VALUES (?,?)",
+            (str(m), f"{root}/{m}/doc.pdf"),
+        )
+    db.commit()
+    return db
+
+
+def _attachment_dirs(tmp_path, *names):
+    for n in names:
+        (tmp_path / str(n)).mkdir()
+    return tmp_path
+
+
+def test_unregistered_dirs_counts_directories_with_no_email(hc, tmp_path):
+    root = _attachment_dirs(tmp_path, "known-1", "known-2", "orphan-1", "orphan-2", "orphan-3")
+    db = _attachments_db(root, "known-1", "known-2")
+
+    assert hc.count_unregistered_attachment_dirs(db, root=root) == 3
+
+
+def test_unregistered_dirs_is_zero_when_every_download_has_its_email(hc, tmp_path):
+    root = _attachment_dirs(tmp_path, "known-1", "known-2")
+    db = _attachments_db(root, "known-1", "known-2")
+
+    assert hc.count_unregistered_attachment_dirs(db, root=root) == 0
+
+
+def test_unregistered_dirs_ignores_loose_files(hc, tmp_path):
+    """Only directories are message-id keyed; a stray file is not a deferred
+    attachment and must not be counted as one."""
+    root = _attachment_dirs(tmp_path, "known-1")
+    db = _attachments_db(root, "known-1")
+    (root / ".DS_Store").write_text("x")
+
+    assert hc.count_unregistered_attachment_dirs(db, root=root) == 0
+
+
+def test_unregistered_dirs_is_zero_without_an_attachments_root(hc, tmp_path):
+    """A host that has never downloaded one must not invent a fault."""
+    db = _attachments_db(tmp_path, "known-1")
+
+    assert hc.count_unregistered_attachment_dirs(db, root=tmp_path / "absent") == 0
+
+
+def test_a_reverse_ingested_document_is_not_an_orphan(hc, tmp_path):
+    """The 44% over-report. A reverse-ingested document carries a NEGATIVE
+    message_id but attachment_pipeline.py files it under str(abs(id)), so its
+    directory name can never match the row that already registers it. Asking
+    about names counts 1,468 healthy directories as leaked; asking about
+    file_path does not."""
+    root = _attachment_dirs(tmp_path, "1003114379954136173")
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE emails (id INTEGER PRIMARY KEY, message_id)")
+    db.execute("CREATE TABLE attachments (id INTEGER PRIMARY KEY, message_id, file_path TEXT)")
+    db.execute("INSERT INTO emails (message_id) VALUES (-1003114379954136173)")
+    db.execute(
+        "INSERT INTO attachments (message_id, file_path) VALUES (?,?)",
+        (-1003114379954136173, f"{root}/1003114379954136173/INDEX.md"),
+    )
+    db.commit()
+
+    assert hc.count_unregistered_attachment_dirs(db, root=root) == 0
+
+
+def test_outlook_sync_threshold_spans_its_real_overnight_gap(hc):
+    """sb-outlook-sync.timer is not hourly despite the name: its OnCalendar skips
+    02:00 to 06:00, so the widest legitimate gap is 01:00 -> 07:00 plus a 300s
+    randomised delay. At three hours this log reported stale from about 04:00 to
+    07:00 every night, on the host that actually sends the report."""
+    assert hc.STALE_THRESHOLDS["outlook_sync"] > timedelta(hours=6, minutes=5)
+    assert hc.STALE_THRESHOLDS["outlook_sync"] < timedelta(hours=12), (
+        "wide enough to stop being an assertion"
+    )

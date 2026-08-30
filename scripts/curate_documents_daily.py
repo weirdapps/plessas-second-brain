@@ -4,8 +4,9 @@ Claude, place into ~/Documents/ sub-folders, refresh per-folder READMEs
 and top-level INDEX.md files.
 
 Designed to be idempotent and resume-safe. State lives in
-~/.second-brain/curate-state.json (processed attachment IDs + cached folder
-summaries). Run via launchd at 05:07 Athens local time.
+~/.second-brain/curate-state.json (processed attachment IDs, candidates parked
+by a full folder, and cached folder summaries). Run via launchd at 05:07
+Athens local time.
 
 Caps:
   --max-new <N>  process at most N new candidates per run (default: 30)
@@ -64,6 +65,11 @@ NOISE_SUBJECT_PATTERNS = [
     r"phishing.*simulation",
     r"επικαιροποιηση προσωπικων στοιχειων",
 ]
+
+# How many runs a cap-blocked candidate may come back for before it is left
+# parked for good.  A folder the operator never prunes would otherwise cost one
+# classification call per candidate per run, twice a day, forever.
+MAX_DEFER_ATTEMPTS = 5
 
 # --- Org-specific taxonomy (private) ------------------------------------
 # MANAGED_FOLDERS, SOFT_CAPS, TAXONOMY, CLASSIFY_PROMPT, SUMMARIZE_PROMPT,
@@ -158,6 +164,7 @@ def load_state() -> dict:
         "last_run": None,
         "processed_ids": [],
         "copied": [],  # {id, src, dst, category, confidence, classified_at}
+        "deferred": {},  # id -> {folder, attempts, last_attempt}; see defer_candidate
         "folder_summaries": {},
     }
 
@@ -230,11 +237,34 @@ def summarize_folder(client, model, folder: str, readme_text: str) -> dict:
         return {"error": str(e)}
 
 
-def query_new_candidates(processed_ids: set[int], limit: int) -> list[dict]:
+def query_new_candidates(
+    processed_ids: set[int], limit: int, deferred: dict | None = None
+) -> list[dict]:
     conn = sqlite3.connect(DB)
     conn.row_factory = sqlite3.Row
     # Static parameterized query; filter against processed_ids in Python.
     # Avoids dynamic IN-clause string building entirely.
+    #
+    # THE `mailbox_name = 'External' AND message_id < 0` CLAUSE IS THE THING
+    # THAT STOPS THIS JOB EATING ITS OWN OUTPUT.  We copy classified
+    # attachments into ~/Documents/<folder>/; sb-reverse-ingest then scans
+    # those same roots and loads every file it finds back into the store
+    # through ingest_document(), which writes a synthetic anchor email with
+    # mailbox_name='External' and a NEGATIVE message_id (a content hash; see
+    # _file_to_message_id in src/extract/attachment_pipeline.py).  Those rows
+    # satisfied every clause below, so curate re-offered its own placements to
+    # itself, re-classified them and re-placed them under a second "[Document]"
+    # prefix.  Measured 2026-08-30: 41% of the tree was curate's own re-placed
+    # output and 553 files carried a doubled or tripled prefix, which is what
+    # drove all 17 folders into their soft caps in the first place.
+    #
+    # The pair is exact, not a heuristic.  ingest_document is the only writer
+    # of mailbox_name='External' and it always writes a negative integer id.
+    # Real mail cannot match it: Outlook message_ids are TEXT ('AAMk...'), and
+    # SQLite sorts every TEXT value above every INTEGER, so `< 0` is false for
+    # them.  News rows are TEXT ids under mailbox_name='News'.  COALESCE keeps
+    # a NULL mailbox_name out of the NOT, where it would otherwise turn the
+    # whole predicate NULL and silently drop the row.
     rows = conn.execute(
         "SELECT a.id, a.filename, a.file_path, a.file_size, a.mime_type, "
         "       e.subject, e.sender_address, e.date_received, ac.summary "
@@ -246,15 +276,20 @@ def query_new_candidates(processed_ids: set[int], limit: int) -> list[dict]:
         "  AND ac.llm_status = 'extracted' "
         "  AND ac.summary IS NOT NULL "
         "  AND LENGTH(ac.summary) > 300 "
+        "  AND NOT (COALESCE(e.mailbox_name, '') = 'External' AND e.message_id < 0) "
         "  AND (a.mime_type LIKE '%pdf%' OR a.mime_type LIKE '%presentation%' "
         "       OR a.mime_type LIKE '%spreadsheet%' OR a.mime_type LIKE '%word%') "
         "ORDER BY a.id DESC"
     ).fetchall()
 
+    deferred = deferred or {}
     out = []
     seen_filenames = set()
     for r in rows:
         if r["id"] in processed_ids:
+            continue
+        parked = deferred.get(str(r["id"]))
+        if parked is not None and not deferred_is_ready(parked):
             continue
         if r["sender_address"] in NOISE_SENDERS:
             continue
@@ -292,6 +327,39 @@ def folder_size(folder: str) -> tuple[int, float]:
         return (0, 0.0)
     files = [f for f in p.iterdir() if f.is_file() and f.name not in {"README.md", ".DS_Store"}]
     return (len(files), round(sum(f.stat().st_size for f in files) / 1024 / 1024, 1))
+
+
+def defer_candidate(deferred: dict, candidate_id: int, folder: str):
+    """Park a candidate the soft cap turned away, so it is neither lost nor burned.
+
+    Deliberately a SEPARATE record from processed_ids, and deliberately not
+    just "add to processed later".  A full folder is a fact about the
+    DESTINATION and can change the moment the operator prunes it; a
+    low-confidence verdict is a fact about the DOCUMENT and never will, which
+    is why only this one rejection defers and every other still records the
+    candidate as processed.  Leaving cap-blocked candidates in the main stream
+    instead is the other wrong answer: candidates come back id DESC, so the
+    same blocked ids would be re-offered first on every run forever, the
+    thousands behind them would never be reached, and each run would spend a
+    classification call re-deciding items it cannot place.
+    """
+    entry = deferred.get(str(candidate_id), {})
+    deferred[str(candidate_id)] = {
+        "folder": folder,
+        "attempts": entry.get("attempts", 0) + 1,
+        "last_attempt": datetime.now().isoformat(),
+    }
+
+
+def deferred_is_ready(entry: dict) -> bool:
+    """True when a parked candidate may be offered again: room, and retries left."""
+    if entry.get("attempts", 0) >= MAX_DEFER_ATTEMPTS:
+        return False
+    folder = entry.get("folder")
+    if not folder:
+        return False
+    cnt, _ = folder_size(folder)
+    return cnt < SOFT_CAPS.get(folder, 50)
 
 
 def write_readme(folder: str, conn):
@@ -431,9 +499,13 @@ def main():
 
     state = load_state()
     processed = set(state.get("processed_ids", []))
-    log(f"Daily curate start. Processed history: {len(processed)} ids. Cap: {args.max_new}")
+    deferred = state.get("deferred", {})
+    log(
+        f"Daily curate start. Processed history: {len(processed)} ids. "
+        f"Deferred: {len(deferred)}. Cap: {args.max_new}"
+    )
 
-    candidates = query_new_candidates(processed, args.max_new)
+    candidates = query_new_candidates(processed, args.max_new, deferred)
     log(f"New candidates after filter: {len(candidates)}")
     if not candidates and not args.refresh_index:
         log("Nothing to do.")
@@ -459,7 +531,18 @@ def main():
         # Soft cap check
         cnt, _ = folder_size(folder)
         if cnt >= SOFT_CAPS.get(folder, 50):
-            log(f"  SKIP (cap {SOFT_CAPS.get(folder, 50)} hit): {folder} ← {c['filename'][:40]}")
+            # Take the id back OUT of processed.  It went in above because
+            # every other rejection is a verdict on the document, but this
+            # one is a verdict on the folder, and recording it as done
+            # destroyed the document: 287 distinct files were dropped and
+            # permanently flagged processed this way in August 2026, while all
+            # 17 folders sat at cap and 40 of the last 44 runs placed nothing
+            # and still exited 0.  defer_candidate keeps it out of the main
+            # stream so this run still advances, and brings it back only once
+            # folder_size() shows headroom.
+            processed.discard(c["id"])
+            defer_candidate(deferred, c["id"], folder)
+            log(f"  DEFER (cap {SOFT_CAPS.get(folder, 50)} hit): {folder} ← {c['filename'][:40]}")
             continue
 
         # Copy
@@ -493,6 +576,11 @@ def main():
             log(f"  copy error: {e}")
 
     state["processed_ids"] = sorted(processed)
+    # Anything that reached processed on this run is decided, so drop its
+    # parking record: the map only ever holds candidates still blocked by a
+    # full folder.  This is also what clears the entry when a previously
+    # deferred candidate finally lands.
+    state["deferred"] = {k: v for k, v in deferred.items() if int(k) not in processed}
     state["copied"].extend(new_placements)
     state["last_run"] = datetime.now().isoformat()
 

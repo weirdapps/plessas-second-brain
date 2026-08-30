@@ -40,6 +40,14 @@ class Classification(StrEnum):
 
 
 SIGNATURE_FREQUENCY_THRESHOLD = 0.05
+# Frequency alone is a ratio, and a thin sender history makes the denominator
+# tiny: a sender with only 19 inline images turns a single one-off image into
+# 1/19 = 5.3%, over the threshold, and it is filed as a signature forever
+# (both caches return early for anything that isn't 'unclassified', so no
+# reprocess path revisits it). Measured on the corpus: of 675 frequency-flagged
+# images, 271 had been seen EXACTLY ONCE. An absolute floor alongside the ratio
+# is what separates a recurring logo from a one-off photo.
+MIN_SIGNATURE_OCCURRENCES = 3
 MIN_DIMENSION_PX = 100
 MIN_BYTES = 5_000
 SIGNATURE_POSITION_CUTOFF = 0.85
@@ -60,10 +68,11 @@ def is_known_signature(
     threshold: float = SIGNATURE_FREQUENCY_THRESHOLD,
 ) -> bool:
     row = conn.execute(
-        "SELECT frequency FROM sender_signature_index WHERE sender_email = ? AND sha256 = ?",
+        "SELECT frequency, occurrence_count FROM sender_signature_index "
+        "WHERE sender_email = ? AND sha256 = ?",
         (sender_email, sha),
     ).fetchone()
-    return row is not None and row[0] >= threshold
+    return row is not None and row[0] >= threshold and row[1] >= MIN_SIGNATURE_OCCURRENCES
 
 
 def refresh_signature_index(conn: sqlite3.Connection, sender: str) -> None:

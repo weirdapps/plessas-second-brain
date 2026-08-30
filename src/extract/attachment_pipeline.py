@@ -582,7 +582,17 @@ def ingest_document(
         0
     ]
 
-    # Copy file to attachments directory
+    # Copy file to attachments directory.
+    #
+    # NOTE the abs(): message_id is NEGATIVE for reverse-ingested documents, but
+    # the directory drops the sign, so this directory's NAME can never be found
+    # in emails.message_id. That is harmless, because the attachments row written
+    # just below carries the real (negative) id and an absolute file_path, and
+    # file_path is what the pipeline resolves. It is however extremely misleading
+    # to anyone auditing the attachments tree by directory name: doing so counted
+    # 1,468 perfectly healthy document directories as leaked, a 44% over-report.
+    # If you are looking for unregistered attachments, ask whether an attachments
+    # row REFERENCES the directory, never whether its name is a known message_id.
     dest_dir = ATTACHMENTS_DIR / str(abs(message_id))
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = dest_dir / filename

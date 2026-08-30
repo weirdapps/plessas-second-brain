@@ -24,7 +24,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.config import DEFAULT_DB, NEWS_DB_PATH, SHAREPOINT_HOST  # noqa: E402
+from src.config import ATTACHMENTS_DIR, DEFAULT_DB, NEWS_DB_PATH, SHAREPOINT_HOST  # noqa: E402
 
 DB_PATH = DEFAULT_DB
 LOG_DIR = Path.home() / ".second-brain/logs"
@@ -45,6 +45,20 @@ INGESTABLE_EXTENSIONS = {".pdf", ".pptx", ".xlsx", ".docx", ".md", ".txt"}
 # our own curate-docs job writes files into those same roots, so a fresh mtime
 # can be self-manufactured while the organic source is frozen.
 DOCUMENT_SYNC_STAMP = STATE_DIR / "document-sync.stamp"
+
+# Written by sb-db-pull.sh after a copy passes its integrity check, and only
+# then. Present on a host that RECEIVES brain.db, absent on the one that writes
+# it, which is what makes it a reliable discriminator between the two. See
+# corpus_lag for why brain.db's own mtime cannot serve here.
+DB_PULL_STAMP = STATE_DIR / "db-pull.stamp"
+
+# curate-docs' own bookkeeping: which candidates it has placed, and which the
+# per-folder soft caps turned away. See check_curation.
+CURATE_STATE = STATE_DIR / "curate-state.json"
+# Mirrors MAX_DEFER_ATTEMPTS in scripts/curate_documents_daily.py, which is the
+# source of truth; duplicated because this script is loaded standalone, and
+# pinned by a test that reads the real one.
+CURATE_MAX_DEFER_ATTEMPTS = 5
 
 # Counterpart to the heartbeat: written by the push job when a run FAILS (line 1
 # ISO-8601 UTC, line 2 the reason), removed when one succeeds. The stamp alone
@@ -68,6 +82,11 @@ _DISCOVERY_JOB_SUFFIXES = (
     ".auth-watch",
     ".curate-docs",
     ".reverse-ingest",
+    # The only one of these a MIGRATED Mac still has, and therefore the only one
+    # left to read the prefix off once ingestion has moved. Without it discovery
+    # found nothing on this host, fell back to the generic literal, and every
+    # label derived from it named a job that had never existed here.
+    ".db-pull",
 )
 
 
@@ -114,15 +133,41 @@ STALE_THRESHOLDS = {
     "sharepoint": timedelta(days=2),
     "conversations": timedelta(days=2),
     "daily_sync": timedelta(hours=26),
-    "outlook_sync": timedelta(hours=3),
+    # sb-outlook-sync.timer is NOT hourly, despite the name. Its OnCalendar is
+    # "01,07,08,...,22:00:00", so it skips 02:00 to 06:00 and the widest
+    # legitimate gap is 01:00 -> 07:00, plus up to RandomizedDelaySec=300. Three
+    # hours meant this log reported stale from roughly 04:00 to 07:00 EVERY
+    # night with nothing wrong, on the host that actually sends the email. Seven
+    # hours covers the real gap and still catches a genuinely dead sync inside
+    # one working morning.
+    "outlook_sync": timedelta(hours=7),
     "attachments_llm": timedelta(days=3),
     "document_roots": timedelta(days=14),
+    # The Mac's own pull. The plist fires 16x/day from 07:45 to 22:45, so the
+    # widest legitimate gap is the 22:45 -> 07:45 overnight window; eleven hours
+    # leaves two of slack. Under nine would report a false stale log every night.
+    "db_pull": timedelta(hours=11),
     "news": timedelta(hours=12),
     # Vision runs inside the daily attachment job, so three days is three missed
     # runs. Measured against an image's own arrival, not against wall-clock
     # MAX(visioned_at): a quiet stretch with no eligible images must stay silent.
     "images_vision": timedelta(days=3),
 }
+
+# How long a received brain.db still proves this host is a CONSUMER of the corpus
+# rather than its producer. Deliberately much wider than STALE_THRESHOLDS
+# ["db_pull"] above: "did the pull run" is a fast signal that must fire on its
+# own, while "is this a pull host" is a slowly-changing fact about the topology.
+# Layered this way a dead pull produces ONE actionable line, not one plus nine
+# resurrected NOT_LOADEDs for jobs that did genuinely move.
+MIGRATION_EVIDENCE_MAX_AGE = timedelta(days=7)
+
+# Set ONCE per run by main(), from corpus_lag(). A module constant rather than a
+# call inside _age deliberately: every source age in one report must be measured
+# from the same instant, and _age must stay a pure function of its argument so a
+# test does not silently inherit whatever this developer's laptop last pulled.
+# Zero is the correct default, and the only value the writing host ever has.
+CORPUS_LAG = timedelta(0)
 
 # Classes the classifier filters out before vision by design — they stay
 # undescribed forever and are not a backlog. Everything else, including a class
@@ -142,13 +187,24 @@ TEAMS_DISABLED_WARN_SHARE = 0.25
 # manual `brain process-images` pass or more budget.
 IMAGE_QUEUE_WARN = 500
 
+# Downloaded attachment directories with no matching email row. A handful is
+# ordinary: a sync can download an attachment minutes before the loader writes
+# its email, and the registrar picks it up on the next pass. Hundreds is not
+# back-pressure, it is directories that will never resolve, because the
+# registrar defers on a missing email and so retries the same ones for ever.
+# Prod reached 3,396 of them (7.23 GB) growing ~20/day, entirely unseen.
+ATTACHMENT_UNREGISTERED_WARN = 200
+
 # Mirrors MAX_SHAREPOINT_ATTEMPTS in src/export/sharepoint_fetcher.py, which is
 # the source of truth — this script is loaded standalone (no package import), so
 # the value is duplicated here and pinned by a test that reads the real one.
 # Links at or past the cap are resting out their cool-off, not being neglected.
 SHAREPOINT_MAX_ATTEMPTS = 5
 
-LAUNCHD_JOBS = {
+# Ingestion jobs. These CAN legitimately be absent, because they are the ones
+# that moved to the VPS; see _is_migrated for what counts as evidence that they
+# did, and why their absence alone is never allowed to be that evidence.
+LAUNCHD_MIGRATED_JOBS = {
     f"{LABEL_PREFIX}.sync": "Hourly Outlook sync",
     f"{LABEL_PREFIX}-sync": "Daily full sync",
     f"{LABEL_PREFIX}.noon-catchup": "Noon catchup",
@@ -159,6 +215,22 @@ LAUNCHD_JOBS = {
     f"{LABEL_PREFIX}.curate-docs": "Document curation",
     f"{LABEL_PREFIX}.reverse-ingest": "Reverse ingest",
 }
+
+# What the Mac still owns after the migration, and therefore what a Mac-side run
+# is actually FOR. Nothing else runs these, so NOT_LOADED here is a real fault
+# and must never be suppressible. Until they were registered, the nine jobs that
+# had left were asserted on and the two that remained were not: a db-pull failure
+# (the 2026-08-29 WAL corruption was one) had no signal anywhere in this script,
+# while twelve pre-migration relic logs produced twelve false issues every run.
+LAUNCHD_LOCAL_JOBS = {
+    f"{LABEL_PREFIX}.db-pull": "DB pull from VPS",
+    "com.plessas.document-sync-vps": "Document push to VPS",
+}
+
+LAUNCHD_JOBS = {**LAUNCHD_MIGRATED_JOBS, **LAUNCHD_LOCAL_JOBS}
+LOCAL_JOB_DESCS = frozenset(LAUNCHD_LOCAL_JOBS.values())
+# Log keys belonging to those jobs, which must survive the relic suppression.
+LOCAL_LOG_NAMES = frozenset({"db_pull"})
 
 # Linux/systemd counterpart. The VPS runs the same repo under `systemctl --user`;
 # the same logical jobs have different identifiers there (and Linux has no
@@ -235,20 +307,68 @@ def get_db():
     return sqlite3.connect(str(DB_PATH), timeout=10)
 
 
+def corpus_lag(stamp: Path | None = None, now: datetime | None = None) -> timedelta:
+    """How far behind wall clock the corpus this host can see actually is.
+
+    Zero on the machine that WRITES brain.db (it has no pull stamp at all).
+    Non-zero only on a host holding a pulled replica, where it is the age of
+    that copy.
+
+    It exists because every source age below is derived from rows inside
+    brain.db, and a replica cannot know anything that happened after it was
+    taken. Measured against wall clock, the Mac's copy inflates EVERY source age
+    by the pull gap: the pull runs 07:45..22:45, so the overnight hours pushed
+    Emails past its 6h threshold and a Mac run reported "Emails: STALE" every
+    single night with nothing whatsoever wrong. Ageing against the copy asks the
+    only question a replica can answer, which is whether the source was healthy
+    AS OF the last pull.
+
+    Read from a stamp and NOT from brain.db's mtime, which is not the pull time:
+    any reader that opens the replica read-write bumps it, and this script is
+    itself such a reader, so the mtime was observed reading 4h newer than the
+    pull that produced it. sb-db-pull.sh writes the stamp only after the copy
+    passes its integrity check, so a failing pull freezes it and the ages it
+    feeds keep growing.
+
+    A missing stamp means zero, i.e. wall clock. That is the safe direction: it
+    can only make sources look OLDER and alert sooner, never fresher. And this
+    is not a way of looking away, because the replica's own freshness is
+    asserted separately and loudly, by the db_pull log threshold at 11h and by
+    the migration suppression expiring at 7 days.
+    """
+    path = DB_PULL_STAMP if stamp is None else Path(stamp)
+    try:
+        pulled_at = _utc(path.read_text(errors="replace").strip())
+    except OSError:
+        return timedelta(0)
+    if pulled_at is None:
+        return timedelta(0)
+    return max(timedelta(0), (now or datetime.now(UTC)) - pulled_at)
+
+
 def _age(ts):
     """Age of a timestamp, handling both naive-local values (macOS sqlite) and
     tz-aware UTC ones (the VPS stores Graph 'Z' timestamps). Without this, a UTC
     'Z' value is compared against local now() — inflating every age by the UTC
-    offset (EEST = +3h) and tripping false STALE alerts on the VPS."""
+    offset (EEST = +3h) and tripping false STALE alerts on the VPS.
+
+    Measured from the corpus's own observation time, not wall clock; see
+    corpus_lag for why.
+    """
     if not ts:
         return None
     try:
         dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return None
-    if dt.tzinfo is not None:
-        return datetime.now(UTC) - dt
-    return datetime.now() - dt
+    ref = (datetime.now(UTC) if dt.tzinfo is not None else datetime.now()) - CORPUS_LAG
+    # Never negative. A row can be newer than the observation point for two
+    # ordinary reasons: a clock-skewed future timestamp, and, on a pull host,
+    # anything written locally AFTER the last pull (conversation capture does
+    # exactly that, and printed "-261m" before this clamp). Both mean the same
+    # thing for the purposes of this report, which is "no older than we can
+    # tell", and a negative age renders as nonsense while comparing as fresh.
+    return max(timedelta(0), ref - dt)
 
 
 def _utc(ts):
@@ -386,6 +506,52 @@ def check_teams(db):
     }
 
 
+def count_unregistered_attachment_dirs(db, root: Path | None = None) -> int:
+    """Downloaded attachment directories the database has no email for.
+
+    outlook-cli writes binaries into data/attachments/<message_id>/, and a
+    separate pass registers them as rows. That pass DEFERS any directory whose
+    message_id has no row in `emails`, so a directory whose email never loaded is
+    deferred again on every run, for ever. Nothing downstream reads the disk, so
+    an unregistered directory is invisible to search_attachments and
+    attachment_image_search alike, and check_attachments counts
+    attachment_content rows and therefore stays perfectly consistent while the
+    shortfall grows underneath it. The user's own scar in a new place: an
+    attachment exists when the table says so, never because the file is on disk.
+
+    ASKS ABOUT REFERENCES, NOT ABOUT NAMES, and the distinction is not academic.
+    The obvious test, "is this directory's name a message_id in `emails`",
+    over-reported by 44% on prod: 3,481 directories against a true 1,946. The
+    difference is reverse-ingested documents, which carry a NEGATIVE message_id
+    but are filed under `str(abs(message_id))` by
+    attachment_pipeline.py:586, so their directory name can never match the row
+    that already registers them perfectly well. Their file_path does match, and
+    file_path is what the pipeline actually resolves, so that is the honest
+    question to ask.
+
+    Compared on the directory's BASENAME rather than its full path, because
+    file_path is stored absolute and this script has no guaranteed CWD.
+    """
+    root = ATTACHMENTS_DIR if root is None else Path(root)
+    try:
+        on_disk = {e.name for e in os.scandir(root) if e.is_dir()}
+    except OSError:
+        return 0
+    if not on_disk:
+        return 0
+    try:
+        referenced = {
+            os.path.basename(os.path.dirname(fp))
+            for (fp,) in db.execute("SELECT file_path FROM attachments WHERE file_path IS NOT NULL")
+        }
+    except sqlite3.OperationalError:
+        # Same posture as check_sharepoint: main() runs the checks unguarded, so
+        # a missing table here would take down the whole nightly report over a
+        # secondary count. Its absence would be loud everywhere else anyway.
+        return 0
+    return len(on_disk - referenced)
+
+
 def check_attachments(db):
     total = db.execute("SELECT COUNT(*) FROM attachment_content").fetchone()[0]
     extracted = db.execute(
@@ -420,9 +586,11 @@ def check_attachments(db):
 
     stale = age and age > STALE_THRESHOLDS["attachments_llm"]
     pct = (extracted * 100 / total) if total > 0 else 0
+    unregistered = count_unregistered_attachment_dirs(db)
     return {
         "name": "Attachments",
         "total": total,
+        "unregistered": unregistered,
         "text_extracted": extracted,
         "text_failed": failed,
         "text_pct": pct,
@@ -433,7 +601,9 @@ def check_attachments(db):
         "latest_llm": latest_llm,
         "age": age,
         "stale": stale,
-        "status": "STALE" if stale else ("WARN" if llm_failed > 200 else "OK"),
+        "status": "STALE"
+        if stale
+        else ("WARN" if llm_failed > 200 or unregistered > ATTACHMENT_UNREGISTERED_WARN else "OK"),
     }
 
 
@@ -444,6 +614,15 @@ def check_images(db):
     ).fetchone()[0]
     pct = (classified * 100 / total) if total > 0 else 0
     # Work still WAITING, using the same predicate run_backfill(unprocessed_only=True)
+    # ---
+    # NOTE ON `pct`: it is kept for the report's prose but nothing is DECIDED on
+    # it any more. Its denominator is every inline image ever seen, including the
+    # signature and noise rows that stage 1 short-circuits before vision is ever
+    # invoked and which therefore can never gain a description. So it has a
+    # ceiling below 100 that reads as a permanent shortfall, and it can only
+    # drift downward as more signatures arrive. Judged as a gauge it is exactly
+    # the "WARN for work that can never drain" mistake already fixed above for
+    # `pending`. The counts below say the same thing without the false ceiling.
     # selects on. Coverage % alone hid a growing backlog: it stayed flat at 88% while
     # the queue sat 200 deep, because the denominator grows with the numerator.
     # The JOIN matters: run_backfill only sees attachments joinable to an email, so
@@ -468,12 +647,35 @@ def check_images(db):
         "AND datetime(classified_at) < datetime('now', ?)",
         (*VISION_SKIPPED_CLASSES, f"-{STALE_THRESHOLDS['images_vision'].days} days"),
     ).fetchone()[0]
+    # The population vision is actually asked to describe, and the remainder that
+    # is deliberately excluded from it. Reporting these two as counts is what
+    # replaces `pct`: "937 skipped by design" is a statement about policy that
+    # stays true as it grows, where "87% classified" was a shortfall that could
+    # only get worse while nothing at all was wrong.
+    skipped = db.execute(
+        f"SELECT COUNT(*) FROM inline_images WHERE classification IN ({placeholders})",
+        VISION_SKIPPED_CLASSES,
+    ).fetchone()[0]
+    eligible = total - skipped
+    described_eligible = db.execute(
+        "SELECT COUNT(*) FROM inline_images WHERE vision_description IS NOT NULL "
+        f"AND (classification IS NULL OR classification NOT IN ({placeholders}))",
+        VISION_SKIPPED_CLASSES,
+    ).fetchone()[0]
+    # What is genuinely owed: eligible, undescribed, and not yet old enough to be
+    # counted as `stuck`. This is the number that must reach zero, and unlike
+    # `pct` it can.
+    owed = eligible - described_eligible
     latest_vision = db.execute("SELECT MAX(visioned_at) FROM inline_images").fetchone()[0]
     return {
         "name": "Inline Images",
         "total": total,
         "classified": classified,
         "pct": pct,
+        "eligible": eligible,
+        "described_eligible": described_eligible,
+        "skipped": skipped,
+        "owed": owed,
         "pending": pending,
         "stuck": stuck,
         "latest_vision": latest_vision,
@@ -481,7 +683,9 @@ def check_images(db):
         # the report printed "?" here, so the one source with a known outage was
         # also the one whose age was invisible.
         "age": _age(latest_vision),
-        "status": "WARN" if pct < 50 or pending > IMAGE_QUEUE_WARN or stuck else "OK",
+        # Only the two gauges with a real drain semantics and a time dimension.
+        # `pct` is deliberately absent: see the note above.
+        "status": "WARN" if pending > IMAGE_QUEUE_WARN or stuck else "OK",
     }
 
 
@@ -585,6 +789,25 @@ def check_sharepoint(db):
             "     OR datetime(last_attempt_at) < datetime('now', ?))",
             (SHAREPOINT_MAX_ATTEMPTS, f"-{STALE_THRESHOLDS['sharepoint'].days} days"),
         ).fetchone()[0]
+        # The complement of `overdue`, and the reason that check can be quiet and
+        # still be hiding something. A never-fetched link past the attempt cap is
+        # excluded from retry_candidates permanently: nothing will ever touch it
+        # again, so it ages out of `overdue` and the row goes back to OK with the
+        # link still missing. That is not a link "resting inside its cool-off", it
+        # is one the pipeline has given up on, and it should be counted as such
+        # rather than inferred from its absence.
+        #
+        # Worth stating plainly because the population is not what the cap implies
+        # it is: the 23 parked here were not deleted documents at all, they were
+        # URLs the extractor had mangled (unescaped &amp;, a swallowed &quot;, a
+        # truncating apostrophe), and the give-up gate is what stopped anyone
+        # noticing for weeks. A count that only ever grows is the cheapest guard
+        # against the next variant of that.
+        given_up = db.execute(
+            "SELECT COUNT(*) FROM sharepoint_links "
+            "WHERE fetched_at IS NULL AND COALESCE(attempts, 0) >= ?",
+            (SHAREPOINT_MAX_ATTEMPTS,),
+        ).fetchone()[0]
         latest_attempt = db.execute("SELECT MAX(last_attempt_at) FROM sharepoint_links").fetchone()[
             0
         ]
@@ -601,6 +824,7 @@ def check_sharepoint(db):
             "by_status": {s: n for s, n in status_map.items() if s != "ok"},
             "total": total,
             "overdue": overdue,
+            "given_up": given_up,
             "age": _age(latest_attempt),
             "stale": bool(overdue),
             "status": status,
@@ -610,16 +834,27 @@ def check_sharepoint(db):
 
 
 def check_sharepoint_token(path: Path = SHAREPOINT_SESSION, now: datetime | None = None):
-    """Surface an expired/expiring SharePoint session token.
+    """Surface an expiring SharePoint session.
 
-    The SharePoint bearer is a *separate* token from the Outlook mail session and
-    does not renew headlessly once fully expired — it needs an interactive
-    `sharepoint-cli login --host <host>`. When it lapses, mail keeps
-    working (its token still renews) while every SharePoint fetch fails with
-    SHAREPOINT_SESSION_MISSING. The file mtime stays fresh because the token-sync
-    job keeps copying the dead token, so mtime alone can't detect this — only the
-    embedded tokenExpiresAt can. This check makes that rot visible instead of
-    silent.
+    Read the number here as a WATERMARK, not a countdown. This tenant is
+    MCAS-gated and issues no SharePoint bearer at all, so `tokenExpiresAt` is the
+    live expiry of the FedAuth cookie captured out of sharepoint-cli's persistent
+    browser profile. SharePoint Online mints that cookie with a five-day TTL and
+    re-issues it on activity, and the laptop-side token-sync job runs
+    `sharepoint-cli auth-renew` every 15 minutes, so a HEALTHY session sits
+    permanently near five days and never visibly counts down. Sampled once, a
+    perfectly rolling session and a frozen one look identical.
+
+    What that means for reading this row: the alarming state is not a small
+    number, it is a number that has started to FALL. Each full day of decline is
+    a day in which no renewal succeeded, and only the laptop can renew (it holds
+    the browser profile; the VPS just receives the file by scp).
+
+    The docstring here previously said the opposite, that the token "does not
+    renew headlessly" and needed an interactive login. That was true of the old
+    outlook-cli-derived bearer and was carried forward verbatim through the
+    2026-08-08 migration to sharepoint-cli, which only updated the command name
+    inside the sentence. Renewal has been unattended and cookie-based since.
     """
     now = now or datetime.now(UTC)
     if not path.exists():
@@ -635,28 +870,85 @@ def check_sharepoint_token(path: Path = SHAREPOINT_SESSION, now: datetime | None
     except (ValueError, TypeError):
         return {"name": "SP Session", "status": "WARN", "error": f"bad tokenExpiresAt: {exp!r}"}
 
-    remaining = dt - now
-    if remaining.total_seconds() <= 0:
-        status = "FAIL"
-    elif remaining < timedelta(hours=24):
-        status = "WARN"
-    else:
-        status = "OK"
-    # This row asserts on time-to-expiry, not on age, so it is the one legitimate
-    # blank in the age column — and a blank there is exactly how the checks that
-    # could NOT go red used to look. Showing when the session was captured keeps
-    # "'?' means nothing is being asserted" true as a reading of the report.
     captured = data.get("capturedAt")
     try:
         age = now - datetime.fromisoformat(str(captured).replace("Z", "+00:00"))
     except (ValueError, TypeError):
         age = None
+
+    remaining = dt - now
+    # Two independent assertions, because time-to-expiry ALONE is nearly blind
+    # here. The renewal job re-mints a five-day cookie every 15 minutes, so
+    # `remaining` reads ~5d whether the session is rolling healthily or was
+    # captured minutes before the renewer died. It only starts falling a full day
+    # after renewal stops, and the old 24h warning then left about one day of
+    # notice out of the five that had already been squandered.
+    #
+    # Capture age is the direct signal and it is the one with a short fuse: at a
+    # 15-minute cadence, a whole day of silence cannot be a blip. It is a WARN
+    # rather than a FAIL because only the laptop can renew (it holds the browser
+    # profile; the VPS just receives the file), so an overnight shutdown is an
+    # ordinary reason to see a few hours here, and a genuinely dead renewer will
+    # keep escalating on its own as `remaining` follows it down.
+    stale_capture = age is not None and age > timedelta(hours=24)
+    if remaining.total_seconds() <= 0:
+        status = "FAIL"
+    elif remaining < timedelta(hours=48) or stale_capture:
+        status = "WARN"
+    else:
+        status = "OK"
     return {
         "name": "SP Session",
         "status": status,
         "expires_at": exp,
         "remaining": remaining,
         "age": age,
+        "stale_capture": stale_capture,
+    }
+
+
+def check_curation(state_path: Path | None = None):
+    """Whether curate-docs is still PLACING documents, not merely running.
+
+    The blind spot this closes: curate classifies email attachments and copies
+    the good ones into the document roots, but every placement is gated on a
+    per-folder soft cap. Once all 17 National folders were at or over cap, 40 of
+    the last 44 runs placed exactly zero documents, and every existing signal
+    stayed green throughout. The job ran, exited 0, and wrote its log;
+    check_documents counts rows the reverse-ingest wrote; check_document_roots
+    watches the Mac push heartbeat. None of them asks whether anything actually
+    arrived, so a job consuming thirty candidates a run and discarding all
+    thirty was indistinguishable from a healthy one.
+
+    `deferred` is the purpose-built signal: candidates the cap turned away, held
+    for retry instead of being silently marked done. Non-empty means the
+    destination is full. Entries at MAX_DEFER_ATTEMPTS have exhausted their
+    retries and will not be offered again, so those are the ones that mean work
+    is being dropped rather than delayed.
+    """
+    path = CURATE_STATE if state_path is None else Path(state_path)
+    try:
+        state = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {"name": "Curation", "status": "N/A"}
+    except (json.JSONDecodeError, OSError) as e:
+        return {"name": "Curation", "status": "WARN", "error": str(e)}
+
+    deferred = state.get("deferred") or {}
+    copied = state.get("copied") or []
+    blocked = sum(1 for v in deferred.values() if v.get("attempts", 0) >= CURATE_MAX_DEFER_ATTEMPTS)
+    latest = max((c.get("classified_at") for c in copied if c.get("classified_at")), default=None)
+    return {
+        "name": "Curation",
+        "total": len(copied),
+        "deferred": len(deferred),
+        "blocked": blocked,
+        "latest": latest,
+        "age": _age(latest),
+        # Deferred alone is ordinary back-pressure and clears itself once a
+        # folder has room. Exhausted retries are not: that is the document being
+        # dropped, which is the condition that went unnoticed for a month.
+        "status": "WARN" if blocked else "OK",
     }
 
 
@@ -879,16 +1171,59 @@ def check_news(db, news_db=None, now=None):
     return result
 
 
-def _is_migrated(label: str, agents_dir: Path = LAUNCH_AGENTS_DIR) -> bool:
+def _replica_is_fresh(db_path: Path | None = None, now: datetime | None = None) -> bool:
+    """Whether this host recently RECEIVED brain.db from somewhere else.
+
+    Positive evidence that ingestion happens elsewhere: a host whose corpus
+    arrives by rsync is not the host producing it. The file is only replaced by a
+    successful pull, so unlike the pull job's log (which is appended on every
+    path, including "VPS unreachable" and "sync FAILED") its mtime cannot advance
+    while the pull is broken.
+    """
+    path = DEFAULT_DB if db_path is None else Path(db_path)
+    try:
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+    except OSError:
+        return False
+    return (now or datetime.now(UTC)) - mtime <= MIGRATION_EVIDENCE_MAX_AGE
+
+
+def _is_migrated(
+    label: str,
+    agents_dir: Path = LAUNCH_AGENTS_DIR,
+    db_path: Path | None = None,
+    now: datetime | None = None,
+) -> bool:
     """Whether a launchd job was intentionally retired to the VPS.
 
-    When ingestion moved to the VPS, the Mac's ingestion plists were renamed to
-    `<label>.plist.disabled-migrated-to-vps`. Such a label is deliberately gone,
-    not broken — reporting it as NOT_LOADED read as a fault on every run.
+    Two POSITIVE markers, never the mere absence of a plist:
+      1. the rename `<label>.plist.disabled-migrated-to-vps`, and
+      2. a freshly received brain.db replica.
+
+    Marker 2 exists because marker 1 does not survive a LaunchAgents rebuild.
+    Every plist on this Mac was re-laid on 2026-08-28 and the nine renamed
+    markers went with it, after which all nine jobs read NOT_LOADED again,
+    `jobs_elsewhere` went False, and twelve relic logs became twelve permanent
+    false issues on every run.
+
+    Marker 2 is timestamped on purpose, so the suppression EXPIRES rather than
+    latching green: a Mac that has stopped receiving a corpus has no evidence
+    anything is running anywhere, and goes loud again.
     """
-    disabled = agents_dir / f"{label}.plist.disabled-migrated-to-vps"
-    active = agents_dir / f"{label}.plist"
-    return disabled.exists() and not active.exists()
+    if label in LAUNCHD_LOCAL_JOBS:
+        return False  # this host owns it; it can never have moved
+    if (agents_dir / f"{label}.plist").exists():
+        return False  # still installed here
+    if (agents_dir / f"{label}.plist.disabled-migrated-to-vps").exists():
+        return True
+    # Only consult host state when we are being asked about the REAL host. A
+    # caller that overrode agents_dir is asking about a hypothetical machine, and
+    # letting this box's live replica leak into that answer would make the result
+    # depend on the developer's laptop. It also silently reversed an existing
+    # test, on macOS only, where CI (Linux, no such file) could never see it.
+    if agents_dir is not LAUNCH_AGENTS_DIR:
+        return False
+    return _replica_is_fresh(db_path, now)
 
 
 def _check_jobs_launchd():
@@ -999,6 +1334,14 @@ def check_sync_logs(log_dir: Path | None = None):
         / f"{unit.removeprefix('sb-').removesuffix('.service')}.log"
         for unit in SYSTEMD_UNITS
     }
+    # The Mac's own job. Not a relic (it is written by a job this host still
+    # runs), so build_report exempts it from the relic suppression below. It is
+    # conditional because the VPS has no db-pull unit and no db-pull.log, and
+    # demanding one there would invent a permanent MISSING out of nothing, which
+    # is exactly how conversation-sync and news-sync came to be reported missing
+    # on the Mac: derived from a registry that describes the other platform.
+    if IS_MACOS:
+        log_files["db_pull"] = log_dir / "db-pull.log"
     for name, path in log_files.items():
         if path.exists():
             mtime = datetime.fromtimestamp(path.stat().st_mtime)
@@ -1076,8 +1419,14 @@ def auto_fix(issues):
 
 
 def format_age(td):
-    if not td:
+    # `is None`, not falsity. A zero timedelta is falsy, and rendering it as "?"
+    # would say "nothing is being asserted here" about the freshest possible
+    # answer. That distinction is the whole reading convention of this report,
+    # and a clamped age (see _age) is legitimately zero.
+    if td is None:
         return "?"
+    if not td:
+        return "0m"
     total_secs = int(td.total_seconds())
     if total_secs < 3600:
         return f"{total_secs // 60}m"
@@ -1093,6 +1442,15 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
 
     lines.append(f"Second Brain Health Report — {now.strftime('%Y-%m-%d %H:%M')}")
     lines.append("=" * 55)
+
+    # Say it out loud on a replica host. Every age below is measured as of this
+    # moment, and reading them as wall-clock ages on a machine whose copy is
+    # hours old is the difference between "the source is fine" and "the source
+    # was fine when we last looked". One line is cheaper than the misreading.
+    if CORPUS_LAG > timedelta(minutes=30):
+        lines.append(
+            f"Source ages are AS OF the local replica, pulled {format_age(CORPUS_LAG)} ago."
+        )
 
     # Sentinels (blocking issues first)
     blocking = [s for s, v in sentinels.items() if v.get("present")]
@@ -1121,8 +1479,22 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
                 f" (LLM: {c.get('llm_done', 0):,} done, {c.get('llm_pending', 0):,} pending"
                 f", {c.get('llm_no_text', 0):,} no-text)"
             )
+            # Downloaded but never registered, so invisible to every search. The
+            # count belongs on this row because this row is what a reader checks
+            # to decide attachments are healthy.
+            if c.get("unregistered"):
+                extra = extra[:-1] + f"; {c['unregistered']:,} downloaded but unregistered)"
         elif c["name"] == "Inline Images":
-            extra = f" ({c.get('pct', 0):.0f}% classified, {c.get('pending', 0):,} queued)"
+            # Counts, not a percentage. The old "87% classified" was a ceiling,
+            # not a shortfall: its denominator included the signature and noise
+            # rows vision is never asked to describe, so it read as permanently
+            # behind while nothing was owed. "skipped by design" is the same
+            # population stated as the policy it actually is.
+            extra = (
+                f" ({c.get('described_eligible', 0):,} described,"
+                f" {c.get('owed', 0):,} owed, {c.get('pending', 0):,} queued;"
+                f" {c.get('skipped', 0):,} skipped by design)"
+            )
             if c.get("stuck"):
                 extra += (
                     f" — {c['stuck']:,} awaiting vision, last output {format_age(c.get('age'))} ago"
@@ -1139,12 +1511,28 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
                 # The date is what separates one bad sweep from slow attrition.
                 if c.get("disabled_at"):
                     extra += f" (latest {str(c['disabled_at'])[:19]})"
+        elif c["name"] == "Curation":
+            if c.get("blocked"):
+                extra = (
+                    f" ({c.get('deferred', 0)} deferred, {c['blocked']} out of retries:"
+                    " destination folders are full)"
+                )
+            elif c.get("deferred"):
+                extra = f" ({c['deferred']} deferred, awaiting folder headroom)"
+            else:
+                extra = " (nothing blocked)"
         elif c["name"] == "SharePoint":
             count = f"{c.get('ok', 0)}/{c.get('total', 0)}"
             failed = c.get("failed", 0)
             if failed:
                 breakdown = ", ".join(f"{n} {s}" for s, n in sorted(c.get("by_status", {}).items()))
                 extra = f" ({failed} unfetched: {breakdown})"
+                # Spelled out because "unfetched" reads as "not fetched YET", and
+                # for these it means never. Without the word, 23 abandoned links
+                # were indistinguishable from 23 queued ones for weeks.
+                given_up = c.get("given_up", 0)
+                if given_up:
+                    extra = extra[:-1] + f"; {given_up} given up, no longer retried)"
             else:
                 extra = " (all fetched)"
         elif c["name"] == "Doc Roots":
@@ -1208,7 +1596,12 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
     # and the systemd path only runs on the VPS. Nine "MIGRATED" lines otherwise
     # read as nine healthy jobs, when a crashed, failed or masked VPS unit looks
     # exactly the same from here. Say so rather than implying coverage.
-    jobs_elsewhere = bool(jobs) and all(info.get("status") == "MIGRATED" for info in jobs.values())
+    # Scoped to the jobs that CAN move. The old all(status == "MIGRATED") went
+    # False the moment db-pull joined the registry, because a job this host owns
+    # can never be MIGRATED, and that one fact would have re-armed all twelve
+    # relic logs below.
+    movable = [info for info in jobs.values() if info.get("desc") not in LOCAL_JOB_DESCS]
+    jobs_elsewhere = bool(movable) and all(info.get("status") == "MIGRATED" for info in movable)
     if jobs_elsewhere:
         lines.append("")
         lines.append("  NOTE: job health is not verifiable from this host — these jobs run on")
@@ -1222,14 +1615,15 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
     # An ABSENT log carries no "stale" flag, so it used to be silence rather
     # than a signal — the same shape as every other blind spot in this file.
     # All twelve resolve on the VPS today, so a missing one is a real fault.
-    bad_logs = (
-        sorted(
-            (name, info)
-            for name, info in logs.items()
-            if info.get("stale") or info.get("status") == "MISSING"
-        )
-        if logs and not jobs_elsewhere
-        else []
+    # Per-log rather than all-or-nothing. The relics belong to jobs that left;
+    # db-pull's log belongs to a job that stayed, and muting it alongside them
+    # would leave the Mac asserting on nothing it actually owns, which is how a
+    # failing pull came to have no signal anywhere in this script.
+    bad_logs = sorted(
+        (name, info)
+        for name, info in logs.items()
+        if (info.get("stale") or info.get("status") == "MISSING")
+        and not (jobs_elsewhere and name not in LOCAL_LOG_NAMES)
     )
     if bad_logs:
         lines.append("")
@@ -1442,6 +1836,12 @@ def main():
         print("ERROR: Database not found", file=sys.stderr)
         sys.exit(1)
 
+    # Pin the observation instant before reading a single row, so every age in
+    # this report is measured from the same point and none of them is measured
+    # from a moment the corpus could not possibly know about.
+    global CORPUS_LAG
+    CORPUS_LAG = corpus_lag()
+
     checks = [
         check_emails(db),
         check_teams(db),
@@ -1451,6 +1851,7 @@ def main():
         check_conversations(db),
         check_embeddings(db),
         check_documents(db),
+        check_curation(),
         check_document_roots(),
         check_news(db),
         check_sharepoint(db),

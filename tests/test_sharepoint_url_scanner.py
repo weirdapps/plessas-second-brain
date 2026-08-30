@@ -55,6 +55,80 @@ def test_empty_input():
     assert extract_sharepoint_urls(None) == []
 
 
+# --- A mangled URL is not a deleted document ---------------------------------
+# The scanner read HTML as if it were plain text: no html.unescape(), and a
+# character class that treated the apostrophe as a delimiter. 23 links on prod
+# were stored broken and 404ed on every attempt, which the retirement rule then
+# read as "the document is gone" and parked them for good. They were never
+# gone: 802 other /SitePages/ links fetch fine. Three shapes of damage:
+#   (a) "&amp;" survived inside the path of a page whose real title has an "&";
+#   (b) an HTML-escaped href left the closing "&quot;" glued to the URL, of
+#       which the old rstrip ate only the ";";
+#   (c) a page title containing an apostrophe truncated at the apostrophe.
+
+
+def test_an_escaped_ampersand_in_the_path_is_unescaped():
+    """(a) The page title really does contain an "&", so "&amp;" in the path is
+    the HTML's escaping of it, not part of the file name."""
+    html = (
+        '<a href="https://contoso.sharepoint.com/sites/Team/SitePages/'
+        'Economy-&amp;-Markets-Snapshot--(2).aspx">link</a>'
+    )
+    urls = extract_sharepoint_urls(html)
+    assert urls == [
+        "https://contoso.sharepoint.com/sites/Team/SitePages/Economy-&-Markets-Snapshot--(2).aspx"
+    ]
+
+
+def test_an_html_escaped_href_keeps_no_trailing_quote_entity():
+    """(b) Markup that itself arrived escaped: the closing delimiter is the
+    five characters "&quot;", which the character class happily swallowed."""
+    html = (
+        "see &lt;a href=&quot;https://contoso.sharepoint.com/sites/Team/SitePages/"
+        "reports(5).aspx&quot; target=&quot;_blank&quot;&gt;link&lt;/a&gt;"
+    )
+    urls = extract_sharepoint_urls(html)
+    assert urls == ["https://contoso.sharepoint.com/sites/Team/SitePages/reports(5).aspx"]
+
+
+def test_a_page_title_with_an_apostrophe_is_captured_in_full():
+    """(c) Truncating at the apostrophe produced a prefix that 404s forever."""
+    html = (
+        '<a href="https://contoso.sharepoint.com/sites/Team/SitePages/'
+        "Sales-Rally-Q2-'2025.aspx\">link</a>"
+    )
+    urls = extract_sharepoint_urls(html)
+    assert urls == ["https://contoso.sharepoint.com/sites/Team/SitePages/Sales-Rally-Q2-'2025.aspx"]
+
+
+def test_a_single_quoted_href_does_not_swallow_what_follows_it():
+    """The apostrophe cannot simply be dropped from the character class: a
+    single-quoted href would then run past its own closing delimiter and drag
+    the anchor text in with it. Anchoring on the attribute is what fixes (c)."""
+    html = "<a href='https://contoso.sharepoint.com/sites/Team/a.aspx'>text</a>"
+    urls = extract_sharepoint_urls(html)
+    assert urls == ["https://contoso.sharepoint.com/sites/Team/a.aspx"]
+
+
+def test_a_bare_url_outside_an_href_is_still_found():
+    """Anchoring on href= must stay a widening, not a narrowing: plain-text
+    SharePoint URLs in message bodies exist and still have to be picked up."""
+    html = "plain text https://contoso.sharepoint.com/sites/Team/notes.aspx end"
+    urls = extract_sharepoint_urls(html)
+    assert urls == ["https://contoso.sharepoint.com/sites/Team/notes.aspx"]
+
+
+def test_an_already_unescaped_url_is_left_alone():
+    """Unescaping is idempotent: a literal "&" already in the path stays one,
+    so re-scanning an already-clean URL cannot corrupt it."""
+    html = (
+        '<a href="https://contoso.sharepoint.com/sites/Team/SitePages/'
+        'Economy-&-Markets.aspx">link</a>'
+    )
+    urls = extract_sharepoint_urls(html)
+    assert urls == ["https://contoso.sharepoint.com/sites/Team/SitePages/Economy-&-Markets.aspx"]
+
+
 # --- Abandoned links must get a second chance --------------------------------
 # The retry pass filters on `attempts < MAX_SHAREPOINT_ATTEMPTS`, which makes the
 # cap an ABANDONMENT rather than a throttle. Between 2026-07-30 and 2026-08-10

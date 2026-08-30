@@ -322,6 +322,61 @@ def test_process_sharepoint_skips_external_host_and_continues(mock_fetch, tmp_pa
     assert external == ["unsupported-host"]
 
 
+# --- A foreign tenant does not always answer with exit 4 ---------------------
+# 'unsupported-host' only fired on auth-required, but a tenant we hold no
+# session for is just as likely to answer HTTP 403 (sharepoint-cli maps
+# access_denied onto 'http-error'). Those links stay eligible for the retry
+# pass and are re-requested every night, forever, against a host our login can
+# never open. The managed-host guard is the whole safety of this: 403 from OUR
+# OWN tenant is a per-item authorisation problem that can be granted later, and
+# parking it as 'unsupported-host' would abandon it permanently, which is the
+# exact bug being fixed here.
+
+
+def _status_after_403(tmp_path, url):
+    """Scan one email carrying `url`, whose fetch answers 403. Returns the
+    status recorded against it."""
+    import argparse
+
+    from src.cli import cmd_process_sharepoint
+    from src.store.schema import get_connection
+
+    db_path = tmp_path / "test.db"
+    conn = _setup_db(tmp_path)
+    conn.execute(
+        "INSERT INTO emails (message_id, date_received, content) VALUES (?, ?, ?)",
+        ("m-403", "2026-08-29T12:00:00", f"the deck is at {url} enjoy"),
+    )
+    conn.commit()
+    conn.close()
+
+    with patch("src.export.sharepoint_fetcher.fetch_sharepoint_link") as mock_fetch:
+        mock_fetch.return_value = SharepointFetchResult(
+            url=url, status="http-error", http_status=403, error_message="access_denied"
+        )
+        args = argparse.Namespace(db=str(db_path), since=None, limit=0, dry_run=False)
+        cmd_process_sharepoint(args)
+
+    conn = get_connection(str(db_path))
+    row = conn.execute("SELECT last_status FROM sharepoint_links WHERE url = ?", (url,)).fetchone()
+    conn.close()
+    return row[0]
+
+
+def test_a_403_from_a_foreign_tenant_is_recorded_as_unsupported_host(tmp_path):
+    """No session for that host exists and no login of ours can create one, so
+    the link is permanently out of reach and must stop being retried."""
+    url = "https://partner.sharepoint.com/sites/Org/Edoc"
+    assert _status_after_403(tmp_path, url) == "unsupported-host"
+
+
+def test_a_403_from_the_managed_host_stays_an_http_error(tmp_path):
+    """Our own tenant refusing one item is transient: access can be granted, so
+    the link must stay in the retry pool."""
+    url = "https://contoso.sharepoint.com/sites/Team/Edoc"
+    assert _status_after_403(tmp_path, url) == "http-error"
+
+
 @patch("src.export.sharepoint_fetcher.fetch_sharepoint_link")
 def test_process_sharepoint_retries_known_unfetched_link(mock_fetch, tmp_path):
     """A link recorded earlier but never successfully fetched (fetched_at NULL,

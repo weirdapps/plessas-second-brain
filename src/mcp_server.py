@@ -507,7 +507,7 @@ def sharepoint_index(
     """Operations on the sharepoint_links table.
 
     Operations:
-      - list_stale: URLs whose last_status is 'stale' or 'http-error'
+      - list_stale: URLs whose last_status is anything other than 'ok'
       - list_unfetched: URLs that have never been successfully fetched
       - refetch: force a re-attempt for a specific URL (requires `url`)
 
@@ -521,11 +521,18 @@ def sharepoint_index(
     conn = _get_conn()
     try:
         if operation == "list_stale":
+            # Enumerate the one healthy status rather than the failing ones. The
+            # hardcoded IN ('stale', 'http-error') was already incomplete when it
+            # was written ('auth-required' existed), and 'unsupported-host'
+            # arrived later without anyone thinking to add it here, so a whole
+            # class of unfetched link was invisible to this tool. A new status
+            # must show up as a problem, not vanish: fail open, the way
+            # scripts/health_check.py counts them.
             rows = conn.execute(
                 """
                 SELECT url, message_id, last_status, last_attempt_at
                 FROM sharepoint_links
-                WHERE last_status IN ('stale', 'http-error')
+                WHERE last_status != 'ok'
                 ORDER BY last_attempt_at DESC
                 """
             ).fetchall()

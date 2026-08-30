@@ -421,10 +421,18 @@ def cmd_process_sharepoint(args):
         result = fetch_sharepoint_link(url, SHAREPOINT_DATA_DIR)
         # An auth failure on an external tenant (a host we hold no session for)
         # can never be fixed by our re-login, so record it distinctly and keep
-        # going instead of aborting the whole pass.
-        external_auth = result.status == "auth-required" and not is_managed_sharepoint_host(
-            url, SHAREPOINT_HOST
-        )
+        # going instead of aborting the whole pass. A foreign tenant announces
+        # itself with HTTP 403 at least as often as with exit-4 auth_required,
+        # and that landed in 'http-error', which the retry pass re-requests
+        # every night for a host our login can never open.
+        # The managed-host guard is what makes widening this safe: 403 from OUR
+        # OWN tenant is a per-item authorisation refusal that can be granted
+        # later, so it must stay 'http-error' and stay in the retry pool.
+        # 'unsupported-host' is permanent, and parking a managed link there
+        # would be the same abandonment bug in a new place.
+        external_auth = (
+            result.status == "auth-required" or result.http_status == 403
+        ) and not is_managed_sharepoint_host(url, SHAREPOINT_HOST)
         recorded_status = "unsupported-host" if external_auth else result.status
         record_link_in_db(
             conn,

@@ -63,12 +63,29 @@ if os.path.exists(db):
 # Replaces the old shutil.copy2, which raw-copied a live WAL DB and could capture a
 # torn/unopenable snapshot. The offsite copy is produced only where the backup key
 # exists (the authoritative VPS), so the Mac replica skips it automatically.
+#
+# The step stays non-fatal on purpose: this script has no `set -e`, and making the
+# backup fatal would let a transient snapshot failure abort the mail and Teams
+# ingest that follows. But non-fatal used to mean invisible, because the `||` below
+# returns 0 and hc-success@sb-daily-sync then fired whether or not a snapshot was
+# taken. --hc-slug fixes that without changing the failure semantics: the backup
+# now reports on its own check and the sync keeps its own verdict.
+#
+# HC_PING_URL is a secret, sourced from the same env file the other wrappers use.
+# Sourced here rather than added to the unit because external/vps/systemd is a
+# backup copy that does not deploy, so a unit edit would not reach the VPS.
+PING_ENV="$HOME/.config/healthchecks-ping.env"
+# shellcheck source=/dev/null
+[ -f "$PING_ENV" ] && . "$PING_ENV"
+export HC_PING_URL="${HC_PING_URL:-}"
+
 "$PYTHON" "$REPO_DIR/scripts/backup_db.py" \
   --db "$REPO_DIR/data/brain.db" \
   --local-dir "$REPO_DIR/data/backups" --local-keep 7 \
   --offsite-dir "$REPO_DIR/data/backups/offsite" \
   --key-file "$HOME/.second-brain/backup.key" \
   --gfs-daily 14 --gfs-weekly 8 \
+  --hc-slug brain-backup \
   >> "$LOG_FILE" 2>&1 \
   || echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: backup step failed (non-fatal)" >> "$LOG_FILE"
 

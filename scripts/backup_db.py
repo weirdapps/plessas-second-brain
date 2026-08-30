@@ -40,6 +40,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import urllib.request
 from datetime import date, datetime
 from glob import glob
 from pathlib import Path
@@ -51,6 +52,32 @@ OFFSITE_PATTERN = "brain-*.db.zst.enc"
 
 def _log(msg: str) -> None:
     print(f"[backup_db] {msg}", flush=True)
+
+
+def _ping(slug: str | None, suffix: str = "") -> None:
+    """Ping a Healthchecks slug, if one was requested and a base URL is in env.
+
+    The caller (sb-daily-sync.sh) runs this step with `|| echo WARN` and the
+    wrapper has no `set -e`, so a failed backup could not turn any check red:
+    hc-success@sb-daily-sync fired whether or not a snapshot was taken. Making
+    the step fatal would have been worse, because a transient backup failure
+    would then also abort that day's mail and Teams ingest. So the backup
+    reports on its own slug instead, and the sync keeps its own verdict.
+
+    HC_PING_URL is a secret and is read from the environment only. It is never
+    a default and never a CLI argument, because this repo is public.
+
+    Best-effort by design: a monitoring call must not be able to fail a backup
+    that has already succeeded.
+    """
+    base = os.environ.get("HC_PING_URL", "").rstrip("/")
+    if not slug or not base:
+        return
+    try:
+        with urllib.request.urlopen(f"{base}/{slug}{suffix}", timeout=10) as r:
+            r.read()
+    except Exception as exc:  # noqa: BLE001 - never let telemetry break a backup
+        _log(f"healthchecks ping failed ({slug}{suffix}): {exc}")
 
 
 def snapshot(db_path: str, dest_path: str) -> str:
@@ -200,8 +227,19 @@ def main(argv=None) -> int:
         action="store_true",
         help="Only GFS-prune --offsite-dir (Mac side, run after rsync).",
     )
+    ap.add_argument(
+        "--hc-slug",
+        help=(
+            "Healthchecks slug to report this backup on. Pings success only when a "
+            "snapshot was actually written, and /fail on every skip or error path. "
+            "Requires HC_PING_URL in the environment; ignored without it."
+        ),
+    )
     args = ap.parse_args(argv)
 
+    # prune-only is the Mac side tidying copies it pulled. It takes no backup, so
+    # it must never report on the backup slug: that would turn the VPS's snapshot
+    # green from a machine that did not take one.
     if args.prune_only:
         if not args.offsite_dir or not os.path.isdir(args.offsite_dir):
             _log(f"prune-only: offsite dir missing, nothing to do: {args.offsite_dir}")
@@ -210,35 +248,48 @@ def main(argv=None) -> int:
         _log(f"GFS prune removed {len(removed)} offsite snapshot(s)")
         return 0
 
+    # Every `return 0` below is a path where NO backup was taken. They stay 0 so
+    # the caller's behaviour is unchanged, but each one pings /fail, because
+    # "exited cleanly" and "took a backup" are different facts and only the
+    # second one is worth a green check.
     if not args.db or not os.path.exists(args.db):
         _log(f"no database found, skipping backup: {args.db}")
+        _ping(args.hc_slug, "/fail")
         return 0
 
-    # 1. Local MVCC-safe snapshot + rolling retention.
-    local_dir = args.local_dir or os.path.join(os.path.dirname(args.db), "backups")
-    stamp = date.today().strftime("%Y%m%d")
-    local_path = os.path.join(local_dir, f"brain-{stamp}.db")
-    snapshot(args.db, local_path)
-    _log(f"local snapshot OK: {os.path.basename(local_path)}")
-    removed = prune_rolling(local_dir, LOCAL_PATTERN, args.local_keep)
-    if removed:
-        _log(f"pruned {len(removed)} old local backup(s)")
+    try:
+        # 1. Local MVCC-safe snapshot + rolling retention.
+        local_dir = args.local_dir or os.path.join(os.path.dirname(args.db), "backups")
+        stamp = date.today().strftime("%Y%m%d")
+        local_path = os.path.join(local_dir, f"brain-{stamp}.db")
+        snapshot(args.db, local_path)
+        _log(f"local snapshot OK: {os.path.basename(local_path)}")
+        removed = prune_rolling(local_dir, LOCAL_PATTERN, args.local_keep)
+        if removed:
+            _log(f"pruned {len(removed)} old local backup(s)")
 
-    # 2. Offsite encrypted copy — scoped by key-file presence (VPS only).
-    if args.offsite_dir and args.key_file:
-        if not os.path.exists(args.key_file):
-            _log(f"offsite skipped: key file not found ({args.key_file})")
-            return 0
-        if not tools_available():
-            _log("offsite skipped: zstd/openssl not available")
-            return 0
-        offsite_path = os.path.join(args.offsite_dir, f"brain-{stamp}{OFFSITE_SUFFIX}")
-        compress_encrypt(local_path, offsite_path, args.key_file)
-        size_mb = os.path.getsize(offsite_path) / 1e6
-        _log(f"offsite encrypted copy OK: {os.path.basename(offsite_path)} ({size_mb:.0f} MB)")
-        # Bound the VPS-side offsite dir too (same GFS window the Mac keeps).
-        prune_gfs(args.offsite_dir, OFFSITE_PATTERN, args.gfs_daily, args.gfs_weekly)
+        # 2. Offsite encrypted copy — scoped by key-file presence (VPS only).
+        if args.offsite_dir and args.key_file:
+            if not os.path.exists(args.key_file):
+                _log(f"offsite skipped: key file not found ({args.key_file})")
+                _ping(args.hc_slug, "/fail")
+                return 0
+            if not tools_available():
+                _log("offsite skipped: zstd/openssl not available")
+                _ping(args.hc_slug, "/fail")
+                return 0
+            offsite_path = os.path.join(args.offsite_dir, f"brain-{stamp}{OFFSITE_SUFFIX}")
+            compress_encrypt(local_path, offsite_path, args.key_file)
+            size_mb = os.path.getsize(offsite_path) / 1e6
+            _log(f"offsite encrypted copy OK: {os.path.basename(offsite_path)} ({size_mb:.0f} MB)")
+            # Bound the VPS-side offsite dir too (same GFS window the Mac keeps).
+            prune_gfs(args.offsite_dir, OFFSITE_PATTERN, args.gfs_daily, args.gfs_weekly)
+    except Exception as exc:  # noqa: BLE001 - report, then re-raise for the log
+        _log(f"backup FAILED: {exc}")
+        _ping(args.hc_slug, "/fail")
+        raise
 
+    _ping(args.hc_slug)
     return 0
 
 

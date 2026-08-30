@@ -54,6 +54,23 @@ def test_list_stale_returns_stale_and_http_error(mock_get_conn, mock_conn):
 
 
 @patch("src.mcp_server._get_conn")
+def test_list_stale_returns_every_non_ok_status(mock_get_conn, mock_conn):
+    """The hardcoded IN ('stale', 'http-error') was a list that stopped being
+    complete the moment a status was added: 'auth-required' and
+    'unsupported-host' both occur in sharepoint_links, and neither was visible
+    here. Enumerate what is healthy instead, so a new status shows up as a
+    problem rather than disappearing. scripts/health_check.py counts this way.
+    """
+    mock_get_conn.return_value = mock_conn
+    from src.mcp_server import sharepoint_index
+
+    result = sharepoint_index(operation="list_stale")
+    urls = [row["url"] for row in result["links"]]
+    assert "https://sp/auth" in urls
+    assert "https://sp/ok" not in urls
+
+
+@patch("src.mcp_server._get_conn")
 def test_list_unfetched_returns_no_local_path(mock_get_conn, mock_conn):
     mock_get_conn.return_value = mock_conn
     from src.mcp_server import sharepoint_index

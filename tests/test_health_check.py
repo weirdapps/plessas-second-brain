@@ -2546,3 +2546,68 @@ def test_outlook_sync_threshold_spans_its_real_overnight_gap(hc):
     assert hc.STALE_THRESHOLDS["outlook_sync"] < timedelta(hours=12), (
         "wide enough to stop being an assertion"
     )
+
+
+# Counting the total was right when the only failure mode was "the registrar
+# never ran". It is wrong once the tree also holds directories no run can ever
+# resolve: triaging a message into Archive-<year> mints a new Graph id and
+# retires the old one, so the directory written under the old id is permanently
+# unmatchable. 1,955 of them had accrued by 2026-08-31 and every one was counted
+# on every report, which pinned the check to WARN no matter what was fixed.
+# Same split, same words, as check_sharepoint's "given up, no longer retried".
+
+
+def _aged_dirs(tmp_path, days, *names):
+    import os
+    import time
+
+    when = time.time() - days * 86400
+    for n in names:
+        d = tmp_path / str(n)
+        d.mkdir(exist_ok=True)
+        os.utime(d, (when, when))
+    return tmp_path
+
+
+def test_split_separates_a_fresh_deferral_from_an_abandoned_one(hc, tmp_path):
+    root = _attachment_dirs(tmp_path, "known-1", "fresh-orphan")
+    _aged_dirs(tmp_path, 40, "dead-orphan-1", "dead-orphan-2")
+    db = _attachments_db(root, "known-1")
+
+    pending, abandoned = hc.split_unregistered_attachment_dirs(db, root=root)
+
+    assert pending == 1
+    assert abandoned == 2
+
+
+def test_abandoned_dirs_do_not_raise_a_warn(hc, tmp_path):
+    """The whole point: a backlog nobody can drain must not read as a fault the
+    operator is expected to act on."""
+    _aged_dirs(tmp_path, 40, *[f"dead-{i}" for i in range(500)])
+    db = _attachments_db(tmp_path)
+
+    pending, abandoned = hc.split_unregistered_attachment_dirs(db, root=tmp_path)
+
+    assert pending == 0
+    assert abandoned == 500
+
+
+def test_a_fresh_backlog_still_raises_a_warn(hc, tmp_path):
+    """Ageing them out must not silence the original bug. A registrar that has
+    stopped running produces recent directories, and those still have to shout."""
+    _attachment_dirs(tmp_path, *[f"new-{i}" for i in range(500)])
+    db = _attachments_db(tmp_path)
+
+    pending, abandoned = hc.split_unregistered_attachment_dirs(db, root=tmp_path)
+
+    assert pending == 500
+    assert abandoned == 0
+
+
+def test_total_count_still_reports_every_unregistered_dir(hc, tmp_path):
+    """The sum keeps its old meaning for anything reading disk usage."""
+    root = _attachment_dirs(tmp_path, "known-1", "fresh-orphan")
+    _aged_dirs(tmp_path, 40, "dead-orphan")
+    db = _attachments_db(root, "known-1")
+
+    assert hc.count_unregistered_attachment_dirs(db, root=root) == 2

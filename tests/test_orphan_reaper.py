@@ -63,18 +63,25 @@ def db(db_path) -> Generator[sqlite3.Connection, None, None]:
     conn.close()
 
 
-def _orphan(base: Path, message_id: str, files: dict[str, bytes], age_days: float = 30) -> Path:
-    """A directory outlook-cli wrote whose message id is no longer in the store."""
+def _age(path: Path, days: float) -> Path:
+    """Backdate a directory. Must be the LAST thing done to it: creating or
+    removing any entry inside resets the parent's mtime to now, which is exactly
+    how a directory built in two steps ends up looking fresh and being skipped."""
     import os
     import time
 
+    when = time.time() - days * 86400
+    os.utime(path, (when, when))
+    return path
+
+
+def _orphan(base: Path, message_id: str, files: dict[str, bytes], age_days: float = 30) -> Path:
+    """A directory outlook-cli wrote whose message id is no longer in the store."""
     d = base / message_id
     d.mkdir(parents=True, exist_ok=True)
     for name, body in files.items():
         (d / name).write_bytes(body)
-    when = time.time() - age_days * 86400
-    os.utime(d, (when, when))
-    return d
+    return _age(d, age_days)
 
 
 def _registered(db, base: Path, message_id: str, name: str, body: bytes) -> Path:
@@ -204,6 +211,7 @@ def test_leaves_the_sharepoint_subtree_for_its_own_tracker(db, db_path, tmp_path
     sp = dead / "sharepoint"
     sp.mkdir()
     (sp / "fetched.xlsx").write_bytes(b"sp-bytes")
+    _age(dead, 30)
 
     result = reap_orphan_attachments(db_path, tmp_path, apply=True)
 
@@ -257,3 +265,65 @@ def test_counts_content_already_ingested_separately_from_a_fresh_adoption(db, db
     assert result["adopted"] == 1
     assert result["already_ingested"] == 1
     assert db.execute("SELECT COUNT(*) FROM emails").fetchone()[0] == 1
+
+
+def test_survives_a_missing_attachments_root(db_path, tmp_path):
+    """A host that has never downloaded one must not invent a fault."""
+    result = reap_orphan_attachments(db_path, tmp_path / "absent", apply=True)
+
+    assert result["scanned"] == 0
+
+
+def test_a_row_with_no_recorded_size_cannot_condemn_a_file(db, db_path, tmp_path):
+    """file_size is nullable, and the macOS exporter left some NULL. Treating
+    the pair (name, NULL) as a match would delete an orphan on the strength of
+    a row that says nothing about its bytes."""
+    d = tmp_path / "AAMk-nullsize"
+    d.mkdir()
+    (d / "same.pdf").write_bytes(b"registered-copy")
+    db.execute("INSERT INTO emails (message_id, date_received, subject) VALUES ('AAMk-ns','x','s')")
+    db.execute(
+        "INSERT INTO attachments (email_id, message_id, filename, file_size, file_path, "
+        "exported_at) VALUES (1,'AAMk-ns','same.pdf',NULL,?,'x')",
+        (str(d / "same.pdf"),),
+    )
+    db.commit()
+    _orphan(tmp_path, "AAMk-orphan-ns", {"same.pdf": b"different-bytes-entirely"})
+
+    result = reap_orphan_attachments(db_path, tmp_path, apply=True)
+
+    assert result["deleted"] == 0
+    assert result["adopted"] == 1
+
+
+def test_keeps_the_husk_when_a_sharepoint_subtree_remains(db, db_path, tmp_path):
+    """Files reaped, directory kept, because someone else still owns what is in
+    it. rmdir on a non-empty directory would raise and abort the whole run."""
+    dead = _orphan(tmp_path, "AAMk-mixed", {"solo.pdf": b"unique-mixed"})
+    (dead / "sharepoint").mkdir()
+    (dead / "sharepoint" / "ref.xlsx").write_bytes(b"sp")
+    _age(dead, 30)
+
+    result = reap_orphan_attachments(db_path, tmp_path, apply=True)
+
+    assert result["adopted"] == 1
+    assert result["dirs_removed"] == 0
+    assert dead.exists()
+    assert (dead / "sharepoint" / "ref.xlsx").exists()
+
+
+def test_cli_defaults_to_a_dry_run(db, db_path, tmp_path, capsys, monkeypatch):
+    """--apply is the only way to touch the disk. A reaper that acted on a bare
+    invocation would be one tab-completion away from deleting 3.88 GiB."""
+    _registered(db, tmp_path, "AAMk-cli-new", "dup.pdf", b"c" * 40)
+    dead = _orphan(tmp_path, "AAMk-cli-old", {"dup.pdf": b"c" * 40})
+
+    monkeypatch.setattr(
+        "sys.argv", ["reap", "--db", db_path, "--root", str(tmp_path), "--grace-days", "7"]
+    )
+    assert _REAPER.main() == 0
+
+    assert (dead / "dup.pdf").exists(), "no --apply means no deletion"
+    out = capsys.readouterr().out
+    assert "DRY RUN" in out
+    assert "duplicates deleted  : 1" in out

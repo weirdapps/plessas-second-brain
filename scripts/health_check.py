@@ -25,6 +25,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import ATTACHMENTS_DIR, DEFAULT_DB, NEWS_DB_PATH, SHAREPOINT_HOST  # noqa: E402
+from src.export.outlook_attachments import (  # noqa: E402
+    ORPHAN_GRACE_DAYS,
+    is_abandoned_orphan,
+)
 
 DB_PATH = DEFAULT_DB
 LOG_DIR = Path.home() / ".second-brain/logs"
@@ -532,13 +536,34 @@ def count_unregistered_attachment_dirs(db, root: Path | None = None) -> int:
     Compared on the directory's BASENAME rather than its full path, because
     file_path is stored absolute and this script has no guaranteed CWD.
     """
+    return sum(split_unregistered_attachment_dirs(db, root))
+
+
+def split_unregistered_attachment_dirs(
+    db, root: Path | None = None, grace_days: float = ORPHAN_GRACE_DAYS, now: float | None = None
+) -> tuple[int, int]:
+    """Unregistered directories, split into (pending, abandoned).
+
+    `pending` is a real backlog: the registrar has not caught up, or has stopped
+    running, and a future run will clear it. That is worth a WARN.
+
+    `abandoned` never will be. A Graph message id encodes its containing folder,
+    so triaging a message into Archive-<year> mints a new id and retires the old
+    one; deleting it retires the id outright. Either way the directory written
+    under the old id can never be matched to an email again, and M365 answers
+    ErrorItemNotFound for all of them. Counting those alongside the backlog is
+    what pinned this check to WARN through every round of fixes: 1,955 of them,
+    3.88 GiB, accrued between April and August 2026 at roughly 400 a month.
+
+    Reported, not hidden, and in check_sharepoint's words: "no longer retried".
+    """
     root = ATTACHMENTS_DIR if root is None else Path(root)
     try:
         on_disk = {e.name for e in os.scandir(root) if e.is_dir()}
     except OSError:
-        return 0
+        return 0, 0
     if not on_disk:
-        return 0
+        return 0, 0
     try:
         referenced = {
             os.path.basename(os.path.dirname(fp))
@@ -548,8 +573,14 @@ def count_unregistered_attachment_dirs(db, root: Path | None = None) -> int:
         # Same posture as check_sharepoint: main() runs the checks unguarded, so
         # a missing table here would take down the whole nightly report over a
         # secondary count. Its absence would be loud everywhere else anyway.
-        return 0
-    return len(on_disk - referenced)
+        return 0, 0
+    pending = abandoned = 0
+    for name in on_disk - referenced:
+        if is_abandoned_orphan(root / name, grace_days, now):
+            abandoned += 1
+        else:
+            pending += 1
+    return pending, abandoned
 
 
 def check_attachments(db):
@@ -586,11 +617,12 @@ def check_attachments(db):
 
     stale = age and age > STALE_THRESHOLDS["attachments_llm"]
     pct = (extracted * 100 / total) if total > 0 else 0
-    unregistered = count_unregistered_attachment_dirs(db)
+    unregistered, abandoned = split_unregistered_attachment_dirs(db)
     return {
         "name": "Attachments",
         "total": total,
         "unregistered": unregistered,
+        "abandoned": abandoned,
         "text_extracted": extracted,
         "text_failed": failed,
         "text_pct": pct,
@@ -1484,6 +1516,11 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
             # to decide attachments are healthy.
             if c.get("unregistered"):
                 extra = extra[:-1] + f"; {c['unregistered']:,} downloaded but unregistered)"
+            # Spelled out for the same reason check_sharepoint spells it out: an
+            # abandoned directory reads as a queued one otherwise, and the
+            # operator waits for a number that will never move on its own.
+            if c.get("abandoned"):
+                extra = extra[:-1] + f"; {c['abandoned']:,} abandoned, no longer retried)"
         elif c["name"] == "Inline Images":
             # Counts, not a percentage. The old "87% classified" was a ceiling,
             # not a shortfall: its denominator included the signature and noise

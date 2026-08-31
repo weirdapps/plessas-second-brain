@@ -27,6 +27,7 @@ Defaults to a dry run. Pass --apply to actually touch the disk.
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -113,6 +114,14 @@ def _reap_one_dir(
             source=f.stem.replace("_", " ").replace("-", " ").strip() or f.name,
         )
         stats["already_ingested" if outcome.get("skipped") else "adopted"] += 1
+        # Adoption files the document under a directory named for the hash of
+        # its own content, inside this same tree, so a file an earlier
+        # reverse-ingest already settled there resolves to where it lies. It was
+        # not consumed, it was registered, and unlinking it now would delete the
+        # copy the row points at.
+        settled = outcome.get("file_path")
+        if settled and Path(settled).exists() and os.path.samefile(settled, f):
+            continue
         f.unlink()
 
 

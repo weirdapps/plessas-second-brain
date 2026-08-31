@@ -267,6 +267,32 @@ def test_counts_content_already_ingested_separately_from_a_fresh_adoption(db, db
     assert db.execute("SELECT COUNT(*) FROM emails").fetchone()[0] == 1
 
 
+def test_never_deletes_a_file_it_registered_where_it_lay(db, db_path, tmp_path, monkeypatch):
+    """An earlier reverse-ingest files a document under a directory named for the
+    hash of its own content, inside this same tree. Adopting it resolves to the
+    path it already occupies, so the unlink that normally removes a consumed
+    source would remove the registered copy instead."""
+    monkeypatch.setattr("src.extract.attachment_pipeline.ATTACHMENTS_DIR", tmp_path, raising=True)
+    from src.extract.attachment_pipeline import _file_to_message_id
+
+    body = b"settled-in-place"
+    staged = tmp_path / "stage.pdf"
+    staged.write_bytes(body)
+    settled_dir = tmp_path / str(abs(_file_to_message_id(str(staged))))
+    settled_dir.mkdir()
+    (settled_dir / "stage.pdf").write_bytes(body)
+    staged.unlink()
+    _age(settled_dir, 30)
+
+    result = reap_orphan_attachments(db_path, tmp_path, apply=True)
+
+    assert result["adopted"] == 1
+    assert (settled_dir / "stage.pdf").exists(), "the registered copy must survive"
+    assert (settled_dir / "stage.pdf").read_bytes() == body
+    row = db.execute("SELECT file_path FROM attachments").fetchone()
+    assert row[0] == str(settled_dir / "stage.pdf")
+
+
 def test_survives_a_missing_attachments_root(db_path, tmp_path):
     """A host that has never downloaded one must not invent a fault."""
     result = reap_orphan_attachments(db_path, tmp_path / "absent", apply=True)

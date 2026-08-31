@@ -181,11 +181,10 @@ def ingest_youtube(
     # Build markdown content
     md_content = f"# {label}\n\nSource: {canonical_url}\n\n## Transcript\n\n{transcript_text}\n"
 
-    with tempfile.NamedTemporaryFile(suffix=".md", delete=False, mode="w") as f:
-        f.write(md_content)
-        temp_path = f.name
-
-    try:
+    with tempfile.TemporaryDirectory() as staging:
+        temp_path = os.path.join(staging, _staged_filename(label, ".md"))
+        with open(temp_path, "w") as f:
+            f.write(md_content)
         doc_result = ingest_document(
             temp_path,
             db_path=db_path,
@@ -195,8 +194,6 @@ def ingest_youtube(
         )
         doc_result["url"] = canonical_url
         return doc_result
-    finally:
-        os.unlink(temp_path)
 
 
 def ingest_url(
@@ -249,11 +246,10 @@ def ingest_url(
     label = source or title
 
     mode = "wb" if result["is_binary"] else "w"
-    with tempfile.NamedTemporaryFile(suffix=ext, delete=False, mode=mode) as f:
-        f.write(content)
-        temp_path = f.name
-
-    try:
+    with tempfile.TemporaryDirectory() as staging:
+        temp_path = os.path.join(staging, _staged_filename(label, ext))
+        with open(temp_path, mode) as f:
+            f.write(content)
         doc_result = ingest_document(
             temp_path,
             db_path=db_path,
@@ -263,8 +259,6 @@ def ingest_url(
         )
         doc_result["url"] = url
         return doc_result
-    finally:
-        os.unlink(temp_path)
 
 
 def _extract_html_title(html_content: str) -> str | None:
@@ -275,6 +269,18 @@ def _extract_html_title(html_content: str) -> str | None:
         title = re.sub(r"\s+", " ", title)
         return html_mod.unescape(title)
     return None
+
+
+def _staged_filename(label: str, ext: str) -> str:
+    """A readable, filesystem-safe basename for the file handed to ingest_document.
+
+    ingest_document stores `Path(file_path).name` verbatim, so staging in a bare
+    NamedTemporaryFile is what put 193 rows called tmp0986_gid.html into the
+    tree. The label is page-supplied and lands in a path, so everything outside
+    a conservative set is folded away rather than escaped.
+    """
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-._")
+    return f"{slug[:80] or 'document'}{ext}"
 
 
 def _title_from_url(url: str) -> str:

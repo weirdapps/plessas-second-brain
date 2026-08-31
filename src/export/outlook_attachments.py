@@ -9,6 +9,7 @@ For each attachment in a message:
 
 import logging
 import mimetypes
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,27 @@ logger = logging.getLogger(__name__)
 FILE_ATTACHMENT = "#Microsoft.OutlookServices.FileAttachment"
 ITEM_ATTACHMENT = "#Microsoft.OutlookServices.ItemAttachment"
 REFERENCE_ATTACHMENT = "#Microsoft.OutlookServices.ReferenceAttachment"
+
+# How long a downloaded directory may sit without its email before we stop
+# calling it a wait. Attachments are downloaded post-commit, so the real gap is
+# seconds, and the nightly bulk pass closes anything the hourly window skipped.
+# A week is pure headroom over both.
+ORPHAN_GRACE_DAYS = 7
+
+
+def is_abandoned_orphan(msg_dir: Path, grace_days: float = ORPHAN_GRACE_DAYS, now=None) -> bool:
+    """True when a directory with no email row will never get one.
+
+    Aged on the directory's own mtime, which `outlook-cli` last touched when it
+    wrote the files, i.e. while the message still lived at that id. There is no
+    cheaper signal: asking Graph costs a round trip per directory and answers
+    404 for both halves of the split anyway.
+    """
+    try:
+        mtime = msg_dir.stat().st_mtime
+    except OSError:
+        return False
+    return ((now if now is not None else time.time()) - mtime) > grace_days * 86400
 
 
 @dataclass
@@ -114,6 +136,7 @@ def register_downloaded_attachments(
     limit: int | None = None,
     now: str | None = None,
     since: str | None = None,
+    grace_days: float = ORPHAN_GRACE_DAYS,
 ) -> dict:
     """Record `attachments` rows for files outlook-cli has already downloaded.
 
@@ -140,10 +163,16 @@ def register_downloaded_attachments(
     recent `since`, while the nightly job (TimeoutStartSec=1h) passes none and
     drains everything. Skipping for the window does not consume the directory —
     the bulk pass still finds it.
+
+    `deferred` counts directories whose email may yet arrive; `abandoned` counts
+    those past `grace_days`, whose message id M365 no longer serves. Keeping them
+    apart is what lets the health check report an actionable backlog instead of a
+    WARN that can never clear. Neither is a refusal: an aged directory still
+    registers the moment its email shows up.
     """
     stamp = now or datetime.now().isoformat()
     base_dir = Path(base_dir)
-    stats: dict = {"scanned": 0, "registered": 0, "deferred": 0, "ids": []}
+    stats: dict = {"scanned": 0, "registered": 0, "deferred": 0, "abandoned": 0, "ids": []}
 
     if not base_dir.is_dir():
         return stats
@@ -191,7 +220,12 @@ def register_downloaded_attachments(
         # even once the email lands. Leave it on disk for a later pass instead.
         found = emails.get(message_id)
         if found is None:
-            stats["deferred"] += 1
+            # Only the unwindowed pass may abandon. Under `since` the email map
+            # holds just the hourly window, so a loaded-but-older email is
+            # indistinguishable from one that never existed, and condemning on
+            # that view would write off the backlog the nightly pass exists for.
+            aged = since is None and is_abandoned_orphan(msg_dir, grace_days)
+            stats["abandoned" if aged else "deferred"] += 1
             continue
         stored_message_id, email_id = found
 

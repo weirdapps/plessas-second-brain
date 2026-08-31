@@ -235,3 +235,60 @@ class TestIngestYoutube:
             mock_ingest_yt.assert_called_once()
             assert result["url"] == "https://youtube.com/watch?v=abc123"
             mock_fetch.assert_not_called()
+
+
+# A web-ingested document was stored under the basename of the throwaway file it
+# was staged in, so `search_attachments` returned rows called tmp0986_gid.html.
+# 193 of them sat in the prod tree, and because ingest_document keys on a content
+# hash, every identical fetch of the same stub piled into one directory.
+
+
+class TestIngestedFilenameIsMeaningful:
+    @patch("src.extract.web_ingest.fetch_url")
+    def test_html_url_is_stored_under_a_readable_name(self, mock_fetch, tmp_path, monkeypatch):
+        from src.extract.web_ingest import ingest_url
+
+        monkeypatch.setattr(
+            "src.extract.attachment_pipeline.ATTACHMENTS_DIR", tmp_path / "att", raising=True
+        )
+        mock_fetch.return_value = {
+            "url": "https://example.com/bitcoin-guide",
+            "content": "<html><body><h1>Bitcoin</h1></body></html>",
+            "content_type": "text/html",
+            "is_binary": False,
+        }
+        db_path = str(tmp_path / "test.db")
+        create_database(db_path).close()
+
+        result = ingest_url(
+            "https://example.com/bitcoin-guide", title="Bitcoin Guide", db_path=db_path
+        )
+
+        assert not result["filename"].startswith("tmp"), result["filename"]
+        assert "bitcoin" in result["filename"].lower()
+        assert result["filename"].endswith(".html")
+
+    @patch("src.extract.web_ingest.fetch_url")
+    def test_a_hostile_title_cannot_escape_the_staging_directory(
+        self, mock_fetch, tmp_path, monkeypatch
+    ):
+        """The title comes from a fetched page, so it is untrusted input and ends
+        up as a path component."""
+        from src.extract.web_ingest import ingest_url
+
+        monkeypatch.setattr(
+            "src.extract.attachment_pipeline.ATTACHMENTS_DIR", tmp_path / "att", raising=True
+        )
+        mock_fetch.return_value = {
+            "url": "https://example.com/x",
+            "content": "<html><body>x</body></html>",
+            "content_type": "text/html",
+            "is_binary": False,
+        }
+        db_path = str(tmp_path / "test.db")
+        create_database(db_path).close()
+
+        result = ingest_url("https://example.com/x", title="../../etc/passwd", db_path=db_path)
+
+        assert "/" not in result["filename"]
+        assert ".." not in result["filename"]

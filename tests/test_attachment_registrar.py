@@ -307,3 +307,86 @@ def test_keeps_the_message_id_type_the_email_uses(db, tmp_path):
     register_downloaded_attachments(db, tmp_path)
 
     assert db.execute("SELECT typeof(message_id) FROM attachments").fetchone()[0] == "integer"
+
+
+# An unbounded deferral is a leak, not a wait. Graph message ids encode the
+# containing folder, so triaging a message into Archive-<year> mints a NEW id and
+# retires the old one; deleting it retires the id outright. Either way the
+# directory `outlook-cli` already wrote under the OLD id can never be matched to
+# an email again — all four ids probed against M365 on 2026-08-31 returned
+# ErrorItemNotFound. The sync then re-exports the moved message under its new id
+# and re-downloads the same files, which is why 4,678 of 5,989 orphaned files
+# were byte-identical duplicates of rows that already existed.
+#
+# Nothing bounded that. 1,955 directories and 3.88 GiB accrued between April and
+# August 2026, every one of them rescanned on every run and counted by the health
+# check on every report, so the WARN could never clear no matter what was fixed.
+# Ageing the deferral out separates "the email is still in flight" from "the email
+# is never coming", which is the same distinction check_sharepoint already draws
+# when it says "given up, no longer retried".
+
+
+def _age_dir(path: Path, days: float) -> None:
+    """Backdate a directory's mtime, as a stale download would be."""
+    import os
+    import time
+
+    when = time.time() - days * 86400
+    os.utime(path, (when, when))
+
+
+def test_a_recent_deferral_is_still_actionable(db, tmp_path):
+    """Attachments land post-commit and a batch can be mid-flight; today's
+    directory must stay in the retry set."""
+    _downloaded(tmp_path, "AAMk-inflight", "orphan.png")
+
+    result = register_downloaded_attachments(db, tmp_path)
+
+    assert result["deferred"] == 1
+    assert result["abandoned"] == 0
+
+
+def test_abandons_a_deferral_older_than_the_grace_period(db, tmp_path):
+    """Its message id is gone from the store; no future run can resolve it."""
+    msg_dir = _downloaded(tmp_path, "AAMk-moved-away", "orphan.png")
+    _age_dir(msg_dir, days=30)
+
+    result = register_downloaded_attachments(db, tmp_path)
+
+    assert result["deferred"] == 0
+    assert result["abandoned"] == 1
+
+
+def test_an_aged_directory_is_still_registered_once_its_email_appears(db, tmp_path):
+    """Abandonment classifies a report line; it must never refuse real work.
+    A backfill that loads old mail has to be able to claim its attachments."""
+    msg_dir = _downloaded(tmp_path, "AAMk-late-arrival", "late.png")
+    _age_dir(msg_dir, days=30)
+    _email(db, "AAMk-late-arrival")
+
+    result = register_downloaded_attachments(db, tmp_path)
+
+    assert result["registered"] == 1
+    assert result["abandoned"] == 0
+
+
+def test_grace_period_is_configurable(db, tmp_path):
+    msg_dir = _downloaded(tmp_path, "AAMk-tunable", "orphan.png")
+    _age_dir(msg_dir, days=3)
+
+    assert register_downloaded_attachments(db, tmp_path, grace_days=1)["abandoned"] == 1
+    assert register_downloaded_attachments(db, tmp_path, grace_days=10)["deferred"] == 1
+
+
+def test_the_since_window_never_abandons_the_backlog(db, tmp_path):
+    """`since` narrows the email set to the hourly window, so an old email that
+    IS loaded looks identical to one that never existed. Abandoning on that view
+    would condemn the very backlog the nightly bulk pass exists to register."""
+    _email(db, "AAMk-old-backlog", received="2026-07-01T09:00:00Z")
+    msg_dir = _downloaded(tmp_path, "AAMk-old-backlog", "backlog.pdf")
+    _age_dir(msg_dir, days=30)
+
+    result = register_downloaded_attachments(db, tmp_path, since="2026-08-18T00:00:00Z")
+
+    assert result["abandoned"] == 0
+    assert register_downloaded_attachments(db, tmp_path)["registered"] == 1

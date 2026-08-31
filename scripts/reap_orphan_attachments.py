@@ -53,6 +53,74 @@ def _registered_elsewhere(conn) -> dict[tuple[str, int], list[str]]:
     return index
 
 
+def _survey(db_path: str) -> tuple[set[str], dict[tuple[str, int], list[str]]]:
+    """Read the table once: which directories are claimed, and what is held where.
+
+    Closes before anything writes. Adoption goes through `ingest_document`, which
+    opens its own connection, and holding a second one across those writes is how
+    six concurrent sb-* units produced "database is locked" on 2026-08-24.
+    """
+    conn = get_connection(db_path)
+    try:
+        referenced = {
+            Path(fp).parent.name
+            for (fp,) in conn.execute(
+                "SELECT file_path FROM attachments WHERE file_path IS NOT NULL"
+            )
+        }
+        return referenced, _registered_elsewhere(conn)
+    finally:
+        conn.close()
+
+
+def _is_duplicate(f: Path, size: int, known: dict[tuple[str, int], list[str]]) -> bool:
+    """Whether these bytes are already registered somewhere that still exists.
+
+    A row is not bytes. If every registered copy has vanished from disk, this
+    orphan is the last one and the row is no licence to delete it.
+    """
+    return any(Path(p).exists() for p in known.get((f.name, size), []))
+
+
+def _reap_one_dir(
+    msg_dir: Path,
+    known: dict[tuple[str, int], list[str]],
+    apply: bool,
+    db_path: str,
+    stats: dict,
+) -> None:
+    for f in sorted(msg_dir.iterdir()):
+        if f.is_dir():
+            continue
+        size = f.stat().st_size
+        if _is_duplicate(f, size, known):
+            stats["deleted"] += 1
+            stats["bytes_freed"] += size
+            if apply:
+                f.unlink()
+            continue
+        if not apply:
+            stats["adopted"] += 1
+            continue
+        # Copies the file under its own synthetic id, so the original is ours to
+        # remove afterwards. The id is a hash of the CONTENT, so identical bytes
+        # seen twice come back skipped: recognised, already searchable, and not
+        # a rescue worth claiming in the count.
+        outcome = ingest_document(
+            str(f),
+            db_path=db_path,
+            sender_name="Recovered Attachment",
+            source=f.stem.replace("_", " ").replace("-", " ").strip() or f.name,
+        )
+        stats["already_ingested" if outcome.get("skipped") else "adopted"] += 1
+        f.unlink()
+
+
+def _husk_is_empty(msg_dir: Path) -> bool:
+    """Nothing left but, at most, someone else's subtree."""
+    return not any(p.name != SHAREPOINT_SUBDIR for p in msg_dir.iterdir())
+
+
 def reap_orphan_attachments(
     db_path: str | Path,
     base_dir: Path | str,
@@ -66,10 +134,7 @@ def reap_orphan_attachments(
     race with the registrar rather than garbage, and reaping one would destroy an
     attachment whose email simply has not committed yet.
 
-    Takes a path and not a live connection because adoption goes through
-    `ingest_document`, which opens its own. Holding a second connection across
-    those writes is how six concurrent sb-* units produced "database is locked"
-    on 2026-08-24; the survey below finishes and closes before anything writes.
+    Takes a path and not a live connection; see `_survey`.
     """
     db_path = str(db_path)
     base_dir = Path(base_dir)
@@ -84,17 +149,7 @@ def reap_orphan_attachments(
     if not base_dir.is_dir():
         return stats
 
-    conn = get_connection(db_path)
-    try:
-        referenced = {
-            Path(fp).parent.name
-            for (fp,) in conn.execute(
-                "SELECT file_path FROM attachments WHERE file_path IS NOT NULL"
-            )
-        }
-        known = _registered_elsewhere(conn)
-    finally:
-        conn.close()
+    referenced, known = _survey(db_path)
 
     for msg_dir in sorted(base_dir.iterdir()):
         if not msg_dir.is_dir() or msg_dir.name in referenced:
@@ -103,44 +158,16 @@ def reap_orphan_attachments(
             continue
         if limit is not None and stats["dirs_removed"] >= limit:
             break
+
         stats["scanned"] += 1
+        _reap_one_dir(msg_dir, known, apply, db_path, stats)
 
-        for f in sorted(msg_dir.iterdir()):
-            if f.is_dir():
-                continue
-            size = f.stat().st_size
-            # A row is not bytes. If every registered copy has vanished from
-            # disk, this orphan is the last one and the row is no licence to
-            # delete it.
-            twins = known.get((f.name, size), [])
-            if any(Path(p).exists() for p in twins):
-                stats["deleted"] += 1
-                stats["bytes_freed"] += size
-                if apply:
-                    f.unlink()
-                continue
-            if not apply:
-                stats["adopted"] += 1
-                continue
-            # Copies the file under its own synthetic id, so the original is
-            # ours to remove afterwards. The id is a hash of the CONTENT, so
-            # identical bytes seen twice come back skipped: recognised, already
-            # searchable, and not a rescue worth claiming in the count.
-            outcome = ingest_document(
-                str(f),
-                db_path=db_path,
-                sender_name="Recovered Attachment",
-                source=f.stem.replace("_", " ").replace("-", " ").strip() or f.name,
-            )
-            stats["already_ingested" if outcome.get("skipped") else "adopted"] += 1
-            f.unlink()
-
-        if apply:
-            remaining = [p for p in msg_dir.iterdir() if p.name != SHAREPOINT_SUBDIR]
-            if not remaining and not (msg_dir / SHAREPOINT_SUBDIR).is_dir():
-                msg_dir.rmdir()
-                stats["dirs_removed"] += 1
-        elif not any(p.name != SHAREPOINT_SUBDIR for p in msg_dir.iterdir()):
+        if not _husk_is_empty(msg_dir):
+            continue
+        if not apply:
+            stats["dirs_removed"] += 1
+        elif not (msg_dir / SHAREPOINT_SUBDIR).is_dir():
+            msg_dir.rmdir()
             stats["dirs_removed"] += 1
 
     return stats

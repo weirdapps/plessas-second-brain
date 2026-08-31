@@ -556,11 +556,24 @@ def ingest_document(
 
     conn = _connect(db_path)
 
-    # Idempotency: skip if this file was already ingested
+    # Idempotency: skip if this file was already ingested. The path we already
+    # hold goes back with it, because a caller that deletes its source on a skip
+    # has to know whether the row it collided with points at that very file.
     existing = conn.execute("SELECT id FROM emails WHERE message_id = ?", (message_id,)).fetchone()
     if existing:
+        held = conn.execute(
+            "SELECT file_path FROM attachments WHERE message_id = ? AND file_path IS NOT NULL",
+            (message_id,),
+        ).fetchone()
         conn.close()
-        return {"skipped": True, "message_id": message_id, "reason": "already ingested"}
+        return {
+            "skipped": True,
+            "message_id": message_id,
+            "reason": "already ingested",
+            "file_path": held[0]
+            if held
+            else str(ATTACHMENTS_DIR / str(abs(message_id)) / filename),
+        }
 
     # Create synthetic email entry
     conn.execute(
@@ -596,7 +609,14 @@ def ingest_document(
     dest_dir = ATTACHMENTS_DIR / str(abs(message_id))
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = dest_dir / filename
-    shutil.copy2(file_path, dest_path)
+    # A file already sitting at its own destination is registered where it lies.
+    # copy2 raises SameFileError on that, and on the VPS it is not hypothetical:
+    # data/attachments is a symlink to /mnt/data, the directory is named for the
+    # hash of the file's own content, so anything an earlier reverse-ingest put
+    # there hashes straight back to itself. samefile() rather than == because
+    # those two paths spell the same inode differently.
+    if not (dest_path.exists() and os.path.samefile(file_path, dest_path)):
+        shutil.copy2(file_path, dest_path)
 
     # Create attachment record
     conn.execute(
@@ -619,4 +639,5 @@ def ingest_document(
         "attachment_id": attachment_id,
         "message_id": message_id,
         "filename": filename,
+        "file_path": str(dest_path),
     }

@@ -2,6 +2,7 @@ import os
 import sqlite3
 import tempfile
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import anthropic
@@ -522,3 +523,73 @@ def test_extract_one_attachment_reports_an_empty_content_list_diagnosably(monkey
 
     assert extraction is None
     assert error.startswith("ValueError: "), f"IndexError is back: {error}"
+
+
+# data/attachments is a symlink to /mnt/data on the VPS, and ingest_document
+# files a document under a directory named for the hash of its own content. Feed
+# it a file that is ALREADY at that path and shutil.copy2 raises SameFileError:
+# the reap of 2026-08-31 died on its first adoption, on a directory an earlier
+# reverse-ingest had itself created. Re-registering in place has to be a no-op
+# copy, and the caller has to be able to tell, because deleting the "source"
+# afterwards would delete the registered copy.
+
+
+def _doc_db(tmp_path, monkeypatch):
+    from src.store.schema import create_database
+
+    db_path = str(tmp_path / "brain.db")
+    create_database(db_path).close()
+    monkeypatch.setattr(
+        "src.extract.attachment_pipeline.ATTACHMENTS_DIR", tmp_path / "att", raising=True
+    )
+    return db_path
+
+
+def test_ingest_document_returns_where_the_file_ended_up(tmp_path, monkeypatch):
+    from src.extract.attachment_pipeline import ingest_document
+
+    db_path = _doc_db(tmp_path, monkeypatch)
+    src = tmp_path / "report.pdf"
+    src.write_bytes(b"payload")
+
+    result = ingest_document(str(src), db_path=db_path)
+
+    assert Path(result["file_path"]).exists()
+    assert Path(result["file_path"]).read_bytes() == b"payload"
+    row = sqlite3.connect(db_path).execute("SELECT file_path FROM attachments").fetchone()
+    assert row[0] == result["file_path"]
+
+
+def test_ingest_document_accepts_a_file_already_at_its_destination(tmp_path, monkeypatch):
+    """The SameFileError. Registering in place must succeed and keep the bytes."""
+    from src.extract.attachment_pipeline import ingest_document
+
+    db_path = _doc_db(tmp_path, monkeypatch)
+    staged = tmp_path / "staged.pdf"
+    staged.write_bytes(b"already-here")
+    first = ingest_document(str(staged), db_path=db_path)
+    settled = Path(first["file_path"])
+
+    sqlite3.connect(db_path).executescript("DELETE FROM attachments; DELETE FROM emails;")
+    second = ingest_document(str(settled), db_path=db_path)
+
+    assert not second["skipped"]
+    assert Path(second["file_path"]) == settled
+    assert settled.exists(), "registering in place must not consume the file"
+    assert settled.read_bytes() == b"already-here"
+
+
+def test_ingest_document_reports_the_path_it_already_holds_when_skipping(tmp_path, monkeypatch):
+    """A caller that deletes its source on `skipped` needs to know whether the
+    row it collided with points at that very file."""
+    from src.extract.attachment_pipeline import ingest_document
+
+    db_path = _doc_db(tmp_path, monkeypatch)
+    src = tmp_path / "twice.pdf"
+    src.write_bytes(b"same-bytes")
+    first = ingest_document(str(src), db_path=db_path)
+
+    again = ingest_document(str(src), db_path=db_path)
+
+    assert again["skipped"]
+    assert again["file_path"] == first["file_path"]

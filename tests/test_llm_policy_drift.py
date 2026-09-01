@@ -8,7 +8,7 @@ Never edit the vendored copy directly; edit the canonical one and re-run the syn
 import hashlib
 from pathlib import Path
 
-EXPECTED_SHA256 = "0a1c9c42bbb9537e126f7eeedfc1179aa3c516ab7f6b6ec786ad693c9579b5c5"
+EXPECTED_SHA256 = "2b293c4d456e658d120281f4097fe8d55ac95d67e85d36dbad40a1d04b5fa95b"
 # parents[N] where N = (path segments in the test's own repo-relative path) - 1,
 # which lands on the repo root. tests/x.py -> parents[1]; a/b/tests/x.py -> parents[3].
 MODULE = Path(__file__).resolve().parents[1] / "src/llm_policy.py"

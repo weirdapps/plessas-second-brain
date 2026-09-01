@@ -23,7 +23,7 @@ NOTIFY_THRESHOLD=3
 mkdir -p "$LOG_DIR" "$(dirname "$STATE")"
 
 # fnm 'default' alias (not a pinned version) so teams-cli stays resolvable across node upgrades.
-export PATH="$HOME/.local/share/fnm/aliases/default/bin:$PATH"
+export PATH="$PATH:$HOME/.local/share/fnm/aliases/default/bin"
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
@@ -50,7 +50,15 @@ fi
 # Pre-flight: skip if reauth needed
 if [ -f "$SENTINEL" ]; then
   echo "$(ts) — skip (reauth sentinel present)" >> "$LOG"
-  exit 0
+  # exit 75 (EX_TEMPFAIL), not 0. Exiting 0 here made systemd record success,
+  # fired OnSuccess=hc-success@, and pinged the dead-man's switch GREEN once an
+  # hour while Teams ingest was dead. On 2026-09-01 that hid a 20-hour outage:
+  # nine green pings, brain.db frozen at 03:33, and every downstream consumer
+  # (search_teams, teams_chat_summary, meeting prep) silently serving stale data.
+  # Same reasoning as the auth-renew branch below, which was fixed on 2026-08-10.
+  # The sentinel is only cleared by an interactive `teams-cli login`, so the
+  # correct signal is RED, not silence.
+  exit 75
 fi
 
 # Pre-flight: skip if gcloud ADC expired (Vertex AI extraction would fail).

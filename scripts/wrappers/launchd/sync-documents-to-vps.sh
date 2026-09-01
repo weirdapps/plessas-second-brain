@@ -12,13 +12,46 @@
 set -uo pipefail
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
+# macOS will not hydrate a dataless OneDrive placeholder for a process that
+# launchd started. The read fails with EDEADLK ("Resource deadlock avoided")
+# because background processes inherit IOPOL_MATERIALIZE_DATALESS_FILES_OFF,
+# rsync then discards the whole transfer, and the SAME file is retried forever.
+# That is what stalled legal/README.md across three runs and 12h on 2026-08-31.
+#
+# This is NOT a TCC problem and NOT an rsync problem, whatever the cdhash block
+# further down implies. Measured 2026-09-01 from a throwaway LaunchAgent against
+# one dataless file: /bin/dd, Homebrew rsync AND Apple's /usr/bin/rsync all
+# failed identically with EDEADLK. /bin/dd is a platform binary with no TCC
+# subject of its own, so no grant can be the gate. It also means no retry can
+# help: the read never succeeds in this context, it does not need a second try.
+#
+# The cure is to opt IN. The policy is process-scoped and is inherited across
+# BOTH execv and fork (both verified on this machine), so setting it once here
+# and re-execing covers every rsync this script later spawns. Fails OPEN: if the
+# shim cannot run we continue exactly as before rather than lose the sync, and
+# say so in the log once log() exists.
+if [ -z "${DOCSYNC_MATERIALIZE_ON:-}" ]; then
+  if /usr/bin/python3 -c 'import ctypes; ctypes.CDLL("/usr/lib/libSystem.B.dylib")' 2>/dev/null; then
+    export DOCSYNC_MATERIALIZE_ON=pending
+    exec /usr/bin/python3 -c 'import ctypes, os, sys
+libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+# setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES=3,
+#                IOPOL_SCOPE_PROCESS=0, IOPOL_MATERIALIZE_DATALESS_FILES_ON=2).
+# Values read out of sys/resource.h:509,520,541, not recalled from memory.
+os.environ["DOCSYNC_MATERIALIZE_ON"] = "1" if libc.setiopolicy_np(3, 0, 2) == 0 else "failed"
+os.execv(sys.argv[1], sys.argv[1:])' /bin/zsh "$0" "$@"
+  fi
+  export DOCSYNC_MATERIALIZE_ON=unavailable
+fi
+
 LOG="$HOME/Library/Logs/document-sync-vps.log"
 LOCK="/tmp/.document-sync-vps.lock"
 VPS="vps"
 
 # One retry and no more; the transfer loop below explains why one. 45s is long
-# enough for OneDrive to finish hydrating the placeholder that failed, and short
-# enough that a doubled run still finishes well inside its 6h window.
+# enough to ride out a dropped link or a file rewritten mid-transfer, and short
+# enough that a doubled run still finishes well inside its 6h window. It is not
+# a hydration wait: sleeping never fixed that, the io-policy opt-in above does.
 RSYNC_MAX_ATTEMPTS=2
 RSYNC_RETRY_SLEEP=45
 
@@ -28,6 +61,15 @@ RSYNC_RETRY_SLEEP=45
 INTERP=$(ps -o comm= -p $$ 2>/dev/null || echo "the interpreter")
 
 log() { echo "[doc-sync] $(date '+%Y-%m-%d %H:%M:%S') $*" >>"$LOG"; }
+
+# Say it out loud when the hydration opt-in above did not take. Silence here
+# would look exactly like a healthy run right up until the next placeholder
+# needs transferring, which is the failure mode this whole block exists to end.
+case "${DOCSYNC_MATERIALIZE_ON:-}" in
+  1) ;;
+  failed)      log "WARN: setiopolicy_np refused; dataless placeholders will fail with EDEADLK" ;;
+  unavailable) log "WARN: no usable /usr/bin/python3; dataless placeholders will fail with EDEADLK" ;;
+esac
 
 # Single-instance guard: the first sync moves ~4 GB and must not overlap itself.
 if ! mkdir "$LOCK" 2>/dev/null; then
@@ -59,14 +101,16 @@ note_failure() {
   fail_reason="${fail_reason:+$fail_reason; }$1"
 }
 
-# Almost every file under ~/Documents/{National,Personal} is a DATALESS
-# OneDrive placeholder, and reading one forces macOS to materialise it. macOS
-# gates that materialisation behind kTCCServiceFileProviderDomain PER CLIENT
-# BINARY. Homebrew's rsync is ad-hoc signed, so it is not a platform binary and
-# macOS makes it its OWN TCC subject rather than attributing the read to the
-# responsible process. That is why Full Disk Access on the interpreter did not
-# cover it: on 2026-08-28 rsync exited 23 for six hours while a permission
-# dialog sat unanswered on the screen.
+# CORRECTED 2026-09-01. This block used to claim that materialising a dataless
+# OneDrive placeholder is gated by kTCCServiceFileProviderDomain per client
+# binary, and that granting Homebrew's ad-hoc-signed rsync its own grant is what
+# fixed the 2026-08-28 stall. The first half is wrong and it cost hours: a
+# LaunchAgent probe showed /bin/dd failing with the identical EDEADLK, and
+# /bin/dd is a platform binary that can never become its own TCC subject.
+# Hydration is gated by the io-policy handled at the top of this script, not by
+# TCC. The grant below is real and still in place, and Full Disk Access on the
+# interpreter is still what lets this job ENUMERATE ~/Documents, so the tripwire
+# stays; it simply does not cover hydration and must not be blamed for it.
 #
 # The grant that fixed it is pinned to a cdhash at a VERSIONED Cellar path. A
 # `brew upgrade rsync` changes both, the grant stops matching in silence, and
@@ -156,11 +200,13 @@ for tree in National Personal; do
   # from. Deleted files linger on the VPS instead; reverse-ingest's
   # latest-version-per-logical-name dedup already tolerates that.
   #
-  # Retried once, because the FIRST read of a dataless OneDrive placeholder is
-  # what kicks its hydration off, and that read can fail while the next one,
-  # moments later, walks straight through. Two of the three exit-23 events on
-  # 2026-08-28 were exactly that shape. One retry and no more: a second failure
-  # is a real problem and belongs in the failure marker rather than slept over.
+  # Retried once, for a TRANSIENT: a dropped link, a busy VPS, a file rewritten
+  # mid-transfer. It is deliberately NOT the hydration remedy any more. The old
+  # comment here claimed the first read of a placeholder kicks hydration off and
+  # the second walks through; 2026-08-31 disproved that, when the same file lost
+  # six reads across three runs and twelve hours. Hydration is settled before
+  # the loop is ever reached, by the io-policy opt-in at the top of this script.
+  # One retry and no more: a second failure is real and belongs in the marker.
   attempt=1
   while :; do
     out=$(rsync -rlptz --partial --stats \

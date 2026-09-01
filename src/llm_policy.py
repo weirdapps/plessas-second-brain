@@ -318,7 +318,14 @@ def default_adc_probe() -> bool:
             timeout=15,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError):
+    except Exception:  # noqa: BLE001 - a probe must never fell its caller
+        # Deliberately bare. The narrow (OSError, SubprocessError) form missed
+        # UnicodeDecodeError, which is a ValueError and is exactly what text=True
+        # raises when the child writes a single non-UTF-8 byte to stderr. This
+        # probe is the first thing reauth() calls, so an escape here kills the
+        # run and takes the per-slot alert email with it: the caller degrades to
+        # a fallback on False, but propagates a raise. Proven 2026-09-01 with a
+        # gcloud stub emitting 0xFF on stderr.
         return False
     return result.returncode == 0 and bool(result.stdout.strip())
 
@@ -438,7 +445,10 @@ def reauth(
             result = subprocess.run(
                 [str(target)], capture_output=True, text=True, timeout=timeout, check=False
             )
-        except (OSError, subprocess.SubprocessError):
+        except Exception:  # noqa: BLE001 - the remedy must never fell its caller either
+            # Same class as default_adc_probe above: text=True decodes strictly,
+            # so one non-UTF-8 byte from the reauth script raises a ValueError
+            # that no subprocess/OS tuple contains.
             return ReauthResult.FAILED
         if result.returncode != 0:
             return ReauthResult.FAILED

@@ -375,10 +375,18 @@ def run_phase2(
                 )
                 stats["failed"] += 1
         else:
+            # llm_error = NULL matters as much as the summary. The deferral
+            # branch above writes "deferred (gcloud reauth needed)" into it, and
+            # this success path used to leave that string behind, so a row that
+            # was retried and extracted correctly still LOOKED deferred forever.
+            # The health check counts that string, so 16 rows deferred on
+            # 2026-07-11 were reported as a live ADC backlog every day for seven
+            # weeks, and got re-attributed to whichever gcloud incident was most
+            # recent. A monitor that cannot go back to zero is not a monitor.
             conn.execute(
                 """UPDATE attachment_content
                    SET summary = ?, language = ?, llm_status = 'extracted',
-                       llm_extracted_at = ?
+                       llm_error = NULL, llm_extracted_at = ?
                    WHERE id = ?""",
                 (extraction.get("summary"), extraction.get("language"), now, ac_id),
             )

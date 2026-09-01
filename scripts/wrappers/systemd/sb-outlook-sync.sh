@@ -21,7 +21,7 @@ NOTIFY_THRESHOLD=3
 mkdir -p "$LOG_DIR" "$(dirname "$STATE")"
 # fnm 'default' alias (not a pinned version) so the path follows node upgrades and
 # never goes stale — outlook-cli lives under the default node's bin, on Mac and VPS.
-export PATH="$HOME/.local/share/fnm/aliases/default/bin:$PATH"
+export PATH="$PATH:$HOME/.local/share/fnm/aliases/default/bin"
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 

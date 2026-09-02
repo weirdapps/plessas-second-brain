@@ -334,7 +334,7 @@ skill/
 
 ## Database schema
 
-`data/brain.db` (SQLite). Migrations run automatically via `src/store/schema.py`; the current version is `CURRENT_SCHEMA_VERSION = 14` in `src/config.py` and is tracked in the `schema_version` table.
+`data/brain.db` (SQLite). Migrations run automatically via `src/store/schema.py`; the current schema version is `CURRENT_SCHEMA_VERSION` in `src/config.py` and is tracked in the `schema_version` table.
 
 - **Core content**: `emails`, `topics`, `email_topics`, `decisions`, `action_items`, `people`, `email_people`, `key_facts`
 - **Attachments and images**: `attachments`, `attachment_content`, `inline_images`, `inline_image_occurrences`, `sender_signature_index`

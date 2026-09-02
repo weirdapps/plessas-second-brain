@@ -129,9 +129,20 @@ apply_exclusion() {
     printf '%s' "$hits"
     return
   fi
+  # Anchored to the `path:` prefix, because that is what these patterns are for.
+  # Matched against the whole line, every path-shaped alternative doubled as a
+  # CONTENT filter: `<[^>]+>` dropped any hit on a line containing an HTML tag
+  # (`<td>firstname.surname@<employer-domain></td>` excluded itself), and a bare
+  # `template` dropped any line merely using the word. That is the false green
+  # the comment above forbids.
+  # Content placeholders stay a separate, deliberately narrow list. See
+  # PLACEHOLDER_CONTENT, defined with the other placeholder policy below.
   # Copyright attribution names the author on purpose and is required by the
   # licence. Flagging it is noise, and noise is how a real hit gets ignored.
-  printf '%s\n' "$hits" | grep -vE "$exclude" | grep -viE '\(c\)[[:space:]]*[0-9]{4}|copyright' || true
+  printf '%s\n' "$hits" \
+    | grep -vE "^[^:]*($exclude)" \
+    | grep -vE "$PLACEHOLDER_CONTENT" \
+    | grep -viE '\(c\)[[:space:]]*[0-9]{4}|copyright' || true
 }
 
 check() {
@@ -212,7 +223,20 @@ check() {
 # Doc placeholders. Extend this when a new invented example host trips the check:
 # being asked once "is this a real tenant?" is the check doing its job, and is a
 # far better failure mode than the silence it replaces.
-PLACEHOLDER='contoso|example|sample|template|your[-_.]?tenant|your-tenant|<[^>]+>|firstname\.lastname|your\.email|recipient\.name|user@|name@|(test|overridden|envvar|dummy|placeholder|foo|bar|[a-z])(-my)?\.sharepoint'
+PLACEHOLDER='contoso|example|sample|template|your[-_.]?tenant|your-tenant|<[^>]+>|firstname\.lastname|your\.email|recipient\.name|user@|name@|(test|overridden|envvar|dummy|placeholder|foo|bar|a|b|x|y|z)(-my)?\.sharepoint'
+
+# Matched against the CONTENT of a hit, so it is kept deliberately short: every
+# entry here is a string that can only ever be an invented example.
+# The example hosts are spelled out. The alternation used to end in a bare
+# `[a-z]`, and `[a-z]\.sharepoint` matches the last letter of EVERY real tenant
+# hostname, so the SharePoint check could not fire at all. `partner` and
+# `mastercard` are the two "some other tenant" fixtures in
+# tests/export/test_sharepoint_fetcher.py; they were only ever green because
+# that same `[a-z]` swallowed them.
+# The trailing digit runs are the synthetic ids the fixtures use in place of a
+# real one. They mirror the placeholder column of the private denylist, which
+# is now matched against the path rather than the content (see apply_exclusion).
+PLACEHOLDER_CONTENT='contoso|firstname\.lastname|your\.email|recipient\.name|(test|overridden|envvar|dummy|placeholder|foo|bar|partner|mastercard|a|b|x|y|z)(-my)?\.sharepoint|123456789|987654321|111111111|000000000|012345678'
 
 # Some repos name the employer on purpose: a marketplace written for colleagues
 # says so in its README by design. Those opt out with a repo-root marker rather

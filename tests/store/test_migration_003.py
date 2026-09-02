@@ -80,7 +80,7 @@ def test_migration_003_inserts_and_queries(tmp_path: Path) -> None:
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            "https://nbggr.sharepoint.com/sites/foo/Doc.docx",
+            "https://contoso.sharepoint.com/sites/foo/Doc.docx",
             "AAQk-msg-1",
             "2026-04-22T10:00:00",
             "/data/sharepoint/abc.docx",
@@ -94,7 +94,7 @@ def test_migration_003_inserts_and_queries(tmp_path: Path) -> None:
 
     row = conn.execute(
         "SELECT message_id, last_status, file_size FROM sharepoint_links WHERE url = ?",
-        ("https://nbggr.sharepoint.com/sites/foo/Doc.docx",),
+        ("https://contoso.sharepoint.com/sites/foo/Doc.docx",),
     ).fetchone()
     assert row[0] == "AAQk-msg-1"
     assert row[1] == "fetched"

@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "Email second brain: extract, structure, and query institutional memory from Outlook, attachments, calendar, Teams, and Claude Code conversations"
 requires-python = ">=3.12"
 dependencies = [
-    "google-cloud-aiplatform>=1.164.0",
+    # What src/store/embeddings.py actually imports is `from google import genai`.
+    # This used to declare google-cloud-aiplatform, which imports nowhere in this
+    # repo and was only ever supplying google-genai by transitive accident.
+    "google-genai>=1.66.0",
     # 0.120.2 is the first release whose mcp extra allows mcp SDK v2 (0.120.1 pinned <2).
     "anthropic[vertex]>=0.122.0",
     "numpy>=2.5.2",

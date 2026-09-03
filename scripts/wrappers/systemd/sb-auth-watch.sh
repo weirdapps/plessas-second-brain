@@ -202,6 +202,22 @@ print(int(datetime.datetime.fromisoformat(sys.argv[1].replace('Z','+00:00')).tim
   fi
   log "outlook silent renew failed — interactive login required"
   notify_interactive_required "bearer expires in ${hours_remaining}h, silent renew failed"
+
+  # Do NOT latch while the bearer still works. auth-check passed at the top of
+  # this function, so the session is usable for another $seconds_remaining, and
+  # this sentinel gates mail, calendar, attachments and curation all at once.
+  # Latching here treats "a renewal I did not need yet did not work" as an
+  # outage. Measured 2026-09-03 16:04: renewal failed with 2468s (41 minutes) of
+  # valid token left, the sentinel went down, and because only an interactive
+  # login clears it, the whole pipeline stayed blocked long past the point where
+  # the token would have carried several more syncs. Notify, but keep working:
+  # the run after expiry takes the auth-check-failed branch above and latches
+  # then, on evidence rather than on a forecast.
+  if [ "$seconds_remaining" -gt 0 ]; then
+    log "outlook bearer still valid for ${seconds_remaining}s; not latching the sentinel yet"
+    return 1
+  fi
+
   touch "$SENTINEL"
   return 1
 }
@@ -252,6 +268,20 @@ auth_check_teams() {
     notify_teams_reauth
     touch "$TEAMS_SENTINEL"
     return 1
+  fi
+
+  # Re-probe before latching. The condition that got us here can clear on its
+  # own: on 2026-09-03 16:05 this latched on `failing probes: graph_me` alone,
+  # a single transient probe, while chatsvcagg (the audience that actually
+  # carries messages) was healthy, and health-check returned ok again minutes
+  # later. The renew attempt itself takes ~90s, which is long enough for a blip
+  # to pass, so the state this decides on must be re-read rather than assumed
+  # from before the renew. The success branch above already re-probes for the
+  # opposite reason; this is the same distrust applied symmetrically.
+  if teams-cli health-check >/dev/null 2>&1; then
+    log "teams: renew failed but health-check now passes; transient, not latching"
+    rm -f "$TEAMS_SENTINEL"
+    return 0
   fi
 
   log "teams silent renew failed — interactive login required"

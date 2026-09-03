@@ -17,7 +17,6 @@ PROJECT="$HOME/SourceCode/plessas-second-brain"
 PYTHON="$HOME/.venvs/second-brain/bin/python"
 LOG_DIR="$HOME/.second-brain/logs"
 LOG_FILE="$LOG_DIR/curate-docs.log"
-SENTINEL="$HOME/.second-brain/needs_reauth"
 mkdir -p "$LOG_DIR"
 
 # --- Concurrency guard (PID-aware mkdir lock). See sb-daily-sync.sh for rationale.
@@ -34,11 +33,12 @@ fi
 mkdir -p "$LOCK_DIR" && echo $$ > "$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 
-# Skip if reauth required (mirrors other second-brain wrappers).
-if [ -f "$SENTINEL" ]; then
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: needs_reauth sentinel present" >> "$LOG_FILE"
-  exit 0
-fi
+# No needs_reauth gate here on purpose. Curation reads brain.db and calls
+# Vertex; curate_documents_daily.py names neither outlook-cli nor sharepoint-cli,
+# so a dead M365 session cannot affect it. The check used to be here, copied from
+# the mail wrappers, and on 2026-09-02 it stopped six days of curation because
+# Outlook was down, while curation's own SharePoint session was healthy
+# throughout. The real dependency is guarded immediately below.
 
 # Skip if gcloud ADC expired — Vertex AI classification would fail.
 if [ -f "$HOME/.second-brain/needs_gcloud_reauth" ]; then

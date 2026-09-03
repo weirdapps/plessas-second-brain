@@ -44,7 +44,6 @@ DOCS = Path.home() / "Documents"
 STATE = Path.home() / ".second-brain/curate-state.json"
 LOG_DIR = Path.home() / ".second-brain/logs"
 LOG_FILE = LOG_DIR / "curate-docs.log"
-SENTINEL_REAUTH = Path.home() / ".second-brain/needs_reauth"
 
 PATH_REWRITES = [
     (
@@ -470,9 +469,13 @@ def write_index(area: str, summaries: dict):
 
 
 def main():
-    if SENTINEL_REAUTH.exists():
-        log("SKIP: needs_reauth sentinel present")
-        return 0
+    # No needs_reauth gate here. That sentinel is an M365 signal, and this
+    # script reads brain.db and calls Vertex: it names neither of the M365 CLIs,
+    # so a dead mail session cannot affect it. The check used to be here and in
+    # sb-curate-docs.sh, both copied from the mail wrappers, and on 2026-09-02
+    # they stopped six days of curation because Outlook was down while
+    # curation's own SharePoint session was healthy throughout. The real
+    # dependency, needs_gcloud_reauth, is still guarded in the wrapper.
 
     # Install the per-unit LLM deadline before any LLM work, mirroring what
     # src/cli.py does for the nine units that go through that entrypoint.

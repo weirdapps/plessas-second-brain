@@ -507,3 +507,38 @@ def test_low_confidence_is_still_recorded_as_processed(curate, brain, monkeypatc
 
     # Second run must not re-decide it: no classification call at all.
     assert _run(curate, monkeypatch, verdicts) == []
+
+
+def test_outlook_reauth_sentinel_does_not_stop_curation(curate, monkeypatch, tmp_path):
+    """needs_reauth is an M365 signal, and curation has no M365 dependency.
+
+    This script reads brain.db and calls Vertex. It names neither of the M365
+    CLIs, so a dead mail session cannot affect it. The gate was copied from the
+    mail wrappers and cost six days of curation on 2026-09-02 while curation's
+    own SharePoint session was healthy throughout.
+
+    The wrapper's copy of the same gate was removed alongside this one; that
+    half is covered by tests/test_sync_wrapper_sentinel.py. Removing only the
+    wrapper's left this one still blocking, which is why both are pinned.
+
+    The real dependency, needs_gcloud_reauth, is guarded in the wrapper and is
+    deliberately untouched.
+    """
+    sentinel = tmp_path / ".second-brain" / "needs_reauth"
+    sentinel.parent.mkdir(parents=True, exist_ok=True)
+    sentinel.touch()
+
+    monkeypatch.setattr(sys, "argv", ["curate_documents_daily.py", "--max-new", "0"])
+    try:
+        curate.main()
+    except Exception:
+        # Anything past the sentinel check is out of scope here: the assertion
+        # is only that the sentinel is not what stopped it.
+        pass
+
+    log = tmp_path / ".second-brain" / "logs" / "curate-docs.log"
+    logged = log.read_text() if log.is_file() else ""
+    assert "SKIP: needs_reauth sentinel present" not in logged, (
+        "curation still refuses to run because of the Outlook sentinel, "
+        "though it never touches Outlook."
+    )

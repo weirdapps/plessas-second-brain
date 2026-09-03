@@ -48,7 +48,17 @@ if [ -x "$HOME/.local/bin/sb-auth-watch.sh" ]; then
 fi
 if [ -f "$SENTINEL" ]; then
   echo "$(ts) — skip (reauth sentinel present after auth-watch)" >> "$LOG"
-  exit 0
+  # exit 75 (EX_TEMPFAIL), not 0, for the reason sb-teams-sync.sh records at its
+  # own sentinel branch. Exiting 0 made systemd log SUCCESS for a sync that never
+  # ran, fired OnSuccess=hc-success@ and pinged the dead-man's switch green.
+  # On 2026-09-02 that hid a 24-hour outage: the session died at 13:19, this
+  # branch reported success every hour until 12:32 the next day, and Inbox,
+  # Archive, Sent, calendar and curate-docs (all gated on this same file) were
+  # frozen the whole time while every unit read green. Only a human asking how
+  # fresh the database was surfaced it.
+  # The sentinel clears only on a successful auth-watch renew or an interactive
+  # `outlook-cli login`, so the honest signal while it is latched is RED.
+  exit 75
 fi
 
 cd "$PROJECT"

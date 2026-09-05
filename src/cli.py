@@ -62,6 +62,21 @@ PHASE2_SYNC_DEADLINE_S = 90.0
 # to keep fresh mail's images moving.
 IMAGE_CLASSIFY_SYNC_BUDGET_S = 90.0
 
+# Step 7 (Claude Code conversation sync) was the last stage with no bound of any
+# kind: cmd_sync called run_conversation_extraction() with no arguments, so the
+# default limit=0 extracted the whole pending list one conversation at a time.
+# The sum in tests/test_sync_budget.py appeared to cover it, but only because
+# that file asserted a 30 s allowance for a stage nothing enforced, so the
+# guarantee was arithmetic over a number production was free to ignore.
+# What made it bite: pending is whatever sync-tokens-to-vps.sh has rsynced since
+# the last run, so it scales with how busy Claude Code has been, not with the
+# mailbox. On 2026-09-05 that was 32 conversations an hour, and every run from
+# 23:28 the previous evening was SIGTERMed seconds after printing "Sync
+# complete". 30 s holds the previously assumed sum exactly, so the margin tests
+# keep the same headroom they were written against; the remainder drains on
+# sb-conversation-sync, which has 1800 s.
+CONVERSATION_SYNC_DEADLINE_S = 30.0
+
 # Observed span for the stages that have no budget of their own: mail fetch,
 # extraction, load, registration, people dedup, embeddings rebuild.
 SYNC_FIXED_WORK_S = 180.0
@@ -1255,7 +1270,7 @@ def cmd_sync(args):
         print(f"  Exported {conv_export['exported']} new conversations")
         from src.extract.local import run_conversation_extraction
 
-        run_conversation_extraction()
+        run_conversation_extraction(deadline_s=CONVERSATION_SYNC_DEADLINE_S)
         conv_loaded = load_convs(db_path)
         print(f"  Loaded {conv_loaded} conversations")
     else:

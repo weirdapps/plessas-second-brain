@@ -33,6 +33,18 @@ DEFAULT_ENGINE = os.environ.get("BRAIN_EXTRACT_ENGINE", "claude")  # "gemini" or
 CONSECUTIVE_FAIL_THRESHOLD = 5  # pause after this many consecutive failures
 QUOTA_PAUSE_SECONDS = 3600  # 1 hour default pause when quota exhausted
 
+# Runs at which a conversation stops being offered again. Each run is already
+# `extract_conversation_inline(max_retries=3)`, so this is 9 real attempts.
+#
+# Without it a conversation the model will not process is immortal: it fails,
+# never enters processed_ids, and is first in line again an hour later. Session
+# 995a679f did that 2,680 times on 2026-09-05, every one returning
+# stop_reason='refusal' with an empty content list, and the loop never reached
+# the other 3,263 pending conversations. Attachments ("110 abandoned, no longer
+# retried") and SharePoint links ("43 given up") already had this idea; the
+# conversation pipeline was the one that did not.
+CONVERSATION_MAX_ATTEMPTS = 3
+
 _shutdown = False
 _state_lock = threading.Lock()
 _log_lock = threading.Lock()
@@ -494,14 +506,28 @@ CONV_STATE_FILE = DATA_DIR / "state" / "conv_extract_state.json"
 
 
 def collect_conversations() -> list[dict]:
-    """Load all staged conversation batches."""
+    """Load all staged conversation batches, one entry per session.
+
+    Every batch file ever written is still on disk (708 of them on the VPS,
+    back to 2026-04-12), and a session that stays open across several exports is
+    re-staged into each batch it was still live for. Concatenating them counted
+    1,696 distinct sessions as 5,265 entries, one of them 248 times, and since a
+    session only leaves the pending list once it extracts successfully, every
+    copy was offered again on every run.
+
+    The LAST copy wins: batch filenames are timestamps and the glob is sorted, so
+    the newest export of a session is also its most complete transcript.
+    """
     batch_files = sorted(CONV_STAGING_DIR.glob("conversation-batch-*.json"))
-    all_convs = []
+    by_session: dict[str, dict] = {}
     for bf in batch_files:
         data = json.load(open(bf, encoding="utf-8"))
-        convs = data.get("conversations", [])
-        all_convs.extend(convs)
-    return all_convs
+        for conv in data.get("conversations", []):
+            # dict preserves insertion order, and re-assigning an existing key
+            # keeps its original position, so a session holds the slot of its
+            # FIRST appearance while carrying the content of its LAST.
+            by_session[conv.get("session_id", "")] = conv
+    return list(by_session.values())
 
 
 def extract_conversation_inline(
@@ -540,11 +566,19 @@ def extract_conversation_inline(
     return (session_id, None, is_quota)
 
 
-def run_conversation_extraction(workers: int = 1, limit: int = 0):
+def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: float | None = None):
     """Extract structured data from staged conversations.
 
     Reuses the same concurrency, quota handling, and state tracking
     patterns as email extraction.
+
+    Args:
+        deadline_s: Optional wall-clock budget in seconds. Once spent, no further
+            conversation is started and the ones already extracted are saved.
+            Same contract as run_phase1/run_phase2/run_backfill: the remainder is
+            left staged for the next run, and for sb-conversation-sync, which has
+            1800 s against this caller's 600 s. None keeps the old unbounded
+            behaviour, which is what a hand-run and the nightly unit both want.
     """
     global _shutdown
 
@@ -558,13 +592,23 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0):
     if CONV_STATE_FILE.exists():
         conv_state = json.loads(CONV_STATE_FILE.read_text())
     processed_ids = set(conv_state.get("processed_ids", []))
+    # session_id -> runs that ended in a failure. Separate from processed_ids so a
+    # given-up conversation never reads as ingested to the loader.
+    attempt_counts = dict(conv_state.get("failed_attempts", {}))
+    given_up = {sid for sid, n in attempt_counts.items() if n >= CONVERSATION_MAX_ATTEMPTS}
     log(f"Previously extracted: {len(processed_ids)} conversations")
+    if given_up:
+        log(f"Given up (no longer retried): {len(given_up)} conversations")
 
     # Load staged conversations
     all_convs = collect_conversations()
     log(f"Total staged conversations: {len(all_convs)}")
 
-    pending = [c for c in all_convs if c.get("session_id", "") not in processed_ids]
+    pending = [
+        c
+        for c in all_convs
+        if c.get("session_id", "") not in processed_ids and c.get("session_id", "") not in given_up
+    ]
     log(f"Pending extraction: {len(pending)} conversations")
 
     if limit > 0:
@@ -585,10 +629,20 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0):
     total_done = 0
     total_failed = 0
     start_time = time.time()
+    # monotonic, not time(), for the same reason run_phase1 uses it: a clock step
+    # mid-run must not hand this loop an unbounded or already-expired budget.
+    deadline = None if deadline_s is None else time.monotonic() + deadline_s
 
     for i, conv in enumerate(pending):
         if _shutdown:
             log("Shutdown requested, saving state...")
+            break
+
+        # Checked before the call, never during: one extraction is a single
+        # LLM round trip that the caller has already reserved max_call_seconds
+        # for, so the useful question is whether to start another one.
+        if deadline is not None and time.monotonic() >= deadline:
+            log(f"Deadline reached, deferring {len(pending) - i} conversation(s) to the next run")
             break
 
         session_id, extraction, is_quota = extract_conversation_inline(conv)
@@ -598,15 +652,27 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0):
             with open(result_file, "w") as f:
                 json.dump(extraction, f, indent=2, ensure_ascii=False)
             processed_ids.add(session_id)
+            # A success clears the record: the next failure starts from zero
+            # rather than inheriting an old transient one.
+            attempt_counts.pop(session_id, None)
             total_done += 1
             log(f"Extracted conv {session_id[:12]}... ({i + 1}/{len(pending)})")
         else:
             total_failed += 1
-            log(f"FAILED conv {session_id[:12]}...")
+            attempts = attempt_counts.get(session_id, 0) + 1
+            attempt_counts[session_id] = attempts
+            if attempts >= CONVERSATION_MAX_ATTEMPTS:
+                log(
+                    f"FAILED conv {session_id[:12]}... "
+                    f"({attempts} runs, giving up, no longer retried)"
+                )
+            else:
+                log(f"FAILED conv {session_id[:12]}... ({attempts}/{CONVERSATION_MAX_ATTEMPTS})")
 
         # Save state periodically
         if (i + 1) % SAVE_INTERVAL == 0 or i == len(pending) - 1:
             conv_state["processed_ids"] = list(processed_ids)
+            conv_state["failed_attempts"] = attempt_counts
             conv_state["total_extracted"] = len(processed_ids)
             conv_state["failures"] = total_failed
             conv_state["last_updated"] = datetime.now().isoformat()
@@ -619,6 +685,10 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0):
 
     # Final save
     conv_state["processed_ids"] = list(processed_ids)
+    conv_state["failed_attempts"] = attempt_counts
+    conv_state["given_up_ids"] = [
+        sid for sid, n in attempt_counts.items() if n >= CONVERSATION_MAX_ATTEMPTS
+    ]
     conv_state["total_extracted"] = len(processed_ids)
     conv_state["failures"] = total_failed
     conv_state["last_updated"] = datetime.now().isoformat()

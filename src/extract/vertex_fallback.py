@@ -29,6 +29,27 @@ def create_with_refusal_fallback(client: Any, *, model: str, **create_kwargs: An
     fb_model = os.environ.get("VERTEX_MODEL_FALLBACK_SDK", "claude-opus-5")
     fb_region = os.environ.get("VERTEX_REGION_FALLBACK", "eu")
     project = os.environ.get("VERTEX_SDK_PROJECT") or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
+
+    # The fallback tier is allowed to equal the primary, and on the VPS it does:
+    # VERTEX_MODEL_EXTRACT and VERTEX_MODEL_FALLBACK_SDK are both claude-opus-5
+    # in region eu, because the fallback stopped being a model-class escape
+    # hatch on 2026-08-03. A refusal is a property of the model and the prompt,
+    # so replaying the identical pair cannot change stop_reason: it only spends a
+    # second call, and up to another max_call_seconds of the caller's deadline,
+    # to be told the same thing. sb-outlook-sync logged 7,124 of these.
+    #
+    # Only when the region is KNOWN to match. A client that does not expose
+    # `.region` leaves the pair unproven, and dropping a retry on an unproven
+    # match would trade a cheap wasted call for a silently lost recovery.
+    primary_region = getattr(client, "region", None)
+    if fb_model == model and primary_region is not None and fb_region == primary_region:
+        logger.warning(
+            "Vertex policy refusal on %s @ %s; fallback tier is the same pair, not retrying",
+            model,
+            primary_region,
+        )
+        return response
+
     logger.warning(
         "Vertex policy refusal on %s — downgrading to fallback %s @ %s",
         model,

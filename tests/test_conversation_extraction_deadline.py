@@ -22,9 +22,16 @@ from src.extract import local
 
 @pytest.fixture
 def staged(tmp_path, monkeypatch):
-    """Ten pending conversations and writable state/output dirs under tmp_path."""
+    """Ten pending conversations and writable state/output/log paths under tmp_path.
+
+    LOG_FILE has to be redirected too. It defaults to `data/extract.log`, and
+    `log()` opens it without creating the parent, so these tests pass on a
+    checkout that happens to have a `data/` directory and fail on one that does
+    not. That is exactly how they went green locally and red on CI.
+    """
     monkeypatch.setattr(local, "CONV_EXTRACTED_DIR", tmp_path / "extracted")
     monkeypatch.setattr(local, "CONV_STATE_FILE", tmp_path / "state" / "conv.json")
+    monkeypatch.setattr(local, "LOG_FILE", tmp_path / "extract.log")
     return [{"session_id": f"sess-{i:03d}"} for i in range(10)]
 
 

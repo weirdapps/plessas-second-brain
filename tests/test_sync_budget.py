@@ -20,6 +20,7 @@ run was 1 min 20 s of CPU across 11 min 30 s of wall clock.
 """
 
 from src.cli import (
+    CONVERSATION_SYNC_DEADLINE_S,
     IMAGE_CLASSIFY_SYNC_BUDGET_S,
     PHASE1_SYNC_DEADLINE_S,
     PHASE2_SYNC_DEADLINE_S,
@@ -27,16 +28,13 @@ from src.cli import (
     SYNC_UNIT_TIMEOUT_S,
 )
 
-# Stage 7 (conversation sync) is small and has no budget of its own.
-STEP7_ALLOWANCE_S = 30.0
-
 
 def _worst_case_run_s() -> float:
     return (
         SYNC_FIXED_WORK_S
         + PHASE1_SYNC_DEADLINE_S
         + PHASE2_SYNC_DEADLINE_S
-        + STEP7_ALLOWANCE_S
+        + CONVERSATION_SYNC_DEADLINE_S
         + IMAGE_CLASSIFY_SYNC_BUDGET_S
     )
 
@@ -71,6 +69,43 @@ def test_the_two_llm_bound_stages_are_budgeted_in_time_not_count():
     deadlines. A count reintroduces the bug the moment per-item cost changes."""
     assert isinstance(PHASE1_SYNC_DEADLINE_S, float)
     assert isinstance(PHASE2_SYNC_DEADLINE_S, float)
+
+
+def test_conversation_step_is_budgeted_in_time_not_count():
+    """Step 7 was the last stage with no bound of any kind. The sum above only
+    ever counted it because this file asserted a 30 s allowance that nothing in
+    `cmd_sync` enforced, so the guarantee was arithmetic over a number that
+    production was free to ignore. On 2026-09-05 it exported 32 conversations
+    and extracted them one at a time with `limit=0`, which is how every run
+    between 23:28 on 2026-09-04 and 05:03 the next morning was SIGTERMed at the
+    600 s mark seconds after printing `Sync complete`."""
+    assert isinstance(CONVERSATION_SYNC_DEADLINE_S, float)
+
+
+def test_cmd_sync_actually_passes_the_conversation_deadline():
+    """The constant existing is not the fix; `cmd_sync` handing it to
+    `run_conversation_extraction` is. The old call site took no arguments at
+    all, so the default `limit=0` ran the whole pending list unbounded."""
+    import inspect
+
+    from src import cli
+
+    src = inspect.getsource(cli.cmd_sync)
+
+    assert "run_conversation_extraction(" in src
+    assert "CONVERSATION_SYNC_DEADLINE_S" in src
+
+
+def test_conversation_extraction_accepts_a_deadline():
+    """The parameter has to exist on the callee for the call site to mean
+    anything. Asserted separately so a rename fails here and names the reason."""
+    import inspect
+
+    from src.extract.local import run_conversation_extraction
+
+    params = inspect.signature(run_conversation_extraction).parameters
+
+    assert "deadline_s" in params
 
 
 # --- The Teams sync has the same shape and the same unit timeout -------------

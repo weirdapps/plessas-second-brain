@@ -814,9 +814,17 @@ def check_sharepoint(db):
         # inside their cool-off by design — prod's 43 sit at 6-9 attempts — and
         # must stay silent, but a link still inside its retry budget that nobody
         # has touched for days means the fetcher is not running at all.
+        # 'unsupported-host' is excluded for the same reason retry_candidates
+        # excludes it: a link on an external tenant is never fetched again, so it
+        # cannot be evidence that the fetcher stopped running. Without this the
+        # two definitions of "eligible" disagreed, and on 2026-09-05 four such
+        # links with attempts=1 sat below the cap, aged past the threshold and
+        # pinned this row to STALE permanently. A red no action can clear gets
+        # ignored exactly as fast as a green no failure can trip.
         overdue = db.execute(
             "SELECT COUNT(*) FROM sharepoint_links "
             "WHERE fetched_at IS NULL AND COALESCE(attempts, 0) < ? "
+            "AND COALESCE(last_status, '') != 'unsupported-host' "
             "AND (last_attempt_at IS NULL "
             "     OR datetime(last_attempt_at) < datetime('now', ?))",
             (SHAREPOINT_MAX_ATTEMPTS, f"-{STALE_THRESHOLDS['sharepoint'].days} days"),

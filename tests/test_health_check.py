@@ -1629,6 +1629,27 @@ def test_check_sharepoint_ok_when_only_capped_links_are_resting(hc):
     assert hc.check_sharepoint(db)["status"] == "OK"
 
 
+def test_check_sharepoint_ok_when_the_only_unattempted_links_are_foreign(hc):
+    """`overdue` has to mean "eligible for retry and nobody retried it", and
+    retry_candidates is what defines eligible. It excludes 'unsupported-host'
+    outright, as a permanent external tenant, but this check did not, so four
+    such links with attempts=1 sat below the cap forever, aged past the two-day
+    threshold and pinned the row to STALE on 2026-09-05 with nothing wrong and
+    nothing anyone could do about it. A red that no action can clear is the same
+    failure as a green that no failure can trip."""
+    db = _sp_db(ok=1000, unsupported_host=4, attempted_days_ago=9, attempts=1)
+
+    assert hc.check_sharepoint(db)["status"] == "OK"
+
+
+def test_check_sharepoint_still_stale_when_a_retryable_link_is_neglected(hc):
+    """Guard the other side of the same line: excluding foreign hosts must not
+    quieten a genuinely eligible link that the fetcher has stopped touching."""
+    db = _sp_db(ok=1000, unsupported_host=4, http_error=1, attempted_days_ago=9, attempts=1)
+
+    assert hc.check_sharepoint(db)["status"] == "STALE"
+
+
 # --- Abandoned links must be counted, not inferred from silence -------------
 # `overdue` deliberately ignores links past the attempt cap, on the grounds that
 # they are resting inside a cool-off. But a never-fetched link past the cap is

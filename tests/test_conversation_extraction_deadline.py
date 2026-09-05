@@ -51,7 +51,7 @@ def test_stops_once_the_deadline_is_spent(staged, monkeypatch):
 
     with (
         patch.object(local, "collect_conversations", return_value=staged),
-        patch.object(local, "_get_client_and_model", create=True),
+        patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
         patch.object(local, "extract_conversation_inline", side_effect=_extraction_for) as ex,
     ):
         local.run_conversation_extraction(deadline_s=25.0)
@@ -64,7 +64,7 @@ def test_no_deadline_still_processes_everything(staged):
     the bound has to be opt-in rather than a new default ceiling."""
     with (
         patch.object(local, "collect_conversations", return_value=staged),
-        patch.object(local, "_get_client_and_model", create=True),
+        patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
         patch.object(local, "extract_conversation_inline", side_effect=_extraction_for) as ex,
     ):
         local.run_conversation_extraction()
@@ -106,7 +106,7 @@ def test_a_conversation_that_keeps_being_refused_is_given_up_on(staged, monkeypa
 
     with (
         patch.object(local, "collect_conversations", return_value=staged),
-        patch.object(local, "_get_client_and_model", create=True),
+        patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
         patch.object(local, "extract_conversation_inline", side_effect=always_refuses),
     ):
         for _ in range(local.CONVERSATION_MAX_ATTEMPTS):
@@ -125,7 +125,7 @@ def test_giving_up_does_not_mark_a_conversation_extracted(staged, monkeypatch):
 
     with (
         patch.object(local, "collect_conversations", return_value=staged),
-        patch.object(local, "_get_client_and_model", create=True),
+        patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
         patch.object(
             local,
             "extract_conversation_inline",
@@ -148,7 +148,7 @@ def test_a_transient_failure_is_retried_before_the_cap(staged, monkeypatch):
 
     with (
         patch.object(local, "collect_conversations", return_value=staged),
-        patch.object(local, "_get_client_and_model", create=True),
+        patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
         patch.object(
             local,
             "extract_conversation_inline",
@@ -175,7 +175,7 @@ def test_work_done_before_the_deadline_is_saved(staged, tmp_path, monkeypatch):
 
     with (
         patch.object(local, "collect_conversations", return_value=staged),
-        patch.object(local, "_get_client_and_model", create=True),
+        patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
         patch.object(local, "extract_conversation_inline", side_effect=_extraction_for),
     ):
         local.run_conversation_extraction(deadline_s=25.0)

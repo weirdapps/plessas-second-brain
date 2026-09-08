@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from src.config import CLAUDE_CODE_PROJECTS_DIR, CONVERSATION_STAGING_DIR
+from src.export.state import write_json_atomic
 
 # Record types that carry conversation content
 _CONTENT_TYPES = {"user", "assistant"}
@@ -291,7 +292,7 @@ def export_conversations(
         return {"exported": 0, "skipped": 0, "errors": 0, "batch_file": None}
 
     exported_ids = exported_ids or set()
-    conversations = []
+    conversations: list[dict] = []
     skipped = 0
     errors = 0
 
@@ -321,8 +322,7 @@ def export_conversations(
     # Write batch file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     batch_file = CONVERSATION_STAGING_DIR / f"conversation-batch-{timestamp}.json"
-    with open(batch_file, "w", encoding="utf-8") as f:
-        json.dump({"conversations": conversations}, f, ensure_ascii=False, indent=2)
+    write_json_atomic(batch_file, {"conversations": conversations})
 
     return {
         "exported": len(conversations),

@@ -12,6 +12,62 @@ from pathlib import Path
 from typing import TypedDict
 
 
+def write_json_atomic(path: Path, payload, *, indent: int | None = 2) -> None:
+    """Write JSON so a reader never sees a partial file.
+
+    The state file has always been written this way; the staging BATCH files,
+    which are two orders of magnitude larger and therefore far likelier to be
+    caught mid-write, were not. All four batch writers opened the destination
+    with mode "w", which truncates immediately, so a job killed during the dump
+    (a systemd RuntimeMaxSec, a reboot, a full disk) left `batch-NNNNN.json`
+    truncated on disk. Every downstream reader does a bare json.load over the
+    whole `batch-*.json` glob, so that one file raised JSONDecodeError and
+    wedged extract and load for EVERY source until someone deleted it by hand.
+
+    fsync before the rename: the rename is atomic with respect to other
+    processes, but without the flush the contents can still be lost on a power
+    failure while the rename survives, which is the same corrupt file by a
+    slower road.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=indent, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def load_json_or_quarantine(path: Path, logger=None):
+    """Parse a staging batch, moving it aside instead of raising.
+
+    Every reader walks the whole `batch-*.json` glob with a bare json.load, so
+    one unparseable file used to stop extract and load for EVERY source until a
+    human deleted it: the textbook poison item. write_json_atomic above removes
+    the cause going forward; this bounds the blast radius of a file already on
+    disk, or of one truncated by something outside this code.
+
+    Returns the parsed object, or None if the file was quarantined.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        quarantine = path.parent / "quarantine"
+        quarantine.mkdir(parents=True, exist_ok=True)
+        dest = quarantine / path.name
+        try:
+            os.replace(path, dest)
+        except OSError:
+            dest = path  # could not move it; still skip it
+        msg = "Quarantined unparseable staging batch %s -> %s: %s"
+        if logger is not None:
+            logger.error(msg, path, dest, e)
+        else:
+            print(msg % (path, dest, e))
+        return None
+
+
 class ExportState(TypedDict):
     """Export progress state."""
 

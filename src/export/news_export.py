@@ -19,6 +19,8 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+from src.export.state import write_json_atomic
+
 DEFAULT_RELEVANCE_THRESHOLD = 60
 NEWS_MAILBOX = "News"
 PIPELINES = ("digest", "monitor", "market", "stack")
@@ -247,19 +249,15 @@ def export_news(
 
     for start in range(0, len(records), batch_size):
         batch_file = staging_path / f"batch-{batch_number:05d}.json"
-        batch_file.write_text(
-            json.dumps(
-                {
-                    "batch_number": batch_number,
-                    "exported_at": exported_at,
-                    "source": "news-reader",
-                    "folder": NEWS_MAILBOX,
-                    "emails": records[start : start + batch_size],
-                },
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
+        write_json_atomic(
+            batch_file,
+            {
+                "batch_number": batch_number,
+                "exported_at": exported_at,
+                "source": "news-reader",
+                "folder": NEWS_MAILBOX,
+                "emails": records[start : start + batch_size],
+            },
         )
         result["batch_files"].append(str(batch_file))
         batch_number += 1

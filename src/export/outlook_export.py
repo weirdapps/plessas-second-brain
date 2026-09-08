@@ -21,6 +21,7 @@ from src.export.state import (
     OutlookSyncState,
     load_outlook_sync_state,
     save_outlook_sync_state,
+    write_json_atomic,
 )
 
 logger = logging.getLogger(__name__)
@@ -204,8 +205,6 @@ def commit_messages_to_db(messages: list[dict], folder: str = "Inbox") -> Path:
     Outlook fields are mapped to the apple_mail staging shape so the
     downstream pipeline doesn't need to learn a new format.
     """
-    import json
-
     staging_dir = Path(__file__).parent.parent.parent / "data" / "staging"
     staging_dir.mkdir(parents=True, exist_ok=True)
 
@@ -219,8 +218,7 @@ def commit_messages_to_db(messages: list[dict], folder: str = "Inbox") -> Path:
         "folder": folder,
         "emails": [_outlook_to_staging_email(m, folder) for m in messages],
     }
-    with open(batch_file, "w", encoding="utf-8") as f:
-        json.dump(batch_data, f, indent=2, ensure_ascii=False)
+    write_json_atomic(batch_file, batch_data)
     logger.info("Wrote %d messages to %s", len(messages), batch_file)
     return batch_file
 

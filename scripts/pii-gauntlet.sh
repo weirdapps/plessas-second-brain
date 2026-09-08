@@ -98,6 +98,15 @@ scan_doctor() {
     --exclude-dir=dist \
     --exclude-dir=coverage \
     --exclude-dir=installers/deps \
+    `# Tool caches. They hold no authored text, so a hit in one is noise by` \
+    `# construction, and .mypy_cache alone is 16 MB / 423 files of minified` \
+    `# JSON. Scanning them made the pre-commit run 3 minutes instead of 19s` \
+    `# and dumped a single 243 KB line into the report. A slow, noisy gate is` \
+    `# a gate that gets bypassed.` \
+    --exclude-dir=.mypy_cache \
+    --exclude-dir=.ruff_cache \
+    --exclude-dir=.pytest_cache \
+    --exclude-dir=htmlcov \
     --exclude=pii-gauntlet.sh \
     --exclude=LICENSE \
     --exclude=PII-GAUNTLET.md \
@@ -187,15 +196,18 @@ check() {
     fi
   done <<< "$hits"
 
+  # `cut -c1-200` before `head`: a hit inside a minified file is ONE line that
+  # can be hundreds of KB, so a line cap alone does not bound the report. The
+  # point of a hit is the path, which is at the front of the line.
   if [ -n "$tracked_hits" ]; then
     echo "FAIL [$label]:                 (tracked — would ship publicly)"
-    printf '%s' "$tracked_hits" | head -20
+    printf '%s' "$tracked_hits" | cut -c1-200 | head -20
     echo
     FAIL=1
   fi
   if [ -n "$untracked_hits" ]; then
     echo "INFO [$label]:                 (gitignored / untracked — local-only)"
-    printf '%s' "$untracked_hits" | head -10
+    printf '%s' "$untracked_hits" | cut -c1-200 | head -10
     echo
     INFO=1
   fi

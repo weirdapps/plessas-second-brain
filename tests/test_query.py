@@ -1281,10 +1281,10 @@ class TestImportPeople:
         from src.store.dedup_people import normalize_name
 
         conn = create_database(":memory:")
-        conn.execute("INSERT INTO people (name, email) VALUES ('ΒΟΛΙΩΤΗ ΕΛΕΥΘΕΡΙΑ', NULL)")
+        conn.execute("INSERT INTO people (name, email) VALUES ('ΠΑΠΑΔΟΠΟΥΛΟΥ ΜΑΡΙΝΑ', NULL)")
         conn.commit()
 
-        alias_norm = normalize_name("ΒΟΛΙΩΤΗ ΕΛΕΥΘΕΡΙΑ")
+        alias_norm = normalize_name("ΠΑΠΑΔΟΠΟΥΛΟΥ ΜΑΡΙΝΑ")
         rows = conn.execute("SELECT id, name FROM people").fetchall()
         match = None
         for r in rows:

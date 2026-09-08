@@ -102,7 +102,16 @@ RSYNC_OPTS="-az --timeout=180"
 # which is exactly what a plain file copy cannot do. It lives outside the repo
 # data dir and PERSISTS between runs on purpose: a stable page layout is what
 # lets rsync keep sending deltas instead of 3 GB every hour.
-REMOTE_SNAP="\$HOME/.second-brain/brain.snapshot.db"
+# Per consumer, not one shared file. Two Macs pull from this VPS (one at :15,
+# one at :45) and both ran `sqlite3 .backup` into the SAME path, guarded only by
+# a /tmp lock that is local to each machine and therefore guards nothing across
+# them. A pull that overruns its 30-minute gap means two .backup runs writing one
+# file, and both hosts then rsync whatever that produced. The DEFER check above
+# looks for VPS sync jobs and would not see the other Mac.
+# The extra disk is one snapshot per consumer, and rsync deltas are unaffected
+# because each host keeps its own stable page layout, which is the whole reason
+# this file persists between runs.
+REMOTE_SNAP="\$HOME/.second-brain/brain.snapshot.$(hostname -s).db"
 ssh $SSH_OPTS "$VPS" "mkdir -p \$HOME/.second-brain && sqlite3 \$HOME/$REMOTE_DATA/brain.db \".backup '$REMOTE_SNAP'\"" 2>> "$LOG_FILE"
 SNAP_RC=$?
 if [ $SNAP_RC -ne 0 ]; then

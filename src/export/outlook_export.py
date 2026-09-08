@@ -218,7 +218,7 @@ def commit_messages_to_db(messages: list[dict], folder: str = "Inbox") -> Path:
         "folder": folder,
         "emails": [_outlook_to_staging_email(m, folder) for m in messages],
     }
-    write_json_atomic(batch_file, batch_data)
+    write_json_atomic(batch_file, batch_data, redact=True)
     logger.info("Wrote %d messages to %s", len(messages), batch_file)
     return batch_file
 

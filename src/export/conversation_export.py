@@ -322,7 +322,7 @@ def export_conversations(
     # Write batch file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     batch_file = CONVERSATION_STAGING_DIR / f"conversation-batch-{timestamp}.json"
-    write_json_atomic(batch_file, {"conversations": conversations})
+    write_json_atomic(batch_file, {"conversations": conversations}, redact=True)
 
     return {
         "exported": len(conversations),

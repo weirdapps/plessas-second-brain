@@ -258,6 +258,7 @@ def export_news(
                 "folder": NEWS_MAILBOX,
                 "emails": records[start : start + batch_size],
             },
+            redact=True,
         )
         result["batch_files"].append(str(batch_file))
         batch_number += 1

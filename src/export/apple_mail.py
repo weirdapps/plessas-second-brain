@@ -672,7 +672,7 @@ def save_batch(batch_number: int, emails: list[dict]) -> None:
         "emails": emails,
     }
 
-    write_json_atomic(batch_file, batch_data)
+    write_json_atomic(batch_file, batch_data, redact=True)
 
 
 def _get_archive_max_date_from_db() -> str | None:

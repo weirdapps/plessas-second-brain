@@ -12,8 +12,15 @@ from pathlib import Path
 from typing import TypedDict
 
 
-def write_json_atomic(path: Path, payload, *, indent: int | None = 2) -> None:
+def write_json_atomic(path: Path, payload, *, indent: int | None = 2, redact: bool = False) -> None:
     """Write JSON so a reader never sees a partial file.
+
+    `redact=True` strips credential-shaped strings first, and every staging BATCH
+    writer passes it. This is the one boundary all four sources cross on the way
+    into the store, so it is the right place: past it, a secret is in brain.db, in
+    the Vertex extraction request, on every replica and in every offsite snapshot
+    taken since. It is off by default because this function also writes state
+    files, where the pattern set has nothing to match and the walk is waste.
 
     The state file has always been written this way; the staging BATCH files,
     which are two orders of magnitude larger and therefore far likelier to be
@@ -29,6 +36,10 @@ def write_json_atomic(path: Path, payload, *, indent: int | None = 2) -> None:
     failure while the rename survives, which is the same corrupt file by a
     slower road.
     """
+    if redact:
+        from src.redact import redact_payload
+
+        payload = redact_payload(payload)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as f:

@@ -27,14 +27,22 @@ cp ~/.local/bin/sb-db-pull.sh ~/.local/bin/sync-documents-to-vps.sh scripts/wrap
 | Directory | Host | Scheduler | Count |
 |---|---|---|---|
 | `systemd/` | VPS | `systemctl --user` timers | 13 |
-| `launchd/` | Mac | LaunchAgents | 2 |
+| `launchd/` | Mac | LaunchAgents | 3 |
 
-The VPS runs all ingestion. The Mac is a read replica: `sb-db-pull.sh` pulls the
-database and embeddings hourly, and `sync-documents-to-vps.sh` pushes the
-document roots the other way. The Mac's other `sb-*` wrappers correspond to jobs
-retired to the VPS (their plists are renamed `*.disabled-migrated-to-vps`) and
-are deliberately not archived — committing retired duplicates would only make it
-harder to tell which copy matters.
+The VPS runs all ingestion. A Mac is a read replica: `sb-db-pull.sh` pulls the
+database and embeddings hourly, `wait-for-vps.sh` is the readiness gate it calls
+first, and `sync-documents-to-vps.sh` pushes the document roots the other way.
+The Mac's other `sb-*` wrappers correspond to jobs retired to the VPS and are
+deliberately not archived, because committing retired duplicates would only make
+it harder to tell which copy matters.
+
+**Do not expect a `*.disabled-migrated-to-vps` plist to mark a retired job.** An
+earlier version of this file said the retired plists carry that suffix; zero such
+files exist on either Mac today. The renames were lost when the LaunchAgents
+directory was re-laid on 2026-08-28, which is exactly why
+`scripts/health_check.py::_is_migrated` stopped treating the marker as its only
+evidence and added a second, timestamped one (a freshly received replica). Treat
+the marker as a convention that may or may not be present, never as the test.
 
 ## What is deliberately absent
 

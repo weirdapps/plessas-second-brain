@@ -137,16 +137,24 @@ def search_emails(query: str, search_type: str = "keyword", limit: int = 20) -> 
 
 @mcp.tool()
 def recall(query: str, limit_per_kind: int = 5, days: int = 365) -> dict:
-    """Unified search across every text-bearing index — emails, attachments, standalone documents, conversations, decisions, action items, and inline images. Auto-pulls person/topic context when the query matches a known person name/email or topic.
+    """Unified search across every text-bearing index. Use this as the default 'tell me everything you know about X' entry point.
 
-    Use this as the default 'tell me everything you know about X' entry point.
-    Returns a categorized bundle so the caller can see at a glance which kinds
-    matched. Each kind capped by limit_per_kind (default 5).
+    Returns nine buckets, keyed exactly as listed: emails (which also covers
+    standalone documents and news, since they share the emails table),
+    attachments, conversations, decisions, actions, commitments, inline_images,
+    teams, calendar_events. `summary.kinds_with_results` names the ones that
+    matched. This list must stay complete: it is what tells you the tool covers
+    Teams, calendar and commitments at all, and it named only seven until
+    2026-09-09, which made three whole kinds invisible to a caller.
+
+    Only the emails bucket fuses keyword and semantic ranking; every other
+    bucket is keyword-only. When the local replica is behind, the result carries
+    `_stale_warning` and `data_as_of`.
 
     Args:
         query: Free-text query (keyword, name, topic, etc.)
         limit_per_kind: Max results per category (default 5)
-        days: Lookback window for person/topic context (default 365)
+        days: Lookback window for the auto-pulled person/topic context (default 365)
     """
     from src.store.embeddings import semantic_email_candidates
     from src.store.query import get_freshness

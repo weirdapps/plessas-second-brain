@@ -57,7 +57,7 @@ jobs:
         # reported to Sonar as a coverage figure. The `test` job in ci.yml is the
         # gate; this one only exists to produce coverage.xml, and it can only do
         # that honestly if the run really passed.
-        run: uv run pytest -q --cov=src --cov=scripts --cov-report=xml --cov-report=term-missing
+        run: uv run --frozen pytest -q --cov=src --cov=scripts --cov-report=xml --cov-report=term-missing
 
       - name: Check for SonarCloud token
         id: check-sonar

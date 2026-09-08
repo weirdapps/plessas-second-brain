@@ -58,7 +58,7 @@ jobs:
       # -rs lists every skipped test with its reason. A skip in CI is a test that
       # runs NOWHERE, because the developer machine has the tool and never sees
       # the skip; printing them keeps that visible instead of silent.
-      - run: uv run pytest -q -rs --cov=src --cov=scripts --cov-report=term-missing
+      - run: uv run --frozen pytest -q -rs --cov=src --cov=scripts --cov-report=term-missing
   pii-gauntlet:
     runs-on: ubuntu-latest
     timeout-minutes: 10

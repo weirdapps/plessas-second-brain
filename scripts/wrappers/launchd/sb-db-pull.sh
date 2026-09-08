@@ -17,6 +17,12 @@ mkdir -p "$LOG_DIR"
 VPS="vps"
 LOCAL_DATA="$HOME/SourceCode/plessas-second-brain/data"
 REMOTE_DATA="SourceCode/plessas-second-brain/data"
+# rsync will not create a two-level destination, and `data/` is gitignored, so a
+# fresh clone does not have it: the Pro rebuilt on 2026-09-05 had the plist, both
+# scripts and a reachable VPS, and the pull would still have failed on every run
+# with "No such file or directory". Same omission the offsite block below already
+# records, one directory earlier in the same script.
+mkdir -p "$LOCAL_DATA"
 REMOTE_PYTHON="~/.venvs/second-brain/bin/python"
 SSH_OPTS="-o ConnectTimeout=10 -o BatchMode=yes -o ServerAliveInterval=15"
 
@@ -167,6 +173,33 @@ if [ "${INTEGRITY% }" != "ok" ]; then
   INTEGRITY_RC=1
 else
   INTEGRITY_RC=0
+fi
+
+# --- Pull encrypted offsite DB snapshots + GFS prune (14 daily + 8 weekly) ---
+# The VPS writes these daily from sb-daily-sync via backup_db.py, but they land in
+# data/backups/offsite on the SAME /dev/sdb as brain.db itself, so "offsite" is a
+# misnomer until they are pulled here. This is the only hop that makes them real.
+# Point OFFSITE_LOCAL at a OneDrive-synced folder for a free second offsite hop.
+#
+# This block was missing from the deployed copy while living in the repo copy, so
+# the pull silently never ran and the directory below never existed. Hence mkdir -p
+# rather than assuming: rsync will not create a two-level destination on its own.
+OFFSITE_LOCAL="$HOME/second-brain-backups/offsite"
+mkdir -p "$OFFSITE_LOCAL"
+rsync $RSYNC_OPTS "$VPS:~/$REMOTE_DATA/backups/offsite/brain-*.db.zst.enc" \
+  "$OFFSITE_LOCAL/" 2>> "$LOG_FILE"
+OFF_RC=$?
+if [ "$OFF_RC" -eq 0 ]; then
+  "$HOME/SourceCode/plessas-second-brain/.venv/bin/python3" \
+    "$HOME/SourceCode/plessas-second-brain/scripts/backup_db.py" \
+    --prune-only --offsite-dir "$OFFSITE_LOCAL" --gfs-daily 14 --gfs-weekly 8 >> "$LOG_FILE" 2>&1 || true
+  OFF_COUNT=$(ls "$OFFSITE_LOCAL"/brain-*.db.zst.enc 2>/dev/null | wc -l | tr -d ' ')
+  log "offsite snapshots synced + pruned (kept $OFF_COUNT)"
+else
+  # Report the code, do not guess the cause. The repo copy of this block asserted
+  # "backup key unprovisioned on VPS?", which was wrong: the key was provisioned
+  # the whole time and the real fault was the missing local directory above.
+  log "ERROR: offsite snapshot pull FAILED (rsync rc=$OFF_RC)"
 fi
 
 # --- Sanity check: compare email counts VPS vs local ---

@@ -360,14 +360,32 @@ def create_database(db_path: str) -> sqlite3.Connection:
         END
     """)
 
-    # Store schema version
+    # Store schema version.
+    #
+    # Stamp 0 and let run_migrations build the rest, rather than declaring
+    # CURRENT_SCHEMA_VERSION over a schema this function does not actually
+    # create. The DDL above covers the base tables only; Teams (v12), calendar
+    # (v13) and conversations (v7) live in migrations. Stamping 19 told
+    # run_migrations there was nothing to do, so a brand new or restored
+    # database came up missing nine tables (calendar_events, event_attendees,
+    # teams_chats, teams_messages, teams_threads, teams_mri_resolution,
+    # conversations, conversation_turns, conversation_topics) while `migrate`
+    # reported it up to date and eight MCP tools raised "no such table". That is
+    # the disaster-recovery path: a rebuild from scratch produced a brain with no
+    # Teams, no calendar and no conversation memory, and said it was fine.
+    #
+    # Every migration is CREATE TABLE IF NOT EXISTS or column-guarded and runs in
+    # milliseconds on an empty database, so one code path now serves both new and
+    # existing stores and the two cannot diverge again.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS schema_version (
             version INTEGER NOT NULL
         )
     """)
-    conn.execute("INSERT INTO schema_version (version) VALUES (?)", (CURRENT_SCHEMA_VERSION,))
+    conn.execute("INSERT INTO schema_version (version) VALUES (0)")
+    conn.commit()
 
+    run_migrations(conn)
     conn.commit()
     return conn
 

@@ -53,11 +53,20 @@ echo
 FAIL=0
 INFO=0
 
+# `git ls-files` renders any non-ASCII path as octal escapes under the default
+# core.quotePath=true, so a Greek filename becomes "\316\244\316\225...".
+# That is not cosmetic: the escaped string is not a path that exists, so xargs
+# hands grep a missing file, the error goes to /dev/null, and the CONTENTS of
+# every Greek-named tracked file are silently never scanned. Verified by planting
+# one, with an @nbg.gr address inside it that the gate could not see. -c
+# overrides the setting for this process without touching the user's config.
+GIT_LS="git -c core.quotePath=false ls-files"
+
 # This script's path relative to the repo root. Derived, not hardcoded: the
 # same file lives in installers/ in some repos and scripts/ in others, and
 # hand-maintained copies are what let them drift apart in the first place.
 # Both modes need it now, so it is computed before either branch.
-SELF_REL=$(git ls-files --full-name -- "$0" 2>/dev/null | head -1)
+SELF_REL=$($GIT_LS --full-name -- "$0" 2>/dev/null | head -1)
 [ -z "$SELF_REL" ] && SELF_REL="scripts/pii-gauntlet.sh"
 
 # Case sensitivity for the scanners below. Every check is case-INSENSITIVE by
@@ -70,7 +79,7 @@ CASE_FLAG=i
 if [ "$MODE" = "ci" ]; then
   # Exclude self + auto-generated lockfiles at any depth (lockfiles contain SHAs / hashes that
   # collide with the 9-digit-ID regex but carry no PII risk).
-  TRACKED=$(git ls-files \
+  TRACKED=$($GIT_LS \
     | grep -v "^$SELF_REL$" \
     | grep -vE '(^|/)LICENSE(\.md|\.txt)?$' \
     | grep -vE '(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Pipfile\.lock)$' \
@@ -81,7 +90,7 @@ fi
 
 # Helper: get the tracked-vs-untracked status of a file.
 file_is_tracked() {
-  git ls-files --error-unmatch "$1" >/dev/null 2>&1
+  git -c core.quotePath=false ls-files --error-unmatch "$1" >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -96,8 +105,8 @@ file_is_tracked() {
 #
 # TREE_PATHS deliberately includes binaries, for exactly that reason. A
 # filename is text no matter what the file contains.
-TREE_PATHS=$(git ls-files | grep -v "^$SELF_REL$" || true)
-UNTRACKED_PATHS=$(git ls-files --others --exclude-standard 2>/dev/null || true)
+TREE_PATHS=$($GIT_LS | grep -v "^$SELF_REL$" || true)
+UNTRACKED_PATHS=$($GIT_LS --others --exclude-standard 2>/dev/null || true)
 
 # Pair every path with its separator-normalised form as "orig<TAB>normalised",
 # so a hit already carries its own path. Matching runs against the whole pasted
@@ -402,8 +411,25 @@ check "Azure AD tenant id" \
 # Greek capitals carry no accent, so the class is the plain 24 uppercase letters.
 # Measured over the whole tracked tree: this fires on nothing except the
 # synthetic placeholder excluded below.
+# A bracket expression over multibyte letters is LOCALE-DEPENDENT. Under C or
+# POSIX it decays into individual BYTES, so {n,} counts bytes rather than
+# characters. Measured with BSD grep, which is what runs this: the same pattern
+# found 3 matches under en_US.UTF-8 and 4 under C, the extra being a two-letter
+# article that is four bytes long and so cleared a three-CHARACTER minimum. The
+# gate would be stricter on a runner than in local testing, in the direction that
+# invents findings. An alternation of literal characters has no collation to
+# resolve and measured identically under en_US.UTF-8, C.UTF-8, C and POSIX.
+#
+# Dialytika is in the set because Greek all-caps drops the tonos but KEEPS the
+# dialytika, so a name containing it would otherwise break mid-word.
+GRK_CAP='(Α|Β|Γ|Δ|Ε|Ζ|Η|Θ|Ι|Κ|Λ|Μ|Ν|Ξ|Ο|Π|Ρ|Σ|Τ|Υ|Φ|Χ|Ψ|Ω|Ϊ|Ϋ)'
+# Four letters, not three. At three the rule fires on the whole Greek acronym
+# class, since every Greek acronym in these repos is two or three letters, and on
+# articles and conjunctions: a bare acronym-plus-conjunction pair matched, as did
+# a logo caption in a sibling repo. Four kills both classes. Five would start
+# missing genuine four-letter forenames.
 check_cs "All-caps Greek personal name" \
-  '[ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩ]{3,}[[:space:]]+[ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩ]{3,}' \
+  "${GRK_CAP}{4,}[[:space:]]+${GRK_CAP}{4,}" \
   'ΠΑΠΑΔΟΠΟΥΛΟΥ ΜΑΡΙΝΑ'
 
 

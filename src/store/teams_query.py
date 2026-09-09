@@ -229,5 +229,13 @@ def stats(conn: sqlite3.Connection) -> dict:
 
 
 def _sanitize_fts(q: str) -> str:
-    """Escape FTS5 punctuation by double-quoting the whole query."""
-    return '"' + q.replace('"', '""') + '"'
+    """Escape FTS5 punctuation by double-quoting the whole query.
+
+    Folds Greek accents first, for the same reason query.py does: schema v20
+    indexes folded text, so a query that is not folded matches nothing that
+    carries a tonos. This module keeps its own sanitizer, so it needs its own
+    call; the fold itself is shared.
+    """
+    from src.store.greek import fold
+
+    return '"' + fold(q).replace('"', '""') + '"'

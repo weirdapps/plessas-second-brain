@@ -589,64 +589,56 @@ def _extract_eml(path: str) -> dict:
     }
 
 
+# The first bytes of a Rights-Protected Message. This is the MSIPC container
+# format, NOT an OLE2 compound document (which begins d0cf11e0).
+_RPMSG_MAGIC = b"\x76\xe8\x04\x60"
+
+
 def _extract_rpmsg(path: str) -> dict:
-    """Best-effort metadata extraction from encrypted .rpmsg files."""
+    """Report an .rpmsg as permanently unreadable, because it is.
+
+    This used to open the file with `compoundfiles` and salvage printable
+    strings. It never once worked. Measured across the live corpus: 685 rows
+    carry this method and ZERO of them hold a single character of extracted
+    text. Every real file fails with CompoundFileInvalidMagicError, for the
+    plain reason that .rpmsg is not an OLE2 compound document: the 687 files on
+    the producer all begin 76e8 0460, the MSIPC magic, where OLE2 begins d0cf11e0.
+
+    So the previous code could not have succeeded on any input, and the
+    dependency it needed was the only source-only package in the tree, built
+    from setup.py on every install on every host. Removing it is what lets the
+    dependency install refuse to build source distributions at all.
+
+    The honest verdict is a skip, matching how the dispatcher already treats
+    other IRM-protected content: the payload is encrypted, and no parser reads
+    it without rights. Marking it 'skipped' rather than 'failed' also stops it
+    counting against the extraction failure rate, which is what a fault should
+    mean.
+    """
     try:
-        import compoundfiles
-    except ImportError:
+        with open(path, "rb") as f:
+            magic = f.read(4)
+    except OSError as e:
         return {
             "text": None,
-            "method": "compoundfiles",
-            "status": "failed",
-            "error": "compoundfiles not installed",
-        }
-
-    try:
-        doc = compoundfiles.CompoundFileReader(path)
-        parts = []
-
-        for entry in doc.root:
-            name = entry.name
-            if entry.is_file:
-                try:
-                    data = doc.open(entry).read()
-                    for encoding in ("utf-8", "utf-16-le", "latin-1"):
-                        try:
-                            decoded = data.decode(encoding)
-                            printable = "".join(
-                                c for c in decoded if c.isprintable() or c in "\n\r\t"
-                            )
-                            if len(printable) > 10:
-                                parts.append(f"[{name}] {printable[:2000]}")
-                                break
-                        except (UnicodeDecodeError, ValueError):
-                            continue
-                except Exception:
-                    continue
-
-        doc.close()
-
-        text = _truncate("\n".join(parts))
-        if not text.strip():
-            return {
-                "text": None,
-                "method": "compoundfiles",
-                "status": "partial",
-                "error": "Encrypted content — metadata only",
-            }
-        return {
-            "text": text,
-            "method": "compoundfiles",
-            "status": "partial",
-            "error": None,
-        }
-    except Exception as e:
-        return {
-            "text": None,
-            "method": "compoundfiles",
+            "method": "rpmsg",
             "status": "failed",
             "error": f"{type(e).__name__}: {str(e)[:200]}",
         }
+
+    if magic == _RPMSG_MAGIC:
+        return {
+            "text": None,
+            "method": "rpmsg",
+            "status": "skipped",
+            "error": "IRM-protected message (MSIPC): encrypted, no extractable text without rights",
+        }
+    return {
+        "text": None,
+        "method": "rpmsg",
+        "status": "skipped",
+        "error": f"unrecognised .rpmsg container (magic {magic.hex()}); not MSIPC",
+    }
 
 
 def _extract_plain_text(path: str) -> dict:

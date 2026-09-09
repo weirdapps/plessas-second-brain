@@ -8,9 +8,22 @@ name: CI
   # workflow events for pushes made with that token. Auto-merged bumps therefore
   # land on master with no CI run on the resulting tip; this allows re-running it.
   workflow_dispatch:
+
+# Least privilege by default. Nothing in this workflow writes to the repo,
+# and the default token grant is write for a push event on a public repo.
+permissions:
+  contents: read
+
+# Supersede an in-flight run when a branch is pushed again. Cancels nothing
+# on master, where every commit should be verified on its own.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
@@ -22,15 +35,33 @@ jobs:
   test:
     runs-on: ubuntu-latest
     needs: lint
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
-      - run: pip install -e ".[dev]"
-      - run: pytest
+      # uv.lock is committed and Dependabot maintains it, but nothing installed
+      # from it: `pip install -e .` resolves pyproject's floors afresh on every
+      # run, so CI tested a dependency set that was neither the lock nor what
+      # production runs, and a Dependabot alert could read "fixed" while the
+      # vulnerable version was still being resolved here.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+      - run: uv sync --frozen --extra dev
+      # zsh is a real test dependency: 8 of the 15 document-sync wrapper tests
+      # skip without it, and the wrapper is run by /bin/zsh in production. The
+      # `wrappers` job below already installs zsh for exactly this reason.
+      - name: Install zsh
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+      # -rs lists every skipped test with its reason. A skip in CI is a test that
+      # runs NOWHERE, because the developer machine has the tool and never sees
+      # the skip; printing them keeps that visible instead of silent.
+      - run: uv run --frozen pytest -q -rs --cov=src --cov=scripts --cov-report=term-missing
   pii-gauntlet:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - name: PII gauntlet
@@ -47,6 +78,7 @@ jobs:
     # /bin/zsh in production (the only shell holding Full Disk Access on that
     # Mac), so checking it with bash would validate a shell that never runs it.
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
       - name: Install zsh

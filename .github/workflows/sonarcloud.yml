@@ -29,19 +29,17 @@ jobs:
         with:
           python-version: '3.12'
 
+      # Install from the lockfile, and let a failure fail. This step was a chain
+      # of `2>/dev/null || true` under `continue-on-error: true`, which is three
+      # independent ways to hide the same thing: a broken install produced a
+      # green check reporting 0.0% coverage, and the log said nothing about why.
+      # The comment above records that happening once already. A coverage number
+      # nobody can trust is worse than no coverage job.
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
       - name: Install dependencies
-        continue-on-error: true
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f pyproject.toml ]; then
-            pip install -e . 2>/dev/null \
-              || pip install -e ".[dev]" 2>/dev/null \
-              || pip install -e ".[test]" 2>/dev/null \
-              || true
-          fi
-          if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
-          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt || true; fi
-          pip install pytest pytest-cov
+        run: uv sync --frozen --extra dev
 
       - name: Check for tests
         id: check-tests
@@ -55,8 +53,11 @@ jobs:
 
       - name: Run tests with coverage
         if: steps.check-tests.outputs.has_tests == 'true'
-        continue-on-error: true
-        run: pytest --cov=. --cov-report=xml --cov-report=term-missing || true
+        # No `|| true`, no continue-on-error: a failing suite must not be
+        # reported to Sonar as a coverage figure. The `test` job in ci.yml is the
+        # gate; this one only exists to produce coverage.xml, and it can only do
+        # that honestly if the run really passed.
+        run: uv run --frozen pytest -q --cov=src --cov=scripts --cov-report=xml --cov-report=term-missing
 
       - name: Check for SonarCloud token
         id: check-sonar

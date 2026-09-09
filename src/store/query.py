@@ -362,6 +362,7 @@ def query_decisions(
     topic: str | None = None,
     person: str | None = None,
     limit: int = 20,
+    days: int | None = None,
 ) -> list[dict]:
     """Find decisions, optionally filtered by topic or person.
 
@@ -370,6 +371,9 @@ def query_decisions(
         topic: Optional topic filter (partial match)
         person: Optional person filter (decided_by field, partial match)
         limit: Maximum number of results to return
+        days: Optional lookback window. None means all time, which is what this
+            function always did; the MCP tool exposed a `days` argument that
+            never reached here.
 
     Returns:
         List of dicts with keys: decision_id, decision, decided_by, date,
@@ -402,6 +406,13 @@ def query_decisions(
     if person:
         where_clauses.append("d.decided_by LIKE ?")
         params.append(f"%{person}%")
+
+    if days is not None:
+        from datetime import datetime, timedelta
+
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+        where_clauses.append("COALESCE(d.decision_date, e.date_received) >= ?")
+        params.append(cutoff)
 
     if where_clauses:
         query += " WHERE " + " AND ".join(where_clauses)
@@ -808,23 +819,47 @@ def find_stale_threads(conn: sqlite3.Connection, days: int = 5) -> list[dict]:
     return [dict(r) for r in results]
 
 
-def find_overdue_actions(conn: sqlite3.Connection) -> list[dict]:
-    """Find action items past their deadline.
+def count_overdue_actions(conn: sqlite3.Connection) -> int:
+    """How many open action items are past a parseable deadline."""
+    return conn.execute("""
+        SELECT COUNT(*) FROM action_items ai
+        WHERE ai.status = 'open' AND ai.deadline IS NOT NULL
+          AND julianday(ai.deadline) IS NOT NULL
+          AND ai.deadline < date('now')
+    """).fetchone()[0]
+
+
+def find_overdue_actions(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
+    """Find action items past their deadline, most overdue first.
+
+    `limit` is not optional in practice. This had no bound until 2026-09-09 and
+    the live corpus answers it with 15,618 rows / 7.2 MB, far past the MCP result
+    cap, so `stale_threads` (its only caller) failed every single time it ran.
+    Use count_overdue_actions() when you want the total.
+
+    A NULL julianday() means the deadline string is not a date SQLite can parse.
+    Those rows sorted to the top with days_overdue = NULL and pushed the real
+    answers off the end, so they are excluded.
 
     Returns:
         List of dicts with keys: action_id, task, owner, deadline,
         email_subject, date, days_overdue
     """
-    results = conn.execute("""
+    results = conn.execute(
+        """
         SELECT ai.id as action_id, ai.task, ai.owner, ai.deadline,
                e.subject as email_subject, e.date_received as date,
                CAST(julianday('now') - julianday(ai.deadline) AS INTEGER) as days_overdue
         FROM action_items ai
         JOIN emails e ON ai.email_id = e.id
         WHERE ai.status = 'open' AND ai.deadline IS NOT NULL
+          AND julianday(ai.deadline) IS NOT NULL
           AND ai.deadline < date('now')
         ORDER BY days_overdue DESC
-    """).fetchall()
+        LIMIT ?
+    """,
+        (limit,),
+    ).fetchall()
     return [dict(r) for r in results]
 
 
@@ -878,8 +913,57 @@ def get_stats(conn: sqlite3.Connection) -> dict:
     row = cursor.fetchone()
     stats["earliest_email"] = row["earliest"]
     stats["latest_email"] = row["latest"]
+    stats.update(get_freshness(conn))
 
     return stats
+
+
+# How far behind the producer the replica may drift before a caller should be
+# told. The Mac pulls hourly during the day and not at all overnight, so a few
+# hours is normal and 3 is the first value that is not.
+STALE_AFTER_HOURS = 3.0
+
+
+def get_freshness(conn: sqlite3.Connection) -> dict:
+    """How current this database is, and whether a caller should say so.
+
+    This file is usually a REPLICA: the VPS produces it and the Mac rsyncs it
+    down on a schedule. Nothing used to expose that. A search tool answering off
+    a replica that stopped updating 29 hours ago looks exactly like one answering
+    off a live corpus in which nothing happened, and on 2026-09-07 the pull did
+    stop, for a day and a half, with no signal to any caller.
+
+    Returns data_as_of / age_hours / stale, plus a `stale_warning` sentence when
+    the replica is behind, so it can be surfaced verbatim.
+    """
+    from datetime import datetime
+
+    out: dict = {"data_as_of": None, "age_hours": None, "stale": False}
+    try:
+        row = conn.execute(
+            "SELECT value FROM sync_metadata WHERE key = 'last_sync_date'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return out
+    if not row or not row[0]:
+        return out
+
+    out["data_as_of"] = row[0]
+    try:
+        as_of = datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+    except ValueError:
+        return out
+    now = datetime.now(as_of.tzinfo) if as_of.tzinfo else datetime.now()
+    age_hours = round((now - as_of).total_seconds() / 3600.0, 1)
+    out["age_hours"] = age_hours
+    if age_hours > STALE_AFTER_HOURS:
+        out["stale"] = True
+        out["stale_warning"] = (
+            f"This corpus was last updated {age_hours}h ago ({row[0]}). Anything "
+            "more recent than that is missing. Use outlook_live_search for very "
+            "recent mail, and say so if the answer depends on recent items."
+        )
+    return out
 
 
 def search_attachments(

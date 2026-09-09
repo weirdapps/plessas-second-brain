@@ -42,6 +42,17 @@ tier: a host without it, a read replica for instance, skips the encrypted copy
 entirely. That is deliberate, so only the authoritative host produces offsite
 snapshots.
 
+Note the asymmetry that creates, because it is easy to get wrong: a replica does
+not produce offsite snapshots, but it does RECEIVE them, so it can end up holding
+a full set of encrypted archives and no key to open them. That was the state on
+2026-09-09, when one consumer held 21 snapshots and zero keys while both the
+current key and the retired one existed only on the producer. Both are now on the
+consumer as well, at mode 600 on a FileVault volume, outside every backup target.
+Losing the producer no longer costs the archives.
+
+Keep the RETIRED key. It is the only thing that opens anything written before the
+rotation date in its filename.
+
 ## Restore
 
 Prerequisites: `zstd`, `openssl` and `sqlite3` on `PATH`, plus the key file.
@@ -96,6 +107,20 @@ An untested restore is a hypothesis. Run the sequence above against the newest
 offsite snapshot on whatever schedule you can live with, and check that step 2
 comes back clean and step 3's counts land where you expect.
 
-Last exercised: 2026-09-09, on a synthetic database, confirming that the command
-sequence on this page round-trips and that `quick_check` and `foreign_key_check`
-are both clean afterwards. That validates the commands, not any one archive.
+Last exercised: 2026-09-09, twice.
+
+First on a synthetic database, which validates the command sequence but not any
+archive. Then, once a consumer had its own key, against the newest REAL offsite
+snapshot on a consumer host with no access to the producer's copy of anything:
+
+```text
+brain-20260909.db.zst.enc, 858,796,160 bytes
+decrypt + decompress          ~2 s      -> 3,333,738,496 bytes
+PRAGMA quick_check            ok
+PRAGMA foreign_key_check      clean
+tables 67, emails 79,264, last_sync_date 2026-09-09T01:42:10
+```
+
+That second run is the one that answers the question this page exists for: can
+this machine, alone, turn an archive back into a working brain. Until the keys
+were copied it could not, and nothing said so.

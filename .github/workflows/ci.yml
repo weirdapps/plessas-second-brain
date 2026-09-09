@@ -29,7 +29,10 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
-      - run: pip install ruff==0.15.13  # pinned: unpinned ruff drifts (markdown-format) and breaks lint
+      # --only-binary so pip refuses to execute a setup.py during the lint
+      # install, matching the --no-build the uv steps use. Quoted because
+      # ':all:' would otherwise be read as a YAML mapping.
+      - run: "pip install --only-binary :all: ruff==0.15.13"
       - run: ruff check .
       - run: ruff format --check .
   test:
@@ -58,7 +61,7 @@ jobs:
       # -rs lists every skipped test with its reason. A skip in CI is a test that
       # runs NOWHERE, because the developer machine has the tool and never sees
       # the skip; printing them keeps that visible instead of silent.
-      - run: uv run --frozen pytest -q -rs --cov=src --cov=scripts --cov-report=term-missing
+      - run: uv run --frozen --no-build pytest -q -rs --cov=src --cov=scripts --cov-report=term-missing
   pii-gauntlet:
     runs-on: ubuntu-latest
     timeout-minutes: 10

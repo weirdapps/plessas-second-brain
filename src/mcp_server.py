@@ -11,10 +11,39 @@ from mcp.server import MCPServer
 from src.config import DEFAULT_DB
 from src.store.schema import get_connection
 
-mcp = MCPServer(
-    "second-brain",
-    instructions="Knowledge repository — query 41K+ emails, 22K+ attachment summaries, decisions, action items, and people context. Also includes conversation memory: search past Claude Code conversations, recall user preferences, and retrieve conversation context.",
-)
+# Routing text, not marketing. Under tool search only the tool NAMES and this
+# string load at session start, so this is what decides whether the brain gets
+# called at all and which tool gets called first. It said "41K+ emails, 22K+
+# attachment summaries" while the corpus held 67K and 33K, named none of the
+# calendar / Teams / SharePoint / commitments tables that have dedicated tools,
+# gave no date range, and stated no exclusions although four other mail servers
+# are usually loaded in the same session. Counts are deliberately absent now:
+# a hardcoded number is a number that goes stale. Call `stats` for the real ones.
+_INSTRUCTIONS = """\
+Indexed personal knowledge base: work email (2018 to present), email attachments \
+(PDF/Office/images, full text plus LLM summaries), calendar events, Microsoft \
+Teams chats and channels, SharePoint links, and this user's own past Claude Code \
+conversations. Extracted per item: summary, topics, decisions, action items, \
+commitments, key facts, people.
+
+Routing. Start with `recall` for any "what do we know about X" question: it fans \
+out across every index and returns a categorised bundle. Use the specific tools \
+when you already know the kind you want (`search_emails`, `search_attachments`, \
+`search_teams`, `search_conversations`, `query_calendar_events`), or the \
+dossier tools for an entity (`person_context`, `topic_context`, `sender_brief`, \
+`meeting_prep`). `stats` reports corpus size, date range and how fresh the data \
+is.
+
+Freshness. This is a REPLICA, synced from the machine that builds it, so it can \
+lag. `stats` returns data_as_of / age_hours / stale, and `recall` attaches \
+_stale_warning when it matters. For mail newer than the replica, use \
+`outlook_live_search`.
+
+Not covered: anything not yet ingested, plus WhatsApp, Yahoo, personal Gmail and \
+sch.gr mail, which are separate MCP servers in this session.\
+"""
+
+mcp = MCPServer("second-brain", instructions=_INSTRUCTIONS)
 
 
 def _get_conn():
@@ -23,35 +52,45 @@ def _get_conn():
 
 
 @mcp.tool()
-def person_context(name_or_email: str, days: int = 365) -> dict:
+def person_context(name_or_email: str, days: int = 365, limit: int = 20) -> dict:
     """Get rich context for a person: email history, topics, sentiment, decisions, open actions, communication pattern.
+
+    Each list is capped at `limit` and carries a `<name>_total` sibling
+    (topics_total, decisions_total, open_actions_total) with the real count, so
+    you can tell a complete answer from the head of a long one.
 
     Args:
         name_or_email: Person's name (partial match) or email address
         days: Lookback period in days (default: 365)
+        limit: Max rows per list (default: 20)
     """
     from src.store.context import get_person_context
 
     conn = _get_conn()
     try:
-        return get_person_context(conn, name_or_email, days=days)
+        return get_person_context(conn, name_or_email, days=days, limit=limit)
     finally:
         conn.close()
 
 
 @mcp.tool()
-def topic_context(topic: str, days: int = 365) -> dict:
+def topic_context(topic: str, days: int = 365, limit: int = 20) -> dict:
     """Get context for a topic: related emails, key people, decisions, open actions, key facts.
+
+    Each list is capped at `limit` and carries a `<name>_total` sibling
+    (key_people_total, decisions_total, open_actions_total, key_facts_total)
+    with the real count.
 
     Args:
         topic: Topic name (partial match)
         days: Lookback period in days (default: 365)
+        limit: Max rows per list (default: 20)
     """
     from src.store.context import get_topic_context
 
     conn = _get_conn()
     try:
-        return get_topic_context(conn, topic, days=days)
+        return get_topic_context(conn, topic, days=days, limit=limit)
     finally:
         conn.close()
 
@@ -98,31 +137,48 @@ def search_emails(query: str, search_type: str = "keyword", limit: int = 20) -> 
 
 @mcp.tool()
 def recall(query: str, limit_per_kind: int = 5, days: int = 365) -> dict:
-    """Unified search across every text-bearing index — emails, attachments, standalone documents, conversations, decisions, action items, and inline images. Auto-pulls person/topic context when the query matches a known person name/email or topic.
+    """Unified search across every text-bearing index. Use this as the default 'tell me everything you know about X' entry point.
 
-    Use this as the default 'tell me everything you know about X' entry point.
-    Returns a categorized bundle so the caller can see at a glance which kinds
-    matched. Each kind capped by limit_per_kind (default 5).
+    Returns nine buckets, keyed exactly as listed: emails (which also covers
+    standalone documents and news, since they share the emails table),
+    attachments, conversations, decisions, actions, commitments, inline_images,
+    teams, calendar_events. `summary.kinds_with_results` names the ones that
+    matched. This list must stay complete: it is what tells you the tool covers
+    Teams, calendar and commitments at all, and it named only seven until
+    2026-09-09, which made three whole kinds invisible to a caller.
+
+    Only the emails bucket fuses keyword and semantic ranking; every other
+    bucket is keyword-only. When the local replica is behind, the result carries
+    `_stale_warning` and `data_as_of`.
 
     Args:
         query: Free-text query (keyword, name, topic, etc.)
         limit_per_kind: Max results per category (default 5)
-        days: Lookback window for person/topic context (default 365)
+        days: Lookback window for the auto-pulled person/topic context (default 365)
     """
     from src.store.embeddings import semantic_email_candidates
+    from src.store.query import get_freshness
     from src.store.recall import recall as _recall
 
     conn = _get_conn()
     try:
         # Inject the semantic provider so the emails bucket is a keyword+semantic
         # RRF fusion. recall() degrades to keyword-only if the index/ADC is absent.
-        return _recall(
+        out = _recall(
             conn,
             query,
             limit_per_kind=limit_per_kind,
             days=days,
             semantic_candidates=semantic_email_candidates,
         )
+        # This is the documented front door, so it is where a stale replica has
+        # to be visible. Only present when it matters, so a healthy call is
+        # unchanged.
+        fresh = get_freshness(conn)
+        if fresh.get("stale"):
+            out["_stale_warning"] = fresh["stale_warning"]
+            out["data_as_of"] = fresh["data_as_of"]
+        return out
     finally:
         conn.close()
 
@@ -175,7 +231,7 @@ def query_decisions(
     Args:
         topic: Filter by topic name
         person: Filter by person who decided
-        days: Lookback period (default: 30)
+        days: Lookback period in days (default: 365). Applies to both branches.
         limit: Maximum results (default: 20)
     """
     conn = _get_conn()
@@ -183,7 +239,10 @@ def query_decisions(
         if topic or person:
             from src.store.query import query_decisions as _qd
 
-            return _qd(conn, topic=topic, person=person, limit=limit)
+            # `days` used to be dropped here whenever a filter was supplied, so
+            # query_decisions(person=X, days=7) silently answered over all time
+            # and the caller had no way to see it.
+            return _qd(conn, topic=topic, person=person, days=days, limit=limit)
         else:
             from src.store.context import get_recent_decisions
 
@@ -215,20 +274,34 @@ def query_actions(
 
 
 @mcp.tool()
-def stale_threads(days: int = 5) -> dict:
+def stale_threads(days: int = 5, limit: int = 20) -> dict:
     """Find stale email threads (you sent last, no reply) and overdue action items.
+
+    `overdue_actions` is the `limit` most overdue; `overdue_actions_total` is how
+    many there are. Requires BRAIN_USER_EMAIL_PATTERN to be set for the
+    stale-thread half; without it `stale_threads` is always empty and
+    `stale_threads_unavailable` explains why.
 
     Args:
         days: Stale threshold in days (default: 5)
+        limit: Max overdue actions to return (default: 20)
     """
-    from src.store.query import find_overdue_actions, find_stale_threads
+    from src.config import USER_EMAIL_PATTERN
+    from src.store.query import count_overdue_actions, find_overdue_actions, find_stale_threads
 
     conn = _get_conn()
     try:
-        return {
+        out: dict = {
             "stale_threads": find_stale_threads(conn, days=days),
-            "overdue_actions": find_overdue_actions(conn),
+            "overdue_actions": find_overdue_actions(conn, limit=limit),
+            "overdue_actions_total": count_overdue_actions(conn),
         }
+        if not USER_EMAIL_PATTERN:
+            out["stale_threads_unavailable"] = (
+                "BRAIN_USER_EMAIL_PATTERN is unset, so 'you sent last' cannot be "
+                "determined and stale_threads is empty for every value of days."
+            )
+        return out
     finally:
         conn.close()
 
@@ -240,7 +313,7 @@ def meeting_prep(people: str, topic: str | None = None, days: int = 365) -> dict
     Args:
         people: Comma-separated list of attendee names or emails
         topic: Optional meeting topic for focused context
-        days: Lookback period in days (default: 90)
+        days: Lookback period in days (default: 365)
     """
     from src.store.query import meeting_prep as _mp
 
@@ -310,10 +383,15 @@ def query_calendar_events(
             params.append(until)
 
         if keyword:
+            from src.store.query import _sanitize_fts5_query
+
             conditions.append(
                 "ce.id IN (SELECT rowid FROM calendar_events_fts WHERE calendar_events_fts MATCH ?)"
             )
-            params.append(keyword)
+            # Raw text here raised OperationalError out of the tool on any query
+            # containing ? & : or a leading hyphen. Same defanging as every other
+            # MATCH in the codebase.
+            params.append(_sanitize_fts5_query(keyword))
 
         sql = query
         if joins:
@@ -515,7 +593,7 @@ def sharepoint_index(
         operation: One of "list_stale", "list_unfetched", "refetch"
         url: Required only for refetch
     """
-    from src.config import ATTACHMENTS_DIR
+    from src.config import ATTACHMENTS_DIR, SHAREPOINT_HOST
     from src.export import sharepoint_fetcher
 
     conn = _get_conn()
@@ -552,12 +630,27 @@ def sharepoint_index(
         if operation == "refetch":
             if not url:
                 return {"error": "url is required for refetch"}
-            out_dir = ATTACHMENTS_DIR / "sharepoint-refetch"
-            result = sharepoint_fetcher.fetch_sharepoint_link(url, out_dir)
+            # Resolve the link BEFORE fetching, and refuse one we have never
+            # recorded. `url` is model-supplied and reaches sharepoint-cli's
+            # `--host` unfiltered (host_for_url is a bare urlparse().netloc), and
+            # the CLI retargets the stored session at whatever host it is given
+            # and attaches the rtFa/FedAuth cookies. Its only guard is a
+            # `*.sharepoint.com` suffix test, which any free M365 tenant
+            # satisfies. Since a search result carries attacker-authored subject
+            # and body text straight to the model, a crafted email could ask for
+            # a refetch of a tenant it controls and receive this mailbox's
+            # SharePoint session cookies. Refetch means "try a link we already
+            # indexed again"; anything else is not this tool's job.
             msg_id_row = conn.execute(
                 "SELECT message_id FROM sharepoint_links WHERE url = ?", (url,)
             ).fetchone()
-            msg_id = msg_id_row["message_id"] if msg_id_row else "unknown"
+            if msg_id_row is None:
+                return {"error": "refetch: url is not present in sharepoint_links"}
+            if not sharepoint_fetcher.is_managed_sharepoint_host(url, SHAREPOINT_HOST):
+                return {"error": "refetch: url is not on the managed SharePoint host"}
+            out_dir = ATTACHMENTS_DIR / "sharepoint-refetch"
+            result = sharepoint_fetcher.fetch_sharepoint_link(url, out_dir)
+            msg_id = msg_id_row["message_id"]
             sharepoint_fetcher.record_link_in_db(
                 conn,
                 url=url,

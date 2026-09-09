@@ -80,10 +80,14 @@ def save_state(state: dict):
 
 
 def collect_emails() -> list[dict]:
+    from src.export.state import load_json_or_quarantine
+
     batch_files = sorted(STAGING_DIR.glob("batch-*.json"))
     all_emails = []
     for bf in batch_files:
-        data = json.load(open(bf, encoding="utf-8"))
+        data = load_json_or_quarantine(bf)
+        if data is None:
+            continue
         emails = data.get("emails", []) if isinstance(data, dict) else data
         all_emails.extend(emails)
     return all_emails

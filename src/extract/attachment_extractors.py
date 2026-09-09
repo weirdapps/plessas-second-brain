@@ -97,6 +97,15 @@ def extract_text_from_file(file_path: str, mime_type: str) -> dict:
             )
             or ext == ".xlsx"
         ):
+            # Sniff, do not trust the extension. 993 attachments on the live
+            # corpus are named .xlsx and are legacy OLE2 .xls: Excel keeps the
+            # name when a user saves an old workbook, and mail systems relabel
+            # freely. openpyxl raises BadZipFile on those, the row is marked
+            # failed, and nothing retries it, so their content was simply absent
+            # from the brain. The same two-magic-number check already guards
+            # _extract_xlsb below; this is the branch it was missing.
+            if _magic(file_path) == b"\xd0\xcf\x11\xe0":
+                return _extract_xls(file_path)
             return _extract_excel(file_path)
         elif (
             mime_type
@@ -278,6 +287,20 @@ def _extract_pptx(path: str) -> dict:
             "error": "Insufficient text extracted",
         }
     return {"text": text, "method": "python-pptx", "status": "extracted", "error": None}
+
+
+def _magic(path: str, n: int = 4) -> bytes:
+    """First n bytes of a file, or b"" if it cannot be read.
+
+    b"\\xd0\\xcf\\x11\\xe0" is the OLE2 compound-document header (legacy .xls,
+    .doc, .msg); b"PK\\x03\\x04" is a zip, which is what every modern Office
+    format is.
+    """
+    try:
+        with open(path, "rb") as f:
+            return f.read(n)
+    except OSError:
+        return b""
 
 
 def _extract_excel(path: str) -> dict:

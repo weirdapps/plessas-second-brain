@@ -177,19 +177,27 @@ def parse_extraction(
     if not isinstance(data, dict):
         raise ValueError(f"Expected JSON object, got {type(data).__name__}")
 
-    # Apply defaults for missing fields
+    # Apply defaults for missing fields.
+    #
+    # `or default`, not `get(key, default)`. The two differ exactly when the key
+    # is PRESENT and null, which the prompt actively teaches the model is legal
+    # ("deadline": "YYYY-MM-DD or null"), and dict.get then returns None: the
+    # enum normalisation below did None.lower() and raised AttributeError, while
+    # a null list reached the loader as None to be iterated. On the email path
+    # that is a permanent poison item, since the same input fails identically on
+    # every retry.
     result = {
-        "summary": data.get("summary", ""),
-        "topics": data.get("topics", []),
-        "decisions": data.get("decisions", []),
-        "action_items": data.get("action_items", []),
-        "commitments": data.get("commitments", []),
-        "people_roles": data.get("people_roles", {}),
-        "sentiment": data.get("sentiment", "informational"),
-        "urgency": data.get("urgency", "low"),
-        "language": data.get("language", "english"),
-        "key_facts": data.get("key_facts", []),
-        "references": data.get("references", []),
+        "summary": data.get("summary") or "",
+        "topics": data.get("topics") or [],
+        "decisions": data.get("decisions") or [],
+        "action_items": data.get("action_items") or [],
+        "commitments": data.get("commitments") or [],
+        "people_roles": data.get("people_roles") or {},
+        "sentiment": data.get("sentiment") or "informational",
+        "urgency": data.get("urgency") or "low",
+        "language": data.get("language") or "english",
+        "key_facts": data.get("key_facts") or [],
+        "references": data.get("references") or [],
     }
 
     # Preserve extra fields (e.g. conversation-specific: preferences_expressed, technical_decisions)
@@ -197,10 +205,11 @@ def parse_extraction(
         if key not in result:
             result[key] = value
 
-    # Normalize enums to lowercase
-    result["sentiment"] = result["sentiment"].lower()
-    result["urgency"] = result["urgency"].lower()
-    result["language"] = result["language"].lower()
+    # Normalize enums to lowercase. str() so a model that answers with a number
+    # or a bool gets validated below rather than raising here.
+    result["sentiment"] = str(result["sentiment"]).lower()
+    result["urgency"] = str(result["urgency"]).lower()
+    result["language"] = str(result["language"]).lower()
 
     # Validate against schema — log issues but don't reject (non-breaking)
     sentiment_values = sentiment_values or SENTIMENT_VALUES

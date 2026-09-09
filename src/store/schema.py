@@ -360,25 +360,56 @@ def create_database(db_path: str) -> sqlite3.Connection:
         END
     """)
 
-    # Store schema version
+    # Store schema version.
+    #
+    # Stamp 0 and let run_migrations build the rest, rather than declaring
+    # CURRENT_SCHEMA_VERSION over a schema this function does not actually
+    # create. The DDL above covers the base tables only; Teams (v12), calendar
+    # (v13) and conversations (v7) live in migrations. Stamping 19 told
+    # run_migrations there was nothing to do, so a brand new or restored
+    # database came up missing nine tables (calendar_events, event_attendees,
+    # teams_chats, teams_messages, teams_threads, teams_mri_resolution,
+    # conversations, conversation_turns, conversation_topics) while `migrate`
+    # reported it up to date and eight MCP tools raised "no such table". That is
+    # the disaster-recovery path: a rebuild from scratch produced a brain with no
+    # Teams, no calendar and no conversation memory, and said it was fine.
+    #
+    # Every migration is CREATE TABLE IF NOT EXISTS or column-guarded and runs in
+    # milliseconds on an empty database, so one code path now serves both new and
+    # existing stores and the two cannot diverge again.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS schema_version (
             version INTEGER NOT NULL
         )
     """)
-    conn.execute("INSERT INTO schema_version (version) VALUES (?)", (CURRENT_SCHEMA_VERSION,))
+    conn.execute("INSERT INTO schema_version (version) VALUES (0)")
+    conn.commit()
 
+    run_migrations(conn)
     conn.commit()
     return conn
 
 
 def get_schema_version(conn: sqlite3.Connection) -> int:
-    """Get the current schema version from the database."""
+    """Get the current schema version from the database.
+
+    Returns 0 only for a database that genuinely has no schema_version table.
+    Every OTHER OperationalError is re-raised: "database is locked", "disk I/O
+    error" and "unable to open database file" all reach this except clause too,
+    and answering 0 to any of them tells run_migrations that a fully-migrated
+    3.3 GB production database is empty, so it replays all 19 migrations,
+    including a DROP TABLE emails_fts and a full FTS rebuild. Concurrent access
+    is normal here (schema.py sets busy_timeout=60000 precisely because several
+    scheduled jobs hit brain.db at once), so the lock case is not hypothetical.
+    Failing loudly lets the caller's retry do its job.
+    """
     try:
         row = conn.execute("SELECT version FROM schema_version").fetchone()
         return row["version"] if row else 0
-    except sqlite3.OperationalError:
-        return 0
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e).lower():
+            return 0
+        raise
 
 
 def set_schema_version(conn: sqlite3.Connection, version: int) -> None:

@@ -26,7 +26,7 @@ from typing import Any
 
 from src.store.schema import get_connection
 
-from .state import load_state
+from .state import load_state, write_json_atomic
 
 # Constants
 BATCH_SIZE = 10
@@ -672,8 +672,7 @@ def save_batch(batch_number: int, emails: list[dict]) -> None:
         "emails": emails,
     }
 
-    with open(batch_file, "w") as f:
-        json.dump(batch_data, f, indent=2)
+    write_json_atomic(batch_file, batch_data, redact=True)
 
 
 def _get_archive_max_date_from_db() -> str | None:

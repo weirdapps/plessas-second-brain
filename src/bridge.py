@@ -47,8 +47,11 @@ def sender_brief(conn, name_or_email: str, days: int = 365) -> dict:
         "role": person.get("role", ""),
         "email_count": ctx["email_count"],
         "top_topics": [t["topic"] for t in ctx["topics"][:5]],
-        "recent_decisions": len(ctx["decisions"]),
-        "open_actions_count": len(ctx["open_actions"]),
+        # The lists are capped now (see DEFAULT_CONTEXT_LIMIT), so len() would
+        # report the page size, not the count. These two fields have always been
+        # counts and callers read them as such.
+        "recent_decisions": ctx["decisions_total"],
+        "open_actions_count": ctx["open_actions_total"],
         "last_contact": ctx["communication_pattern"].get("last_email_date", ""),
         "sentiment": ctx["sentiment_distribution"],
     }

@@ -7,14 +7,34 @@ to retrieve person, topic, conversation, and decision context from the knowledge
 import sqlite3
 from datetime import datetime, timedelta
 
+# Every list in a context dossier is capped at this many rows unless the caller
+# asks for more. These functions are reached from MCP tools, so their return
+# value is spent from the model's context window, and until 2026-09-09 the
+# topics / decisions / open_actions / key_people / key_facts queries had no LIMIT
+# at all. Measured on the live corpus, get_person_context on the top
+# correspondent returned 77 MB (175,035 open_actions and 111,744 decisions) and
+# get_topic_context('media monitoring') 6.5 MB, so every call on a heavy person
+# or a broad topic was rejected outright by the MCP result cap. `recall`, the
+# documented front door, auto-injects both and failed on 9 of 12 ordinary
+# one-word queries for the same reason. Each capped list ships a `<name>_total`
+# sibling so a caller can still tell a complete answer from the head of one.
+DEFAULT_CONTEXT_LIMIT = 20
 
-def get_person_context(conn: sqlite3.Connection, name_or_email: str, days: int = 365) -> dict:
+
+def get_person_context(
+    conn: sqlite3.Connection,
+    name_or_email: str,
+    days: int = 365,
+    limit: int = DEFAULT_CONTEXT_LIMIT,
+) -> dict:
     """Return rich context for a person.
 
     Args:
         conn: Database connection
         name_or_email: Person's name (partial match) or email address
         days: Number of days to look back
+        limit: Max rows per list (topics, decisions, open_actions). Each list is
+            accompanied by a `<name>_total` giving the unbounded count.
 
     Returns:
         Dict with person info, email_count, recent_emails, topics,
@@ -41,9 +61,12 @@ def get_person_context(conn: sqlite3.Connection, name_or_email: str, days: int =
             "email_count": 0,
             "recent_emails": [],
             "topics": [],
+            "topics_total": 0,
             "sentiment_distribution": {},
             "decisions": [],
+            "decisions_total": 0,
             "open_actions": [],
+            "open_actions_total": 0,
             "communication_pattern": {},
         }
 
@@ -90,10 +113,22 @@ def get_person_context(conn: sqlite3.Connection, name_or_email: str, days: int =
         WHERE ep.person_id = ? AND e.date_received >= ?
         GROUP BY t.id
         ORDER BY count DESC
+        LIMIT ?
     """,
-            (person_id, cutoff),
+            (person_id, cutoff, limit),
         ).fetchall()
     ]
+    topics_total = conn.execute(
+        """
+        SELECT COUNT(DISTINCT t.id) as cnt
+        FROM topics t
+        JOIN email_topics et ON t.id = et.topic_id
+        JOIN email_people ep ON et.email_id = ep.email_id
+        JOIN emails e ON et.email_id = e.id
+        WHERE ep.person_id = ? AND e.date_received >= ?
+    """,
+        (person_id, cutoff),
+    ).fetchone()["cnt"]
 
     # Sentiment distribution
     sentiment_rows = conn.execute(
@@ -119,10 +154,21 @@ def get_person_context(conn: sqlite3.Connection, name_or_email: str, days: int =
         JOIN email_people ep ON e.id = ep.email_id
         WHERE ep.person_id = ? AND e.date_received >= ?
         ORDER BY d.decision_date DESC
+        LIMIT ?
     """,
-            (person_id, cutoff),
+            (person_id, cutoff, limit),
         ).fetchall()
     ]
+    decisions_total = conn.execute(
+        """
+        SELECT COUNT(*) as cnt
+        FROM decisions d
+        JOIN emails e ON d.email_id = e.id
+        JOIN email_people ep ON e.id = ep.email_id
+        WHERE ep.person_id = ? AND e.date_received >= ?
+    """,
+        (person_id, cutoff),
+    ).fetchone()["cnt"]
 
     # Open action items
     open_actions = [
@@ -135,10 +181,21 @@ def get_person_context(conn: sqlite3.Connection, name_or_email: str, days: int =
         JOIN email_people ep ON e.id = ep.email_id
         WHERE ep.person_id = ? AND a.status = 'open' AND e.date_received >= ?
         ORDER BY a.deadline IS NULL, a.deadline ASC
+        LIMIT ?
     """,
-            (person_id, cutoff),
+            (person_id, cutoff, limit),
         ).fetchall()
     ]
+    open_actions_total = conn.execute(
+        """
+        SELECT COUNT(*) as cnt
+        FROM action_items a
+        JOIN emails e ON a.email_id = e.id
+        JOIN email_people ep ON e.id = ep.email_id
+        WHERE ep.person_id = ? AND a.status = 'open' AND e.date_received >= ?
+    """,
+        (person_id, cutoff),
+    ).fetchone()["cnt"]
 
     # Communication pattern
     pattern_row = conn.execute(
@@ -218,9 +275,12 @@ def get_person_context(conn: sqlite3.Connection, name_or_email: str, days: int =
         "email_count": email_count,
         "recent_emails": recent_emails,
         "topics": topics,
+        "topics_total": topics_total,
         "sentiment_distribution": sentiment_distribution,
         "decisions": decisions,
+        "decisions_total": decisions_total,
         "open_actions": open_actions,
+        "open_actions_total": open_actions_total,
         "communication_pattern": communication_pattern,
         "last_met": calendar_data.get("last_met"),
         "next_meeting": calendar_data.get("next_meeting"),
@@ -228,13 +288,20 @@ def get_person_context(conn: sqlite3.Connection, name_or_email: str, days: int =
     }
 
 
-def get_topic_context(conn: sqlite3.Connection, topic: str, days: int = 365) -> dict:
+def get_topic_context(
+    conn: sqlite3.Connection,
+    topic: str,
+    days: int = 365,
+    limit: int = DEFAULT_CONTEXT_LIMIT,
+) -> dict:
     """Return context for a topic.
 
     Args:
         conn: Database connection
         topic: Topic name (partial match)
         days: Number of days to look back
+        limit: Max rows per list (key_people, decisions, open_actions,
+            key_facts). Each list ships a `<name>_total` with the true count.
 
     Returns:
         Dict with topic info, email_count, recent_emails, key_people,
@@ -256,9 +323,13 @@ def get_topic_context(conn: sqlite3.Connection, topic: str, days: int = 365) -> 
             "email_count": 0,
             "recent_emails": [],
             "key_people": [],
+            "key_people_total": 0,
             "decisions": [],
+            "decisions_total": 0,
             "open_actions": [],
+            "open_actions_total": 0,
             "key_facts": [],
+            "key_facts_total": 0,
         }
 
     topic_info = {"name": topic_row["name"], "display_name": topic_row["display_name"]}
@@ -304,10 +375,22 @@ def get_topic_context(conn: sqlite3.Connection, topic: str, days: int = 365) -> 
         WHERE et.topic_id = ? AND e.date_received >= ?
         GROUP BY p.id
         ORDER BY email_count DESC
+        LIMIT ?
     """,
-            (topic_id, cutoff),
+            (topic_id, cutoff, limit),
         ).fetchall()
     ]
+    key_people_total = conn.execute(
+        """
+        SELECT COUNT(DISTINCT p.id) as cnt
+        FROM people p
+        JOIN email_people ep ON p.id = ep.person_id
+        JOIN email_topics et ON ep.email_id = et.email_id
+        JOIN emails e ON ep.email_id = e.id
+        WHERE et.topic_id = ? AND e.date_received >= ?
+    """,
+        (topic_id, cutoff),
+    ).fetchone()["cnt"]
 
     # Decisions
     decisions = [
@@ -320,10 +403,21 @@ def get_topic_context(conn: sqlite3.Connection, topic: str, days: int = 365) -> 
         JOIN email_topics et ON e.id = et.email_id
         WHERE et.topic_id = ? AND e.date_received >= ?
         ORDER BY d.decision_date DESC
+        LIMIT ?
     """,
-            (topic_id, cutoff),
+            (topic_id, cutoff, limit),
         ).fetchall()
     ]
+    decisions_total = conn.execute(
+        """
+        SELECT COUNT(*) as cnt
+        FROM decisions d
+        JOIN emails e ON d.email_id = e.id
+        JOIN email_topics et ON e.id = et.email_id
+        WHERE et.topic_id = ? AND e.date_received >= ?
+    """,
+        (topic_id, cutoff),
+    ).fetchone()["cnt"]
 
     # Open action items
     open_actions = [
@@ -336,10 +430,21 @@ def get_topic_context(conn: sqlite3.Connection, topic: str, days: int = 365) -> 
         JOIN email_topics et ON e.id = et.email_id
         WHERE et.topic_id = ? AND a.status = 'open' AND e.date_received >= ?
         ORDER BY a.deadline IS NULL, a.deadline ASC
+        LIMIT ?
     """,
-            (topic_id, cutoff),
+            (topic_id, cutoff, limit),
         ).fetchall()
     ]
+    open_actions_total = conn.execute(
+        """
+        SELECT COUNT(*) as cnt
+        FROM action_items a
+        JOIN emails e ON a.email_id = e.id
+        JOIN email_topics et ON e.id = et.email_id
+        WHERE et.topic_id = ? AND a.status = 'open' AND e.date_received >= ?
+    """,
+        (topic_id, cutoff),
+    ).fetchone()["cnt"]
 
     # Key facts
     key_facts = [
@@ -351,19 +456,34 @@ def get_topic_context(conn: sqlite3.Connection, topic: str, days: int = 365) -> 
         JOIN emails e ON kf.email_id = e.id
         JOIN email_topics et ON e.id = et.email_id
         WHERE et.topic_id = ? AND e.date_received >= ?
+        LIMIT ?
     """,
-            (topic_id, cutoff),
+            (topic_id, cutoff, limit),
         ).fetchall()
     ]
+    key_facts_total = conn.execute(
+        """
+        SELECT COUNT(*) as cnt
+        FROM key_facts kf
+        JOIN emails e ON kf.email_id = e.id
+        JOIN email_topics et ON e.id = et.email_id
+        WHERE et.topic_id = ? AND e.date_received >= ?
+    """,
+        (topic_id, cutoff),
+    ).fetchone()["cnt"]
 
     return {
         "topic": topic_info,
         "email_count": email_count,
         "recent_emails": recent_emails,
         "key_people": key_people,
+        "key_people_total": key_people_total,
         "decisions": decisions,
+        "decisions_total": decisions_total,
         "open_actions": open_actions,
+        "open_actions_total": open_actions_total,
         "key_facts": key_facts,
+        "key_facts_total": key_facts_total,
     }
 
 

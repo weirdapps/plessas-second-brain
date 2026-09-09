@@ -61,8 +61,16 @@ jobs:
 
       - name: Check for SonarCloud token
         id: check-sonar
+        # Through env:, not `${{ secrets.* }}` inline. An inline expansion is
+        # substituted into the SCRIPT TEXT before the shell ever runs, so the
+        # token becomes part of the command body: it can surface in a set -x
+        # trace or a shell error, and a value containing shell metacharacters
+        # changes what the script does. The two steps further down already pass
+        # this same secret correctly; this one was the outlier.
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
-          if [ -n "${{ secrets.SONAR_TOKEN }}" ]; then
+          if [ -n "$SONAR_TOKEN" ]; then
             echo "has_token=true" >> $GITHUB_OUTPUT
           else
             echo "has_token=false" >> $GITHUB_OUTPUT

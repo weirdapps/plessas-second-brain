@@ -34,7 +34,13 @@ _WRAPPER = Path(__file__).parent.parent / "scripts" / "wrappers" / "launchd" / "
 # already gone is a no-op, so running it twice costs nothing and closes the gap
 # where a reader recreates a -wal against the newly renamed file.
 _SIDECAR_RM = 'rm -f "$LOCAL_DATA/brain.db-wal" "$LOCAL_DATA/brain.db-shm"'
-_DB_RSYNC = 'rsync $RSYNC_OPTS "$VPS:~/.second-brain/brain.snapshot.db" "$LOCAL_DATA/brain.db"'
+# The snapshot filename is per-consumer now ($SNAP_NAME, built from hostname),
+# because two Macs pulling from one producer were both writing the same shared
+# path. Match the line by its fixed ends rather than by the interpolated middle,
+# so this test pins the sidecar ORDERING it is about and stops re-breaking every
+# time the source path changes.
+_DB_RSYNC_HEAD = 'rsync $RSYNC_OPTS "$VPS:~/.second-brain/'
+_DB_RSYNC_TAIL = '" "$LOCAL_DATA/brain.db"'
 
 # Captures whatever sits between `sqlite3` and the database path, i.e. the flags
 # the wrapper actually passes. An empty capture (a plain open) is the fix.
@@ -199,8 +205,11 @@ class TestStaleSidecarRemoval:
         a reader holding the old inode can recreate one against the new file
         between the rename and the integrity check."""
         text = _WRAPPER.read_text()
-        rsync_at = text.find(_DB_RSYNC)
+        rsync_at = text.find(_DB_RSYNC_HEAD)
         assert rsync_at != -1, f"could not find the brain.db rsync in {_WRAPPER}"
+        assert _DB_RSYNC_TAIL in text[rsync_at : rsync_at + 200], (
+            "the brain.db rsync no longer writes to $LOCAL_DATA/brain.db"
+        )
 
         before = text.rfind(_SIDECAR_RM, 0, rsync_at)
         after = text.find(_SIDECAR_RM, rsync_at)
@@ -273,3 +282,36 @@ class TestStaleSidecarRemoval:
 
         assert _run_check(db, _integrity_flags()) == "ok"
         assert _content(db) == expected, "the replica must be exactly what was copied"
+
+
+class TestSnapshotPathAgreement:
+    """The path `.backup` WRITES must be the path rsync READS.
+
+    Making the producer-side snapshot per-consumer changed the first and not the
+    second, so both Macs wrote brain.snapshot.<host>.db and then pulled the old
+    shared brain.snapshot.db, which nothing updates any more. Every run still
+    exited 0 and logged "synced OK" against a frozen file. Two spellings of one
+    path was the entire cause.
+    """
+
+    def test_both_sides_derive_from_one_variable(self):
+        text = _WRAPPER.read_text()
+        assert 'SNAP_NAME="brain.snapshot.$(hostname -s).db"' in text, (
+            "the snapshot filename should be defined once, from the hostname"
+        )
+        assert 'REMOTE_SNAP="\\$HOME/.second-brain/$SNAP_NAME"' in text, (
+            "REMOTE_SNAP must be built from SNAP_NAME, not spelled out again"
+        )
+        assert 'rsync $RSYNC_OPTS "$VPS:~/.second-brain/$SNAP_NAME"' in text, (
+            "the rsync must read $SNAP_NAME, the same file .backup wrote"
+        )
+
+    def test_no_bare_shared_snapshot_path_survives(self):
+        """The shared path is what every consumer used to collide on."""
+        text = _WRAPPER.read_text()
+        for line in text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            assert 'brain.snapshot.db"' not in line, (
+                f"a shared, non-per-host snapshot path is back: {line.strip()}"
+            )

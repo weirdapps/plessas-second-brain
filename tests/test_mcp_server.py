@@ -1,6 +1,5 @@
 """Tests for the MCP server tool functions."""
 
-import sqlite3
 from unittest.mock import patch
 
 import pytest
@@ -20,96 +19,24 @@ from src.mcp_server import (
 
 
 @pytest.fixture
-def mock_conn():
-    """Create an in-memory SQLite DB with minimal schema for testing."""
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
+def mock_conn(tmp_path):
+    """A REAL database, built by the code under test, seeded with a few rows.
+
+    This fixture used to hand-roll a dozen CREATE TABLEs. That made it a fiction:
+    it declared the shape the tests wished the schema had, so a query joining a
+    table the fixture had never heard of passed here and raised "no such table"
+    in production. It also hid the create_database() defect that shipped a fresh
+    store with 32 of its 67 tables missing, because these tests never called it.
+
+    create_database() now stamps 0 and runs the full migration chain, so this is
+    the same schema the MCP server meets on a real host.
+    """
+    from src.store.schema import create_database, get_connection
+
+    db = tmp_path / "brain.db"
+    create_database(str(db)).close()
+    conn = get_connection(str(db))
     conn.executescript("""
-        CREATE TABLE emails (
-            id INTEGER PRIMARY KEY,
-            message_id INTEGER,
-            date_received TEXT,
-            subject TEXT,
-            summary TEXT,
-            sender_name TEXT,
-            sender_address TEXT,
-            sentiment TEXT,
-            conversation_id TEXT,
-            mailbox_name TEXT,
-            content TEXT
-        );
-        CREATE TABLE people (
-            id INTEGER PRIMARY KEY,
-            name TEXT,
-            email TEXT,
-            role TEXT,
-            department TEXT
-        );
-        CREATE TABLE email_people (
-            email_id INTEGER,
-            person_id INTEGER,
-            role_in_email TEXT
-        );
-        CREATE TABLE topics (
-            id INTEGER PRIMARY KEY,
-            name TEXT,
-            display_name TEXT
-        );
-        CREATE TABLE email_topics (
-            email_id INTEGER,
-            topic_id INTEGER
-        );
-        CREATE TABLE decisions (
-            id INTEGER PRIMARY KEY,
-            email_id INTEGER,
-            decision TEXT,
-            decided_by TEXT,
-            decision_date TEXT
-        );
-        CREATE TABLE action_items (
-            id INTEGER PRIMARY KEY,
-            email_id INTEGER,
-            task TEXT,
-            owner TEXT,
-            deadline TEXT,
-            status TEXT DEFAULT 'open'
-        );
-        CREATE TABLE key_facts (
-            id INTEGER PRIMARY KEY,
-            email_id INTEGER,
-            person_id INTEGER,
-            fact TEXT
-        );
-
-        CREATE TABLE attachments (
-            id INTEGER PRIMARY KEY,
-            email_id INTEGER,
-            message_id INTEGER,
-            filename TEXT,
-            mime_type TEXT,
-            file_size INTEGER,
-            file_path TEXT,
-            is_inline INTEGER,
-            exported_at TEXT
-        );
-        CREATE TABLE attachment_content (
-            id INTEGER PRIMARY KEY,
-            attachment_id INTEGER,
-            extracted_text TEXT,
-            extraction_method TEXT,
-            extraction_status TEXT,
-            extraction_error TEXT,
-            extracted_at TEXT,
-            summary TEXT,
-            language TEXT,
-            llm_status TEXT,
-            llm_error TEXT,
-            llm_extracted_at TEXT
-        );
-        CREATE VIRTUAL TABLE attachment_content_fts USING fts5(
-            extracted_text, summary, content=attachment_content, content_rowid=id
-        );
-
         INSERT INTO people (id, name, email, role, department) VALUES
             (1, 'Alice Smith', 'alice@example.com', 'Director', 'Digital');
         INSERT INTO emails (id, message_id, date_received, subject, summary, sender_name, sender_address, sentiment, mailbox_name) VALUES
@@ -122,15 +49,13 @@ def mock_conn():
         INSERT INTO action_items (id, email_id, task, owner, deadline, status) VALUES
             (1, 1, 'Send updated timeline', 'Alice Smith', '2026-03-15', 'open');
 
-        INSERT INTO attachments (id, email_id, filename, mime_type, file_size) VALUES
-            (1, 1, 'Q1_2026_Report.pdf', 'application/pdf', 102400);
+        INSERT INTO attachments (id, email_id, message_id, filename, file_path, exported_at, mime_type, file_size) VALUES
+            (1, 1, 1, 'Q1_2026_Report.pdf', '/tmp/Q1_2026_Report.pdf', '2026-03-01T10:00:00', 'application/pdf', 102400);
         INSERT INTO attachment_content (id, attachment_id, extracted_text, extraction_status, summary, language, llm_status) VALUES
             (1, 1, 'Consumer loans disbursements reached 16.9 million euros with market share of 53.5 percent', 'extracted',
              'Q1 2026 retail banking report showing consumer loan disbursements of EUR 16.9M and 53.5% market share', 'english', 'extracted');
-        INSERT INTO attachment_content_fts (rowid, extracted_text, summary) VALUES
-            (1, 'Consumer loans disbursements reached 16.9 million euros with market share of 53.5 percent',
-             'Q1 2026 retail banking report showing consumer loan disbursements of EUR 16.9M and 53.5% market share');
     """)
+    conn.commit()
     return conn
 
 
@@ -185,13 +110,13 @@ def test_sender_brief_unknown(mock_get_conn, mock_conn):
 @patch("src.mcp_server._get_conn")
 def test_search_emails_keyword(mock_get_conn, mock_conn):
     mock_get_conn.return_value = mock_conn
-    # FTS5 tables not present in mock, so expect empty results gracefully
-    try:
-        result = search_emails("cards", search_type="keyword")
-        assert isinstance(result, list)
-    except Exception:
-        # FTS5 tables not in mock schema - acceptable
-        pass
+    # The fixture is a real database now, so the FTS tables and their triggers
+    # exist and this must actually work. It used to be wrapped in a bare
+    # `except Exception: pass` because the hand-rolled schema had no FTS, which
+    # meant the test passed whether search worked or raised.
+    result = search_emails("cards", search_type="keyword")
+    assert isinstance(result, list)
+    assert any("cards" in (r.get("subject", "") + r.get("summary", "")).lower() for r in result)
 
 
 @patch("src.mcp_server._get_conn")

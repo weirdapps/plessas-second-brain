@@ -60,6 +60,12 @@ INFO=0
 SELF_REL=$(git ls-files --full-name -- "$0" 2>/dev/null | head -1)
 [ -z "$SELF_REL" ] && SELF_REL="scripts/pii-gauntlet.sh"
 
+# Case sensitivity for the scanners below. Every check is case-INSENSITIVE by
+# default, which is right for almost all of them. One is not: an ALL-CAPS Greek
+# personal name is a SHAPE, and folding case destroys the shape, so that check
+# flips this to empty for its own run via check_cs.
+CASE_FLAG=i
+
 # Build the file list once. CI mode = tracked only. Doctor mode = working tree.
 if [ "$MODE" = "ci" ]; then
   # Exclude self + auto-generated lockfiles at any depth (lockfiles contain SHAs / hashes that
@@ -113,7 +119,7 @@ scan_paths() {
   local list="$2"
   [ -n "$list" ] || return 0
   paste <(printf '%s\n' "$list") <(printf '%s\n' "$list" | tr '_.-' '   ') \
-    | grep -iE "$pattern" 2>/dev/null \
+    | grep -${CASE_FLAG}E "$pattern" 2>/dev/null \
     | cut -f1 \
     | sed 's/$/:(filename)/' \
     || true
@@ -121,7 +127,7 @@ scan_paths() {
 
 scan_doctor() {
   local pattern="$1"
-  grep -riE \
+  grep -r${CASE_FLAG}E \
     --exclude-dir=.git \
     --exclude-dir=node_modules \
     --exclude-dir=dist \
@@ -167,7 +173,7 @@ scan_ci() {
   # while the local doctor was not, so the check that blocks a push was the
   # weaker of the two, which is backwards.
   if [ -s "$TRACKED_TMP" ]; then
-    tr '\n' '\0' < "$TRACKED_TMP" | xargs -0 grep -inE --binary-files=without-match "$pattern" 2>/dev/null || true
+    tr '\n' '\0' < "$TRACKED_TMP" | xargs -0 grep -${CASE_FLAG}nE --binary-files=without-match "$pattern" 2>/dev/null || true
   fi
 }
 
@@ -208,6 +214,15 @@ apply_exclusion() {
     hits=$(printf '%s\n' "$hits" | grep -vE "$exclude" || true)
   fi
   printf '%s' "$hits"
+}
+
+# Run one check case-SENSITIVELY. Restores the flag afterwards so nothing else
+# is affected, and takes the same arguments as check.
+check_cs() {
+  local prev="$CASE_FLAG"
+  CASE_FLAG=""
+  check "$@"
+  CASE_FLAG="$prev"
 }
 
 check() {
@@ -373,6 +388,24 @@ check "SharePoint tenant"    '[a-z0-9-]+\.sharepoint\.com' "$PLACEHOLDER_TENANT"
 check "Azure AD tenant id" \
   '(tenant[_-]?id|tenantId|\"tid\"|authority|login\.microsoftonline\.com/|realm)[^0-9a-f]{0,24}[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
   '00000000-0000-0000-0000-000000000000|11111111-2222-3333-4444-555555555555|00000000-|11111111-|22222222-|33333333-|44444444-|55555555-|66666666-|77777777-|88888888-|99999999-|aaaaaaaa-|bbbbbbbb-|cccccccc-|dddddddd-|eeeeeeee-|ffffffff-|/common|/organizations|/consumers'
+
+# Two or more consecutive ALL-CAPS Greek words is how Greek corporate systems
+# write a person: SURNAME FORENAME. In source it is almost never anything else.
+#
+# This is a SHAPE check, and it is case-SENSITIVE for that reason: both scanners
+# are -i now, and folding case turns every Greek word into a match. It exists
+# because the denylist can only ever hold names somebody remembered to add, and
+# a real direct report's full name sat in a tracked test file of this PUBLIC repo
+# from the initial release until 2026-09-09 with the denylist loaded and the
+# gauntlet printing PASS. A shape catches the next one without being told.
+#
+# Greek capitals carry no accent, so the class is the plain 24 uppercase letters.
+# Measured over the whole tracked tree: this fires on nothing except the
+# synthetic placeholder excluded below.
+check_cs "All-caps Greek personal name" \
+  '[ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩ]{3,}[[:space:]]+[ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡΣΤΥΦΧΨΩ]{3,}' \
+  'ΠΑΠΑΔΟΠΟΥΛΟΥ ΜΑΡΙΝΑ'
+
 
 # ---------------------------------------------------------------------------
 # Name-based checks, loaded from a private denylist

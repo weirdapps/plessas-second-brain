@@ -133,7 +133,16 @@ def generate_embeddings(texts: list[str], client=None) -> np.ndarray:
     if client is None:
         client = _get_client()
 
-    all_embeddings = []
+    # Write each batch straight into a preallocated float32 slab. The previous
+    # version accumulated every vector in a Python list and converted once at the
+    # end, which is not a style question at this scale: a 3072-float row costs
+    # ~98 KB as Python floats against 12 KB as float32, so a full rebuild of
+    # 112,686 items needed 11.1 GB and the producer has 7 GB. It was OOM-killed
+    # at batch 850 of 1127 after 55 minutes, which means `embed --force` could
+    # not repair a corrupt index on this host at all. Peak is now the slab
+    # (1.38 GB) plus one batch.
+    out = np.empty((len(texts), EMBEDDING_DIM), dtype=np.float32)
+    written = 0
     total_batches = (len(texts) + BATCH_SIZE - 1) // BATCH_SIZE
 
     for batch_num, i in enumerate(range(0, len(texts), BATCH_SIZE), 1):
@@ -160,8 +169,10 @@ def generate_embeddings(texts: list[str], client=None) -> np.ndarray:
                         f"{len(batch)} inputs in batch {batch_num}; refusing to "
                         "misalign the index"
                     )
-                for emb in returned:
-                    all_embeddings.append(emb.values)
+                out[written : written + len(returned)] = np.asarray(
+                    [emb.values for emb in returned], dtype=np.float32
+                )
+                written += len(returned)
                 break
             except Exception as e:
                 if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
@@ -184,7 +195,12 @@ def generate_embeddings(texts: list[str], client=None) -> np.ndarray:
         if i + BATCH_SIZE < len(texts):
             time.sleep(1.5)  # Stay under 3000 req/min limit
 
-    return np.array(all_embeddings, dtype=np.float32)
+    if written != len(texts):
+        raise RuntimeError(
+            f"wrote {written} embeddings for {len(texts)} inputs; refusing to "
+            "return a short array that would misalign the index"
+        )
+    return out
 
 
 def _email_embed_text(subject, sender_name, date_received, summary) -> str:

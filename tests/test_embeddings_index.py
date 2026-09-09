@@ -274,3 +274,85 @@ class TestGenerateEmbeddingsAlignment:
             raise AssertionError("expected a RuntimeError after retry exhaustion")
         except RuntimeError as e:
             assert "still rate-limited" in str(e)
+
+
+class TestGenerateEmbeddingsMemory:
+    """A full rebuild must fit in the producer's RAM.
+
+    generate_embeddings accumulated every vector in a Python list and converted
+    once at the end. A 3072-float row costs ~98 KB as Python floats against 12 KB
+    as float32, so rebuilding 112,686 items needed 11.1 GB on a 7 GB host. It was
+    OOM-killed at batch 850 of 1127 after 55 minutes, which meant `embed --force`
+    could not repair a corrupt index on that machine at all: the one recovery
+    path for the id-misalignment bug was itself unusable.
+    """
+
+    def _client(self, dim=3072):
+        class _Emb:
+            def __init__(self):
+                self.values = [0.5] * dim
+
+        class _Models:
+            def embed_content(self, model, contents):
+                class R:
+                    embeddings = [_Emb() for _ in contents]
+
+                return R()
+
+        class _C:
+            models = _Models()
+
+        return _C()
+
+    def test_returns_a_float32_array_of_the_right_shape(self):
+        from src.store.embeddings import EMBEDDING_DIM, generate_embeddings
+
+        out = generate_embeddings(["a", "b", "c"], client=self._client(EMBEDDING_DIM))
+        assert out.shape == (3, EMBEDDING_DIM)
+        assert out.dtype == np.float32
+
+    def test_does_not_build_an_intermediate_python_list(self):
+        """The property that actually mattered: peak allocation is the slab.
+
+        Asserted structurally, because measuring RSS in a unit test is flaky.
+        A returned array that does not own its buffer, or is not float32, means
+        a conversion copy crept back in.
+        """
+        from src.store.embeddings import EMBEDDING_DIM, generate_embeddings
+
+        out = generate_embeddings(["a"] * 250, client=self._client(EMBEDDING_DIM))
+        assert out.dtype == np.float32
+        assert out.flags["C_CONTIGUOUS"]
+        assert out.nbytes == 250 * EMBEDDING_DIM * 4
+
+    def test_multiple_batches_land_in_order(self):
+        """BATCH_SIZE is 100, so 250 inputs is three batches written by offset."""
+        import src.store.embeddings as emb
+
+        dim = 4
+        calls = {"n": 0}
+
+        class _Models:
+            def embed_content(self, model, contents):
+                calls["n"] += 1
+                marker = float(calls["n"])
+
+                class R:
+                    embeddings = [type("E", (), {"values": [marker] * dim})() for _ in contents]
+
+                return R()
+
+        class _C:
+            models = _Models()
+
+        monkey = emb.EMBEDDING_DIM
+        try:
+            emb.EMBEDDING_DIM = dim
+            out = emb.generate_embeddings(["x"] * 250, client=_C())
+        finally:
+            emb.EMBEDDING_DIM = monkey
+
+        assert out.shape == (250, dim)
+        assert out[0][0] == 1.0
+        assert out[100][0] == 2.0
+        assert out[200][0] == 3.0

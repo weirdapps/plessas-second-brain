@@ -39,6 +39,12 @@ lag. `stats` returns data_as_of / age_hours / stale, and `recall` attaches \
 _stale_warning when it matters. For mail newer than the replica, use \
 `outlook_live_search`.
 
+Greek. Most of this corpus is Greek, and the full-text index is ACCENT-SENSITIVE: \
+it case-folds but does not strip the tonos. Searching "παρουσιαση" returns about \
+3% of what "παρουσίαση" returns. Always write Greek search terms WITH their \
+accents. If a Greek query returns suspiciously little, re-run it accented before \
+concluding the corpus has nothing.
+
 Not covered: anything not yet ingested, plus WhatsApp, Yahoo, personal Gmail and \
 sch.gr mail, which are separate MCP servers in this session.\
 """
@@ -225,14 +231,21 @@ def query_decisions(
     person: str | None = None,
     days: int = 365,
     limit: int = 20,
+    include_news: bool = False,
 ) -> list[dict]:
     """Query recent decisions, optionally filtered by topic or person.
+
+    Covers decisions taken in email, Teams threads, calendar events and past
+    Claude Code conversations; each result carries a `source` saying which.
+    Excludes decisions extracted from ingested news articles unless you ask for
+    them: those are things companies announced, not things this user decided.
 
     Args:
         topic: Filter by topic name
         person: Filter by person who decided
         days: Lookback period in days (default: 365). Applies to both branches.
         limit: Maximum results (default: 20)
+        include_news: Include news-derived decisions (default: False)
     """
     conn = _get_conn()
     try:
@@ -242,7 +255,14 @@ def query_decisions(
             # `days` used to be dropped here whenever a filter was supplied, so
             # query_decisions(person=X, days=7) silently answered over all time
             # and the caller had no way to see it.
-            return _qd(conn, topic=topic, person=person, days=days, limit=limit)
+            return _qd(
+                conn,
+                topic=topic,
+                person=person,
+                days=days,
+                limit=limit,
+                include_news=include_news,
+            )
         else:
             from src.store.context import get_recent_decisions
 
@@ -256,19 +276,31 @@ def query_actions(
     owner: str | None = None,
     status: str = "open",
     limit: int = 20,
+    include_news: bool = False,
 ) -> list[dict]:
     """Query action items, optionally filtered by owner and status.
+
+    Ordered so the actionable ones come first: upcoming deadlines soonest-first,
+    then undated items, then overdue ones most-recently-missed first. Each row
+    carries `overdue` and a `source` of email / teams / calendar / conversation.
+    Nothing is hidden, but 16,475 of the 20,518 dated open items are already
+    overdue and would otherwise fill every page.
+
+    Excludes items extracted from ingested news articles unless asked.
 
     Args:
         owner: Filter by action owner name
         status: Filter by status: "open" or "completed" (default: "open")
         limit: Maximum results (default: 20)
+        include_news: Include news-derived action items (default: False)
     """
     from src.store.query import query_action_items
 
     conn = _get_conn()
     try:
-        return query_action_items(conn, owner=owner, status=status, limit=limit)
+        return query_action_items(
+            conn, owner=owner, status=status, limit=limit, include_news=include_news
+        )
     finally:
         conn.close()
 

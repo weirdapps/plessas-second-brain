@@ -363,6 +363,7 @@ def query_decisions(
     person: str | None = None,
     limit: int = 20,
     days: int | None = None,
+    include_news: bool = False,
 ) -> list[dict]:
     """Find decisions, optionally filtered by topic or person.
 
@@ -374,22 +375,42 @@ def query_decisions(
         days: Optional lookback window. None means all time, which is what this
             function always did; the MCP tool exposed a `days` argument that
             never reached here.
+        include_news: Include decisions extracted from ingested news articles.
+            Default False: 15,602 of 104,768 decisions come from market
+            commentary, and a decision some company announced is not one this
+            user or their colleagues took.
 
     Returns:
         List of dicts with keys: decision_id, decision, decided_by, date,
         email_subject, topics (comma-separated)
     """
     # Build query with optional filters
+    # Same shape as query_action_items: LEFT JOIN every parent and COALESCE for
+    # display. The inner JOIN on emails dropped 13,785 decisions whose parent was
+    # a Teams thread, a calendar event or a conversation turn, and the 4,674
+    # calendar ones had no read path anywhere.
     query = """
         SELECT
             d.id as decision_id,
             d.decision,
             d.decided_by,
-            COALESCE(d.decision_date, e.date_received) as date,
-            e.subject as email_subject,
+            COALESCE(d.decision_date, e.date_received, tt.started_at, ce.start_at,
+                     c.started_at) as date,
+            COALESCE(e.subject, tt.title, ce.subject, c.summary) as email_subject,
+            CASE
+                WHEN e.id IS NOT NULL THEN 'email'
+                WHEN tt.id IS NOT NULL THEN 'teams'
+                WHEN ce.id IS NOT NULL THEN 'calendar'
+                WHEN c.id IS NOT NULL THEN 'conversation'
+                ELSE 'orphan'
+            END as source,
             GROUP_CONCAT(t.display_name, ', ') as topics
         FROM decisions d
-        JOIN emails e ON d.email_id = e.id
+        LEFT JOIN emails e ON d.email_id = e.id
+        LEFT JOIN teams_threads tt ON d.teams_thread_id = tt.id
+        LEFT JOIN calendar_events ce ON d.event_id = ce.id
+        LEFT JOIN conversation_turns ct ON d.conversation_turn_id = ct.id
+        LEFT JOIN conversations c ON ct.conversation_id = c.id
         LEFT JOIN email_topics et ON e.id = et.email_id
         LEFT JOIN topics t ON et.topic_id = t.id
     """
@@ -407,11 +428,17 @@ def query_decisions(
         where_clauses.append("d.decided_by LIKE ?")
         params.append(f"%{person}%")
 
+    if not include_news:
+        where_clauses.append("(e.id IS NULL OR e.mailbox_name IS NULL OR e.mailbox_name <> 'News')")
+
     if days is not None:
         from datetime import datetime, timedelta
 
         cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
-        where_clauses.append("COALESCE(d.decision_date, e.date_received) >= ?")
+        where_clauses.append(
+            "COALESCE(d.decision_date, e.date_received, tt.started_at, ce.start_at,"
+            " c.started_at) >= ?"
+        )
         params.append(cutoff)
 
     if where_clauses:
@@ -429,11 +456,21 @@ def query_decisions(
     return [dict(row) for row in cursor.fetchall()]
 
 
+# An ISO date this store can actually sort and compare. 3,157 open action items
+# carry a deadline that is free text the model wrote ("1 day before", "2-3 days
+# after the workshop"). Those are not dates, and because they are not NULL either
+# they sorted ahead of every real one: the default page of "my open actions" was
+# entirely "1 day before" and "2 days befor", with no genuine deadline visible.
+_ISO_DATE = "GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'"
+
+
 def query_action_items(
     conn: sqlite3.Connection,
     owner: str | None = None,
     status: str = "open",
     limit: int = 20,
+    include_news: bool = False,
+    sources: tuple[str, ...] = ("email", "teams", "calendar", "conversation"),
 ) -> list[dict]:
     """Find action items, filtered by owner and/or status.
 
@@ -442,12 +479,22 @@ def query_action_items(
         owner: Optional owner filter (partial match)
         status: Status filter (default: 'open')
         limit: Maximum number of results to return
+        include_news: Include items extracted from ingested news articles.
+            Default False: news contributes 10,314 of the 141,478 open items and
+            they are market commentary, not things this user owes anyone.
+        sources: Which parent kinds to include. Defaults to all four. This used
+            to INNER JOIN emails, which silently dropped every item whose parent
+            was a Teams thread, a calendar event or a conversation turn: 10,654
+            open items, of which the 2,555 calendar ones had no read path
+            anywhere in the codebase.
 
     Returns:
         List of dicts with keys: action_id, task, owner, deadline, status,
-        email_subject, date
+        email_subject, date, source
     """
-    # Build query with filters
+    # LEFT JOIN every parent, then COALESCE for display. `source` tells the
+    # caller which kind it got, because "email_subject" on a calendar item would
+    # otherwise be a quiet lie.
     query = """
         SELECT
             a.id as action_id,
@@ -455,10 +502,25 @@ def query_action_items(
             a.owner,
             a.deadline,
             a.status,
-            e.subject as email_subject,
-            e.date_received as date
+            COALESCE(e.subject, tt.title, ce.subject, c.summary) as email_subject,
+            COALESCE(e.date_received, tt.started_at, ce.start_at, c.started_at) as date,
+            CASE
+                WHEN e.id IS NOT NULL THEN 'email'
+                WHEN tt.id IS NOT NULL THEN 'teams'
+                WHEN ce.id IS NOT NULL THEN 'calendar'
+                WHEN c.id IS NOT NULL THEN 'conversation'
+                ELSE 'orphan'
+            END as source,
+            CASE
+                WHEN a.deadline GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'
+                     AND a.deadline < date('now') THEN 1 ELSE 0
+            END as overdue
         FROM action_items a
-        JOIN emails e ON a.email_id = e.id
+        LEFT JOIN emails e ON a.email_id = e.id
+        LEFT JOIN teams_threads tt ON a.teams_thread_id = tt.id
+        LEFT JOIN calendar_events ce ON a.event_id = ce.id
+        LEFT JOIN conversation_turns ct ON a.conversation_turn_id = ct.id
+        LEFT JOIN conversations c ON ct.conversation_id = c.id
     """
 
     where_clauses = []
@@ -472,11 +534,45 @@ def query_action_items(
         where_clauses.append("a.owner LIKE ?")
         params.append(f"%{owner}%")
 
+    if not include_news:
+        where_clauses.append("(e.id IS NULL OR e.mailbox_name IS NULL OR e.mailbox_name <> 'News')")
+
+    wanted = set(sources)
+    if wanted != {"email", "teams", "calendar", "conversation"}:
+        parts = []
+        if "email" in wanted:
+            parts.append("e.id IS NOT NULL")
+        if "teams" in wanted:
+            parts.append("tt.id IS NOT NULL")
+        if "calendar" in wanted:
+            parts.append("ce.id IS NOT NULL")
+        if "conversation" in wanted:
+            parts.append("c.id IS NOT NULL")
+        where_clauses.append("(" + " OR ".join(parts) + ")" if parts else "0")
+
     if where_clauses:
         query += " WHERE " + " AND ".join(where_clauses)
 
-    query += """
-        ORDER BY a.deadline IS NULL, a.deadline ASC, e.date_received DESC
+    # Actionable first. Three buckets, in this order:
+    #   0  upcoming: a real date, today or later, soonest first
+    #   1  undated: NULL or free text, most recent parent first
+    #   2  overdue: a real date in the past, most recently missed first
+    #
+    # Nothing is hidden, because an overdue commitment is still a commitment,
+    # but 16,475 of the 20,518 dated open items are overdue and 2,000 of those
+    # predate 2025. Sorted purely by deadline they filled every page and the
+    # default view of "what do I owe" contained not one live item.
+    query += f"""
+        ORDER BY CASE
+                     WHEN a.deadline {_ISO_DATE} AND a.deadline >= date('now') THEN 0
+                     WHEN a.deadline {_ISO_DATE} THEN 2
+                     ELSE 1
+                 END ASC,
+                 CASE WHEN a.deadline {_ISO_DATE} AND a.deadline >= date('now')
+                      THEN a.deadline END ASC,
+                 CASE WHEN a.deadline {_ISO_DATE} AND a.deadline < date('now')
+                      THEN a.deadline END DESC,
+                 date DESC
         LIMIT ?
     """
 

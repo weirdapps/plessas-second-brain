@@ -111,7 +111,15 @@ RSYNC_OPTS="-az --timeout=180"
 # The extra disk is one snapshot per consumer, and rsync deltas are unaffected
 # because each host keeps its own stable page layout, which is the whole reason
 # this file persists between runs.
-REMOTE_SNAP="\$HOME/.second-brain/brain.snapshot.$(hostname -s).db"
+# Two spellings of one path, and they MUST stay in step. SNAP_NAME is the bare
+# filename; REMOTE_SNAP is it with an escaped $HOME, because that string is
+# expanded by the REMOTE shell inside the ssh below, not by this one. Making the
+# snapshot per-host without also changing the rsync source left this script
+# writing brain.snapshot.<host>.db and then pulling the stale shared
+# brain.snapshot.db, so every pull "succeeded" against a file nothing updated any
+# more. Derive both from one variable so they cannot diverge again.
+SNAP_NAME="brain.snapshot.$(hostname -s).db"
+REMOTE_SNAP="\$HOME/.second-brain/$SNAP_NAME"
 ssh $SSH_OPTS "$VPS" "mkdir -p \$HOME/.second-brain && sqlite3 \$HOME/$REMOTE_DATA/brain.db \".backup '$REMOTE_SNAP'\"" 2>> "$LOG_FILE"
 SNAP_RC=$?
 if [ $SNAP_RC -ne 0 ]; then
@@ -134,7 +142,7 @@ else
   # previous replica short whatever an interrupted local checkpoint had not yet
   # folded in. That is acceptable: the next run re-copies the file entire.
   rm -f "$LOCAL_DATA/brain.db-wal" "$LOCAL_DATA/brain.db-shm"
-  rsync $RSYNC_OPTS "$VPS:~/.second-brain/brain.snapshot.db" "$LOCAL_DATA/brain.db" 2>> "$LOG_FILE"
+  rsync $RSYNC_OPTS "$VPS:~/.second-brain/$SNAP_NAME" "$LOCAL_DATA/brain.db" 2>> "$LOG_FILE"
   DB_RC=$?
   # rsync renames its temp file into place, so a reader that had the old inode
   # open can recreate a -wal against the NEW file between the two lines above.

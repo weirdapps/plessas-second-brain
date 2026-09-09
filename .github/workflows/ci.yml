@@ -49,7 +49,7 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           enable-cache: true
-      - run: uv sync --frozen --extra dev
+      - run: uv sync --frozen --no-build --extra dev
       # zsh is a real test dependency: 8 of the 15 document-sync wrapper tests
       # skip without it, and the wrapper is run by /bin/zsh in production. The
       # `wrappers` job below already installs zsh for exactly this reason.

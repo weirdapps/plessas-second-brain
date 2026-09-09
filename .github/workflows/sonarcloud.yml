@@ -39,7 +39,7 @@ jobs:
         with:
           enable-cache: true
       - name: Install dependencies
-        run: uv sync --frozen --extra dev
+        run: uv sync --frozen --no-build --extra dev
 
       - name: Check for tests
         id: check-tests

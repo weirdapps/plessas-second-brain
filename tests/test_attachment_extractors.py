@@ -488,3 +488,62 @@ def test_legacy_doc_without_converter_is_skipped_not_failed(tmp_path, monkeypatc
 
     assert result["status"] == "skipped"
     assert "Errno 2" not in (result["error"] or "")
+
+
+class TestRpmsgIsReportedHonestly:
+    """.rpmsg extraction never worked, and the dependency it needed was dead weight.
+
+    The old path opened the file with `compoundfiles` and salvaged printable
+    strings. Measured on the live corpus: 685 rows carry that method and ZERO
+    hold a single character of text. Every real file raises
+    CompoundFileInvalidMagicError, because .rpmsg is not an OLE2 compound
+    document: real files begin 76e8 0460 (MSIPC), OLE2 begins d0cf11e0.
+
+    compoundfiles was also the only source-only distribution in the dependency
+    tree, built from setup.py on every install on every host, and the only thing
+    preventing `uv sync --no-build`.
+    """
+
+    def _write(self, tmp_path, magic: bytes):
+        p = tmp_path / "message.rpmsg"
+        p.write_bytes(magic + b"\x00" * 64)
+        return str(p)
+
+    def test_a_real_msipc_file_is_skipped_with_a_clear_reason(self, tmp_path):
+        from src.extract.attachment_extractors import _extract_rpmsg
+
+        r = _extract_rpmsg(self._write(tmp_path, b"\x76\xe8\x04\x60"))
+        assert r["status"] == "skipped"
+        assert r["text"] is None
+        assert "IRM-protected" in r["error"]
+
+    def test_skipped_not_failed_so_it_does_not_count_as_a_fault(self, tmp_path):
+        """685 permanent skips reported as failures would swamp the real ones."""
+        from src.extract.attachment_extractors import _extract_rpmsg
+
+        assert _extract_rpmsg(self._write(tmp_path, b"\x76\xe8\x04\x60"))["status"] != "failed"
+
+    def test_an_unexpected_container_says_so_rather_than_guessing(self, tmp_path):
+        from src.extract.attachment_extractors import _extract_rpmsg
+
+        r = _extract_rpmsg(self._write(tmp_path, b"\xd0\xcf\x11\xe0"))
+        assert r["status"] == "skipped"
+        assert "d0cf11e0" in r["error"]
+
+    def test_an_unreadable_file_is_a_real_failure(self, tmp_path):
+        from src.extract.attachment_extractors import _extract_rpmsg
+
+        r = _extract_rpmsg(str(tmp_path / "does-not-exist.rpmsg"))
+        assert r["status"] == "failed"
+
+    def test_compoundfiles_is_no_longer_imported_anywhere(self):
+        import pathlib
+
+        root = pathlib.Path(__file__).parent.parent
+        hits = [
+            f"{p}:{i}"
+            for p in (root / "src").rglob("*.py")
+            for i, line in enumerate(p.read_text().splitlines(), 1)
+            if "import compoundfiles" in line
+        ]
+        assert hits == [], f"compoundfiles is back: {hits}"

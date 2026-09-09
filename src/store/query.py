@@ -26,7 +26,13 @@ def _sanitize_fts5_query(keyword: str) -> str:
         "ACME Q1 2026"         -> '"ACME" "Q1" "2026"'      (all three required)
         ""                    -> '""'                     (matches nothing)
     """
-    tokens = keyword.split()
+    # Fold Greek accents to match how the index stores them (schema v20). Both
+    # sides fold, so an accented query still works: folding it yields the same
+    # form the index holds. Without this the index would be folded and the query
+    # would not, which is the strictly worse version of the bug being fixed.
+    from src.store.greek import fold
+
+    tokens = fold(keyword).split()
     if not tokens:
         return '""'
     quoted = []
@@ -226,7 +232,10 @@ def query_by_keyword(
                 'summary' as source
             FROM emails_fts
             JOIN emails e ON e.id = emails_fts.rowid
-            WHERE emails_fts.summary MATCH ?
+            -- Column names carry the _f suffix from schema v20: the FTS indexes
+            -- the folded GENERATED columns, and an external-content FTS5's
+            -- column names are by definition its content table's column names.
+            WHERE emails_fts.summary_f MATCH ?
             ORDER BY rank
             LIMIT ?
         """
@@ -250,7 +259,7 @@ def query_by_keyword(
                 'content' as source
             FROM emails e
             JOIN emails_fts ON emails_fts.rowid = e.id
-            WHERE emails_fts.content MATCH ?
+            WHERE emails_fts.content_f MATCH ?
             ORDER BY rank
             LIMIT ?
         """
@@ -657,7 +666,7 @@ def query_combined(
         safe_kw = _sanitize_fts5_query(keyword)
         or_branches = [
             "e.id IN (SELECT rowid FROM emails_fts WHERE emails_fts MATCH ?)",
-            "e.id IN (SELECT email_id FROM key_facts kf WHERE kf.id IN (SELECT rowid FROM key_facts_fts WHERE fact MATCH ?))",
+            "e.id IN (SELECT email_id FROM key_facts kf WHERE kf.id IN (SELECT rowid FROM key_facts_fts WHERE fact_f MATCH ?))",
         ]
         params.extend([safe_kw, safe_kw])
         if _has_attachment_fts(conn):

@@ -19,7 +19,8 @@ To change a wrapper: edit the deployed copy, verify it under its real scheduler
 ```bash
 # refresh from the hosts after a verified change
 scp '<vps-host>:~/.local/bin/sb-*.sh' scripts/wrappers/systemd/
-cp ~/.local/bin/sb-db-pull.sh ~/.local/bin/sync-documents-to-vps.sh scripts/wrappers/launchd/
+cp ~/.local/bin/sb-db-pull.sh ~/.local/bin/sync-documents-to-vps.sh \
+   ~/.local/bin/wait-for-vps.sh scripts/wrappers/launchd/
 ```
 
 ## Layout
@@ -54,8 +55,13 @@ the right place for machine-specific configuration and credentials anyway.
 
 ## Two families, not one
 
-`systemd/` and `launchd/` are independent lineages. Where a name appears in both,
-the two have drifted — only `sb-reverse-ingest.sh` is currently identical. Some
+`systemd/` and `launchd/` are independent lineages. Exactly one name appears in
+both, `sb-db-pull.sh`, and the two copies differ by 153 diff lines: the launchd
+one is the live consumer script, the systemd one is a much older relic. Nothing
+is shared between the families, so do not read a matching filename as a matching
+script. (This paragraph previously said `sb-reverse-ingest.sh` was the one name
+in common and was identical. It is wrong twice: that file exists only under
+`systemd/`, and the set it described has one member which is not identical.) Some
 of that is legitimate (macOS and Linux differ on `launchctl`/`systemctl`, `stat`,
 `date`), some is probably rot. They are archived as-is rather than reconciled;
 unifying them is a separate exercise with live ingestion at stake.

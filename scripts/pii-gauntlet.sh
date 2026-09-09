@@ -53,23 +53,21 @@ echo
 FAIL=0
 INFO=0
 
+# This script's path relative to the repo root. Derived, not hardcoded: the
+# same file lives in installers/ in some repos and scripts/ in others, and
+# hand-maintained copies are what let them drift apart in the first place.
+# Both modes need it now, so it is computed before either branch.
+SELF_REL=$(git ls-files --full-name -- "$0" 2>/dev/null | head -1)
+[ -z "$SELF_REL" ] && SELF_REL="scripts/pii-gauntlet.sh"
+
 # Build the file list once. CI mode = tracked only. Doctor mode = working tree.
 if [ "$MODE" = "ci" ]; then
   # Exclude self + auto-generated lockfiles at any depth (lockfiles contain SHAs / hashes that
   # collide with the 9-digit-ID regex but carry no PII risk).
-  # User-cleared public showcase assets (maintainer confirmed 2026-06-08): the
-  # decks screenshot library is public-safe, and its INDEX.md captions legitimately
-  # name NBG products (dual card, Skroutz, …). Exclude that subtree from scanning.
-  # This script's path relative to the repo root. Derived, not hardcoded: the
-  # same file lives in installers/ in some repos and scripts/ in others, and
-  # six hand-maintained copies is what let them drift apart in the first place.
-  SELF_REL=$(git ls-files --full-name -- "$0" 2>/dev/null | head -1)
-  [ -z "$SELF_REL" ] && SELF_REL="installers/pii-gauntlet.sh"
   TRACKED=$(git ls-files \
     | grep -v "^$SELF_REL$" \
     | grep -vE '(^|/)LICENSE(\.md|\.txt)?$' \
     | grep -vE '(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Pipfile\.lock)$' \
-    | grep -vE '^plugins/decks/assets/screenshots/' \
     || true)
   TRACKED_TMP=$(mktemp)
   printf '%s\n' "$TRACKED" > "$TRACKED_TMP"
@@ -78,6 +76,47 @@ fi
 # Helper: get the tracked-vs-untracked status of a file.
 file_is_tracked() {
   git ls-files --error-unmatch "$1" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# The tracked TREE, as distinct from file CONTENTS
+# ---------------------------------------------------------------------------
+#
+# Neither mode could see a FILENAME. Both grep file CONTENTS, and both skip
+# binaries, so for a .png or an attachment fixture the name is the only
+# readable surface there is. In the marketplace copy of this script that blind
+# spot hid two tracked files disclosing an internal project name in their own
+# filenames while every content check passed and the gate printed PASS.
+#
+# TREE_PATHS deliberately includes binaries, for exactly that reason. A
+# filename is text no matter what the file contains.
+TREE_PATHS=$(git ls-files | grep -v "^$SELF_REL$" || true)
+UNTRACKED_PATHS=$(git ls-files --others --exclude-standard 2>/dev/null || true)
+
+# Pair every path with its separator-normalised form as "orig<TAB>normalised",
+# so a hit already carries its own path. Matching runs against the whole pasted
+# line, so a hit on EITHER form counts, which is the union wanted.
+#
+# The normalisation matters more than case does. Filenames join words with _ .
+# or -, so a pattern written "two words" matches prose and misses Two_words.png.
+# Without it this check finds nothing at all, which would make it a check that
+# exists only to look reassuring.
+#
+# One consequence: a `$`-anchored pattern would anchor to the normalised half.
+# No pattern in use is `$`-anchored.
+#
+# Hits are emitted as "path:(filename)" so they share the "path:" shape the
+# doctor-mode tracked/untracked splitter already parses. They are short by
+# construction, so the cut -c1-200 further down never truncates one.
+scan_paths() {
+  local pattern="$1"
+  local list="$2"
+  [ -n "$list" ] || return 0
+  paste <(printf '%s\n' "$list") <(printf '%s\n' "$list" | tr '_.-' '   ') \
+    | grep -iE "$pattern" 2>/dev/null \
+    | cut -f1 \
+    | sed 's/$/:(filename)/' \
+    || true
 }
 
 scan_doctor() {
@@ -98,13 +137,23 @@ scan_doctor() {
     --exclude-dir=dist \
     --exclude-dir=coverage \
     --exclude-dir=installers/deps \
+    `# Tool caches. They hold no authored text, so a hit in one is noise by` \
+    `# construction, and .mypy_cache alone is 16 MB / 423 files of minified` \
+    `# JSON. Scanning them made the pre-commit run 3 minutes instead of 19s` \
+    `# and dumped a single 243 KB line into the report. A slow, noisy gate is` \
+    `# a gate that gets bypassed.` \
+    --exclude-dir=.mypy_cache \
+    --exclude-dir=.ruff_cache \
+    --exclude-dir=.pytest_cache \
+    --exclude-dir=htmlcov \
     --exclude=pii-gauntlet.sh \
     --exclude=LICENSE \
+    --exclude=LICENSE.md \
+    --exclude=LICENSE.txt \
     --exclude=PII-GAUNTLET.md \
     --exclude=package-lock.json \
     --binary-files=without-match \
     "$pattern" . 2>/dev/null \
-    | grep -vE 'plugins/decks/assets/screenshots/' \
     || true
 }
 
@@ -114,46 +163,67 @@ scan_ci() {
   # (portable on BSD/macOS and GNU). The old `xargs -a FILE -d '\n'` form is
   # GNU-only: on macOS it errors "invalid option -- a", gets swallowed by
   # 2>/dev/null, and the gate silently PASSES while scanning nothing.
+  # -i, matching scan_doctor above. Without it the GATE was case-sensitive
+  # while the local doctor was not, so the check that blocks a push was the
+  # weaker of the two, which is backwards.
   if [ -s "$TRACKED_TMP" ]; then
-    tr '\n' '\0' < "$TRACKED_TMP" | xargs -0 grep -nE --binary-files=without-match "$pattern" 2>/dev/null || true
+    tr '\n' '\0' < "$TRACKED_TMP" | xargs -0 grep -inE --binary-files=without-match "$pattern" 2>/dev/null || true
   fi
 }
 
-# Drop hits whose PATH is a historical record rather than live configuration.
-# Path-scoped only. Never extend this to filter on matched content: that would
-# hide live hits and turn a working guardrail into a false green.
+# Drop hits that are documentation rather than live configuration.
+#
+# Two kinds of exclusion, and they are NOT interchangeable:
+#   $2 content: matched anywhere on the grep line. Keep it narrow, because a
+#      broad content exclusion is indistinguishable from switching the check off.
+#   $3 path: matched against the `path:` prefix only. A path-shaped pattern let
+#      loose on the whole line also matches CONTENT, which is how `<[^>]+>`
+#      came to drop any hit on a line containing an HTML tag
+#      (`<td>firstname.surname@<employer-domain></td>` excluded itself).
+#
+# The two used to be one argument, anchored to the path, with the content list
+# hardcoded inside this function as PLACEHOLDER_CONTENT where no caller could
+# see or override it. Splitting them is what lets the path blob go away.
 apply_exclusion() {
   local hits="$1"
   local exclude="$2"
-  if [ -z "$exclude" ] || [ -z "$hits" ]; then
-    printf '%s' "$hits"
-    return
+  local exclude_path="${3:-}"
+  # No early return, and no filter that only some callers get. The old version
+  # short-circuited when $exclude was empty, so a denylist entry with a blank
+  # third field skipped the placeholder filters entirely while a generic check
+  # got them. Every caller now runs the same two filters, each a no-op when its
+  # argument is empty.
+  #
+  # There used to be a third, unconditional filter here dropping any line that
+  # contained "(c) YYYY" or the word "copyright", case-insensitively, in the
+  # name of licence attribution. LICENSE, LICENSE.md and LICENSE.txt are already
+  # removed from the file list in both modes, so it protected nothing and
+  # instead handed anyone a one-word suppression token: "Copyright 2026 - reach
+  # me at <real address>" was dropped silently while the same address without
+  # the word was caught. It is gone.
+  if [ -n "$hits" ] && [ -n "$exclude_path" ]; then
+    hits=$(printf '%s\n' "$hits" | grep -vE "^[^:]*($exclude_path)" || true)
   fi
-  # Anchored to the `path:` prefix, because that is what these patterns are for.
-  # Matched against the whole line, every path-shaped alternative doubled as a
-  # CONTENT filter: `<[^>]+>` dropped any hit on a line containing an HTML tag
-  # (`<td>firstname.surname@<employer-domain></td>` excluded itself), and a bare
-  # `template` dropped any line merely using the word. That is the false green
-  # the comment above forbids.
-  # Content placeholders stay a separate, deliberately narrow list. See
-  # PLACEHOLDER_CONTENT, defined with the other placeholder policy below.
-  # Copyright attribution names the author on purpose and is required by the
-  # licence. Flagging it is noise, and noise is how a real hit gets ignored.
-  printf '%s\n' "$hits" \
-    | grep -vE "^[^:]*($exclude)" \
-    | grep -vE "$PLACEHOLDER_CONTENT" \
-    | grep -viE '\(c\)[[:space:]]*[0-9]{4}|copyright' || true
+  if [ -n "$hits" ] && [ -n "$exclude" ]; then
+    hits=$(printf '%s\n' "$hits" | grep -vE "$exclude" || true)
+  fi
+  printf '%s' "$hits"
 }
 
 check() {
   local label="$1"
   local pattern="$2"
   local exclude="${3:-}"
+  local exclude_path="${4:-}"
   local hits
 
   if [ "$MODE" = "ci" ]; then
-    hits=$(scan_ci "$pattern")
-    hits=$(apply_exclusion "$hits" "$exclude")
+    # Contents AND filenames, in one verdict per check. Folding them together
+    # rather than bolting on a separate section is deliberate: it means a check
+    # added later cannot silently skip the tree, which is the shape of every
+    # hole found in this file.
+    hits=$(printf '%s\n%s' "$(scan_ci "$pattern")" "$(scan_paths "$pattern" "$TREE_PATHS")" | grep -v '^$' || true)
+    hits=$(apply_exclusion "$hits" "$exclude" "$exclude_path")
     if [ -n "$hits" ]; then
       echo "FAIL [$label]:"
       echo "$hits" | head -20
@@ -166,8 +236,16 @@ check() {
   fi
 
   # Doctor mode — separate tracked from gitignored.
-  hits=$(scan_doctor "$pattern")
-  hits=$(apply_exclusion "$hits" "$exclude")
+  #
+  # Untracked FILENAMES are included here and not in CI, matching how doctor
+  # already treats untracked CONTENT: an untracked path never ships, so it is
+  # INFO rather than FAIL, but doctor exists to surface local drift before
+  # someone stages it.
+  hits=$(printf '%s\n%s\n%s' \
+    "$(scan_doctor "$pattern")" \
+    "$(scan_paths "$pattern" "$TREE_PATHS")" \
+    "$(scan_paths "$pattern" "$UNTRACKED_PATHS")" | grep -v '^$' || true)
+  hits=$(apply_exclusion "$hits" "$exclude" "$exclude_path")
   if [ -z "$hits" ]; then
     echo "OK   [$label]"
     return
@@ -187,15 +265,18 @@ check() {
     fi
   done <<< "$hits"
 
+  # `cut -c1-200` before `head`: a hit inside a minified file is ONE line that
+  # can be hundreds of KB, so a line cap alone does not bound the report. The
+  # point of a hit is the path, which is at the front of the line.
   if [ -n "$tracked_hits" ]; then
     echo "FAIL [$label]:                 (tracked — would ship publicly)"
-    printf '%s' "$tracked_hits" | head -20
+    printf '%s' "$tracked_hits" | cut -c1-200 | head -20
     echo
     FAIL=1
   fi
   if [ -n "$untracked_hits" ]; then
     echo "INFO [$label]:                 (gitignored / untracked — local-only)"
-    printf '%s' "$untracked_hits" | head -10
+    printf '%s' "$untracked_hits" | cut -c1-200 | head -10
     echo
     INFO=1
   fi
@@ -223,20 +304,56 @@ check() {
 # Doc placeholders. Extend this when a new invented example host trips the check:
 # being asked once "is this a real tenant?" is the check doing its job, and is a
 # far better failure mode than the silence it replaces.
-PLACEHOLDER='contoso|example|sample|template|your[-_.]?tenant|your-tenant|<[^>]+>|firstname\.lastname|your\.email|recipient\.name|user@|name@|(test|overridden|envvar|dummy|placeholder|foo|bar|a|b|x|y|z)(-my)?\.sharepoint'
+#
+# Every exclusion below names a placeholder VALUE. None of them exempts a FILE.
+# The variable that used to sit here did three other jobs, and all three were
+# holes:
+#
+#   `example|sample|template` was matched against the path of every hit, so any
+#   path merely CONTAINING one of those words was exempt from the employer-name,
+#   mail-domain and tenant checks. Three tracked files were invisible outright:
+#   .env.example, examples/example_exporter.py and examples/sample-batch.json.
+#   An .env example is exactly the file a real host or token gets pasted into.
+#   Grepped against every check, the only hit inside the three is
+#   `.env.example:33 SHAREPOINT_HOST=contoso.sharepoint.com`, and contoso is
+#   already excluded by value below, so removing the token changes no verdict
+#   and the three files are now scanned for the first time.
+#
+#   `<[^>]+>` matched any HTML or XML tag; the moment it was tested against a
+#   whole line it cancelled every hit on a line containing a tag.
+#
+#   `user@|name@` were unanchored substrings, exempting `realuser@...` and
+#   `firstname@...` as readily as the placeholders they named. Every occurrence
+#   in this repo is `user@1000.service` in src/llm_deadline.py and its test, a
+#   systemd unit rather than an address, and none is an @nbg.gr address, so they
+#   excluded nothing the mail-domain check could have fired on. Dropped.
+PLACEHOLDER='contoso|firstname\.lastname|your\.email|recipient\.name|your[-_.]?tenant'
 
-# Matched against the CONTENT of a hit, so it is kept deliberately short: every
-# entry here is a string that can only ever be an invented example.
-# The example hosts are spelled out. The alternation used to end in a bare
-# `[a-z]`, and `[a-z]\.sharepoint` matches the last letter of EVERY real tenant
-# hostname, so the SharePoint check could not fire at all. `partner` and
-# `mastercard` are the two "some other tenant" fixtures in
-# tests/export/test_sharepoint_fetcher.py; they were only ever green because
-# that same `[a-z]` swallowed them.
-# The trailing digit runs are the synthetic ids the fixtures use in place of a
-# real one. They mirror the placeholder column of the private denylist, which
-# is now matched against the path rather than the content (see apply_exclusion).
-PLACEHOLDER_CONTENT='contoso|firstname\.lastname|your\.email|recipient\.name|(test|overridden|envvar|dummy|placeholder|foo|bar|partner|mastercard|a|b|x|y|z)(-my)?\.sharepoint|123456789|987654321|111111111|000000000|012345678'
+# Fixture hostnames, for the tenant check only. Two rules, both of which the
+# previous list broke.
+#
+# 1. Anchored on the left by a character that cannot appear inside a host label,
+#    so a fixture name has to be the WHOLE label. The list was UNANCHORED, which
+#    is the same defect as the bare `[a-z]` it was written to replace: `x`
+#    matched the last character of onyx.sharepoint.com, and `y` matched the `y`
+#    of every `<tenant>-my.sharepoint.com`, which is the OneDrive-for-Business
+#    half of the very thing this check looks for. Anchoring is what makes the
+#    remaining single letter safe.
+# 2. Only fixture names this repo actually uses, each grepped over the tracked
+#    tree: test (2), dummy (1), partner (3), mastercard (2) and x (8). The
+#    dropped names, overridden, envvar, placeholder, foo, bar, a, b, y and z,
+#    appear nowhere; each was a live exemption for a tenant label nobody had
+#    written. partner and mastercard are the two "some other tenant" fixtures in
+#    tests/export/test_sharepoint_fetcher.py.
+PLACEHOLDER_TENANT="$PLACEHOLDER"'|(^|[^a-z0-9.-])(test|dummy|partner|mastercard|x)(-my)?\.sharepoint'
+
+# Synthetic id runs the fixtures use in place of a real one. These are literal
+# VALUES that cannot occur by accident, which is why they are safe to apply to
+# the denylist checks below, where the private denylist ships one exclude column
+# per entry and cannot know about a placeholder specific to this repo. Only the
+# four that actually appear in the tracked tree are kept; 012345678 was listed
+# and is used nowhere.
+PLACEHOLDER_VALUE='123456789|987654321|111111111|000000000'
 
 # Some repos name the employer on purpose: a marketplace written for colleagues
 # says so in its README by design. Those opt out with a repo-root marker rather
@@ -248,7 +365,7 @@ else
 fi
 
 check "Employer mail domain" '[A-Za-z0-9._%+-]+@nbg\.gr' "$PLACEHOLDER"
-check "SharePoint tenant"    '[a-z0-9-]+\.sharepoint\.com' "$PLACEHOLDER"
+check "SharePoint tenant"    '[a-z0-9-]+\.sharepoint\.com' "$PLACEHOLDER_TENANT"
 # A bare UUID is not a finding: fixtures, generated filenames and message ids
 # are full of them, and flagging all of them is how a check earns the right to
 # be ignored. What matters is a GUID sitting where a TENANT id sits, so key on
@@ -275,9 +392,20 @@ if [ -r "$PII_DENYLIST" ]; then
   # Tab-delimited: the patterns are full of regex alternation pipes, so "|"
   # cannot be the field separator.
   loaded=0
+  # The repo-local placeholder VALUES are ORed onto each entry's own exclude
+  # column. The denylist is shared by several repos and cannot know about the
+  # synthetic id runs this repo's fixtures use, and editing it from here would
+  # change every repo's gate at once. These used to reach the denylist checks
+  # via a filter applied unconditionally inside apply_exclusion; passing them
+  # explicitly means a reader can see which checks they affect.
   while IFS=$'\t' read -r label pattern exclude; do
     case "$label" in ''|\#*) continue ;; esac
     [ -z "$pattern" ] && continue
+    if [ -n "$exclude" ]; then
+      exclude="$exclude|$PLACEHOLDER_VALUE"
+    else
+      exclude="$PLACEHOLDER_VALUE"
+    fi
     check "$label" "$pattern" "$exclude"
     loaded=$((loaded + 1))
   done < "$PII_DENYLIST"

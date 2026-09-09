@@ -2632,3 +2632,83 @@ def test_total_count_still_reports_every_unregistered_dir(hc, tmp_path):
     db = _attachments_db(root, "known-1")
 
     assert hc.count_unregistered_attachment_dirs(db, root=root) == 2
+
+
+def test_report_escalates_a_job_that_is_on_disk_but_not_loaded(hc):
+    """NOT_LOADED must reach `issues`, not just the printed table.
+
+    The escalation used to be `if "FAIL" in str(status)`, and neither NOT_LOADED
+    nor "ERROR: ..." contains "FAIL". So a scheduled job that had stopped being
+    bootstrapped printed a status line and reached neither issues, nor the
+    email, nor --fix. On 2026-09-07 that was the live defect: com.plessas.
+    second-brain.db-pull went unbootstrapped and the replica sat 30h stale.
+    """
+    jobs = {"db-pull": {"desc": "second-brain db-pull", "status": "NOT_LOADED"}}
+
+    text, issues = hc.build_report([], jobs, {}, {}, [])
+
+    assert "second-brain db-pull" in text
+    assert any("NOT_LOADED" in i for i in issues), issues
+
+
+def test_report_escalates_a_job_whose_status_probe_errored(hc):
+    jobs = {"x": {"desc": "Job X", "status": "ERROR: launchctl exit 113"}}
+
+    _, issues = hc.build_report([], jobs, {}, {}, [])
+
+    assert any("Job X" in i for i in issues), issues
+
+
+def test_report_stays_quiet_for_healthy_and_migrated_jobs(hc):
+    """The escalation must not turn the normal case red: MIGRATED means the job
+    legitimately runs on the other host.
+    """
+    jobs = {
+        "a": {"desc": "Job A", "status": "OK"},
+        "b": {"desc": "Job B", "status": "RUNNING"},
+        "c": {"desc": "Job C", "status": "MIGRATED"},
+    }
+
+    _, issues = hc.build_report([], jobs, {}, {}, [])
+
+    assert [i for i in issues if i.startswith("Job ")] == []
+
+
+def test_wrapper_drift_detects_a_repo_copy_behind_the_deployed_one(hc, tmp_path):
+    """CI syntax-checks scripts/wrappers/, but production runs ~/.local/bin, so
+    the archive drifted both ways unnoticed: a committed fix sat undeployed for
+    nine days, and the deployed db-pull carried 33 lines of hardening the
+    archive lacked, meaning a restore from the repo would have reverted it.
+    """
+    import sys
+
+    flavour = "launchd" if sys.platform == "darwin" else "systemd"
+    archive = tmp_path / "scripts" / "wrappers" / flavour
+    archive.mkdir(parents=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    (archive / "same.sh").write_text("#!/bin/bash\necho a\n")
+    (bin_dir / "same.sh").write_text("#!/bin/bash\necho a\n")
+    (archive / "drifted.sh").write_text("#!/bin/bash\necho old\n")
+    (bin_dir / "drifted.sh").write_text("#!/bin/bash\necho new\n")
+    (archive / "not-deployed.sh").write_text("#!/bin/bash\necho x\n")
+
+    result = hc.check_wrapper_drift(repo_root=tmp_path, bin_dir=bin_dir)
+
+    assert result["same.sh"]["status"] == "OK"
+    assert result["drifted.sh"]["status"] == "DRIFT"
+    assert result["not-deployed.sh"]["status"] == "NOT_DEPLOYED"
+
+
+def test_wrapper_drift_reaches_issues(hc):
+    _, issues = hc.build_report([], {}, {}, {}, [], {"x.sh": {"status": "DRIFT"}})
+    assert any("Wrapper archive differs" in i for i in issues), issues
+
+
+def test_wrapper_drift_is_quiet_when_in_sync(hc):
+    """NOT_DEPLOYED must not be an issue: not every host runs every job."""
+    _, issues = hc.build_report(
+        [], {}, {}, {}, [], {"a.sh": {"status": "OK"}, "b.sh": {"status": "NOT_DEPLOYED"}}
+    )
+    assert not any("Wrapper archive differs" in i for i in issues), issues

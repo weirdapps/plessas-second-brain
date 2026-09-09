@@ -49,10 +49,17 @@ def _load_index(index_path=None):
         return _INDEX_CACHE["ids"], _INDEX_CACHE["unit"]
     data = np.load(path, allow_pickle=False)
     ids = data["ids"]
-    vectors = data["vectors"]
+    # Normalise IN PLACE. `vectors` is a fresh array this call owns, so dividing
+    # into it is safe, and it is the difference between one 1.44 GB allocation
+    # and three: `vectors / norms` builds a second full array and `.astype()`
+    # copies again even when the dtype already matches. Every MCP server process
+    # pays this on its first semantic query, and there are routinely a dozen of
+    # them alive at once across sessions.
+    vectors = np.ascontiguousarray(data["vectors"], dtype=np.float32)
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     norms[norms == 0] = 1
-    unit = (vectors / norms).astype(np.float32)
+    vectors /= norms
+    unit = vectors
     _INDEX_CACHE.update({"path": str(path), "mtime": mtime, "ids": ids, "unit": unit})
     return ids, unit
 
@@ -132,14 +139,28 @@ def generate_embeddings(texts: list[str], client=None) -> np.ndarray:
     for batch_num, i in enumerate(range(0, len(texts), BATCH_SIZE), 1):
         batch = texts[i : i + BATCH_SIZE]
 
-        # Retry with exponential backoff on rate limits
+        # Retry with exponential backoff on rate limits.
+        #
+        # Both the exhaustion path and the short-response path have to raise. The
+        # caller pairs this array positionally with its `ids` list, so a batch
+        # that quietly contributes 0 rows (5 failed 429s, then falling out of the
+        # loop) or fewer rows than it was given does not lose 100 embeddings: it
+        # shifts every id after it onto the wrong vector, which is invisible and
+        # unrecoverable. Failing the run is cheap because the hourly job retries.
         for attempt in range(5):
             try:
                 result = client.models.embed_content(
                     model=EMBEDDING_MODEL,
                     contents=batch,
                 )
-                for emb in result.embeddings:
+                returned = list(result.embeddings)
+                if len(returned) != len(batch):
+                    raise RuntimeError(
+                        f"embed_content returned {len(returned)} embeddings for "
+                        f"{len(batch)} inputs in batch {batch_num}; refusing to "
+                        "misalign the index"
+                    )
+                for emb in returned:
                     all_embeddings.append(emb.values)
                 break
             except Exception as e:
@@ -149,6 +170,11 @@ def generate_embeddings(texts: list[str], client=None) -> np.ndarray:
                     time.sleep(wait)
                 else:
                     raise
+        else:
+            raise RuntimeError(
+                f"embed_content still rate-limited after 5 attempts on batch "
+                f"{batch_num}/{total_batches}; aborting so the index stays aligned"
+            )
 
         if batch_num % 50 == 0 or batch_num == total_batches:
             _log(
@@ -196,13 +222,33 @@ def build_index(conn: sqlite3.Connection, force: bool = False) -> int:
     Returns:
         Number of new embeddings generated
     """
-    # Load existing index
-    existing_ids = set()
+    # Load existing index.
+    #
+    # `existing_id_order` is the file's own row order and is the ONLY thing that
+    # may be concatenated with the new ids, because it has to stay positionally
+    # paired with `existing_vectors`. The membership set is a separate object.
+    # Until 2026-09-09 the merge below did `list(existing_ids) + ids` against
+    # `np.vstack([existing_vectors, new_vectors])`, and set iteration order is
+    # hash order, not insertion order. With namespaced negative ids in the index
+    # the two diverge: 67,723 of 117,101 live vectors carried the wrong id, from
+    # position 42,026 on, so every attachment, conversation and Teams vector and
+    # every email filed after 2026-03-24 resolved to an unrelated row. Semantic
+    # search returned confident, random results. Verified by embedding text that
+    # is byte-identical across two rows and getting cosine 0.55 instead of 1.00.
+    existing_id_order: list[int] = []
+    existing_ids: set[int] = set()
     existing_vectors = None
     if not force and EMBEDDINGS_FILE.exists():
         data = np.load(EMBEDDINGS_FILE, allow_pickle=False)
-        existing_ids = {int(x) for x in data["ids"]}
+        existing_id_order = [int(x) for x in data["ids"]]
+        existing_ids = set(existing_id_order)
         existing_vectors = data["vectors"]
+        if len(existing_id_order) != len(existing_vectors):
+            raise RuntimeError(
+                f"{EMBEDDINGS_FILE} holds {len(existing_id_order)} ids for "
+                f"{len(existing_vectors)} vectors; refusing to extend a "
+                "misaligned index"
+            )
 
     # Get emails needing embeddings. Embed a metadata-enriched string (subject /
     # sender / date + summary), not the summary alone, so the vector captures
@@ -270,13 +316,19 @@ def build_index(conn: sqlite3.Connection, force: bool = False) -> int:
 
     new_vectors = generate_embeddings(texts, client)
 
-    # Merge with existing
+    # Merge with existing. File order, never set order (see the load comment).
     if existing_vectors is not None and not force:
-        all_ids = list(existing_ids) + ids
+        all_ids = existing_id_order + ids
         all_vectors = np.vstack([existing_vectors, new_vectors])
     else:
         all_ids = ids
         all_vectors = new_vectors
+
+    if len(all_ids) != len(all_vectors):
+        raise RuntimeError(
+            f"refusing to save a misaligned index: {len(all_ids)} ids for "
+            f"{len(all_vectors)} vectors"
+        )
 
     # Save to disk atomically so an interrupted write can never truncate the
     # shared index (see _atomic_savez).

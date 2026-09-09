@@ -7,6 +7,7 @@ a known person name/email or topic. Used by both the /recall skill and
 by other agents through the MCP `recall` tool.
 """
 
+import logging
 import sqlite3
 
 from src.store.context import get_person_context, get_topic_context
@@ -14,6 +15,8 @@ from src.store.conversation_query import search_conversations_keyword
 from src.store.fusion import reciprocal_rank_fusion
 from src.store.query import _sanitize_fts5_query, query_by_keyword, search_attachments
 from src.store.teams_query import search_teams as _search_teams_q
+
+logger = logging.getLogger(__name__)
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -110,11 +113,22 @@ def _search_calendar_events(conn: sqlite3.Connection, query: str, limit: int) ->
                JOIN calendar_events ce ON ce.id = f.rowid
                WHERE calendar_events_fts MATCH ?
                ORDER BY rank LIMIT ?""",
-            (query, limit),
+            (_sanitize_fts5_query(query), limit),
         ).fetchall()
         return [dict(r) for r in rows]
-    except Exception:
+    except sqlite3.OperationalError as e:
+        # Was `except Exception: return []`, which turned an unsanitized-query
+        # crash into a confident empty calendar bucket. The sanitizer above is
+        # the actual fix; this stays narrow and loud so the next tokenizer change
+        # is visible instead of silently zeroing a whole result kind.
+        logger.warning("recall calendar bucket skipped: %s", e)
         return []
+
+
+# recall auto-injects a person and a topic dossier as a HINT beside the buckets,
+# so they get a tighter cap than a direct person_context/topic_context call. With
+# no cap at all these two lines were >95% of every oversized recall payload.
+_CONTEXT_HINT_LIMIT = 5
 
 
 def _maybe_person_context(conn: sqlite3.Connection, query: str, days: int) -> dict | None:
@@ -128,7 +142,7 @@ def _maybe_person_context(conn: sqlite3.Connection, query: str, days: int) -> di
         hit = conn.execute("SELECT 1 FROM people WHERE name LIKE ?", (f"%{query}%",)).fetchone()
     if not hit:
         return None
-    ctx = get_person_context(conn, query, days=days)
+    ctx = get_person_context(conn, query, days=days, limit=_CONTEXT_HINT_LIMIT)
     return ctx if ctx.get("person") else None
 
 
@@ -139,7 +153,7 @@ def _maybe_topic_context(conn: sqlite3.Connection, query: str, days: int) -> dic
     ).fetchone()
     if not hit:
         return None
-    ctx = get_topic_context(conn, query, days=days)
+    ctx = get_topic_context(conn, query, days=days, limit=_CONTEXT_HINT_LIMIT)
     return ctx if ctx.get("topic") else None
 
 

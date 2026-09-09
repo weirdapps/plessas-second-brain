@@ -9,6 +9,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+from src.export.state import load_json_or_quarantine
+
 from .normalizer import find_or_create_person, find_or_create_topic
 from .schema import normalize_subject
 
@@ -52,16 +54,17 @@ def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
     batch_to_msgids: dict[Path, set] = {}
     staging_im: dict[str, str] = {}  # message_id -> RFC822 internet_message_id
     for batch_file in sorted(staging_path.glob("batch-*.json")):
-        with open(batch_file, encoding="utf-8") as f:
-            batch = json.load(f)
-            emails = batch.get("emails", batch) if isinstance(batch, dict) else batch
-            msgids = set()
-            for email in emails:
-                msgid = str(email["message_id"])
-                staging_index[msgid] = email
-                staging_im[msgid] = email.get("internet_message_id") or ""
-                msgids.add(msgid)
-            batch_to_msgids[batch_file] = msgids
+        batch = load_json_or_quarantine(batch_file)
+        if batch is None:
+            continue
+        emails = batch.get("emails", batch) if isinstance(batch, dict) else batch
+        msgids = set()
+        for email in emails:
+            msgid = str(email["message_id"])
+            staging_index[msgid] = email
+            staging_im[msgid] = email.get("internet_message_id") or ""
+            msgids.add(msgid)
+        batch_to_msgids[batch_file] = msgids
 
     # Index available extraction files by lowercased stem. Outlook message-ids
     # are case-sensitive base64, but macOS/APFS is case-insensitive (and
@@ -499,8 +502,9 @@ def load_conversations(db_path: str) -> int:
     # Build index of staged conversations by session_id
     staging_index = {}
     for batch_file in sorted(staging_dir.glob("conversation-batch-*.json")):
-        with open(batch_file, encoding="utf-8") as f:
-            batch = json.load(f)
+        batch = load_json_or_quarantine(batch_file)
+        if batch is None:
+            continue
         for conv in batch.get("conversations", []):
             staging_index[conv["session_id"]] = conv
 

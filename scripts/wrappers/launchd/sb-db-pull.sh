@@ -17,6 +17,12 @@ mkdir -p "$LOG_DIR"
 VPS="vps"
 LOCAL_DATA="$HOME/SourceCode/plessas-second-brain/data"
 REMOTE_DATA="SourceCode/plessas-second-brain/data"
+# rsync will not create a two-level destination, and `data/` is gitignored, so a
+# fresh clone does not have it: the Pro rebuilt on 2026-09-05 had the plist, both
+# scripts and a reachable VPS, and the pull would still have failed on every run
+# with "No such file or directory". Same omission the offsite block below already
+# records, one directory earlier in the same script.
+mkdir -p "$LOCAL_DATA"
 REMOTE_PYTHON="~/.venvs/second-brain/bin/python"
 SSH_OPTS="-o ConnectTimeout=10 -o BatchMode=yes -o ServerAliveInterval=15"
 
@@ -96,7 +102,16 @@ RSYNC_OPTS="-az --timeout=180"
 # which is exactly what a plain file copy cannot do. It lives outside the repo
 # data dir and PERSISTS between runs on purpose: a stable page layout is what
 # lets rsync keep sending deltas instead of 3 GB every hour.
-REMOTE_SNAP="\$HOME/.second-brain/brain.snapshot.db"
+# Per consumer, not one shared file. Two Macs pull from this VPS (one at :15,
+# one at :45) and both ran `sqlite3 .backup` into the SAME path, guarded only by
+# a /tmp lock that is local to each machine and therefore guards nothing across
+# them. A pull that overruns its 30-minute gap means two .backup runs writing one
+# file, and both hosts then rsync whatever that produced. The DEFER check above
+# looks for VPS sync jobs and would not see the other Mac.
+# The extra disk is one snapshot per consumer, and rsync deltas are unaffected
+# because each host keeps its own stable page layout, which is the whole reason
+# this file persists between runs.
+REMOTE_SNAP="\$HOME/.second-brain/brain.snapshot.$(hostname -s).db"
 ssh $SSH_OPTS "$VPS" "mkdir -p \$HOME/.second-brain && sqlite3 \$HOME/$REMOTE_DATA/brain.db \".backup '$REMOTE_SNAP'\"" 2>> "$LOG_FILE"
 SNAP_RC=$?
 if [ $SNAP_RC -ne 0 ]; then
@@ -167,6 +182,33 @@ if [ "${INTEGRITY% }" != "ok" ]; then
   INTEGRITY_RC=1
 else
   INTEGRITY_RC=0
+fi
+
+# --- Pull encrypted offsite DB snapshots + GFS prune (14 daily + 8 weekly) ---
+# The VPS writes these daily from sb-daily-sync via backup_db.py, but they land in
+# data/backups/offsite on the SAME /dev/sdb as brain.db itself, so "offsite" is a
+# misnomer until they are pulled here. This is the only hop that makes them real.
+# Point OFFSITE_LOCAL at a OneDrive-synced folder for a free second offsite hop.
+#
+# This block was missing from the deployed copy while living in the repo copy, so
+# the pull silently never ran and the directory below never existed. Hence mkdir -p
+# rather than assuming: rsync will not create a two-level destination on its own.
+OFFSITE_LOCAL="$HOME/second-brain-backups/offsite"
+mkdir -p "$OFFSITE_LOCAL"
+rsync $RSYNC_OPTS "$VPS:~/$REMOTE_DATA/backups/offsite/brain-*.db.zst.enc" \
+  "$OFFSITE_LOCAL/" 2>> "$LOG_FILE"
+OFF_RC=$?
+if [ "$OFF_RC" -eq 0 ]; then
+  "$HOME/SourceCode/plessas-second-brain/.venv/bin/python3" \
+    "$HOME/SourceCode/plessas-second-brain/scripts/backup_db.py" \
+    --prune-only --offsite-dir "$OFFSITE_LOCAL" --gfs-daily 14 --gfs-weekly 8 >> "$LOG_FILE" 2>&1 || true
+  OFF_COUNT=$(ls "$OFFSITE_LOCAL"/brain-*.db.zst.enc 2>/dev/null | wc -l | tr -d ' ')
+  log "offsite snapshots synced + pruned (kept $OFF_COUNT)"
+else
+  # Report the code, do not guess the cause. The repo copy of this block asserted
+  # "backup key unprovisioned on VPS?", which was wrong: the key was provisioned
+  # the whole time and the real fault was the missing local directory above.
+  log "ERROR: offsite snapshot pull FAILED (rsync rc=$OFF_RC)"
 fi
 
 # --- Sanity check: compare email counts VPS vs local ---

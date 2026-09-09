@@ -77,6 +77,39 @@ def reconcile_moves(
     """
     outlook_ids, internet_ids = list_current_inbox_ids(max_results=max_results)
 
+    # Refuse an implausible listing before touching a single row. This function
+    # relabels by ABSENCE, so a listing that is empty or truncated does not mean
+    # "the inbox is empty", it means "we could not see the inbox", and the two
+    # produce opposite actions from identical input. outlook-cli answers 0 with
+    # an empty list on several non-fault paths (a throttled tenant, an expired
+    # session on a code path that does not map to exit 4, a wrong folder name),
+    # and the relabel is one-way with no undo. outlook_export.py already refuses
+    # on exactly this shape.
+    if not outlook_ids:
+        return {
+            "scanned_inbox": 0,
+            "by_outlook_id": 0,
+            "by_internet_id": 0,
+            "moved": 0,
+            "status": "refused-empty-listing",
+            "detail": (
+                "outlook-cli returned no Inbox messages. Treating that as an "
+                "unreadable inbox, not an empty one; nothing was relabelled."
+            ),
+        }
+    if len(outlook_ids) >= max_results:
+        return {
+            "scanned_inbox": len(outlook_ids),
+            "by_outlook_id": 0,
+            "by_internet_id": 0,
+            "moved": 0,
+            "status": "refused-truncated-listing",
+            "detail": (
+                f"listing hit the {max_results} cap, so absence from it proves "
+                "nothing. Raise --max-results and re-run."
+            ),
+        }
+
     conn = get_connection(str(db_path))
     try:
         # Pass 1 — outlook-cli-sourced rows.
@@ -115,6 +148,7 @@ def reconcile_moves(
         "by_outlook_id": len(by_outlook_id),
         "by_internet_id": len(by_internet_id),
         "moved": len(moved),
+        "status": "ok",
     }
 
 

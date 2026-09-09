@@ -16,6 +16,7 @@ from pathlib import Path
 from src.config import ATTACHMENTS_DIR, DEFAULT_DB
 from src.extract.attachment_extractors import extract_text_from_file
 from src.extract.vertex_auth import touch_sentinel
+from src.redact import redact_secrets
 
 # Processing constants
 PHASE1_BATCH_SIZE = 50
@@ -160,6 +161,11 @@ def run_phase1(
             continue
 
         result = extract_text_from_file(file_path, mime_type or "")
+        # Attachments do NOT pass through data/staging, so the redaction applied
+        # by write_json_atomic never sees them. A .env, a config dump or a
+        # screenshot of a terminal reaches the store and then Vertex by this path
+        # instead. Redact here, at the equivalent boundary.
+        result["text"] = redact_secrets(result["text"])
 
         conn.execute(
             """INSERT OR IGNORE INTO attachment_content

@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -1423,6 +1424,42 @@ def check_sentinels(state_dir: Path | None = None):
     return results
 
 
+def check_wrapper_drift(repo_root: Path | None = None, bin_dir: Path | None = None):
+    """Does the committed wrapper archive still match what this host runs?
+
+    CI syntax-checks `scripts/wrappers/<flavour>/*.sh`, but nothing executes
+    them: production runs the copies in ~/.local/bin. So the archive can drift
+    in either direction and every gate stays green. It has, both ways: a
+    committed backup-alerting fix sat undeployed for nine days, and the deployed
+    db-pull carried 33 lines of hardening the archive did not have, which means
+    a restore from the repo would have silently reverted live fixes.
+
+    Flavour is chosen by platform, because the other flavour's scripts belong to
+    the other host and comparing them here would report permanent false drift.
+    A script that is archived but not deployed is not drift: not every host runs
+    every job.
+    """
+    repo_root = repo_root or Path(__file__).resolve().parent.parent
+    bin_dir = bin_dir or (Path.home() / ".local" / "bin")
+    flavour = "launchd" if sys.platform == "darwin" else "systemd"
+    archive = repo_root / "scripts" / "wrappers" / flavour
+
+    results: dict[str, dict] = {}
+    if not archive.is_dir():
+        return results
+    for src in sorted(archive.glob("*.sh")):
+        deployed = bin_dir / src.name
+        if not deployed.exists():
+            results[src.name] = {"status": "NOT_DEPLOYED"}
+            continue
+        same = (
+            hashlib.sha256(src.read_bytes()).digest()
+            == hashlib.sha256(deployed.read_bytes()).digest()
+        )
+        results[src.name] = {"status": "OK" if same else "DRIFT"}
+    return results
+
+
 def auto_fix(issues):
     """Attempt to fix detected issues. Returns list of actions taken.
 
@@ -1475,7 +1512,7 @@ def format_age(td):
     return f"{total_secs // 86400}d {(total_secs % 86400) // 3600}h"
 
 
-def build_report(checks, jobs, logs, sentinels, fix_actions):
+def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
     now = datetime.now()
     lines = []
     issues = []
@@ -1635,7 +1672,14 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
         status = info.get("status", "?")
         marker = "OK" if status in ("OK", "RUNNING") else status
         lines.append(f"  {desc:<28} {marker}")
-        if "FAIL" in str(status):
+        # Escalate anything that is not a healthy state, not just the strings
+        # containing "FAIL". NOT_LOADED and ERROR: are the two that matter and
+        # neither contains "FAIL", so a job sitting on disk unbootstrapped, or a
+        # launchctl call that errored, printed a status line in the report and
+        # reached neither `issues`, nor the email, nor --fix. That is precisely
+        # the failure this section exists to catch, and on 2026-09-07 it was the
+        # live one: the db-pull agent stopped running for a day and a half.
+        if status not in ("OK", "RUNNING", "MIGRATED"):
             issues.append(f"Job {desc}: {status}")
     # Every job MIGRATED means this host checked nothing: the plists are retired
     # and the systemd path only runs on the VPS. Nine "MIGRATED" lines otherwise
@@ -1700,6 +1744,18 @@ def build_report(checks, jobs, logs, sentinels, fix_actions):
     else:
         lines.append("ALL SYSTEMS HEALTHY")
     lines.append("=" * 55)
+
+    # Committed wrapper archive vs what this host actually runs. Drift in either
+    # direction is a fault: repo-ahead means a committed fix was never deployed,
+    # host-ahead means restoring from the repo would silently revert live code.
+    drifted = sorted(n for n, i in (wrappers or {}).items() if i.get("status") == "DRIFT")
+    if drifted:
+        lines.append("")
+        lines.append("WRAPPER DRIFT")
+        lines.append("-" * 55)
+        for name in drifted:
+            lines.append(f"  {name:<28} differs from ~/.local/bin")
+        issues.append("Wrapper archive differs from deployed: " + ", ".join(drifted))
 
     return "\n".join(lines), issues
 
@@ -1907,6 +1963,7 @@ def main():
     jobs = check_jobs()
     logs = check_sync_logs()
     sentinels = check_sentinels()
+    wrappers = check_wrapper_drift()
 
     # Detect fixable issues
     fixable = []
@@ -1931,7 +1988,7 @@ def main():
 
     fix_actions = auto_fix(fixable) if args.fix else []
 
-    text_report, issues = build_report(checks, jobs, logs, sentinels, fix_actions)
+    text_report, issues = build_report(checks, jobs, logs, sentinels, fix_actions, wrappers)
     print(text_report)
 
     # Before the email, not after: a send_email failure exits 1, and the ping is

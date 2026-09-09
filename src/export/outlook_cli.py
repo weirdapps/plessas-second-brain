@@ -6,8 +6,29 @@ to prevent silent Playwright pop-ups in cron context.
 """
 
 import json
+import os
+import shutil
 import subprocess
+from pathlib import Path
 from typing import Any
+
+
+def _resolve_outlook_cli() -> str:
+    """Absolute path to outlook-cli, not a bare name on the caller's PATH.
+
+    The binary lives in ~/.local/bin, which is on an interactive shell's PATH and
+    frequently not on a daemon's. MCP servers in particular run with a sanitized
+    PATH, so `outlook_live_search` raised a bare FileNotFoundError in most live
+    server processes: the one tool that exists to reach past a stale replica was
+    the one that could not run. Same override shape as SHAREPOINT_CLI_PATH.
+    """
+    override = os.environ.get("OUTLOOK_CLI_PATH")
+    if override:
+        return override
+    found = shutil.which("outlook-cli")
+    if found:
+        return found
+    return str(Path.home() / ".local" / "bin" / "outlook-cli")
 
 
 class OutlookCliError(Exception):
@@ -39,14 +60,27 @@ def run_outlook_cli(args: list[str], timeout_sec: int = 60) -> Any:
     if "--json" not in final_args:
         final_args.append("--json")
 
-    cmd = ["outlook-cli", *final_args]
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout_sec,
-        check=False,
-    )
+    cmd = [_resolve_outlook_cli(), *final_args]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except FileNotFoundError as e:
+        # A typed error saying what to do, not a bare FileNotFoundError that a
+        # caller reads as "no results".
+        raise OutlookCliError(
+            exit_code=127,
+            stderr=(
+                f"outlook-cli not found at {cmd[0]}. Install it, or set "
+                "OUTLOOK_CLI_PATH to its absolute path (this process does not "
+                "necessarily share an interactive shell's PATH)."
+            ),
+            retryable=False,
+        ) from e
 
     if result.returncode == 0:
         try:

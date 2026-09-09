@@ -4,7 +4,12 @@ Provides keyword search (FTS5), semantic search, preference recall,
 and context retrieval for Claude Code conversation history.
 """
 
+import logging
 import sqlite3
+
+from src.store.query import _sanitize_fts5_query
+
+logger = logging.getLogger(__name__)
 
 
 def search_conversations_keyword(
@@ -26,6 +31,13 @@ def search_conversations_keyword(
     """
     results = []
 
+    # Defang FTS5 operator syntax before every MATCH in this module. search_emails
+    # and search_attachments have always done this; these three sites did not, so
+    # any natural-language query raised OperationalError straight out of the MCP
+    # tool: a question mark is "fts5: syntax error near "?"", an ampersand the
+    # same, and a bare word after a hyphen becomes "no such column".
+    safe_query = _sanitize_fts5_query(query)
+
     # Search conversation-level summaries
     rows = conn.execute(
         """
@@ -38,7 +50,7 @@ def search_conversations_keyword(
         ORDER BY rank
         LIMIT ?
     """,
-        (query, limit),
+        (safe_query, limit),
     ).fetchall()
 
     seen_ids = set()
@@ -74,7 +86,7 @@ def search_conversations_keyword(
             ORDER BY rank
             LIMIT ?
         """,
-            (query, remaining * 2),
+            (safe_query, remaining * 2),
         ).fetchall()
 
         for r in rows:
@@ -253,7 +265,7 @@ def recall_preferences(
             ORDER BY rank
             LIMIT ?
         """,
-            (topic, limit),
+            (_sanitize_fts5_query(topic), limit),
         ).fetchall()
 
         seen = {r["preference"] for r in results}
@@ -268,8 +280,11 @@ def recall_preferences(
                     }
                 )
                 seen.add(r["fact"])
-    except Exception:
-        pass  # FTS may not have conversation-linked key_facts yet
+    except sqlite3.OperationalError as e:
+        # Narrow, and logged. A bare `except Exception: pass` here hid the same
+        # FTS5 syntax error that crashed search_conversations, so this branch
+        # silently contributed nothing for years and the caller could not tell.
+        logger.warning("recall_preferences FTS branch skipped: %s", e)
 
     # If no specific matches, return all preferences (they're all valuable)
     if not results:
@@ -286,6 +301,11 @@ def recall_preferences(
             (limit,),
         ).fetchall()
 
+        # Mark them. These rows are the most RECENT preferences, not preferences
+        # about `topic`: the topic is dropped from the query entirely. Unlabelled,
+        # three unrelated topics returned byte-identical lists and the caller read
+        # them as answers. `topic_match: False` is the whole difference between
+        # orientation and a wrong answer.
         for r in all_prefs:
             results.append(
                 {
@@ -294,6 +314,11 @@ def recall_preferences(
                     "date": r["started_at"],
                     "project": r["project_name"],
                     "conversation_summary": r["summary"],
+                    "topic_match": False,
+                    "note": (
+                        f"no preference recorded for '{topic}'; these are the most "
+                        "recent preferences overall, shown for orientation only"
+                    ),
                 }
             )
 

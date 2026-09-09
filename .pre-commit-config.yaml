@@ -18,9 +18,13 @@ repos:
       - id: check-added-large-files
         args: ['--maxkb=1000']
 
-  # Ruff - replaces black, isort, flake8
+  # Ruff - replaces black, isort, flake8.
+  # Keep this rev in lockstep with the pin in .github/workflows/ci.yml. It sat at
+  # v0.15.12 against CI's 0.15.13, and ruff's formatter is version-sensitive
+  # enough that the two can disagree, which shows up as a commit that passes
+  # locally and fails `ruff format --check` on the runner.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.12
+    rev: v0.15.13
     hooks:
       - id: ruff
         args: [--fix]

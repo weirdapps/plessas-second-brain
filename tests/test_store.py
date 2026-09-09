@@ -150,7 +150,7 @@ class TestSchema:
         conn.commit()
 
         # Check FTS5 table was populated
-        cursor = conn.execute("SELECT summary FROM emails_fts WHERE summary MATCH 'test'")
+        cursor = conn.execute("SELECT summary_f FROM emails_fts WHERE summary_f MATCH 'test'")
         result = cursor.fetchone()
         assert result is not None
         assert "Test email summary" in result[0]
@@ -164,7 +164,7 @@ class TestSchema:
         conn.commit()
 
         # Check FTS5 table was populated
-        cursor = conn.execute("SELECT fact FROM key_facts_fts WHERE fact MATCH 'decision'")
+        cursor = conn.execute("SELECT fact_f FROM key_facts_fts WHERE fact_f MATCH 'decision'")
         result = cursor.fetchone()
         assert result is not None
         assert "decision" in result[0].lower()
@@ -1048,7 +1048,7 @@ class TestFTS5Search:
             """
             SELECT e.message_id, e.summary
             FROM emails e
-            WHERE e.id IN (SELECT rowid FROM emails_fts WHERE summary MATCH 'migration')
+            WHERE e.id IN (SELECT rowid FROM emails_fts WHERE summary_f MATCH 'migration')
             """
         )
         results = cursor.fetchall()
@@ -1060,7 +1060,7 @@ class TestFTS5Search:
             """
             SELECT e.message_id, e.summary
             FROM emails e
-            WHERE e.id IN (SELECT rowid FROM emails_fts WHERE summary MATCH 'digital')
+            WHERE e.id IN (SELECT rowid FROM emails_fts WHERE summary_f MATCH 'digital')
             """
         )
         results = cursor.fetchall()
@@ -1094,7 +1094,7 @@ class TestFTS5Search:
             """
             SELECT kf.fact
             FROM key_facts kf
-            WHERE kf.id IN (SELECT rowid FROM key_facts_fts WHERE fact MATCH 'budget')
+            WHERE kf.id IN (SELECT rowid FROM key_facts_fts WHERE fact_f MATCH 'budget')
             """
         )
         results = cursor.fetchall()
@@ -1106,7 +1106,7 @@ class TestFTS5Search:
             """
             SELECT kf.fact
             FROM key_facts kf
-            WHERE kf.id IN (SELECT rowid FROM key_facts_fts WHERE fact MATCH 'timeline')
+            WHERE kf.id IN (SELECT rowid FROM key_facts_fts WHERE fact_f MATCH 'timeline')
             """
         )
         results = cursor.fetchall()

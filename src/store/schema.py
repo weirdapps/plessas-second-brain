@@ -467,6 +467,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_teams_last_pulled_at(conn)
     if current < 19:
         migrate_add_teams_ingest_disabled_at(conn)
+    if current < 20:
+        migrate_fold_greek_accents(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -1464,3 +1466,105 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
     return conn
+
+
+# (fts table, content table, [indexed columns]). Every FTS table in this store is
+# external-content, which is what makes the generated-column approach below work
+# uniformly: FTS5 reads its column values from the content table, including on
+# 'rebuild', so a VIRTUAL generated column is indexed exactly like a real one.
+_FOLDED_FTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("emails_fts", "emails", ("summary", "content")),
+    ("attachment_content_fts", "attachment_content", ("extracted_text", "summary")),
+    ("key_facts_fts", "key_facts", ("fact",)),
+    ("calendar_events_fts", "calendar_events", ("subject", "body_summary")),
+    ("teams_messages_fts", "teams_messages", ("content_text", "sender_display_name")),
+    ("teams_threads_fts", "teams_threads", ("title", "summary")),
+    ("conversations_fts", "conversations", ("summary", "topics_summary")),
+    ("conversation_turns_fts", "conversation_turns", ("summary", "content")),
+)
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?", (name,)
+        ).fetchone()
+        is not None
+    )
+
+
+def migrate_fold_greek_accents(conn: sqlite3.Connection) -> None:
+    """v20: index Greek text with the tonos stripped, so unaccented queries work.
+
+    unicode61 case-folds but does not strip the Greek tonos, and
+    `remove_diacritics 2` does not either (measured on SQLite 3.53.4). So the
+    index held "παρουσίαση" and a search for "παρουσιαση" returned about 3% of
+    the true matches. Most of this corpus is Greek and Greeks routinely type
+    without accents, so the loss was large and completely silent.
+
+    The folded text lives in VIRTUAL generated columns, which cost NO storage:
+    SQLite computes them on read. That matters here, because `emails.content`
+    alone is 1.1 GB, so a materialised folded duplicate would have grown the
+    database by roughly a third, on every replica and inside every offsite
+    snapshot.
+
+    It also has to be a generated column rather than folding inside the triggers.
+    An external-content FTS5 'rebuild' reads the content table directly and
+    bypasses triggers entirely, so trigger-side folding would be silently undone
+    by the next rebuild. A generated column is read by rebuild like any other.
+
+    Both sides fold: src/store/greek.fold() is applied to the query string, and
+    fold_sql_expr() generates the identical replace() chain used here.
+    """
+    from src.store.greek import fold_sql_expr
+
+    for fts, table, columns in _FOLDED_FTS:
+        if not _table_exists(conn, table) or not _table_exists(conn, fts):
+            continue
+        # table_xinfo, NOT table_info: table_info omits hidden columns, and a
+        # VIRTUAL generated column is hidden. With table_info the guard below
+        # could never see the columns it had just added, so a second run of this
+        # migration raised "duplicate column name" instead of being a no-op.
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_xinfo({table})")}
+        folded = [f"{c}_f" for c in columns]
+        if all(f in existing for f in folded):
+            continue  # already migrated
+
+        for col, fcol in zip(columns, folded, strict=True):
+            if fcol not in existing:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {fcol} TEXT "
+                    f"GENERATED ALWAYS AS ({fold_sql_expr(col)}) VIRTUAL"
+                )
+
+        # Recreate the index over the folded columns, and its triggers with it.
+        # The trigger bodies must name the SAME columns the FTS declares, or the
+        # 'delete' rows will not match what was inserted.
+        for suffix in ("ai", "ad", "au"):
+            conn.execute(f"DROP TRIGGER IF EXISTS {table}_{suffix}")
+        conn.execute(f"DROP TABLE IF EXISTS {fts}")
+        cols_sql = ", ".join(folded)
+        conn.execute(
+            f"CREATE VIRTUAL TABLE {fts} USING fts5({cols_sql}, "
+            f"content='{table}', content_rowid='id')"
+        )
+        new_list = ", ".join(folded)
+        new_vals = ", ".join(f"new.{f}" for f in folded)
+        old_vals = ", ".join(f"old.{f}" for f in folded)
+        conn.execute(
+            f"CREATE TRIGGER {table}_ai AFTER INSERT ON {table} BEGIN "
+            f"INSERT INTO {fts}(rowid, {new_list}) VALUES (new.id, {new_vals}); END"
+        )
+        conn.execute(
+            f"CREATE TRIGGER {table}_ad AFTER DELETE ON {table} BEGIN "
+            f"INSERT INTO {fts}({fts}, rowid, {new_list}) "
+            f"VALUES('delete', old.id, {old_vals}); END"
+        )
+        conn.execute(
+            f"CREATE TRIGGER {table}_au AFTER UPDATE ON {table} BEGIN "
+            f"INSERT INTO {fts}({fts}, rowid, {new_list}) "
+            f"VALUES('delete', old.id, {old_vals}); "
+            f"INSERT INTO {fts}(rowid, {new_list}) VALUES (new.id, {new_vals}); END"
+        )
+        conn.execute(f"INSERT INTO {fts}({fts}) VALUES('rebuild')")
+    conn.commit()

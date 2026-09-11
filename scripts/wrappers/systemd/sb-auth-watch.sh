@@ -111,12 +111,32 @@ hc_report() {  # hc_report <slug> <ok|fail>
     # function curled ${HC_PING_URL}/$1/fail straight past the gate. The config
     # read as active and governed nothing.
     #
-    # Cost, measured 2026-09-11: seven sb-auth-teams flaps in six days (api_flip
-    # 09-06 13:02, 09-08 10:35, 09-09 01:01, 09-09 15:32, 09-10 16:34, 09-11
-    # 01:03, 09-11 22:32), every one a transient that cleared on the next cycle.
-    # The 22:32 one was sb-teams-sync's teams-cli auth-renew racing this script's
-    # probe over the same Playwright profile: all four audiences failed in the
-    # same second and the renew returned in under 1s with empty stdout.
+    # Cost, measured 2026-09-11: seven sb-auth-teams down-flips in six days
+    # (api_flip, UTC: 09-06 13:02, 09-08 10:35, 09-09 01:01, 09-09 15:32,
+    # 09-10 16:34, 09-11 01:03, 09-11 22:32). They come in TWO SHAPES and N=2 is
+    # deliberately right for both, which is the whole argument for this gate:
+    #   short: 09-11 22:32:56 EEST latched and the very next probe was healthy.
+    #     One cycle. It should never have paged, and under N=2 it does not.
+    #   long:  09-11 01:03 UTC ran until 15:02 UTC. auth-watch.log holds THIRTEEN
+    #     consecutive teams latches from 11:32 to 14:41 EEST with no intervening
+    #     "health-check ok", outlook failing in lockstep. N=2 still pages for
+    #     this, on the second consecutive cycle, which is 1-2 minutes later
+    #     because this script runs from two schedules (its own 4-hourly timer
+    #     AND sb-outlook-sync's hourly pre-flight). Damping costs it ~2 minutes.
+    #
+    # AND THE RENEW ABOVE RESCUES NEITHER SHAPE, which is why the ping has to be
+    # damped rather than the failure prevented here. teams-cli auth-renew has
+    # succeeded ONCE in 295 attempts on this box since 2026-06-10, and
+    # outlook-cli auth-renew 0 times in 139. Headless renewal does not work at
+    # all; sync-tokens-to-vps.sh pushing from the Mac is the only thing that
+    # actually renews either surface. So every probe failure reaches the latch.
+    #
+    # An earlier version of this comment blamed the 22:32 event on sb-teams-sync
+    # racing this script over the Playwright profile. That was WRONG and is
+    # recorded here so it is not re-derived: 156 of the 294 renew failures fall
+    # in the :00-:04 tick band where sb-teams-sync provably is not running, and
+    # the single success took 42s while every failure returns instantly. Instant
+    # failure is the broken path, not a contended one.
     #
     # THE BIAS STAYS TOWARDS ALERTING, matching hc-failstreak.sh's own rule that
     # every uncertain path exits 0. A missing or non-executable gate pings; it

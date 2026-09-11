@@ -42,6 +42,7 @@ GCLOUD_SENTINEL="$HOME/.second-brain/needs_gcloud_reauth"
 LOG_DIR="$HOME/.second-brain/logs"
 LOG="$LOG_DIR/auth-watch.log"
 TRIGGERED_LOG="$LOG_DIR/auth-triggered.log"
+RENEW_ERR_LOG="$LOG_DIR/auth-renew-stderr.log"
 MIN_HOURS_BEFORE_NOTIFY=1   # notify + sentinel when <1h to expiry
 GCLOUD_AUTO_LOGIN="$HOME/scripts/gcloud-auto-login.sh"
 WRAPPER_DIR="$HOME/.local/bin"
@@ -160,30 +161,53 @@ notify_gcloud_reauth() {
 }
 
 # --- Silent renew helper (returns 0 on success, non-zero on failure) ---
+#
+# WHY STDERR IS KEPT. `2>/dev/null` used to be here, on the reasoning below that
+# the diagnostic prints confuse jq. They do, which is why stdout is still parsed
+# alone — but discarding stderr threw away the only account of WHY a renew
+# failed. On 2026-09-11 this path had 319 `silent renew failed (stdout: )` lines
+# against 1 success, every one of them empty, and the two red timers that
+# prompted the audit could not be diagnosed past "the renew does not work".
+# Stderr now goes to auth-renew-stderr.log, which already exists for exactly
+# this purpose and stopped being written on 2026-09-03.
+#
+# The elapsed time is logged because it is the one field that separates the two
+# failure modes: a renew that runs and times out takes 30-90s, while one that
+# never started (busy profile, missing DISPLAY, bad flag) returns in under a
+# second. Those need opposite responses and looked identical in the old line.
+_renew_stderr_note() {   # $1 = surface, $2 = elapsed seconds, $3 = stderr file
+  { printf '===== %s %s (%ss, FAILED) =====\n' "$(ts)" "$1" "$2"; cat "$3"; } >> "$RENEW_ERR_LOG"
+  printf '%s' "$(tr '\n' ' ' < "$3" | tail -c 300)"
+}
+
 try_silent_renew_outlook() {
   log "outlook: attempting silent auth-renew (headless via persistent profile)"
-  # Capture stdout only — stderr from auth-renew is noisy diagnostic prints
-  # (bearer-seen, navigated to ..., etc.) that confuse jq downstream.
-  local renew_stdout
-  if renew_stdout=$(outlook-cli auth-renew 2>/dev/null); then
-    log "outlook: silent renew OK — $(echo "$renew_stdout" | jq -r '"expires=" + .tokenExpiresAt + " durationMs=" + (.durationMs | tostring)' 2>/dev/null || echo 'ok-but-output-unparseable')"
+  local renew_stdout err t0 elapsed
+  err=$(mktemp); t0=$SECONDS
+  if renew_stdout=$(outlook-cli auth-renew 2>"$err"); then
+    log "outlook: silent renew OK in $(( SECONDS - t0 ))s — $(echo "$renew_stdout" | jq -r '"expires=" + .tokenExpiresAt + " durationMs=" + (.durationMs | tostring)' 2>/dev/null || echo 'ok-but-output-unparseable')"
+    rm -f "$err"
     return 0
-  else
-    log "outlook: silent renew failed (stdout: $(echo "$renew_stdout" | head -c 300))"
-    return 1
   fi
+  elapsed=$(( SECONDS - t0 ))
+  log "outlook: silent renew failed in ${elapsed}s (stdout: $(echo "$renew_stdout" | head -c 200)) (stderr: $(_renew_stderr_note outlook "$elapsed" "$err"))"
+  rm -f "$err"
+  return 1
 }
 
 try_silent_renew_teams() {
   log "teams: attempting silent auth-renew (headless via persistent profile)"
-  local renew_stdout
-  if renew_stdout=$(teams-cli auth-renew 2>/dev/null); then
-    log "teams: silent renew OK — $(echo "$renew_stdout" | jq -r '"audiencesCaptured=" + (.audiencesCaptured | tostring) + " durationMs=" + (.durationMs | tostring)' 2>/dev/null || echo 'ok-but-output-unparseable')"
+  local renew_stdout err t0 elapsed
+  err=$(mktemp); t0=$SECONDS
+  if renew_stdout=$(teams-cli auth-renew 2>"$err"); then
+    log "teams: silent renew OK in $(( SECONDS - t0 ))s — $(echo "$renew_stdout" | jq -r '"audiencesCaptured=" + (.audiencesCaptured | tostring) + " durationMs=" + (.durationMs | tostring)' 2>/dev/null || echo 'ok-but-output-unparseable')"
+    rm -f "$err"
     return 0
-  else
-    log "teams: silent renew failed (stdout: $(echo "$renew_stdout" | head -c 300))"
-    return 1
   fi
+  elapsed=$(( SECONDS - t0 ))
+  log "teams: silent renew failed in ${elapsed}s (stdout: $(echo "$renew_stdout" | head -c 200)) (stderr: $(_renew_stderr_note teams "$elapsed" "$err"))"
+  rm -f "$err"
+  return 1
 }
 
 # --- Outlook auth probe ---

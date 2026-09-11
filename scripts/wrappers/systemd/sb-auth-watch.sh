@@ -133,7 +133,7 @@ hc_report() {  # hc_report <slug> <ok|fail>
     #
     # An earlier version of this comment blamed the 22:32 event on sb-teams-sync
     # racing this script over the Playwright profile. That was WRONG and is
-    # recorded here so it is not re-derived: 156 of the 294 renew failures fall
+    # recorded here so it is not re-derived: 164 of the 294 renew failures fall
     # in the :00-:04 tick band where sb-teams-sync provably is not running, and
     # the single success took 42s while every failure returns instantly. Instant
     # failure is the broken path, not a contended one.

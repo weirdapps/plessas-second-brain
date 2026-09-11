@@ -97,8 +97,41 @@ fi
 [ -r "$HOME/.config/healthchecks-ping.env" ] && . "$HOME/.config/healthchecks-ping.env"
 hc_report() {  # hc_report <slug> <ok|fail>
   [ -n "${HC_PING_URL:-}" ] || return 0
-  local suffix=""
-  [ "$2" = "fail" ] && suffix="/fail"
+  local suffix="" state="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hc-failstreak/$1"
+  if [ "$2" = "fail" ]; then
+    # ROUTE THE FAIL PING THROUGH THE SAME GATE THE SYSTEMD PATH USES.
+    #
+    # ~/.config/hc-failstreak.conf lists sb-auth-teams, sb-auth-outlook and
+    # sb-auth-gcloud at N=2, and that damping has NEVER applied to any of the
+    # three. It is an ExecCondition= on the hc-fail@ TEMPLATE
+    # (hc-fail@.service.d/zz-failstreak.conf), so it only gates pings emitted by
+    # OnFailure=hc-fail@<unit>. These three are SLUGS, not units: no
+    # sb-auth-teams.service exists, they are pinged only from here, and this
+    # function curled ${HC_PING_URL}/$1/fail straight past the gate. The config
+    # read as active and governed nothing.
+    #
+    # Cost, measured 2026-09-11: seven sb-auth-teams flaps in six days (api_flip
+    # 09-06 13:02, 09-08 10:35, 09-09 01:01, 09-09 15:32, 09-10 16:34, 09-11
+    # 01:03, 09-11 22:32), every one a transient that cleared on the next cycle.
+    # The 22:32 one was sb-teams-sync's teams-cli auth-renew racing this script's
+    # probe over the same Playwright profile: all four audiences failed in the
+    # same second and the renew returned in under 1s with empty stdout.
+    #
+    # THE BIAS STAYS TOWARDS ALERTING, matching hc-failstreak.sh's own rule that
+    # every uncertain path exits 0. A missing or non-executable gate pings; it
+    # never suppresses. Only an explicit "suppressed" verdict holds the ping back.
+    if [ -x "$HOME/.local/bin/hc-failstreak.sh" ] \
+       && ! "$HOME/.local/bin/hc-failstreak.sh" "$1"; then
+      return 0
+    fi
+    suffix="/fail"
+  else
+    # Mirror hc-success@.service.d/zz-failstreak-clear.conf, which does exactly
+    # this for the systemd path: a success clears the counter, so N counts
+    # CONSECUTIVE failures. Without this the streak is a lifetime tally and the
+    # second failure of the month alerts as if it were the second in a row.
+    rm -f "$state" 2>/dev/null || true
+  fi
   curl -fsS -m 10 --retry 2 -o /dev/null "${HC_PING_URL}/$1${suffix}?create=1" 2>/dev/null || true
   return 0
 }

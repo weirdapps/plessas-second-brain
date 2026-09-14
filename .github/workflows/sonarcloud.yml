@@ -35,7 +35,7 @@ jobs:
       # green check reporting 0.0% coverage, and the log said nothing about why.
       # The comment above records that happening once already. A coverage number
       # nobody can trust is worse than no coverage job.
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
         with:
           enable-cache: true
       - name: Install dependencies

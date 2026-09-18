@@ -58,7 +58,27 @@ if [ -f "$SENTINEL" ]; then
   # fresh the database was surfaced it.
   # The sentinel clears only on a successful auth-watch renew or an interactive
   # `outlook-cli login`, so the honest signal while it is latched is RED.
-  exit 75
+  #
+  # 69 (EX_UNAVAILABLE) rather than 75 (EX_TEMPFAIL), for the reason
+  # sb-teams-sync.sh now records at its own sentinel branch, and this unit is
+  # the more exposed of the two: retry.conf here carries Restart=on-failure with
+  # StartLimitBurst=2 in a 30min window, and this branch exits in under a
+  # second, so TWO of them spend the whole budget in about ninety seconds. Every
+  # start requested inside the rest of that window is then refused with "Start
+  # request repeated too quickly" -- including the one sb-auth-watch issues the
+  # moment it renews the session, which is precisely the start that matters.
+  # This unit fires seventeen times a day, so it meets the window far more often
+  # than teams-sync does.
+  #
+  # A restart could never have helped here either: the sentinel is owned by
+  # sb-auth-watch, whose timer is 4-hourly, so nothing ninety seconds from now
+  # changes this branch's answer.
+  #
+  # RestartPreventExitStatus=69 in retry.conf is the other half. The unit still
+  # goes failed and still fires OnFailure, so this stays RED; what stops is the
+  # pointless restart that eats the budget a real transient failure needs. 75
+  # keeps its meaning and its retry everywhere else in this script.
+  exit 69
 fi
 
 cd "$PROJECT"

@@ -50,15 +50,35 @@ fi
 # Pre-flight: skip if reauth needed
 if [ -f "$SENTINEL" ]; then
   echo "$(ts) — skip (reauth sentinel present)" >> "$LOG"
-  # exit 75 (EX_TEMPFAIL), not 0. Exiting 0 here made systemd record success,
-  # fired OnSuccess=hc-success@, and pinged the dead-man's switch GREEN once an
-  # hour while Teams ingest was dead. On 2026-09-01 that hid a 20-hour outage:
-  # nine green pings, brain.db frozen at 03:33, and every downstream consumer
+  # Non-zero, not 0. Exiting 0 here made systemd record success, fired
+  # OnSuccess=hc-success@, and pinged the dead-man's switch GREEN once an hour
+  # while Teams ingest was dead. On 2026-09-01 that hid a 20-hour outage: nine
+  # green pings, brain.db frozen at 03:33, and every downstream consumer
   # (search_teams, teams_chat_summary, meeting prep) silently serving stale data.
   # Same reasoning as the auth-renew branch below, which was fixed on 2026-08-10.
-  # The sentinel is only cleared by an interactive `teams-cli login`, so the
-  # correct signal is RED, not silence.
-  exit 75
+  # The correct signal is RED, not silence.
+  #
+  # 69 (EX_UNAVAILABLE) rather than 75 (EX_TEMPFAIL), and the distinction is the
+  # retry budget. retry.conf carries Restart=on-failure with StartLimitBurst=3
+  # in a 1800s window, sized on the assumption that an attempt costs
+  # "timeout + 90s". THIS branch costs under a second, so three of them burn the
+  # entire budget in 92 seconds, and the next start systemd is asked for is
+  # refused outright with "Start request repeated too quickly".
+  #
+  # Observed 2026-09-18. The sentinel skips at 22:32:03 and 22:33:33 spent the
+  # budget; sb-auth-watch's health-check passed at 22:33:44, cleared the
+  # sentinel, and its start at 22:33:45 was rejected. The unit then sat failed
+  # for an hour holding a token that was valid the whole time.
+  #
+  # Retrying is pointless here anyway, which is what makes 69 honest rather than
+  # merely convenient: the sentinel is owned by sb-auth-watch and cleared only
+  # when ITS probe next succeeds, and that timer is 4-hourly. Nothing a restart
+  # 90 seconds from now can do will change this branch's answer.
+  #
+  # RestartPreventExitStatus=69 in retry.conf is the other half. The unit still
+  # goes failed and still fires OnFailure, so this stays RED; what it stops is
+  # the pointless restart that eats the budget a real transient failure needs.
+  exit 69
 fi
 
 # Pre-flight: skip if gcloud ADC expired (Vertex AI extraction would fail).

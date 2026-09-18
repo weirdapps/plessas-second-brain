@@ -165,6 +165,35 @@ if [ -n "$cdhash_problem" ]; then
   note_failure "$cdhash_problem"
 fi
 
+# Resolve the document root instead of assuming ~/Documents reaches OneDrive.
+#
+# This used to read "$HOME/Documents/$tree" unconditionally, which worked only
+# while ~/Documents was a symlink into OneDrive. On 2026-09-08 that symlink went
+# away and macOS recreated ~/Documents as an ordinary local folder, so both roots
+# silently became MISSING. Nothing reported it, because the job had already been
+# disabled in launchd the day before by the 2026-09-07 role split, so it never
+# ran to log the skip.
+#
+# ~/Documents cannot simply be symlinked back: it carries the macOS special-folder
+# ACL "group:everyone deny delete", so rename and replace are refused even with
+# Full Disk Access. The canonical CloudStorage path is therefore the primary, with
+# the legacy symlink layout kept as a fallback so this works either way.
+for candidate in \
+  "$HOME/Library/CloudStorage/OneDrive-Personal/Documents" \
+  "$HOME/Documents"; do
+  if [ -d "$candidate/National" ] || [ -d "$candidate/Personal" ]; then
+    DOCROOT="$candidate"
+    break
+  fi
+done
+if [ -z "${DOCROOT:-}" ]; then
+  log "ABORT: no document root found; tried CloudStorage/OneDrive-Personal/Documents and ~/Documents"
+  note_failure "no document root found"
+  cdhash_problem="${cdhash_problem:-no document root}"
+else
+  log "document root: $DOCROOT"
+fi
+
 for tree in National Personal; do
   # A cdhash mismatch is fatal for the whole run rather than for one tree:
   # every transfer below would hit the same missing grant.
@@ -172,7 +201,7 @@ for tree in National Personal; do
     break
   fi
 
-  src="$HOME/Documents/$tree"
+  src="$DOCROOT/$tree"
 
   # Refuse to sync a tree that is not present. OneDrive can transiently unmount;
   # syncing "nothing" is harmless here only because we never pass --delete.

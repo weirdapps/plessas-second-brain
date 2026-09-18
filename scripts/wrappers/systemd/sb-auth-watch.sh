@@ -472,7 +472,31 @@ trigger_job() {
   # 54s (survived), but 2026-08-10 01:00 parent 42s vs a ~55s child (would have
   # been killed). As its own probe-only unit this script exits in well under a
   # minute, so the fallback would lose that race nearly every time.
+  #
+  # reset-failed BEFORE the start, or this trigger is a no-op in the only case
+  # it exists for. systemd refuses a start once StartLimitBurst is spent inside
+  # StartLimitIntervalSec, and `--no-block` means the refusal never reaches our
+  # exit status: the queued job is rejected later, the log line below still says
+  # "started", and nothing runs. reset-failed clears the failed state AND the
+  # rate-limit counter, which is the half that matters here.
+  #
+  # Observed on the VPS 2026-09-18. sb-teams-sync carries Restart=on-failure
+  # with StartLimitBurst=3 in a 1800s window, sized on the assumption that an
+  # attempt costs "timeout + 90s". A reauth-sentinel skip does not: it exits 75
+  # in under a second, so three of them burn the whole budget in 92 seconds.
+  #   22:32:03  timer fires, sentinel present, exit 75
+  #   22:33:33  restart 1, sentinel still present, exit 75
+  #   22:33:44  this script's health-check passes, sentinel cleared
+  #   22:33:45  this script calls start -> "Start request repeated too quickly"
+  # The unit then sat failed for the next hour with a perfectly good token,
+  # holding three estate rows red (the timer, vps:health:failed-units, and the
+  # sb-teams-sync dead-man), and our own log claimed we had started it.
+  #
+  # Ignore the exit status deliberately: reset-failed on a healthy unit is a
+  # no-op that returns 0, and on a unit that vanished it returns non-zero, which
+  # is the `start` below's problem to report, not a reason to skip the start.
   if [ -n "$unit" ] && command -v systemctl >/dev/null 2>&1 \
+     && { systemctl --user reset-failed "$unit" 2>/dev/null || true; } \
      && systemctl --user start --no-block "$unit" 2>/dev/null; then
     log "auth-trigger: started $unit via systemd (reason=$reason)"
   elif [ -n "$label" ] && command -v launchctl >/dev/null 2>&1 \

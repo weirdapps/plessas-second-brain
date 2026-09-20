@@ -29,6 +29,14 @@ dependencies = [
     # Legacy Excel (.xls); xlrd 2.0+ dropped .xlsx support, focuses exclusively on .xls
     "xlrd>=2.0.1",
     "pillow-heif>=1.5.0",
+    # Security pin. Not needed by anything here directly: anyio arrives transitively
+    # via anthropic and mcp, and uv.lock has held a fixed version since #70 bumped it
+    # to 4.14.2. It is declared anyway because the VPS deploy hook is
+    # `pip install -e .` with no --upgrade, which resolves THESE specifiers and never
+    # reads uv.lock. Measured 2026-09-20: #70 merged green, the lock said 4.14.2, and
+    # ~/.venvs/second-brain was still running 4.13.0 - the exact version the PR was
+    # raised to get off. Declaring it is what makes the fix ship.
+    "anyio>=4.14.2",  # CVE-2026-63374 CRITICAL + CVE-2026-64847; fixed in 4.14.2
 ]
 
 [project.optional-dependencies]

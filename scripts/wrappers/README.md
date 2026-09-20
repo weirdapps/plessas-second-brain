@@ -26,7 +26,7 @@ cp ~/.local/bin/sb-db-pull.sh ~/.local/bin/sync-documents-to-vps.sh \
 ## Layout
 
 | Directory | Host | Scheduler | Count |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `systemd/` | VPS | `systemctl --user` timers | 13 |
 | `launchd/` | Mac | LaunchAgents | 3 |
 

@@ -24,7 +24,7 @@ repos:
   # enough that the two can disagree, which shows up as a commit that passes
   # locally and fails `ruff format --check` on the runner.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.13
+    rev: v0.16.8
     hooks:
       - id: ruff
         args: [--fix]

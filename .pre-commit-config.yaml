@@ -5,7 +5,7 @@
 repos:
   # Standard pre-commit hooks
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: v6.0.0
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
@@ -32,7 +32,7 @@ repos:
 
   # MyPy - type checking
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.13.0
+    rev: v2.3.1
     hooks:
       - id: mypy
         # --follow-imports=silent: type-check the changed file(s), but don't
@@ -47,13 +47,13 @@ repos:
 
   # Gitleaks - secret scanning
   - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.21.2
+    rev: v8.30.0
     hooks:
       - id: gitleaks
 
   # YAML linting for GitHub Actions
   - repo: https://github.com/adrienverge/yamllint
-    rev: v1.35.1
+    rev: v1.38.0
     hooks:
       - id: yamllint
         args: [--strict, -d, '{extends: default, rules: {line-length: {max: 120}, document-start: disable}}']
@@ -61,7 +61,7 @@ repos:
 
   # Markdown linting
   - repo: https://github.com/igorshubovych/markdownlint-cli
-    rev: v0.43.0
+    rev: v0.49.1
     hooks:
       - id: markdownlint
         args: [--config, .markdownlint.yaml]

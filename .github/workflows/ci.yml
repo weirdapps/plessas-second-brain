@@ -32,7 +32,7 @@ jobs:
       # --only-binary so pip refuses to execute a setup.py during the lint
       # install, matching the --no-build the uv steps use. Quoted because
       # ':all:' would otherwise be read as a YAML mapping.
-      - run: "pip install --only-binary :all: ruff==0.15.13"
+      - run: "pip install --only-binary :all: ruff==0.16.8"
       - run: ruff check .
       - run: ruff format --check .
   test:

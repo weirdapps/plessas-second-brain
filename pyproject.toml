@@ -9,7 +9,11 @@ dependencies = [
     # repo and was only ever supplying google-genai by transitive accident.
     "google-genai>=1.66.0",
     # 0.120.2 is the first release whose mcp extra allows mcp SDK v2 (0.120.1 pinned <2).
-    "anthropic[vertex]>=0.122.0",
+    # 1.x moved the HTTP layer from httpx to httpx2 and raised the Python floor to
+    # 3.10; nothing here was affected (no .with_raw_response, no Text Completions, no
+    # temperature/top_p/top_k, and src/extract/web_ingest.py's httpx use never crosses
+    # the SDK boundary). Floor raised so a fresh resolve cannot land back on 0.x.
+    "anthropic[vertex]>=1.7.0",
     "numpy>=2.5.2",
     # v2 removed mcp.server.fastmcp; the server uses mcp.server.MCPServer.
     "mcp[cli]>=2.0.0",

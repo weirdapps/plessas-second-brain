@@ -25,7 +25,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.config import ATTACHMENTS_DIR, DEFAULT_DB, NEWS_DB_PATH, SHAREPOINT_HOST  # noqa: E402
+from src.config import (  # noqa: E402
+    ATTACHMENTS_DIR,
+    DEFAULT_DB,
+    NEWS_DB_PATH,
+    SHAREPOINT_HOST,
+    document_roots,
+)
 from src.export.outlook_attachments import (  # noqa: E402
     ORPHAN_GRACE_DAYS,
     is_abandoned_orphan,
@@ -38,11 +44,9 @@ LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 SHAREPOINT_SESSION = Path.home() / ".sharepoint-cli" / "session.json"
 
 # Reverse-ingest input side: the roots cmd_reverse_ingest scans and the
-# extensions it ingests. Kept in sync with src/cli.py:cmd_reverse_ingest.
-DOCUMENT_ROOTS = [
-    Path("~/Documents/National").expanduser(),
-    Path("~/Documents/Personal").expanduser(),
-]
+# extensions it ingests. Both sides call the same resolver, so the check cannot
+# end up watching a directory the job does not scan.
+DOCUMENT_ROOTS = document_roots()
 INGESTABLE_EXTENSIONS = {".pdf", ".pptx", ".xlsx", ".docx", ".md", ".txt"}
 
 # Heartbeat written by the laptop-side push job after every successful push

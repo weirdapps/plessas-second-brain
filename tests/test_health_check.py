@@ -740,9 +740,26 @@ def test_check_document_roots_empty_root_is_warn(hc, tmp_path):
 
 def test_check_document_roots_defaults_match_reverse_ingest(hc):
     """Defaults must be the roots cmd_reverse_ingest scans, else the check
-    watches a different source than the job it is meant to police."""
+    watches a different source than the job it is meant to police. Both sides
+    now go through one resolver, because the two layouts (OneDrive CloudStorage
+    on the Mac, plain ~/Documents on the VPS) cannot both be hardcoded."""
+    from src.config import document_roots
+
     assert [p.name for p in hc.DOCUMENT_ROOTS] == ["National", "Personal"]
-    assert all(p.parent == Path.home() / "Documents" for p in hc.DOCUMENT_ROOTS)
+    assert hc.DOCUMENT_ROOTS == document_roots()
+
+
+def test_check_document_roots_defaults_are_not_pinned_to_legacy_documents(hc):
+    """Regression for 2026-09-08: ~/Documents stopped reaching OneDrive on this
+    Mac, and the hardcoded default made the check report MISSING for two weeks
+    while the push job, which resolves the path, was working fine."""
+    import sys
+
+    from src.config import DOCUMENT_ROOT_CANDIDATES
+
+    assert all(p.parent in DOCUMENT_ROOT_CANDIDATES for p in hc.DOCUMENT_ROOTS)
+    if sys.platform == "darwin" and (DOCUMENT_ROOT_CANDIDATES[0] / "National").is_dir():
+        assert hc.DOCUMENT_ROOTS[0].parent == DOCUMENT_ROOT_CANDIDATES[0]
 
 
 # --- Document sync heartbeat -------------------------------------------------

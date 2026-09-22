@@ -15,6 +15,7 @@ from src.config import (
     EXTRACT_ENGINE,
     IMAGE_CLASSIFY_BUDGET_S,
     NEWS_DB_PATH,
+    document_roots,
 )
 from src.llm_deadline import install_llm_deadline_for_this_process
 
@@ -541,10 +542,7 @@ def cmd_reverse_ingest(args):
 
     roots = [Path(r).expanduser().resolve() for r in (args.root or [])]
     if not roots:
-        roots = [
-            Path("~/Documents/National").expanduser(),
-            Path("~/Documents/Personal").expanduser(),
-        ]
+        roots = document_roots()
 
     print(f"Scanning {len(roots)} root(s):")
     for r in roots:
@@ -2172,7 +2170,7 @@ def main():
         "--root",
         action="append",
         type=Path,
-        help="Directory to scan (repeatable; defaults to ~/Documents/National + ~/Documents/Personal)",
+        help="Directory to scan (repeatable; defaults to the National + Personal trees under the resolved document root)",
     )
     parser_reverse.add_argument(
         "--workers",

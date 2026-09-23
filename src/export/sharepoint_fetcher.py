@@ -12,6 +12,7 @@ sharepoint_links table and the sharepoint_index MCP tool are unaffected.
 """
 
 import logging
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -31,6 +32,8 @@ from src.export.sharepoint_cli import (
 
 logger = logging.getLogger(__name__)
 
+_BARE_HOST = re.compile(r"[a-z0-9-]+(\.[a-z0-9-]+)+")
+
 
 def managed_sharepoint_hosts(managed_host: str) -> frozenset[str]:
     """The tenant host we hold a session for, plus its OneDrive twin.
@@ -40,9 +43,12 @@ def managed_sharepoint_hosts(managed_host: str) -> frozenset[str]:
     either spelling of the setting yields both.
     """
     host = (managed_host or "").strip().lower()
-    label, dot, rest = host.partition(".")
-    if not label or not dot:
+    # A bare host only. Anything else (an inline comment, a scheme, a path)
+    # would become a tenant no URL can ever match, and every real link would be
+    # refused and parked; an empty set makes the caller refuse to run instead.
+    if not _BARE_HOST.fullmatch(host):
         return frozenset()
+    label, _dot, rest = host.partition(".")
     base = label.removesuffix("-my")
     return frozenset({f"{base}.{rest}", f"{base}-my.{rest}"})
 
@@ -172,7 +178,10 @@ def fetch_sharepoint_link(
         from src import config
 
         managed_host = config.SHAREPOINT_HOST
-    host = host_for_url(url)
+    try:
+        host = host_for_url(url)
+    except ValueError as err:  # urlparse rejects e.g. an unclosed "[": never raise
+        return SharepointFetchResult(url=url, status="exception", error_message=str(err))
     if not host:
         return SharepointFetchResult(
             url=url, status="exception", error_message=f"cannot derive host from URL: {url}"

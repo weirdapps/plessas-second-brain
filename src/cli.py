@@ -390,9 +390,11 @@ def cmd_process_sharepoint(args):
     # variable was never set; refuse loudly instead. A dry run fetches nothing.
     import os
 
-    if not args.dry_run and not os.environ.get("SHAREPOINT_HOST"):
+    from src.export.sharepoint_fetcher import managed_sharepoint_hosts
+
+    if not args.dry_run and not managed_sharepoint_hosts(os.environ.get("SHAREPOINT_HOST", "")):
         print(
-            "Error: SHAREPOINT_HOST is not set. Set it (environment or "
+            "Error: SHAREPOINT_HOST is not set to a bare host. Set it (environment or "
             "~/.config/second-brain/env) to the tenant sharepoint-cli is logged in to.",
             file=sys.stderr,
         )

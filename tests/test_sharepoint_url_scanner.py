@@ -278,3 +278,16 @@ def test_a_previously_fetched_link_that_went_stale_is_still_retried():
     db.commit()
 
     assert _selected(db) == ["https://x/changed"]
+
+
+def test_a_url_urlparse_rejects_is_skipped_not_fatal():
+    """'[' opens an IPv6 literal to urlparse, which raises ValueError. The nightly
+    scan called it unguarded, so one email carrying such a link killed the pass
+    every night and starved every older email behind it."""
+    from src.extract.sharepoint_url_scanner import extract_sharepoint_urls
+
+    out = extract_sharepoint_urls(
+        "see https://[x.sharepoint.com/doc.docx and https://x.sharepoint.com/ok.docx today"
+    )
+
+    assert out == ["https://x.sharepoint.com/ok.docx"]

@@ -101,14 +101,32 @@ fi
 # generic checks read history WITHOUT this script, whose own text is full of the
 # patterns, and the denylist checks read it WITH the script, because an earlier
 # version of this very file carried the denylist inline.
+#
+# --all covers local refs only. A pull request's head stays reachable on GitHub
+# through refs/pull/N/head, merged or closed, and survives a history rewrite, so
+# those heads are fetched into temporary refs for the run and deleted after it.
+# --full-history on the pathspec'd stream: without it git simplifies history and
+# skips the side of a merge that ends tree-identical, which is exactly where
+# content added and removed inside a merged PR lives.
 if [ "$MODE" = "history" ]; then
   HISTORY_ALL=$(mktemp)
   HISTORY_NOSELF=$(mktemp)
   HISTORY_NAMES=$(mktemp)
-  trap 'rm -f "$HISTORY_ALL" "$HISTORY_NOSELF" "$HISTORY_NAMES"' EXIT
+  cleanup_history() {
+    rm -f "$HISTORY_ALL" "$HISTORY_NOSELF" "$HISTORY_NAMES"
+    git for-each-ref --format='%(refname)' refs/gauntlet-pr/ | while read -r ref; do
+      git update-ref -d "$ref"
+    done
+  }
+  trap cleanup_history EXIT
+  if git remote get-url origin >/dev/null 2>&1; then
+    if ! git fetch -q --no-tags origin '+refs/pull/*/head:refs/gauntlet-pr/*' 2>/dev/null; then
+      echo "NOTE: could not fetch pull-request heads from origin; they are not scanned."
+    fi
+  fi
   git -c core.quotePath=false log --all -p -U0 --no-color --no-ext-diff \
     --format='commit %h' > "$HISTORY_ALL"
-  git -c core.quotePath=false log --all -p -U0 --no-color --no-ext-diff \
+  git -c core.quotePath=false log --all --full-history -p -U0 --no-color --no-ext-diff \
     --format='commit %h' -- . ':(exclude,glob)**/pii-gauntlet.sh' > "$HISTORY_NOSELF"
   git -c core.quotePath=false log --all --diff-filter=AR --name-only \
     --format='commit %h' > "$HISTORY_NAMES"
@@ -118,23 +136,28 @@ fi
 # Emit "<commit>:<added line>" for every line the diffs ADD, then filter. State
 # tracking rather than a "+++ " test, so an added line that happens to start
 # with "++" is still content. Filenames go through the same separator
-# normalisation scan_paths uses, reported as "<commit>:(filename)".
+# normalisation scan_paths uses, as "<commit>:<path>:(filename)", so the
+# placeholder exclusions still see the path; only the commit is ever printed.
 # awk runs under LC_ALL=C: history holds bytes that are not valid UTF-8 (a small
 # binary with no NUL byte is diffed as text), BSD awk aborts on them in a UTF-8
-# locale, and every pattern awk matches here is ASCII. grep keeps the caller's
-# locale, which the Greek checks below were measured under.
+# locale, and every pattern awk matches here is ASCII. iconv -c then drops the
+# invalid bytes rather than the line: a UTF-8 grep silently skips any line that
+# carries one, which hid every line of a legacy cp1253 or Latin-1 file. grep
+# keeps the caller's locale, which the Greek checks below were measured under.
 scan_history() {
   local pattern="$1"
   LC_ALL=C awk '/^commit [0-9a-f]+$/ { c = $2; hunk = 0; next }
        /^diff --git / { hunk = 0; next }
        /^@@ / { hunk = 1; next }
        hunk && /^\+/ { print c ":" substr($0, 2) }' "$HISTORY_SRC" \
+    | iconv -f UTF-8 -t UTF-8 -c \
     | grep -${CASE_FLAG}E "$pattern" 2>/dev/null || true
   LC_ALL=C awk '/^commit [0-9a-f]+$/ { c = $2; next } NF { print c "\t" $0 }' "$HISTORY_NAMES" \
     | LC_ALL=C awk -F'\t' '{ n = $2; gsub(/[_.-]/, " ", n); print $1 "\t" $2 "\t" n }' \
+    | iconv -f UTF-8 -t UTF-8 -c \
     | grep -${CASE_FLAG}E "$pattern" 2>/dev/null \
-    | cut -f1 \
-    | sed 's/$/:(filename)/' || true
+    | cut -f1,2 \
+    | LC_ALL=C awk -F'\t' '{ print $1 ":" $2 ":(filename)" }' || true
 }
 
 # Helper: get the tracked-vs-untracked status of a file.
@@ -579,6 +602,8 @@ else
   elif [ "$MODE" = "history" ]; then
     echo "Published history carries PII. Removing it means rewriting history and"
     echo "force-pushing, which is irreversible: an owner decision, not a fix to automate."
+    echo "After a rewrite, GitHub keeps old commits reachable through pull-request refs"
+    echo "and cached views until GitHub Support purges them."
   else
     echo "Fix the PII leaks above before any public push."
   fi

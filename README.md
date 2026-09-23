@@ -178,7 +178,7 @@ pip install -e ".[dev]"
 
 Read from environment variables. Only identity plus one extraction path (Vertex or Gemini) is strictly required.
 
-Identity and tenant settings (`BRAIN_*` and `SHAREPOINT_HOST`) can also live in a per-host file, `~/.config/second-brain/env` (override the path with `BRAIN_CONFIG_FILE`), one `KEY=value` per line. `src/config.py` applies it at import, and the environment wins over it. It exists because the processes that need these settings start without a login shell: Claude Code launches the MCP server with an empty environment, and systemd starts the timers with a fixed one. Other keys in the file are ignored, so a credential pasted into it is never picked up. Nothing reads a `.env` file; the schedulers that want one source it themselves.
+Four identity and tenant settings (`BRAIN_USER_NAME`, `BRAIN_USER_ROLE`, `BRAIN_USER_EMAIL_PATTERN`, `SHAREPOINT_HOST`) can also live in a per-host file, `~/.config/second-brain/env` (override the path with `BRAIN_CONFIG_FILE`), one `KEY=value` per line, `#` comments allowed. `src/config.py` applies it at import, and the environment wins over it. It exists because the processes that need these settings start without a login shell: Claude Code launches the MCP server with an empty environment, and systemd starts the timers with a fixed one. Any other key in the file is ignored, so a credential, a backend switch or a relocated data home pasted into it is never picked up. Nothing reads a `.env` file; the schedulers that want one source it themselves.
 
 ### Identity
 
@@ -449,7 +449,7 @@ Typical cadence: `sync` hourly, `embed` daily. `sync` does not cover every sourc
 
 Report vulnerabilities via GitHub's private vulnerability reporting. See `SECURITY.md`.
 
-Credentials are redacted on the way in (`src/redact.py`): every staging batch, extracted attachment text, Teams messages, and calendar bodies before they reach the model. Rows stored before that existed are cleaned with `python scripts/scrub_secrets.py --apply` on the host that builds the database, which also purges the old bytes from free pages and full-text segments. `scripts/pii-gauntlet.sh --mode=history` scans every line and filename ever committed, on every ref, against the same checks as CI plus the private denylist.
+Credentials are redacted on the way in (`src/redact.py`): every staging batch, extracted attachment text, Teams messages, and calendar bodies before they reach the model. Rows stored before that existed are cleaned with `python scripts/scrub_secrets.py --apply` on the host that builds the database, with the jobs that write it stopped. It rewrites them under `secure_delete` and optimizes every full-text index, which removes what the run itself frees; `--vacuum` also drops copies freed by earlier churn, and needs free space of about twice the database. Snapshots taken before the scrub keep the old rows until retention ages them out. `scripts/pii-gauntlet.sh --mode=history` scans every line and filename ever committed, on every ref and on the pull-request heads fetched from `origin`, against the same checks as CI plus the private denylist.
 
 ## License
 

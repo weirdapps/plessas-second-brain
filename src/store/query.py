@@ -463,6 +463,15 @@ def query_by_date_range(
     return [dict(row) for row in cursor.fetchall()]
 
 
+# A decision's date: its own when it is one, else its parent's. The extractor
+# writes free text too ('null', 'Q3 2026'), which sorted after every date and
+# fell to the bound that keeps meetings still to come from deciding anything.
+_DECISION_DATE = (
+    "COALESCE(CASE WHEN d.decision_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'"
+    " THEN d.decision_date END, e.date_received, tt.started_at, ce.start_at, c.started_at)"
+)
+
+
 def query_decisions(
     conn: sqlite3.Connection,
     topic: str | None = None,
@@ -496,13 +505,12 @@ def query_decisions(
     # display. The inner JOIN on emails dropped 13,785 decisions whose parent was
     # a Teams thread, a calendar event or a conversation turn, and the 4,674
     # calendar ones had no read path anywhere.
-    query = """
+    query = f"""
         SELECT
             d.id as decision_id,
             d.decision,
             d.decided_by,
-            COALESCE(d.decision_date, e.date_received, tt.started_at, ce.start_at,
-                     c.started_at) as date,
+            {_DECISION_DATE} as date,
             COALESCE(e.subject, tt.title, ce.subject, c.summary) as email_subject,
             CASE
                 WHEN e.id IS NOT NULL THEN 'email'
@@ -538,14 +546,16 @@ def query_decisions(
     if not include_news:
         where_clauses.append("(e.id IS NULL OR e.mailbox_name IS NULL OR e.mailbox_name <> 'News')")
 
+    # Nothing has been decided at a date still to come. A meeting next week
+    # returned its agenda as decisions, and dated by the meeting they sorted
+    # above every real one: on the replica, the whole first page.
+    where_clauses.append(f"{_DECISION_DATE} <= strftime('%Y-%m-%dT%H:%M:%S', 'now')")
+
     if days is not None:
         from datetime import datetime, timedelta
 
         cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
-        where_clauses.append(
-            "COALESCE(d.decision_date, e.date_received, tt.started_at, ce.start_at,"
-            " c.started_at) >= ?"
-        )
+        where_clauses.append(f"{_DECISION_DATE} >= ?")
         params.append(cutoff)
 
     if where_clauses:
@@ -667,9 +677,9 @@ def query_action_items(
     #   2  overdue: a real date in the past, most recently missed first
     #
     # Nothing is hidden, because an overdue commitment is still a commitment,
-    # but 16,475 of the 20,518 dated open items are overdue and 2,000 of those
-    # predate 2025. Sorted purely by deadline they filled every page and the
-    # default view of "what do I owe" contained not one live item.
+    # but most dated open items are overdue (on 2026-09-09, 16,475 of 20,518).
+    # Sorted purely by deadline they filled every page and the default view of
+    # "what do I owe" contained not one live item.
     query += f"""
         ORDER BY CASE
                      WHEN a.deadline {_ISO_DATE} AND a.deadline >= date('now') THEN 0
@@ -983,25 +993,21 @@ def meeting_prep(
     return result
 
 
-def find_stale_threads(conn: sqlite3.Connection, days: int = 5) -> list[dict]:
-    """Find conversation threads where user is last sender with no reply.
+def _stale_threads_sql(select: str, days: int, max_days: int) -> tuple[str, tuple]:
+    """Threads whose last message the user sent between `days` and `max_days` ago.
 
-    Args:
-        conn: Database connection
-        days: Number of days since last activity to consider stale
-
-    Returns:
-        List of dicts with keys: conversation_id, subject, date_received,
-        sender_address, days_waiting
+    A threshold at or past the window widens it by 30 days: days=45 against
+    the 30-day default was an empty answer with a total of 0, read as 'nobody
+    owes you a reply'.
     """
     from datetime import datetime, timedelta
 
-    if not USER_EMAIL_PATTERN:
-        return []
-
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
-    results = conn.execute(
-        """
+    if max_days <= days:
+        max_days = days + 30
+    now = datetime.now()
+    cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    oldest = (now - timedelta(days=max_days)).strftime("%Y-%m-%dT%H:%M:%S")
+    sql = f"""
         WITH latest_per_thread AS (
             SELECT conversation_id,
                    MAX(date_received) as last_date
@@ -1009,57 +1015,116 @@ def find_stale_threads(conn: sqlite3.Connection, days: int = 5) -> list[dict]:
             WHERE conversation_id IS NOT NULL
             GROUP BY conversation_id
         )
-        SELECT e.conversation_id, e.subject, e.date_received, e.sender_address,
-               CAST(julianday('now') - julianday(e.date_received) AS INTEGER) as days_waiting
+        SELECT {select}
         FROM latest_per_thread lpt
         JOIN emails e ON e.conversation_id = lpt.conversation_id
                      AND e.date_received = lpt.last_date
         WHERE LOWER(e.sender_address) LIKE LOWER(?)
           AND lpt.last_date < ?
-        ORDER BY days_waiting DESC
-    """,
-        (f"%{USER_EMAIL_PATTERN}%", cutoff),
-    ).fetchall()
-    return [dict(r) for r in results]
+          AND lpt.last_date >= ?
+    """
+    return sql, (f"%{USER_EMAIL_PATTERN}%", cutoff, oldest)
+
+
+def find_stale_threads(
+    conn: sqlite3.Connection, days: int = 5, max_days: int = 30, limit: int = 20
+) -> list[dict]:
+    """Threads where the user sent last and nobody replied, newest first.
+
+    Bounded both ways. Unbounded and oldest first, it returned every thread the
+    user ever sent last: 8,891 rows and 2.2 MB on the replica once
+    BRAIN_USER_EMAIL_PATTERN was set, far past the MCP result cap. A thread last
+    touched more than `max_days` ago is history, not a reminder. Use
+    count_stale_threads() for the total.
+
+    Args:
+        conn: Database connection
+        days: Days since the user's message before a thread counts as stale
+        max_days: Oldest such message still worth a reminder
+        limit: Maximum threads to return
+
+    Returns:
+        List of dicts with keys: conversation_id, subject, date_received,
+        sender_address, days_waiting
+    """
+    if not USER_EMAIL_PATTERN:
+        return []
+    sql, params = _stale_threads_sql(
+        "e.conversation_id, e.subject, e.date_received, e.sender_address, "
+        "CAST(julianday('now') - julianday(e.date_received) AS INTEGER) as days_waiting",
+        days,
+        max_days,
+    )
+    rows = conn.execute(sql + " ORDER BY e.date_received DESC LIMIT ?", (*params, limit))
+    return [dict(r) for r in rows.fetchall()]
+
+
+def count_stale_threads(conn: sqlite3.Connection, days: int = 5, max_days: int = 30) -> int:
+    """How many threads find_stale_threads would return without its limit."""
+    if not USER_EMAIL_PATTERN:
+        return 0
+    sql, params = _stale_threads_sql("COUNT(*)", days, max_days)
+    return conn.execute(sql, params).fetchone()[0]
+
+
+# Open, past a deadline SQLite can parse, and not from a news article. A NULL
+# julianday() means the deadline is free text; those rows sorted to the top with
+# days_overdue = NULL and pushed the real answers off the end.
+_OVERDUE_WHERE = """
+    ai.status = 'open' AND ai.deadline IS NOT NULL
+      AND julianday(ai.deadline) IS NOT NULL
+      AND ai.deadline < date('now')
+      AND (e.id IS NULL OR e.mailbox_name IS NULL OR e.mailbox_name <> 'News')
+"""
 
 
 def count_overdue_actions(conn: sqlite3.Connection) -> int:
-    """How many open action items are past a parseable deadline."""
-    return conn.execute("""
-        SELECT COUNT(*) FROM action_items ai
-        WHERE ai.status = 'open' AND ai.deadline IS NOT NULL
-          AND julianday(ai.deadline) IS NOT NULL
-          AND ai.deadline < date('now')
-    """).fetchone()[0]
+    """How many open action items are past a parseable deadline, news excluded."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM action_items ai LEFT JOIN emails e ON ai.email_id = e.id "
+        "WHERE " + _OVERDUE_WHERE
+    ).fetchone()[0]
 
 
 def find_overdue_actions(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
-    """Find action items past their deadline, most overdue first.
+    """Find action items past their deadline, most recently missed first.
 
     `limit` is not optional in practice. This had no bound until 2026-09-09 and
     the live corpus answers it with 15,618 rows / 7.2 MB, far past the MCP result
     cap, so `stale_threads` (its only caller) failed every single time it ran.
     Use count_overdue_actions() when you want the total.
 
-    A NULL julianday() means the deadline string is not a date SQLite can parse.
-    Those rows sorted to the top with days_overdue = NULL and pushed the real
-    answers off the end, so they are excluded.
+    Every parent kind, as query_action_items has: this joined emails, which
+    dropped every Teams, calendar and conversation item, and it kept news. Most
+    overdue first, the list opened on items missed years ago.
 
     Returns:
         List of dicts with keys: action_id, task, owner, deadline,
-        email_subject, date, days_overdue
+        email_subject, date, source, days_overdue
     """
     results = conn.execute(
         """
         SELECT ai.id as action_id, ai.task, ai.owner, ai.deadline,
-               e.subject as email_subject, e.date_received as date,
+               COALESCE(e.subject, tt.title, ce.subject, c.summary) as email_subject,
+               COALESCE(e.date_received, tt.started_at, ce.start_at, c.started_at) as date,
+               CASE
+                   WHEN e.id IS NOT NULL THEN 'email'
+                   WHEN tt.id IS NOT NULL THEN 'teams'
+                   WHEN ce.id IS NOT NULL THEN 'calendar'
+                   WHEN c.id IS NOT NULL THEN 'conversation'
+                   ELSE 'orphan'
+               END as source,
                CAST(julianday('now') - julianday(ai.deadline) AS INTEGER) as days_overdue
         FROM action_items ai
-        JOIN emails e ON ai.email_id = e.id
-        WHERE ai.status = 'open' AND ai.deadline IS NOT NULL
-          AND julianday(ai.deadline) IS NOT NULL
-          AND ai.deadline < date('now')
-        ORDER BY days_overdue DESC
+        LEFT JOIN emails e ON ai.email_id = e.id
+        LEFT JOIN teams_threads tt ON ai.teams_thread_id = tt.id
+        LEFT JOIN calendar_events ce ON ai.event_id = ce.id
+        LEFT JOIN conversation_turns ct ON ai.conversation_turn_id = ct.id
+        LEFT JOIN conversations c ON ct.conversation_id = c.id
+        WHERE """
+        + _OVERDUE_WHERE
+        + """
+        ORDER BY ai.deadline DESC
         LIMIT ?
     """,
         (limit,),
@@ -1117,9 +1182,44 @@ def get_stats(conn: sqlite3.Connection) -> dict:
     row = cursor.fetchone()
     stats["earliest_email"] = row["earliest"]
     stats["latest_email"] = row["latest"]
+    stats["coverage"] = get_coverage(conn)
     stats.update(get_freshness(conn))
 
     return stats
+
+
+def get_coverage(conn: sqlite3.Connection) -> dict:
+    """The first and last date each source holds, and how many items.
+
+    Sources start at different dates, most of them later than the earliest
+    email suggests: 19 old documents made that '2018', while mail starts years
+    later. An agent that cannot see where a source starts reads an empty answer
+    as 'nothing happened'.
+    """
+
+    def span(sql: str) -> dict:
+        try:
+            first, last, n = conn.execute(sql).fetchone()
+        except sqlite3.OperationalError:
+            return {"first": None, "last": None, "items": 0}
+        return {"first": first, "last": last, "items": n}
+
+    mailboxes = {
+        name or "(none)": {"first": first, "last": last, "emails": n}
+        for name, first, last, n in conn.execute(
+            "SELECT mailbox_name, MIN(date_received), MAX(date_received), COUNT(*) "
+            "FROM emails GROUP BY mailbox_name ORDER BY MIN(date_received)"
+        )
+    }
+    return {
+        "mailboxes": mailboxes,
+        "teams": span("SELECT MIN(started_at), MAX(ended_at), COUNT(*) FROM teams_threads"),
+        "calendar": span("SELECT MIN(start_at), MAX(start_at), COUNT(*) FROM calendar_events"),
+        "conversations": span(
+            "SELECT MIN(started_at), MAX(COALESCE(ended_at, started_at)), COUNT(*) "
+            "FROM conversations"
+        ),
+    }
 
 
 # How far behind the producer the replica may drift before a caller should be

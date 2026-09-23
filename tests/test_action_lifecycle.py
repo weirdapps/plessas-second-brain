@@ -1,11 +1,20 @@
 """Tests for action-item lifecycle: dedup exact duplicates + age-out stale actions."""
 
+from datetime import UTC, datetime
+
 from src.store.action_lifecycle import (
     dedup_exact_open_actions,
     expire_stale_actions,
+    expire_undated_actions,
     run_action_lifecycle,
 )
 from src.store.schema import create_database, get_connection
+
+OLD = "2020-01-01T10:00:00"
+
+
+def _now():
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def _seed_emails(conn, ids=(1,)):
@@ -16,10 +25,54 @@ def _seed_emails(conn, ids=(1,)):
         )
 
 
-def _add(conn, task, owner="X", deadline=None, email_id=1, status="open"):
+def _add(conn, task, owner="X", deadline=None, email_id=1, status="open", **parent):
     conn.execute(
-        "INSERT INTO action_items (email_id, task, owner, deadline, status) VALUES (?, ?, ?, ?, ?)",
-        (email_id, task, owner, deadline, status),
+        "INSERT INTO action_items (email_id, task, owner, deadline, status, teams_thread_id, "
+        "event_id, conversation_turn_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            email_id,
+            task,
+            owner,
+            deadline,
+            status,
+            parent.get("teams_thread_id"),
+            parent.get("event_id"),
+            parent.get("conversation_turn_id"),
+        ),
+    )
+
+
+def _thread(conn, thread_id, started_at, ended_at):
+    conn.execute(
+        "INSERT OR IGNORE INTO teams_chats (id, teams_chat_id, chat_kind, first_seen_at) "
+        "VALUES (1, '19:x', 'channel', ?)",
+        (OLD,),
+    )
+    conn.execute(
+        "INSERT INTO teams_threads (id, chat_id, thread_kind, started_at, ended_at, "
+        "message_count, extraction_status) VALUES (?, 1, 'channel_post', ?, ?, 1, 'extracted')",
+        (thread_id, started_at, ended_at),
+    )
+
+
+def _meeting(conn, event_id, start_at):
+    conn.execute(
+        "INSERT INTO calendar_events (id, outlook_event_id, start_at, end_at, is_recurring, "
+        "is_self_organized, is_cancelled, ingested_at, llm_status) "
+        "VALUES (?, ?, ?, ?, 0, 0, 0, ?, 'extracted')",
+        (event_id, f"ev{event_id}", start_at, start_at, OLD),
+    )
+
+
+def _turn(conn, turn_id, timestamp):
+    conn.execute(
+        "INSERT INTO conversations (id, session_id, started_at, created_at) VALUES (?, ?, ?, ?)",
+        (turn_id, f"s{turn_id}", timestamp, timestamp),
+    )
+    conn.execute(
+        "INSERT INTO conversation_turns (id, conversation_id, turn_index, timestamp, speaker, "
+        "content) VALUES (?, ?, 0, ?, 'user', 'x')",
+        (turn_id, turn_id, timestamp),
     )
 
 
@@ -45,6 +98,31 @@ class TestDedup:
         assert conn.execute("SELECT COUNT(*) FROM action_items").fetchone()[0] == 3
         conn.close()
 
+    def test_the_same_task_under_two_non_email_parents_is_not_a_duplicate(self):
+        """email_id is NULL on every Teams, meeting and conversation action, and
+        GROUP BY puts NULLs together: the same task in two threads, or in a
+        thread and a meeting, was deleted as a duplicate of the other."""
+        conn = create_database(":memory:")
+        for i in (1, 2):
+            _thread(conn, i, OLD, OLD)
+            _meeting(conn, i, OLD)
+            _turn(conn, i, OLD)
+            _add(conn, "send the deck", email_id=None, teams_thread_id=i)
+            _add(conn, "send the deck", email_id=None, event_id=i)
+            _add(conn, "send the deck", email_id=None, conversation_turn_id=i)
+        conn.commit()
+        assert dedup_exact_open_actions(conn) == 0
+        conn.close()
+
+    def test_duplicates_under_one_non_email_parent_are_still_removed(self):
+        conn = create_database(":memory:")
+        _thread(conn, 1, OLD, OLD)
+        _add(conn, "send the deck", email_id=None, teams_thread_id=1)
+        _add(conn, "send the deck", email_id=None, teams_thread_id=1)
+        conn.commit()
+        assert dedup_exact_open_actions(conn) == 1
+        conn.close()
+
 
 class TestExpire:
     def test_expires_only_old_dated_open_actions(self):
@@ -61,6 +139,191 @@ class TestExpire:
         assert statuses["recent"] == "open"
         assert statuses["nodate"] == "open"
         assert statuses["freetext"] == "open"
+        conn.close()
+
+    def test_a_fresh_action_with_a_long_past_deadline_is_kept(self):
+        """A model that writes last year for 'by 30/9' dates a fresh action a
+        year overdue, and dated expiry now runs every day: it vanished the
+        morning after it arrived."""
+        conn = create_database(":memory:")
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received) VALUES (1, 1, ?), (2, 2, ?)",
+            (_now(), OLD),
+        )
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received) VALUES (3, 3, '2106-02-07T00:00:00')"
+        )
+        # Calendar sync runs a month ahead, and that is where year slips land.
+        _meeting(conn, 1, "2999-01-01T10:00:00")
+        conn.execute(
+            "UPDATE calendar_events SET start_at = datetime('now', '+20 days') WHERE id = 1"
+        )
+        _add(conn, "fresh email", deadline="2020-09-30", email_id=1)
+        _add(conn, "old email", deadline="2020-09-30", email_id=2)
+        _add(conn, "no parent", deadline="2020-09-30", email_id=None)
+        _add(conn, "meeting next month", deadline="2020-09-30", email_id=None, event_id=1)
+        # A parent dated generations ahead is a bad date, not a fresh one.
+        _add(conn, "far-future parent", deadline="2020-09-30", email_id=3)
+        conn.commit()
+
+        assert expire_stale_actions(conn, days=180) == 3
+        assert dict(conn.execute("SELECT task, status FROM action_items")) == {
+            "fresh email": "open",
+            "old email": "expired",
+            "no parent": "expired",
+            "meeting next month": "open",
+            "far-future parent": "expired",
+        }
+        conn.close()
+
+
+class TestExpireUndated:
+    def test_an_undated_action_ages_with_its_email(self):
+        """expire_stale_actions needs a deadline, and 128K of the 154K open actions
+        had none, so they stayed open for good. A free-text deadline is no date."""
+        conn = create_database(":memory:")
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received) VALUES (1, 1, ?), (2, 2, ?)",
+            (OLD, _now()),
+        )
+        _add(conn, "old, no date", email_id=1)
+        _add(conn, "old, free text", deadline="ASAP", email_id=1)
+        _add(conn, "old, due in the future", deadline="2099-01-01", email_id=1)
+        _add(conn, "recent, no date", email_id=2)
+        _add(conn, "old, completed", email_id=1, status="completed")
+        conn.commit()
+
+        assert expire_undated_actions(conn, days=90) == 2
+        assert dict(conn.execute("SELECT task, status FROM action_items")) == {
+            "old, no date": "expired",
+            "old, free text": "expired",
+            "old, due in the future": "open",
+            "recent, no date": "open",
+            "old, completed": "completed",
+        }
+        conn.close()
+
+    def test_a_thread_ages_from_its_last_message(self):
+        conn = create_database(":memory:")
+        _thread(conn, 1, OLD, _now())
+        _thread(conn, 2, OLD, OLD)
+        _add(conn, "still talked about", email_id=None, teams_thread_id=1)
+        _add(conn, "long quiet", email_id=None, teams_thread_id=2)
+        conn.commit()
+
+        assert expire_undated_actions(conn, days=90) == 1
+        statuses = dict(conn.execute("SELECT task, status FROM action_items"))
+        assert statuses == {"still talked about": "open", "long quiet": "expired"}
+        conn.close()
+
+    def test_meetings_and_conversations_age_too(self):
+        conn = create_database(":memory:")
+        _meeting(conn, 1, OLD)
+        _meeting(conn, 2, "2099-01-01T10:00:00")
+        _turn(conn, 1, OLD)
+        _turn(conn, 2, _now())
+        _add(conn, "old meeting", email_id=None, event_id=1)
+        _add(conn, "future meeting", email_id=None, event_id=2)
+        _add(conn, "old turn", email_id=None, conversation_turn_id=1)
+        _add(conn, "recent turn", email_id=None, conversation_turn_id=2)
+        conn.commit()
+
+        assert expire_undated_actions(conn, days=90) == 2
+        assert dict(conn.execute("SELECT task, status FROM action_items")) == {
+            "old meeting": "expired",
+            "future meeting": "open",
+            "old turn": "expired",
+            "recent turn": "open",
+        }
+        conn.close()
+
+    def test_a_parent_without_a_date_leaves_its_action_alone(self):
+        """'' is how a missing date is stored, and it sorted before every date,
+        so an undatable parent counted as infinitely old."""
+        conn = create_database(":memory:")
+        conn.execute("INSERT INTO emails (id, message_id, date_received) VALUES (1, 1, '')")
+        _turn(conn, 1, "")
+        _add(conn, "email without a date", email_id=1)
+        _add(conn, "turn without a date", email_id=None, conversation_turn_id=1)
+        conn.commit()
+
+        assert expire_undated_actions(conn, days=90) == 0
+        conn.close()
+
+    def test_a_free_text_deadline_in_a_coming_year_is_kept(self):
+        """'31/12/2027' is no ISO date, but it is still to come, and so are
+        '31/12/27', 'Q4/26', 'FY26/27' and a d/m/yy date beside an amount."""
+        conn = create_database(":memory:")
+        conn.execute("INSERT INTO emails (id, message_id, date_received) VALUES (1, 1, ?)", (OLD,))
+        year = datetime.now(UTC).year
+        pyy, yy, nyy = (f"{(year + k) % 100:02d}" for k in (-1, 0, 1))
+        kept = [
+            f"31/12/{year + 1}",
+            f"31/12/{nyy}",
+            f"by end {year + 8}",
+            f"pay invoice 4521 by 30/10/{nyy}",
+            f"transfer EUR 1500 by 15/11/{nyy}",
+            f"Q4/{yy}",
+            f"end H1-{nyy}",
+            f"FY{yy}/{nyy}",
+            f"by 12/{nyy}",
+            # A span that closes this year, a padded month, a spaced quarter and
+            # the digit-first quarter brokers write.
+            f"FY{pyy}/{yy}",
+            f"{year - 1}-{yy}",
+            f"card expiry 01/{nyy}",
+            f"Q4 {yy}",
+            f"4Q{yy}",
+            f"Q2 '{nyy}",
+        ]
+        expired = [
+            "31/12/2020",
+            "31/12/20",
+            f"after PO 1{year}5 is approved",  # a year inside a longer number
+            "10/26/2023",
+            "2023/10/26",
+            "by 17.30",
+            "after v1.30",
+            f"release v2.1.{nyy}",
+            # Greek clock times and decimals: a dot is no month separator.
+            f"Τρίτη 10.{yy}",
+            f"rate 3.{nyy}%",
+            f"FY{year - 3}/{(year - 2) % 100:02d}",
+            f"ref 1{year}",  # ends in a year, but is a longer number
+            f"ticket 123/10/{nyy}",  # a number path, not a month
+        ]
+        for i, deadline in enumerate(kept + expired):
+            _add(conn, f"task {i}", deadline=deadline, email_id=1)
+        conn.commit()
+
+        assert expire_undated_actions(conn, days=90) == len(expired)
+        statuses = dict(conn.execute("SELECT deadline, status FROM action_items"))
+        assert [d for d in kept if statuses[d] != "open"] == []
+        assert [d for d in expired if statuses[d] != "expired"] == []
+        conn.close()
+
+    def test_a_deadline_shaped_like_a_date_but_not_one_is_undated(self):
+        """'2026-13-01' passed for a date, so the dated pass could not parse it
+        and the undated pass would not touch it: open for good."""
+        conn = create_database(":memory:")
+        conn.execute("INSERT INTO emails (id, message_id, date_received) VALUES (1, 1, ?)", (OLD,))
+        _add(conn, "month thirteen", deadline="2020-13-01", email_id=1)
+        # SQLite's date() reads these as dates (a Julian day, a time, today), and
+        # the dated pass skips them, so they belong to this one.
+        _add(conn, "a bare past year", deadline="2024", email_id=1)
+        _add(conn, "a time of day", deadline="10:00", email_id=1)
+        _add(conn, "now", deadline="now", email_id=1)
+        conn.commit()
+
+        assert expire_undated_actions(conn, days=90) == 4
+        conn.close()
+
+    def test_an_action_with_no_parent_is_left_alone(self):
+        conn = create_database(":memory:")
+        _add(conn, "orphan", email_id=None)
+        conn.commit()
+
+        assert expire_undated_actions(conn, days=90) == 0
         conn.close()
 
 
@@ -98,3 +361,17 @@ class TestRunLifecycle:
         conn = get_connection(db)
         assert conn.execute("SELECT status FROM action_items").fetchone()[0] == "expired"
         conn.close()
+
+    def test_expires_undated_actions_by_parent_age(self, tmp_path):
+        db = str(tmp_path / "b.db")
+        conn = create_database(db)
+        _seed_emails(conn)  # dated 2026-01-01
+        _add(conn, "no date")
+        conn.commit()
+        conn.close()
+
+        kept = run_action_lifecycle(db, dry_run=True, undated_expire_days=100_000)
+        res = run_action_lifecycle(db, undated_expire_days=90)
+
+        assert kept["expired_undated"] == 0
+        assert (res["expired_undated"], res["after_open"]) == (1, 0)

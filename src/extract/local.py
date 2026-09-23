@@ -333,8 +333,12 @@ def run_extraction(
     pending = [e for e in all_emails if str(e.get("message_id", "")) not in processed_ids]
     log(f"Pending extraction: {len(pending)} emails")
     if deadline is not None:
-        # Batches are staged in arrival order, so this is newest first.
-        pending.reverse()
+        # By the mail's own date, not staging order: Archive and Sent bootstraps
+        # stage old mail into new batches. Undated emails go last.
+        pending.sort(
+            key=lambda e: str(e.get("date_received") or "")[:19].replace(" ", "T"),
+            reverse=True,
+        )
 
     if limit > 0:
         pending = pending[:limit]
@@ -558,7 +562,8 @@ def run_extraction(
         # Counted here, after the fact: a deadline can pass mid-chunk, and the
         # cancelled futures of that chunk stay pending as well.
         left = sum(1 for e in pending if str(e.get("message_id", "")) not in processed_ids)
-        log(f"Deadline reached; {left} emails stay pending for the next run.")
+        cause = "Quota pause" if quota_paused else "Deadline reached"
+        log(f"{cause}; {left} emails stay pending for the next run.")
     outcome = "STOPPED" if _shutdown else "CUT SHORT" if cut_short else "COMPLETE"
     log(f"=== EXTRACTION {outcome} ===")
     log(f"Extracted: {total_done}, Failed: {total_failed}, Time: {elapsed:.1f}min")

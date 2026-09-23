@@ -32,7 +32,9 @@ run_stage() {
   "$@" >> "$LOG_FILE" 2>&1
   local rc=$?
   if [ "$rc" -ne 0 ]; then
-    echo "$(date '+%Y-%m-%d %H:%M:%S'): $name FAILED (exit $rc)" >> "$LOG_FILE"
+    # Also to stderr, which is what the unit's failure alert shows: the pass
+    # exits 65, so the stage's own code (4 is re-authenticate) is only here.
+    echo "$(date '+%Y-%m-%d %H:%M:%S'): $name FAILED (exit $rc)" | tee -a "$LOG_FILE" >&2
     [ "$overall_rc" -eq 0 ] && overall_rc=$rc
   fi
   return 0
@@ -74,10 +76,12 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') — starting SharePoint fetch" >> "$LOG_FILE"
 run_stage "SharePoint fetch" "$PYTHON" -m src.cli process-sharepoint --limit 200
 
 # Every stage has run by here, so a restart would repeat the whole hour of LLM
-# and vision calls for a failure a retry cannot fix. 65 means "ran to the end, a
-# stage failed" (each stage's own code is in the log above), and
-# RestartPreventExitStatus=65 in the unit's retry.conf keeps the restart for a
-# pass that was killed or timed out.
+# and vision calls for a failure that a retry of the whole pass is unlikely to
+# fix; the failed stage is retried by tomorrow's pass. 65 means "ran to the end,
+# a stage failed" (each stage's own code is on stderr and in the log). Deploy
+# with RestartPreventExitStatus=65 in the unit's retry.conf, which keeps the
+# restart for a pass that was killed or timed out; until then 65 restarts like
+# any other failure.
 if [ "$overall_rc" -ne 0 ]; then
   exit 65
 fi

@@ -375,3 +375,26 @@ def test_migration_v21_adds_the_calendar_change_key_idempotently():
         bare = sqlite3.connect(":memory:")
         schema.migrate_add_calendar_change_key(bare)  # no calendar tables: a no-op
         bare.close()
+
+
+def test_migration_v21_loses_a_race_cleanly():
+    """Two units can start together after a deploy. The loser reads the column
+    as missing, then finds it there when it ALTERs; that must be a no-op, not
+    an error that fails its run."""
+
+    class StaleRead(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if sql.startswith("PRAGMA table_info(calendar_events)"):
+                return super().execute("SELECT 1 WHERE 0")
+            return super().execute(sql, *args)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = str(Path(tmpdir) / "test.db")
+        conn = sqlite3.connect(path)
+        _v16_calendar_db(conn)
+        schema.migrate_add_calendar_change_key(conn)
+        conn.close()
+
+        racer = sqlite3.connect(path, factory=StaleRead)
+        schema.migrate_add_calendar_change_key(racer)  # must not raise
+        racer.close()

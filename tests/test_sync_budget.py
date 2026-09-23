@@ -183,7 +183,9 @@ def test_the_modelled_timeout_is_the_one_llm_deadline_budgets_against():
 
 @pytest.mark.parametrize("unit", ["sb-daily-sync", "sb-noon-catchup"])
 def test_the_backlog_units_extraction_slice_fits_their_timeout(unit):
-    """Neither wrapper fetches mail, so the sync command is the whole run."""
+    """Neither wrapper fetches mail. sb-daily-sync runs its backup first, inside the
+    same unit; that time comes out of the extraction slice, because
+    _extract_deadline_s caps Step 2 by what is left of the unit."""
     assert _sync_command_s(EXTRACT_DEADLINE_BY_UNIT_S[unit]) < _UNIT_TIMEOUT_SECONDS[unit] * 0.85
 
 

@@ -116,3 +116,39 @@ def test_attachment_pass_runs_every_stage_even_after_one_fails(tmp_path):
 def test_attachment_pass_succeeds_when_every_stage_does(tmp_path):
     home = _home_with_python(tmp_path, "exit 0\n")
     assert _run("sb-attachment-pass.sh", home).returncode == 0
+
+
+def test_a_lock_override_that_is_not_a_lock_path_is_refused(tmp_path):
+    """The wrapper deletes its lock directory recursively. An override pointing
+    anywhere else would have deleted that directory."""
+    home = _home_with_python(tmp_path, "exit 0\n")
+    victim = tmp_path / "precious"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("x")
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-conversation-sync.sh")],
+        env={
+            "HOME": str(home),
+            "PATH": "/usr/bin:/bin",
+            "SB_CONVERSATION_SYNC_LOCK": str(victim),
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 64
+    assert (victim / "keep.txt").exists()
+
+
+def test_a_failed_attachment_stage_is_named_on_stderr(tmp_path):
+    """The unit's own stderr is what the failure alert shows; the per-stage exit
+    code used to reach only the wrapper's log file."""
+    home = _home_with_python(
+        tmp_path, 'case "$*" in *register-attachments*) exit 4;; esac\nexit 0\n'
+    )
+
+    result = _run("sb-attachment-pass.sh", home)
+
+    assert "attachment registration FAILED (exit 4)" in result.stderr

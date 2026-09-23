@@ -71,4 +71,21 @@ def classify_exception(exc: BaseException | None, response: object | None) -> Ou
     return Outcome.OK
 
 
+def is_transient(exc: BaseException) -> bool:
+    """A failure of the service rather than of the item, so worth offering again.
+
+    call_with_policy re-raises the SDK's last exception when it gives up, so a
+    quota error, a timeout, a dropped connection or a 5xx reaches its caller as
+    itself. A reply the caller cannot use (unparseable, truncated) raises
+    ValueError there, and trying again would get the same reply.
+    """
+    if classify_exception(exc, None) in (Outcome.RATE_LIMIT, Outcome.TIMEOUT):
+        return True
+    if isinstance(exc, anthropic.APIConnectionError | anthropic.InternalServerError):
+        return True
+    if isinstance(exc, anthropic.APIStatusError) and getattr(exc, "status_code", 0) >= 500:
+        return True
+    return isinstance(exc, ConnectionError | TimeoutError)
+
+
 register_post_reauth(reset_client_cache)

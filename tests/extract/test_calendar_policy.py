@@ -23,6 +23,7 @@ detector re-offer an event whose modified_at has not moved.
 
 import sqlite3
 import types
+from pathlib import Path
 from unittest.mock import patch
 
 import google.auth.exceptions as gauth
@@ -736,15 +737,49 @@ def test_an_unfetchable_event_stops_failing_the_run_after_three_runs(monkeypatch
     never return must not keep the unit red for as long as it sits in the window."""
     db_path = _calendar_db(tmp_path)
     fetches: list[str] = []
+    healthy = {**_LIST_EVENT, "Id": "AAMkAGI2healthy="}
 
-    def unfetchable(event_id):
+    def one_unfetchable(event_id):
         fetches.append(event_id)
-        return None
+        if event_id == _EVENT_ID:
+            return None
+        return {**_RAW_EVENT, "Id": event_id, "Body": {"Content": "short"}}
 
-    rcs = [_sync_rc(monkeypatch, db_path, [_LIST_EVENT], unfetchable) for _ in range(5)]
+    rcs = [
+        _sync_rc(monkeypatch, db_path, [healthy, _LIST_EVENT], one_unfetchable) for _ in range(5)
+    ]
 
     assert rcs == [1, 1, 1, 0, 0]
-    assert len(fetches) == 5
+    assert fetches.count(_EVENT_ID) == 5
+
+
+def test_when_no_fetch_has_worked_every_failure_keeps_counting(monkeypatch, tmp_path):
+    """A get-event that fails for everything must not go green after three runs:
+    that is an outage, not one bad event."""
+    db_path = _calendar_db(tmp_path)
+
+    def broken(event_id):
+        return None
+
+    rcs = [_sync_rc(monkeypatch, db_path, [_LIST_EVENT], broken) for _ in range(5)]
+
+    assert rcs == [1, 1, 1, 1, 1]
+
+
+def test_the_cap_lapses_once_the_last_good_fetch_is_a_day_old(monkeypatch, tmp_path):
+    import json
+
+    db_path = _calendar_db(tmp_path)
+    state = Path(db_path).parent / "state" / "calendar_fetch_failures.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(
+        json.dumps({"events": {_EVENT_ID: 5}, "last_fetch_ok": "2020-01-01T00:00:00+00:00"})
+    )
+
+    def broken(event_id):
+        return None
+
+    assert _sync_rc(monkeypatch, db_path, [_LIST_EVENT], broken) == 1
 
 
 def test_a_successful_fetch_resets_the_unfetchable_count(monkeypatch, tmp_path):
@@ -756,7 +791,7 @@ def test_a_successful_fetch_resets_the_unfetchable_count(monkeypatch, tmp_path):
     def fetchable(event_id):
         return {**_RAW_EVENT, "Body": {"Content": "short"}}
 
-    for _ in range(3):
+    for _ in range(4):
         _sync_rc(monkeypatch, db_path, [_LIST_EVENT], unfetchable)
     _sync_rc(monkeypatch, db_path, [_LIST_EVENT], fetchable)
     edited = {**_LIST_EVENT, "@odata.etag": 'W/"change-2"'}
@@ -764,10 +799,10 @@ def test_a_successful_fetch_resets_the_unfetchable_count(monkeypatch, tmp_path):
     assert _sync_rc(monkeypatch, db_path, [edited], unfetchable) == 1
 
 
-def test_an_outlook_auth_failure_mid_run_is_a_deferral(monkeypatch, tmp_path):
-    """An expired Outlook session is sb-auth-watch's to report and repair. The
-    run stops asking, leaves the rows alone for the next run, and does not add
-    a second alarm for the same outage."""
+def test_an_outlook_session_that_expires_mid_run_stops_and_exits_4(monkeypatch, tmp_path):
+    """The run stops asking (every later fetch would fail the same way), leaves
+    the rows alone for the next run, and exits 4, the shared re-authenticate
+    code, as it does when the session is already dead at list time."""
     from src.export.outlook_cli import OutlookCliAuthRequired
 
     db_path = _calendar_db(tmp_path)
@@ -780,6 +815,123 @@ def test_an_outlook_auth_failure_mid_run_is_a_deferral(monkeypatch, tmp_path):
     second = {**_LIST_EVENT, "Id": "AAMkAGI2second="}
     rc = _sync_rc(monkeypatch, db_path, [_LIST_EVENT, second], expired)
 
-    assert rc == 0
+    assert rc == 4
     assert len(fetches) == 1, "the rest of the run is deferred, not hammered"
     assert _row(db_path) is None
+
+
+def test_an_outlook_session_dead_at_list_time_exits_4(monkeypatch, tmp_path):
+    from src import cli
+    from src.export import calendar_export
+    from src.export.outlook_cli import OutlookCliAuthRequired
+
+    db_path = _calendar_db(tmp_path)
+
+    def expired(since, until, failures=None):
+        raise OutlookCliAuthRequired("session expired")
+
+    monkeypatch.setattr(calendar_export, "list_events", expired)
+
+    assert cli.cmd_calendar_sync(_sync_args(db_path)) == 4
+
+
+def test_a_transient_extraction_failure_is_retried_by_the_next_run(monkeypatch, tmp_path):
+    """A 5xx, a timeout or a quota error is the service's, not the event's.
+    Recorded 'failed', it was never offered again once the change detector
+    worked; 'pending' re-offers it. The run still fails, so the outage shows."""
+    monkeypatch.setattr(vertex_auth, "GCLOUD_SENTINEL", tmp_path / "needs_gcloud_reauth")
+    db_path = _calendar_db(tmp_path)
+    attempts = []
+
+    def body(event_id):
+        return {**_RAW_EVENT, "Body": {"Content": _LONG_BODY}}
+
+    def unavailable(event, body):
+        attempts.append(event)
+        raise ConnectionError("503 Service Unavailable")
+
+    def succeeding(event, body):
+        attempts.append(event)
+        return _succeeding(event, body)
+
+    assert _sync_rc(monkeypatch, db_path, [_LIST_EVENT], body, unavailable) == 1
+    assert _row(db_path)["llm_status"] == "pending"
+
+    assert _sync_rc(monkeypatch, db_path, [_LIST_EVENT], body, succeeding) == 0
+    assert len(attempts) == 2
+    assert _row(db_path)["llm_status"] == "extracted"
+
+
+def _heartbeat(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM sync_metadata WHERE key = 'calendar_last_listed'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    conn.close()
+    return row[0] if row else None
+
+
+def test_a_quiet_calendar_still_leaves_a_heartbeat(monkeypatch, tmp_path):
+    """With a working change detector an unchanged calendar writes no event row,
+    so MAX(ingested_at) stopped proving the sync ran. The run stamps its own."""
+    db_path = _calendar_db(tmp_path)
+
+    def body(event_id):
+        return {**_RAW_EVENT, "Body": {"Content": "short"}}
+
+    _sync_rc(monkeypatch, db_path, [_LIST_EVENT], body)
+    first = _heartbeat(db_path)
+    _sync_rc(monkeypatch, db_path, [_LIST_EVENT], body)  # unchanged: no event row written
+
+    assert first is not None
+    assert _heartbeat(db_path) >= first
+
+
+def test_no_heartbeat_when_part_of_the_window_could_not_be_listed(monkeypatch, tmp_path):
+    from src import cli
+    from src.export import calendar_export
+
+    db_path = _calendar_db(tmp_path)
+
+    def one_chunk_failed(since, until, failures=None):
+        failures.append("2026-08-01..2026-09-01: outlook-cli timed out")
+        return []
+
+    monkeypatch.setattr(calendar_export, "list_events", one_chunk_failed)
+    cli.cmd_calendar_sync(_sync_args(db_path))
+
+    assert _heartbeat(db_path) is None
+
+
+def test_skip_extraction_leaves_a_long_body_owed(monkeypatch, tmp_path):
+    """A run told not to extract has no basis for recording that nothing was
+    owed, and with the etag stored a 'skipped' row would never be offered again."""
+    db_path = _calendar_db(tmp_path)
+
+    _run_sync(monkeypatch, db_path, _LONG_BODY, _succeeding, skip_extraction=True)
+
+    assert _row(db_path)["llm_status"] == "pending"
+
+
+def test_an_unwritable_state_dir_does_not_fail_the_run(monkeypatch, tmp_path, capsys):
+    """The state file is bookkeeping for the fetch-failure cap. The rows are
+    already committed, so failing to write it must not turn the run red."""
+    db_path = _calendar_db(tmp_path)
+    state_dir = Path(db_path).parent / "state"
+    state_dir.mkdir()
+    state_dir.chmod(0o500)
+
+    def body(event_id):
+        return {**_RAW_EVENT, "Body": {"Content": "short"}}
+
+    try:
+        rc = _sync_rc(monkeypatch, db_path, [_LIST_EVENT], body)
+    finally:
+        state_dir.chmod(0o700)
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "calendar_fetch_failures" in err

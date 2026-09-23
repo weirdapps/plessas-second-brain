@@ -620,7 +620,13 @@ def migrate_add_calendar_change_key(conn: sqlite3.Connection) -> None:
         return
     cols = {row[1] for row in conn.execute("PRAGMA table_info(calendar_events)").fetchall()}
     if "change_key" not in cols:
-        conn.execute("ALTER TABLE calendar_events ADD COLUMN change_key TEXT")
+        try:
+            conn.execute("ALTER TABLE calendar_events ADD COLUMN change_key TEXT")
+        except sqlite3.OperationalError as e:
+            # Another process added it between the check and the ALTER: two units
+            # can start together after a deploy. Nothing is left for this one to do.
+            if "duplicate column name" not in str(e):
+                raise
         conn.commit()
 
 

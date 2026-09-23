@@ -58,7 +58,10 @@ SYNC_UNIT_TIMEOUT_S = 1200.0
 # The wrapper runs auth-watch, three outlook_export folder passes and
 # inbox_reconcile inside the same unit before it calls `sync`, so their time is
 # spent from the same timeout. p99 of 133 runs, 2026-09-16 to 09-23 (median 47 s,
-# max 364 s, the max on a day Outlook was slow).
+# max 364 s), measured from the Inbox export to the start of `sync`: auth-watch
+# runs before the first timestamp the wrapper logs and is not in the figure.
+# _extract_deadline_s caps Step 2 by what is actually left of the unit, so a
+# slow auth-watch comes out of the extraction slice rather than the timeout.
 SYNC_WRAPPER_FETCH_OBSERVED_S = 140.0
 
 PHASE1_SYNC_DEADLINE_S = 90.0
@@ -98,8 +101,7 @@ EXTRACT_SYNC_DEADLINE_S = 300.0
 # ones that drain a backlog (the health check kicks sb-daily-sync to drain
 # staging), so they get most of their larger budget rather than the hourly
 # slice. Found by /proc/self/cgroup, as llm_deadline finds the unit: sb-noon-
-# catchup and sb-outlook-sync run identical argv. No unit (a hand run) keeps the
-# old unbounded behaviour.
+# catchup and sb-outlook-sync run identical argv.
 EXTRACT_DEADLINE_BY_UNIT_S = {
     "sb-outlook-sync": EXTRACT_SYNC_DEADLINE_S,
     "sb-daily-sync": 900.0,
@@ -111,12 +113,43 @@ EXTRACT_DEADLINE_BY_UNIT_S = {
 # update (about 10 s). Mail fetch is SYNC_WRAPPER_FETCH_OBSERVED_S above.
 SYNC_FIXED_WORK_S = 60.0
 
+# What the stages after Step 2 need, held back from the unit's remaining time.
+SYNC_AFTER_EXTRACTION_S = (
+    SYNC_FIXED_WORK_S
+    + PHASE1_SYNC_DEADLINE_S
+    + PHASE2_SYNC_DEADLINE_S
+    + CONVERSATION_SYNC_DEADLINE_S
+    + IMAGE_CLASSIFY_SYNC_BUDGET_S
+)
+
 
 def _extract_deadline_s() -> float | None:
-    """Step 2's wall-clock budget under the unit running this process."""
+    """Step 2's wall-clock budget for this process.
+
+    Its unit's slice when the unit is in the table; the hourly slice for any
+    other scheduler (cron, launchd or a unit off the table, all three described
+    in the docs); unbounded only for a person at a terminal. Then capped by what
+    is left of the unit, read from the unit-anchored PTS_LLM_DEADLINE, less what
+    the later stages need: a second sync in the same unit (the wrappers retry
+    once on a database lock) used to get a fresh full slice and overrun it.
+    """
+    import os
+    import time
+
     from src.llm_deadline import _detect_systemd_unit
 
-    return EXTRACT_DEADLINE_BY_UNIT_S.get(_detect_systemd_unit() or "")
+    unit = _detect_systemd_unit()
+    if unit in EXTRACT_DEADLINE_BY_UNIT_S:
+        slice_s = EXTRACT_DEADLINE_BY_UNIT_S[unit]
+    elif sys.stdin is not None and sys.stdin.isatty():
+        return None
+    else:
+        slice_s = EXTRACT_SYNC_DEADLINE_S
+    try:
+        left = float(os.environ["PTS_LLM_DEADLINE"]) - time.time() - SYNC_AFTER_EXTRACTION_S
+    except (KeyError, ValueError):
+        return slice_s
+    return max(0.0, min(slice_s, left))
 
 
 # --- Wall-clock budget for one Teams sync run -------------------------------
@@ -1402,7 +1435,9 @@ def cmd_sync(args):
 
     # Everything else ran and the rest of the mail stays pending, but extraction
     # did not finish. Before the deadline existed the same pause slept past the
-    # unit timeout and read red, so it stays red: 75 is EX_TEMPFAIL.
+    # unit timeout and read red. 75 is EX_TEMPFAIL. sb-daily-sync and
+    # sb-noon-catchup pass it through; sb-outlook-sync logs the sync's code and
+    # keeps it out of its own status by design, with those two units behind it.
     if isinstance(extraction_run, dict) and extraction_run.get("quota_paused"):
         print("Extraction ended on a quota pause; the rest stays pending", file=sys.stderr)
         return 75
@@ -1576,6 +1611,14 @@ def cmd_teams_stats(args):
 # the window, and a check that is always red is a check nobody reads.
 CALENDAR_FETCH_ALERT_RUNS = 3
 
+# ...but only while get-event has worked for some event within the last day.
+# When nothing has been fetchable that long, every failure counts: that is an
+# outage (an outlook-cli regression, say), not one bad event.
+CALENDAR_FETCH_OK_WITHIN_S = 24 * 3600
+
+# The shared "re-authenticate" exit code, the same as the three M365 CLIs'.
+EXIT_REAUTH = 4
+
 
 def _read_json_dict(path: Path) -> dict:
     import json
@@ -1587,6 +1630,21 @@ def _read_json_dict(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _within(iso: object, seconds: float) -> bool:
+    """Whether ``iso`` is a timestamp no older than ``seconds``."""
+    from datetime import UTC
+
+    if not isinstance(iso, str):
+        return False
+    try:
+        then = datetime.fromisoformat(iso)
+    except ValueError:
+        return False
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - then).total_seconds() <= seconds
+
+
 def cmd_calendar_sync(args):
     """Sync calendar events from Outlook into the knowledge store."""
     from datetime import timedelta
@@ -1595,7 +1653,7 @@ def cmd_calendar_sync(args):
     from src.export.calendar_export import get_event_body, list_events, parse_event
     from src.export.outlook_cli import OutlookCliAuthRequired
     from src.extract.calendar_extractor import extract_event
-    from src.extract.policy_bridge import classify_exception
+    from src.extract.policy_bridge import classify_exception, is_transient
     from src.extract.vertex_auth import touch_sentinel
     from src.llm_policy import Outcome
     from src.store.calendar_loader import (
@@ -1604,7 +1662,7 @@ def cmd_calendar_sync(args):
         load_proxy_emails,
         refresh_self_flags,
     )
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import get_connection, migrate_add_sync_metadata, run_migrations
 
     db_path = str(args.db)
     if not Path(db_path).exists():
@@ -1628,7 +1686,12 @@ def cmd_calendar_sync(args):
 
     print(f"Calendar sync: {since.date()} to {until_dt.date()}")
     chunk_failures: list[str] = []
-    raw_events = list_events(since, until_dt, failures=chunk_failures)
+    try:
+        raw_events = list_events(since, until_dt, failures=chunk_failures)
+    except OutlookCliAuthRequired:
+        conn.close()
+        print("  Outlook needs re-authentication; nothing listed", file=sys.stderr)
+        return EXIT_REAUTH
     print(f"  Fetched {len(raw_events)} events")
     for failure in chunk_failures:
         print(f"  Could not fetch {failure}", file=sys.stderr)
@@ -1643,10 +1706,18 @@ def cmd_calendar_sync(args):
         "fetch_failed_known": 0,
     }
 
-    # Consecutive runs each event has failed get-event, kept beside the database.
+    # Consecutive runs each event has failed get-event, and when get-event last
+    # worked for anything, kept beside the database.
     fetch_state = Path(db_path).parent / "state" / "calendar_fetch_failures.json"
-    unfetched_before = _read_json_dict(fetch_state)
+    state_before = _read_json_dict(fetch_state)
+    unfetched_before = state_before.get("events")
+    if not isinstance(unfetched_before, dict):
+        unfetched_before = {}
+    last_fetch_ok = state_before.get("last_fetch_ok")
     unfetched_now: dict[str, int] = {}
+    failed_fetch_runs: dict[str, int] = {}
+    fetched_ok = False
+    session_expired = False
     listed_ids = [raw.get("Id", "") for raw in raw_events]
 
     for index, raw in enumerate(raw_events):
@@ -1684,14 +1755,15 @@ def cmd_calendar_sync(args):
             body_raw = get_event_body(event["outlook_event_id"])
         except OutlookCliAuthRequired:
             # The session expired mid-run. Every later fetch would fail the same way,
-            # and the outage is sb-auth-watch's to report and repair, so this is a
-            # deferral like a dead gcloud, not a failure of the run. Nothing is
-            # written, so the next run re-offers all of them.
+            # so the run stops asking and exits EXIT_REAUTH, as it does when the
+            # session is already dead at list time. Nothing is written, so the next
+            # run re-offers all of them, and their fetch-failure counts carry over.
             remaining = listed_ids[index:]
             stats["deferred"] += len(remaining)
             unfetched_now.update(
                 {eid: unfetched_before[eid] for eid in remaining if eid in unfetched_before}
             )
+            session_expired = True
             print(
                 f"  Outlook needs re-authentication; {len(remaining)} event(s) deferred "
                 "to the next run",
@@ -1723,19 +1795,17 @@ def cmd_calendar_sync(args):
             # you already have". This is its mirror: an API failure must not overwrite API
             # data you already have with less of it.
             event_id = event["outlook_event_id"]
-            runs = unfetched_before.get(event_id, 0) + 1
-            unfetched_now[event_id] = runs
+            previous_runs = unfetched_before.get(event_id, 0)
+            runs = (previous_runs if isinstance(previous_runs, int) else 0) + 1
+            failed_fetch_runs[event_id] = runs
             print(
                 f"  Body fetch failed for {event.get('subject', '???')} ({runs} run(s) in a "
                 "row); leaving the row untouched so the next run re-offers it",
                 file=sys.stderr,
             )
-            if runs <= CALENDAR_FETCH_ALERT_RUNS:
-                stats["fetch_failed"] += 1
-            else:
-                stats["fetch_failed_known"] += 1
             continue
 
+        fetched_ok = True
         event = parse_event(body_raw)
         event["change_key"] = list_change_key
         body_obj = body_raw.get("Body", {})
@@ -1746,13 +1816,17 @@ def cmd_calendar_sync(args):
         # above succeeded so both are authoritative.
         #
         # --skip-extraction IS NOT AUTHORITATIVE. A run told not to extract has no basis
-        # for discharging a debt an earlier run recorded, so it must not write 'skipped'
-        # over a 'pending'. Latent today, because sb-calendar-sync.sh runs the command
-        # bare, and closed here because it is the same line.
+        # for discharging a debt, an earlier one or this event's own: a body worth
+        # extracting stays 'pending', or with the etag stored it would never be offered
+        # again. Latent today, because sb-calendar-sync.sh runs the command bare.
         extraction = {"body_summary": "", "decisions": [], "action_items": []}
         prior_status = existing["llm_status"] if existing else None
-        llm_status = "pending" if args.skip_extraction and prior_status == "pending" else "skipped"
-        if not args.skip_extraction and body_html and len(body_html.strip()) >= 50:
+        long_enough = bool(body_html) and len(body_html.strip()) >= 50
+        if args.skip_extraction:
+            llm_status = "pending" if long_enough or prior_status == "pending" else "skipped"
+        else:
+            llm_status = "skipped"
+        if not args.skip_extraction and long_enough:
             try:
                 extraction = extract_event(event, body_html)
                 llm_status = "extracted"
@@ -1765,6 +1839,11 @@ def cmd_calendar_sync(args):
                     llm_status = "pending"
                     touch_sentinel()
                     stats["deferred"] += 1
+                elif is_transient(e):
+                    # The service failed, not the event: offered again next run. The
+                    # run still fails, so an outage that lasts is seen.
+                    llm_status = "pending"
+                    stats["failed"] += 1
                 else:
                     llm_status = "failed"
                     # Once per event: a failure already on record was reported by the
@@ -1801,16 +1880,51 @@ def cmd_calendar_sync(args):
             "  BRAIN_USER_EMAIL_PATTERN is unset; leaving the stored self flags alone",
             file=sys.stderr,
         )
+    if not chunk_failures:
+        # The run itself is the liveness signal. With a working change detector an
+        # unchanged calendar writes no event row, so MAX(ingested_at) stopped
+        # proving the sync ran; scripts/health_check.py reads this as well.
+        from datetime import UTC
+
+        migrate_add_sync_metadata(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('calendar_last_listed', ?)",
+            (datetime.now(UTC).isoformat(),),
+        )
+        conn.commit()
     conn.close()
 
-    # Only events that failed this run (or were deferred before their turn) keep a
-    # count, so a success or an event gone from the window clears it.
-    import json
+    # The cap needs evidence that get-event works at all: a success this run or
+    # within the last day. Without it every failure counts, known or not.
+    cap_applies = fetched_ok or _within(last_fetch_ok, CALENDAR_FETCH_OK_WITHIN_S)
+    for runs in failed_fetch_runs.values():
+        if cap_applies and runs > CALENDAR_FETCH_ALERT_RUNS:
+            stats["fetch_failed_known"] += 1
+        else:
+            stats["fetch_failed"] += 1
 
-    fetch_state.parent.mkdir(parents=True, exist_ok=True)
-    tmp_state = fetch_state.with_name(fetch_state.name + ".tmp")
-    tmp_state.write_text(json.dumps(unfetched_now, indent=1))
-    tmp_state.replace(fetch_state)
+    # Only events that failed this run (or were deferred before their turn) keep a
+    # count, so a success or an event gone from the window clears it. The file is
+    # bookkeeping: the rows are committed, so failing to write it is a warning.
+    import json
+    import os
+    import tempfile
+    from datetime import UTC
+
+    unfetched_now.update(failed_fetch_runs)
+    new_state = {
+        "events": unfetched_now,
+        "last_fetch_ok": datetime.now(UTC).isoformat() if fetched_ok else last_fetch_ok,
+    }
+    try:
+        fetch_state.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", dir=fetch_state.parent, prefix=fetch_state.name, delete=False
+        ) as tmp:
+            json.dump(new_state, tmp, indent=1)
+        os.replace(tmp.name, fetch_state)
+    except OSError as e:
+        print(f"  Could not write {fetch_state}: {e}", file=sys.stderr)
 
     print(f"  Loaded:     {stats['loaded']}")
     print(f"  Unchanged:  {stats['skipped_unchanged']}")
@@ -1830,7 +1944,10 @@ def cmd_calendar_sync(args):
 
     # Every one of these is already recorded so the next run re-offers or
     # reports it; the exit code is what tells the scheduler this run did not do
-    # its job. A deferral (auth, sentinel set) is not a failure of the run.
+    # its job. A dead gcloud (sentinel set) is a deferral, not a failure; an
+    # expired Outlook session is EXIT_REAUTH, wherever in the run it shows.
+    if session_expired:
+        return EXIT_REAUTH
     if chunk_failures or stats["fetch_failed"] or stats["failed"]:
         print(
             f"  Run incomplete: {len(chunk_failures)} window chunk(s), "

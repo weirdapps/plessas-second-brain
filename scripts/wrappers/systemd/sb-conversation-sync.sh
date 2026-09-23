@@ -8,8 +8,16 @@ LOG_DIR="$HOME/.second-brain/logs"
 LOG_FILE="$LOG_DIR/conversation-sync.log"
 mkdir -p "$LOG_DIR"
 
-# Overridable so the wrapper tests never touch a lock a real run may hold.
+# Overridable so the wrapper tests never touch a lock a real run may hold. The
+# lock is removed with rm -rf, so the override must name a *.lock directory.
 LOCK_DIR="${SB_CONVERSATION_SYNC_LOCK:-/tmp/sb-conversation-sync.lock}"
+case "$LOCK_DIR" in
+  *.lock) ;;
+  *)
+    echo "SB_CONVERSATION_SYNC_LOCK must name a *.lock directory, got: $LOCK_DIR" >&2
+    exit 64
+    ;;
+esac
 if [ -d "$LOCK_DIR" ]; then
   stored_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
   if [ -z "$stored_pid" ] || ! kill -0 "$stored_pid" 2>/dev/null; then

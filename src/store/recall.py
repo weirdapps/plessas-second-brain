@@ -15,6 +15,7 @@ from src.store.conversation_query import search_conversations_keyword
 from src.store.fusion import reciprocal_rank_fusion
 from src.store.greek import (
     PHRASE_MATCH,
+    STOPWORDS,
     register_sql_functions,
     search_fold,
     search_phrase,
@@ -39,23 +40,31 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 def _folded_bucket(conn: sqlite3.Connection, sql: str, keyword: str, limit: int) -> list[dict]:
     """Run a LIKE-style bucket in one pass: the whole query, else any of its tokens.
 
-    ``sql`` takes (phrase, joined tokens, limit), selects sb_match(...) AS score
+    ``sql`` takes (phrases, joined tokens, limit), selects sb_match(...) AS score
     and orders by it first. Matching is on folded text (case, accents, final
-    sigma, punctuation around words), which LIKE alone does for ASCII only. Rows
-    holding the whole query keep each bucket's old semantics and come back alone
-    when there are any. Otherwise rows holding some of its meaningful tokens come
-    back, most first, flagged partial_match: the whole-query form alone emptied
-    these buckets for the long queries agents write. A one-word query gets no
-    token pass, since "any" would equal "all".
+    sigma), at the start of a word, which LIKE alone does not do. A row holding
+    the phrase, or every word of the query in any order, is a whole match, and
+    whole matches come back alone when there are any. The any-order test counts
+    tokens, so it applies only when the tokens are every word but the stopwords:
+    a year or a short word is no token, and a row without it is not whole.
+    Otherwise rows holding some of the words come back, most first, flagged
+    partial_match: the whole-query form alone emptied these buckets for the long
+    queries agents write. A one-word query gets no token pass, since "any" would
+    equal "all".
     """
     register_sql_functions(conn)  # the MCP image search calls this directly
-    phrase = search_phrase(keyword)
-    if not phrase:
+    stripped = search_phrase(keyword)
+    if not stripped:
         return []
-    tokens = search_tokens(keyword) if len(phrase.split()) >= 2 else []
-    rows = [dict(r) for r in conn.execute(sql, (phrase, "\x1f".join(tokens), limit))]
-    exact = [r for r in rows if r["score"] >= PHRASE_MATCH]
-    out = exact or [{**r, "partial_match": True} for r in rows]
+    typed = " ".join(search_fold(keyword).split())
+    phrases = "\x1e".join(dict.fromkeys(f for f in (stripped, typed) if f))
+    tokens = search_tokens(keyword) if len(stripped.split()) >= 2 else []
+    every_word = bool(tokens) and set(tokens) == set(stripped.split()) - STOPWORDS
+    rows = [dict(r) for r in conn.execute(sql, (phrases, "\x1f".join(tokens), limit))]
+    whole = [
+        r for r in rows if r["score"] >= PHRASE_MATCH or (every_word and r["score"] == len(tokens))
+    ]
+    out = whole or [{**r, "partial_match": True} for r in rows]
     for row in out:
         del row["score"]
     return out
@@ -368,8 +377,14 @@ def recall(
     kinds_with_results = [k for k, v in text_kinds.items() if v]
     # Kinds whose every row came from the any-token fallback: nothing there held
     # the whole query, which a caller reading only the summary could not tell.
+    # Semantic rows in the fused email bucket carry no flag either way, so they
+    # count as neither whole nor partial.
     partial_kinds = [
-        k for k, v in text_kinds.items() if v and all(r.get("partial_match") for r in v)
+        k
+        for k, v in text_kinds.items()
+        if v
+        and any(r.get("partial_match") for r in v)
+        and all(r.get("partial_match") or r.get("source") == "semantic" for r in v)
     ]
 
     return {

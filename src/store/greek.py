@@ -99,6 +99,10 @@ STOPWORDS = frozenset(
         "but", "you", "all", "any", "our", "what", "how", "when", "who", "which",
         "about", "did", "does", "have", "has", "there", "will", "can", "should",
         "would", "could", "they", "their", "them", "into", "also",
+        # Two-letter function words, which the acronym rule would otherwise keep
+        # from an ALL-CAPS query. Not "it": IT is a department.
+        "σε", "σαν", "ως", "αν", "is", "of", "or", "to", "in", "on", "at", "by",
+        "an", "as", "be", "we", "if", "do", "so", "no",
     )
 )  # fmt: skip
 
@@ -167,17 +171,46 @@ def _token_pattern(joined_tokens: str) -> re.Pattern | None:
     return re.compile(r"(?<!\w)(?:" + "|".join(parts) + ")")
 
 
-def _match_score(text: str | None, phrase: str, joined_tokens: str) -> int:
-    """PHRASE_MATCH if the folded text holds ``phrase``, else how many tokens it holds.
+@lru_cache(maxsize=64)
+def _phrase_pattern(joined_phrases: str) -> re.Pattern | None:
+    """One regex for the forms of a query's phrase, each at the start of a word.
+
+    A plain substring test let a one-word query match inside other words: 'AI'
+    in 'email', 'UX' in 'Luxembourg'. A phrase under three characters is an
+    acronym and must be the whole word. The forms, separated by U+001E, are the
+    phrase as typed and without its punctuation, so a verbatim query with inner
+    punctuation still counts as whole.
+    """
+    phrases = sorted((f for f in joined_phrases.split("\x1e") if f), key=len, reverse=True)
+    if not phrases:
+        return None
+    parts = (re.escape(f) + (r"(?!\w)" if len(f) < 3 else "") for f in phrases)
+    return re.compile(r"(?<!\w)(?:" + "|".join(parts) + ")")
+
+
+@lru_cache(maxsize=128)
+def _forms(joined: str, separator: str) -> tuple[str, ...]:
+    """The non-empty parts of a joined argument, split once per query, not per row."""
+    return tuple(f for f in joined.split(separator) if f)
+
+
+def _match_score(text: str | None, phrases: str, joined_tokens: str) -> int:
+    """PHRASE_MATCH if the folded text holds the phrase, else how many tokens it holds.
 
     One function, so a search that falls back from the whole query to its tokens
     folds each row once, in one pass over the table: the fold runs in Python and
-    a second pass cost as much again. The phrase is a substring test, as the
-    LIKE it replaced was.
+    a second pass cost as much again. A plain substring test runs first, in C,
+    and rules out most rows; the regexes, which place a hit at the start of a
+    word, run on the rest. The regexes alone cost about a microsecond more per
+    row, a third of a second per recall.
     """
     folded = search_fold(text)
-    if phrase and phrase in folded:
-        return PHRASE_MATCH
+    if any(map(folded.__contains__, _forms(phrases, "\x1e"))):
+        phrase = _phrase_pattern(phrases)
+        if phrase is not None and phrase.search(folded):
+            return PHRASE_MATCH
+    if not any(map(folded.__contains__, _forms(joined_tokens, "\x1f"))):
+        return 0
     pattern = _token_pattern(joined_tokens)
     return len(set(pattern.findall(folded))) if pattern else 0
 

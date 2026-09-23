@@ -176,20 +176,24 @@ def query_by_person(conn: sqlite3.Connection, name_or_email: str, limit: int = 2
         """
         params = (name_or_email.strip(), limit)
     else:
-        # Search by name (partial match)
+        # Search by name (partial match). People are folded once each, into a
+        # materialized id list. Emails are then walked newest first and kept when
+        # they link to one of them, so LIMIT stops early for the mailbox owner,
+        # who is on nearly every email; joined through email_people, SQLite
+        # could fold once per link (1.3M rows) or sort every linked email first.
         query = """
-            SELECT DISTINCT
+            WITH ids AS MATERIALIZED (SELECT id FROM people WHERE sb_fold(name) LIKE ?)
+            SELECT
                 e.id as email_id,
                 e.date_received as date,
                 e.subject,
                 e.summary,
-                ep.role_in_email as person_role,
+                (SELECT ep.role_in_email FROM email_people ep
+                  WHERE ep.email_id = e.id AND ep.person_id IN ids LIMIT 1) as person_role,
                 e.sentiment
             FROM emails e
-            JOIN email_people ep ON e.id = ep.email_id
-            -- People are folded in a subquery, once each. Joined, the planner
-            -- could fold once per email link (1.3M rows, seconds per call).
-            WHERE ep.person_id IN (SELECT id FROM people WHERE sb_fold(name) LIKE ?)
+            WHERE EXISTS (SELECT 1 FROM email_people ep
+                          WHERE ep.email_id = e.id AND ep.person_id IN ids)
             ORDER BY e.date_received DESC
             LIMIT ?
         """
@@ -682,39 +686,26 @@ def query_combined(
     if not any([person, topic, keyword, start_date, end_date]):
         raise ValueError("At least one filter must be provided")
 
-    # Build query with all filters
-    query = """
-        SELECT DISTINCT
-            e.id as email_id,
-            e.date_received as date,
-            e.subject,
-            e.summary,
-            e.sender_name as sender,
-            GROUP_CONCAT(t.display_name, ', ') as topics,
-            1.0 as relevance_score
-        FROM emails e
-        LEFT JOIN email_topics et ON e.id = et.email_id
-        LEFT JOIN topics t ON et.topic_id = t.id
-    """
-
-    joins = []
+    cte = ""
+    cte_params: list[Any] = []
     where_clauses = []
     params: list[Any] = []
 
-    # Person filter
+    # Person filter. Folded once per person into a materialized id list, then
+    # tested per email, as in query_by_person.
     if person:
-        # People are filtered in a subquery, once each; see query_by_person.
-        joins.append("JOIN email_people ep ON e.id = ep.email_id")
         if "@" in person:
             where_clauses.append(
-                "ep.person_id IN (SELECT id FROM people WHERE LOWER(email) = LOWER(?))"
+                "EXISTS (SELECT 1 FROM email_people ep WHERE ep.email_id = e.id AND "
+                "ep.person_id IN (SELECT id FROM people WHERE LOWER(email) = LOWER(?)))"
             )
             params.append(person.strip())
         else:
+            cte = "WITH ids AS MATERIALIZED (SELECT id FROM people WHERE sb_fold(name) LIKE ?) "
+            cte_params.append(f"%{search_fold(person)}%")
             where_clauses.append(
-                "ep.person_id IN (SELECT id FROM people WHERE sb_fold(name) LIKE ?)"
+                "EXISTS (SELECT 1 FROM email_people ep WHERE ep.email_id = e.id AND ep.person_id IN ids)"
             )
-            params.append(f"%{search_fold(person)}%")
 
     # Topic filter
     if topic:
@@ -724,7 +715,7 @@ def query_combined(
         )
         params.append(f"%{topic_normalized}%")
 
-    # Keyword filter (FTS5) — emails, key facts, and attachment content
+    # Keyword filter (FTS5): emails, key facts, and attachment content
     if keyword:
         safe_kw = _sanitize_fts5_query(keyword)
         or_branches = [
@@ -750,21 +741,34 @@ def query_combined(
         where_clauses.append("DATE(e.date_received) <= DATE(?)")
         params.append(end_date)
 
-    # Add joins
-    if joins:
-        query += " " + " ".join(joins)
-
-    # Add where clause
+    # The newest `limit` matching emails are picked first, then their topics are
+    # joined: grouping every match by topic before the LIMIT sorted them all.
+    picked = "SELECT e.id FROM emails e"
     if where_clauses:
-        query += " WHERE " + " AND ".join(where_clauses)
-
-    query += """
+        picked += " WHERE " + " AND ".join(where_clauses)
+    picked += " ORDER BY e.date_received DESC LIMIT ?"
+    query = (
+        cte
+        + """
+        SELECT
+            e.id as email_id,
+            e.date_received as date,
+            e.subject,
+            e.summary,
+            e.sender_name as sender,
+            GROUP_CONCAT(t.display_name, ', ') as topics,
+            1.0 as relevance_score
+        FROM ("""
+        + picked
+        + """) picked
+        JOIN emails e ON e.id = picked.id
+        LEFT JOIN email_topics et ON e.id = et.email_id
+        LEFT JOIN topics t ON et.topic_id = t.id
         GROUP BY e.id
         ORDER BY e.date_received DESC
-        LIMIT ?
     """
-
-    params.append(limit)
+    )
+    params = cte_params + params + [limit]
 
     cursor = conn.execute(query, params)
     return [dict(row) for row in cursor.fetchall()]

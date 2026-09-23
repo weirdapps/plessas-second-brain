@@ -43,9 +43,10 @@ Matching. Most of this corpus is Greek. Every search ignores case, accents and \
 final sigma, so either form of a word works. Keyword search wants every word; \
 when nothing holds them all it falls back to any meaningful word and flags those \
 rows partial_match (recall's summary.partial_kinds names the kinds that only \
-matched partly). Plain words work best; quotes and operators are ignored. An \
-ambiguous name resolves to the most-emailed person, with match_count and \
-other_candidates saying who else it could be.
+matched partly). Plain words work best; quotes and operators are ignored. In \
+person_context, sender_brief and meeting_prep an ambiguous name resolves to the \
+most-emailed person, with match_count and other_candidates saying who else it \
+could be; the query_* filters match everyone the name fits.
 
 Not covered: anything not yet ingested, plus WhatsApp, Yahoo, personal Gmail and \
 sch.gr mail, which are separate MCP servers in this session.\
@@ -358,7 +359,7 @@ def meeting_prep(people: str, topic: str | None = None, days: int = 365) -> dict
 
     conn = _get_conn()
     try:
-        people_list = [p.strip() for p in people.split(",")]
+        people_list = [p.strip() for p in people.split(",") if p.strip()]
         return _mp(conn, people_list, topic=topic, days=days)
     finally:
         conn.close()

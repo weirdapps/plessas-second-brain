@@ -37,6 +37,10 @@ def resolve_person(
     through here, so one name means one person in both.
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
+    if not search_fold(name_or_email).strip():
+        # '%%' matched everyone, so an empty name (a trailing comma in a list of
+        # attendees) resolved to the most-emailed person.
+        return None, 0, []
     if "@" in name_or_email:
         row = conn.execute(
             "SELECT id, name, email, role, department FROM people WHERE LOWER(email) = LOWER(?)",
@@ -262,13 +266,14 @@ def get_person_context(
         }
 
     # Calendar: last met, next meeting, meeting frequency. An attendee row is this
-    # person by resolved person_id, else by address, and by folded name only when
-    # there is no address on record: folding every attendee name in Python cost a
-    # scan of every past event for anyone who never attended one. Each IN
-    # subquery runs once per statement.
+    # person by resolved person_id, else by address, else by folded name when the
+    # row resolved to no one (an invite from an address not on record, such as a
+    # personal one). Only unresolved rows are folded, about a tenth of them:
+    # folding every attendee name in Python cost a scan of every past event for
+    # anyone who never attended one. Each IN subquery runs once per statement.
     calendar_data = {}
     email = person.get("email") or ""
-    attendee_args = (person["id"], email, email, email, f"%{search_fold(person['name'])}%")
+    attendee_args = (person["id"], email, email, f"%{search_fold(person['name'])}%")
 
     try:
         last_met = conn.execute(
@@ -277,7 +282,7 @@ def get_person_context(
                    SELECT event_id FROM event_attendees
                    WHERE person_id = ?
                       OR (? <> '' AND LOWER(email) = LOWER(?))
-                      OR (? = '' AND sb_fold(name) LIKE ?))
+                      OR (person_id IS NULL AND sb_fold(name) LIKE ?))
                  AND ce.start_at < datetime('now')
                ORDER BY ce.start_at DESC LIMIT 1""",
             attendee_args,
@@ -291,7 +296,7 @@ def get_person_context(
                    SELECT event_id FROM event_attendees
                    WHERE person_id = ?
                       OR (? <> '' AND LOWER(email) = LOWER(?))
-                      OR (? = '' AND sb_fold(name) LIKE ?))
+                      OR (person_id IS NULL AND sb_fold(name) LIKE ?))
                  AND ce.start_at > datetime('now')
                ORDER BY ce.start_at ASC LIMIT 1""",
             attendee_args,
@@ -308,7 +313,7 @@ def get_person_context(
                    SELECT event_id FROM event_attendees
                    WHERE person_id = ?
                       OR (? <> '' AND LOWER(email) = LOWER(?))
-                      OR (? = '' AND sb_fold(name) LIKE ?))
+                      OR (person_id IS NULL AND sb_fold(name) LIKE ?))
                  AND ce.start_at >= datetime('now', '-30 days')""",
             attendee_args,
         ).fetchone()[0]

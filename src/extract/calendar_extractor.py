@@ -3,6 +3,7 @@
 import json
 
 from src.extract.claude_extract import _get_client_and_model, _response_text, call_with_policy
+from src.extract.untrusted import fence
 from src.redact import redact_secrets
 
 
@@ -90,16 +91,17 @@ def extract_event(event: dict, body: str | None = None) -> dict:
     )
     start_at = event.get("start_at", "")
 
-    # Build prompt
-    prompt = f"""You are analyzing a calendar event from a corporate email system.
-
-Event subject: {subject}
+    # Build prompt. Whoever sent the invite wrote all of it, the subject included.
+    invite = f"""Event subject: {subject}
 Organizer: {organizer}
 Attendees: {attendees}
 Date: {start_at}
 
 Event body/description:
-{truncated_body}
+{truncated_body}"""
+    prompt = f"""You are analyzing a calendar event from a corporate email system.
+
+{fence(invite)}
 
 Extract the following as JSON:
 {{

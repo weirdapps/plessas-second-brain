@@ -85,6 +85,10 @@ def is_transient(exc: BaseException) -> bool:
         return True
     if isinstance(exc, anthropic.APIStatusError) and getattr(exc, "status_code", 0) >= 500:
         return True
+    # AnthropicVertex refreshes its Google token outside the SDK's own error
+    # wrapping, so a network drop there arrives as google-auth's own types.
+    if isinstance(exc, gauth.TransportError | gauth.TimeoutError):
+        return True
     return isinstance(exc, ConnectionError | TimeoutError)
 
 

@@ -766,20 +766,49 @@ def test_when_no_fetch_has_worked_every_failure_keeps_counting(monkeypatch, tmp_
     assert rcs == [1, 1, 1, 1, 1]
 
 
-def test_the_cap_lapses_once_the_last_good_fetch_is_a_day_old(monkeypatch, tmp_path):
+def _quiet_calendar_with_one_known_bad_event(monkeypatch, tmp_path):
+    """A stored, unchanged event, and a bad one already past the cap."""
     import json
 
     db_path = _calendar_db(tmp_path)
-    state = Path(db_path).parent / "state" / "calendar_fetch_failures.json"
-    state.parent.mkdir(parents=True, exist_ok=True)
-    state.write_text(
-        json.dumps({"events": {_EVENT_ID: 5}, "last_fetch_ok": "2020-01-01T00:00:00+00:00"})
-    )
+    healthy = {**_LIST_EVENT, "Id": "AAMkAGI2healthy="}
 
-    def broken(event_id):
+    def fetchable(event_id):
+        return {**_RAW_EVENT, "Id": event_id, "Body": {"Content": "short"}}
+
+    _sync_rc(monkeypatch, db_path, [healthy], fetchable)
+    state = Path(db_path).parent / "state" / "calendar_fetch_failures.json"
+    state.write_text(json.dumps({"events": {_EVENT_ID: 5}}))
+    return db_path, healthy
+
+
+def test_on_a_quiet_calendar_a_canary_keeps_the_cap(monkeypatch, tmp_path):
+    """Nothing changed, so nothing but the bad event was fetched: no evidence
+    either way about get-event. One fetch of an unchanged event provides it, and
+    the known-bad event stays quiet however long the calendar stays quiet."""
+    db_path, healthy = _quiet_calendar_with_one_known_bad_event(monkeypatch, tmp_path)
+    fetches: list[str] = []
+
+    def only_the_bad_one_fails(event_id):
+        fetches.append(event_id)
+        if event_id == _EVENT_ID:
+            return None
+        return {**_RAW_EVENT, "Id": event_id, "Body": {"Content": "short"}}
+
+    rc = _sync_rc(monkeypatch, db_path, [healthy, _LIST_EVENT], only_the_bad_one_fails)
+
+    assert rc == 0
+    assert fetches == [_EVENT_ID, healthy["Id"]]
+
+
+def test_a_failing_canary_counts_every_failure(monkeypatch, tmp_path):
+    """The canary failing too means get-event is down, not one event."""
+    db_path, healthy = _quiet_calendar_with_one_known_bad_event(monkeypatch, tmp_path)
+
+    def down(event_id):
         return None
 
-    assert _sync_rc(monkeypatch, db_path, [_LIST_EVENT], broken) == 1
+    assert _sync_rc(monkeypatch, db_path, [healthy, _LIST_EVENT], down) == 1
 
 
 def test_a_successful_fetch_resets_the_unfetchable_count(monkeypatch, tmp_path):
@@ -935,3 +964,17 @@ def test_an_unwritable_state_dir_does_not_fail_the_run(monkeypatch, tmp_path, ca
     assert rc == 0
     err = capsys.readouterr().err
     assert "calendar_fetch_failures" in err
+
+
+def test_a_run_where_a_fetch_failure_counts_leaves_no_heartbeat(monkeypatch, tmp_path):
+    """The heartbeat means the calendar is being read. A run where get-event
+    failed for real must not refresh it, or a get-event outage would keep the
+    health check green on every replica."""
+    db_path = _calendar_db(tmp_path)
+
+    def broken(event_id):
+        return None
+
+    _sync_rc(monkeypatch, db_path, [_LIST_EVENT], broken)
+
+    assert _heartbeat(db_path) is None

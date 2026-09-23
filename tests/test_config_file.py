@@ -123,9 +123,10 @@ def test_a_file_that_is_not_utf8_is_ignored_not_fatal(tmp_path, capsys):
 
 
 def test_importing_config_applies_the_file(monkeypatch, tmp_path):
-    # import_module, not `import src.config`: the latter can resolve through the
-    # package attribute, which tests/test_health_check.py's _reload_hc leaves
-    # pointing at a module object that is no longer in sys.modules.
+    # import_module, not `import src.config`: the latter resolves through the
+    # package attribute, which a reload elsewhere can leave pointing at a module
+    # no longer in sys.modules (tests/test_health_check.py's _reload_hc did until
+    # it restored both). import_module reads sys.modules, whatever ran before.
     cfg = importlib.import_module("src.config")
 
     path = _write(tmp_path, "BRAIN_USER_EMAIL_PATTERN=owner@example.com\n")

@@ -1611,11 +1611,6 @@ def cmd_teams_stats(args):
 # the window, and a check that is always red is a check nobody reads.
 CALENDAR_FETCH_ALERT_RUNS = 3
 
-# ...but only while get-event has worked for some event within the last day.
-# When nothing has been fetchable that long, every failure counts: that is an
-# outage (an outlook-cli regression, say), not one bad event.
-CALENDAR_FETCH_OK_WITHIN_S = 24 * 3600
-
 # The shared "re-authenticate" exit code, the same as the three M365 CLIs'.
 EXIT_REAUTH = 4
 
@@ -1628,21 +1623,6 @@ def _read_json_dict(path: Path) -> dict:
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
-
-
-def _within(iso: object, seconds: float) -> bool:
-    """Whether ``iso`` is a timestamp no older than ``seconds``."""
-    from datetime import UTC
-
-    if not isinstance(iso, str):
-        return False
-    try:
-        then = datetime.fromisoformat(iso)
-    except ValueError:
-        return False
-    if then.tzinfo is None:
-        then = then.replace(tzinfo=UTC)
-    return (datetime.now(UTC) - then).total_seconds() <= seconds
 
 
 def cmd_calendar_sync(args):
@@ -1706,15 +1686,13 @@ def cmd_calendar_sync(args):
         "fetch_failed_known": 0,
     }
 
-    # Consecutive runs each event has failed get-event, and when get-event last
-    # worked for anything, kept beside the database.
+    # Consecutive runs each event has failed get-event, kept beside the database.
     fetch_state = Path(db_path).parent / "state" / "calendar_fetch_failures.json"
-    state_before = _read_json_dict(fetch_state)
-    unfetched_before = state_before.get("events")
+    unfetched_before = _read_json_dict(fetch_state).get("events")
     if not isinstance(unfetched_before, dict):
         unfetched_before = {}
-    last_fetch_ok = state_before.get("last_fetch_ok")
     unfetched_now: dict[str, int] = {}
+    unchanged_ids: list[str] = []
     failed_fetch_runs: dict[str, int] = {}
     fetched_ok = False
     session_expired = False
@@ -1747,6 +1725,7 @@ def cmd_calendar_sync(args):
             and existing["llm_status"] != "pending"
         ):
             stats["skipped_unchanged"] += 1
+            unchanged_ids.append(event["outlook_event_id"])
             continue
 
         # Fetch full event (list-calendar returns a subset without Attendees,
@@ -1880,10 +1859,26 @@ def cmd_calendar_sync(args):
             "  BRAIN_USER_EMAIL_PATTERN is unset; leaving the stored self flags alone",
             file=sys.stderr,
         )
-    if not chunk_failures:
+    # The cap needs evidence that get-event works at all, from this run. On a
+    # quiet calendar the failing events may be the only ones fetched, so fetch
+    # one unchanged event as a canary. If nothing was fetchable, every failure
+    # counts, known or not: that is an outage, not one bad event.
+    if failed_fetch_runs and not fetched_ok and unchanged_ids and not session_expired:
+        try:
+            fetched_ok = isinstance(get_event_body(unchanged_ids[0]), dict)
+        except OutlookCliAuthRequired:
+            session_expired = True
+    for runs in failed_fetch_runs.values():
+        if fetched_ok and runs > CALENDAR_FETCH_ALERT_RUNS:
+            stats["fetch_failed_known"] += 1
+        else:
+            stats["fetch_failed"] += 1
+
+    if not chunk_failures and not stats["fetch_failed"]:
         # The run itself is the liveness signal. With a working change detector an
         # unchanged calendar writes no event row, so MAX(ingested_at) stopped
-        # proving the sync ran; scripts/health_check.py reads this as well.
+        # proving the sync ran; scripts/health_check.py reads this as well. Not on
+        # a run where get-event failed for real, or an outage would read as fresh.
         from datetime import UTC
 
         migrate_add_sync_metadata(conn)
@@ -1894,28 +1889,15 @@ def cmd_calendar_sync(args):
         conn.commit()
     conn.close()
 
-    # The cap needs evidence that get-event works at all: a success this run or
-    # within the last day. Without it every failure counts, known or not.
-    cap_applies = fetched_ok or _within(last_fetch_ok, CALENDAR_FETCH_OK_WITHIN_S)
-    for runs in failed_fetch_runs.values():
-        if cap_applies and runs > CALENDAR_FETCH_ALERT_RUNS:
-            stats["fetch_failed_known"] += 1
-        else:
-            stats["fetch_failed"] += 1
-
     # Only events that failed this run (or were deferred before their turn) keep a
     # count, so a success or an event gone from the window clears it. The file is
     # bookkeeping: the rows are committed, so failing to write it is a warning.
     import json
     import os
     import tempfile
-    from datetime import UTC
 
     unfetched_now.update(failed_fetch_runs)
-    new_state = {
-        "events": unfetched_now,
-        "last_fetch_ok": datetime.now(UTC).isoformat() if fetched_ok else last_fetch_ok,
-    }
+    new_state = {"events": unfetched_now}
     try:
         fetch_state.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(

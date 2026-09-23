@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
 # pii-gauntlet.sh — verify no PII leaked into plessas-marketplace.
 #
-# TWO MODES:
+# THREE MODES:
 #   --mode=ci      Scan only git-tracked files. Used by GitHub Actions to gate
 #                  pushes. Any hit = FAIL = exit 1.
 #   --mode=doctor  (default) Scan the entire working tree. Distinguishes tracked
 #                  hits (FAIL — these would ship publicly) from gitignored hits
 #                  (INFO — local-only, never pushed). Exit 1 only on tracked hits.
+#   --mode=history Scan every line and filename ever ADDED, on every ref. Local
+#                  only: needs the private denylist. Prints the commit and the
+#                  check, never the matched text. Exit 1 on any hit.
 #
-# Why two modes:
+# Why these modes:
 #   The CI mode is the actual safety gate.
 #   The doctor mode helps the maintainer notice PII drift in their LOCAL files
 #   before they accidentally `git add` something. It must NOT scare a teammate
 #   running the script casually — "FAIL" on a gitignored file would teach them
 #   to ignore the script entirely, defeating the point.
+#   The history mode sees what the other two cannot: content a fix removed from
+#   the tree but not from the published history.
 #
 # Self-exclusion: this script contains the very patterns it searches for, so
 # `--exclude=pii-gauntlet.sh` is essential to avoid self-match false positives.
+# History mode keeps the script in scope for the denylist checks only, because
+# the denylist once lived inside it.
 
 set -u
 
@@ -36,10 +43,11 @@ fi
 _MODE_FROM_ENV="$MODE"
 for arg in "$@"; do
   case "$arg" in
-    --mode=ci)     MODE="ci" ;;
-    --mode=doctor) MODE="doctor" ;;
+    --mode=ci)      MODE="ci" ;;
+    --mode=doctor)  MODE="doctor" ;;
+    --mode=history) MODE="history" ;;
     -h|--help)
-      sed -n '2,18p' "$0"
+      sed -n '2,25p' "$0"
       exit 0
       ;;
     *) echo "Unknown arg: $arg" >&2; exit 2 ;;
@@ -87,6 +95,47 @@ if [ "$MODE" = "ci" ]; then
   TRACKED_TMP=$(mktemp)
   printf '%s\n' "$TRACKED" > "$TRACKED_TMP"
 fi
+
+# History mode reads added lines and added filenames from every ref, each tagged
+# with the short hash of the commit that introduced it. Two content streams: the
+# generic checks read history WITHOUT this script, whose own text is full of the
+# patterns, and the denylist checks read it WITH the script, because an earlier
+# version of this very file carried the denylist inline.
+if [ "$MODE" = "history" ]; then
+  HISTORY_ALL=$(mktemp)
+  HISTORY_NOSELF=$(mktemp)
+  HISTORY_NAMES=$(mktemp)
+  trap 'rm -f "$HISTORY_ALL" "$HISTORY_NOSELF" "$HISTORY_NAMES"' EXIT
+  git -c core.quotePath=false log --all -p -U0 --no-color --no-ext-diff \
+    --format='commit %h' > "$HISTORY_ALL"
+  git -c core.quotePath=false log --all -p -U0 --no-color --no-ext-diff \
+    --format='commit %h' -- . ':(exclude,glob)**/pii-gauntlet.sh' > "$HISTORY_NOSELF"
+  git -c core.quotePath=false log --all --diff-filter=AR --name-only \
+    --format='commit %h' > "$HISTORY_NAMES"
+  HISTORY_SRC="$HISTORY_NOSELF"
+fi
+
+# Emit "<commit>:<added line>" for every line the diffs ADD, then filter. State
+# tracking rather than a "+++ " test, so an added line that happens to start
+# with "++" is still content. Filenames go through the same separator
+# normalisation scan_paths uses, reported as "<commit>:(filename)".
+# awk runs under LC_ALL=C: history holds bytes that are not valid UTF-8 (a small
+# binary with no NUL byte is diffed as text), BSD awk aborts on them in a UTF-8
+# locale, and every pattern awk matches here is ASCII. grep keeps the caller's
+# locale, which the Greek checks below were measured under.
+scan_history() {
+  local pattern="$1"
+  LC_ALL=C awk '/^commit [0-9a-f]+$/ { c = $2; hunk = 0; next }
+       /^diff --git / { hunk = 0; next }
+       /^@@ / { hunk = 1; next }
+       hunk && /^\+/ { print c ":" substr($0, 2) }' "$HISTORY_SRC" \
+    | grep -${CASE_FLAG}E "$pattern" 2>/dev/null || true
+  LC_ALL=C awk '/^commit [0-9a-f]+$/ { c = $2; next } NF { print c "\t" $0 }' "$HISTORY_NAMES" \
+    | LC_ALL=C awk -F'\t' '{ n = $2; gsub(/[_.-]/, " ", n); print $1 "\t" $2 "\t" n }' \
+    | grep -${CASE_FLAG}E "$pattern" 2>/dev/null \
+    | cut -f1 \
+    | sed 's/$/:(filename)/' || true
+}
 
 # Helper: get the tracked-vs-untracked status of a file.
 file_is_tracked() {
@@ -240,6 +289,23 @@ check() {
   local exclude="${3:-}"
   local exclude_path="${4:-}"
   local hits
+
+  if [ "$MODE" = "history" ]; then
+    # The commit and the check, never the text: the point is to locate history
+    # that needs rewriting, not to reprint what it discloses.
+    hits=$(scan_history "$pattern")
+    hits=$(apply_exclusion "$hits" "$exclude" "$exclude_path")
+    if [ -n "$hits" ]; then
+      local count commits
+      count=$(printf '%s\n' "$hits" | wc -l | tr -d ' ')
+      commits=$(printf '%s\n' "$hits" | cut -d: -f1 | sort -u | tr '\n' ' ')
+      echo "FAIL [$label]: $count added line(s) or filename(s) in commit(s): $commits"
+      FAIL=1
+    else
+      echo "OK   [$label]"
+    fi
+    return
+  fi
 
   if [ "$MODE" = "ci" ]; then
     # Contents AND filenames, in one verdict per check. Folding them together
@@ -447,6 +513,9 @@ check_cs "All-caps Greek personal name" \
 
 PII_DENYLIST="${PII_DENYLIST:-$HOME/.claude/private/pii-denylist.conf}"
 
+# The denylist once lived inside this script, so its history is in scope here.
+[ "$MODE" = "history" ] && HISTORY_SRC="$HISTORY_ALL"
+
 if [ -r "$PII_DENYLIST" ]; then
   # Tab-delimited: the patterns are full of regex alternation pipes, so "|"
   # cannot be the field separator.
@@ -507,6 +576,9 @@ else
   echo "=== GAUNTLET FAIL ==="
   if [ "$MODE" = "doctor" ]; then
     echo "Tracked PII detected. These files would ship publicly. Fix before committing."
+  elif [ "$MODE" = "history" ]; then
+    echo "Published history carries PII. Removing it means rewriting history and"
+    echo "force-pushing, which is irreversible: an owner decision, not a fix to automate."
   else
     echo "Fix the PII leaks above before any public push."
   fi

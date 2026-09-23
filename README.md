@@ -176,7 +176,9 @@ pip install -e ".[dev]"
 
 ## Configuration
 
-Read from environment variables (shell profile or `.env`). Only identity plus one extraction path (Vertex or Gemini) is strictly required.
+Read from environment variables. Only identity plus one extraction path (Vertex or Gemini) is strictly required.
+
+Identity and tenant settings (`BRAIN_*` and `SHAREPOINT_HOST`) can also live in a per-host file, `~/.config/second-brain/env` (override the path with `BRAIN_CONFIG_FILE`), one `KEY=value` per line. `src/config.py` applies it at import, and the environment wins over it. It exists because the processes that need these settings start without a login shell: Claude Code launches the MCP server with an empty environment, and systemd starts the timers with a fixed one. Other keys in the file are ignored, so a credential pasted into it is never picked up. Nothing reads a `.env` file; the schedulers that want one source it themselves.
 
 ### Identity
 
@@ -209,7 +211,7 @@ Preferred credential path. Uses Application Default Credentials, no API key requ
 
 ### Paths and hosts
 
-- `SHAREPOINT_HOST`: SharePoint tenant you hold a session for (default `contoso.sharepoint.com`). Auth failures on any other host are recorded as `unsupported-host` and skipped, and `sharepoint_index(refetch)` refuses any URL not on this host.
+- `SHAREPOINT_HOST`: SharePoint tenant you hold a session for (default: the placeholder `contoso.sharepoint.com`). The session is only ever presented to this host and its `<tenant>-my` OneDrive twin: a link to any other tenant is recorded as `unsupported-host` without a request, because `sharepoint-cli` attaches the session's cookies to whatever host it is given. `process-sharepoint` refuses to fetch until this is set, and `sharepoint_index(refetch)` refuses any URL off the tenant.
 - `OUTLOOK_CLI_PATH`, `SHAREPOINT_CLI_PATH`: absolute paths to those two adapters. Set them for any process that does not inherit an interactive shell's `PATH`, which includes MCP servers, launchd agents and systemd units.
 - `BRAIN_NEWS_DB`: the external news-reader SQLite database `news-sync` reads (default `~/SourceCode/news/data/news.db`). Read-only; no news ingestion happens without it.
 - `SECOND_BRAIN_VENV_PYTHON`: explicit venv override for `run_mcp.sh`.
@@ -360,10 +362,11 @@ scripts/
   backup_db.py                 MVCC-safe encrypted DB snapshot + retention (see docs/RESTORE.md)
   recover_missing_extractions.py  Backfill emails that staged but never extracted
   reap_orphan_attachments.py   Resolves attachment dirs the registrar can never claim
+  scrub_secrets.py             Redacts credentials already in the DB (dry run by default)
   curate_documents_daily.py    Classifies new attachments into ~/Documents sub-folders
   backfill-all.sh              One-shot backfill across all sources
   conversation-capture.sh      Helper to snapshot Claude Code sessions
-  pii-gauntlet.sh              Guards tracked files against personal-data leaks
+  pii-gauntlet.sh              Guards tracked files (and, with --mode=history, published history) against personal-data leaks
   wrappers/                    Archive of the scheduler wrappers each host runs
 
 examples/
@@ -445,6 +448,8 @@ Typical cadence: `sync` hourly, `embed` daily. `sync` does not cover every sourc
 ## Security
 
 Report vulnerabilities via GitHub's private vulnerability reporting. See `SECURITY.md`.
+
+Credentials are redacted on the way in (`src/redact.py`): every staging batch, extracted attachment text, Teams messages, and calendar bodies before they reach the model. Rows stored before that existed are cleaned with `python scripts/scrub_secrets.py --apply` on the host that builds the database, which also purges the old bytes from free pages and full-text segments. `scripts/pii-gauntlet.sh --mode=history` scans every line and filename ever committed, on every ref, against the same checks as CI plus the private denylist.
 
 ## License
 

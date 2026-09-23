@@ -86,6 +86,24 @@ def test_a_write_command_runs_on_the_producer(stamp, monkeypatch, tmp_path):
     assert (code, called) == (0, ["load"])
 
 
+# runpy warns that it re-executes a module the package already imported.
+@pytest.mark.filterwarnings("ignore:.*found in sys.modules:RuntimeWarning")
+def test_the_action_lifecycle_refuses_to_run_on_a_replica(stamp, monkeypatch, tmp_path, capsys):
+    """It writes, and even a dry run opens a write transaction."""
+    import runpy
+
+    stamp.write_text("x")
+    db = tmp_path / "b.db"
+    monkeypatch.setattr(sys, "argv", ["action_lifecycle", "--db", str(db), "--dry-run"])
+
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_module("src.store.action_lifecycle", run_name="__main__")
+
+    assert exc.value.code == 2
+    assert "BRAIN_ROLE=producer" in capsys.readouterr().err
+    assert not db.exists()
+
+
 def test_every_read_only_name_is_a_real_command():
     """A misspelt name would leave the real command refused, or let a new one in."""
     import argparse

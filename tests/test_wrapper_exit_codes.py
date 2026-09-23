@@ -256,6 +256,36 @@ def test_a_lock_path_that_is_a_file_is_never_removed(tmp_path, wrapper, variable
     assert precious.read_text() == "x"
 
 
+@pytest.mark.parametrize(
+    ("wrapper", "variable"),
+    [
+        ("sb-daily-sync.sh", "SB_DAILY_SYNC_LOCK"),
+        ("sb-conversation-sync.sh", "SB_CONVERSATION_SYNC_LOCK"),
+    ],
+)
+def test_a_stale_lock_that_cannot_be_removed_fails_the_run(tmp_path, wrapper, variable):
+    """Removal failed, mkdir then found the directory, and the run logged
+    'another run took the lock' and exited 0: skipped every day, unit green."""
+    home = _daily_home(tmp_path, "exit 0\n")
+    parent = tmp_path / "locks"
+    lock = parent / "stale.lock"
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text("999999")
+    parent.chmod(0o555)
+    try:
+        result = subprocess.run(
+            ["/bin/bash", str(_WRAPPERS / wrapper)],
+            env={"HOME": str(home), "PATH": "/usr/bin:/bin", variable: str(lock)},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    finally:
+        parent.chmod(0o755)
+
+    assert result.returncode == 73
+
+
 def test_a_relative_conversation_sync_lock_override_is_refused(tmp_path):
     home = _daily_home(tmp_path, "exit 0\n")
 

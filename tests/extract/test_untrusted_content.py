@@ -90,6 +90,7 @@ def test_a_quoted_turn_label_cannot_pose_as_the_owner():
         }
     )
 
+    assert "task-notification" in prompt and "teammate-message" in prompt
     mark = re.search(r"as in \[Turn 1 ([0-9a-f]{6})\]", prompt).group(1)
     inside = prompt[TAG.search(prompt).end() :]
     labels = re.findall(rf"\[Turn \d+ {mark}\] (USER|ASSISTANT):", inside)

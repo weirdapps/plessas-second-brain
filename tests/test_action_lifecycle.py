@@ -153,11 +153,17 @@ class TestExpire:
         conn.execute(
             "INSERT INTO emails (id, message_id, date_received) VALUES (3, 3, '2106-02-07T00:00:00')"
         )
+        # Calendar sync runs a month ahead, and that is where year slips land.
+        _meeting(conn, 1, "2999-01-01T10:00:00")
+        conn.execute(
+            "UPDATE calendar_events SET start_at = datetime('now', '+20 days') WHERE id = 1"
+        )
         _add(conn, "fresh email", deadline="2020-09-30", email_id=1)
         _add(conn, "old email", deadline="2020-09-30", email_id=2)
         _add(conn, "no parent", deadline="2020-09-30", email_id=None)
-        # A parent dated in the future is a bad date, not a fresh one.
-        _add(conn, "future parent", deadline="2020-09-30", email_id=3)
+        _add(conn, "meeting next month", deadline="2020-09-30", email_id=None, event_id=1)
+        # A parent dated generations ahead is a bad date, not a fresh one.
+        _add(conn, "far-future parent", deadline="2020-09-30", email_id=3)
         conn.commit()
 
         assert expire_stale_actions(conn, days=180) == 3
@@ -165,7 +171,8 @@ class TestExpire:
             "fresh email": "open",
             "old email": "expired",
             "no parent": "expired",
-            "future parent": "expired",
+            "meeting next month": "open",
+            "far-future parent": "expired",
         }
         conn.close()
 
@@ -252,17 +259,28 @@ class TestExpireUndated:
         _add(conn, "due next year, short", deadline=f"31/12/{(year + 1) % 100:02d}", email_id=1)
         _add(conn, "due in eight years", deadline=f"by end {year + 8}", email_id=1)
         _add(conn, "due long ago", deadline="31/12/2020", email_id=1)
-        # A year inside a longer number is no year.
+        # A year inside a longer number is no year, and two digits after a
+        # separator are a day or a minute unless the whole reads d/m/yy.
         _add(conn, "after a PO", deadline=f"after PO 1{year}5 is approved", email_id=1)
+        _add(conn, "a past US date", deadline="10/26/2023", email_id=1)
+        _add(conn, "a time", deadline="by 17.30", email_id=1)
+        _add(conn, "a day and month", deadline="5/30", email_id=1)
+        _add(conn, "a version", deadline="after v1.30", email_id=1)
+        _add(conn, "a slashed past date", deadline="2023/10/26", email_id=1)
         conn.commit()
 
-        assert expire_undated_actions(conn, days=90) == 2
+        assert expire_undated_actions(conn, days=90) == 7
         assert dict(conn.execute("SELECT task, status FROM action_items")) == {
             "due next year": "open",
             "due next year, short": "open",
             "due in eight years": "open",
             "due long ago": "expired",
             "after a PO": "expired",
+            "a past US date": "expired",
+            "a time": "expired",
+            "a day and month": "expired",
+            "a version": "expired",
+            "a slashed past date": "expired",
         }
         conn.close()
 
@@ -272,9 +290,14 @@ class TestExpireUndated:
         conn = create_database(":memory:")
         conn.execute("INSERT INTO emails (id, message_id, date_received) VALUES (1, 1, ?)", (OLD,))
         _add(conn, "month thirteen", deadline="2020-13-01", email_id=1)
+        # SQLite's date() reads these as dates (a Julian day, a time, today), and
+        # the dated pass skips them, so they belong to this one.
+        _add(conn, "a bare past year", deadline="2024", email_id=1)
+        _add(conn, "a time of day", deadline="10:00", email_id=1)
+        _add(conn, "now", deadline="now", email_id=1)
         conn.commit()
 
-        assert expire_undated_actions(conn, days=90) == 1
+        assert expire_undated_actions(conn, days=90) == 4
         conn.close()
 
     def test_an_action_with_no_parent_is_left_alone(self):

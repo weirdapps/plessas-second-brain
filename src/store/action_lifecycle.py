@@ -74,8 +74,9 @@ def expire_stale_actions(conn: sqlite3.Connection, days: int = DEFAULT_EXPIRE_DA
     Only touches dated actions (NULL/free-text deadlines are left alone), and
     never one whose parent is itself younger than `days`: a model that writes
     last year for 'by 30/9' dates a fresh action a year overdue, and this runs
-    every day. A parent dated in the future is a bad date, not a fresh one.
-    Returns the number of rows expired.
+    every day. The shield reaches `days` into the future too, since calendar
+    sync runs a month ahead; a parent dated beyond that is a bad date, not a
+    fresh one. Returns the number of rows expired.
     """
     cur = conn.execute(
         f"""
@@ -87,9 +88,9 @@ def expire_stale_actions(conn: sqlite3.Connection, days: int = DEFAULT_EXPIRE_DA
           AND date(substr(deadline, 1, 10)) < date('now', '-' || ? || ' day')
           AND NOT COALESCE({_PARENT_LAST_ACTIVE} GLOB {_ISO_DATE}
               AND substr({_PARENT_LAST_ACTIVE}, 1, 10) >= date('now', '-' || ? || ' day')
-              AND substr({_PARENT_LAST_ACTIVE}, 1, 10) <= date('now', '+1 day'), 0)
+              AND substr({_PARENT_LAST_ACTIVE}, 1, 10) <= date('now', '+' || ? || ' day'), 0)
         """,
-        (days, days),
+        (days, days, days),
     )
     return cur.rowcount
 
@@ -101,30 +102,38 @@ def expire_undated_actions(
 
     expire_stale_actions needs a deadline to have passed, and on 2026-09-23 128K
     of the 154K open actions had none (NULL or free text such as 'ASAP'), so they
-    stayed open for good. A deadline that is no valid date counts as none,
-    '2026-13-01' included. Left alone: an action whose parent has no ISO date
-    (no parent row, or '', the store's word for a missing date, which sorts
-    before every date), and a free-text deadline naming this year or one of the
-    next ten ('31/12/2027', '31/12/27'), which is still to come. A year inside a
-    longer number ('PO 120265') is no year. Returns the number of rows expired.
+    stayed open for good. Every deadline the dated pass cannot use counts as
+    none: free text, '2026-13-01', and strings SQLite's date() would still read
+    ('2024' as a Julian day, '10:00', 'now'). Left alone: an action whose parent
+    has no ISO date (no parent row, or '', the store's word for a missing date,
+    which sorts before every date), and a free-text deadline naming this year or
+    one of the next ten ('31/12/2027', '31/12/27'), which is still to come. A
+    year inside a longer number ('PO 120265') is no year, and two digits count
+    as a year only in a d/m/yy date with no four-digit number beside them, or
+    '17.30' and '10/26/2023' would. Returns the number of rows expired.
     """
     this_year = date.today().year
-    coming_years = []
-    for year in range(this_year, this_year + 11):
-        coming_years += [f"*[^0-9]{year}[^0-9]*", f"*[/.-]{year % 100:02d}[^0-9]*"]
+    years = range(this_year, this_year + 11)
+    full = [f"*[^0-9]{year}[^0-9]*" for year in years]
+    short = [f"*[0-9][/.-][0-9]*[/.-]{year % 100:02d}[^0-9]*" for year in years]
     padded = "(' ' || deadline || ' ')"
-    names_a_coming_year = " OR ".join(f"{padded} GLOB ?" for _ in coming_years)
+    names_a_coming_year = (
+        "(" + " OR ".join(f"{padded} GLOB ?" for _ in full) + ")"
+        f" OR ({padded} NOT GLOB '*[0-9][0-9][0-9][0-9]*'"
+        " AND (" + " OR ".join(f"{padded} GLOB ?" for _ in short) + "))"
+    )
     cur = conn.execute(
         f"""
         UPDATE action_items
         SET status = 'expired'
         WHERE status = 'open'
           AND (deadline IS NULL
-               OR (date(substr(deadline, 1, 10)) IS NULL AND NOT ({names_a_coming_year})))
+               OR ((deadline NOT GLOB {_ISO_DATE} OR date(substr(deadline, 1, 10)) IS NULL)
+                   AND NOT ({names_a_coming_year})))
           AND {_PARENT_LAST_ACTIVE} GLOB {_ISO_DATE}
           AND substr({_PARENT_LAST_ACTIVE}, 1, 10) < date('now', '-' || ? || ' day')
         """,
-        (*coming_years, days),
+        (*full, *short, days),
     )
     return cur.rowcount
 

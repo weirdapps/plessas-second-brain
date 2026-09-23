@@ -23,14 +23,17 @@ if [ -d "$LOCK_DIR" ]; then
   stored_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
   if [ -z "$stored_pid" ] || ! kill -0 "$stored_pid" 2>/dev/null; then
     rm -rf "$LOCK_DIR"
+    [ -e "$LOCK_DIR" ] && { echo "cannot remove the stale lock $LOCK_DIR" >&2; exit 73; }
   else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: already running (pid=$stored_pid)" >> "$LOG_FILE"
     exit 0
   fi
 fi
-# mkdir without -p is atomic, so of two starts one gets the lock, and the trap is
-# set only once it is ours: `mkdir -p` let a run go on unlocked when it failed,
-# and its trap then removed a path this run never created.
+# mkdir without -p fails on an existing path, so no run goes on unlocked, and the
+# trap is set only once the lock is ours: `mkdir -p` let a run go on unlocked
+# when it failed, and its trap then removed a path this run never created. The
+# stale check above is not atomic with this; two starts in the same instant can
+# still race there.
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   if [ -d "$LOCK_DIR" ]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: another run took the lock" >> "$LOG_FILE"

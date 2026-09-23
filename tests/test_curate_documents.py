@@ -129,10 +129,10 @@ def test_summarize_folder_reads_past_a_thinking_block(curate, monkeypatch):
         curate,
         _Response(
             _ThinkingBlock("reading the readme"),
-            _TextBlock('{"summary": "ok"}'),
+            _TextBlock('{"purpose": "ok"}'),
         ),
     )
-    assert curate.summarize_folder(object(), "model", "Area/one", "readme") == {"summary": "ok"}
+    assert curate.summarize_folder(object(), "model", "Area/one", "readme") == {"purpose": "ok"}
 
 
 def test_classify_still_parses_a_plain_text_response(curate, monkeypatch):
@@ -383,6 +383,30 @@ def test_a_reply_that_is_not_an_object_is_a_skip(curate, monkeypatch, reply):
     }
 
     assert curate.classify_one(object(), "model", candidate)["folder"] == "SKIP"
+
+
+@pytest.mark.parametrize("reply", ['"just prose"', '["x"]', '{"purpose": 5}'])
+def test_a_summary_of_the_wrong_shape_is_an_error(curate, monkeypatch, reply):
+    """A reply of the wrong shape was cached and crashed every later run's
+    write_index, so INDEX.md was never rebuilt."""
+    _capture_response(monkeypatch, curate, _Response(_TextBlock(reply)))
+
+    assert "error" in curate.summarize_folder(object(), "model", "Area/one", "readme")
+
+
+def test_the_index_survives_a_bad_cached_summary(curate, brain):
+    """A summary cannot override the folder, its size or its file count."""
+    curate.write_index(
+        "Area",
+        {
+            "Area/one": "just prose",
+            "Area/two": {"folder": "nope", "files": "x", "purpose": "the real purpose"},
+        },
+    )
+
+    index = (curate.DOCS / "Area" / "INDEX.md").read_text()
+    assert "the real purpose" in index
+    assert "`one/`" in index and "`two/`" in index
 
 
 def test_the_summarize_prompt_fences_the_readme(curate, monkeypatch):

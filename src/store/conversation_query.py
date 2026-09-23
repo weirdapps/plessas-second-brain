@@ -7,7 +7,7 @@ and context retrieval for Claude Code conversation history.
 import logging
 import sqlite3
 
-from src.store.query import _sanitize_fts5_query
+from src.store.query import _sanitize_fts5_query, fts5_query_variants
 
 logger = logging.getLogger(__name__)
 
@@ -27,16 +27,33 @@ def search_conversations_keyword(
         limit: Maximum results
 
     Returns:
-        List of matching conversations with turn excerpts
+        List of matching conversations with turn excerpts. When no conversation
+        carries every token, those matching any meaningful token come back
+        instead, flagged partial_match.
     """
-    results = []
-
     # Defang FTS5 operator syntax before every MATCH in this module. search_emails
     # and search_attachments have always done this; these three sites did not, so
     # any natural-language query raised OperationalError straight out of the MCP
     # tool: a question mark is "fts5: syntax error near "?"", an ampersand the
     # same, and a bare word after a hyphen becomes "no such column".
-    safe_query = _sanitize_fts5_query(query)
+    for safe_query, partial in fts5_query_variants(query):
+        results = _conversation_hits(conn, safe_query, workspace, limit)
+        if results:
+            if partial:
+                for row in results:
+                    row["partial_match"] = True
+            return results
+    return []
+
+
+def _conversation_hits(
+    conn: sqlite3.Connection,
+    safe_query: str,
+    workspace: str | None,
+    limit: int,
+) -> list[dict]:
+    """search_conversations_keyword for one sanitized MATCH expression."""
+    results: list[dict] = []
 
     # Search conversation-level summaries
     rows = conn.execute(

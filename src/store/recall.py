@@ -13,7 +13,9 @@ import sqlite3
 from src.store.context import get_person_context, get_topic_context
 from src.store.conversation_query import search_conversations_keyword
 from src.store.fusion import reciprocal_rank_fusion
-from src.store.query import _sanitize_fts5_query, query_by_keyword, search_attachments
+from src.store.greek import PHRASE_MATCH, register_sql_functions, search_fold, search_tokens
+from src.store.normalizer import normalize_topic
+from src.store.query import fts5_query_variants, query_by_keyword, search_attachments
 from src.store.teams_query import search_teams as _search_teams_q
 
 logger = logging.getLogger(__name__)
@@ -28,68 +30,106 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     )
 
 
+def _folded_bucket(conn: sqlite3.Connection, sql: str, keyword: str, limit: int) -> list[dict]:
+    """Run a LIKE-style bucket in one pass: the whole query, else any of its tokens.
+
+    ``sql`` takes (phrase, joined tokens, limit), selects sb_match(...) AS score
+    and orders by it first. Matching is on folded text (case, accents, final
+    sigma), which LIKE alone does for ASCII only. Rows holding the whole query
+    keep each bucket's old semantics and come back alone when there are any.
+    Otherwise rows holding some of its meaningful tokens come back, most first,
+    flagged partial_match: the whole-query form alone emptied these buckets for
+    the long queries agents write. A one-word query gets no token pass, since
+    "any" would equal "all".
+    """
+    phrase = search_fold(keyword).strip()
+    if not phrase:
+        return []
+    tokens = search_tokens(keyword) if len(phrase.split()) >= 2 else []
+    rows = [dict(r) for r in conn.execute(sql, (phrase, "\x1f".join(tokens), limit))]
+    exact = [r for r in rows if r["score"] >= PHRASE_MATCH]
+    out = exact or [{**r, "partial_match": True} for r in rows]
+    for row in out:
+        del row["score"]
+    return out
+
+
 def _search_decisions(conn: sqlite3.Connection, keyword: str, limit: int) -> list[dict]:
-    rows = conn.execute(
+    # Dated like query_decisions: a decision without its own date takes its
+    # parent's, so a meeting's decisions no longer sink below every dated one.
+    return _folded_bucket(
+        conn,
         """
         SELECT d.id, d.email_id, d.decision, d.decided_by, d.decision_date,
-               e.subject as email_subject
-        FROM decisions d
+               e.subject as email_subject, d.score
+        FROM (SELECT *, sb_match(decision, ?, ?) AS score FROM decisions) d
         LEFT JOIN emails e ON e.id = d.email_id
-        WHERE d.decision LIKE ?
-        ORDER BY d.decision_date DESC
+        LEFT JOIN teams_threads tt ON tt.id = d.teams_thread_id
+        LEFT JOIN calendar_events ce ON ce.id = d.event_id
+        LEFT JOIN conversation_turns ct ON ct.id = d.conversation_turn_id
+        LEFT JOIN conversations c ON c.id = ct.conversation_id
+        WHERE d.score > 0
+        ORDER BY d.score DESC,
+                 COALESCE(d.decision_date, e.date_received, tt.started_at, ce.start_at,
+                          c.started_at) DESC
         LIMIT ?
         """,
-        (f"%{keyword}%", limit),
-    ).fetchall()
-    return [dict(r) for r in rows]
+        keyword,
+        limit,
+    )
 
 
 def _search_actions(conn: sqlite3.Connection, keyword: str, limit: int) -> list[dict]:
-    rows = conn.execute(
+    return _folded_bucket(
+        conn,
         """
         SELECT a.id, a.email_id, a.task, a.owner, a.deadline, a.status,
-               e.subject as email_subject
-        FROM action_items a
+               e.subject as email_subject, a.score
+        FROM (SELECT *, sb_match(task, ?, ?) AS score FROM action_items) a
         LEFT JOIN emails e ON e.id = a.email_id
-        WHERE a.task LIKE ?
-        ORDER BY CASE WHEN a.deadline IS NULL THEN 1 ELSE 0 END, a.deadline ASC
+        WHERE a.score > 0
+        ORDER BY a.score DESC, CASE WHEN a.deadline IS NULL THEN 1 ELSE 0 END, a.deadline ASC
         LIMIT ?
         """,
-        (f"%{keyword}%", limit),
-    ).fetchall()
-    return [dict(r) for r in rows]
+        keyword,
+        limit,
+    )
 
 
 def _search_commitments(conn: sqlite3.Connection, keyword: str, limit: int) -> list[dict]:
     if not _table_exists(conn, "commitments"):
         return []
-    rows = conn.execute(
+    return _folded_bucket(
+        conn,
         """
         SELECT c.id, c.email_id, c.commitment, c.by_person, c.to_person,
-               e.subject as email_subject
-        FROM commitments c
+               e.subject as email_subject, c.score
+        FROM (SELECT *, sb_match(commitment, ?, ?) AS score FROM commitments) c
         LEFT JOIN emails e ON e.id = c.email_id
-        WHERE c.commitment LIKE ?
+        WHERE c.score > 0
+        ORDER BY c.score DESC
         LIMIT ?
         """,
-        (f"%{keyword}%", limit),
-    ).fetchall()
-    return [dict(r) for r in rows]
+        keyword,
+        limit,
+    )
 
 
 def _search_inline_images(conn: sqlite3.Connection, keyword: str, limit: int) -> list[dict]:
     if not _table_exists(conn, "inline_images"):
         return []
-    rows = conn.execute(
+    return _folded_bucket(
+        conn,
         """
-        SELECT sha256, classification, vision_description, width, height
-        FROM inline_images
-        WHERE vision_description LIKE ?
+        SELECT sha256, classification, vision_description, width, height, score
+        FROM (SELECT *, sb_match(vision_description, ?, ?) AS score FROM inline_images)
+        WHERE score > 0
+        ORDER BY score DESC
         LIMIT ?
         """,
-        (f"%{keyword}%", limit),
-    ).fetchall()
-    return [dict(r) for r in rows]
+        keyword,
+        limit,
+    )
 
 
 def _search_teams(conn: sqlite3.Connection, keyword: str, limit: int) -> list[dict]:
@@ -107,15 +147,18 @@ def _search_calendar_events(conn: sqlite3.Connection, query: str, limit: int) ->
     if not _table_exists(conn, "calendar_events_fts"):
         return []
     try:
-        rows = conn.execute(
-            """SELECT ce.id, ce.subject, ce.start_at, ce.body_summary, ce.organizer_name
-               FROM calendar_events_fts f
-               JOIN calendar_events ce ON ce.id = f.rowid
-               WHERE calendar_events_fts MATCH ?
-               ORDER BY rank LIMIT ?""",
-            (_sanitize_fts5_query(query), limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
+        for expression, partial in fts5_query_variants(query):
+            rows = conn.execute(
+                """SELECT ce.id, ce.subject, ce.start_at, ce.body_summary, ce.organizer_name
+                   FROM calendar_events_fts f
+                   JOIN calendar_events ce ON ce.id = f.rowid
+                   WHERE calendar_events_fts MATCH ?
+                   ORDER BY rank LIMIT ?""",
+                (expression, limit),
+            ).fetchall()
+            if rows:
+                return [{**dict(r), "partial_match": True} if partial else dict(r) for r in rows]
+        return []
     except sqlite3.OperationalError as e:
         # Was `except Exception: return []`, which turned an unsanitized-query
         # crash into a confident empty calendar bucket. The sanitizer above is
@@ -139,7 +182,9 @@ def _maybe_person_context(conn: sqlite3.Connection, query: str, days: int) -> di
             "SELECT 1 FROM people WHERE LOWER(email) = LOWER(?)", (query.strip(),)
         ).fetchone()
     else:
-        hit = conn.execute("SELECT 1 FROM people WHERE name LIKE ?", (f"%{query}%",)).fetchone()
+        hit = conn.execute(
+            "SELECT 1 FROM people WHERE sb_fold(name) LIKE ?", (f"%{search_fold(query)}%",)
+        ).fetchone()
     if not hit:
         return None
     ctx = get_person_context(conn, query, days=days, limit=_CONTEXT_HINT_LIMIT)
@@ -149,7 +194,7 @@ def _maybe_person_context(conn: sqlite3.Connection, query: str, days: int) -> di
 def _maybe_topic_context(conn: sqlite3.Connection, query: str, days: int) -> dict | None:
     """Return topic_context if the query plausibly matches a known topic."""
     hit = conn.execute(
-        "SELECT 1 FROM topics WHERE name LIKE ?", (f"%{query.strip().lower()}%",)
+        "SELECT 1 FROM topics WHERE name LIKE ?", (f"%{normalize_topic(query)}%",)
     ).fetchone()
     if not hit:
         return None
@@ -234,6 +279,7 @@ def recall(
         key (empty list if no matches) so callers don't have to handle missing
         keys.
     """
+    register_sql_functions(conn)  # sb_fold et al., whoever opened conn
     # Emails (incl. attachments + standalone docs — query_by_keyword spans
     # emails_fts, key_facts_fts, and attachment_content_fts in one call). When a
     # semantic candidate provider is injected (the MCP runtime does this), fuse the
@@ -243,11 +289,11 @@ def recall(
     else:
         emails = _hybrid_emails(conn, query, limit_per_kind, semantic_candidates)
 
-    # Conversations — search_conversations_keyword takes a raw FTS5 query, so
-    # sanitize first to mirror the safety of every other path here.
-    safe_kw = _sanitize_fts5_query(query)
+    # Conversations. search_conversations_keyword sanitizes the raw query itself
+    # and falls back to any-token like every other bucket. It used to be handed
+    # an already-sanitized string, which it quoted a second time.
     if _table_exists(conn, "conversation_turns_fts"):
-        conversations = search_conversations_keyword(conn, safe_kw, limit=limit_per_kind)
+        conversations = search_conversations_keyword(conn, query, limit=limit_per_kind)
     else:
         conversations = []
 

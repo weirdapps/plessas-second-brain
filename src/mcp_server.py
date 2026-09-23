@@ -388,30 +388,42 @@ def query_calendar_events(
     """Query calendar events by person, date range, or keyword.
 
     Args:
-        person: Filter by attendee name or email (partial match)
+        person: Filter by attendee name or email (partial match, case and accent blind)
         since: Start date (YYYY-MM-DD)
-        until: End date (YYYY-MM-DD)
+        until: End date (YYYY-MM-DD, inclusive)
         keyword: Full-text search in subject and body_summary
         limit: Maximum results (default: 20)
     """
+    import re
+
+    from src.store.greek import search_fold
+
     conn = _get_conn()
     try:
         query = "SELECT ce.* FROM calendar_events ce"
         conditions = []
         params: list[str | int] = []
-        joins = []
 
         if person:
-            joins.append("JOIN event_attendees ea ON ea.event_id = ce.id")
-            conditions.append("(LOWER(ea.name) LIKE ? OR LOWER(ea.email) LIKE ?)")
-            pattern = f"%{person.lower()}%"
-            params.extend([pattern, pattern])
+            # Attendee names are mostly ALL-CAPS Greek, which LOWER() does not
+            # fold, and the JOIN this used to be listed an event once per
+            # matching attendee.
+            conditions.append(
+                "ce.id IN (SELECT event_id FROM event_attendees "
+                "WHERE sb_fold(name) LIKE ? OR LOWER(email) LIKE ?)"
+            )
+            params.extend([f"%{search_fold(person)}%", f"%{person.strip().lower()}%"])
 
         if since:
             conditions.append("ce.start_at >= ?")
             params.append(since)
         if until:
-            conditions.append("ce.start_at <= ?")
+            # start_at carries a time, so a bare date compared with <= dropped
+            # every event on that day. A bare date now means the whole day.
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", until):
+                conditions.append("ce.start_at < date(?, '+1 day')")
+            else:
+                conditions.append("ce.start_at <= ?")
             params.append(until)
 
         if keyword:
@@ -426,8 +438,6 @@ def query_calendar_events(
             params.append(_sanitize_fts5_query(keyword))
 
         sql = query
-        if joins:
-            sql += " " + " ".join(joins)
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY ce.start_at DESC LIMIT ?"

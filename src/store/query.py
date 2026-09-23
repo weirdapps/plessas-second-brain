@@ -9,6 +9,8 @@ import sqlite3
 from typing import Any
 
 from src.config import USER_EMAIL_PATTERN
+from src.store.greek import register_sql_functions, search_fold
+from src.store.normalizer import normalize_topic
 
 
 def _sanitize_fts5_query(keyword: str) -> str:
@@ -41,6 +43,45 @@ def _sanitize_fts5_query(keyword: str) -> str:
         escaped = token.replace('"', '""')
         quoted.append(f'"{escaped}"')
     return " ".join(quoted)
+
+
+def _any_token_fts5_query(keyword: str) -> str | None:
+    """An FTS5 expression matching ANY meaningful token, or None if there is none.
+
+    Every token required is right for the short queries people type, and wrong
+    for the long, reformulated, mixed-language ones agents write: about half of
+    those found nothing. Searches retry with this when the strict form finds
+    nothing. None for a single-token query, where "any" would equal "all", and
+    when no token survives search_tokens (stopwords, numbers, short words).
+    """
+    from src.store.greek import fold, search_tokens
+
+    if len(fold(keyword).split()) < 2:
+        return None
+    tokens = search_tokens(keyword)
+    if not tokens:
+        return None
+    return " OR ".join('"' + token.replace('"', '""') + '"' for token in tokens)
+
+
+def fts5_query_variants(keyword: str) -> list[tuple[str, bool]]:
+    """(MATCH expression, partial) pairs to try in order: every token, then any.
+
+    A caller stops at the first variant that returns rows and flags those rows
+    with partial_match when the variant is the any-token one.
+    """
+    variants = [(_sanitize_fts5_query(keyword), False)]
+    loose = _any_token_fts5_query(keyword)
+    if loose:
+        variants.append((loose, True))
+    return variants
+
+
+def _mark_partial(rows: list[dict], partial: bool) -> list[dict]:
+    if partial:
+        for row in rows:
+            row["partial_match"] = True
+    return rows
 
 
 def _has_attachment_fts(conn: sqlite3.Connection) -> bool:
@@ -114,6 +155,7 @@ def query_by_person(conn: sqlite3.Connection, name_or_email: str, limit: int = 2
     Returns:
         List of dicts with keys: email_id, date, subject, summary, person_role, sentiment
     """
+    register_sql_functions(conn)  # sb_fold et al., whoever opened conn
     # Determine if searching by email or name
     if "@" in name_or_email:
         # Search by email address
@@ -146,11 +188,11 @@ def query_by_person(conn: sqlite3.Connection, name_or_email: str, limit: int = 2
             FROM emails e
             JOIN email_people ep ON e.id = ep.email_id
             JOIN people p ON ep.person_id = p.id
-            WHERE p.name LIKE ?
+            WHERE sb_fold(p.name) LIKE ?
             ORDER BY e.date_received DESC
             LIMIT ?
         """
-        params = (f"%{name_or_email}%", limit)
+        params = (f"%{search_fold(name_or_email)}%", limit)
 
     cursor = conn.execute(query, params)
     return [dict(row) for row in cursor.fetchall()]
@@ -185,7 +227,7 @@ def query_by_topic(conn: sqlite3.Connection, topic: str, limit: int = 20) -> lis
     """
 
     # Normalize search term
-    topic_normalized = topic.strip().lower()
+    topic_normalized = normalize_topic(topic)
     params = (f"%{topic_normalized}%", limit)
 
     cursor = conn.execute(query, params)
@@ -208,13 +250,26 @@ def query_by_keyword(
 
     Returns:
         List of dicts with keys: email_id, date, subject, summary, snippet, source
-        where source is 'summary', 'content', or 'key_fact'
+        where source is 'summary', 'content', or 'key_fact'. When no row carries
+        every token, rows matching any meaningful token come back instead, each
+        flagged partial_match.
     """
+    for expression, partial in fts5_query_variants(keyword):
+        results = _keyword_waterfall(conn, expression, limit, search_content_only)
+        if results:
+            return _mark_partial(results, partial)
+    return []
+
+
+def _keyword_waterfall(
+    conn: sqlite3.Connection,
+    safe_keyword: str,
+    limit: int,
+    search_content_only: bool,
+) -> list[dict]:
+    """query_by_keyword's source waterfall for one sanitized MATCH expression."""
     results = []
     seen_ids = set()
-
-    # Sanitize keyword for safe FTS5 matching
-    safe_keyword = _sanitize_fts5_query(keyword)
 
     if not search_content_only:
         # Search in email summaries
@@ -393,6 +448,7 @@ def query_decisions(
         List of dicts with keys: decision_id, decision, decided_by, date,
         email_subject, topics (comma-separated)
     """
+    register_sql_functions(conn)  # sb_fold et al., whoever opened conn
     # Build query with optional filters
     # Same shape as query_action_items: LEFT JOIN every parent and COALESCE for
     # display. The inner JOIN on emails dropped 13,785 decisions whose parent was
@@ -431,11 +487,11 @@ def query_decisions(
         where_clauses.append(
             "e.id IN (SELECT email_id FROM email_topics et2 JOIN topics t2 ON et2.topic_id = t2.id WHERE t2.name LIKE ?)"
         )
-        params.append(f"%{topic.strip().lower()}%")
+        params.append(f"%{normalize_topic(topic)}%")
 
     if person:
-        where_clauses.append("d.decided_by LIKE ?")
-        params.append(f"%{person}%")
+        where_clauses.append("sb_fold(d.decided_by) LIKE ?")
+        params.append(f"%{search_fold(person)}%")
 
     if not include_news:
         where_clauses.append("(e.id IS NULL OR e.mailbox_name IS NULL OR e.mailbox_name <> 'News')")
@@ -501,6 +557,7 @@ def query_action_items(
         List of dicts with keys: action_id, task, owner, deadline, status,
         email_subject, date, source
     """
+    register_sql_functions(conn)  # sb_fold et al., whoever opened conn
     # LEFT JOIN every parent, then COALESCE for display. `source` tells the
     # caller which kind it got, because "email_subject" on a calendar item would
     # otherwise be a quiet lie.
@@ -540,8 +597,8 @@ def query_action_items(
         params.append(status)
 
     if owner:
-        where_clauses.append("a.owner LIKE ?")
-        params.append(f"%{owner}%")
+        where_clauses.append("sb_fold(a.owner) LIKE ?")
+        params.append(f"%{search_fold(owner)}%")
 
     if not include_news:
         where_clauses.append("(e.id IS NULL OR e.mailbox_name IS NULL OR e.mailbox_name <> 'News')")
@@ -620,6 +677,7 @@ def query_combined(
     Raises:
         ValueError: If no filters are provided
     """
+    register_sql_functions(conn)  # sb_fold et al., whoever opened conn
     if not any([person, topic, keyword, start_date, end_date]):
         raise ValueError("At least one filter must be provided")
 
@@ -650,12 +708,12 @@ def query_combined(
             where_clauses.append("LOWER(p.email) = LOWER(?)")
             params.append(person.strip())
         else:
-            where_clauses.append("p.name LIKE ?")
-            params.append(f"%{person}%")
+            where_clauses.append("sb_fold(p.name) LIKE ?")
+            params.append(f"%{search_fold(person)}%")
 
     # Topic filter
     if topic:
-        topic_normalized = topic.strip().lower()
+        topic_normalized = normalize_topic(topic)
         where_clauses.append(
             "e.id IN (SELECT email_id FROM email_topics et2 JOIN topics t2 ON et2.topic_id = t2.id WHERE t2.name LIKE ?)"
         )
@@ -728,6 +786,7 @@ def meeting_prep(
         - attendees: list of per-person dossiers
         - topic_context: topic-related context (if topic provided)
     """
+    register_sql_functions(conn)  # sb_fold et al., whoever opened conn
     from datetime import datetime, timedelta
 
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -748,7 +807,7 @@ def meeting_prep(
         if "@" in person:
             person_param = person.strip()
         else:
-            person_param = f"%{person}%"
+            person_param = f"%{search_fold(person)}%"
 
         # Recent emails
         cursor = conn.execute(
@@ -758,7 +817,7 @@ def meeting_prep(
             FROM emails e
             JOIN email_people ep ON e.id = ep.email_id
             WHERE ep.person_id IN (SELECT id FROM people WHERE
-                CASE WHEN ? THEN LOWER(email) = LOWER(?) ELSE name LIKE ? END)
+                CASE WHEN ? THEN LOWER(email) = LOWER(?) ELSE sb_fold(name) LIKE ? END)
                 AND e.date_received >= ?
             ORDER BY e.date_received DESC LIMIT ?
         """,
@@ -781,7 +840,7 @@ def meeting_prep(
             JOIN emails e ON d.email_id = e.id
             JOIN email_people ep ON e.id = ep.email_id
             WHERE ep.person_id IN (SELECT id FROM people WHERE
-                CASE WHEN ? THEN LOWER(email) = LOWER(?) ELSE name LIKE ? END)
+                CASE WHEN ? THEN LOWER(email) = LOWER(?) ELSE sb_fold(name) LIKE ? END)
                 AND e.date_received >= ?
             ORDER BY date DESC LIMIT 10
         """,
@@ -798,7 +857,7 @@ def meeting_prep(
             JOIN emails e ON a.email_id = e.id
             JOIN email_people ep ON e.id = ep.email_id
             WHERE ep.person_id IN (SELECT id FROM people WHERE
-                CASE WHEN ? THEN LOWER(email) = LOWER(?) ELSE name LIKE ? END)
+                CASE WHEN ? THEN LOWER(email) = LOWER(?) ELSE sb_fold(name) LIKE ? END)
                 AND a.status = 'open'
             ORDER BY a.deadline IS NULL, a.deadline ASC LIMIT 10
         """,
@@ -815,7 +874,7 @@ def meeting_prep(
             JOIN emails e ON et.email_id = e.id
             JOIN email_people ep ON e.id = ep.email_id
             WHERE ep.person_id IN (SELECT id FROM people WHERE
-                CASE WHEN ? THEN LOWER(email) = LOWER(?) ELSE name LIKE ? END)
+                CASE WHEN ? THEN LOWER(email) = LOWER(?) ELSE sb_fold(name) LIKE ? END)
                 AND e.date_received >= ?
             GROUP BY t.id ORDER BY count DESC LIMIT 5
         """,
@@ -827,7 +886,7 @@ def meeting_prep(
 
     # Topic context (if provided)
     if topic:
-        topic_normalized = topic.strip().lower()
+        topic_normalized = normalize_topic(topic)
         topic_ctx: dict[str, Any] = {
             "topic": topic,
             "decisions": [],
@@ -1085,10 +1144,9 @@ def search_attachments(
 
     Returns:
         List of dicts with: attachment_id, filename, mime_type,
-        email_subject, email_date, snippet, summary
+        email_subject, email_date, snippet, summary. Rows from the any-token
+        fallback carry partial_match.
     """
-    safe_kw = _sanitize_fts5_query(keyword)
-
     # Check if attachment_content_fts exists
     tables = [
         r[0]
@@ -1099,32 +1157,37 @@ def search_attachments(
     if "attachment_content_fts" not in tables:
         return []
 
-    rows = conn.execute(
-        """
-        SELECT ac.attachment_id, a.filename, a.mime_type,
-               e.subject, e.date_received,
-               snippet(attachment_content_fts, 0, '>>>', '<<<', '...', 40) as text_snippet,
-               ac.summary
-        FROM attachment_content_fts
-        JOIN attachment_content ac ON ac.id = attachment_content_fts.rowid
-        JOIN attachments a ON a.id = ac.attachment_id
-        LEFT JOIN emails e ON e.id = a.email_id
-        WHERE attachment_content_fts MATCH ?
-        ORDER BY rank
-        LIMIT ?
-    """,
-        (safe_kw, limit),
-    ).fetchall()
-
-    return [
-        {
-            "attachment_id": r[0],
-            "filename": r[1],
-            "mime_type": r[2],
-            "email_subject": r[3],
-            "email_date": r[4],
-            "snippet": r[5],
-            "summary": r[6],
-        }
-        for r in rows
-    ]
+    for safe_kw, partial in fts5_query_variants(keyword):
+        rows = conn.execute(
+            """
+            SELECT ac.attachment_id, a.filename, a.mime_type,
+                   e.subject, e.date_received,
+                   snippet(attachment_content_fts, 0, '>>>', '<<<', '...', 40) as text_snippet,
+                   ac.summary
+            FROM attachment_content_fts
+            JOIN attachment_content ac ON ac.id = attachment_content_fts.rowid
+            JOIN attachments a ON a.id = ac.attachment_id
+            LEFT JOIN emails e ON e.id = a.email_id
+            WHERE attachment_content_fts MATCH ?
+            ORDER BY rank
+            LIMIT ?
+        """,
+            (safe_kw, limit),
+        ).fetchall()
+        if rows:
+            return _mark_partial(
+                [
+                    {
+                        "attachment_id": r[0],
+                        "filename": r[1],
+                        "mime_type": r[2],
+                        "email_subject": r[3],
+                        "email_date": r[4],
+                        "snippet": r[5],
+                        "summary": r[6],
+                    }
+                    for r in rows
+                ],
+                partial,
+            )
+    return []

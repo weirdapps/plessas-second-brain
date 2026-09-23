@@ -10,6 +10,7 @@ import sqlite3
 from pathlib import Path
 
 from src.config import CURRENT_SCHEMA_VERSION
+from src.store.greek import register_sql_functions
 
 
 def create_database(db_path: str) -> sqlite3.Connection:
@@ -29,6 +30,7 @@ def create_database(db_path: str) -> sqlite3.Connection:
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    register_sql_functions(conn)
     conn.execute("PRAGMA foreign_keys = ON")
     # Born in WAL mode (see get_connection). No-op on :memory: test DBs.
     conn.execute("PRAGMA journal_mode = WAL")
@@ -1452,6 +1454,7 @@ def get_connection(db_path: str) -> sqlite3.Connection:
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    register_sql_functions(conn)
     conn.execute("PRAGMA foreign_keys = ON")
     # Multiple launchd jobs (daily-sync, calendar-sync, teams-sync, outlook-sync,
     # curate-docs) can hit brain.db concurrently after a missed-fire wake-up.

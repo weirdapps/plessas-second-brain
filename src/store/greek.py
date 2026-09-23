@@ -64,6 +64,71 @@ def fold(text: str) -> str:
     return text
 
 
+def search_fold(text: str | None) -> str:
+    """fold() plus lower case and one sigma: the form both sides of a LIKE are compared in.
+
+    The FTS indexes fold accents in SQL and case-fold in the tokenizer, but the
+    LIKE lookups on names, topics and extracted text did neither for Greek:
+    SQLite's LIKE folds ASCII case only, and people are mostly stored in ALL-CAPS
+    Greek, so "Παπαδόπουλος" never matched "ΠΑΠΑΔΟΠΟΥΛΟΣ". Final sigma is merged
+    into sigma because a lower-cased capital and a typed word disagree on it.
+    """
+    if not text:
+        return ""
+    return fold(text).lower().replace("ς", "σ")
+
+
+# Words too common to carry a search on their own. The any-token fallback drops
+# them, as it drops numbers and anything under three characters. Stored folded.
+STOPWORDS = frozenset(
+    search_fold(word)
+    for word in (
+        "και", "της", "του", "των", "για", "στο", "στη", "στην", "στον", "στα",
+        "από", "που", "με", "να", "τα", "το", "τη", "την", "τον", "οι", "ένα",
+        "μια", "είναι", "θα", "δεν", "the", "and", "for", "with", "from", "that",
+        "this", "are", "was", "not", "but", "you", "all", "any", "our",
+    )
+)  # fmt: skip
+
+
+def search_tokens(text: str | None) -> list[str]:
+    """Distinct folded tokens worth an any-token search, in query order."""
+    tokens = []
+    for token in search_fold(text).split():
+        token = token.strip(".,;:!?()[]{}\"'«»")
+        if len(token) >= 3 and not token.isdigit() and token not in STOPWORDS:
+            tokens.append(token)
+    return list(dict.fromkeys(tokens))
+
+
+# sb_match's score for a row holding the whole query: above any token count.
+PHRASE_MATCH = 1 << 20
+
+
+def _match_score(text: str | None, phrase: str, joined_tokens: str) -> int:
+    """PHRASE_MATCH if the folded text holds ``phrase``, else how many tokens it holds.
+
+    One function, so a search that falls back from the whole query to its tokens
+    folds each row once, in one pass over the table: the fold runs in Python and
+    a second pass cost as much again.
+    """
+    folded = search_fold(text)
+    if phrase and phrase in folded:
+        return PHRASE_MATCH
+    return sum(1 for token in joined_tokens.split("\x1f") if token and token in folded)
+
+
+def register_sql_functions(conn) -> None:
+    """sb_fold(text) and sb_match(text, phrase, tokens) for the LIKE-based lookups.
+
+    Registered by every connection the store opens (schema.create_database and
+    get_connection). Unlike the generated FTS columns, which must stay pure SQL,
+    these only ever run inside a query issued by this code.
+    """
+    conn.create_function("sb_fold", 1, search_fold, deterministic=True)
+    conn.create_function("sb_match", 3, _match_score, deterministic=True)
+
+
 def fold_sql_expr(column: str) -> str:
     """A nested replace() chain equivalent to fold(), for use in SQL.
 

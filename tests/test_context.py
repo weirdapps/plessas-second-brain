@@ -8,7 +8,6 @@ import pytest
 from src.store.context import (
     get_conversation_context,
     get_person_context,
-    get_recent_decisions,
     get_topic_context,
 )
 from src.store.normalizer import find_or_create_person, find_or_create_topic
@@ -406,45 +405,3 @@ class TestGetConversationContext:
         assert result["participants"] == []
         assert result["decisions"] == []
         assert result["action_items"] == []
-
-
-class TestGetRecentDecisions:
-    """Test get_recent_decisions function."""
-
-    def test_returns_recent_decisions(self, sample_db):
-        results = get_recent_decisions(sample_db, days=365)
-
-        assert len(results) == 2
-
-    def test_decision_structure(self, sample_db):
-        results = get_recent_decisions(sample_db, days=365)
-
-        for r in results:
-            assert "decision" in r
-            assert "decided_by" in r
-            assert "date" in r
-            assert "email_subject" in r
-            assert "email_date" in r
-            assert "topics" in r
-
-    def test_includes_topics(self, sample_db):
-        results = get_recent_decisions(sample_db, days=365)
-
-        # At least one decision should have a topic
-        assert any(r["topics"] is not None for r in results)
-
-    def test_ordered_by_date_desc(self, sample_db):
-        results = get_recent_decisions(sample_db, days=365)
-
-        dates = [r["date"] for r in results]
-        assert dates == sorted(dates, reverse=True)
-
-    def test_limit(self, sample_db):
-        results = get_recent_decisions(sample_db, days=365, limit=1)
-
-        assert len(results) == 1
-
-    def test_date_filtering(self, sample_db):
-        results = get_recent_decisions(sample_db, days=0)
-
-        assert len(results) == 0

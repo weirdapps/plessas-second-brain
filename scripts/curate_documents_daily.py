@@ -218,13 +218,21 @@ def classify_one(client, model, c: dict) -> dict:
         lines = text.split("\n")
         text = "\n".join(lines[1:-1] if lines[0].startswith("```") else lines[:-1])
     try:
-        return json.loads(text)
+        result = json.loads(text)
     except Exception:
         return {"folder": "SKIP", "confidence": "low", "reasoning": "parse error"}
+    # A bare string or list crashed main() at result.get(), losing every
+    # classification of the run, and the sender's text can steer the reply.
+    if not isinstance(result, dict):
+        return {"folder": "SKIP", "confidence": "low", "reasoning": "not an object"}
+    return result
 
 
 def summarize_folder(client, model, folder: str, readme_text: str) -> dict:
     truncated = readme_text[:18000]
+    # The README lists senders' subjects and summaries, and the answer is written
+    # into INDEX.md, which later sessions read as curated guidance.
+    intro, fenced = fence_fields(readme=truncated)
     response = create_with_refusal_fallback(
         client,
         model=model,
@@ -232,7 +240,7 @@ def summarize_folder(client, model, folder: str, readme_text: str) -> dict:
         messages=[
             {
                 "role": "user",
-                "content": SUMMARIZE_PROMPT.format(folder=folder, readme=truncated),
+                "content": intro + "\n\n" + SUMMARIZE_PROMPT.format(folder=folder, **fenced),
             }
         ],
     )
@@ -540,6 +548,8 @@ def main():
         # 'National/../../x' copy an attachment outside the tree.
         folder = str(result.get("folder", "SKIP")).strip().rstrip("/")
         if folder not in MANAGED_FOLDERS:
+            if folder != "SKIP":
+                log(f"  REJECT folder {folder[:60]!r}: {c['filename'][:40]}")
             continue
         if result.get("confidence") != "high":
             log(f"  SKIP (conf={result.get('confidence')}): {c['filename'][:40]}")

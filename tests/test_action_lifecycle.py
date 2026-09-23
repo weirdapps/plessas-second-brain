@@ -150,16 +150,22 @@ class TestExpire:
             "INSERT INTO emails (id, message_id, date_received) VALUES (1, 1, ?), (2, 2, ?)",
             (_now(), OLD),
         )
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received) VALUES (3, 3, '2106-02-07T00:00:00')"
+        )
         _add(conn, "fresh email", deadline="2020-09-30", email_id=1)
         _add(conn, "old email", deadline="2020-09-30", email_id=2)
         _add(conn, "no parent", deadline="2020-09-30", email_id=None)
+        # A parent dated in the future is a bad date, not a fresh one.
+        _add(conn, "future parent", deadline="2020-09-30", email_id=3)
         conn.commit()
 
-        assert expire_stale_actions(conn, days=180) == 2
+        assert expire_stale_actions(conn, days=180) == 3
         assert dict(conn.execute("SELECT task, status FROM action_items")) == {
             "fresh email": "open",
             "old email": "expired",
             "no parent": "expired",
+            "future parent": "expired",
         }
         conn.close()
 
@@ -241,16 +247,34 @@ class TestExpireUndated:
         """'31/12/2027' is no ISO date, but it is still to come."""
         conn = create_database(":memory:")
         conn.execute("INSERT INTO emails (id, message_id, date_received) VALUES (1, 1, ?)", (OLD,))
-        next_year = datetime.now(UTC).year + 1
-        _add(conn, "due next year", deadline=f"31/12/{next_year}", email_id=1)
+        year = datetime.now(UTC).year
+        _add(conn, "due next year", deadline=f"31/12/{year + 1}", email_id=1)
+        _add(conn, "due next year, short", deadline=f"31/12/{(year + 1) % 100:02d}", email_id=1)
+        _add(conn, "due in eight years", deadline=f"by end {year + 8}", email_id=1)
         _add(conn, "due long ago", deadline="31/12/2020", email_id=1)
+        # A year inside a longer number is no year.
+        _add(conn, "after a PO", deadline=f"after PO 1{year}5 is approved", email_id=1)
+        conn.commit()
+
+        assert expire_undated_actions(conn, days=90) == 2
+        assert dict(conn.execute("SELECT task, status FROM action_items")) == {
+            "due next year": "open",
+            "due next year, short": "open",
+            "due in eight years": "open",
+            "due long ago": "expired",
+            "after a PO": "expired",
+        }
+        conn.close()
+
+    def test_a_deadline_shaped_like_a_date_but_not_one_is_undated(self):
+        """'2026-13-01' passed for a date, so the dated pass could not parse it
+        and the undated pass would not touch it: open for good."""
+        conn = create_database(":memory:")
+        conn.execute("INSERT INTO emails (id, message_id, date_received) VALUES (1, 1, ?)", (OLD,))
+        _add(conn, "month thirteen", deadline="2020-13-01", email_id=1)
         conn.commit()
 
         assert expire_undated_actions(conn, days=90) == 1
-        assert dict(conn.execute("SELECT task, status FROM action_items")) == {
-            "due next year": "open",
-            "due long ago": "expired",
-        }
         conn.close()
 
     def test_an_action_with_no_parent_is_left_alone(self):

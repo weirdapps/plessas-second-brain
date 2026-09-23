@@ -32,10 +32,13 @@ def _neutralise(text: str) -> str:
     return _CLOSING.sub(r"&lt;\1", text)
 
 
-def fence(text: str, intro: str = DATA_NOT_INSTRUCTIONS) -> str:
-    """The intro sentence, then `text` on its own lines between tags no sender can guess."""
+def fence(text: str, intro: str = DATA_NOT_INSTRUCTIONS, **names: str) -> str:
+    """The intro sentence, then `text` on its own lines between tags no sender can guess.
+
+    `names` fill any other placeholder the intro has.
+    """
     tag = _new_tag()
-    return f"{intro.format(tag=tag)}\n\n<{tag}>\n{_neutralise(text)}\n</{tag}>"
+    return f"{intro.format(tag=tag, **names)}\n\n<{tag}>\n{_neutralise(text)}\n</{tag}>"
 
 
 def fence_fields(**fields: str) -> tuple[str, dict[str, str]]:

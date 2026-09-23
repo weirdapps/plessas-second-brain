@@ -230,6 +230,48 @@ def test_a_relative_daily_sync_lock_override_is_refused(tmp_path):
     assert not (tmp_path / "rel.lock").exists()
 
 
+@pytest.mark.parametrize(
+    ("wrapper", "variable"),
+    [
+        ("sb-daily-sync.sh", "SB_DAILY_SYNC_LOCK"),
+        ("sb-conversation-sync.sh", "SB_CONVERSATION_SYNC_LOCK"),
+    ],
+)
+def test_a_lock_path_that_is_a_file_is_never_removed(tmp_path, wrapper, variable):
+    """mkdir -p failed on it, the run went on without a lock, and the EXIT trap
+    ran rm -rf on a file this run never created."""
+    home = _daily_home(tmp_path, "exit 0\n")
+    precious = tmp_path / "Cargo.lock"
+    precious.write_text("x")
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / wrapper)],
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin", variable: str(precious)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 73
+    assert precious.read_text() == "x"
+
+
+def test_a_relative_conversation_sync_lock_override_is_refused(tmp_path):
+    home = _daily_home(tmp_path, "exit 0\n")
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-conversation-sync.sh")],
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin", "SB_CONVERSATION_SYNC_LOCK": "rel.lock"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=tmp_path,
+    )
+
+    assert result.returncode == 64
+    assert not (tmp_path / "rel.lock").exists()
+
+
 def test_a_daily_sync_lock_override_that_is_not_a_lock_path_is_refused(tmp_path):
     home = _daily_home(tmp_path, "exit 0\n")
     victim = tmp_path / "precious"

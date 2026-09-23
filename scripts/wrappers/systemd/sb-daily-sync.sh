@@ -45,7 +45,18 @@ if [ -d "$LOCK_DIR" ]; then
     exit 0
   fi
 fi
-mkdir -p "$LOCK_DIR" && echo $$ > "$LOCK_DIR/pid"
+# mkdir without -p is atomic, so of two starts one gets the lock, and the trap is
+# set only once it is ours: `mkdir -p` let a run go on unlocked when it failed,
+# and its trap then removed a path this run never created.
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  if [ -d "$LOCK_DIR" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: another run took the lock" >> "$LOG_FILE"
+    exit 0
+  fi
+  echo "cannot create the lock directory $LOCK_DIR" >&2
+  exit 73
+fi
+echo $$ > "$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 
 # Skip extraction phase if gcloud ADC expired — the email loop would otherwise

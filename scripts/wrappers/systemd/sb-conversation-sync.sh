@@ -9,12 +9,13 @@ LOG_FILE="$LOG_DIR/conversation-sync.log"
 mkdir -p "$LOG_DIR"
 
 # Overridable so the wrapper tests never touch a lock a real run may hold. The
-# lock is removed with rm -rf, so the override must name a *.lock directory.
+# lock is removed with rm -rf after a cd, so the override must be an absolute
+# path to a *.lock directory.
 LOCK_DIR="${SB_CONVERSATION_SYNC_LOCK:-/tmp/sb-conversation-sync.lock}"
 case "$LOCK_DIR" in
-  *.lock) ;;
+  /*.lock) ;;
   *)
-    echo "SB_CONVERSATION_SYNC_LOCK must name a *.lock directory, got: $LOCK_DIR" >&2
+    echo "SB_CONVERSATION_SYNC_LOCK must name an absolute *.lock directory, got: $LOCK_DIR" >&2
     exit 64
     ;;
 esac
@@ -27,7 +28,18 @@ if [ -d "$LOCK_DIR" ]; then
     exit 0
   fi
 fi
-mkdir -p "$LOCK_DIR" && echo $$ > "$LOCK_DIR/pid"
+# mkdir without -p is atomic, so of two starts one gets the lock, and the trap is
+# set only once it is ours: `mkdir -p` let a run go on unlocked when it failed,
+# and its trap then removed a path this run never created.
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  if [ -d "$LOCK_DIR" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: another run took the lock" >> "$LOG_FILE"
+    exit 0
+  fi
+  echo "cannot create the lock directory $LOCK_DIR" >&2
+  exit 73
+fi
+echo $$ > "$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 
 [ -f "$HOME/.second-brain/needs_gcloud_reauth" ] && exit 0

@@ -1624,6 +1624,87 @@ def test_check_embeddings_missing_index_is_warn(hc, tmp_path):
     assert r["status"] == "WARN"
 
 
+# A fresh file with the right total can still be missing a whole source: on
+# 2026-09-23 the index held 133 of 5,469 extracted Teams threads and this check
+# said OK, because it looked at the mtime and the total count only.
+
+
+def _coverage_db(threads):
+    from src.store.schema import create_database
+
+    db = create_database(":memory:")
+    for i in range(1, 101):
+        db.execute(
+            "INSERT INTO emails (id, message_id, date_received, summary) "
+            "VALUES (?, ?, '2026-09-01', 'a summary')",
+            (i, i),
+        )
+    db.execute(
+        "INSERT INTO teams_chats(teams_chat_id, chat_kind, first_seen_at) "
+        "VALUES ('19:t', 'channel', '2026-04-01T00:00:00')"
+    )
+    for i in range(threads):
+        db.execute(
+            "INSERT INTO teams_threads(chat_id, thread_kind, anchor_message_id, started_at, "
+            "ended_at, extraction_status, summary, extracted_at) VALUES "
+            "(1, 'channel_post', ?, '2026-04-29', '2026-04-29', 'extracted', 's', '2026-04-29')",
+            (f"P{i}",),
+        )
+    db.commit()
+    return db
+
+
+def _coverage_npz(tmp_path, ids):
+    import numpy as np
+
+    path = tmp_path / "embeddings.npz"
+    np.savez(str(path), ids=np.array(ids, dtype=np.int64))
+    return path
+
+
+def test_check_embeddings_warns_when_a_source_is_mostly_missing(hc, tmp_path):
+    from src.store.embeddings import TEAMS_THREAD_ID_OFFSET
+
+    db = _coverage_db(threads=100)
+    ids = list(range(1, 101)) + [TEAMS_THREAD_ID_OFFSET - 1]
+
+    r = hc.check_embeddings(db, npz_path=_coverage_npz(tmp_path, ids))
+
+    assert r["status"] == "WARN"
+    assert r["gaps"] == {"teams": (1, 100)}
+
+
+def test_check_embeddings_is_ok_when_every_source_is_covered(hc, tmp_path):
+    from src.store.embeddings import TEAMS_THREAD_ID_OFFSET
+
+    db = _coverage_db(threads=100)
+    ids = list(range(1, 101)) + [TEAMS_THREAD_ID_OFFSET - i for i in range(1, 101)]
+
+    r = hc.check_embeddings(db, npz_path=_coverage_npz(tmp_path, ids))
+
+    assert r["status"] == "OK"
+    assert r["gaps"] == {}
+
+
+def test_check_embeddings_ignores_a_source_too_small_to_judge(hc, tmp_path):
+    """A handful of eligible rows is noise, not a gap worth a WARN."""
+    db = _coverage_db(threads=5)
+
+    r = hc.check_embeddings(db, npz_path=_coverage_npz(tmp_path, list(range(1, 101))))
+
+    assert r["status"] == "OK"
+
+
+def test_report_names_the_embedding_gap(hc, tmp_path):
+    from src.store.embeddings import TEAMS_THREAD_ID_OFFSET
+
+    db = _coverage_db(threads=100)
+    npz = _coverage_npz(tmp_path, list(range(1, 101)) + [TEAMS_THREAD_ID_OFFSET - 1])
+    text, _ = hc.build_report([hc.check_embeddings(db, npz_path=npz)], {}, {}, {}, [])
+
+    assert "teams 1/100 indexed" in text
+
+
 # --- SharePoint: a frozen ratio cannot move ----------------------------------
 # check_sharepoint judged the share of rows whose last_status != 'ok'. If the
 # fetcher stops, no row changes, so the ratio is pinned and the row reads OK

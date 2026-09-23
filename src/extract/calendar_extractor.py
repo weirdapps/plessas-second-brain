@@ -95,7 +95,7 @@ Extract the following as JSON:
 {{
   "body_summary": "1-2 sentence summary of what this meeting was about",
   "decisions": [
-    {{"decision": "what was decided", "decided_by": "who decided it", "decision_date": "{start_at}"}}
+    {{"decision": "what was decided", "decided_by": "who decided it", "decision_date": "ISO date if the text states one, else null"}}
   ],
   "action_items": [
     {{"task": "what needs to be done", "owner": "who owns it", "deadline": "when, if mentioned"}}

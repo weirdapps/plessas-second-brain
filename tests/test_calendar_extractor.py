@@ -224,3 +224,26 @@ def test_extract_event_survives_an_attendee_with_a_null_name(monkeypatch):
     extract_event(event, _BODY)
 
     assert "Attendees: a@example.com" in seen["prompt"]
+
+
+def test_the_prompt_does_not_pre_fill_decision_dates_with_the_meeting_date(monkeypatch):
+    """The example JSON used "decision_date": "{start_at}", so decisions read off
+    an invitation body were dated to the meeting whether or not anything was
+    decided then."""
+    from src.extract.calendar_extractor import extract_event
+
+    seen = {}
+
+    class FakeMessages:
+        def create(self, **kw):
+            seen["prompt"] = kw["messages"][0]["content"]
+            return _Response(
+                _TextBlock('{"body_summary": "s", "decisions": [], "action_items": []}')
+            )
+
+    fake = type("Client", (), {"messages": FakeMessages()})()
+    monkeypatch.setattr("src.extract.calendar_extractor._get_client_and_model", lambda: (fake, "m"))
+
+    extract_event(_EVENT, _BODY)
+
+    assert f'"decision_date": "{_EVENT["start_at"]}"' not in seen["prompt"]

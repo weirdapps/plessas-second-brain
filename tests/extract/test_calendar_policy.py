@@ -266,6 +266,38 @@ def test_a_failed_extraction_leaves_the_facts_and_is_retried_by_the_next_run(mon
     assert after_retry["llm_status"] == "extracted"
 
 
+def test_every_sync_run_repairs_stacked_duplicates_and_self_flags(monkeypatch, tmp_path):
+    """Both repairs run even when every event is unchanged, which is the point:
+    the rows they fix belong to events no upsert will ever touch again."""
+    import src.config
+
+    monkeypatch.setattr(src.config, "USER_EMAIL_PATTERN", "")
+    db_path = _calendar_db(tmp_path)
+
+    def succeeding(event, body):
+        return {"body_summary": "s", "decisions": [{"decision": "Go"}], "action_items": []}
+
+    _run_sync(monkeypatch, db_path, _LONG_BODY, succeeding)
+    conn = sqlite3.connect(db_path)
+    event_id = conn.execute("SELECT id FROM calendar_events").fetchone()[0]
+    conn.execute("INSERT INTO decisions (decision, event_id) VALUES ('Go', ?)", (event_id,))
+    conn.execute("UPDATE event_attendees SET is_self = 1")
+    conn.commit()
+    conn.close()
+
+    _run_sync(monkeypatch, db_path, _LONG_BODY, succeeding)
+
+    conn = sqlite3.connect(db_path)
+    decisions = conn.execute(
+        "SELECT COUNT(*) FROM decisions WHERE event_id = ?", (event_id,)
+    ).fetchone()[0]
+    selves = conn.execute("SELECT COUNT(*) FROM event_attendees WHERE is_self = 1").fetchone()[0]
+    attendees = conn.execute("SELECT COUNT(*) FROM event_attendees").fetchone()[0]
+    conn.close()
+    assert (decisions, selves) == (1, 0)
+    assert attendees == 1
+
+
 def test_a_permanent_failure_is_recorded_but_not_retried_forever(monkeypatch, tmp_path):
     """The auth-versus-permanent split, decided by the same classifier attachments use.
 

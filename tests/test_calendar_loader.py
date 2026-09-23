@@ -301,3 +301,127 @@ def test_proxy_organizer(db_conn, proxy_config):
         "SELECT is_self_organized FROM calendar_events WHERE id = ?", (event_id,)
     ).fetchone()[0]
     assert is_self_organized == 1
+
+
+# --- Re-extraction replaces, it does not stack --------------------------------
+# load_event deleted and re-inserted the attendees on every upsert but only ever
+# appended decisions and action items. Each time an event's modified_at moved,
+# calendar-sync re-extracted it and stacked another full set on top: on
+# 2026-09-23 one meeting carried 916 decisions and 65% of all calendar decisions
+# were exact duplicates.
+
+
+def _counts(conn, event_id):
+    decisions = conn.execute(
+        "SELECT COUNT(*) FROM decisions WHERE event_id = ?", (event_id,)
+    ).fetchone()[0]
+    actions = conn.execute(
+        "SELECT COUNT(*) FROM action_items WHERE event_id = ?", (event_id,)
+    ).fetchone()[0]
+    return decisions, actions
+
+
+def test_a_second_extraction_replaces_the_first(db_conn):
+    load_event(db_conn, SAMPLE_EVENT, SAMPLE_EXTRACTION, llm_status="extracted")
+    event_id = load_event(db_conn, SAMPLE_EVENT, SAMPLE_EXTRACTION, llm_status="extracted")
+
+    assert _counts(db_conn, event_id) == (1, 1)
+
+
+def test_a_failed_or_skipped_extraction_keeps_the_previous_one(db_conn):
+    """Only a successful extraction is new information. A model failure, a
+    deferral or a --skip-extraction run passes an empty extraction, and treating
+    that as "no decisions" would destroy good data on a transient error."""
+    empty = {"body_summary": "", "decisions": [], "action_items": []}
+    event_id = load_event(db_conn, SAMPLE_EVENT, SAMPLE_EXTRACTION, llm_status="extracted")
+
+    for status in ("failed", "pending", "skipped"):
+        load_event(db_conn, SAMPLE_EVENT, empty, llm_status=status)
+        assert _counts(db_conn, event_id) == (1, 1), status
+
+
+def test_an_empty_owner_pattern_marks_nobody_as_self(db_conn):
+    """'' is a substring of every string. With BRAIN_USER_EMAIL_PATTERN unset on
+    the producer, every event and every attendee (31,588 rows) was 'self'."""
+    event_id = load_event(
+        db_conn, SAMPLE_EVENT, SAMPLE_EXTRACTION, user_email_pattern="", llm_status="extracted"
+    )
+
+    organized = db_conn.execute(
+        "SELECT is_self_organized FROM calendar_events WHERE id = ?", (event_id,)
+    ).fetchone()[0]
+    selves = db_conn.execute(
+        "SELECT COUNT(*) FROM event_attendees WHERE event_id = ? AND is_self = 1", (event_id,)
+    ).fetchone()[0]
+    assert (organized, selves) == (0, 0)
+
+
+def test_refresh_self_flags_recomputes_every_stored_row(db_conn, proxy_config):
+    """Rows written under the wrong pattern are only fixed when an event is
+    re-upserted, which unchanged events never are. The refresh repairs them all."""
+    from src.store.calendar_loader import refresh_self_flags
+
+    proxy_event = {
+        **SAMPLE_EVENT,
+        "outlook_event_id": "evt-002",
+        "organizer_email": "duarte.dana@example.com",
+    }
+    first = load_event(db_conn, SAMPLE_EVENT, SAMPLE_EXTRACTION, llm_status="extracted")
+    second = load_event(db_conn, proxy_event, SAMPLE_EXTRACTION, llm_status="extracted")
+    db_conn.execute("UPDATE calendar_events SET is_self_organized = 1")
+    db_conn.execute("UPDATE event_attendees SET is_self = 1")
+    db_conn.commit()
+
+    refresh_self_flags(db_conn, "chen@", load_proxy_emails(proxy_config))
+
+    organized = dict(db_conn.execute("SELECT id, is_self_organized FROM calendar_events"))
+    assert organized == {first: 0, second: 1}  # nobody matches 'chen@' as organizer; proxy does
+    selves = db_conn.execute(
+        "SELECT email FROM event_attendees WHERE is_self = 1 ORDER BY email"
+    ).fetchall()
+    assert [r[0] for r in selves] == ["chen@example.com", "chen@example.com"]
+
+
+def test_refresh_self_flags_with_an_empty_pattern_clears_everything(db_conn):
+    from src.store.calendar_loader import refresh_self_flags
+
+    load_event(db_conn, SAMPLE_EVENT, SAMPLE_EXTRACTION, llm_status="extracted")
+    db_conn.execute("UPDATE event_attendees SET is_self = 1")
+    db_conn.commit()
+
+    refresh_self_flags(db_conn, "", set())
+
+    assert db_conn.execute("SELECT MAX(is_self) FROM event_attendees").fetchone()[0] == 0
+
+
+def test_dedupe_event_children_keeps_the_first_of_each_exact_duplicate(db_conn):
+    from src.store.calendar_loader import dedupe_event_children
+
+    event_id = load_event(db_conn, SAMPLE_EVENT, SAMPLE_EXTRACTION, llm_status="extracted")
+    for _ in range(3):  # what the old append-only loader left behind
+        db_conn.execute(
+            "INSERT INTO decisions (decision, decided_by, event_id) VALUES ('Ship by June 1', 'X', ?)",
+            (event_id,),
+        )
+        db_conn.execute(
+            "INSERT INTO action_items (task, owner, status, event_id) VALUES ('Draft timeline', 'Y', 'open', ?)",
+            (event_id,),
+        )
+    db_conn.execute(
+        "INSERT INTO decisions (decision, email_id) VALUES ('Ship by June 1', 42)"
+    )  # an email decision with the same text is not a calendar duplicate
+    db_conn.commit()
+    first_decision = db_conn.execute(
+        "SELECT MIN(id) FROM decisions WHERE event_id = ?", (event_id,)
+    ).fetchone()[0]
+
+    removed = dedupe_event_children(db_conn)
+
+    assert removed == (3, 3)
+    assert _counts(db_conn, event_id) == (1, 1)
+    assert (
+        db_conn.execute("SELECT id FROM decisions WHERE event_id = ?", (event_id,)).fetchone()[0]
+        == first_decision
+    )
+    assert db_conn.execute("SELECT COUNT(*) FROM decisions WHERE email_id = 42").fetchone()[0] == 1
+    assert dedupe_event_children(db_conn) == (0, 0)

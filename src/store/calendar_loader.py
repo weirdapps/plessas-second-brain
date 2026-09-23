@@ -39,6 +39,16 @@ def load_proxy_emails(canonical_path: str) -> set[str]:
         return set()
 
 
+def _is_self_email(email: str, user_email_pattern: str) -> bool:
+    """Whether ``email`` is the owner's, by case-insensitive substring.
+
+    An empty pattern matches nobody. '' is a substring of every string, so with
+    BRAIN_USER_EMAIL_PATTERN unset on the producer every event was stored as
+    self-organized and every one of 31,588 attendees as the owner.
+    """
+    return bool(user_email_pattern) and user_email_pattern.lower() in (email or "").lower()
+
+
 def _is_self_organized(
     organizer_email: str,
     user_email_pattern: str,
@@ -56,7 +66,7 @@ def _is_self_organized(
         True if user_email_pattern matches organizer or organizer is in proxy set
     """
     # Direct user match (case-insensitive)
-    if user_email_pattern.lower() in organizer_email.lower():
+    if _is_self_email(organizer_email, user_email_pattern):
         return True
 
     # Proxy match
@@ -192,7 +202,7 @@ def load_event(
     # Insert attendees
     for attendee in event.get("attendees", []):
         person_id = _resolve_person_id(conn, attendee["email"])
-        is_self = user_email_pattern.lower() in attendee["email"].lower()
+        is_self = _is_self_email(attendee["email"], user_email_pattern)
         is_organizer = attendee["email"].lower() == event.get("organizer_email", "").lower()
 
         conn.execute(
@@ -212,6 +222,15 @@ def load_event(
                 1 if is_organizer else 0,
             ),
         )
+
+    # A successful extraction replaces the event's previous one, the way the
+    # attendee rows above are replaced. Appending is what stacked a full new set
+    # on every re-extraction (916 decisions on one meeting by 2026-09-23). Any
+    # other status arrives with an empty extraction that says nothing about the
+    # event, so the previous decisions and actions are kept.
+    if llm_status == "extracted":
+        conn.execute("DELETE FROM decisions WHERE event_id = ?", (event_id,))
+        conn.execute("DELETE FROM action_items WHERE event_id = ?", (event_id,))
 
     # Insert decisions
     for decision in extraction.get("decisions", []):
@@ -246,3 +265,57 @@ def load_event(
 
     conn.commit()
     return event_id
+
+
+def refresh_self_flags(
+    conn: sqlite3.Connection,
+    user_email_pattern: str,
+    proxy_emails: set[str] | None = None,
+) -> int:
+    """Recompute is_self_organized and is_self on every stored row. Returns rows changed.
+
+    load_event only sets the flags when an event is upserted, and an unchanged
+    event is never upserted again, so rows written under a wrong or empty
+    pattern stay wrong. Cheap enough to run on every calendar-sync (a thousand
+    events, a few tens of thousands of attendees), which also makes a changed
+    pattern take effect everywhere at once.
+    """
+    changed = 0
+    for event_id, organizer, flag in conn.execute(
+        "SELECT id, organizer_email, is_self_organized FROM calendar_events"
+    ).fetchall():
+        want = 1 if _is_self_organized(organizer or "", user_email_pattern, proxy_emails) else 0
+        if want != flag:
+            conn.execute(
+                "UPDATE calendar_events SET is_self_organized = ? WHERE id = ?", (want, event_id)
+            )
+            changed += 1
+    for rowid, email, flag in conn.execute(
+        "SELECT rowid, email, is_self FROM event_attendees"
+    ).fetchall():
+        want = 1 if _is_self_email(email, user_email_pattern) else 0
+        if want != flag:
+            conn.execute("UPDATE event_attendees SET is_self = ? WHERE rowid = ?", (want, rowid))
+            changed += 1
+    conn.commit()
+    return changed
+
+
+def dedupe_event_children(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Delete exact duplicate calendar decisions and action items, keeping the first.
+
+    Returns (decisions_removed, action_items_removed). Cleans what the old
+    append-only load_event stacked up, and stays as a guard: an exact duplicate
+    within one event is never information. Scoped to event_id rows, so an email
+    or Teams decision with the same text is untouched.
+    """
+    decisions = conn.execute(
+        "DELETE FROM decisions WHERE event_id IS NOT NULL AND id NOT IN "
+        "(SELECT MIN(id) FROM decisions WHERE event_id IS NOT NULL GROUP BY event_id, decision)"
+    ).rowcount
+    actions = conn.execute(
+        "DELETE FROM action_items WHERE event_id IS NOT NULL AND id NOT IN "
+        "(SELECT MIN(id) FROM action_items WHERE event_id IS NOT NULL GROUP BY event_id, task)"
+    ).rowcount
+    conn.commit()
+    return decisions, actions

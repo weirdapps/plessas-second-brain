@@ -4,10 +4,13 @@ Generates embeddings for email summaries using Google's text-embedding model
 and provides cosine similarity search.
 """
 
+import fcntl
 import gc
 import sqlite3
 import sys
 import time
+import zipfile
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -81,6 +84,55 @@ def _log(msg: str):
         sys.stderr.flush()
     except OSError:
         pass
+
+
+def _index_lock_path() -> Path:
+    return EMBEDDINGS_FILE.with_name(EMBEDDINGS_FILE.name + ".lock")
+
+
+@contextmanager
+def _index_lock():
+    """Serialise every read-modify-write of EMBEDDINGS_FILE across processes.
+
+    build_index (hourly and daily syncs) and _append_to_index (teams-sync) run
+    from different timers and each rewrites the whole file. Unlocked, an append
+    that landed while build_index was embedding was overwritten by the stale copy
+    build_index then saved: 45 Teams vectors were lost that way after 2026-09-09.
+    Hold it only around load-merge-save, never around the network calls.
+    """
+    path = _index_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _indexed_ids() -> set[int]:
+    """The ids currently in EMBEDDINGS_FILE, read without loading the vectors.
+
+    Refuses a misaligned file here, before anyone pays for embeddings: the
+    vector count comes from the .npy header inside the archive, not the data.
+    """
+    if not EMBEDDINGS_FILE.exists():
+        return set()
+    with np.load(EMBEDDINGS_FILE, allow_pickle=False) as data:
+        ids = {int(x) for x in data["ids"]}
+        n_ids = len(data["ids"])
+    with zipfile.ZipFile(EMBEDDINGS_FILE) as archive, archive.open("vectors.npy") as member:
+        major, _minor = np.lib.format.read_magic(member)
+        if major == 1:
+            n_vectors = np.lib.format.read_array_header_1_0(member)[0][0]
+        else:
+            n_vectors = np.lib.format.read_array_header_2_0(member)[0][0]
+    if n_ids != n_vectors:
+        raise RuntimeError(
+            f"{EMBEDDINGS_FILE} holds {n_ids} ids for {n_vectors} vectors; "
+            "refusing to extend a misaligned index"
+        )
+    return ids
 
 
 def _atomic_savez(path, ids, vectors) -> None:
@@ -251,20 +303,11 @@ def build_index(conn: sqlite3.Connection, force: bool = False) -> int:
     # every email filed after 2026-03-24 resolved to an unrelated row. Semantic
     # search returned confident, random results. Verified by embedding text that
     # is byte-identical across two rows and getting cosine 0.55 instead of 1.00.
-    existing_id_order: list[int] = []
-    existing_ids: set[int] = set()
-    existing_vectors = None
-    if not force and EMBEDDINGS_FILE.exists():
-        data = np.load(EMBEDDINGS_FILE, allow_pickle=False)
-        existing_id_order = [int(x) for x in data["ids"]]
-        existing_ids = set(existing_id_order)
-        existing_vectors = data["vectors"]
-        if len(existing_id_order) != len(existing_vectors):
-            raise RuntimeError(
-                f"{EMBEDDINGS_FILE} holds {len(existing_id_order)} ids for "
-                f"{len(existing_vectors)} vectors; refusing to extend a "
-                "misaligned index"
-            )
+    #
+    # Selection reads only the ids. The vectors are loaded at save time, under
+    # the index lock, so an append another process made while this one was
+    # embedding is merged rather than overwritten (see _index_lock).
+    existing_ids: set[int] = set() if force else _indexed_ids()
 
     # Get emails needing embeddings. Embed a metadata-enriched string (subject /
     # sender / date + summary), not the summary alone, so the vector captures
@@ -332,23 +375,42 @@ def build_index(conn: sqlite3.Connection, force: bool = False) -> int:
 
     new_vectors = generate_embeddings(texts, client)
 
-    # Merge with existing. File order, never set order (see the load comment).
-    if existing_vectors is not None and not force:
-        all_ids = existing_id_order + ids
-        all_vectors = np.vstack([existing_vectors, new_vectors])
-    else:
-        all_ids = ids
-        all_vectors = new_vectors
+    with _index_lock():
+        # A force rebuild rewrites the file from what this function owns
+        # (emails, attachments, conversations). Teams vectors it drops come
+        # back on the next teams-sync, which selects by membership in the file.
+        if force or not EMBEDDINGS_FILE.exists():
+            all_ids = ids
+            all_vectors = new_vectors
+        else:
+            # Merge into the file AS IT IS NOW, in file order (never set order;
+            # see the comment above). Ids another writer added since the
+            # snapshot are kept, and not duplicated.
+            data = np.load(EMBEDDINGS_FILE, allow_pickle=False)
+            existing_id_order = [int(x) for x in data["ids"]]
+            existing_vectors = data["vectors"]
+            if len(existing_id_order) != len(existing_vectors):
+                raise RuntimeError(
+                    f"{EMBEDDINGS_FILE} holds {len(existing_id_order)} ids for "
+                    f"{len(existing_vectors)} vectors; refusing to extend a "
+                    "misaligned index"
+                )
+            present = set(existing_id_order)
+            fresh = [i for i, vid in enumerate(ids) if vid not in present]
+            all_ids = existing_id_order + [ids[i] for i in fresh]
+            all_vectors = np.vstack([existing_vectors, new_vectors[fresh]])
+            del data, existing_vectors
+            gc.collect()
 
-    if len(all_ids) != len(all_vectors):
-        raise RuntimeError(
-            f"refusing to save a misaligned index: {len(all_ids)} ids for "
-            f"{len(all_vectors)} vectors"
-        )
+        if len(all_ids) != len(all_vectors):
+            raise RuntimeError(
+                f"refusing to save a misaligned index: {len(all_ids)} ids for "
+                f"{len(all_vectors)} vectors"
+            )
 
-    # Save to disk atomically so an interrupted write can never truncate the
-    # shared index (see _atomic_savez).
-    _atomic_savez(EMBEDDINGS_FILE, all_ids, all_vectors)
+        # Save to disk atomically so an interrupted write can never truncate the
+        # shared index (see _atomic_savez).
+        _atomic_savez(EMBEDDINGS_FILE, all_ids, all_vectors)
 
     _log(f"Saved {len(all_ids)} embeddings to {EMBEDDINGS_FILE}")
     return len(to_embed)
@@ -530,56 +592,62 @@ def _append_to_index(ids: list[int], vectors) -> None:
     EMBEDDINGS_FILE format: npz with arrays 'ids' (int64) and 'vectors' (float32).
     Re-saves the merged arrays atomically. Existing ids are replaced (so re-embedding
     the same teams_thread overwrites its prior vector instead of duplicating it).
+    Load, merge and save all happen under the index lock (see _index_lock).
     """
-    if EMBEDDINGS_FILE.exists():
-        existing = np.load(EMBEDDINGS_FILE, allow_pickle=False)
-        old_ids = existing["ids"]
-        old_vecs = existing["vectors"]
-        # Drop any rows whose id matches one we're inserting (replace semantics).
-        keep = ~np.isin(old_ids, np.array(ids, dtype=np.int64))
-        merged_ids = np.concatenate([old_ids[keep], np.array(ids, dtype=np.int64)])
-        merged_vecs = np.concatenate([old_vecs[keep], vectors])
-        # Release the NpzFile-backed arrays before we allocate the tmp save buffer.
-        del existing, old_ids, old_vecs
-        gc.collect()
-    else:
-        merged_ids = np.array(ids, dtype=np.int64)
-        merged_vecs = vectors
-    _atomic_savez(EMBEDDINGS_FILE, merged_ids, merged_vecs)
+    with _index_lock():
+        if EMBEDDINGS_FILE.exists():
+            existing = np.load(EMBEDDINGS_FILE, allow_pickle=False)
+            old_ids = existing["ids"]
+            old_vecs = existing["vectors"]
+            # Drop any rows whose id matches one we're inserting (replace semantics).
+            keep = ~np.isin(old_ids, np.array(ids, dtype=np.int64))
+            merged_ids = np.concatenate([old_ids[keep], np.array(ids, dtype=np.int64)])
+            merged_vecs = np.concatenate([old_vecs[keep], vectors])
+            # Release the NpzFile-backed arrays before we allocate the tmp save buffer.
+            del existing, old_ids, old_vecs
+            gc.collect()
+        else:
+            merged_ids = np.array(ids, dtype=np.int64)
+            merged_vecs = vectors
+        _atomic_savez(EMBEDDINGS_FILE, merged_ids, merged_vecs)
 
 
-def _teams_threads_to_embed(conn) -> list[tuple[int, str]]:
+def _teams_threads_to_embed(conn, indexed: set[int] | None = None) -> list[tuple[int, str]]:
     """Return [(teams_threads.id, summary), ...] for threads needing fresh embeddings.
 
-    A thread needs (re-)embedding when extraction_status='extracted' AND
-    (embedding_at IS NULL OR embedding_at < extracted_at).
+    A thread needs (re-)embedding when extraction_status='extracted' AND either
+    embedding_at is missing or older than extracted_at, OR its vector is not in
+    the index. The second test is what emails already had: embedding_at alone
+    said "done" for 5,336 threads whose vectors a force rebuild and a lost update
+    had removed, so they were never retried. ``indexed`` defaults to the ids in
+    EMBEDDINGS_FILE.
     """
+    if indexed is None:
+        indexed = _indexed_ids()
     rows = conn.execute(
         """
-        SELECT id, summary
+        SELECT id, summary, embedding_at, extracted_at
         FROM teams_threads
         WHERE extraction_status = 'extracted'
           AND COALESCE(summary, '') != ''
-          AND (embedding_at IS NULL OR embedding_at < extracted_at)
         ORDER BY id
         """
     ).fetchall()
     out = []
-    for r in rows:
-        # Support both Row and tuple access patterns.
-        rid = r["id"] if hasattr(r, "keys") else r[0]
-        summary = r["summary"] if hasattr(r, "keys") else r[1]
-        out.append((int(rid), summary))
+    for rid, summary, embedding_at, extracted_at in rows:
+        stale = embedding_at is None or (extracted_at is not None and embedding_at < extracted_at)
+        if stale or (TEAMS_THREAD_ID_OFFSET - int(rid)) not in indexed:
+            out.append((int(rid), summary))
     return out
 
 
-def build_teams_index(conn, force: bool = False) -> int:
-    """Embed every teams_thread that needs it. Returns count generated.
+def build_teams_index(conn, force: bool = False, limit: int = 0) -> int:
+    """Embed the teams_threads that need it, at most ``limit`` (0 = all).
 
-    Stores into the same EMBEDDINGS_FILE keyed by TEAMS_THREAD_ID_OFFSET-id
-    (mirrors the conversation encoding shape), so all teams npz keys are
-    strictly less than TEAMS_THREAD_ID_OFFSET (-10M). Lets query_semantic
-    distinguish teams from conversations purely by id sign+threshold.
+    Returns count generated. Stores into the same EMBEDDINGS_FILE keyed by
+    TEAMS_THREAD_ID_OFFSET-id (mirrors the conversation encoding shape), so all
+    teams npz keys are strictly less than TEAMS_THREAD_ID_OFFSET (-10M). Lets
+    query_semantic distinguish teams from conversations purely by id sign+threshold.
     """
     if force:
         # Force rebuild = clear embedding_at so the query re-selects everything.
@@ -587,6 +655,8 @@ def build_teams_index(conn, force: bool = False) -> int:
         conn.commit()
 
     pairs = _teams_threads_to_embed(conn)
+    if limit and limit > 0:
+        pairs = pairs[:limit]
     if not pairs:
         return 0
 

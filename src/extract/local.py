@@ -298,11 +298,18 @@ def run_extraction(
     With a deadline (the scheduled syncs pass one) the run stops taking new work
     once it passes, and a quota pause ends the run instead of sleeping
     QUOTA_PAUSE_SECONDS in-process: whatever is left stays pending, and the next
-    scheduled run is the retry. Without one (a manual run) nothing changes.
+    scheduled run is the retry. It also works newest first, so a tail of old
+    emails that fail on every run cannot spend each run's budget ahead of fresh
+    mail. Without one (a manual run) nothing changes.
+
+    Returns {"extracted", "failed", "quota_paused"}; quota_paused is True when a
+    quota pause ended a run that had a deadline.
     """
     global _shutdown
 
     deadline = None if deadline_s is None else time.monotonic() + deadline_s
+    quota_paused = False
+    cut_short = False
 
     def past_deadline() -> bool:
         return deadline is not None and time.monotonic() >= deadline
@@ -325,6 +332,9 @@ def run_extraction(
 
     pending = [e for e in all_emails if str(e.get("message_id", "")) not in processed_ids]
     log(f"Pending extraction: {len(pending)} emails")
+    if deadline is not None:
+        # Batches are staged in arrival order, so this is newest first.
+        pending.reverse()
 
     if limit > 0:
         pending = pending[:limit]
@@ -332,7 +342,7 @@ def run_extraction(
 
     if not pending:
         log("Nothing to extract. Done.")
-        return
+        return {"extracted": 0, "failed": 0, "quota_paused": False}
 
     # Warm up: verify auth
     if engine == "claude":
@@ -363,6 +373,7 @@ def run_extraction(
                 break
             if past_deadline():
                 log(f"Deadline reached; {len(pending) - i} emails stay pending for the next run.")
+                cut_short = True
                 break
 
             email = pending[i]
@@ -393,6 +404,7 @@ def run_extraction(
                             f"QUOTA PAUSE: {consecutive_failures} consecutive failures; "
                             "ending the run, the rest stays pending for the next one."
                         )
+                        quota_paused = cut_short = True
                         break
                     log(
                         f"QUOTA PAUSE: {consecutive_failures} consecutive failures. "
@@ -445,10 +457,7 @@ def run_extraction(
 
             while i < len(pending) and not _shutdown:
                 if past_deadline():
-                    log(
-                        f"Deadline reached; {len(pending) - i} emails stay pending "
-                        "for the next run."
-                    )
+                    cut_short = True
                     break
                 chunk = pending[i : i + chunk_size]
                 futures = {
@@ -461,6 +470,7 @@ def run_extraction(
                     if past_deadline():
                         # Calls already running finish (each is bounded by the
                         # policy); the ones not yet started are dropped.
+                        cut_short = True
                         for queued in futures:
                             queued.cancel()
                         if future.cancelled():
@@ -519,6 +529,7 @@ def run_extraction(
                             f"QUOTA PAUSE: {consecutive_failures} consecutive failures; "
                             "ending the run, the rest stays pending for the next one."
                         )
+                        quota_paused = cut_short = True
                         break
                     log(
                         f"QUOTA PAUSE: {consecutive_failures} consecutive failures. "
@@ -543,8 +554,15 @@ def run_extraction(
     save_state(state)
 
     elapsed = (time.time() - start_time) / 60
-    log(f"=== EXTRACTION {'STOPPED' if _shutdown else 'COMPLETE'} ===")
+    if cut_short and workers > 1:
+        # Counted here, after the fact: a deadline can pass mid-chunk, and the
+        # cancelled futures of that chunk stay pending as well.
+        left = sum(1 for e in pending if str(e.get("message_id", "")) not in processed_ids)
+        log(f"Deadline reached; {left} emails stay pending for the next run.")
+    outcome = "STOPPED" if _shutdown else "CUT SHORT" if cut_short else "COMPLETE"
+    log(f"=== EXTRACTION {outcome} ===")
     log(f"Extracted: {total_done}, Failed: {total_failed}, Time: {elapsed:.1f}min")
+    return {"extracted": total_done, "failed": total_failed, "quota_paused": quota_paused}
 
 
 # --- Conversation Extraction ---

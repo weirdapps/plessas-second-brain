@@ -8,7 +8,8 @@ LOG_DIR="$HOME/.second-brain/logs"
 LOG_FILE="$LOG_DIR/conversation-sync.log"
 mkdir -p "$LOG_DIR"
 
-LOCK_DIR="/tmp/sb-conversation-sync.lock"
+# Overridable so the wrapper tests never touch a lock a real run may hold.
+LOCK_DIR="${SB_CONVERSATION_SYNC_LOCK:-/tmp/sb-conversation-sync.lock}"
 if [ -d "$LOCK_DIR" ]; then
   stored_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
   if [ -z "$stored_pid" ] || ! kill -0 "$stored_pid" 2>/dev/null; then
@@ -27,8 +28,10 @@ echo "=== Conversation sync started: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_
 
 cd "$REPO_DIR" || exit 1
 # Both steps always run: extraction drains what earlier exports staged, so a
-# failed export must not stop it. Either failure fails the run; this used to log
-# "ok" and exit 0 unconditionally, and systemd recorded every failure as success.
+# failed export must not stop it. Either command exiting non-zero fails the run,
+# with the export's code first; this used to log "ok" and exit 0 whatever
+# happened. Per-session errors inside a command are counted in its output and do
+# not fail it: a corrupt session file stays in the 7-day window for a week.
 "$PYTHON" -m src.cli export-conversations --days 7 >> "$LOG_FILE" 2>&1
 export_rc=$?
 "$PYTHON" -m src.cli extract-conversations --workers 2 >> "$LOG_FILE" 2>&1

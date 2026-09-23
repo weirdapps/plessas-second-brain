@@ -177,3 +177,28 @@ def test_list_events_reports_the_chunks_it_could_not_fetch(monkeypatch):
 
     assert [e["Id"] for e in events] == ["e1", "e4"]
     assert len(failures) == 2
+
+
+def test_get_event_body_lets_an_auth_failure_through(monkeypatch):
+    """Swallowed with everything else, an expired session read as one failed
+    fetch per event. The caller treats it as the outage it is."""
+    import pytest
+
+    from src.export import calendar_export
+    from src.export.outlook_cli import OutlookCliAuthRequired
+
+    def expired(args):
+        raise OutlookCliAuthRequired("session expired")
+
+    monkeypatch.setattr(calendar_export, "run_outlook_cli", expired)
+
+    with pytest.raises(OutlookCliAuthRequired):
+        calendar_export.get_event_body("e1")
+
+
+def test_parse_event_keeps_the_etag_a_list_entry_carries():
+    from src.export.calendar_export import parse_event
+
+    parsed = parse_event({"Id": "e1", "@odata.etag": 'W/"abc"'})
+
+    assert parsed["change_key"] == 'W/"abc"'

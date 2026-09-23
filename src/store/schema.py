@@ -469,6 +469,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_teams_ingest_disabled_at(conn)
     if current < 20:
         migrate_fold_greek_accents(conn)
+    if current < 21:
+        migrate_add_calendar_change_key(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -595,6 +597,30 @@ def migrate_add_teams_last_pulled_at(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(teams_chats)").fetchall()}
     if "last_pulled_at" not in cols:
         conn.execute("ALTER TABLE teams_chats ADD COLUMN last_pulled_at TEXT")
+        conn.commit()
+
+
+def migrate_add_calendar_change_key(conn: sqlite3.Connection) -> None:
+    """v21: the event's etag as list-calendar returned it, for the change detector.
+
+    cmd_calendar_sync skipped an event whose stored modified_at equalled the one in
+    the list-calendar entry. The entry never carries one (its $select has no
+    LastModifiedDateTime), so nothing ever matched: every event in the window was
+    fetched again and re-extracted on every run, eight LLM calls an hour for
+    unchanged meetings. The etag comes back with every entry and changes whenever
+    the event does.
+
+    Nullable, no backfill: rows written before this have no etag, so each is
+    fetched once more and stamped then.
+    """
+    has_table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='calendar_events'"
+    ).fetchone()
+    if not has_table:
+        return
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(calendar_events)").fetchall()}
+    if "change_key" not in cols:
+        conn.execute("ALTER TABLE calendar_events ADD COLUMN change_key TEXT")
         conn.commit()
 
 

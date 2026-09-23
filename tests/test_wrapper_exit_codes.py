@@ -29,7 +29,14 @@ def _home_with_python(tmp_path: Path, body: str) -> Path:
 def _run(wrapper: str, home: Path) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["/bin/bash", str(_WRAPPERS / wrapper)],
-        env={"HOME": str(home), "PATH": "/usr/bin:/bin", "SHELL": "/bin/bash"},
+        env={
+            "HOME": str(home),
+            "PATH": "/usr/bin:/bin",
+            "SHELL": "/bin/bash",
+            # Never the machine-wide lock: a real run holding it would make the
+            # wrapper exit 0 before running anything.
+            "SB_CONVERSATION_SYNC_LOCK": str(home / "conversation-sync.lock"),
+        },
         capture_output=True,
         text=True,
         timeout=60,
@@ -69,6 +76,17 @@ def test_conversation_wrapper_still_extracts_after_a_failed_export(tmp_path):
     assert marker.exists()
 
 
+def test_when_both_conversation_steps_fail_the_export_code_wins(tmp_path):
+    home = _home_with_python(
+        tmp_path,
+        'case "$*" in\n'
+        "  *export-conversations*) exit 4;;\n"
+        "  *extract-conversations*) exit 5;;\n"
+        "esac\nexit 0\n",
+    )
+    assert _run("sb-conversation-sync.sh", home).returncode == 4
+
+
 def test_conversation_wrapper_succeeds_when_both_steps_do(tmp_path):
     home = _home_with_python(tmp_path, "exit 0\n")
     assert _run("sb-conversation-sync.sh", home).returncode == 0
@@ -77,8 +95,9 @@ def test_conversation_wrapper_succeeds_when_both_steps_do(tmp_path):
 def test_attachment_pass_runs_every_stage_even_after_one_fails(tmp_path):
     """Under set -e the first failing stage aborted the rest: one poison
     attachment in registration or Phase 1 starved the image and SharePoint
-    passes every night. The stages are independent; each runs, and the first
-    failure is the exit status."""
+    passes every night. The stages are independent; each runs, and a failure
+    ends the pass with 65, which the unit's retry.conf does not restart: every
+    stage already ran, so a restart would repeat the hour for nothing."""
     marker = tmp_path / "sharepoint-ran"
     home = _home_with_python(
         tmp_path,
@@ -91,7 +110,7 @@ def test_attachment_pass_runs_every_stage_even_after_one_fails(tmp_path):
     result = _run("sb-attachment-pass.sh", home)
 
     assert marker.exists()
-    assert result.returncode == 5
+    assert result.returncode == 65
 
 
 def test_attachment_pass_succeeds_when_every_stage_does(tmp_path):

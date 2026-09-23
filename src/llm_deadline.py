@@ -60,15 +60,22 @@ from src.llm_policy import MAX_ATTEMPTS, ROW_CAPS, backoff
 # on 2026-08-11 with `systemctl --user show sb-<name>.service -p TimeoutStartUSec`.
 # These ten are the whole scheduled set. A unit missing from this map gets no deadline
 # rather than a guessed one.
+#
+# Re-read 2026-09-23. Three drop-ins had raised units since, each an owner decision
+# with its reason in the drop-in: sb-calendar-sync and sb-conversation-sync to 15min
+# (timeout.conf, so the policy can fund a retry at all) and sb-outlook-sync to 20min
+# (catchup-timeout.conf, 2026-09-11, so a recovery run is not killed mid-catch-up).
+# The smaller of table and live wins, so the stale 300s entries kept both 15-minute
+# units at a 90s budget: the one attempt, no retry, the drop-in was written to end.
 _UNIT_TIMEOUT_SECONDS: dict[str, int] = {
     "sb-attachments": 3600,
-    "sb-calendar-sync": 300,
-    "sb-conversation-sync": 300,
+    "sb-calendar-sync": 900,
+    "sb-conversation-sync": 900,
     "sb-curate-docs": 1800,
     "sb-daily-sync": 1800,
     "sb-news-sync": 1800,
     "sb-noon-catchup": 1800,
-    "sb-outlook-sync": 600,
+    "sb-outlook-sync": 1200,
     "sb-reverse-ingest": 1800,
     "sb-teams-sync": 600,
 }

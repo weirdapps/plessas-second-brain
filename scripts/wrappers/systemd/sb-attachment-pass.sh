@@ -5,7 +5,7 @@
 # No -e. The stages below are independent, and under set -e the first one to
 # fail aborted the rest: a single poison attachment in registration or Phase 1
 # starved the image and SharePoint passes every night. Each stage runs through
-# run_stage, and the first failure becomes the exit status.
+# run_stage, which logs its failure, and any failure ends the pass with 65.
 set -uo pipefail
 
 # Vertex AI credentials for Claude LLM (Phase 2 + image vision)
@@ -73,4 +73,12 @@ run_stage "image classification" "$PYTHON" -m src.cli process-images --limit 500
 echo "$(date '+%Y-%m-%d %H:%M:%S') — starting SharePoint fetch" >> "$LOG_FILE"
 run_stage "SharePoint fetch" "$PYTHON" -m src.cli process-sharepoint --limit 200
 
-exit "$overall_rc"
+# Every stage has run by here, so a restart would repeat the whole hour of LLM
+# and vision calls for a failure a retry cannot fix. 65 means "ran to the end, a
+# stage failed" (each stage's own code is in the log above), and
+# RestartPreventExitStatus=65 in the unit's retry.conf keeps the restart for a
+# pass that was killed or timed out.
+if [ "$overall_rc" -ne 0 ]; then
+  exit 65
+fi
+exit 0

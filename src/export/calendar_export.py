@@ -100,10 +100,17 @@ def get_event_body(event_id: str) -> dict | None:
 
     Returns:
         Event dict with body, or None on error
+
+    Raises:
+        OutlookCliAuthRequired: If outlook-cli requires re-authentication. It was
+            swallowed with everything else, so an expired session read as one
+            failed fetch per event instead of as the outage it is.
     """
     try:
         result = run_outlook_cli(["get-event", event_id, "--body", "html"])
         return result
+    except OutlookCliAuthRequired:
+        raise
     except Exception as e:
         logger.error(f"Error fetching event body for {event_id}: {e}")
         return None
@@ -159,5 +166,7 @@ def parse_event(raw: dict) -> dict:
         "is_cancelled": raw.get("IsCancelled", False),
         "created_at": raw.get("CreatedDateTime"),
         "modified_at": raw.get("LastModifiedDateTime"),
+        # In list-calendar entries too, unlike LastModifiedDateTime: the change detector.
+        "change_key": raw.get("@odata.etag"),
         "attendees": attendees,
     }

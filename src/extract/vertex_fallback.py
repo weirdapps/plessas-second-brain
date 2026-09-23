@@ -26,17 +26,25 @@ def create_with_refusal_fallback(client: Any, *, model: str, **create_kwargs: An
     if getattr(response, "stop_reason", None) != "refusal":
         return response
 
-    fb_model = os.environ.get("VERTEX_MODEL_FALLBACK_SDK", "claude-opus-5")
-    fb_region = os.environ.get("VERTEX_REGION_FALLBACK", "eu")
+    # Defaults are the Opus 4.6 escape-hatch tier (owner decision 2026-09-23). The
+    # REGION default moves with the model on purpose: 4.6 is a <=4.6 model, so it
+    # belongs in europe-west1 and an "eu" default would 429 every retry.
+    fb_model = os.environ.get("VERTEX_MODEL_FALLBACK_SDK", "claude-opus-4-6")
+    fb_region = os.environ.get("VERTEX_REGION_FALLBACK", "europe-west1")
     project = os.environ.get("VERTEX_SDK_PROJECT") or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
 
-    # The fallback tier is allowed to equal the primary, and on the VPS it does:
-    # VERTEX_MODEL_EXTRACT and VERTEX_MODEL_FALLBACK_SDK are both claude-opus-5
-    # in region eu, because the fallback stopped being a model-class escape
-    # hatch on 2026-08-03. A refusal is a property of the model and the prompt,
-    # so replaying the identical pair cannot change stop_reason: it only spends a
-    # second call, and up to another max_call_seconds of the caller's deadline,
-    # to be told the same thing. sb-outlook-sync logged 7,124 of these.
+    # The fallback tier is ALLOWED to equal the primary, and between 2026-08-03 and
+    # 2026-09-23 it did: VERTEX_MODEL_EXTRACT and VERTEX_MODEL_FALLBACK_SDK were both
+    # claude-opus-5 in region eu, so the guard below fired constantly and
+    # sb-outlook-sync logged 7,124 skipped retries. A refusal is a property of the
+    # model and the prompt, so replaying the identical pair cannot change stop_reason:
+    # it only spends a second call, and up to another max_call_seconds of the caller's
+    # deadline, to be told the same thing.
+    #
+    # Since 2026-09-23 the pair genuinely differs (extract claude-opus-5-5 @ eu,
+    # fallback claude-opus-4-6 @ europe-west1), so this guard should now be quiet and
+    # the retry is live again. Keep the guard: it is what makes it safe to point the
+    # fallback back at the primary in future without re-introducing those 7,124 calls.
     #
     # Only when the region is KNOWN to match. A client that does not expose
     # `.region` leaves the pair unproven, and dropping a retry on an unproven

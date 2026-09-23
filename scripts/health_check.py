@@ -767,6 +767,54 @@ def check_conversations(db):
     }
 
 
+def _embedding_coverage(db, ids) -> dict[str, tuple[int, int]]:
+    """(indexed, eligible) per source, with "eligible" as each embedder selects it.
+
+    A fresh file with a plausible total can still be missing a whole source: on
+    2026-09-23 the index held 133 of 5,469 extracted Teams threads while this
+    check, which looked at the mtime and the total only, said OK.
+    """
+    from src.store.embeddings import CONVERSATION_ID_OFFSET, TEAMS_THREAD_ID_OFFSET
+
+    indexed = {int(i) for i in ids}
+    sources = {
+        "emails": (
+            "SELECT id FROM emails WHERE summary IS NOT NULL AND summary != ''",
+            lambda i: i,
+        ),
+        "attachments": (
+            "SELECT ac.id FROM attachment_content ac JOIN attachments a "
+            "ON a.id = ac.attachment_id WHERE ac.llm_status = 'extracted' "
+            "AND ac.summary IS NOT NULL AND ac.summary != ''",
+            lambda i: -i,
+        ),
+        "conversations": (
+            "SELECT id FROM conversations WHERE summary IS NOT NULL AND summary != ''",
+            lambda i: CONVERSATION_ID_OFFSET - i,
+        ),
+        "teams": (
+            "SELECT id FROM teams_threads WHERE extraction_status = 'extracted' "
+            "AND COALESCE(summary, '') != ''",
+            lambda i: TEAMS_THREAD_ID_OFFSET - i,
+        ),
+    }
+    coverage = {}
+    for name, (sql, to_vector_id) in sources.items():
+        try:
+            rows = db.execute(sql).fetchall()
+        except sqlite3.Error:
+            continue  # a source this schema does not have
+        eligible = [to_vector_id(int(r[0])) for r in rows]
+        coverage[name] = (sum(1 for v in eligible if v in indexed), len(eligible))
+    return coverage
+
+
+# A source is a gap below this share of its eligible rows, once it has enough
+# rows for the share to mean something.
+EMBEDDING_COVERAGE_MIN = 0.98
+EMBEDDING_COVERAGE_MIN_ROWS = 50
+
+
 def check_embeddings(db, npz_path: Path | None = None, now: datetime | None = None):
     total_emails = db.execute("SELECT COUNT(*) FROM emails").fetchone()[0]
     import numpy as np
@@ -787,13 +835,21 @@ def check_embeddings(db, npz_path: Path | None = None, now: datetime | None = No
     # months ago. The file's mtime is the only thing here that keeps moving.
     age = (now or datetime.now()) - datetime.fromtimestamp(npz.stat().st_mtime)
     stale = age > STALE_THRESHOLDS["embeddings"]
+    coverage = _embedding_coverage(db, d["ids"] if "ids" in d else [])
+    gaps = {
+        name: (have, want)
+        for name, (have, want) in coverage.items()
+        if want >= EMBEDDING_COVERAGE_MIN_ROWS and have < EMBEDDING_COVERAGE_MIN * want
+    }
     return {
         "name": "Embeddings",
         "embedded": n,
         "total_emails": total_emails,
         "age": age,
         "stale": stale,
-        "status": "STALE" if stale else "OK",
+        "coverage": coverage,
+        "gaps": gaps,
+        "status": "STALE" if stale else ("WARN" if gaps else "OK"),
     }
 
 
@@ -1600,6 +1656,14 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
                 )
         elif c["name"] == "Emails":
             extra = f" ({c.get('recent_24h', 0)} today)"
+        elif c["name"] == "Embeddings" and c.get("gaps"):
+            extra = (
+                " ("
+                + ", ".join(
+                    f"{name} {have:,}/{want:,} indexed" for name, (have, want) in c["gaps"].items()
+                )
+                + ")"
+            )
         elif c["name"] == "Teams":
             extra = f" ({c.get('recent_24h', 0)} today)"
             if c.get("coverage_lost"):

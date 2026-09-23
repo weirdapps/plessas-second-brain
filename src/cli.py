@@ -109,6 +109,12 @@ TEAMS_EXTRACT_DEADLINE_S = 150.0
 TEAMS_EMBED_OBSERVED_S = 30.0
 TEAMS_UNIT_TIMEOUT_S = 600.0
 
+# Step 6 embeds by count, capped so the 30 s above still holds when a backlog
+# appears: threads are now re-selected when their vector is missing from the
+# index, and 5,336 were missing on 2026-09-23. 500 is five embedding batches and
+# one index save; the backlog drains over a day of hourly runs.
+TEAMS_EMBED_LIMIT = 500
+
 
 def format_email_result(email: dict, show_full: bool = False) -> str:
     """Format a single email result for display.
@@ -1416,7 +1422,7 @@ def cmd_teams_sync(args):
     )
 
     print("Step 6/6: embedding thread summaries...")
-    n = build_teams_index(conn)
+    n = build_teams_index(conn, limit=TEAMS_EMBED_LIMIT)
     print(f"  {n} new/updated embeddings")
 
     conn.close()
@@ -1524,7 +1530,12 @@ def cmd_calendar_sync(args):
     from src.extract.policy_bridge import classify_exception
     from src.extract.vertex_auth import touch_sentinel
     from src.llm_policy import Outcome
-    from src.store.calendar_loader import load_event, load_proxy_emails
+    from src.store.calendar_loader import (
+        dedupe_event_children,
+        load_event,
+        load_proxy_emails,
+        refresh_self_flags,
+    )
     from src.store.schema import get_connection, run_migrations
 
     db_path = str(args.db)
@@ -1665,6 +1676,19 @@ def cmd_calendar_sync(args):
         )
         stats["loaded"] += 1
 
+    # Both are idempotent and cheap, and both repair rows no upsert will touch
+    # again: stacked duplicates from the old append-only loader, and self flags
+    # written while BRAIN_USER_EMAIL_PATTERN was unset.
+    dup_decisions, dup_actions = dedupe_event_children(conn)
+    flags_changed = 0
+    if USER_EMAIL_PATTERN:
+        flags_changed = refresh_self_flags(conn, USER_EMAIL_PATTERN, proxy_emails)
+    else:
+        # Without the pattern every stored flag would be rewritten to not-self.
+        print(
+            "  BRAIN_USER_EMAIL_PATTERN is unset; leaving the stored self flags alone",
+            file=sys.stderr,
+        )
     conn.close()
     print(f"  Loaded:     {stats['loaded']}")
     print(f"  Unchanged:  {stats['skipped_unchanged']}")
@@ -1672,6 +1696,10 @@ def cmd_calendar_sync(args):
     print(f"  Failed:     {stats['failed']}")
     print(f"  Deferred:   {stats['deferred']}")
     print(f"  Fetch fail: {stats['fetch_failed']}")
+    if dup_decisions or dup_actions:
+        print(f"  Removed duplicate decisions/actions: {dup_decisions}/{dup_actions}")
+    if flags_changed:
+        print(f"  Self flags corrected: {flags_changed}")
 
 
 def _staged_news_ids(staging_dir: Path) -> set[str]:

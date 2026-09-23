@@ -641,3 +641,44 @@ def test_process_sharepoint_counts_a_refused_foreign_link_as_skipped(tmp_path, c
     row = conn.execute("SELECT last_status FROM sharepoint_links WHERE url = ?", (url,)).fetchone()
     conn.close()
     assert row[0] == "unsupported-host"
+
+
+def test_a_malformed_tenant_setting_yields_no_managed_host():
+    """A value that is not a bare host (an inline comment, a scheme, a path)
+    must not become a tenant that nothing can ever match."""
+    from src.export.sharepoint_fetcher import managed_sharepoint_hosts
+
+    for value in (
+        "contoso.sharepoint.com  # our tenant",
+        "https://contoso.sharepoint.com",
+        "contoso.sharepoint.com/sites",
+        "",
+        "contoso",
+    ):
+        assert managed_sharepoint_hosts(value) == frozenset(), value
+
+
+def test_process_sharepoint_refuses_a_malformed_tenant_setting(tmp_path, monkeypatch):
+    """Set but unusable is the same as unset: fetching would park every real link."""
+    import argparse
+
+    from src.cli import cmd_process_sharepoint
+
+    monkeypatch.setenv("SHAREPOINT_HOST", "contoso.sharepoint.com  # our tenant")
+    _setup_db(tmp_path).close()
+    with patch("src.export.sharepoint_fetcher.fetch_sharepoint_link") as mock_fetch:
+        args = argparse.Namespace(db=str(tmp_path / "test.db"), since=None, limit=0, dry_run=False)
+        with pytest.raises(SystemExit) as exc:
+            cmd_process_sharepoint(args)
+        assert exc.value.code == 2
+        assert not mock_fetch.called
+
+
+def test_fetch_never_raises_on_a_url_urlparse_rejects(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr("src.export.sharepoint_cli.subprocess.run", lambda *a, **k: calls.append(a))
+    result = fetch_sharepoint_link(
+        "https://[contoso.sharepoint.com/x", tmp_path, managed_host="contoso.sharepoint.com"
+    )
+    assert result.status == "exception"
+    assert calls == []

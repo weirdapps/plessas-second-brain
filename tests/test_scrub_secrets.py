@@ -139,3 +139,78 @@ def test_a_second_apply_is_a_no_op(scrub, tmp_path, capsys, monkeypatch):
 def test_a_missing_database_is_an_error(scrub, tmp_path, monkeypatch):
     monkeypatch.setattr(scrub, "DEFAULT_DB", tmp_path / "absent.db")
     assert scrub.main([]) == 2
+
+
+def _traced(scrub, monkeypatch):
+    """Record every statement the script's connections execute."""
+    statements = []
+    real_connect = sqlite3.connect
+
+    def connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(scrub.sqlite3, "connect", connect)
+    return statements
+
+
+def test_apply_optimizes_every_fts_index_even_when_nothing_is_found(scrub, tmp_path, monkeypatch):
+    """An interrupted run leaves the rows clean and the index dirty; a re-run
+    must still finish the job. And a document deleted or re-ingested since it
+    was indexed leaves its terms in segments whose content table shows no hit."""
+    _db(tmp_path, scrub, monkeypatch)
+    scrub.main(["--apply"])
+    statements = _traced(scrub, monkeypatch)
+
+    assert scrub.main(["--apply"]) == 0
+
+    optimized = {s.split('"')[1] for s in statements if "VALUES('optimize')" in s}
+    assert {
+        "emails_fts",
+        "conversation_turns_fts",
+        "key_facts_fts",
+        "teams_messages_fts",
+    } <= optimized
+
+
+def test_a_checkpoint_blocked_by_a_reader_is_reported_not_passed(
+    scrub, tmp_path, monkeypatch, capsys
+):
+    """While a reader holds an old snapshot the WAL cannot be copied back, so
+    the main file still holds the pre-scrub pages that the replica pull ships."""
+    path = _db(tmp_path, scrub, monkeypatch)
+    monkeypatch.setattr(scrub, "BUSY_TIMEOUT_MS", 200)
+    reader = sqlite3.connect(path)
+    reader.execute("BEGIN")
+    reader.execute("SELECT COUNT(*) FROM emails").fetchone()
+    try:
+        rc = scrub.main(["--apply"])
+    finally:
+        reader.close()
+
+    assert rc == 1
+    assert "checkpoint" in capsys.readouterr().err
+
+
+def test_vacuum_removes_bytes_freed_before_the_scrub(scrub, tmp_path, monkeypatch):
+    """secure_delete only zeroes what is freed while it is on. Copies freed by
+    years of ordinary churn sit in freelist pages and slack, and only VACUUM
+    rewrites them away."""
+    path = _db(tmp_path, scrub, monkeypatch)
+    conn = sqlite3.connect(path)  # ordinary churn, secure_delete off
+    conn.execute("UPDATE emails SET summary = 'extracted' WHERE message_id = 'm1'")
+    for i in range(200):  # later ingest: FTS merges free the old segment pages
+        conn.execute(
+            "INSERT INTO emails (message_id, date_received, content) VALUES (?, ?, ?)",
+            (f"churn{i}", "2026-03-03T10:00:00", f"routine message number {i} " * 20),
+        )
+    conn.commit()
+    conn.close()
+
+    assert scrub.main(["--apply", "--vacuum"]) == 0
+
+    data = _file_bytes(path)
+    for secret in (GOOGLE, ANTHROPIC):
+        assert secret.encode() not in data
+        assert secret.lower().encode() not in data

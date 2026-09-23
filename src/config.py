@@ -7,12 +7,27 @@ reads a .env file.
 """
 
 import os
+import sys
 from collections.abc import MutableMapping
 from pathlib import Path
 
-# Keys the settings file may set. Identity and tenant only: a credential or a
-# backend switch pasted into it must not be picked up silently.
-_CONFIG_FILE_KEYS = frozenset({"SHAREPOINT_HOST"})
+# Keys the settings file may set: identity and tenant, named one by one. A
+# credential, a backend switch (BRAIN_EXTRACT_ENGINE) or a relocated data home
+# (BRAIN_DATA_DIR) pasted into it must not be picked up silently.
+_CONFIG_FILE_KEYS = frozenset(
+    {"BRAIN_USER_NAME", "BRAIN_USER_ROLE", "BRAIN_USER_EMAIL_PATTERN", "SHAREPOINT_HOST"}
+)
+
+
+def _config_value(raw: str) -> str:
+    """The value part of a KEY=VALUE line: quotes removed, a trailing # comment dropped."""
+    value = raw.strip()
+    if value[:1] in ("'", '"'):
+        closing = value.find(value[0], 1)
+        if closing != -1:
+            return value[1:closing]
+    comment = value.find(" #")
+    return (value[:comment] if comment != -1 else value).strip()
 
 
 def load_config_file(path: Path, environ: MutableMapping[str, str] = os.environ) -> None:
@@ -22,11 +37,16 @@ def load_config_file(path: Path, environ: MutableMapping[str, str] = os.environ)
     starts the timers with a fixed one, so a setting exported in a shell profile
     reaches neither. Before this existed, the producer ran with SHAREPOINT_HOST
     at its placeholder and every Mac MCP server ran without
-    BRAIN_USER_EMAIL_PATTERN. Accepts ``export``, quotes and # comments.
+    BRAIN_USER_EMAIL_PATTERN. Accepts ``export``, quotes and # comments. Runs at
+    import of every entry point, so an unreadable file is reported and ignored,
+    never fatal.
     """
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")
     except OSError:
+        return
+    except UnicodeDecodeError:
+        print(f"second-brain: {path} is not UTF-8; ignoring it", file=sys.stderr)
         return
     for raw in text.splitlines():
         line = raw.strip()
@@ -36,14 +56,8 @@ def load_config_file(path: Path, environ: MutableMapping[str, str] = os.environ)
             line = line[len("export ") :].lstrip()
         key, sep, value = line.partition("=")
         key = key.strip()
-        if not sep or key == "BRAIN_CONFIG_FILE":
-            continue
-        if not (key.startswith("BRAIN_") or key in _CONFIG_FILE_KEYS):
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        environ.setdefault(key, value)
+        if sep and key in _CONFIG_FILE_KEYS:
+            environ.setdefault(key, _config_value(value))
 
 
 load_config_file(

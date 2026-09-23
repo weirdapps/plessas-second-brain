@@ -124,3 +124,66 @@ def test_history_mode_without_the_denylist_refuses(repo, tmp_path):
     result = _run(repo, tmp_path / "absent.conf")
     assert result.returncode == 1
     assert "no denylist" in result.stdout
+
+
+def test_content_added_and_removed_on_a_merged_branch_is_found(repo, denylist):
+    _git(repo, "switch", "-q", "-c", "feature")
+    (repo / "notes.txt").write_text(f"{MARKER}\n")
+    planted = _commit(repo, "plant on a branch")
+    (repo / "notes.txt").write_text("clean\n")
+    _commit(repo, "clean on the branch")
+    _git(repo, "switch", "-q", "main")
+    _git(repo, "merge", "-q", "--no-ff", "-m", "merge feature", "feature")
+    _git(repo, "branch", "-q", "-D", "feature")
+
+    result = _run(repo, denylist)
+
+    assert result.returncode == 1
+    assert planted in result.stdout
+
+
+def test_the_generic_stream_does_not_simplify_merge_history():
+    """A pathspec turns on history simplification, which skips the side of a
+    merge that ends up tree-identical, so PII added and removed inside a merged
+    PR vanished from every generic check. --full-history keeps it."""
+    text = SCRIPT.read_text()
+    generic_log = text[text.index("HISTORY_NOSELF=$(mktemp)") :].split('> "$HISTORY_NOSELF"')[0]
+    assert "--full-history" in generic_log
+
+
+def test_a_line_that_is_not_valid_utf8_is_still_scanned(repo, denylist):
+    """A UTF-8 locale grep silently skips lines with invalid bytes, so a legacy
+    cp1253 or Latin-1 file was invisible to every check."""
+    (repo / "legacy.csv").write_bytes(b"\xff\xfe name;" + MARKER.encode() + b"\n")
+    planted = _commit(repo, "legacy encoded file")
+    (repo / "legacy.csv").unlink()
+    _commit(repo, "remove it")
+
+    result = _run(repo, denylist)
+
+    assert result.returncode == 1
+    assert planted in result.stdout
+
+
+def test_pull_request_heads_on_origin_are_scanned_and_cleaned_up(repo, denylist, tmp_path):
+    """--all sees local refs only. On GitHub a closed PR's head stays reachable
+    through refs/pull/N/head, including after a history rewrite, so history mode
+    fetches those heads into temporary refs and deletes them afterwards."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "push", "-q", "origin", "main")
+    _git(repo, "switch", "-q", "-c", "pr")
+    (repo / "notes.txt").write_text(f"{MARKER}\n")
+    planted = _commit(repo, "only ever in a pull request")
+    _git(repo, "push", "-q", "origin", "HEAD:refs/pull/7/head")
+    _git(repo, "switch", "-q", "main")
+    _git(repo, "branch", "-q", "-D", "pr")
+    _git(repo, "reflog", "expire", "--expire=now", "--all")
+    _git(repo, "gc", "-q", "--prune=now")
+
+    result = _run(repo, denylist)
+
+    assert result.returncode == 1
+    assert planted in result.stdout
+    assert _git(repo, "for-each-ref", "refs/gauntlet-pr/") == ""

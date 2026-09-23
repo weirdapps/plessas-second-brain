@@ -92,7 +92,7 @@ The MCP server exposes 23 tools (all defined in `src/mcp_server.py`). Register t
 
 - `search_emails(query, search_type, limit)`. Keyword (FTS5) or semantic (embedding).
 - `query_emails(person, topic, keyword, start_date, end_date, limit)`. Combined filters.
-- `outlook_live_search(folder, since_minutes, subject_contains)`. Bypasses the DB and queries the live Outlook mailbox directly, for mail newer than the store. `since_minutes` defaults to 60. This is the escape hatch when `stats` says the local copy is stale.
+- `outlook_live_search(folder, since_minutes, subject_contains)`. Bypasses the DB and queries the live Outlook mailbox directly, for mail newer than the store. `since_minutes` defaults to 60 and is capped at 1440 (24 hours); the answer's `since_minutes` and `clamped` say what was searched. This is the escape hatch when `stats` says the local copy is stale.
 
 ### People and topics
 
@@ -105,7 +105,7 @@ The MCP server exposes 23 tools (all defined in `src/mcp_server.py`). Register t
 
 - `query_decisions(topic, person, days, limit)`.
 - `query_actions(owner, status, limit)`.
-- `stale_threads(days, limit)`. Threads awaiting reply plus overdue action items (`overdue_actions_total` is the untruncated count). The stale-thread half needs `BRAIN_USER_EMAIL_PATTERN`; without it that half is always empty and the response says so.
+- `stale_threads(days, limit, max_days)`. Threads whose last message you sent between `days` and `max_days` (default 30) ago, plus overdue action items from every source but news; both lists newest first, capped at `limit`, with `stale_threads_total` and `overdue_actions_total` giving the untruncated counts. The stale-thread half needs `BRAIN_USER_EMAIL_PATTERN`; without it that half is always empty and the response says so.
 
 ### Attachments and images
 
@@ -137,7 +137,7 @@ The MCP server exposes 23 tools (all defined in `src/mcp_server.py`). Register t
 
 ### Stats
 
-- `stats()`. Counts across emails, news articles, standalone documents, conversations, topics, people, decisions, actions, attachments, key facts and calendar events, plus the corpus date range.
+- `stats()`. Counts across emails, news articles, standalone documents, conversations, topics, people, decisions, actions, attachments, key facts and calendar events, plus `coverage`: the first and last date held per mailbox, Teams, calendar and conversations. Check it before reading an empty answer as 'nothing happened'.
 
   It also returns `data_as_of`, `age_hours` and `stale`, read from the `last_sync_date` cursor. On a read replica that is the only way to tell a live corpus from one whose feed stopped, because both answer queries identically.
 

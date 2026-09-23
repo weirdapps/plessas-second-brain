@@ -2128,14 +2128,15 @@ def cmd_import_people(args):
 
 def cmd_stale(args):
     """Find stale threads and overdue actions."""
-    from src.store.query import find_overdue_actions, find_stale_threads
+    from src.store.query import count_stale_threads, find_overdue_actions, find_stale_threads
     from src.store.schema import get_connection
 
     conn = get_connection(str(args.db))
 
-    print("STALE THREADS (you sent last, no reply)")
+    stale = find_stale_threads(conn, days=args.days, max_days=args.max_days, limit=args.limit)
+    total = count_stale_threads(conn, days=args.days, max_days=args.max_days)
+    print(f"STALE THREADS (you sent last, no reply): {len(stale)} of {total}")
     print("=" * 50)
-    stale = find_stale_threads(conn, days=args.days)
     if stale:
         for i, t in enumerate(stale, 1):
             print(f"{i}. [{t['days_waiting']}d waiting] {t['subject']}")
@@ -2704,6 +2705,15 @@ def main():
     parser_stale = subparsers.add_parser("stale", help="Find stale threads and overdue actions")
     parser_stale.add_argument(
         "--days", type=int, default=5, help="Stale threshold in days (default: 5)"
+    )
+    parser_stale.add_argument(
+        "--max-days",
+        type=int,
+        default=30,
+        help="Oldest thread still worth a reminder, in days (default: 30)",
+    )
+    parser_stale.add_argument(
+        "--limit", type=int, default=20, help="Max threads to list (default: 20)"
     )
     parser_stale.set_defaults(func=cmd_stale)
 

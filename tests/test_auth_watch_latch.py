@@ -28,6 +28,7 @@ These tests stand up stub CLIs on a temporary HOME and assert the latch fires on
 """
 
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -160,16 +161,80 @@ def test_teams_transient_probe_failure_is_reprobed_before_latching(tmp_path):
     )
 
 
+def _suspect(home: Path) -> Path:
+    return home / ".second-brain" / "teams_reauth_suspect"
+
+
+def _seed_suspect(home: Path, seconds_ago: int) -> int:
+    """A previous pass that already found Teams failing, `seconds_ago` seconds back."""
+    (home / ".second-brain").mkdir(parents=True, exist_ok=True)
+    first = int(time.time()) - seconds_ago
+    _suspect(home).write_text(f"{first}\n")
+    return first
+
+
 @pytest.mark.skipif(not Path("/usr/bin/python3").exists(), reason="probe needs /usr/bin/python3")
 def test_teams_sustained_failure_still_latches(tmp_path):
-    """A genuinely dead Teams session must still stop the sync."""
+    """A genuinely dead Teams session must still stop the sync: failing on two
+    passes 20+ minutes apart is the definition of sustained."""
     _outlook_stub(tmp_path, seconds_remaining=7200, renew_ok=True)
     _teams_stub(tmp_path, healthy_after_renew_attempt=False)
+    _seed_suspect(tmp_path, seconds_ago=1300)
 
     _run_watcher(tmp_path)
 
     sentinel = tmp_path / ".second-brain" / "needs_teams_reauth"
     assert sentinel.exists(), (
         "auth-watch failed to latch on a Teams session that stays degraded "
-        "across every probe and cannot be renewed.\n\n" + _log(tmp_path)
+        "across two passes 21 minutes apart and cannot be renewed.\n\n" + _log(tmp_path)
     )
+    assert not _suspect(tmp_path).exists(), "the latch supersedes the suspect marker"
+    assert "interactive login required" in _log(tmp_path)
+
+
+@pytest.mark.skipif(not Path("/usr/bin/python3").exists(), reason="probe needs /usr/bin/python3")
+def test_teams_first_failed_pass_marks_suspect_and_does_not_latch(tmp_path):
+    """ONE failing pass is not an outage (2026-09-23). The captured bearer expires on
+    the VPS about ten minutes before the producer's next push lands, the VPS renew
+    succeeds about 1 time in 87, and the latch then held sb-teams-sync off for 25
+    minutes past recovery, until the next pass cleared it. A pass that fails now only
+    marks the session suspect; the gate closes only if it is still failing later."""
+    _outlook_stub(tmp_path, seconds_remaining=7200, renew_ok=True)
+    _teams_stub(tmp_path, healthy_after_renew_attempt=False)
+
+    _run_watcher(tmp_path)
+
+    assert not (tmp_path / ".second-brain" / "needs_teams_reauth").exists(), _log(tmp_path)
+    assert _suspect(tmp_path).exists(), _log(tmp_path)
+    assert "marking suspect" in _log(tmp_path)
+    assert "interactive login required" not in _log(tmp_path)
+
+
+@pytest.mark.skipif(not Path("/usr/bin/python3").exists(), reason="probe needs /usr/bin/python3")
+def test_teams_second_failure_inside_twenty_minutes_does_not_latch(tmp_path):
+    """Two failures five minutes apart can both sit inside one ten-minute gap."""
+    _outlook_stub(tmp_path, seconds_remaining=7200, renew_ok=True)
+    _teams_stub(tmp_path, healthy_after_renew_attempt=False)
+    first = _seed_suspect(tmp_path, seconds_ago=300)
+
+    _run_watcher(tmp_path)
+
+    assert not (tmp_path / ".second-brain" / "needs_teams_reauth").exists(), _log(tmp_path)
+    # The clock runs from the FIRST failure, so a failure every few minutes still
+    # latches 20 minutes in rather than never.
+    assert _suspect(tmp_path).read_text().strip() == str(first)
+
+
+@pytest.mark.skipif(not Path("/usr/bin/python3").exists(), reason="probe needs /usr/bin/python3")
+def test_a_healthy_teams_pass_clears_the_suspect_marker(tmp_path):
+    _outlook_stub(tmp_path, seconds_remaining=7200, renew_ok=True)
+    _write_stub(
+        _bin(tmp_path) / "teams-cli",
+        'case "$1" in health-check) echo \'{"overall":"ok","probes":[]}\'; exit 0 ;; esac\nexit 0\n',
+    )
+    _seed_suspect(tmp_path, seconds_ago=600)
+
+    _run_watcher(tmp_path)
+
+    assert not _suspect(tmp_path).exists(), _log(tmp_path)
+    assert not (tmp_path / ".second-brain" / "needs_teams_reauth").exists()

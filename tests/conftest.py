@@ -56,6 +56,11 @@ os.environ["BRAIN_CONFIG_FILE"] = os.path.join(
     tempfile.mkdtemp(prefix="brain-test-config-"), "absent"
 )
 os.environ.pop("SHAREPOINT_HOST", None)
+# A replica's pull job stamps ~/.second-brain/db-pull.stamp, and write commands
+# refuse to run where it exists. CI has no stamp, so a test driving a write
+# command would pass there and exit 2 on a replica. tests/test_replica_guard.py
+# clears this to test the stamp itself.
+os.environ["BRAIN_ROLE"] = "producer"
 
 
 def pytest_configure(config):

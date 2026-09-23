@@ -2298,6 +2298,24 @@ def cmd_stats(args):
         print(f"Date Range:          {earliest} to {latest}")
 
 
+# Subcommands that only read, and so may run on a replica. Everything else
+# writes to the database or starts an export, and a new subcommand is refused
+# there until it is added here.
+READ_ONLY_COMMANDS = frozenset(
+    {
+        "query",
+        "prep",
+        "stale",
+        "stats",
+        "teams-search",
+        "teams-thread",
+        "teams-chat",
+        "teams-stats",
+        "prune-staged",
+    }
+)
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -2765,6 +2783,18 @@ def main():
     if args.command == "query" and not args.query_type:
         parser_query.print_help()
         sys.exit(1)
+
+    from src import config
+
+    if args.command not in READ_ONLY_COMMANDS and config.is_replica():
+        print(
+            f"Refusing '{args.command}': this host holds a replica of the database "
+            f"({config.REPLICA_STAMP} exists), and the next pull replaces what it "
+            "writes. Run it on the producer, or set BRAIN_ROLE=producer if this "
+            "host builds the store.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     # Execute command
     try:

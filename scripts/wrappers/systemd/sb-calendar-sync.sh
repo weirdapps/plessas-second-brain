@@ -36,3 +36,7 @@ if [ $EXIT_CODE -eq 0 ]; then
 else
   echo "$(date '+%Y-%m-%d %H:%M:%S') — FAILED (exit $EXIT_CODE)" >> "$LOG_FILE"
 fi
+
+# Pass the command's status through. Without this the script ended on the echo
+# above and exited 0 whatever calendar-sync did, so systemd recorded success.
+exit "$EXIT_CODE"

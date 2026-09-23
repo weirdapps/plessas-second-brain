@@ -21,6 +21,7 @@ run was 1 min 20 s of CPU across 11 min 30 s of wall clock.
 
 from src.cli import (
     CONVERSATION_SYNC_DEADLINE_S,
+    EXTRACT_SYNC_DEADLINE_S,
     IMAGE_CLASSIFY_SYNC_BUDGET_S,
     PHASE1_SYNC_DEADLINE_S,
     PHASE2_SYNC_DEADLINE_S,
@@ -32,6 +33,7 @@ from src.cli import (
 def _worst_case_run_s() -> float:
     return (
         SYNC_FIXED_WORK_S
+        + EXTRACT_SYNC_DEADLINE_S
         + PHASE1_SYNC_DEADLINE_S
         + PHASE2_SYNC_DEADLINE_S
         + CONVERSATION_SYNC_DEADLINE_S

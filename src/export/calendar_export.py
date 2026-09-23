@@ -43,13 +43,17 @@ def chunk_date_range(since: datetime, until: datetime) -> Iterator[tuple[datetim
         current = chunk_end
 
 
-def list_events(since: datetime, until: datetime) -> list[dict]:
+def list_events(since: datetime, until: datetime, failures: list[str] | None = None) -> list[dict]:
     """
     Fetch calendar events in monthly chunks via outlook-cli.
 
     Args:
         since: Start of date range (inclusive)
         until: End of date range (inclusive)
+        failures: If given, one entry is appended per chunk that could not be
+            fetched. A failed chunk used to be logged and skipped, so the caller
+            reported a partial window as complete; an answer that is not a list
+            is a failure too, not zero events.
 
     Returns:
         List of raw event dicts from Outlook
@@ -63,20 +67,26 @@ def list_events(since: datetime, until: datetime) -> list[dict]:
         # Format as ISO strings for outlook-cli
         from_iso = chunk_start.isoformat()
         to_iso = chunk_end.isoformat()
+        window = f"{chunk_start.date()}..{chunk_end.date()}"
 
         try:
             result = run_outlook_cli(["list-calendar", "--from", from_iso, "--to", to_iso])
-            events = result if isinstance(result, list) else []
-            all_events.extend(events)
-            logger.info(
-                f"Fetched {len(events)} events from {chunk_start.date()} to {chunk_end.date()}"
-            )
         except OutlookCliAuthRequired:
             # Re-raise auth errors immediately
             raise
         except Exception as e:
             # Log other errors but continue with remaining chunks
-            logger.error(f"Error fetching events {chunk_start.date()} to {chunk_end.date()}: {e}")
+            logger.error(f"Error fetching events {window}: {e}")
+            if failures is not None:
+                failures.append(f"{window}: {e}")
+            continue
+        if not isinstance(result, list):
+            logger.error(f"Unexpected list-calendar answer for {window}: {type(result).__name__}")
+            if failures is not None:
+                failures.append(f"{window}: unexpected answer of type {type(result).__name__}")
+            continue
+        all_events.extend(result)
+        logger.info(f"Fetched {len(result)} events from {chunk_start.date()} to {chunk_end.date()}")
 
     return all_events
 

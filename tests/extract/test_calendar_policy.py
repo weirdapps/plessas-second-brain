@@ -207,7 +207,9 @@ def _run_sync(
             return None
         return {**_RAW_EVENT, "Body": {"Content": body}}
 
-    monkeypatch.setattr(calendar_export, "list_events", lambda since, until: [_LIST_EVENT])
+    monkeypatch.setattr(
+        calendar_export, "list_events", lambda since, until, failures=None: [_LIST_EVENT]
+    )
     monkeypatch.setattr(calendar_export, "get_event_body", _body)
     monkeypatch.setattr(extractor, "extract_event", extract)
     args = _sync_args(db_path)
@@ -362,6 +364,50 @@ def test_an_unparseable_re_extraction_keeps_the_previous_decisions(monkeypatch, 
     status = conn.execute("SELECT llm_status FROM calendar_events").fetchone()[0]
     conn.close()
     assert (decisions, status) == (1, "failed")
+
+
+def test_a_run_that_lost_part_of_the_window_exits_non_zero(monkeypatch, tmp_path):
+    """sb-calendar-sync reported success whatever happened, so its dead-man
+    switch pinged green while chunks, bodies or extractions failed."""
+    from src import cli
+    from src.export import calendar_export
+
+    db_path = _calendar_db(tmp_path)
+
+    def one_chunk_failed(since, until, failures=None):
+        if failures is not None:
+            failures.append("2026-08-01..2026-09-01: outlook-cli timed out")
+        return []
+
+    monkeypatch.setattr(calendar_export, "list_events", one_chunk_failed)
+
+    assert cli.cmd_calendar_sync(_sync_args(db_path)) == 1
+
+
+def test_a_clean_run_exits_zero(monkeypatch, tmp_path):
+    from src import cli
+    from src.export import calendar_export
+
+    db_path = _calendar_db(tmp_path)
+    monkeypatch.setattr(calendar_export, "list_events", lambda since, until, failures=None: [])
+
+    assert cli.cmd_calendar_sync(_sync_args(db_path)) == 0
+
+
+def test_a_failed_body_fetch_or_extraction_makes_the_run_fail(monkeypatch, tmp_path):
+    """Both are already recorded so the next run re-offers or reports them; the
+    exit code is what tells the scheduler this run did not do its job."""
+    monkeypatch.setattr(vertex_auth, "GCLOUD_SENTINEL", tmp_path / "needs_gcloud_reauth")
+    from src import cli
+    from src.export import calendar_export
+
+    db_path = _calendar_db(tmp_path)
+    monkeypatch.setattr(
+        calendar_export, "list_events", lambda since, until, failures=None: [_LIST_EVENT]
+    )
+    monkeypatch.setattr(calendar_export, "get_event_body", lambda event_id: None)
+
+    assert cli.cmd_calendar_sync(_sync_args(db_path)) == 1
 
 
 def test_a_permanent_failure_is_recorded_but_not_retried_forever(monkeypatch, tmp_path):

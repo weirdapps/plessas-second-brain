@@ -26,7 +26,17 @@ trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 echo "=== Conversation sync started: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
 
 cd "$REPO_DIR" || exit 1
+# Both steps always run: extraction drains what earlier exports staged, so a
+# failed export must not stop it. Either failure fails the run; this used to log
+# "ok" and exit 0 unconditionally, and systemd recorded every failure as success.
 "$PYTHON" -m src.cli export-conversations --days 7 >> "$LOG_FILE" 2>&1
+export_rc=$?
 "$PYTHON" -m src.cli extract-conversations --workers 2 >> "$LOG_FILE" 2>&1
+extract_rc=$?
 
+if [ "$export_rc" -ne 0 ] || [ "$extract_rc" -ne 0 ]; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') FAILED (export exit $export_rc, extract exit $extract_rc)" >> "$LOG_FILE"
+  if [ "$export_rc" -ne 0 ]; then exit "$export_rc"; fi
+  exit "$extract_rc"
+fi
 echo "$(date '+%Y-%m-%d %H:%M:%S') ok" >> "$LOG_FILE"

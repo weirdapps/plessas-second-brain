@@ -78,9 +78,16 @@ IMAGE_CLASSIFY_SYNC_BUDGET_S = 90.0
 # sb-conversation-sync, which has 1800 s.
 CONVERSATION_SYNC_DEADLINE_S = 30.0
 
-# Observed span for the stages that have no budget of their own: mail fetch,
-# extraction, load, registration, people dedup, embeddings rebuild.
-SYNC_FIXED_WORK_S = 180.0
+# Step 2 (email extraction) had no bound either, and could sleep an hour
+# in-process on five quota errors. Measured on 2026-09-23: 7-19 new emails an
+# hour take 1.5-2.5 minutes through Steps 2-4, most of it extraction. The rest
+# of a backlog stays pending for the next run.
+EXTRACT_SYNC_DEADLINE_S = 140.0
+
+# Observed span for the stages that have no budget of their own: load,
+# registration (count-bounded), people dedup, and the incremental embeddings
+# update (about 10 s). Mail fetch runs in the wrapper, before this command.
+SYNC_FIXED_WORK_S = 60.0
 
 # --- Wall-clock budget for one Teams sync run -------------------------------
 #
@@ -1169,7 +1176,12 @@ def cmd_sync(args):
     print(f"\nStep 2: Extracting new emails (engine: {engine})...")
     from src.extract.local import run_extraction
 
-    run_extraction(limit=args.limit or 0, engine=engine, workers=args.workers or 1)
+    run_extraction(
+        limit=args.limit or 0,
+        engine=engine,
+        workers=args.workers or 1,
+        deadline_s=EXTRACT_SYNC_DEADLINE_S,
+    )
 
     # Step 3: Load into DB
     print("\nStep 3: Loading into database...")
@@ -1559,8 +1571,11 @@ def cmd_calendar_sync(args):
     until_dt = datetime.fromisoformat(args.until) if args.until else (now + timedelta(days=30))
 
     print(f"Calendar sync: {since.date()} to {until_dt.date()}")
-    raw_events = list_events(since, until_dt)
+    chunk_failures: list[str] = []
+    raw_events = list_events(since, until_dt, failures=chunk_failures)
     print(f"  Fetched {len(raw_events)} events")
+    for failure in chunk_failures:
+        print(f"  Could not fetch {failure}", file=sys.stderr)
 
     stats = {
         "loaded": 0,
@@ -1700,6 +1715,18 @@ def cmd_calendar_sync(args):
         print(f"  Removed duplicate decisions/actions: {dup_decisions}/{dup_actions}")
     if flags_changed:
         print(f"  Self flags corrected: {flags_changed}")
+
+    # Every one of these is already recorded so the next run re-offers or
+    # reports it; the exit code is what tells the scheduler this run did not do
+    # its job. A deferral (auth, sentinel set) is not a failure of the run.
+    if chunk_failures or stats["fetch_failed"] or stats["failed"]:
+        print(
+            f"  Run incomplete: {len(chunk_failures)} window chunk(s), "
+            f"{stats['fetch_failed']} body fetch(es), {stats['failed']} extraction(s) failed",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 def _staged_news_ids(staging_dir: Path) -> set[str]:
@@ -2532,10 +2559,15 @@ def main():
         # cannot fund one worst-case LLM call raises here, and exiting 1 with the
         # reason on stderr is the loud refusal that beats a SIGTERM later.
         install_llm_deadline_for_this_process()
-        args.func(args)
+        rc = args.func(args)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+    # A command reports failure by returning a non-zero int. This used to be
+    # discarded, so calendar-sync counted failed chunks, bodies and extractions
+    # and still exited 0, and its dead-man switch pinged green.
+    if isinstance(rc, int) and not isinstance(rc, bool) and rc != 0:
+        sys.exit(rc)
 
 
 if __name__ == "__main__":

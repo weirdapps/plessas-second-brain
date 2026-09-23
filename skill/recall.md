@@ -142,7 +142,9 @@ carry different weight, and the reader cannot tell them apart unless you say so.
 For deeper queries, `src.store.context` is what the dossier tools call:
 
 - **`get_person_context(conn, name_or_email, days=365, limit=20)`**: email
-  history, topics, sentiment, decisions, open actions, communication pattern
+  history, topics, sentiment, decisions, open actions, communication pattern. An
+  ambiguous name resolves to the most-emailed match; `match_count` and
+  `other_candidates` report the rest
 - **`get_topic_context(conn, topic, days=365, limit=20)`**: emails, key people,
   decisions, open actions, key facts
 - **`get_conversation_context(conn, email_id)`**: all emails in a thread, with

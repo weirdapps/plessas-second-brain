@@ -54,6 +54,9 @@ def sender_brief(conn, name_or_email: str, days: int = 365) -> dict:
         "open_actions_count": ctx["open_actions_total"],
         "last_contact": ctx["communication_pattern"].get("last_email_date", ""),
         "sentiment": ctx["sentiment_distribution"],
+        # A name can match several people; the most-emailed is the one above.
+        "match_count": ctx["match_count"],
+        "other_candidates": ctx["other_candidates"],
     }
 
 

@@ -47,15 +47,37 @@ def test_parse_extraction_response_empty():
     assert result["action_items"] == []
 
 
-def test_parse_extraction_response_malformed():
-    """Test parsing non-JSON input returns empty defaults."""
-    raw = "This is not valid JSON at all"
+def test_parse_extraction_response_malformed_raises():
+    """Unparseable output used to come back as empty defaults, which the caller
+    stored as a finished 'extracted' row with an empty summary: never retried,
+    never reported. Now that a successful extraction REPLACES an event's
+    decisions and actions, it would also have deleted them. Raising lets
+    calendar-sync record 'failed' and keep what it had."""
+    import pytest
 
-    result = parse_extraction_response(raw)
+    with pytest.raises(ValueError, match="not JSON"):
+        parse_extraction_response("This is not valid JSON at all")
 
-    assert result["body_summary"] == ""
-    assert result["decisions"] == []
-    assert result["action_items"] == []
+
+def test_parse_extraction_response_raises_on_truncated_json():
+    import pytest
+
+    with pytest.raises(ValueError):
+        parse_extraction_response('{"body_summary": "x", "decisions": [{"decision": "Eg')
+
+
+def test_parse_extraction_response_salvages_a_preamble():
+    """'Here is the JSON:' before the object is the commonest near-miss."""
+    raw = 'Here is the JSON: {"body_summary": "Q3", "decisions": [], "action_items": []} Done.'
+
+    assert parse_extraction_response(raw)["body_summary"] == "Q3"
+
+
+def test_parse_extraction_response_rejects_a_non_object():
+    import pytest
+
+    with pytest.raises(ValueError):
+        parse_extraction_response('["a list", "not an object"]')
 
 
 def test_parse_extraction_response_with_code_fence():

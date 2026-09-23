@@ -135,6 +135,17 @@ def test_load_proxy_emails_missing_file():
     assert emails == set()
 
 
+def test_a_missing_proxy_file_is_reported_not_silent(caplog):
+    """The file is absent on every host, so proxy-organised meetings have been
+    classified without it and nothing said so."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        load_proxy_emails("/nonexistent/canonical_people.json")
+
+    assert "canonical_people.json" in caplog.text
+
+
 def test_is_self_organized_direct_match():
     """User email pattern matches organizer."""
     assert _is_self_organized("nikos.papadopoulos@example.com", "papadopoulos") is True
@@ -394,17 +405,73 @@ def test_refresh_self_flags_with_an_empty_pattern_clears_everything(db_conn):
     assert db_conn.execute("SELECT MAX(is_self) FROM event_attendees").fetchone()[0] == 0
 
 
+def test_dedupe_keeps_the_same_task_for_different_owners_or_deadlines(db_conn):
+    """Only an exact duplicate is noise. One meeting can hand the same task to two
+    people, or to one person with two deadlines."""
+    from src.store.calendar_loader import dedupe_event_children
+
+    event_id = load_event(
+        db_conn,
+        SAMPLE_EVENT,
+        {
+            "body_summary": "s",
+            "decisions": [
+                {"decision": "Go", "decided_by": "A", "decision_date": "2026-05-01"},
+                {"decision": "Go", "decided_by": "B", "decision_date": "2026-05-01"},
+            ],
+            "action_items": [
+                {"task": "Prepare the Q4 budget", "owner": "Anna", "deadline": "2026-10-01"},
+                {"task": "Prepare the Q4 budget", "owner": "Kostas", "deadline": "2026-10-15"},
+            ],
+        },
+        llm_status="extracted",
+    )
+
+    assert dedupe_event_children(db_conn) == (0, 0)
+    assert _counts(db_conn, event_id) == (2, 2)
+
+
+def test_a_decision_date_that_is_not_an_iso_date_is_stored_as_null(db_conn):
+    """A free-text date ('end of October', the string 'null') sorts above every
+    real date and passes every days filter, the way action deadlines once did.
+    NULL lets the readers fall back to the meeting's own start."""
+    event_id = load_event(
+        db_conn,
+        SAMPLE_EVENT,
+        {
+            "body_summary": "s",
+            "decisions": [
+                {"decision": "A", "decision_date": "null"},
+                {"decision": "B", "decision_date": "end of October"},
+                {"decision": "C", "decision_date": "2026-10-31"},
+                {"decision": "D", "decision_date": "2026-10-31T09:00:00"},
+            ],
+            "action_items": [],
+        },
+        llm_status="extracted",
+    )
+
+    dates = dict(
+        db_conn.execute(
+            "SELECT decision, decision_date FROM decisions WHERE event_id = ?", (event_id,)
+        ).fetchall()
+    )
+    assert dates == {"A": None, "B": None, "C": "2026-10-31", "D": "2026-10-31T09:00:00"}
+
+
 def test_dedupe_event_children_keeps_the_first_of_each_exact_duplicate(db_conn):
     from src.store.calendar_loader import dedupe_event_children
 
     event_id = load_event(db_conn, SAMPLE_EVENT, SAMPLE_EXTRACTION, llm_status="extracted")
-    for _ in range(3):  # what the old append-only loader left behind
+    for _ in range(3):  # what the old append-only loader left behind: exact copies
         db_conn.execute(
-            "INSERT INTO decisions (decision, decided_by, event_id) VALUES ('Ship by June 1', 'X', ?)",
+            "INSERT INTO decisions (decision, decided_by, decision_date, event_id) "
+            "VALUES ('Ship by June 1', 'Papadopoulos', '2026-05-01', ?)",
             (event_id,),
         )
         db_conn.execute(
-            "INSERT INTO action_items (task, owner, status, event_id) VALUES ('Draft timeline', 'Y', 'open', ?)",
+            "INSERT INTO action_items (task, owner, status, event_id) "
+            "VALUES ('Draft timeline', 'Chen', 'open', ?)",
             (event_id,),
         )
     db_conn.execute(

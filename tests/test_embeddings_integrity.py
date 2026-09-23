@@ -86,6 +86,38 @@ def test_a_teams_sync_run_embeds_at_most_its_cap(index):
     assert embeddings.build_teams_index(conn, limit=2) == 0
 
 
+def test_fresh_threads_are_embedded_before_the_repair_backlog(index):
+    """The cap must not park this week's threads behind 5,336 old ones whose
+    vectors went missing: real staleness first, then the repair, newest first."""
+    conn = _db_with_threads(3)
+    embeddings.build_teams_index(conn)
+    # Threads 1 and 2 lost their vectors (repair backlog); thread 3 is re-extracted.
+    np.savez(
+        str(index),
+        ids=np.array([_teams_vid(3)], dtype=np.int64),
+        vectors=np.ones((1, DIM), np.float32),
+    )
+    conn.execute("UPDATE teams_threads SET extracted_at = '2030-01-01T00:00:00' WHERE id = 3")
+    conn.commit()
+
+    pairs = embeddings._teams_threads_to_embed(conn)
+
+    assert [thread_id for thread_id, _ in pairs] == [3, 2, 1]
+
+
+def test_a_lock_file_this_user_cannot_write_does_not_block_the_index(index):
+    """A root-owned or read-only lock file (a manual sudo run creates one) must
+    not stop every later writer: flock needs a descriptor, not write access."""
+    lock = embeddings._index_lock_path()
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("")
+    lock.chmod(0o444)
+
+    embeddings._append_to_index([_teams_vid(1)], np.ones((1, DIM), np.float32))
+
+    assert _ids(index) == [_teams_vid(1)]
+
+
 def test_a_force_rebuild_no_longer_strands_teams_threads(index):
     conn = _db_with_threads(1)
     conn.execute(

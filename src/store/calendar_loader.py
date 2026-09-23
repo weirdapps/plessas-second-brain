@@ -1,9 +1,13 @@
 """Calendar event loader with UPSERT, attendee resolution, and proxy logic."""
 
 import json
+import logging
+import re
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # The calendar_events.llm_status vocabulary. Defined here, next to the only writer, so
 # there is one spelling of each value; schema.migrate_add_calendar_llm_status explains what
@@ -26,6 +30,9 @@ def load_proxy_emails(canonical_path: str) -> set[str]:
     try:
         path = Path(canonical_path)
         if not path.exists():
+            # It was missing on every host and nothing said so, so meetings the
+            # PA books were never recognised as the owner's.
+            logger.warning("%s not found; proxy-organised events will not count as self", path)
             return set()
 
         data = json.loads(path.read_text())
@@ -37,6 +44,21 @@ def load_proxy_emails(canonical_path: str) -> set[str]:
         return proxy_emails
     except (json.JSONDecodeError, KeyError, TypeError):
         return set()
+
+
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _iso_date_or_none(value) -> str | None:
+    """Keep a decision_date only if it starts with a YYYY-MM-DD date.
+
+    A free-text value ('end of October', the string 'null') sorts above every
+    real date and passes every days filter; NULL lets the readers fall back to
+    the meeting's own start, as query_decisions' COALESCE already does.
+    """
+    if isinstance(value, str) and _ISO_DATE.match(value.strip()):
+        return value.strip()
+    return None
 
 
 def _is_self_email(email: str, user_email_pattern: str) -> bool:
@@ -242,7 +264,7 @@ def load_event(
             (
                 decision.get("decision"),
                 decision.get("decided_by"),
-                decision.get("decision_date"),
+                _iso_date_or_none(decision.get("decision_date")),
                 event_id,
             ),
         )
@@ -311,11 +333,13 @@ def dedupe_event_children(conn: sqlite3.Connection) -> tuple[int, int]:
     """
     decisions = conn.execute(
         "DELETE FROM decisions WHERE event_id IS NOT NULL AND id NOT IN "
-        "(SELECT MIN(id) FROM decisions WHERE event_id IS NOT NULL GROUP BY event_id, decision)"
+        "(SELECT MIN(id) FROM decisions WHERE event_id IS NOT NULL GROUP BY event_id, "
+        "decision, COALESCE(decided_by, ''), COALESCE(decision_date, ''))"
     ).rowcount
     actions = conn.execute(
         "DELETE FROM action_items WHERE event_id IS NOT NULL AND id NOT IN "
-        "(SELECT MIN(id) FROM action_items WHERE event_id IS NOT NULL GROUP BY event_id, task)"
+        "(SELECT MIN(id) FROM action_items WHERE event_id IS NOT NULL GROUP BY event_id, "
+        "task, COALESCE(owner, ''), COALESCE(deadline, ''))"
     ).rowcount
     conn.commit()
     return decisions, actions

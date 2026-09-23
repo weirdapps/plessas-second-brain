@@ -1680,7 +1680,15 @@ def cmd_calendar_sync(args):
     # again: stacked duplicates from the old append-only loader, and self flags
     # written while BRAIN_USER_EMAIL_PATTERN was unset.
     dup_decisions, dup_actions = dedupe_event_children(conn)
-    flags_changed = refresh_self_flags(conn, USER_EMAIL_PATTERN, proxy_emails)
+    flags_changed = 0
+    if USER_EMAIL_PATTERN:
+        flags_changed = refresh_self_flags(conn, USER_EMAIL_PATTERN, proxy_emails)
+    else:
+        # Without the pattern every stored flag would be rewritten to not-self.
+        print(
+            "  BRAIN_USER_EMAIL_PATTERN is unset; leaving the stored self flags alone",
+            file=sys.stderr,
+        )
     conn.close()
     print(f"  Loaded:     {stats['loaded']}")
     print(f"  Unchanged:  {stats['skipped_unchanged']}")

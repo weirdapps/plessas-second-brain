@@ -6,6 +6,7 @@ and provides cosine similarity search.
 
 import fcntl
 import gc
+import os
 import sqlite3
 import sys
 import time
@@ -102,12 +103,17 @@ def _index_lock():
     """
     path = _index_lock_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+    # Read-only is enough for flock, so a lock file this user cannot write
+    # (left by a manual sudo run, say) cannot block every later writer.
+    fd = os.open(path, os.O_RDONLY | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(handle, fcntl.LOCK_UN)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def _indexed_ids() -> set[int]:
@@ -118,15 +124,19 @@ def _indexed_ids() -> set[int]:
     """
     if not EMBEDDINGS_FILE.exists():
         return set()
-    with np.load(EMBEDDINGS_FILE, allow_pickle=False) as data:
-        ids = {int(x) for x in data["ids"]}
-        n_ids = len(data["ids"])
-    with zipfile.ZipFile(EMBEDDINGS_FILE) as archive, archive.open("vectors.npy") as member:
-        major, _minor = np.lib.format.read_magic(member)
-        if major == 1:
-            n_vectors = np.lib.format.read_array_header_1_0(member)[0][0]
-        else:
-            n_vectors = np.lib.format.read_array_header_2_0(member)[0][0]
+    # One handle for both members: a writer's atomic replace between two opens
+    # would pair the old ids with the new header and read as misalignment.
+    with zipfile.ZipFile(EMBEDDINGS_FILE) as archive:
+        with archive.open("ids.npy") as member:
+            raw_ids = np.lib.format.read_array(member, allow_pickle=False)
+        with archive.open("vectors.npy") as member:
+            major, _minor = np.lib.format.read_magic(member)
+            if major == 1:
+                n_vectors = np.lib.format.read_array_header_1_0(member)[0][0]
+            else:
+                n_vectors = np.lib.format.read_array_header_2_0(member)[0][0]
+    ids = {int(x) for x in raw_ids}
+    n_ids = len(raw_ids)
     if n_ids != n_vectors:
         raise RuntimeError(
             f"{EMBEDDINGS_FILE} holds {n_ids} ids for {n_vectors} vectors; "
@@ -633,12 +643,18 @@ def _teams_threads_to_embed(conn, indexed: set[int] | None = None) -> list[tuple
         ORDER BY id
         """
     ).fetchall()
-    out = []
+    stale_rows = []
+    repair_rows = []
     for rid, summary, embedding_at, extracted_at in rows:
         stale = embedding_at is None or (extracted_at is not None and embedding_at < extracted_at)
-        if stale or (TEAMS_THREAD_ID_OFFSET - int(rid)) not in indexed:
-            out.append((int(rid), summary))
-    return out
+        if stale:
+            stale_rows.append((int(rid), summary))
+        elif (TEAMS_THREAD_ID_OFFSET - int(rid)) not in indexed:
+            repair_rows.append((int(rid), summary))
+    # New and re-extracted threads first, then the repair backlog newest first,
+    # so a per-run cap never parks this week's threads behind thousands of old
+    # ones whose vectors went missing.
+    return sorted(stale_rows, key=lambda p: -p[0]) + sorted(repair_rows, key=lambda p: -p[0])
 
 
 def build_teams_index(conn, force: bool = False, limit: int = 0) -> int:

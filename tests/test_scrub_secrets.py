@@ -193,6 +193,29 @@ def test_a_checkpoint_blocked_by_a_reader_is_reported_not_passed(
     assert "checkpoint" in capsys.readouterr().err
 
 
+def test_vacuum_requires_apply(scrub, tmp_path, monkeypatch):
+    """A --vacuum on its own used to fall into the dry run and quietly do nothing."""
+    _db(tmp_path, scrub, monkeypatch)
+    with pytest.raises(SystemExit) as exc:
+        scrub.main(["--vacuum"])
+    assert exc.value.code == 2
+
+
+def test_vacuum_puts_its_temp_copy_beside_the_database(scrub, tmp_path, monkeypatch):
+    """VACUUM builds a full temporary copy. Left to SQLite it goes to $TMPDIR,
+    /var/tmp or /tmp, and on the producer /tmp is a tmpfs smaller than the
+    database. SQLITE_TMPDIR set from inside the process is read too late (at
+    import of sqlite3), so the directory is set on the connection."""
+    path = _db(tmp_path, scrub, monkeypatch)
+    statements = _traced(scrub, monkeypatch)
+
+    assert scrub.main(["--apply", "--vacuum"]) == 0
+
+    wanted = f"PRAGMA temp_store_directory = '{path.parent}'"
+    assert any(s.strip() == wanted for s in statements), statements[:5]
+    assert "SQLITE_TMPDIR" not in __import__("os").environ
+
+
 def test_vacuum_removes_bytes_freed_before_the_scrub(scrub, tmp_path, monkeypatch):
     """secure_delete only zeroes what is freed while it is on. Copies freed by
     years of ordinary churn sit in freelist pages and slack, and only VACUUM

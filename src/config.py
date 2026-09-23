@@ -7,6 +7,7 @@ reads a .env file.
 """
 
 import os
+import re
 import sys
 from collections.abc import MutableMapping
 from pathlib import Path
@@ -20,14 +21,17 @@ _CONFIG_FILE_KEYS = frozenset(
 
 
 def _config_value(raw: str) -> str:
-    """The value part of a KEY=VALUE line: quotes removed, a trailing # comment dropped."""
+    """The value part of a KEY=VALUE line: quotes removed, a # comment dropped.
+
+    A comment starts at a "#" at the start of the value or after whitespace
+    (a space or a tab), as in a shell; a "#" inside a word or quotes is kept.
+    """
     value = raw.strip()
     if value[:1] in ("'", '"'):
         closing = value.find(value[0], 1)
         if closing != -1:
             return value[1:closing]
-    comment = value.find(" #")
-    return (value[:comment] if comment != -1 else value).strip()
+    return re.split(r"(?:^|\s)#", value, maxsplit=1)[0].strip()
 
 
 def load_config_file(path: Path, environ: MutableMapping[str, str] = os.environ) -> None:
@@ -57,7 +61,10 @@ def load_config_file(path: Path, environ: MutableMapping[str, str] = os.environ)
         key, sep, value = line.partition("=")
         key = key.strip()
         if sep and key in _CONFIG_FILE_KEYS:
-            environ.setdefault(key, _config_value(value))
+            try:
+                environ.setdefault(key, _config_value(value))
+            except ValueError:  # os.environ refuses an embedded NUL
+                print(f"second-brain: skipping {key} in {path}: unusable value", file=sys.stderr)
 
 
 load_config_file(

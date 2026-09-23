@@ -119,9 +119,14 @@ if [ "$MODE" = "history" ]; then
     done
   }
   trap cleanup_history EXIT
+  # Never prompt: ssh passphrase, host-key and credential prompts go to the
+  # terminal, not stderr, and would stall an unattended run. A fetch that fails
+  # fails the audit, because GitHub still serves what it could not see.
+  PR_HEADS_UNSCANNED=0
   if git remote get-url origin >/dev/null 2>&1; then
-    if ! git fetch -q --no-tags origin '+refs/pull/*/head:refs/gauntlet-pr/*' 2>/dev/null; then
-      echo "NOTE: could not fetch pull-request heads from origin; they are not scanned."
+    if ! GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=15' \
+        git fetch -q --no-tags origin '+refs/pull/*/head:refs/gauntlet-pr/*' 2>/dev/null; then
+      PR_HEADS_UNSCANNED=1
     fi
   fi
   git -c core.quotePath=false log --all -p -U0 --no-color --no-ext-diff \
@@ -586,6 +591,11 @@ else
     echo "     or set PII_DENYLIST to the file."
     FAIL=1
   fi
+fi
+
+if [ "$MODE" = "history" ] && [ "${PR_HEADS_UNSCANNED:-0}" -eq 1 ]; then
+  echo "FAIL [pull-request heads]: could not fetch them from origin, so they were not scanned."
+  FAIL=1
 fi
 
 if [ $FAIL -eq 0 ]; then

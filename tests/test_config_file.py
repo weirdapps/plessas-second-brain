@@ -79,6 +79,30 @@ def test_an_inline_comment_is_not_part_of_the_value(tmp_path):
     assert env == {"SHAREPOINT_HOST": "contoso.sharepoint.com", "BRAIN_USER_NAME": "Jane # Doe"}
 
 
+def test_a_comment_after_a_tab_or_an_empty_value_is_not_the_value(tmp_path):
+    path = _write(
+        tmp_path,
+        "SHAREPOINT_HOST=contoso.sharepoint.com\t# tenant\nBRAIN_USER_NAME= # nothing yet\n",
+    )
+    env: dict[str, str] = {}
+    load_config_file(path, env)
+    assert env == {"SHAREPOINT_HOST": "contoso.sharepoint.com", "BRAIN_USER_NAME": ""}
+
+
+def test_a_nul_byte_in_a_value_is_skipped_not_fatal(tmp_path, monkeypatch):
+    """os.environ refuses embedded NULs with ValueError, at import of every entry point."""
+    import os
+
+    monkeypatch.delenv("BRAIN_USER_ROLE", raising=False)
+    monkeypatch.delenv("BRAIN_USER_NAME", raising=False)
+    path = _write(tmp_path, "BRAIN_USER_ROLE=CF\x00O\nBRAIN_USER_NAME=Jane\n")
+
+    load_config_file(path)  # the real environment, which is what refuses NULs
+
+    assert "BRAIN_USER_ROLE" not in os.environ
+    assert os.environ.get("BRAIN_USER_NAME") == "Jane"
+
+
 def test_a_byte_order_mark_does_not_hide_the_first_line(tmp_path):
     path = tmp_path / "env"
     path.write_bytes("﻿SHAREPOINT_HOST=contoso.sharepoint.com\n".encode())

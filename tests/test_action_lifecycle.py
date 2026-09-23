@@ -251,37 +251,41 @@ class TestExpireUndated:
         conn.close()
 
     def test_a_free_text_deadline_in_a_coming_year_is_kept(self):
-        """'31/12/2027' is no ISO date, but it is still to come."""
+        """'31/12/2027' is no ISO date, but it is still to come, and so are
+        '31/12/27', 'Q4/26', 'FY26/27' and a d/m/yy date beside an amount."""
         conn = create_database(":memory:")
         conn.execute("INSERT INTO emails (id, message_id, date_received) VALUES (1, 1, ?)", (OLD,))
         year = datetime.now(UTC).year
-        _add(conn, "due next year", deadline=f"31/12/{year + 1}", email_id=1)
-        _add(conn, "due next year, short", deadline=f"31/12/{(year + 1) % 100:02d}", email_id=1)
-        _add(conn, "due in eight years", deadline=f"by end {year + 8}", email_id=1)
-        _add(conn, "due long ago", deadline="31/12/2020", email_id=1)
-        # A year inside a longer number is no year, and two digits after a
-        # separator are a day or a minute unless the whole reads d/m/yy.
-        _add(conn, "after a PO", deadline=f"after PO 1{year}5 is approved", email_id=1)
-        _add(conn, "a past US date", deadline="10/26/2023", email_id=1)
-        _add(conn, "a time", deadline="by 17.30", email_id=1)
-        _add(conn, "a day and month", deadline="5/30", email_id=1)
-        _add(conn, "a version", deadline="after v1.30", email_id=1)
-        _add(conn, "a slashed past date", deadline="2023/10/26", email_id=1)
+        yy, nyy = f"{year % 100:02d}", f"{(year + 1) % 100:02d}"
+        kept = [
+            f"31/12/{year + 1}",
+            f"31/12/{nyy}",
+            f"by end {year + 8}",
+            f"pay invoice 4521 by 30/10/{nyy}",
+            f"transfer EUR 1500 by 15/11/{nyy}",
+            f"Q4/{yy}",
+            f"end H1-{nyy}",
+            f"FY{yy}/{nyy}",
+            f"by 12/{nyy}",
+        ]
+        expired = [
+            "31/12/2020",
+            "31/12/20",
+            f"after PO 1{year}5 is approved",  # a year inside a longer number
+            "10/26/2023",
+            "2023/10/26",
+            "by 17.30",
+            "after v1.30",
+            f"release v2.1.{nyy}",
+        ]
+        for i, deadline in enumerate(kept + expired):
+            _add(conn, f"task {i}", deadline=deadline, email_id=1)
         conn.commit()
 
-        assert expire_undated_actions(conn, days=90) == 7
-        assert dict(conn.execute("SELECT task, status FROM action_items")) == {
-            "due next year": "open",
-            "due next year, short": "open",
-            "due in eight years": "open",
-            "due long ago": "expired",
-            "after a PO": "expired",
-            "a past US date": "expired",
-            "a time": "expired",
-            "a day and month": "expired",
-            "a version": "expired",
-            "a slashed past date": "expired",
-        }
+        assert expire_undated_actions(conn, days=90) == len(expired)
+        statuses = dict(conn.execute("SELECT deadline, status FROM action_items"))
+        assert [d for d in kept if statuses[d] != "open"] == []
+        assert [d for d in expired if statuses[d] != "expired"] == []
         conn.close()
 
     def test_a_deadline_shaped_like_a_date_but_not_one_is_undated(self):

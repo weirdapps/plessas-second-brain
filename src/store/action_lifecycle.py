@@ -15,6 +15,7 @@ sb-daily-sync.sh runs it after each successful sync on the producer, whose
 database the replicas copy. By hand, `--dry-run` rolls back.
 """
 
+import re
 import sqlite3
 from datetime import date
 
@@ -95,6 +96,31 @@ def expire_stale_actions(conn: sqlite3.Connection, days: int = DEFAULT_EXPIRE_DA
     return cur.rowcount
 
 
+# How a free-text deadline names a year: four digits standing alone, or two in
+# a d/m/yy date, a m/yy month, a quarter or half ('Q4/26', 'H1-27') or a fiscal
+# year ('FY26'). A year inside a longer number names none ('PO 120265'), nor do
+# two digits after a time or a version ('17.30', 'v1.30'), nor the day of a full
+# date ('10/26/2023', '2023/10/26'). An amount beside the date is no obstacle
+# ('pay 4521 by 30/10/27').
+_YEAR_FORMS = re.compile(
+    r"(?<![0-9])(?P<full>20[0-9]{2})(?![0-9])"
+    r"|(?<![0-9A-Za-z])[0-9]{1,2}[/.-][0-9]{1,2}[/.-](?P<dmy>[0-9]{2})(?![0-9])"
+    r"|(?<![0-9A-Za-z/.-])(?:1[0-2]|[1-9])[/.-](?P<my>[0-9]{2})(?![0-9/-])"
+    r"|(?<![0-9A-Za-z])[QqHh][1-4][/.-]?(?P<quarter>[0-9]{2})(?![0-9])"
+    r"|(?<![0-9A-Za-z])[Ff][Yy] ?(?P<fiscal>[0-9]{2})(?![0-9])"
+)
+
+
+def _names_a_coming_year(text: str | None, this_year: int) -> int:
+    """1 if `text` names this year or one of the next ten, in a _YEAR_FORMS form."""
+    for match in _YEAR_FORMS.finditer(text or ""):
+        full, *short = match.group("full", "dmy", "my", "quarter", "fiscal")
+        year = int(full) if full else 2000 + int(next(digits for digits in short if digits))
+        if this_year <= year <= this_year + 10:
+            return 1
+    return 0
+
+
 def expire_undated_actions(
     conn: sqlite3.Connection, days: int = DEFAULT_UNDATED_EXPIRE_DAYS
 ) -> int:
@@ -107,21 +133,11 @@ def expire_undated_actions(
     ('2024' as a Julian day, '10:00', 'now'). Left alone: an action whose parent
     has no ISO date (no parent row, or '', the store's word for a missing date,
     which sorts before every date), and a free-text deadline naming this year or
-    one of the next ten ('31/12/2027', '31/12/27'), which is still to come. A
-    year inside a longer number ('PO 120265') is no year, and two digits count
-    as a year only in a d/m/yy date with no four-digit number beside them, or
-    '17.30' and '10/26/2023' would. Returns the number of rows expired.
+    one of the next ten in any of the _YEAR_FORMS ('31/12/2027', '31/12/27',
+    'Q4/26', 'FY26/27'), which is still to come. Returns the number of rows
+    expired.
     """
-    this_year = date.today().year
-    years = range(this_year, this_year + 11)
-    full = [f"*[^0-9]{year}[^0-9]*" for year in years]
-    short = [f"*[0-9][/.-][0-9]*[/.-]{year % 100:02d}[^0-9]*" for year in years]
-    padded = "(' ' || deadline || ' ')"
-    names_a_coming_year = (
-        "(" + " OR ".join(f"{padded} GLOB ?" for _ in full) + ")"
-        f" OR ({padded} NOT GLOB '*[0-9][0-9][0-9][0-9]*'"
-        " AND (" + " OR ".join(f"{padded} GLOB ?" for _ in short) + "))"
-    )
+    conn.create_function("sb_names_coming_year", 2, _names_a_coming_year, deterministic=True)
     cur = conn.execute(
         f"""
         UPDATE action_items
@@ -129,11 +145,11 @@ def expire_undated_actions(
         WHERE status = 'open'
           AND (deadline IS NULL
                OR ((deadline NOT GLOB {_ISO_DATE} OR date(substr(deadline, 1, 10)) IS NULL)
-                   AND NOT ({names_a_coming_year})))
+                   AND NOT sb_names_coming_year(deadline, ?)))
           AND {_PARENT_LAST_ACTIVE} GLOB {_ISO_DATE}
           AND substr({_PARENT_LAST_ACTIVE}, 1, 10) < date('now', '-' || ? || ' day')
         """,
-        (*full, *short, days),
+        (date.today().year, days),
     )
     return cur.rowcount
 

@@ -86,7 +86,8 @@ def search_fold(text: str | None) -> str:
 
 
 # Words too common to carry a search on their own, including the question words
-# agents open with. The any-token fallback drops them. Stored folded.
+# agents open with. The any-token fallback drops them, and a row need not hold
+# them to hold the whole query. Stored folded.
 STOPWORDS = frozenset(
     search_fold(word)
     for word in (
@@ -119,6 +120,8 @@ def _strip_punctuation(word: str) -> str:
     while start < end and unicodedata.category(word[start]).startswith("P"):
         start += 1
     while end > start and unicodedata.category(word[end - 1]).startswith("P"):
+        if word[end - 1] == "#" and end - start == 2 and word[start].isalpha():
+            break  # C#, F#: without the sign it is a letter every row holds
         end -= 1
     return word[start:end]
 
@@ -148,21 +151,40 @@ def search_tokens(text: str | None) -> list[str]:
         elif len(token) >= 3:
             keep = True
         else:
-            keep = len(token) == 2 and (raw.isupper() or any(c.isdigit() for c in raw))
+            keep = (
+                len(token) == 2
+                and token.isalnum()
+                and (raw.isupper() or any(c.isdigit() for c in raw))
+            )
         if keep:
             tokens.append(token)
     return list(dict.fromkeys(tokens))
 
 
+def is_stopword(word: str) -> bool:
+    """Whether a query word is one a row need not hold.
+
+    A capital letter is never one: 'A' in 'Series A' and 'I' in 'Basel I' name a
+    variant, where 'a' and 'i' are an article and a pronoun.
+    """
+    raw = _strip_punctuation(word)
+    capital = len(raw) == 1 and raw.isascii() and raw.isupper()
+    return not capital and search_fold(raw) in STOPWORDS
+
+
 def search_words(text: str | None) -> list[str]:
     """Distinct folded words a row must hold, in any order, to hold the whole query.
 
-    Every word but the stopwords. Unlike search_tokens this keeps years and short
-    words: they are too common to find a row by, but a row without the query's
-    year does not answer it.
+    Every word but the stopwords and bare symbols ('+', '->'). Unlike
+    search_tokens this keeps years and short words: they are too common to find a
+    row by, but a row without the query's year does not answer it.
     """
-    words = (search_fold(_strip_punctuation(word)) for word in (text or "").split())
-    return list(dict.fromkeys(w for w in words if w and w not in STOPWORDS))
+    words = []
+    for word in (text or "").split():
+        folded = search_fold(_strip_punctuation(word))
+        if any(c.isalnum() for c in folded) and not is_stopword(word):
+            words.append(folded)
+    return list(dict.fromkeys(words))
 
 
 # sb_match's score for a row holding the whole query: above any token count.
@@ -177,29 +199,21 @@ def _word_end(word: str) -> str:
     three letters must be the whole word, and a number the whole number, or 500
     matched 5000 and the Greek 500.000.
     """
+    if word[-1].isdigit():
+        return r"(?![.,]?\d)" + (r"(?!\w)" if len(word) < 3 else "")
     if len(word) < 3:
         return r"(?!\w)"
-    if word[-1].isdigit():
-        return r"(?![.,]?\d)"
     return ""
 
 
+def _word_start(word: str) -> str:
+    """What must come before a query word: a non-word character, and not a
+    digit and a separator before a number, or 500 is the end of 1.500."""
+    return r"(?<!\w)" + (r"(?<!\d[.,])" if word[:1].isdigit() else "")
+
+
 def _at_word_start(word: str) -> str:
-    return r"(?<!\w)" + re.escape(word) + _word_end(word)
-
-
-@lru_cache(maxsize=64)
-def _token_pattern(joined_tokens: str) -> re.Pattern | None:
-    """One regex for a query's tokens, each matched at the start of a word.
-
-    A token used to count anywhere inside a word, so 'act' matched 'contract'.
-    """
-    tokens = sorted(_forms(joined_tokens), key=len, reverse=True)
-    if not tokens:
-        return None
-    # One lookbehind for all of them: repeated on every branch it ran 30-50%
-    # slower on rows that hold a common token such as 'ai'.
-    return re.compile(r"(?<!\w)(?:" + "|".join(re.escape(t) + _word_end(t) for t in tokens) + ")")
+    return _word_start(word) + re.escape(word) + _word_end(word)
 
 
 @lru_cache(maxsize=64)
@@ -211,11 +225,18 @@ def _phrase_pattern(phrase: str) -> re.Pattern:
     Europe'.
     """
     last = phrase.rsplit(" ", 1)[-1]
-    return re.compile(r"(?<!\w)" + re.escape(phrase) + _word_end(last))
+    return re.compile(_word_start(phrase) + re.escape(phrase) + _word_end(last))
 
 
 @lru_cache(maxsize=64)
 def _word_patterns(joined_words: str) -> tuple[re.Pattern, ...]:
+    """One regex per word, at the start of a word, in the order of _forms.
+
+    Each word is looked for on its own. One alternation, longest first, let a
+    longer word hide a shorter one inside it ('cards' hid 'card', 'e-banking'
+    hid 'banking'), so a row holding every word counted short. A token used to
+    count anywhere inside a word, so 'act' matched 'contract'.
+    """
     return tuple(re.compile(_at_word_start(w)) for w in _forms(joined_words))
 
 
@@ -245,8 +266,10 @@ def _match_score(text: str | None, phrase: str, words: str, joined_tokens: str) 
     if tokens:
         if not any(map(contains, tokens)):
             return 0
-        pattern = _token_pattern(joined_tokens)
-        found = len(set(pattern.findall(folded))) if pattern else 0
+        patterns = _word_patterns(joined_tokens)
+        found = sum(
+            1 for t, p in zip(tokens, patterns, strict=True) if t in folded and p.search(folded)
+        )
         if found < len(tokens):
             return found
     required = _forms(words)

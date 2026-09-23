@@ -40,7 +40,8 @@ _stale_warning when it matters. For mail newer than the replica, use \
 `outlook_live_search`.
 
 Matching. Most of this corpus is Greek. Every search ignores case, accents and \
-final sigma, so either form of a word works. Keyword search wants every word; \
+final sigma, so either form of a word works. Keyword search wants every word \
+but stopwords (the, what, και, για); \
 when nothing holds them all it falls back to any meaningful word and flags those \
 rows partial_match (recall's summary.partial_kinds names the kinds that only \
 matched partly). Plain words work best; quotes and operators are ignored. In \

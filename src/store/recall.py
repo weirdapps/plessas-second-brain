@@ -54,13 +54,10 @@ def _folded_bucket(conn: sqlite3.Connection, sql: str, keyword: str, limit: int)
     stripped = search_phrase(keyword)
     if not stripped:
         return []
-    # 'C#' stripped of its '#' is the letter c, which is in half the rows.
-    typed = " ".join(search_fold(keyword).split())
-    phrase = typed if len(stripped) == 1 and typed != stripped else stripped
     several = len(stripped.split()) >= 2
     words = "\x1f".join(search_words(keyword)) if several else ""
     tokens = "\x1f".join(search_tokens(keyword)) if several else ""
-    rows = [dict(r) for r in conn.execute(sql, (phrase, words, tokens, limit))]
+    rows = [dict(r) for r in conn.execute(sql, (stripped, words, tokens, limit))]
     whole = [r for r in rows if r["score"] >= PHRASE_MATCH]
     out = whole or [{**r, "partial_match": True} for r in rows]
     for row in out:

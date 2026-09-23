@@ -783,7 +783,11 @@ def test_every_word_with_its_year_in_another_order_is_a_whole_match(conn):
     from src.store.recall import recall
 
     _decisions(
-        conn, "The 2026 budget was approved", "Budget freeze for travel", "Budget line 20261"
+        conn,
+        "The 2026 budget was approved",
+        "Budget freeze for travel",
+        "Budget line 20261",
+        "Budget 1.2026 approved",
     )
 
     out = recall(conn, "budget 2026")
@@ -841,16 +845,128 @@ def test_a_phrase_ending_in_an_acronym_ends_with_it(conn):
 
 @pytest.mark.parametrize(
     ("query", "expected"),
-    [("500", ["500 euros"]), ("12345 ανύπαρκτηλέξη", ["ref 12345"])],
+    [("500", ["500 euros"]), ("50", ["50 cards"]), ("12345 ανύπαρκτηλέξη", ["ref 12345"])],
 )
 def test_a_number_matches_only_the_whole_number(conn, query, expected):
-    """500 matched 5000 and the Greek 500.000, and a reference number matched
-    every longer one it began."""
+    """500 matched 5000, 1.500 and the Greek 500.000, 50 matched 50.000, and a
+    reference number matched every longer one it began."""
     from src.store.recall import recall
 
-    _decisions(conn, "5000 euros", "500 euros", "500.000 πελάτες", "ref 12345", "ref 1234567")
+    _decisions(
+        conn,
+        "5000 euros",
+        "500 euros",
+        "500.000 πελάτες",
+        "1.500 ευρώ",
+        "2,500 euros",
+        "50 cards",
+        "50.000 cards",
+        "ref 12345",
+        "ref 1234567",
+    )
 
     assert [d["decision"] for d in recall(conn, query)["decisions"]] == expected
+
+
+def test_a_term_with_a_symbol_keeps_it_in_a_longer_query(conn):
+    from src.store.recall import recall
+
+    _decisions(conn, "Plan C, developer hired", "C# developer hired")
+
+    out = recall(conn, "C# developer")
+
+    assert [d["decision"] for d in out["decisions"]] == ["C# developer hired"]
+
+
+@pytest.mark.parametrize("query", ['"C"', "C."])
+def test_a_quoted_letter_is_still_the_letter(conn, query):
+    from src.store.recall import recall
+
+    _decisions(conn, "Plan C approved")
+
+    assert [d["decision"] for d in recall(conn, query)["decisions"]] == ["Plan C approved"]
+
+
+@pytest.mark.parametrize(
+    ("query", "kept", "dropped"),
+    [
+        ("Series A funding", "Series A funding closed", "Series B funding closed"),
+        ("Basel I rules", "Basel I rules apply", "Basel III rules apply"),
+    ],
+)
+def test_a_capital_letter_names_a_variant(conn, query, kept, dropped):
+    """'a' and 'i' are stopwords as an article and a pronoun, not as the letter
+    of Series A or Basel I."""
+    from src.store.recall import recall
+
+    _decisions(conn, kept, dropped)
+
+    assert [d["decision"] for d in recall(conn, query)["decisions"]] == [kept]
+
+
+def test_a_lowercase_article_is_not_a_word_the_row_must_hold(conn):
+    from src.store.recall import recall
+
+    _decisions(conn, "Digital euro pilot approved")
+
+    out = recall(conn, "what is a digital euro")
+
+    assert [d["decision"] for d in out["decisions"]] == ["Digital euro pilot approved"]
+    assert not out["decisions"][0].get("partial_match")
+
+
+@pytest.mark.parametrize(
+    ("query", "row"),
+    [("card cards", "New cards issued"), ("e-banking banking", "E-banking relaunch")],
+)
+def test_a_word_inside_another_word_of_the_query_still_counts(conn, query, row):
+    """Counted in one pass, the longer word hid the shorter one it contains, and
+    a row holding every word came back partial."""
+    from src.store.recall import recall
+
+    _decisions(conn, row)
+
+    out = recall(conn, query)
+
+    assert [d["decision"] for d in out["decisions"]] == [row]
+    assert not out["decisions"][0].get("partial_match")
+
+
+def test_only_a_letter_keeps_a_trailing_hash():
+    """'C#' is a name; 'ticket#' is a word with a stray sign. As a search token
+    'c#' would reach the full-text index as the letter c, which every row holds."""
+    from src.store.greek import search_tokens, search_words
+
+    assert search_words("C# ticket#") == ["c#", "ticket"]
+    assert search_tokens("C# developer") == ["developer"]
+
+
+def test_a_query_of_stopwords_only_keeps_them_in_the_full_text_match():
+    from src.store.query import _sanitize_fts5_query
+
+    assert _sanitize_fts5_query("what is the") == '"what" "is" "the"'
+    assert _sanitize_fts5_query("what is the ACME") == '"ACME"'
+
+
+def test_a_symbol_between_words_is_not_a_word(conn):
+    from src.store.recall import recall
+
+    _decisions(conn, "AI and ML roadmap")
+
+    out = recall(conn, "AI + ML")
+
+    assert [d["decision"] for d in out["decisions"]] == ["AI and ML roadmap"]
+    assert not out["decisions"][0].get("partial_match")
+
+
+def test_the_full_text_buckets_do_not_require_stopwords(conn):
+    """A question holds words no row does ('what', 'the'), so the full-text
+    buckets flagged every answer partial while the others called it whole."""
+    from src.store.query import query_by_keyword
+
+    rows = query_by_keyword(conn, "what about the προϋπολογισμό")
+
+    assert rows and not any(r.get("partial_match") for r in rows)
 
 
 def test_a_term_with_a_symbol_is_not_its_bare_letter(conn):
@@ -1024,6 +1140,29 @@ def test_the_person_plan_switches_above_dense_person_links(conn, monkeypatch):
     assert query._linked_to_ids(conn, ids).startswith("e.id IN")
     monkeypatch.setattr(query, "DENSE_PERSON_LINKS", 3)
     assert query._linked_to_ids(conn, ids).startswith("EXISTS")
+
+
+@pytest.mark.parametrize("person", ["%", "_", " ", "."])
+def test_a_person_filter_without_a_letter_or_digit_matches_no_one(conn, person):
+    from src.store.query import query_by_person, query_combined
+
+    assert query_by_person(conn, person) == []
+    assert query_combined(conn, person=person) == []
+
+
+def test_a_persons_role_on_an_email_prefers_sender(conn):
+    """The lowest role in sort order won, so 'recipient' hid 'sender'."""
+    from src.store.query import query_by_person
+
+    conn.executemany(
+        "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (2, 3, ?)",
+        [("recipient",), ("sender",)],
+    )
+    conn.commit()
+
+    rows = {r["email_id"]: r["person_role"] for r in query_by_person(conn, "Καραγιάννης")}
+
+    assert rows[2] == "sender"
 
 
 def test_resolve_person_registers_its_own_functions():

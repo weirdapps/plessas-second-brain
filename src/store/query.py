@@ -23,21 +23,27 @@ def _sanitize_fts5_query(keyword: str) -> str:
     while preserving FTS5's implicit AND semantics across tokens (every token
     must appear somewhere in the row).
 
+    Stopwords are dropped when anything else is left, as the folded buckets
+    drop them: a question holds words no row does ('what', 'the', 'για'), and
+    requiring them flagged every full-text answer partial.
+
     Examples:
         "Mylonas"             -> '"Mylonas"'
         "earnings release"    -> '"earnings" "release"'   (both required)
         "ACME Q1 2026"         -> '"ACME" "Q1" "2026"'      (all three required)
+        "what about the ACME" -> '"ACME"'
         ""                    -> '""'                     (matches nothing)
     """
     # Fold Greek accents to match how the index stores them (schema v20). Both
     # sides fold, so an accented query still works: folding it yields the same
     # form the index holds. Without this the index would be folded and the query
     # would not, which is the strictly worse version of the bug being fixed.
-    from src.store.greek import fold
+    from src.store.greek import fold, is_stopword
 
-    tokens = fold(keyword).split()
-    if not tokens:
+    words = keyword.split()
+    if not words:
         return '""'
+    tokens = [fold(w) for w in ([w for w in words if not is_stopword(w)] or words)]
     quoted = []
     for token in tokens:
         # Escape any internal double quotes per FTS5 phrase syntax
@@ -148,7 +154,9 @@ def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> li
 # nearly every email; collecting and sorting all of theirs took 0.4 s. For
 # anyone else the walk can cover the whole mailbox: a name that fits hundreds of
 # rarely emailed people took 0.8-1.3 s on the replica. Up to this many links,
-# their emails are collected and sorted instead.
+# their emails are collected and sorted instead. Someone on many emails, all of
+# them old, still gets the walk; reading each email's few links, it costs about
+# 50 ms over 100K emails.
 DENSE_PERSON_LINKS = 5000
 
 # The people a filter means, as a CTE over a JSON list of their ids.
@@ -161,6 +169,8 @@ def _person_ids(conn: sqlite3.Connection, name_or_email: str) -> list[int]:
     Folded in a pass of its own over people: inside the email query, joined
     through email_people, SQLite could fold once per link (1.3M rows).
     """
+    if not any(ch.isalnum() for ch in search_fold(name_or_email)):
+        return []  # '%', '_' and '.' fit everyone
     if "@" in name_or_email:
         sql = "SELECT id FROM people WHERE LOWER(email) = LOWER(?)"
         arg = name_or_email.strip()
@@ -205,7 +215,8 @@ def query_by_person(conn: sqlite3.Connection, name_or_email: str, limit: int = 2
     if not ids:
         return []
     ids_json = json.dumps(ids)
-    # One row per email. person_role is one of the roles they hold on it.
+    # One row per email. person_role is one of the roles they hold on it, sender
+    # first: the lowest in sort order used to win, so 'recipient' hid 'sender'.
     query = (
         _IDS_CTE
         + """
@@ -215,7 +226,8 @@ def query_by_person(conn: sqlite3.Connection, name_or_email: str, limit: int = 2
             e.subject,
             e.summary,
             (SELECT ep.role_in_email FROM email_people ep
-              WHERE ep.email_id = e.id AND +ep.person_id IN ids LIMIT 1) as person_role,
+              WHERE ep.email_id = e.id AND +ep.person_id IN ids
+              ORDER BY ep.role_in_email <> 'sender', ep.role_in_email LIMIT 1) as person_role,
             e.sentiment
         FROM emails e
         WHERE """

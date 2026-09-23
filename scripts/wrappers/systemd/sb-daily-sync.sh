@@ -25,17 +25,41 @@ mkdir -p "$LOG_DIR"
 # --- Concurrency guard: a single run can take 30+ min when staging has backlog.
 # Without this, auth-watch's restoration trigger can overlap with the 07:00 cron
 # (or a manual run), doubling Vertex AI spend. Stale-lock recovery via PID check.
-LOCK_DIR="/tmp/sb-daily-sync.lock"
+# Overridable so the wrapper tests never touch a lock a real run may hold. The
+# lock is removed with rm -rf after a cd, so the override must be an absolute
+# path to a *.lock directory.
+LOCK_DIR="${SB_DAILY_SYNC_LOCK:-/tmp/sb-daily-sync.lock}"
+case "$LOCK_DIR" in
+  /*.lock) ;;
+  *)
+    echo "SB_DAILY_SYNC_LOCK must name an absolute *.lock directory, got: $LOCK_DIR" >&2
+    exit 64
+    ;;
+esac
 if [ -d "$LOCK_DIR" ]; then
   stored_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
   if [ -z "$stored_pid" ] || ! kill -0 "$stored_pid" 2>/dev/null; then
     rm -rf "$LOCK_DIR"  # stale (previous run crashed without trap cleanup)
+    [ -e "$LOCK_DIR" ] && { echo "cannot remove the stale lock $LOCK_DIR" >&2; exit 73; }
   else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: already running (pid=$stored_pid)" >> "$LOG_FILE"
     exit 0
   fi
 fi
-mkdir -p "$LOCK_DIR" && echo $$ > "$LOCK_DIR/pid"
+# mkdir without -p fails on an existing path, so no run goes on unlocked, and the
+# trap is set only once the lock is ours: `mkdir -p` let a run go on unlocked
+# when it failed, and its trap then removed a path this run never created. The
+# stale check above is not atomic with this; two starts in the same instant can
+# still race there.
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  if [ -d "$LOCK_DIR" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: another run took the lock" >> "$LOG_FILE"
+    exit 0
+  fi
+  echo "cannot create the lock directory $LOCK_DIR" >&2
+  exit 73
+fi
+echo $$ > "$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 
 # Skip extraction phase if gcloud ADC expired — the email loop would otherwise
@@ -109,6 +133,15 @@ if [ "$EXIT_CODE" -ne 0 ] && tail -20 "$LOG_FILE" | grep -qi "database is locked
   EXIT_CODE=$?
 fi
 echo "=== Daily sync finished (exit $EXIT_CODE): $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
+
+# Action lifecycle: drop re-extracted duplicates and expire actions nobody can
+# still owe. Extraction only appends, and this had no caller, so every action
+# stayed open for good. After a successful sync only, and non-fatal: it is
+# housekeeping, and its failure must not turn the sync's verdict red.
+if [ "$EXIT_CODE" -eq 0 ]; then
+  "$PYTHON" -m src.store.action_lifecycle >> "$LOG_FILE" 2>&1 \
+    || echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: action lifecycle failed (non-fatal)" >> "$LOG_FILE"
+fi
 
 # Style guide sync
 STYLE_SYNC="$HOME/SourceCode/plessas-marketplace/plugins/mail/scripts/style-sync.py"

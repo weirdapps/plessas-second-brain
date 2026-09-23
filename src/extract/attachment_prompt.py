@@ -1,6 +1,7 @@
 """Prompt template for Vertex AI attachment content extraction."""
 
 from src.config import USER_NAME, USER_ROLE
+from src.extract.untrusted import fence
 
 
 def build_attachment_prompt(
@@ -34,13 +35,17 @@ def build_attachment_prompt(
             f"\n[Document truncated from {len(extracted_text)} to {max_chars} characters]\n"
         )
 
+    # The filename and the parent email's subject are third-party text too.
+    document = f"""{email_context}Attachment filename: {filename}
+File type: {mime_type or "unknown"}
+
+Document content:
+{text}"""
+
     return f"""You are extracting structured information from a document attachment.
 {identity_context}
-{email_context}Attachment filename: {filename}
-File type: {mime_type or "unknown"}
 {truncation_note}
-Document content:
-{text}
+{fence(document)}
 
 ---
 

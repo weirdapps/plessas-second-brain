@@ -24,6 +24,45 @@ from src.store.normalizer import normalize_topic
 DEFAULT_CONTEXT_LIMIT = 20
 
 
+def resolve_person(
+    conn: sqlite3.Connection, name_or_email: str
+) -> tuple[sqlite3.Row | None, int, list[dict]]:
+    """The person a name or email means, how many people matched, and the next three.
+
+    A name is matched folded (case, accents, final sigma), because people are
+    mostly stored in ALL-CAPS Greek and SQLite's LIKE folds ASCII only. Several
+    people usually match a surname, and fetchone() used to pick whichever row came
+    first with no word of the others; the most-emailed match wins, and the caller
+    is told how many there were. person_context and meeting_prep both resolve
+    through here, so one name means one person in both.
+    """
+    register_sql_functions(conn)  # sb_fold et al., whoever opened conn
+    if "@" in name_or_email:
+        row = conn.execute(
+            "SELECT id, name, email, role, department FROM people WHERE LOWER(email) = LOWER(?)",
+            (name_or_email.strip(),),
+        ).fetchone()
+        return row, (1 if row else 0), []
+    pattern = f"%{search_fold(name_or_email)}%"
+    candidates = conn.execute(
+        """
+        SELECT p.id, p.name, p.email, p.role, p.department
+        FROM people p
+        WHERE sb_fold(p.name) LIKE ?
+        ORDER BY (SELECT COUNT(*) FROM email_people ep WHERE ep.person_id = p.id) DESC, p.id
+        LIMIT 4
+        """,
+        (pattern,),
+    ).fetchall()
+    if not candidates:
+        return None, 0, []
+    match_count = conn.execute(
+        "SELECT COUNT(*) FROM people WHERE sb_fold(name) LIKE ?", (pattern,)
+    ).fetchone()[0]
+    others = [{"name": c["name"], "email": c["email"]} for c in candidates[1:]]
+    return candidates[0], match_count, others
+
+
 def get_person_context(
     conn: sqlite3.Connection,
     name_or_email: str,
@@ -47,36 +86,7 @@ def get_person_context(
 
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
 
-    # Find person. A name is matched folded (case, accents, final sigma), because
-    # people are mostly stored in ALL-CAPS Greek and SQLite's LIKE folds ASCII
-    # only. Several people usually match a surname, and fetchone() used to pick
-    # whichever row came first with no word of the others; the most-emailed match
-    # wins now, and the answer says how many there were.
-    match_count = 0
-    other_candidates: list[dict] = []
-    if "@" in name_or_email:
-        person_row = conn.execute(
-            "SELECT id, name, email, role, department FROM people WHERE LOWER(email) = LOWER(?)",
-            (name_or_email.strip(),),
-        ).fetchone()
-        match_count = 1 if person_row else 0
-    else:
-        pattern = f"%{search_fold(name_or_email)}%"
-        candidates = conn.execute(
-            """
-            SELECT p.id, p.name, p.email, p.role, p.department
-            FROM people p
-            WHERE sb_fold(p.name) LIKE ?
-            ORDER BY (SELECT COUNT(*) FROM email_people ep WHERE ep.person_id = p.id) DESC, p.id
-            LIMIT 4
-            """,
-            (pattern,),
-        ).fetchall()
-        person_row = candidates[0] if candidates else None
-        match_count = conn.execute(
-            "SELECT COUNT(*) FROM people WHERE sb_fold(name) LIKE ?", (pattern,)
-        ).fetchone()[0]
-        other_candidates = [{"name": c["name"], "email": c["email"]} for c in candidates[1:]]
+    person_row, match_count, other_candidates = resolve_person(conn, name_or_email)
 
     if not person_row:
         return {
@@ -251,30 +261,40 @@ def get_person_context(
             "avg_emails_per_week": round(pattern_row["total"] / weeks, 1),
         }
 
-    # Calendar: last met, next meeting, meeting frequency
+    # Calendar: last met, next meeting, meeting frequency. An attendee row is this
+    # person by resolved person_id, else by address, and by folded name only when
+    # there is no address on record: folding every attendee name in Python cost a
+    # scan of every past event for anyone who never attended one. Each IN
+    # subquery runs once per statement.
     calendar_data = {}
-    name_lower = f"%{search_fold(person['name'])}%"
-    email_lower = f"%{person['email'].lower()}%" if person.get("email") else "%@invalid%"
+    email = person.get("email") or ""
+    attendee_args = (person["id"], email, email, email, f"%{search_fold(person['name'])}%")
 
     try:
         last_met = conn.execute(
             """SELECT ce.subject, ce.start_at FROM calendar_events ce
-               JOIN event_attendees ea ON ea.event_id = ce.id
-               WHERE (sb_fold(ea.name) LIKE ? OR LOWER(ea.email) LIKE ?)
+               WHERE ce.id IN (
+                   SELECT event_id FROM event_attendees
+                   WHERE person_id = ?
+                      OR (? <> '' AND LOWER(email) = LOWER(?))
+                      OR (? = '' AND sb_fold(name) LIKE ?))
                  AND ce.start_at < datetime('now')
                ORDER BY ce.start_at DESC LIMIT 1""",
-            (name_lower, email_lower),
+            attendee_args,
         ).fetchone()
         if last_met:
             calendar_data["last_met"] = {"subject": last_met[0], "date": last_met[1]}
 
         next_meeting = conn.execute(
             """SELECT ce.subject, ce.start_at FROM calendar_events ce
-               JOIN event_attendees ea ON ea.event_id = ce.id
-               WHERE (sb_fold(ea.name) LIKE ? OR LOWER(ea.email) LIKE ?)
+               WHERE ce.id IN (
+                   SELECT event_id FROM event_attendees
+                   WHERE person_id = ?
+                      OR (? <> '' AND LOWER(email) = LOWER(?))
+                      OR (? = '' AND sb_fold(name) LIKE ?))
                  AND ce.start_at > datetime('now')
                ORDER BY ce.start_at ASC LIMIT 1""",
-            (name_lower, email_lower),
+            attendee_args,
         ).fetchone()
         if next_meeting:
             calendar_data["next_meeting"] = {
@@ -284,10 +304,13 @@ def get_person_context(
 
         meeting_count = conn.execute(
             """SELECT COUNT(*) FROM calendar_events ce
-               JOIN event_attendees ea ON ea.event_id = ce.id
-               WHERE (sb_fold(ea.name) LIKE ? OR LOWER(ea.email) LIKE ?)
+               WHERE ce.id IN (
+                   SELECT event_id FROM event_attendees
+                   WHERE person_id = ?
+                      OR (? <> '' AND LOWER(email) = LOWER(?))
+                      OR (? = '' AND sb_fold(name) LIKE ?))
                  AND ce.start_at >= datetime('now', '-30 days')""",
-            (name_lower, email_lower),
+            attendee_args,
         ).fetchone()[0]
         calendar_data["meeting_count_30d"] = meeting_count
     except Exception:

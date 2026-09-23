@@ -36,7 +36,7 @@ def conn():
         c.execute(
             "INSERT INTO emails (id, message_id, date_received, subject, summary) "
             "VALUES (?, ?, '2026-09-01T10:00:00', ?, ?)",
-            (i, i, f"Θέμα {i}", f"Περίληψη για τον προϋπολογισμό {i}"),
+            (i, i, f"Θέμα {i}", f"Περίληψη για το 2026 και τον προϋπολογισμό {i}"),
         )
     # Α. appears on four emails, Μαρίνα on one: Α. is the likelier Παπαδοπούλου.
     c.executemany(
@@ -54,6 +54,10 @@ def conn():
     c.execute(
         "INSERT INTO action_items (email_id, task, owner, status) "
         "VALUES (1, 'Ετοιμασία παρουσίασης για τις κάρτες', 'ΠΑΠΑΔΟΠΟΥΛΟΥ Α.', 'open')"
+    )
+    c.execute(
+        "INSERT INTO action_items (email_id, task, owner, status) "
+        "VALUES (2, 'Αποστολή του προϋπολογισμού καρτών', 'ΚΑΡΑΓΙΑΝΝΗΣ Ν.', 'open')"
     )
     c.commit()
     return c
@@ -114,6 +118,21 @@ def test_recall_decisions_and_actions_match_without_accents(conn):
     out = recall(conn, "προυπολογισμος καρτων")
 
     assert len(out["decisions"]) == 1
+    assert [a["task"] for a in out["actions"]] == ["Αποστολή του προϋπολογισμού καρτών"]
+
+
+def test_rows_holding_the_whole_query_come_back_alone(conn):
+    """A LIKE bucket that has rows with the whole query returns only those, never
+    mixed with rows that hold one of its words."""
+    from src.store.recall import recall
+
+    conn.execute("INSERT INTO decisions (email_id, decision) VALUES (3, 'Μόνο για τις καρτών')")
+    conn.commit()
+
+    out = recall(conn, "προυπολογισμος καρτων")
+
+    assert [d["decision"] for d in out["decisions"]] == ["Εγκρίθηκε ο προϋπολογισμός καρτών"]
+    assert not any(d.get("partial_match") for d in out["decisions"])
 
 
 def test_recall_falls_back_to_any_token_and_marks_it(conn):
@@ -267,3 +286,377 @@ def test_calendar_until_includes_its_own_day(conn, monkeypatch):
     out = mcp_server.query_calendar_events(since="2026-09-23", until="2026-09-23")
 
     assert [e["id"] for e in out["events"]] == [10]
+
+
+# --------------------------------------------------------------- review round 2
+
+
+def _decisions(conn, *texts):
+    for text in texts:
+        conn.execute("INSERT INTO decisions (email_id, decision) VALUES (5, ?)", (text,))
+    conn.commit()
+
+
+def test_a_token_matches_at_the_start_of_a_word_not_inside_one(conn):
+    """'act' used to match 'contract': a substring anywhere in a word."""
+    from src.store.recall import recall
+
+    _decisions(conn, "Contract renewal signed", "Act on the audit findings")
+
+    out = recall(conn, "act ανύπαρκτηλέξη")
+
+    assert [d["decision"] for d in out["decisions"]] == ["Act on the audit findings"]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        '"προϋπολογισμός καρτών"',
+        "“προϋπολογισμός καρτών”",
+        "προϋπολογισμός καρτών;",
+        "προϋπολογισμός καρτών?",
+    ],
+)
+def test_quotes_and_question_marks_do_not_change_the_match(conn, query):
+    """Punctuation stayed in the phrase, so a quoted or questioned query lost the
+    whole-query tier and its real match came back flagged partial."""
+    from src.store.recall import recall
+
+    out = recall(conn, query)
+
+    assert [d["decision"] for d in out["decisions"]] == ["Εγκρίθηκε ο προϋπολογισμός καρτών"]
+    assert not out["decisions"][0].get("partial_match")
+
+
+def test_a_two_letter_acronym_is_searched_and_question_words_are_not(conn):
+    """'what did we decide about UX' fell back to what/did/decide/about and
+    returned the lunch menu, never the UX decision."""
+    from src.store.recall import recall
+
+    _decisions(conn, "UX redesign approved", "Told them what the lunch menu is about")
+
+    out = recall(conn, "what did we decide about UX")
+
+    assert [d["decision"] for d in out["decisions"]] == ["UX redesign approved"]
+
+
+def test_the_fallback_keeps_reference_numbers_but_not_years_or_small_words():
+    from src.store.greek import search_tokens
+
+    assert search_tokens("invoice 4500123457 2026 Q4 ab to") == ["invoice", "4500123457", "q4"]
+
+
+def test_decomposed_text_folds_like_composed_text():
+    """Text from PDFs and macOS arrives decomposed (alpha + combining acute);
+    the FTS tokenizer folds it and the LIKE side did not."""
+    import unicodedata
+
+    from src.store.greek import search_fold
+
+    composed = "κάρτες πληρωμών"
+    assert search_fold(unicodedata.normalize("NFD", composed)) == search_fold(composed)
+
+
+def test_registering_twice_mid_iteration_is_harmless(conn):
+    from src.store.greek import register_sql_functions
+
+    cursor = conn.execute("SELECT id FROM people")
+    cursor.fetchone()
+
+    register_sql_functions(conn)  # already registered: must not raise
+
+    assert cursor.fetchone() is not None
+
+
+def test_a_name_filter_folds_each_person_once_not_each_email_link():
+    """Joined through email_people, sb_fold could run once per link: without
+    planner statistics (the store never runs ANALYZE) SQLite scanned the link
+    table first, 1.3M calls and 2 s or more for any name. A tiny test store gets
+    the other plan, so the shape is what is pinned: people are filtered in a
+    subquery, once each."""
+    import inspect
+
+    from src.store import query
+
+    shape = "IN (SELECT id FROM people WHERE sb_fold(name) LIKE ?)"
+    assert shape in inspect.getsource(query.query_by_person)
+    assert shape in inspect.getsource(query.query_combined)
+
+
+@pytest.mark.parametrize(
+    "lookup",
+    [
+        lambda c: __import__("src.store.query", fromlist=["x"]).query_by_topic(c, "Προϋπολογισμός"),
+        lambda c: __import__("src.store.query", fromlist=["x"]).query_decisions(
+            c, topic="Προϋπολογισμός", days=None
+        ),
+        lambda c: __import__("src.store.query", fromlist=["x"]).query_combined(
+            c, topic="Προϋπολογισμός"
+        ),
+        lambda c: __import__("src.store.query", fromlist=["x"]).meeting_prep(
+            c, ["Καραγιάννης"], topic="Προϋπολογισμός", days=100000
+        )["topic_context"]["decisions"],
+        lambda c: __import__("src.store.recall", fromlist=["x"]).recall(c, "Προϋπολογισμός")[
+            "topic_context"
+        ],
+    ],
+    ids=["query_by_topic", "query_decisions", "query_combined", "meeting_prep", "recall"],
+)
+def test_every_topic_lookup_finds_the_normalized_topic(conn, lookup):
+    assert lookup(conn)
+
+
+@pytest.mark.parametrize(
+    "lookup",
+    [
+        lambda c: __import__("src.store.query", fromlist=["x"]).query_by_person(c, "Καραγιάννης"),
+        lambda c: __import__("src.store.query", fromlist=["x"]).query_combined(
+            c, person="Καραγιάννης"
+        ),
+        lambda c: __import__("src.store.query", fromlist=["x"]).meeting_prep(
+            c, ["Καραγιάννης"], days=100000
+        )["attendees"][0]["emails"],
+    ],
+    ids=["query_by_person", "query_combined", "meeting_prep"],
+)
+def test_every_person_lookup_ignores_case_and_accents(conn, lookup):
+    assert lookup(conn)
+
+
+def test_meeting_prep_resolves_a_namesake_to_one_person_and_says_so(conn):
+    """It merged every Παπαδοπούλου into one dossier; person_context picks the
+    most-emailed and names the others, and so does this now."""
+    from src.store.query import meeting_prep
+
+    dossier = meeting_prep(conn, ["Παπαδοπούλου"], days=100000)["attendees"][0]
+
+    assert dossier["match_count"] == 2
+    assert [c["name"] for c in dossier["other_candidates"]] == ["ΠΑΠΑΔΟΠΟΥΛΟΥ ΜΑΡΙΝΑ"]
+    assert len(dossier["emails"]) == 4
+
+
+def test_sender_brief_passes_the_ambiguity_on(conn):
+    from src.bridge import sender_brief
+
+    brief = sender_brief(conn, "Παπαδοπούλου")
+
+    assert brief["match_count"] == 2
+    assert brief["other_candidates"]
+
+
+def test_match_count_counts_past_the_candidates_shown(conn):
+    from src.store.context import get_person_context
+
+    conn.executemany(
+        "INSERT INTO people (name, email) VALUES (?, ?)",
+        [(f"ΠΑΠΑΔΟΠΟΥΛΟΥ {n}", f"p{n}@example.com") for n in ("Β.", "Γ.", "Δ.")],
+    )
+    conn.commit()
+
+    assert get_person_context(conn, "παπαδοπουλου")["match_count"] == 5
+
+
+def test_recall_summary_names_the_kinds_that_matched_only_partly(conn):
+    from src.store.recall import recall
+
+    out = recall(conn, "παρουσίαση κάρτες εξωτερικός ελεγκτής")
+
+    assert "actions" in out["summary"]["partial_kinds"]
+
+
+def test_a_recalled_meeting_decision_carries_its_date_and_meeting(conn):
+    """It was ordered by the meeting's date but arrived with no date and no
+    subject, so the caller could not say where it came from."""
+    from src.store.recall import recall
+
+    conn.execute(
+        "INSERT INTO calendar_events (id, outlook_event_id, subject, start_at, end_at, "
+        "is_recurring, is_self_organized, is_cancelled, ingested_at, llm_status) VALUES "
+        "(7, 'ev7', 'Επιτροπή τιμολόγησης', '2026-09-20T10:00:00', '2026-09-20T11:00:00', "
+        "0, 0, 0, '2026-09-20T12:00:00', 'extracted')"
+    )
+    conn.execute("INSERT INTO decisions (event_id, decision) VALUES (7, 'Νέα τιμολόγηση')")
+    conn.commit()
+
+    row = recall(conn, "τιμολόγηση")["decisions"][0]
+
+    assert (row["date"], row["email_subject"], row["source"]) == (
+        "2026-09-20T10:00:00",
+        "Επιτροπή τιμολόγησης",
+        "calendar",
+    )
+
+
+def test_an_undated_teams_decision_is_dated_by_its_thread(conn):
+    from src.store.recall import recall
+
+    _teams(conn)
+    conn.execute("UPDATE teams_threads SET started_at = '2026-09-22T09:00:00' WHERE id = 1")
+    conn.execute("INSERT INTO decisions (teams_thread_id, decision) VALUES (1, 'Νέα χρέωση')")
+    conn.execute(
+        "INSERT INTO decisions (email_id, decision, decision_date) "
+        "VALUES (2, 'Παλιά χρέωση', '2025-01-01')"
+    )
+    conn.commit()
+
+    out = recall(conn, "χρέωση")
+
+    assert [d["decision"] for d in out["decisions"]] == ["Νέα χρέωση", "Παλιά χρέωση"]
+
+
+def test_conversation_and_attachment_searches_fall_back_too(conn):
+    from src.store.conversation_query import search_conversations_keyword
+    from src.store.query import search_attachments
+
+    conn.execute(
+        "INSERT INTO conversations (id, session_id, started_at, created_at, summary) "
+        "VALUES (1, 's1', '2026-09-01', '2026-09-01', 'Συζήτηση για τον προϋπολογισμό')"
+    )
+    conn.execute(
+        "INSERT INTO attachments (id, email_id, message_id, filename, file_path, exported_at) "
+        "VALUES (1, 1, 1, 'plan.pdf', '/tmp/plan.pdf', '2026-09-01')"
+    )
+    conn.execute(
+        "INSERT INTO attachment_content (id, attachment_id, extracted_text, extraction_status) "
+        "VALUES (1, 1, 'Σχέδιο προϋπολογισμού για τις κάρτες', 'extracted')"
+    )
+    conn.commit()
+
+    convs = search_conversations_keyword(conn, "προϋπολογισμό ανύπαρκτηλέξη")
+    atts = search_attachments(conn, "κάρτες ανύπαρκτηλέξη")
+
+    assert convs and all(c["partial_match"] for c in convs)
+    assert atts and all(a["partial_match"] for a in atts)
+
+
+def test_calendar_until_with_a_time_is_taken_literally(conn, monkeypatch):
+    from src import mcp_server
+
+    _calendar(conn)
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    out = mcp_server.query_calendar_events(since="2026-09-23", until="2026-09-23T12:00:00")
+
+    assert out["events"] == []
+
+
+def test_calendar_keyword_falls_back_to_any_token(conn, monkeypatch):
+    from src import mcp_server
+
+    _calendar(conn)
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    out = mcp_server.query_calendar_events(keyword="Επιτροπή ανύπαρκτηλέξη")
+
+    assert [e["id"] for e in out["events"]] == [10]
+    assert out["events"][0]["partial_match"] is True
+
+
+def test_image_search_ignores_case_and_accents(conn, monkeypatch):
+    from src import mcp_server
+
+    conn.execute(
+        "INSERT INTO inline_images (sha256, classification, classification_method, "
+        "classified_at, vision_description, width, height, bytes) VALUES ('abc', 'content', "
+        "'vision', '2026-09-01', 'Γράφημα με τις κάρτες πληρωμών', 800, 600, 1024)"
+    )
+    conn.commit()
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    out = mcp_server.attachment_image_search("ΓΡΑΦΗΜΑ καρτες")
+
+    assert [r["sha256"] for r in out["results"]] == ["abc"]
+
+
+def test_person_context_finds_meetings_by_person_address_or_name(conn):
+    """Attendee rows are matched by resolved person, by address (any case), and
+    by folded name only for a person with no address on record."""
+    from src.store.context import get_person_context
+
+    conn.execute(
+        "INSERT INTO calendar_events (id, outlook_event_id, subject, start_at, end_at, "
+        "is_recurring, is_self_organized, is_cancelled, ingested_at, llm_status) VALUES "
+        "(20, 'ev20', 'Παλιά σύσκεψη', '2020-01-01T10:00:00', '2020-01-01T11:00:00', "
+        "0, 0, 0, '2020-01-01T12:00:00', 'extracted'), "
+        "(21, 'ev21', 'Μελλοντική σύσκεψη', '2099-01-01T10:00:00', '2099-01-01T11:00:00', "
+        "0, 0, 0, '2020-01-01T12:00:00', 'extracted')"
+    )
+    conn.execute("INSERT INTO people (id, name) VALUES (9, 'ΔΗΜΗΤΡΙΟΥ Κ.')")
+    conn.executemany(
+        "INSERT INTO event_attendees (event_id, email, name, response_status, is_organizer, "
+        "is_self) VALUES (?, ?, ?, 'accepted', 0, 0)",
+        [
+            (20, "N.Karagiannis@Example.com", "Karagiannis N"),
+            (21, "k.dimitriou@elsewhere.example", "Δημητρίου Κ."),
+        ],
+    )
+    conn.commit()
+
+    by_address = get_person_context(conn, "Καραγιάννης")
+    by_name = get_person_context(conn, "Δημητρίου")
+
+    assert by_address["last_met"]["subject"] == "Παλιά σύσκεψη"
+    assert by_name["next_meeting"]["subject"] == "Μελλοντική σύσκεψη"
+
+
+def test_the_workspace_filter_applies_before_the_limit(conn):
+    """Filtered after LIMIT, a page of matches from other workspaces came back
+    empty and pushed the caller onto the any-token fallback."""
+    from src.store.conversation_query import search_conversations_keyword
+
+    for i in range(3):
+        conn.execute(
+            "INSERT INTO conversations (session_id, started_at, created_at, workspace, summary) "
+            "VALUES (?, '2026-09-01', '2026-09-01', '/work/other', 'προϋπολογισμός καρτών')",
+            (f"o{i}",),
+        )
+    conn.execute(
+        "INSERT INTO conversations (session_id, started_at, created_at, workspace, summary) "
+        "VALUES ('mine', '2026-08-01', '2026-08-01', '/work/brain', 'προϋπολογισμός καρτών')"
+    )
+    conn.commit()
+
+    rows = search_conversations_keyword(conn, "προϋπολογισμός καρτών", workspace="brain", limit=1)
+
+    assert [r["session_id"] for r in rows] == ["mine"]
+    assert not rows[0].get("partial_match")
+
+
+def test_the_cli_says_when_no_email_held_every_word(tmp_path, capsys):
+    import types
+
+    from src import cli
+
+    db = tmp_path / "brain.db"
+    store = create_database(str(db))
+    store.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, summary) "
+        "VALUES (1, 1, '2026-09-01T10:00:00', 'Θέμα', 'Περίληψη για τον προϋπολογισμό')"
+    )
+    store.commit()
+    store.close()
+
+    cli.cmd_query_keyword(
+        types.SimpleNamespace(db=db, keyword="προϋπολογισμό ανύπαρκτηλέξη", limit=5, verbose=False)
+    )
+
+    assert "No email held every word" in capsys.readouterr().out
+
+
+def test_each_row_is_scored_once(conn):
+    """Selected from a plain subquery, SQLite flattened it and scored every
+    matching row a second time for the sort key: a Python call per row."""
+    from src.store.greek import _match_score
+    from src.store.recall import _search_decisions
+
+    calls = []
+
+    def counting(text, phrase, tokens):
+        calls.append(text)
+        return _match_score(text, phrase, tokens)
+
+    conn.create_function("sb_match", 3, counting, deterministic=True)
+    rows = conn.execute("SELECT COUNT(*) FROM decisions").fetchone()[0]
+
+    assert _search_decisions(conn, "προυπολογισμος καρτων", 5)
+    assert len([c for c in calls if c]) == rows  # the empty one is the registration probe

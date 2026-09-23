@@ -96,7 +96,7 @@ The MCP server exposes 23 tools (all defined in `src/mcp_server.py`). Register t
 
 ### People and topics
 
-- `person_context(name_or_email, days, limit)`. History, sentiment, decisions, open actions, communication pattern. Each list is capped at `limit` (default 20) and carries a `<name>_total` sibling with the real count, so a truncated answer is distinguishable from a complete one.
+- `person_context(name_or_email, days, limit)`. History, sentiment, decisions, open actions, communication pattern. Each list is capped at `limit` (default 20) and carries a `<name>_total` sibling with the real count, so a truncated answer is distinguishable from a complete one. A name is matched ignoring case and accents; when several people match, the most-emailed one is used and `match_count` / `other_candidates` say who else it could be (`sender_brief` and `meeting_prep` resolve names the same way).
 - `topic_context(topic, days, limit)`. Key people, decisions, actions, facts. Same `limit` and `<name>_total` contract.
 - `sender_brief(name_or_email, days)`. Compact briefing suitable for inline display.
 - `meeting_prep(people, topic, days)`. Per-attendee dossiers, optionally scoped to a topic.
@@ -110,7 +110,7 @@ The MCP server exposes 23 tools (all defined in `src/mcp_server.py`). Register t
 ### Attachments and images
 
 - `search_attachments(query, limit)`. FTS over extracted text and LLM summaries.
-- `attachment_image_search(query, limit)`. LIKE match on vision descriptions of classified content images.
+- `attachment_image_search(query, limit)`. Case- and accent-blind match on vision descriptions of classified content images: the whole query first, then any meaningful word (`partial_match`).
 
 ### Calendar
 

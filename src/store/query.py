@@ -187,8 +187,9 @@ def query_by_person(conn: sqlite3.Connection, name_or_email: str, limit: int = 2
                 e.sentiment
             FROM emails e
             JOIN email_people ep ON e.id = ep.email_id
-            JOIN people p ON ep.person_id = p.id
-            WHERE sb_fold(p.name) LIKE ?
+            -- People are folded in a subquery, once each. Joined, the planner
+            -- could fold once per email link (1.3M rows, seconds per call).
+            WHERE ep.person_id IN (SELECT id FROM people WHERE sb_fold(name) LIKE ?)
             ORDER BY e.date_received DESC
             LIMIT ?
         """
@@ -702,13 +703,17 @@ def query_combined(
 
     # Person filter
     if person:
+        # People are filtered in a subquery, once each; see query_by_person.
         joins.append("JOIN email_people ep ON e.id = ep.email_id")
-        joins.append("JOIN people p ON ep.person_id = p.id")
         if "@" in person:
-            where_clauses.append("LOWER(p.email) = LOWER(?)")
+            where_clauses.append(
+                "ep.person_id IN (SELECT id FROM people WHERE LOWER(email) = LOWER(?))"
+            )
             params.append(person.strip())
         else:
-            where_clauses.append("sb_fold(p.name) LIKE ?")
+            where_clauses.append(
+                "ep.person_id IN (SELECT id FROM people WHERE sb_fold(name) LIKE ?)"
+            )
             params.append(f"%{search_fold(person)}%")
 
     # Topic filter
@@ -793,6 +798,8 @@ def meeting_prep(
 
     result: dict[str, Any] = {"attendees": [], "topic_context": None}
 
+    from src.store.context import resolve_person
+
     for person in people:
         dossier: dict[str, Any] = {
             "name": person,
@@ -803,11 +810,17 @@ def meeting_prep(
             "sentiment_summary": {},
         }
 
-        # Build person subquery (avoids SQL string concatenation)
-        if "@" in person:
-            person_param = person.strip()
-        else:
-            person_param = f"%{search_fold(person)}%"
+        # One person per attendee, resolved as person_context resolves a name. A
+        # folded LIKE in every query merged every namesake into one dossier.
+        person_row, match_count, others = resolve_person(conn, person)
+        dossier["match_count"] = match_count
+        dossier["other_candidates"] = others
+        if person_row is None:
+            result["attendees"].append(dossier)
+            continue
+        dossier["resolved_name"] = person_row["name"]
+        dossier["resolved_email"] = person_row["email"]
+        person_id = person_row["id"]
 
         # Recent emails
         cursor = conn.execute(
@@ -816,12 +829,10 @@ def meeting_prep(
                 e.subject, e.summary, ep.role_in_email as role, e.sentiment
             FROM emails e
             JOIN email_people ep ON e.id = ep.email_id
-            WHERE ep.person_id IN (SELECT id FROM people WHERE
-                CASE WHEN ? THEN LOWER(email) = LOWER(?) ELSE sb_fold(name) LIKE ? END)
-                AND e.date_received >= ?
+            WHERE ep.person_id = ? AND e.date_received >= ?
             ORDER BY e.date_received DESC LIMIT ?
         """,
-            ("@" in person, person_param, person_param, cutoff, limit_per_person),
+            (person_id, cutoff, limit_per_person),
         )
         dossier["emails"] = [dict(r) for r in cursor.fetchall()]
 
@@ -839,12 +850,10 @@ def meeting_prep(
             FROM decisions d
             JOIN emails e ON d.email_id = e.id
             JOIN email_people ep ON e.id = ep.email_id
-            WHERE ep.person_id IN (SELECT id FROM people WHERE
-                CASE WHEN ? THEN LOWER(email) = LOWER(?) ELSE sb_fold(name) LIKE ? END)
-                AND e.date_received >= ?
+            WHERE ep.person_id = ? AND e.date_received >= ?
             ORDER BY date DESC LIMIT 10
         """,
-            ("@" in person, person_param, person_param, cutoff),
+            (person_id, cutoff),
         )
         dossier["decisions"] = [dict(r) for r in cursor.fetchall()]
 
@@ -856,12 +865,10 @@ def meeting_prep(
             FROM action_items a
             JOIN emails e ON a.email_id = e.id
             JOIN email_people ep ON e.id = ep.email_id
-            WHERE ep.person_id IN (SELECT id FROM people WHERE
-                CASE WHEN ? THEN LOWER(email) = LOWER(?) ELSE sb_fold(name) LIKE ? END)
-                AND a.status = 'open'
+            WHERE ep.person_id = ? AND a.status = 'open'
             ORDER BY a.deadline IS NULL, a.deadline ASC LIMIT 10
         """,
-            ("@" in person, person_param, person_param),
+            (person_id,),
         )
         dossier["open_actions"] = [dict(r) for r in cursor.fetchall()]
 
@@ -873,12 +880,10 @@ def meeting_prep(
             JOIN topics t ON et.topic_id = t.id
             JOIN emails e ON et.email_id = e.id
             JOIN email_people ep ON e.id = ep.email_id
-            WHERE ep.person_id IN (SELECT id FROM people WHERE
-                CASE WHEN ? THEN LOWER(email) = LOWER(?) ELSE sb_fold(name) LIKE ? END)
-                AND e.date_received >= ?
+            WHERE ep.person_id = ? AND e.date_received >= ?
             GROUP BY t.id ORDER BY count DESC LIMIT 5
         """,
-            ("@" in person, person_param, person_param, cutoff),
+            (person_id, cutoff),
         )
         dossier["topics"] = [dict(r) for r in cursor.fetchall()]
 

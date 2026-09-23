@@ -28,6 +28,11 @@ Folding is 1:1 per character, which is what makes it safe here: snippet() offset
 computed against the folded text still line up with the original.
 """
 
+import re
+import sqlite3
+import unicodedata
+from functools import lru_cache
+
 # Precomposed Greek vowels carrying tonos or dialytika, mapped to their bare form.
 # Uppercase entries are included because Greek all-caps legitimately keeps the
 # dialytika even though it drops the tonos, and because text arrives in both.
@@ -72,31 +77,73 @@ def search_fold(text: str | None) -> str:
     SQLite's LIKE folds ASCII case only, and people are mostly stored in ALL-CAPS
     Greek, so "Παπαδόπουλος" never matched "ΠΑΠΑΔΟΠΟΥΛΟΣ". Final sigma is merged
     into sigma because a lower-cased capital and a typed word disagree on it.
+    NFC first: text from PDFs and macOS arrives decomposed (alpha plus a
+    combining acute), which the FTS tokenizer folds and fold() would not.
     """
     if not text:
         return ""
-    return fold(text).lower().replace("ς", "σ")
+    return fold(unicodedata.normalize("NFC", text)).lower().replace("ς", "σ")
 
 
-# Words too common to carry a search on their own. The any-token fallback drops
-# them, as it drops numbers and anything under three characters. Stored folded.
+# Words too common to carry a search on their own, including the question words
+# agents open with. The any-token fallback drops them. Stored folded.
 STOPWORDS = frozenset(
     search_fold(word)
     for word in (
         "και", "της", "του", "των", "για", "στο", "στη", "στην", "στον", "στα",
         "από", "που", "με", "να", "τα", "το", "τη", "την", "τον", "οι", "ένα",
-        "μια", "είναι", "θα", "δεν", "the", "and", "for", "with", "from", "that",
-        "this", "are", "was", "not", "but", "you", "all", "any", "our",
+        "μια", "είναι", "θα", "δεν", "τους", "τις", "στις", "στους", "ότι",
+        "πώς", "τι", "ποιος", "ποια", "ποιο", "ποιες", "ποιοι", "όταν",
+        "σχετικά", "έχει", "είχε", "ήταν", "αυτό", "αυτή", "αυτά", "μας", "σας",
+        "the", "and", "for", "with", "from", "that", "this", "are", "was", "not",
+        "but", "you", "all", "any", "our", "what", "how", "when", "who", "which",
+        "about", "did", "does", "have", "has", "there", "will", "can", "should",
+        "would", "could", "they", "their", "them", "into", "also",
     )
 )  # fmt: skip
 
 
+def _strip_punctuation(word: str) -> str:
+    """``word`` without leading or trailing punctuation (any Unicode P* category).
+
+    Quotes of every kind, question marks (the Greek one is U+037E) and ellipses
+    around a word said nothing about it and broke both the phrase and its tokens.
+    """
+    start, end = 0, len(word)
+    while start < end and unicodedata.category(word[start]).startswith("P"):
+        start += 1
+    while end > start and unicodedata.category(word[end - 1]).startswith("P"):
+        end -= 1
+    return word[start:end]
+
+
+def search_phrase(text: str | None) -> str:
+    """The folded query as one phrase, punctuation stripped from each word."""
+    words = (_strip_punctuation(word) for word in (text or "").split())
+    return " ".join(search_fold(word) for word in words if word)
+
+
 def search_tokens(text: str | None) -> list[str]:
-    """Distinct folded tokens worth an any-token search, in query order."""
+    """Distinct folded tokens worth an any-token search, in query order.
+
+    Three characters or more; a two-character word only when it is written as an
+    acronym (UX, EU, ΔΤ) or carries a digit (Q4), because it is often the subject
+    of the whole query; numbers only from five digits, so a reference number is
+    kept and a year, which would match half the corpus, is not.
+    """
     tokens = []
-    for token in search_fold(text).split():
-        token = token.strip(".,;:!?()[]{}\"'«»")
-        if len(token) >= 3 and not token.isdigit() and token not in STOPWORDS:
+    for word in (text or "").split():
+        raw = _strip_punctuation(word)
+        token = search_fold(raw)
+        if not token or token in STOPWORDS:
+            continue
+        if token.isdigit():
+            keep = len(token) >= 5
+        elif len(token) >= 3:
+            keep = True
+        else:
+            keep = len(token) == 2 and (raw.isupper() or any(c.isdigit() for c in raw))
+        if keep:
             tokens.append(token)
     return list(dict.fromkeys(tokens))
 
@@ -105,26 +152,50 @@ def search_tokens(text: str | None) -> list[str]:
 PHRASE_MATCH = 1 << 20
 
 
+@lru_cache(maxsize=64)
+def _token_pattern(joined_tokens: str) -> re.Pattern | None:
+    """One regex for a query's tokens, each matched at the start of a word.
+
+    A token used to count anywhere inside a word, so 'act' matched 'contract'.
+    At the start it still takes Greek inflection (καρτ-ες, καρτ-ων). A token
+    under three characters is an acronym and must be the whole word.
+    """
+    tokens = sorted((t for t in joined_tokens.split("\x1f") if t), key=len, reverse=True)
+    if not tokens:
+        return None
+    parts = (re.escape(t) + (r"(?!\w)" if len(t) < 3 else "") for t in tokens)
+    return re.compile(r"(?<!\w)(?:" + "|".join(parts) + ")")
+
+
 def _match_score(text: str | None, phrase: str, joined_tokens: str) -> int:
     """PHRASE_MATCH if the folded text holds ``phrase``, else how many tokens it holds.
 
     One function, so a search that falls back from the whole query to its tokens
     folds each row once, in one pass over the table: the fold runs in Python and
-    a second pass cost as much again.
+    a second pass cost as much again. The phrase is a substring test, as the
+    LIKE it replaced was.
     """
     folded = search_fold(text)
     if phrase and phrase in folded:
         return PHRASE_MATCH
-    return sum(1 for token in joined_tokens.split("\x1f") if token and token in folded)
+    pattern = _token_pattern(joined_tokens)
+    return len(set(pattern.findall(folded))) if pattern else 0
 
 
 def register_sql_functions(conn) -> None:
     """sb_fold(text) and sb_match(text, phrase, tokens) for the LIKE-based lookups.
 
     Registered by every connection the store opens (schema.create_database and
-    get_connection). Unlike the generated FTS columns, which must stay pure SQL,
-    these only ever run inside a query issued by this code.
+    get_connection), and again, lazily, by the entry points that use them. A
+    connection that has them is left alone: create_function fails while any of
+    its statements is mid-iteration. Unlike the generated FTS columns, which must
+    stay pure SQL, these only ever run inside a query issued by this code.
     """
+    try:
+        conn.execute("SELECT sb_match('', '', '')").fetchone()
+        return
+    except sqlite3.OperationalError:
+        pass
     conn.create_function("sb_fold", 1, search_fold, deterministic=True)
     conn.create_function("sb_match", 3, _match_score, deterministic=True)
 

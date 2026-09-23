@@ -13,7 +13,13 @@ import sqlite3
 from src.store.context import get_person_context, get_topic_context
 from src.store.conversation_query import search_conversations_keyword
 from src.store.fusion import reciprocal_rank_fusion
-from src.store.greek import PHRASE_MATCH, register_sql_functions, search_fold, search_tokens
+from src.store.greek import (
+    PHRASE_MATCH,
+    register_sql_functions,
+    search_fold,
+    search_phrase,
+    search_tokens,
+)
 from src.store.normalizer import normalize_topic
 from src.store.query import fts5_query_variants, query_by_keyword, search_attachments
 from src.store.teams_query import search_teams as _search_teams_q
@@ -35,14 +41,15 @@ def _folded_bucket(conn: sqlite3.Connection, sql: str, keyword: str, limit: int)
 
     ``sql`` takes (phrase, joined tokens, limit), selects sb_match(...) AS score
     and orders by it first. Matching is on folded text (case, accents, final
-    sigma), which LIKE alone does for ASCII only. Rows holding the whole query
-    keep each bucket's old semantics and come back alone when there are any.
-    Otherwise rows holding some of its meaningful tokens come back, most first,
-    flagged partial_match: the whole-query form alone emptied these buckets for
-    the long queries agents write. A one-word query gets no token pass, since
-    "any" would equal "all".
+    sigma, punctuation around words), which LIKE alone does for ASCII only. Rows
+    holding the whole query keep each bucket's old semantics and come back alone
+    when there are any. Otherwise rows holding some of its meaningful tokens come
+    back, most first, flagged partial_match: the whole-query form alone emptied
+    these buckets for the long queries agents write. A one-word query gets no
+    token pass, since "any" would equal "all".
     """
-    phrase = search_fold(keyword).strip()
+    register_sql_functions(conn)  # the MCP image search calls this directly
+    phrase = search_phrase(keyword)
     if not phrase:
         return []
     tokens = search_tokens(keyword) if len(phrase.split()) >= 2 else []
@@ -54,24 +61,43 @@ def _folded_bucket(conn: sqlite3.Connection, sql: str, keyword: str, limit: int)
     return out
 
 
+# Each bucket scores every row once, in a MATERIALIZED CTE. Selected from a plain
+# subquery, SQLite flattened it and ran sb_match again for the sort key of every
+# matching row, and the score is a Python call.
+
+
 def _search_decisions(conn: sqlite3.Connection, keyword: str, limit: int) -> list[dict]:
-    # Dated like query_decisions: a decision without its own date takes its
-    # parent's, so a meeting's decisions no longer sink below every dated one.
+    # Dated, titled and sourced like query_decisions: a decision without its own
+    # date takes its parent's, so a meeting's decisions no longer sink below every
+    # dated one, and the row says which meeting or thread it came from.
     return _folded_bucket(
         conn,
         """
-        SELECT d.id, d.email_id, d.decision, d.decided_by, d.decision_date,
-               e.subject as email_subject, d.score
-        FROM (SELECT *, sb_match(decision, ?, ?) AS score FROM decisions) d
+        WITH scored AS MATERIALIZED (
+            SELECT id, sb_match(decision, ?, ?) AS score FROM decisions
+        )
+        SELECT d.id, d.email_id, d.event_id, d.teams_thread_id, d.decision, d.decided_by,
+               d.decision_date,
+               COALESCE(d.decision_date, e.date_received, tt.started_at, ce.start_at,
+                        c.started_at) AS date,
+               COALESCE(e.subject, tt.title, ce.subject, c.summary) AS email_subject,
+               CASE
+                   WHEN e.id IS NOT NULL THEN 'email'
+                   WHEN tt.id IS NOT NULL THEN 'teams'
+                   WHEN ce.id IS NOT NULL THEN 'calendar'
+                   WHEN c.id IS NOT NULL THEN 'conversation'
+                   ELSE 'orphan'
+               END AS source,
+               s.score
+        FROM scored s
+        JOIN decisions d ON d.id = s.id
         LEFT JOIN emails e ON e.id = d.email_id
         LEFT JOIN teams_threads tt ON tt.id = d.teams_thread_id
         LEFT JOIN calendar_events ce ON ce.id = d.event_id
         LEFT JOIN conversation_turns ct ON ct.id = d.conversation_turn_id
         LEFT JOIN conversations c ON c.id = ct.conversation_id
-        WHERE d.score > 0
-        ORDER BY d.score DESC,
-                 COALESCE(d.decision_date, e.date_received, tt.started_at, ce.start_at,
-                          c.started_at) DESC
+        WHERE s.score > 0
+        ORDER BY s.score DESC, date DESC
         LIMIT ?
         """,
         keyword,
@@ -83,12 +109,16 @@ def _search_actions(conn: sqlite3.Connection, keyword: str, limit: int) -> list[
     return _folded_bucket(
         conn,
         """
+        WITH scored AS MATERIALIZED (
+            SELECT id, sb_match(task, ?, ?) AS score FROM action_items
+        )
         SELECT a.id, a.email_id, a.task, a.owner, a.deadline, a.status,
-               e.subject as email_subject, a.score
-        FROM (SELECT *, sb_match(task, ?, ?) AS score FROM action_items) a
+               e.subject as email_subject, s.score
+        FROM scored s
+        JOIN action_items a ON a.id = s.id
         LEFT JOIN emails e ON e.id = a.email_id
-        WHERE a.score > 0
-        ORDER BY a.score DESC, CASE WHEN a.deadline IS NULL THEN 1 ELSE 0 END, a.deadline ASC
+        WHERE s.score > 0
+        ORDER BY s.score DESC, CASE WHEN a.deadline IS NULL THEN 1 ELSE 0 END, a.deadline ASC
         LIMIT ?
         """,
         keyword,
@@ -102,12 +132,16 @@ def _search_commitments(conn: sqlite3.Connection, keyword: str, limit: int) -> l
     return _folded_bucket(
         conn,
         """
+        WITH scored AS MATERIALIZED (
+            SELECT id, sb_match(commitment, ?, ?) AS score FROM commitments
+        )
         SELECT c.id, c.email_id, c.commitment, c.by_person, c.to_person,
-               e.subject as email_subject, c.score
-        FROM (SELECT *, sb_match(commitment, ?, ?) AS score FROM commitments) c
+               e.subject as email_subject, s.score
+        FROM scored s
+        JOIN commitments c ON c.id = s.id
         LEFT JOIN emails e ON e.id = c.email_id
-        WHERE c.score > 0
-        ORDER BY c.score DESC
+        WHERE s.score > 0
+        ORDER BY s.score DESC
         LIMIT ?
         """,
         keyword,
@@ -121,10 +155,14 @@ def _search_inline_images(conn: sqlite3.Connection, keyword: str, limit: int) ->
     return _folded_bucket(
         conn,
         """
-        SELECT sha256, classification, vision_description, width, height, score
-        FROM (SELECT *, sb_match(vision_description, ?, ?) AS score FROM inline_images)
-        WHERE score > 0
-        ORDER BY score DESC
+        WITH scored AS MATERIALIZED (
+            SELECT sha256, sb_match(vision_description, ?, ?) AS score FROM inline_images
+        )
+        SELECT i.sha256, i.classification, i.vision_description, i.width, i.height, s.score
+        FROM scored s
+        JOIN inline_images i ON i.sha256 = s.sha256
+        WHERE s.score > 0
+        ORDER BY s.score DESC
         LIMIT ?
         """,
         keyword,
@@ -328,6 +366,11 @@ def recall(
     }
     total_hits = sum(len(v) for v in text_kinds.values())
     kinds_with_results = [k for k, v in text_kinds.items() if v]
+    # Kinds whose every row came from the any-token fallback: nothing there held
+    # the whole query, which a caller reading only the summary could not tell.
+    partial_kinds = [
+        k for k, v in text_kinds.items() if v and all(r.get("partial_match") for r in v)
+    ]
 
     return {
         "query": query,
@@ -337,6 +380,7 @@ def recall(
         "summary": {
             "total_hits": total_hits,
             "kinds_with_results": kinds_with_results,
+            "partial_kinds": partial_kinds,
             "has_person_context": person_context is not None,
             "has_topic_context": topic_context is not None,
         },

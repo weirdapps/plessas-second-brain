@@ -2729,3 +2729,27 @@ def test_wrapper_drift_is_quiet_when_in_sync(hc):
         [], {}, {}, {}, [], {"a.sh": {"status": "OK"}, "b.sh": {"status": "NOT_DEPLOYED"}}
     )
     assert not any("Wrapper archive differs" in i for i in issues), issues
+
+
+def test_check_sharepoint_counts_own_tenant_parked_links_as_eligible(hc):
+    """Mirrors retry_candidates: our own tenant is never 'unsupported-host', so a
+    link parked there is retry work, and retry work nobody touches is overdue.
+    A foreign tenant's parked link stays silent, as before."""
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE sharepoint_links (url TEXT, last_status TEXT, attempts INT, "
+        "last_attempt_at TEXT, fetched_at TEXT)"
+    )
+    db.execute(
+        "INSERT INTO sharepoint_links VALUES ('https://partner.sharepoint.com/a', "
+        "'unsupported-host', 1, '2026-01-01T00:00:00Z', NULL)"
+    )
+    assert hc.check_sharepoint(db)["status"] != "STALE"
+
+    db.execute(
+        "INSERT INTO sharepoint_links VALUES ('https://contoso-my.sharepoint.com/b', "
+        "'unsupported-host', 1, '2026-01-01T00:00:00Z', NULL)"
+    )
+    assert hc.check_sharepoint(db)["status"] == "STALE"

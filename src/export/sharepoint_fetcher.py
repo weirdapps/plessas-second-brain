@@ -32,25 +32,42 @@ from src.export.sharepoint_cli import (
 logger = logging.getLogger(__name__)
 
 
+def managed_sharepoint_hosts(managed_host: str) -> frozenset[str]:
+    """The tenant host we hold a session for, plus its OneDrive twin.
+
+    OneDrive for Business lives on the tenant's "-my" twin host (for example
+    ``contoso-my`` beside ``contoso``) and is opened with the same session, so
+    either spelling of the setting yields both.
+    """
+    host = (managed_host or "").strip().lower()
+    label, dot, rest = host.partition(".")
+    if not label or not dot:
+        return frozenset()
+    base = label.removesuffix("-my")
+    return frozenset({f"{base}.{rest}", f"{base}-my.{rest}"})
+
+
 def is_managed_sharepoint_host(url: str, managed_host: str) -> bool:
-    """Whether ``url`` is on the SharePoint host we hold a session for.
+    """Whether ``url`` is on the SharePoint tenant we hold a session for.
 
     An "auth-required" result on the managed host means the session expired —
     a re-login (``sharepoint-cli login --host <host>``) fixes it, so a caller
     is right to stop and prompt for it. The same result on any other host is an
     external tenant we can never authenticate to via our login, and should be
     skipped rather than aborting the whole pass.
+
+    The netloc must be the bare host: a userinfo part (``host@evil``) or a port
+    is refused rather than parsed around, since the netloc is what reaches
+    sharepoint-cli's ``--host``.
     """
-    if not managed_host:
-        return False
     try:
-        host = urlparse(url).netloc.lower()
+        netloc = urlparse(url).netloc.lower()
     except ValueError:
         return False
-    return host == managed_host.strip().lower()
+    return netloc in managed_sharepoint_hosts(managed_host)
 
 
-FetchStatus = Literal["ok", "stale", "auth-required", "http-error", "exception"]
+FetchStatus = Literal["ok", "stale", "auth-required", "http-error", "exception", "unsupported-host"]
 
 # After this many consecutive failed fetch attempts, the retry pass stops trying
 # a link every night. It is a throttle, not an abandonment — see the cool-off.
@@ -66,12 +83,16 @@ MAX_SHAREPOINT_ATTEMPTS = 5
 SHAREPOINT_RETRY_COOL_OFF_DAYS = 7
 
 
-def retry_candidates(conn, now: str | None = None) -> list:
+def retry_candidates(conn, now: str | None = None, managed_host: str = "") -> list:
     """Links seen before but never fetched OK, that are due for another attempt.
 
     Returns (url, message_id) rows. `attempts` throttles: past the cap a link is
     rested rather than dropped, and offered again once the cool-off expires.
-    'unsupported-host' is a permanent external tenant and stays excluded.
+    'unsupported-host' is a permanent external tenant and stays excluded, except
+    on our own tenant, which is never unsupported: while SHAREPOINT_HOST sat at
+    its placeholder on the producer, session expiries there were parked under
+    that status (5 links on 2026-09-03, 17 on the OneDrive twin), and this is
+    what takes them back without a one-off repair.
 
     One class of link is never resurrected: a 404 that has spent its whole
     attempt budget without ever fetching OK. sharepoint-cli maps not_found onto
@@ -89,14 +110,17 @@ def retry_candidates(conn, now: str | None = None) -> list:
     cutoff = (
         datetime.fromisoformat(stamp) - timedelta(days=SHAREPOINT_RETRY_COOL_OFF_DAYS)
     ).isoformat()
+    # Always two slots (host and OneDrive twin), so the statement stays a
+    # constant; an empty pattern matches no URL when no tenant is configured.
+    own = [f"https://{h}/%" for h in sorted(managed_sharepoint_hosts(managed_host))] + ["", ""]
     return conn.execute(
         "SELECT url, message_id FROM sharepoint_links "
         "WHERE (fetched_at IS NULL OR last_status = 'stale') "
-        "AND COALESCE(last_status, '') != 'unsupported-host' "
+        "AND (COALESCE(last_status, '') != 'unsupported-host' OR url LIKE ? OR url LIKE ?) "
         "AND (attempts < ? OR (COALESCE(last_attempt_at, '') < ? "
         "                      AND NOT (fetched_at IS NULL "
         "                               AND COALESCE(last_status, '') = 'stale')))",
-        (MAX_SHAREPOINT_ATTEMPTS, cutoff),
+        (own[0], own[1], MAX_SHAREPOINT_ATTEMPTS, cutoff),
     ).fetchall()
 
 
@@ -131,17 +155,35 @@ def _name_from_url(url: str) -> str:
     return unquote(tail) or "download.bin"
 
 
-def fetch_sharepoint_link(url: str, out_dir: Path) -> SharepointFetchResult:
+def fetch_sharepoint_link(
+    url: str, out_dir: Path, managed_host: str | None = None
+) -> SharepointFetchResult:
     """
     Fetch a SharePoint URL via sharepoint-cli. Returns a structured result;
     never raises (callers want to record every attempt).
+
+    Only our own tenant is ever fetched. sharepoint-cli retargets the stored
+    session at whatever ``--host`` it is given and attaches its cookies, and the
+    URLs reaching here come from arbitrary email bodies, so any other host gets
+    'unsupported-host' with no subprocess at all. ``managed_host`` defaults to
+    config.SHAREPOINT_HOST, read at call time.
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if managed_host is None:
+        from src import config
+
+        managed_host = config.SHAREPOINT_HOST
     host = host_for_url(url)
     if not host:
         return SharepointFetchResult(
             url=url, status="exception", error_message=f"cannot derive host from URL: {url}"
         )
+    if not is_managed_sharepoint_host(url, managed_host):
+        return SharepointFetchResult(
+            url=url,
+            status="unsupported-host",
+            error_message=f"{host} is not the managed SharePoint tenant; not fetched",
+        )
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # sharepoint-cli writes to a FILE path, while this function's contract is
     # "save into out_dir under the server's name". Fetch to a temp file, then

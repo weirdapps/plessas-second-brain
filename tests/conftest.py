@@ -11,7 +11,8 @@ days before this file existed they were not, each time costing a red CI push:
   reached a real client path.
 
 Both are the same class: a test that silently borrows the developer's machine.
-The two autouse fixtures below make that impossible rather than reviewable.
+The two autouse fixtures below make that impossible rather than reviewable. The
+per-host settings file src/config.py reads is redirected for the same reason.
 
 The data root is redirected in `pytest_configure`, NOT in a session fixture.
 src/config.py resolves DATA_ROOT, DEFAULT_DB, ATTACHMENTS_DIR, RAW_BATCH_DIR,
@@ -44,6 +45,13 @@ def pytest_configure(config):
     # reachable from a test.
     if not os.environ.get("BRAIN_DATA_DIR"):
         os.environ["BRAIN_DATA_DIR"] = tempfile.mkdtemp(prefix="brain-test-data-")
+    # src/config.py applies the per-host settings file at import. A developer's
+    # real one would hand every test this machine's identity and tenant, which
+    # CI never has, so point it at a path that cannot exist. Unconditional, unlike
+    # the data root above: there is no legitimate reason to test against it.
+    os.environ["BRAIN_CONFIG_FILE"] = os.path.join(
+        tempfile.mkdtemp(prefix="brain-test-config-"), "absent"
+    )
 
 
 class _BlockedSocket(socket.socket):

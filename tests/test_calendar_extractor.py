@@ -176,3 +176,51 @@ def test_extract_event_raises_diagnosably_on_a_thinking_only_response(monkeypatc
 
     with pytest.raises(ValueError, match="no text block"):
         extract_event(_EVENT, _BODY)
+
+
+def test_extract_event_redacts_credentials_before_the_prompt(monkeypatch):
+    """The event body goes to the model. Credentials are redacted before the
+    4,000-character cut, so a key straddling the cut cannot survive as a
+    fragment the pattern no longer recognises."""
+    from src.extract.calendar_extractor import extract_event
+
+    seen = {}
+
+    class FakeMessages:
+        def create(self, **kw):
+            seen["prompt"] = kw["messages"][0]["content"]
+            return _Response(
+                _TextBlock('{"body_summary": "s", "decisions": [], "action_items": []}')
+            )
+
+    fake = type("Client", (), {"messages": FakeMessages()})()
+    monkeypatch.setattr("src.extract.calendar_extractor._get_client_and_model", lambda: (fake, "m"))
+    secret = "AIzaSy" + "A1b2C3d4E5" * 3 + "fghij"  # shape fixture, not a key
+    body = "x" * 3990 + secret + " and the agenda follows."
+
+    extract_event(_EVENT, body)
+
+    assert "AIzaSy" not in seen["prompt"]
+
+
+def test_extract_event_survives_an_attendee_with_a_null_name(monkeypatch):
+    """Graph sends "name": null for some attendees. dict.get(key, default) returns
+    the stored None rather than the default, and str.join raised TypeError on it."""
+    from src.extract.calendar_extractor import extract_event
+
+    seen = {}
+
+    class FakeMessages:
+        def create(self, **kw):
+            seen["prompt"] = kw["messages"][0]["content"]
+            return _Response(
+                _TextBlock('{"body_summary": "s", "decisions": [], "action_items": []}')
+            )
+
+    fake = type("Client", (), {"messages": FakeMessages()})()
+    monkeypatch.setattr("src.extract.calendar_extractor._get_client_and_model", lambda: (fake, "m"))
+    event = {**_EVENT, "attendees": [{"name": None, "email": "a@example.com"}]}
+
+    extract_event(event, _BODY)
+
+    assert "Attendees: a@example.com" in seen["prompt"]

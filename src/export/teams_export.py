@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from typing import Literal
 
 from src.export.teams_cli import TeamsCliAuthRequired, run_teams_cli
+from src.redact import redact_payload, redact_secrets
 
 Scope = Literal["channel", "all"]
 
@@ -411,6 +412,11 @@ def _persist_messages(conn: sqlite3.Connection, chat_id: int, payload: dict) -> 
             parent_id = props.get("replyChainId")
 
         composite_id = f"{chat_id}::{upstream_id}"
+        # Teams never passes through data/staging, so the redaction that
+        # write_json_atomic applies to every staging batch never saw it. All
+        # three stored copies of the message are covered: text, HTML and raw.
+        content_text = redact_secrets(content_text)
+        content_html = redact_secrets(content_html)
         try:
             conn.execute(
                 """
@@ -431,7 +437,7 @@ def _persist_messages(conn: sqlite3.Connection, chat_id: int, payload: dict) -> 
                     content_html,
                     parent_id,
                     1 if _is_system_message(msg_type) else 0,
-                    json.dumps(item),
+                    json.dumps(redact_payload(item)),
                 ),
             )
             inserted += 1

@@ -384,6 +384,20 @@ def cmd_process_sharepoint(args):
         print("Error: Database not found. Run 'brain load' first.")
         sys.exit(1)
 
+    # Fetching is gated on our own tenant (fetch_sharepoint_link), so with the
+    # placeholder host every real link would be refused and parked as the
+    # permanent 'unsupported-host'. That happened on the producer, where the
+    # variable was never set; refuse loudly instead. A dry run fetches nothing.
+    import os
+
+    if not args.dry_run and not os.environ.get("SHAREPOINT_HOST"):
+        print(
+            "Error: SHAREPOINT_HOST is not set. Set it (environment or "
+            "~/.config/second-brain/env) to the tenant sharepoint-cli is logged in to.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     # Ensure schema is up to date
     conn = get_connection(db_path)
     run_migrations(conn)
@@ -446,9 +460,13 @@ def cmd_process_sharepoint(args):
         # later, so it must stay 'http-error' and stay in the retry pool.
         # 'unsupported-host' is permanent, and parking a managed link there
         # would be the same abandonment bug in a new place.
-        external_auth = (
-            result.status == "auth-required" or result.http_status == 403
-        ) and not is_managed_sharepoint_host(url, SHAREPOINT_HOST)
+        # The fetcher refuses a foreign tenant itself, before any request, and
+        # says so with 'unsupported-host'; the relabel below stays as the second
+        # line for a result that reached a host we hold no session for.
+        external_auth = result.status == "unsupported-host" or (
+            (result.status == "auth-required" or result.http_status == 403)
+            and not is_managed_sharepoint_host(url, SHAREPOINT_HOST)
+        )
         recorded_status = "unsupported-host" if external_auth else result.status
         record_link_in_db(
             conn,
@@ -481,7 +499,7 @@ def cmd_process_sharepoint(args):
     # still inside the scan window — otherwise old failures never clear.
     # 'unsupported-host' is a permanent external tenant, so it is excluded.
     if not args.dry_run:
-        retry_rows = retry_candidates(conn)
+        retry_rows = retry_candidates(conn, managed_host=SHAREPOINT_HOST)
         if retry_rows:
             print(f"Retrying {len(retry_rows)} previously unfetched/stale link(s)...")
         for url, message_id in retry_rows:

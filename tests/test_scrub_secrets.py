@@ -33,8 +33,11 @@ def scrub():
     return module
 
 
-def _db(tmp_path) -> Path:
+def _db(tmp_path, scrub=None, monkeypatch=None) -> Path:
     path = tmp_path / "brain.db"
+    if scrub is not None and monkeypatch is not None:
+        # The script takes no --db: it works on the configured database.
+        monkeypatch.setattr(scrub, "DEFAULT_DB", path)
     conn = create_database(str(path))
     conn.execute(
         "INSERT INTO emails (message_id, date_received, content) VALUES (?, ?, ?)",
@@ -66,11 +69,11 @@ def _file_bytes(path: Path) -> bytes:
     return data
 
 
-def test_dry_run_reports_and_changes_nothing(scrub, tmp_path, capsys):
-    path = _db(tmp_path)
+def test_dry_run_reports_and_changes_nothing(scrub, tmp_path, capsys, monkeypatch):
+    path = _db(tmp_path, scrub, monkeypatch)
     before = _file_bytes(path)
 
-    rc = scrub.main(["--db", str(path)])
+    rc = scrub.main([])
 
     assert rc == 1  # hits present
     out = capsys.readouterr().out
@@ -80,10 +83,10 @@ def test_dry_run_reports_and_changes_nothing(scrub, tmp_path, capsys):
     assert _file_bytes(path) == before
 
 
-def test_apply_redacts_every_hit_and_nothing_else(scrub, tmp_path):
-    path = _db(tmp_path)
+def test_apply_redacts_every_hit_and_nothing_else(scrub, tmp_path, monkeypatch):
+    path = _db(tmp_path, scrub, monkeypatch)
 
-    assert scrub.main(["--db", str(path), "--apply"]) == 0
+    assert scrub.main(["--apply"]) == 0
 
     conn = sqlite3.connect(path)
     m1, m2 = (r[0] for r in conn.execute("SELECT content FROM emails ORDER BY id"))
@@ -94,13 +97,13 @@ def test_apply_redacts_every_hit_and_nothing_else(scrub, tmp_path):
     assert turn == "export ANTHROPIC_API_KEY=[REDACTED:anthropic-key]"
 
 
-def test_apply_leaves_no_copy_in_the_database_file(scrub, tmp_path):
+def test_apply_leaves_no_copy_in_the_database_file(scrub, tmp_path, monkeypatch):
     """Not in a free page, not in an FTS segment, not in the WAL, and not in the
     lowercased form the full-text tokenizer stores."""
-    path = _db(tmp_path)
+    path = _db(tmp_path, scrub, monkeypatch)
     assert GOOGLE.encode() in _file_bytes(path)
 
-    scrub.main(["--db", str(path), "--apply"])
+    scrub.main(["--apply"])
 
     data = _file_bytes(path)
     for secret in (GOOGLE, ANTHROPIC):
@@ -108,10 +111,10 @@ def test_apply_leaves_no_copy_in_the_database_file(scrub, tmp_path):
         assert secret.lower().encode() not in data
 
 
-def test_full_text_index_stays_consistent(scrub, tmp_path):
-    path = _db(tmp_path)
+def test_full_text_index_stays_consistent(scrub, tmp_path, monkeypatch):
+    path = _db(tmp_path, scrub, monkeypatch)
 
-    scrub.main(["--db", str(path), "--apply"])
+    scrub.main(["--apply"])
 
     conn = sqlite3.connect(path)
     for fts in ("emails_fts", "conversation_turns_fts"):
@@ -123,15 +126,16 @@ def test_full_text_index_stays_consistent(scrub, tmp_path):
     assert hits == 1  # the redacted email is still findable by its other words
 
 
-def test_a_second_apply_is_a_no_op(scrub, tmp_path, capsys):
-    path = _db(tmp_path)
-    scrub.main(["--db", str(path), "--apply"])
+def test_a_second_apply_is_a_no_op(scrub, tmp_path, capsys, monkeypatch):
+    _db(tmp_path, scrub, monkeypatch)
+    scrub.main(["--apply"])
     capsys.readouterr()
 
-    assert scrub.main(["--db", str(path), "--apply"]) == 0
+    assert scrub.main(["--apply"]) == 0
     assert "0 rows redacted" in capsys.readouterr().out
-    assert scrub.main(["--db", str(path)]) == 0  # the dry run now finds nothing
+    assert scrub.main([]) == 0  # the dry run now finds nothing
 
 
-def test_a_missing_database_is_an_error(scrub, tmp_path):
-    assert scrub.main(["--db", str(tmp_path / "absent.db")]) == 2
+def test_a_missing_database_is_an_error(scrub, tmp_path, monkeypatch):
+    monkeypatch.setattr(scrub, "DEFAULT_DB", tmp_path / "absent.db")
+    assert scrub.main([]) == 2

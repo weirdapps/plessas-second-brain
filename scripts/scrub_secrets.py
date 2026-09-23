@@ -140,12 +140,14 @@ def _apply(conn: sqlite3.Connection, found: dict[tuple[str, str], list[int]]) ->
 
 
 def main(argv: list[str] | None = None) -> int:
+    # No --db flag on purpose: the database is the configured one (BRAIN_DATA_DIR,
+    # else <repo>/data), so no command-line string ever reaches sqlite3.connect.
+    # To rehearse on a copy, point BRAIN_DATA_DIR at the copy's directory.
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
-    parser.add_argument("--db", default=str(DEFAULT_DB), help="path to brain.db")
     parser.add_argument("--apply", action="store_true", help="rewrite the rows (default: dry run)")
     args = parser.parse_args(argv)
 
-    db = Path(args.db)
+    db = Path(DEFAULT_DB)
     if not db.exists():
         print(f"Error: no database at {db}", file=sys.stderr)
         return 2

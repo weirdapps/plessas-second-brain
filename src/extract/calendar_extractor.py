@@ -12,9 +12,15 @@ def parse_extraction_response(raw: str) -> dict:
 
     Defensive parsing:
     - Strip markdown code fences if present (```json ... ```)
-    - Parse as JSON
+    - Parse as JSON; failing that, the object between the first "{" and the
+      last "}" (a "Here is the JSON:" preamble is the commonest near-miss)
     - Return dict with keys: body_summary (str), decisions (list), action_items (list)
-    - On any parse failure: return {"body_summary": "", "decisions": [], "action_items": []}
+
+    Raises ValueError when no JSON object can be recovered. It used to return
+    empty defaults, which calendar-sync stored as a finished 'extracted' row
+    with an empty summary, and now that an extraction REPLACES an event's
+    decisions and actions it would also have deleted them. Raising lets the
+    caller record 'failed' and keep what it had.
 
     Args:
         raw: Raw LLM response text
@@ -35,19 +41,23 @@ def parse_extraction_response(raw: str) -> dict:
             if closing_fence > first_newline:
                 cleaned = cleaned[first_newline + 1 : closing_fence].strip()
 
-    # Try to parse as JSON
-    try:
-        result = json.loads(cleaned)
-
-        # Ensure required keys exist with defaults
-        return {
-            "body_summary": result.get("body_summary", ""),
-            "decisions": result.get("decisions", []),
-            "action_items": result.get("action_items", []),
-        }
-    except (json.JSONDecodeError, ValueError):
-        # Return empty defaults on any parse failure
-        return {"body_summary": "", "decisions": [], "action_items": []}
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    candidates = [cleaned]
+    if start != -1 and end > start:
+        candidates.append(cleaned[start : end + 1])
+    for candidate in candidates:
+        try:
+            result = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(result, dict):
+            # Ensure required keys exist with defaults
+            return {
+                "body_summary": result.get("body_summary", ""),
+                "decisions": result.get("decisions", []),
+                "action_items": result.get("action_items", []),
+            }
+    raise ValueError(f"calendar extraction response is not JSON: {raw[:80]!r}")
 
 
 def extract_event(event: dict, body: str | None = None) -> dict:
@@ -95,13 +105,14 @@ Extract the following as JSON:
 {{
   "body_summary": "1-2 sentence summary of what this meeting was about",
   "decisions": [
-    {{"decision": "what was decided", "decided_by": "who decided it", "decision_date": "{start_at}"}}
+    {{"decision": "what was decided", "decided_by": "who decided it", "decision_date": null}}
   ],
   "action_items": [
     {{"task": "what needs to be done", "owner": "who owns it", "deadline": "when, if mentioned"}}
   ]
 }}
 
+Set decision_date to the date the text states for the decision, as YYYY-MM-DD, or to JSON null when it states none.
 If the body is empty or contains only a Teams link with no agenda, return empty summary and empty arrays.
 Respond with ONLY the JSON object, no other text."""
 

@@ -1174,8 +1174,14 @@ def test_report_still_flags_genuine_news_staleness(hc):
 
 def _reload_hc(monkeypatch, **env):
     """Re-import health_check (and src.config) with the given env applied."""
+    import src
+
     for key, value in env.items():
         monkeypatch.setenv(key, value)
+    # The re-import also rebinds the package attribute src.config. Restoring only
+    # sys.modules left the two pointing at different modules, so a later test that
+    # patched src.config.X patched a module the code no longer read.
+    monkeypatch.setattr(src, "config", sys.modules["src.config"])
     monkeypatch.delitem(sys.modules, "src.config", raising=False)
     spec = importlib.util.spec_from_file_location("health_check_reloaded", HEALTH_CHECK_PATH)
     assert spec and spec.loader
@@ -2834,3 +2840,28 @@ def test_check_sharepoint_counts_own_tenant_parked_links_as_eligible(hc):
         "'unsupported-host', 1, '2026-01-01T00:00:00Z', NULL)"
     )
     assert hc.check_sharepoint(db)["status"] == "STALE"
+
+
+def test_check_calendar_takes_the_sync_heartbeat_over_an_old_row(hc):
+    """A quiet calendar writes no event row once the change detector works, so
+    calendar-sync stamps sync_metadata after a complete listing. A fresh stamp
+    keeps the row green over events that have not changed in days."""
+    db = _calendar_db(ingested_days_ago=9)
+    db.execute("CREATE TABLE sync_metadata (key TEXT PRIMARY KEY, value TEXT)")
+    db.execute(
+        "INSERT INTO sync_metadata VALUES "
+        "('calendar_last_listed', strftime('%Y-%m-%dT%H:%M:%SZ','now'))"
+    )
+
+    assert hc.check_calendar(db)["status"] == "OK"
+
+
+def test_check_calendar_ignores_a_stale_heartbeat(hc):
+    db = _calendar_db(ingested_days_ago=9)
+    db.execute("CREATE TABLE sync_metadata (key TEXT PRIMARY KEY, value TEXT)")
+    db.execute(
+        "INSERT INTO sync_metadata VALUES "
+        "('calendar_last_listed', strftime('%Y-%m-%dT%H:%M:%SZ','now','-9 days'))"
+    )
+
+    assert hc.check_calendar(db)["status"] == "STALE"

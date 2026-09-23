@@ -358,3 +358,43 @@ def test_migration_v17_loses_a_race_cleanly_instead_of_raising_duplicate_column(
         cols = {row[1] for row in check.execute("PRAGMA table_info(calendar_events)")}
         assert "llm_status" in cols
         check.close()
+
+
+def test_migration_v21_adds_the_calendar_change_key_idempotently():
+    """Nullable and not backfilled: a row stored before it has no etag, so the
+    next sync fetches it once more and stamps it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        conn = sqlite3.connect(str(Path(tmpdir) / "test.db"))
+        _v16_calendar_db(conn)
+        schema.migrate_add_calendar_change_key(conn)
+        schema.migrate_add_calendar_change_key(conn)  # must not crash
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(calendar_events)").fetchall()}
+        assert "change_key" in cols
+        conn.close()
+
+        bare = sqlite3.connect(":memory:")
+        schema.migrate_add_calendar_change_key(bare)  # no calendar tables: a no-op
+        bare.close()
+
+
+def test_migration_v21_loses_a_race_cleanly():
+    """Two units can start together after a deploy. The loser reads the column
+    as missing, then finds it there when it ALTERs; that must be a no-op, not
+    an error that fails its run."""
+
+    class StaleRead(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if sql.startswith("PRAGMA table_info(calendar_events)"):
+                return super().execute("SELECT 1 WHERE 0")
+            return super().execute(sql, *args)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = str(Path(tmpdir) / "test.db")
+        conn = sqlite3.connect(path)
+        _v16_calendar_db(conn)
+        schema.migrate_add_calendar_change_key(conn)
+        conn.close()
+
+        racer = sqlite3.connect(path, factory=StaleRead)
+        schema.migrate_add_calendar_change_key(racer)  # must not raise
+        racer.close()

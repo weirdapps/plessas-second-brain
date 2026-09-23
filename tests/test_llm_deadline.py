@@ -12,6 +12,9 @@ TimeoutStopUSec`:
     sb-daily-sync   30min  sb-news-sync      30min    sb-teams-sync    10min
     sb-noon-catchup 30min  sb-reverse-ingest 30min    sb-calendar-sync  5min
     sb-conversation-sync 5min          TimeoutStopUSec = 1min 30s on all ten
+
+Re-read on 2026-09-23, after three drop-ins: sb-outlook-sync 20min, sb-calendar-sync
+15min, sb-conversation-sync 15min. The other seven are unchanged.
 """
 
 import logging
@@ -33,13 +36,13 @@ from src.cli import main as cli_main
 # 210s reserve (max_call 120 + shutdown grace 90) is held back.
 UNIT_TIMEOUT_AND_BUDGET = {
     "sb-attachments": (3600, 3390),
-    "sb-calendar-sync": (300, 90),
-    "sb-conversation-sync": (300, 90),
+    "sb-calendar-sync": (900, 690),
+    "sb-conversation-sync": (900, 690),
     "sb-curate-docs": (1800, 1590),
     "sb-daily-sync": (1800, 1590),
     "sb-news-sync": (1800, 1590),
     "sb-noon-catchup": (1800, 1590),
-    "sb-outlook-sync": (600, 390),
+    "sb-outlook-sync": (1200, 990),
     "sb-reverse-ingest": (1800, 1590),
     "sb-teams-sync": (600, 390),
 }
@@ -140,8 +143,8 @@ def test_the_reserve_excludes_the_largest_backoff():
 
     Would this pass with the behaviour removed? No. Adding max_backoff back, as the
     spec's formula says, makes the reserve 450 and this assertion reads 210.
-    Concretely it would also push the two 300s units to a margin of minus 150 and stop
-    them booting, which test_every_scheduled_unit_has_a_positive_margin then catches.
+    Every unit is now 600s or longer, so a 450s reserve would still let them all boot:
+    this literal is what catches that mutation.
     """
     assert llm_deadline._deadline_reserve_seconds(120.0) == 210.0
 
@@ -200,20 +203,20 @@ def test_the_timeout_table_holds_exactly_the_ten_scheduled_units():
 def test_every_scheduled_unit_has_a_positive_margin():
     """Nothing in the estate refuses to boot under the 210s reserve.
 
-    The smallest unit is 300s and lands at exactly +90. Verified independently rather
-    than taken on trust, because a reserve that bricks a production unit is the one
-    failure mode of this whole mechanism.
+    The smallest unit is 600s and lands at +390. Verified independently rather than
+    taken on trust, because a reserve that bricks a production unit is the one failure
+    mode of this whole mechanism.
 
     Would this pass with the behaviour removed? It is a guard rather than a behaviour,
     so the mutation it answers is to the reserve, not to this file: any reserve at or
-    above 300 (adding max_backoff gets there, at 450) makes _llm_budget_seconds raise
-    for the two 5-minute units and this test error out.
+    above 600 makes _llm_budget_seconds raise for the 10-minute unit and this test
+    error out.
     """
     margins = {
         unit: llm_deadline._llm_budget_seconds(unit, 120.0, unit_timeout_seconds=timeout)
         for unit, (timeout, _) in UNIT_TIMEOUT_AND_BUDGET.items()
     }
-    assert min(margins.values()) == 90
+    assert min(margins.values()) == 390
     assert all(m > 0 for m in margins.values())
 
 
@@ -351,7 +354,7 @@ def test_the_unit_comes_from_the_cgroup(tmp_path):
 def test_two_units_running_identical_argv_are_told_apart(tmp_path):
     """The reason detection is not the CLI subcommand. sb-noon-catchup and
     sb-outlook-sync both invoke `src.cli sync --engine claude --workers 8
-    --skip-export`, byte for byte, and their timeouts differ by 1200s. Nothing in argv
+    --skip-export`, byte for byte, and their timeouts differ by 600s. Nothing in argv
     separates them; the cgroup does, and the budgets that come out must differ.
 
     Would this pass with the behaviour removed? No. Any argv-derived mapping gives both
@@ -364,7 +367,7 @@ def test_two_units_running_identical_argv_are_told_apart(tmp_path):
     assert llm_deadline._detect_systemd_unit(noon) == "sb-noon-catchup"
     assert llm_deadline._detect_systemd_unit(outlook) == "sb-outlook-sync"
     assert llm_deadline._llm_budget_seconds("sb-noon-catchup", 120.0) == 1590
-    assert llm_deadline._llm_budget_seconds("sb-outlook-sync", 120.0) == 390
+    assert llm_deadline._llm_budget_seconds("sb-outlook-sync", 120.0) == 990
 
 
 def test_the_enclosing_user_manager_slice_is_not_mistaken_for_the_unit(tmp_path):
@@ -667,7 +670,7 @@ def test_a_raised_live_timeout_still_uses_the_smaller_table_value(monkeypatch):
     conservative reading and is kept.
 
     Would this pass with the behaviour removed? No. Replacing min(table, systemd) with
-    the live value alone yields 3390 rather than 390.
+    the live value alone yields 3390 rather than 990.
     """
     monkeypatch.setattr(
         llm_deadline.subprocess,
@@ -675,7 +678,7 @@ def test_a_raised_live_timeout_still_uses_the_smaller_table_value(monkeypatch):
         _fake_systemctl("LoadState=loaded\nTimeoutStartUSec=1h\n"),
     )
     deadline = llm_deadline.install_llm_deadline("sb-outlook-sync", now=1_000_000.0)
-    assert deadline == 1_000_390.0
+    assert deadline == 1_000_990.0
 
 
 def test_agreement_between_table_and_systemd_warns_about_nothing(monkeypatch, caplog):

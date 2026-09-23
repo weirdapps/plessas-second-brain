@@ -7,6 +7,8 @@ the loader logic stays uniform across kinds.
 
 import json
 
+from src.extract.untrusted import DATA_NOT_INSTRUCTIONS, fence
+
 SYSTEM_PROMPT = (
     "You are extracting structured knowledge from a Microsoft Teams thread "
     "(channel post + replies, or a chat session). Produce the JSON object "
@@ -17,7 +19,9 @@ SYSTEM_PROMPT = (
     "ISO 639-1 code for that language."
 )
 
-USER_TEMPLATE = """\
+# The chat name and participants' names are third-party text, as the messages
+# are, so the whole thread goes inside the fence.
+THREAD_TEMPLATE = """\
 THREAD METADATA
 - chat: {chat_label}
 - thread_kind: {thread_kind}
@@ -27,7 +31,12 @@ THREAD METADATA
 - message_count: {message_count}
 
 MESSAGES (chronological; system messages already excluded):
-{transcript}
+{transcript}"""
+
+USER_TEMPLATE = """\
+{data_not_instructions}
+
+{thread}
 
 Return JSON with these keys (use empty string / empty list when nothing applies):
 
@@ -63,7 +72,7 @@ def build_prompt(thread: dict, messages: list[dict]) -> tuple[str, str]:
         (system_prompt, user_prompt)
     """
     transcript = "\n".join(f"[{m['composed_at']}] {m['sender']}: {m['content']}" for m in messages)
-    user = USER_TEMPLATE.format(
+    thread_text = THREAD_TEMPLATE.format(
         chat_label=thread.get("chat_label", "(unknown)"),
         thread_kind=thread.get("thread_kind", ""),
         started_at=thread.get("started_at", ""),
@@ -71,6 +80,9 @@ def build_prompt(thread: dict, messages: list[dict]) -> tuple[str, str]:
         participants=", ".join(thread.get("participants", [])) or "(unknown)",
         message_count=thread.get("message_count", len(messages)),
         transcript=transcript,
+    )
+    user = USER_TEMPLATE.format(
+        data_not_instructions=DATA_NOT_INSTRUCTIONS, thread=fence(thread_text)
     )
     return SYSTEM_PROMPT, user
 

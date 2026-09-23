@@ -152,3 +152,77 @@ def test_a_failed_attachment_stage_is_named_on_stderr(tmp_path):
     result = _run("sb-attachment-pass.sh", home)
 
     assert "attachment registration FAILED (exit 4)" in result.stderr
+
+
+def _run_daily(home: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-daily-sync.sh")],
+        env={
+            "HOME": str(home),
+            "PATH": "/usr/bin:/bin",
+            "SHELL": "/bin/bash",
+            "SB_DAILY_SYNC_LOCK": str(home / "daily-sync.lock"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def _daily_home(tmp_path: Path, body: str) -> Path:
+    """A stub python that records every call, then runs `body`."""
+    return _home_with_python(tmp_path, 'echo "$*" >> "$HOME/calls.log"\n' + body)
+
+
+def _calls(home: Path) -> list[str]:
+    return (home / "calls.log").read_text().splitlines()
+
+
+def test_daily_sync_runs_the_action_lifecycle_after_a_successful_sync(tmp_path):
+    """Extraction only appends, and the lifecycle job had no caller: nothing
+    was ever deduped or aged out, so every action stayed open for good."""
+    home = _daily_home(tmp_path, "exit 0\n")
+
+    result = _run_daily(home)
+
+    calls = _calls(home)
+    sync = next(i for i, c in enumerate(calls) if "src.cli sync" in c)
+    lifecycle = next(i for i, c in enumerate(calls) if "src.store.action_lifecycle" in c)
+    assert result.returncode == 0
+    assert lifecycle > sync
+
+
+def test_a_failed_action_lifecycle_does_not_fail_the_daily_sync(tmp_path):
+    home = _daily_home(tmp_path, 'case "$*" in *action_lifecycle*) exit 1;; esac\nexit 0\n')
+
+    result = _run_daily(home)
+
+    assert result.returncode == 0
+    assert any("src.store.action_lifecycle" in c for c in _calls(home))
+
+
+def test_a_failed_daily_sync_keeps_its_code_and_skips_the_lifecycle(tmp_path):
+    home = _daily_home(tmp_path, 'case "$*" in *"src.cli sync"*) exit 3;; esac\nexit 0\n')
+
+    result = _run_daily(home)
+
+    assert result.returncode == 3
+    assert not any("action_lifecycle" in c for c in _calls(home))
+
+
+def test_a_daily_sync_lock_override_that_is_not_a_lock_path_is_refused(tmp_path):
+    home = _daily_home(tmp_path, "exit 0\n")
+    victim = tmp_path / "precious"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("x")
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-daily-sync.sh")],
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin", "SB_DAILY_SYNC_LOCK": str(victim)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 64
+    assert (victim / "keep.txt").exists()

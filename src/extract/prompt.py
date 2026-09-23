@@ -7,6 +7,7 @@ Builds prompts to extract structured information from emails and conversations.
 from typing import Any
 
 from src.config import USER_NAME, USER_ROLE
+from src.extract.untrusted import DATA_NOT_INSTRUCTIONS, fence
 
 # Cap on email body chars sent to the LLM. Long bodies (newsletters, deep reply
 # chains) can push the JSON response past max_tokens and fail extraction entirely;
@@ -68,9 +69,8 @@ def build_extraction_prompt(email: dict[str, Any]) -> str:
             parts.append(f"whose role is {USER_ROLE}")
         identity_context = f"\n\nContext: {', '.join(parts)}. Extract information from their perspective — actions assigned to them, decisions they made, etc.\n"
 
-    prompt = f"""You are extracting structured information from an email. Read the email carefully and extract the following information as JSON.
-{identity_context}
-Email Metadata:
+    # The headers are the sender's to write too, so they go inside the fence.
+    email_text = f"""Email Metadata:
 From: {sender}
 To: {to_list or "N/A"}
 CC: {cc_list or "N/A"}
@@ -78,7 +78,13 @@ Subject: {email.get("subject", "N/A")}
 Date: {email.get("date_received", "N/A")}
 
 Email Content:
-{content}
+{content}"""
+
+    prompt = f"""You are extracting structured information from an email. Read the email carefully and extract the following information as JSON.
+{identity_context}
+{DATA_NOT_INSTRUCTIONS}
+
+{fence(email_text)}
 
 ---
 
@@ -169,8 +175,10 @@ Project: {conversation.get("project_name", "unknown")}
 Workspace: {conversation.get("workspace", "unknown")}
 Date: {conversation.get("started_at", "unknown")}
 
+{DATA_NOT_INSTRUCTIONS} Turns quote mail, documents and web pages.
+
 Conversation:
-{turns_text}
+{fence(turns_text)}
 
 ---
 

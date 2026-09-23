@@ -25,7 +25,16 @@ mkdir -p "$LOG_DIR"
 # --- Concurrency guard: a single run can take 30+ min when staging has backlog.
 # Without this, auth-watch's restoration trigger can overlap with the 07:00 cron
 # (or a manual run), doubling Vertex AI spend. Stale-lock recovery via PID check.
-LOCK_DIR="/tmp/sb-daily-sync.lock"
+# Overridable so the wrapper tests never touch a lock a real run may hold. The
+# lock is removed with rm -rf, so the override must name a *.lock directory.
+LOCK_DIR="${SB_DAILY_SYNC_LOCK:-/tmp/sb-daily-sync.lock}"
+case "$LOCK_DIR" in
+  *.lock) ;;
+  *)
+    echo "SB_DAILY_SYNC_LOCK must name a *.lock directory, got: $LOCK_DIR" >&2
+    exit 64
+    ;;
+esac
 if [ -d "$LOCK_DIR" ]; then
   stored_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
   if [ -z "$stored_pid" ] || ! kill -0 "$stored_pid" 2>/dev/null; then
@@ -109,6 +118,15 @@ if [ "$EXIT_CODE" -ne 0 ] && tail -20 "$LOG_FILE" | grep -qi "database is locked
   EXIT_CODE=$?
 fi
 echo "=== Daily sync finished (exit $EXIT_CODE): $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
+
+# Action lifecycle: drop re-extracted duplicates and expire actions nobody can
+# still owe. Extraction only appends, and this had no caller, so every action
+# stayed open for good. After a successful sync only, and non-fatal: it is
+# housekeeping, and its failure must not turn the sync's verdict red.
+if [ "$EXIT_CODE" -eq 0 ]; then
+  "$PYTHON" -m src.store.action_lifecycle >> "$LOG_FILE" 2>&1 \
+    || echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: action lifecycle failed (non-fatal)" >> "$LOG_FILE"
+fi
 
 # Style guide sync
 STYLE_SYNC="$HOME/SourceCode/plessas-marketplace/plugins/mail/scripts/style-sync.py"

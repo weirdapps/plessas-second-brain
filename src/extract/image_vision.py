@@ -151,7 +151,7 @@ def _encode_image_for_vision(img_path: Path) -> tuple[str, str]:
             "deferring until the host has room"
         )
 
-    im = Image.open(io.BytesIO(raw))
+    im: Image.Image = Image.open(io.BytesIO(raw))
     if im.mode not in ("RGB", "L"):
         im = im.convert("RGB")
 

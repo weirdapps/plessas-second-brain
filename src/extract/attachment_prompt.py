@@ -7,8 +7,8 @@ def build_attachment_prompt(
     extracted_text: str,
     filename: str,
     mime_type: str,
-    email_subject: str = None,
-    email_date: str = None,
+    email_subject: str | None = None,
+    email_date: str | None = None,
 ) -> str:
     """Build extraction prompt for an attachment's extracted text."""
     identity_context = ""

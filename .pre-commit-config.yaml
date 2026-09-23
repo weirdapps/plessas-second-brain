@@ -40,8 +40,8 @@ repos:
         # runs the mypy hook on the changed files only, so if mypy follows
         # imports into other modules we get a flood of pre-existing errors
         # unrelated to the current commit (e.g. implicit-Optional debt in
-        # src/extract/attachment_pipeline.py). For full project-wide type
-        # audits, run `mypy src/` directly outside the hook.
+        # src/extract/attachment_pipeline.py). The full audit, with the
+        # project's dependencies installed, is the `types` job in ci.yml.
         args: [--ignore-missing-imports, --show-error-codes, --follow-imports=silent]
         additional_dependencies: [types-requests]
 

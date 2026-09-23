@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from src.llm_policy import (
     Action,
@@ -309,7 +310,8 @@ def extract_one(email: dict) -> dict | None:
             messages=[{"role": "user", "content": prompt}],
         )
 
-    response = call_with_policy(_do_call, max_call_seconds=120.0)
+    # call_with_policy is typed to return object; this is the SDK's Message.
+    response: Any = call_with_policy(_do_call, max_call_seconds=120.0)
 
     text = _response_text(response)
     if text.startswith("```"):

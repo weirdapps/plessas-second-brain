@@ -116,7 +116,8 @@ def extract_one(email: dict, api_key: str | None, engine: str = "gemini") -> dic
         config=types.GenerateContentConfig(thinking_config=types.ThinkingConfig(thinking_budget=0)),
     )
 
-    text = response.text
+    # None when Gemini returns no text part (a block or an empty candidate).
+    text = response.text or ""
     if text.startswith("```"):
         lines = text.split("\n")
         text = "\n".join(lines[1:-1])

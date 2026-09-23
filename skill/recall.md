@@ -149,13 +149,15 @@ For deeper queries, `src.store.context` is what the dossier tools call:
   decisions, open actions, key facts
 - **`get_conversation_context(conn, email_id)`**: all emails in a thread, with
   participants, decisions and action items
-- **`get_recent_decisions(conn, days=365, limit=20)`**: recent decisions with
-  email context and topics
 
 The first two cap every list at `limit` and return a `<name>_total` sibling
 (`topics_total`, `decisions_total`, `open_actions_total`, and so on) with the
 real count, so a truncated answer is distinguishable from a complete one. Say
 which one you have.
+
+Recent decisions come from `src.store.query.query_decisions(conn, days=365,
+limit=20)`, which covers email, Teams, calendar and conversation decisions and
+skips news.
 
 ## Notes
 

@@ -1101,16 +1101,20 @@ class TestFindStaleThreads:
         conn.commit()
         return conn
 
+    # The fixture's stale thread is dated March 2026, past the default 30-day
+    # window by now, so the tests that need it found widen the window.
+    WIDE = 100_000
+
     def test_finds_stale_thread(self):
         conn = self._make_stale_db()
-        results = find_stale_threads(conn, days=5)
+        results = find_stale_threads(conn, days=5, max_days=self.WIDE)
         subjects = [r["subject"] for r in results]
         assert any("Stale" in s for s in subjects)
         conn.close()
 
     def test_excludes_replied_thread(self):
         conn = self._make_stale_db()
-        results = find_stale_threads(conn, days=5)
+        results = find_stale_threads(conn, days=5, max_days=self.WIDE)
         subjects = [r["subject"] for r in results]
         # The replied thread's last sender is 'other@example.com', not papadopoulos
         assert not any("Replied" in s for s in subjects)
@@ -1132,16 +1136,16 @@ class TestFindStaleThreads:
 
     def test_result_keys(self):
         conn = self._make_stale_db()
-        results = find_stale_threads(conn, days=5)
-        if results:
-            for key in (
-                "conversation_id",
-                "subject",
-                "date_received",
-                "sender_address",
-                "days_waiting",
-            ):
-                assert key in results[0]
+        results = find_stale_threads(conn, days=5, max_days=self.WIDE)
+        assert results
+        for key in (
+            "conversation_id",
+            "subject",
+            "date_received",
+            "sender_address",
+            "days_waiting",
+        ):
+            assert key in results[0]
         conn.close()
 
     def test_empty_db(self):

@@ -87,6 +87,39 @@ def test_auth_type_check_beats_the_rate_limit_string_widener():
     assert classify_exception(exc, None) is Outcome.AUTH_REAUTH_REQUIRED
 
 
+def _status_error(cls, status):
+    exc = cls.__new__(cls)
+    exc.status_code = status
+    return exc
+
+
+def test_is_transient_knows_the_service_failures_the_sdk_raises():
+    """What call_with_policy re-raises for a real 5xx, a dropped connection or a
+    token refresh that could not reach Google, not only the builtin types."""
+    from src.extract.policy_bridge import is_transient
+
+    cases = [
+        _status_error(anthropic.InternalServerError, 500),
+        _status_error(anthropic.APIStatusError, 503),
+        anthropic.APIConnectionError.__new__(anthropic.APIConnectionError),
+        anthropic.APITimeoutError.__new__(anthropic.APITimeoutError),
+        anthropic.RateLimitError.__new__(anthropic.RateLimitError),
+        gauth.TransportError("token endpoint unreachable"),
+        gauth.TimeoutError("token refresh timed out"),
+        ConnectionError("reset by peer"),
+    ]
+
+    assert [is_transient(e) for e in cases] == [True] * len(cases)
+
+
+def test_is_transient_leaves_an_unusable_reply_permanent():
+    from src.extract.policy_bridge import is_transient
+
+    assert not is_transient(ValueError("calendar extraction response is not JSON"))
+    assert not is_transient(_status_error(anthropic.BadRequestError, 400))
+    assert not is_transient(gauth.RefreshError("invalid_grant"))
+
+
 def test_reset_client_cache_is_registered_as_a_post_reauth_callback():
     from src import llm_policy
     from src.extract import (

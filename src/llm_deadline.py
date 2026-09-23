@@ -8,9 +8,9 @@ is executing. That is not cosmetic in either direction:
     when the remaining budget can fund ``PUSH_WAIT_SECONDS + max_call`` (1020 + 120 =
     1140). Against a flat 900 that test can never pass, so the six units with 1800s or
     3600s of real headroom, the ones the wait exists for, never get it.
-  * Too large for the short units. sb-calendar-sync and sb-conversation-sync have a real
-    TimeoutStartSec of 300. A 900s budget lets the policy plan retries the unit will be
-    SIGTERMed in the middle of.
+  * Too large for the short units. sb-calendar-sync and sb-conversation-sync had a real
+    TimeoutStartSec of 300 when this was written (900 since their timeout.conf drop-ins).
+    A 900s budget let the policy plan retries the unit would be SIGTERMed in the middle of.
 
 FOUR SEPARATE QUESTIONS, answered by four separate mechanisms. They are easy to
 conflate on a later read, and conflating them is how a budget quietly becomes wrong:
@@ -60,15 +60,22 @@ from src.llm_policy import MAX_ATTEMPTS, ROW_CAPS, backoff
 # on 2026-08-11 with `systemctl --user show sb-<name>.service -p TimeoutStartUSec`.
 # These ten are the whole scheduled set. A unit missing from this map gets no deadline
 # rather than a guessed one.
+#
+# Re-read 2026-09-23. Three drop-ins had raised units since, each an owner decision
+# with its reason in the drop-in: sb-calendar-sync and sb-conversation-sync to 15min
+# (timeout.conf, so the policy can fund a retry at all) and sb-outlook-sync to 20min
+# (catchup-timeout.conf, 2026-09-11, so a recovery run is not killed mid-catch-up).
+# The smaller of table and live wins, so the stale 300s entries kept both 15-minute
+# units at a 90s budget: the one attempt, no retry, the drop-in was written to end.
 _UNIT_TIMEOUT_SECONDS: dict[str, int] = {
     "sb-attachments": 3600,
-    "sb-calendar-sync": 300,
-    "sb-conversation-sync": 300,
+    "sb-calendar-sync": 900,
+    "sb-conversation-sync": 900,
     "sb-curate-docs": 1800,
     "sb-daily-sync": 1800,
     "sb-news-sync": 1800,
     "sb-noon-catchup": 1800,
-    "sb-outlook-sync": 600,
+    "sb-outlook-sync": 1200,
     "sb-reverse-ingest": 1800,
     "sb-teams-sync": 600,
 }
@@ -321,9 +328,9 @@ def _deadline_reserve_seconds(max_call_seconds: float) -> float:
     FORWARD-LOOKING — ``now + sleep_s + max_call_seconds > deadline`` in llm_policy — so
     it already refuses any backoff whose sleep plus the following call would not fit, and
     no backoff can push the loop past the deadline. Subtracting the maximum again charges
-    for it twice. Literally, the reserve would become 450s and sb-calendar-sync and
-    sb-conversation-sync, at 300s, would go MINUS 150s, so the startup check in
-    ``_llm_budget_seconds`` would refuse to run two of the ten production units.
+    for it twice. Literally, the reserve would become 450s. When this was written that put
+    sb-calendar-sync and sb-conversation-sync, then at 300s, at MINUS 150s, so the startup
+    check in ``_llm_budget_seconds`` would have refused to run two of the ten units.
 
     ``max_call_seconds`` is NOT double-counted and must stay. ``call_with_policy`` calls
     ``fn()`` unconditionally at the top of its loop with no deadline test before the
@@ -346,8 +353,9 @@ def _llm_budget_seconds(
     Raises RuntimeError when the margin is not positive. A unit that cannot fund one
     worst-case call plus its shutdown grace cannot produce output at all, and an
     immediate loud failure beats a SIGTERM later with nothing to show for it. On today's
-    numbers the threshold sits at 211s and the smallest unit is 300s, so the check fires
-    for nobody; it exists to catch a future TimeoutStartSec cut before it ships.
+    numbers the threshold sits at 211s and the smallest unit is sb-teams-sync at 600s, so
+    the check fires for nobody; it exists to catch a future TimeoutStartSec cut before it
+    ships.
     """
     if unit_timeout_seconds is None:
         unit_timeout_seconds = _UNIT_TIMEOUT_SECONDS.get(unit)

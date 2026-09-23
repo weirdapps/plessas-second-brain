@@ -735,6 +735,18 @@ def check_calendar(db):
     # ingestion stops.
     latest = db.execute("SELECT MAX(ingested_at) FROM calendar_events").fetchone()[0]
     age = _age(latest)
+    # Since calendar-sync skips unchanged events, a quiet calendar writes no row
+    # and ingested_at ages while the sync is healthy. It stamps sync_metadata
+    # after every complete listing; the fresher of the two is the signal.
+    try:
+        listed = db.execute(
+            "SELECT value FROM sync_metadata WHERE key = 'calendar_last_listed'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        listed = None
+    listed_age = _age(listed[0]) if listed and listed[0] else None
+    if listed_age is not None and (age is None or listed_age < age):
+        latest, age = listed[0], listed_age
     stale = age is not None and age > STALE_THRESHOLDS["calendar"]
     return {
         "name": "Calendar",

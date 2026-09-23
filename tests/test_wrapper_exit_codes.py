@@ -152,3 +152,169 @@ def test_a_failed_attachment_stage_is_named_on_stderr(tmp_path):
     result = _run("sb-attachment-pass.sh", home)
 
     assert "attachment registration FAILED (exit 4)" in result.stderr
+
+
+def _run_daily(home: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-daily-sync.sh")],
+        env={
+            "HOME": str(home),
+            "PATH": "/usr/bin:/bin",
+            "SHELL": "/bin/bash",
+            "SB_DAILY_SYNC_LOCK": str(home / "daily-sync.lock"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def _daily_home(tmp_path: Path, body: str) -> Path:
+    """A stub python that records every call, then runs `body`."""
+    return _home_with_python(tmp_path, 'echo "$*" >> "$HOME/calls.log"\n' + body)
+
+
+def _calls(home: Path) -> list[str]:
+    return (home / "calls.log").read_text().splitlines()
+
+
+def test_daily_sync_runs_the_action_lifecycle_after_a_successful_sync(tmp_path):
+    """Extraction only appends, and the lifecycle job had no caller: nothing
+    was ever deduped or aged out, so every action stayed open for good."""
+    home = _daily_home(tmp_path, "exit 0\n")
+
+    result = _run_daily(home)
+
+    calls = _calls(home)
+    sync = next(i for i, c in enumerate(calls) if "src.cli sync" in c)
+    lifecycle = next(i for i, c in enumerate(calls) if "src.store.action_lifecycle" in c)
+    assert result.returncode == 0
+    assert lifecycle > sync
+
+
+def test_a_failed_action_lifecycle_does_not_fail_the_daily_sync(tmp_path):
+    home = _daily_home(tmp_path, 'case "$*" in *action_lifecycle*) exit 1;; esac\nexit 0\n')
+
+    result = _run_daily(home)
+
+    assert result.returncode == 0
+    assert any("src.store.action_lifecycle" in c for c in _calls(home))
+    log = (home / ".second-brain" / "logs" / "daily-sync.log").read_text()
+    assert "WARN: action lifecycle failed" in log
+
+
+def test_a_failed_daily_sync_keeps_its_code_and_skips_the_lifecycle(tmp_path):
+    home = _daily_home(tmp_path, 'case "$*" in *"src.cli sync"*) exit 3;; esac\nexit 0\n')
+
+    result = _run_daily(home)
+
+    assert result.returncode == 3
+    assert not any("action_lifecycle" in c for c in _calls(home))
+
+
+def test_a_relative_daily_sync_lock_override_is_refused(tmp_path):
+    """The wrapper changes directory before its EXIT trap removes the lock, so
+    a relative path was made in one directory and removed from another."""
+    home = _daily_home(tmp_path, "exit 0\n")
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-daily-sync.sh")],
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin", "SB_DAILY_SYNC_LOCK": "rel.lock"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=tmp_path,
+    )
+
+    assert result.returncode == 64
+    assert not (tmp_path / "rel.lock").exists()
+
+
+@pytest.mark.parametrize(
+    ("wrapper", "variable"),
+    [
+        ("sb-daily-sync.sh", "SB_DAILY_SYNC_LOCK"),
+        ("sb-conversation-sync.sh", "SB_CONVERSATION_SYNC_LOCK"),
+    ],
+)
+def test_a_lock_path_that_is_a_file_is_never_removed(tmp_path, wrapper, variable):
+    """mkdir -p failed on it, the run went on without a lock, and the EXIT trap
+    ran rm -rf on a file this run never created."""
+    home = _daily_home(tmp_path, "exit 0\n")
+    precious = tmp_path / "Cargo.lock"
+    precious.write_text("x")
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / wrapper)],
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin", variable: str(precious)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 73
+    assert precious.read_text() == "x"
+
+
+@pytest.mark.parametrize(
+    ("wrapper", "variable"),
+    [
+        ("sb-daily-sync.sh", "SB_DAILY_SYNC_LOCK"),
+        ("sb-conversation-sync.sh", "SB_CONVERSATION_SYNC_LOCK"),
+    ],
+)
+def test_a_stale_lock_that_cannot_be_removed_fails_the_run(tmp_path, wrapper, variable):
+    """Removal failed, mkdir then found the directory, and the run logged
+    'another run took the lock' and exited 0: skipped every day, unit green."""
+    home = _daily_home(tmp_path, "exit 0\n")
+    parent = tmp_path / "locks"
+    lock = parent / "stale.lock"
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text("999999")
+    parent.chmod(0o555)
+    try:
+        result = subprocess.run(
+            ["/bin/bash", str(_WRAPPERS / wrapper)],
+            env={"HOME": str(home), "PATH": "/usr/bin:/bin", variable: str(lock)},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    finally:
+        parent.chmod(0o755)
+
+    assert result.returncode == 73
+
+
+def test_a_relative_conversation_sync_lock_override_is_refused(tmp_path):
+    home = _daily_home(tmp_path, "exit 0\n")
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-conversation-sync.sh")],
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin", "SB_CONVERSATION_SYNC_LOCK": "rel.lock"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=tmp_path,
+    )
+
+    assert result.returncode == 64
+    assert not (tmp_path / "rel.lock").exists()
+
+
+def test_a_daily_sync_lock_override_that_is_not_a_lock_path_is_refused(tmp_path):
+    home = _daily_home(tmp_path, "exit 0\n")
+    victim = tmp_path / "precious"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("x")
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-daily-sync.sh")],
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin", "SB_DAILY_SYNC_LOCK": str(victim)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 64
+    assert (victim / "keep.txt").exists()

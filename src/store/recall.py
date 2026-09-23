@@ -15,11 +15,11 @@ from src.store.conversation_query import search_conversations_keyword
 from src.store.fusion import reciprocal_rank_fusion
 from src.store.greek import (
     PHRASE_MATCH,
-    STOPWORDS,
     register_sql_functions,
     search_fold,
     search_phrase,
     search_tokens,
+    search_words,
 )
 from src.store.normalizer import normalize_topic
 from src.store.query import fts5_query_variants, query_by_keyword, search_attachments
@@ -40,30 +40,28 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 def _folded_bucket(conn: sqlite3.Connection, sql: str, keyword: str, limit: int) -> list[dict]:
     """Run a LIKE-style bucket in one pass: the whole query, else any of its tokens.
 
-    ``sql`` takes (phrases, joined tokens, limit), selects sb_match(...) AS score
+    ``sql`` takes (phrase, words, tokens, limit), selects sb_match(...) AS score
     and orders by it first. Matching is on folded text (case, accents, final
     sigma), at the start of a word, which LIKE alone does not do. A row holding
-    the phrase, or every word of the query in any order, is a whole match, and
-    whole matches come back alone when there are any. The any-order test counts
-    tokens, so it applies only when the tokens are every word but the stopwords:
-    a year or a short word is no token, and a row without it is not whole.
-    Otherwise rows holding some of the words come back, most first, flagged
-    partial_match: the whole-query form alone emptied these buckets for the long
-    queries agents write. A one-word query gets no token pass, since "any" would
-    equal "all".
+    the phrase, or every word of the query but the stopwords in any order (years
+    and short words included, as in the full-text buckets), is a whole match, and
+    whole matches come back alone when there are any. Otherwise rows holding
+    some of its tokens come back, most first, flagged partial_match: the
+    whole-query form alone emptied these buckets for the long queries agents
+    write. A one-word query gets no token pass, since "any" would equal "all".
     """
     register_sql_functions(conn)  # the MCP image search calls this directly
     stripped = search_phrase(keyword)
     if not stripped:
         return []
+    # 'C#' stripped of its '#' is the letter c, which is in half the rows.
     typed = " ".join(search_fold(keyword).split())
-    phrases = "\x1e".join(dict.fromkeys(f for f in (stripped, typed) if f))
-    tokens = search_tokens(keyword) if len(stripped.split()) >= 2 else []
-    every_word = bool(tokens) and set(tokens) == set(stripped.split()) - STOPWORDS
-    rows = [dict(r) for r in conn.execute(sql, (phrases, "\x1f".join(tokens), limit))]
-    whole = [
-        r for r in rows if r["score"] >= PHRASE_MATCH or (every_word and r["score"] == len(tokens))
-    ]
+    phrase = typed if len(stripped) == 1 and typed != stripped else stripped
+    several = len(stripped.split()) >= 2
+    words = "\x1f".join(search_words(keyword)) if several else ""
+    tokens = "\x1f".join(search_tokens(keyword)) if several else ""
+    rows = [dict(r) for r in conn.execute(sql, (phrase, words, tokens, limit))]
+    whole = [r for r in rows if r["score"] >= PHRASE_MATCH]
     out = whole or [{**r, "partial_match": True} for r in rows]
     for row in out:
         del row["score"]
@@ -83,7 +81,7 @@ def _search_decisions(conn: sqlite3.Connection, keyword: str, limit: int) -> lis
         conn,
         """
         WITH scored AS MATERIALIZED (
-            SELECT id, sb_match(decision, ?, ?) AS score FROM decisions
+            SELECT id, sb_match(decision, ?, ?, ?) AS score FROM decisions
         )
         SELECT d.id, d.email_id, d.event_id, d.teams_thread_id, d.decision, d.decided_by,
                d.decision_date,
@@ -119,7 +117,7 @@ def _search_actions(conn: sqlite3.Connection, keyword: str, limit: int) -> list[
         conn,
         """
         WITH scored AS MATERIALIZED (
-            SELECT id, sb_match(task, ?, ?) AS score FROM action_items
+            SELECT id, sb_match(task, ?, ?, ?) AS score FROM action_items
         )
         SELECT a.id, a.email_id, a.task, a.owner, a.deadline, a.status,
                e.subject as email_subject, s.score
@@ -142,7 +140,7 @@ def _search_commitments(conn: sqlite3.Connection, keyword: str, limit: int) -> l
         conn,
         """
         WITH scored AS MATERIALIZED (
-            SELECT id, sb_match(commitment, ?, ?) AS score FROM commitments
+            SELECT id, sb_match(commitment, ?, ?, ?) AS score FROM commitments
         )
         SELECT c.id, c.email_id, c.commitment, c.by_person, c.to_person,
                e.subject as email_subject, s.score
@@ -165,7 +163,7 @@ def _search_inline_images(conn: sqlite3.Connection, keyword: str, limit: int) ->
         conn,
         """
         WITH scored AS MATERIALIZED (
-            SELECT sha256, sb_match(vision_description, ?, ?) AS score FROM inline_images
+            SELECT sha256, sb_match(vision_description, ?, ?, ?) AS score FROM inline_images
         )
         SELECT i.sha256, i.classification, i.vision_description, i.width, i.height, s.score
         FROM scored s

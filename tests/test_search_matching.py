@@ -371,24 +371,29 @@ def test_registering_twice_mid_iteration_is_harmless(conn):
     assert cursor.fetchone() is not None
 
 
-def test_a_name_filter_folds_each_person_once_not_each_email_link():
+def test_a_name_filter_folds_each_person_once_not_each_email_link(conn):
     """Joined through email_people, sb_fold could run once per link: without
     planner statistics (the store never runs ANALYZE) SQLite scanned the link
-    table first, 1.3M calls and 2 s or more for any name. A tiny test store gets
-    the other plan, so the shape is what is pinned: people are filtered in a
-    subquery, once each."""
-    import inspect
+    table first, 1.3M calls and 2 s or more for any name. People are folded in a
+    pass of their own, whatever plan the email query gets."""
+    from src.store.greek import register_sql_functions, search_fold
+    from src.store.query import query_by_person, query_combined
 
-    from src.store import query
+    _dated_emails(conn)
+    register_sql_functions(conn)
+    calls = []
 
-    for fn in (query.query_by_person, query.query_combined):
-        source = inspect.getsource(fn)
-        assert (
-            "WITH ids AS MATERIALIZED (SELECT id FROM people WHERE sb_fold(name) LIKE ?)" in source
-        )
-        # Emails are walked newest first and tested for a link, so LIMIT stops
-        # early for the mailbox owner, who is on nearly every email.
-        assert "EXISTS (SELECT 1 FROM email_people" in source
+    def counting(text):
+        calls.append(text)
+        return search_fold(text)
+
+    conn.create_function("sb_fold", 1, counting, deterministic=True)
+    people = conn.execute("SELECT COUNT(*) FROM people").fetchone()[0]
+
+    for search in (query_by_person, lambda c, n: query_combined(c, person=n)):
+        calls.clear()
+        search(conn, "Καραγιάννης")
+        assert len(calls) == people
 
 
 @pytest.mark.parametrize(
@@ -696,11 +701,11 @@ def test_each_row_is_scored_once(conn, table, search):
     conn.commit()
     calls = []
 
-    def counting(text, phrase, tokens):
+    def counting(text, phrase, words, tokens):
         calls.append(text)
-        return _match_score(text, phrase, tokens)
+        return _match_score(text, phrase, words, tokens)
 
-    conn.create_function("sb_match", 3, counting, deterministic=True)
+    conn.create_function("sb_match", 4, counting, deterministic=True)
     rows = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
     getattr(recall, search)(conn, "προυπολογισμος καρτων", 5)
@@ -772,9 +777,93 @@ def test_a_row_without_the_year_is_not_a_whole_match(conn):
     assert "decisions" in out["summary"]["partial_kinds"]
 
 
+def test_every_word_with_its_year_in_another_order_is_a_whole_match(conn):
+    """A year is no search token, but a row holding it and every other word, in
+    any order, holds the whole query, as the full-text buckets already say."""
+    from src.store.recall import recall
+
+    _decisions(
+        conn, "The 2026 budget was approved", "Budget freeze for travel", "Budget line 20261"
+    )
+
+    out = recall(conn, "budget 2026")
+
+    assert [d["decision"] for d in out["decisions"]] == ["The 2026 budget was approved"]
+    assert not out["decisions"][0].get("partial_match")
+
+
+def test_partial_rows_come_back_most_tokens_first(conn):
+    from src.store.recall import recall
+
+    conn.executemany(
+        "INSERT INTO decisions (email_id, decision, decision_date) VALUES (5, ?, ?)",
+        [("New cards for the auditor", "2026-01-01"), ("New cards", "2026-09-10")],
+    )
+    conn.commit()
+
+    out = recall(conn, "cards auditor zzzqqq")
+
+    assert [d["decision"] for d in out["decisions"]] == ["New cards for the auditor", "New cards"]
+    assert all(d["partial_match"] for d in out["decisions"])
+
+
+def test_a_one_letter_article_is_not_a_word_the_row_must_hold(conn):
+    from src.store.recall import recall
+
+    out = recall(conn, "η αποστολή του προϋπολογισμού")
+
+    assert [a["task"] for a in out["actions"]] == ["Αποστολή του προϋπολογισμού καρτών"]
+    assert not out["actions"][0].get("partial_match")
+
+
+def test_a_short_lowercase_word_is_still_a_word_of_the_query(conn):
+    from src.store.recall import recall
+
+    _decisions(conn, "Strategy for AI approved", "Strategy for the Thai market")
+
+    out = recall(conn, "ai strategy")
+
+    assert [d["decision"] for d in out["decisions"]] == ["Strategy for AI approved"]
+    assert not out["decisions"][0].get("partial_match")
+
+
+def test_a_phrase_ending_in_an_acronym_ends_with_it(conn):
+    """The whole-word rule looked at the length of the whole phrase, so 'digital
+    EU' ran into 'Digital Europe' and came back as a whole match."""
+    from src.store.recall import recall
+
+    _decisions(conn, "Digital Europe plan", "EU digital agenda")
+
+    out = recall(conn, "digital EU")
+
+    assert [d["decision"] for d in out["decisions"]] == ["EU digital agenda"]
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [("500", ["500 euros"]), ("12345 ανύπαρκτηλέξη", ["ref 12345"])],
+)
+def test_a_number_matches_only_the_whole_number(conn, query, expected):
+    """500 matched 5000 and the Greek 500.000, and a reference number matched
+    every longer one it began."""
+    from src.store.recall import recall
+
+    _decisions(conn, "5000 euros", "500 euros", "500.000 πελάτες", "ref 12345", "ref 1234567")
+
+    assert [d["decision"] for d in recall(conn, query)["decisions"]] == expected
+
+
+def test_a_term_with_a_symbol_is_not_its_bare_letter(conn):
+    """Stripping '#' from 'C#' left 'c', which matched 'Plan C' as the whole query."""
+    from src.store.recall import recall
+
+    _decisions(conn, "Plan C approved", "C# migration planned")
+
+    assert [d["decision"] for d in recall(conn, "C#")["decisions"]] == ["C# migration planned"]
+
+
 def test_a_verbatim_phrase_with_inner_punctuation_is_a_whole_match(conn):
-    """The year is no token, so only the phrase can make the row whole, and
-    only the phrase as typed still holds the colon."""
+    """'Q4:' is the word Q4, so the row holds every word of the query."""
     from src.store.recall import recall
 
     _decisions(conn, "Q4: 2027 budget approved", "Budget moved to Q1")
@@ -853,9 +942,9 @@ def test_a_name_query_returns_that_persons_newest_emails(conn):
 
     _dated_emails(conn)
 
-    rows = query_by_person(conn, "Καραγιάννης", limit=2)
+    rows = query_by_person(conn, "Καραγιάννης", limit=3)
 
-    assert [r["email_id"] for r in rows] == [1, 13]
+    assert [r["email_id"] for r in rows] == [1, 13, 12]
 
 
 @pytest.mark.parametrize("person", ["Καραγιάννης", "n.karagiannis@example.com"])
@@ -864,9 +953,77 @@ def test_combined_query_picks_that_persons_newest_emails(conn, person):
 
     _dated_emails(conn)
 
-    rows = query_combined(conn, person=person, limit=2)
+    rows = query_combined(conn, person=person, limit=3)
 
-    assert [r["email_id"] for r in rows] == [1, 13]
+    assert [r["email_id"] for r in rows] == [1, 13, 12]
+
+
+@pytest.mark.parametrize("dense_above", [0, 5000])
+@pytest.mark.parametrize("person", ["Καραγιάννης", "n.karagiannis@example.com"])
+def test_both_person_plans_find_the_same_emails(conn, monkeypatch, dense_above, person):
+    """A person on many emails is found by walking emails newest first, anyone
+    else by collecting their emails; both must give the same answer."""
+    from src.store import query
+
+    _dated_emails(conn)
+    monkeypatch.setattr(query, "DENSE_PERSON_LINKS", dense_above)
+
+    by_person = query.query_by_person(conn, person, limit=3)
+    combined = query.query_combined(conn, person=person, limit=3)
+
+    assert [r["email_id"] for r in by_person] == [1, 13, 12]
+    assert [r["email_id"] for r in combined] == [1, 13, 12]
+    assert {r["person_role"] for r in by_person} == {"to", "cc"}
+
+
+@pytest.mark.parametrize("name", ["%", "_", ".", "%%"])
+def test_a_name_without_a_letter_or_digit_resolves_to_no_one(conn, name):
+    """'%' and '_' are LIKE wildcards and '.' ends every initial, so each fitted
+    somebody, and the most-emailed of them got the dossier."""
+    from src.store.context import resolve_person
+
+    assert resolve_person(conn, name) == (None, 0, [])
+
+
+def test_the_cli_meeting_prep_skips_empty_names(monkeypatch, tmp_path):
+    import types
+
+    from src import cli
+
+    seen = {}
+
+    def fake_prep(conn, people, **kwargs):
+        seen["people"] = people
+        return {"attendees": []}
+
+    monkeypatch.setattr("src.store.query.meeting_prep", fake_prep)
+    monkeypatch.setattr(
+        "src.store.schema.get_connection", lambda path: types.SimpleNamespace(close=lambda: None)
+    )
+
+    cli.cmd_prep(
+        types.SimpleNamespace(
+            db=tmp_path / "x.db", people="Καραγιάννης, ", topic=None, days=365, limit=5
+        )
+    )
+
+    assert seen["people"] == ["Καραγιάννης"]
+
+
+def test_the_person_plan_switches_above_dense_person_links(conn, monkeypatch):
+    """The walk is for people on many emails and the collection for everyone
+    else; on the wrong side of the line, either took up to 1.3 s on the replica."""
+    import json
+
+    from src.store import query
+
+    _dated_emails(conn)  # Καραγιάννης (id 3) is now on four emails
+    ids = json.dumps([3])
+
+    monkeypatch.setattr(query, "DENSE_PERSON_LINKS", 4)
+    assert query._linked_to_ids(conn, ids).startswith("e.id IN")
+    monkeypatch.setattr(query, "DENSE_PERSON_LINKS", 3)
+    assert query._linked_to_ids(conn, ids).startswith("EXISTS")
 
 
 def test_resolve_person_registers_its_own_functions():
@@ -950,6 +1107,38 @@ def test_an_attendee_resolved_to_a_namesake_is_not_claimed_by_name(conn):
 
     assert namesake["last_met"]["subject"] == "Σύσκεψη με τον συνονόματο"
     assert other["last_met"] is None
+
+
+def _unresolved_invite(conn, event_id, subject, name):
+    _meeting(conn, event_id, subject, "2020-05-01T10:00:00")
+    conn.execute(
+        "INSERT INTO event_attendees (event_id, person_id, email, name, response_status, "
+        "is_organizer, is_self) VALUES (?, NULL, 'x@vendor.example', ?, 'accepted', 0, 0)",
+        (event_id, name),
+    )
+    conn.commit()
+
+
+def test_a_person_with_a_blank_name_claims_no_unresolved_invite(conn):
+    """A blank name made the pattern '%%', which every unresolved attendee fitted:
+    a person stored without a display name got every external meeting."""
+    from src.store.context import get_person_context
+
+    conn.execute("INSERT INTO people (id, name, email) VALUES (6, '', 'blank@example.com')")
+    _unresolved_invite(conn, 33, "Κλήση με προμηθευτή", "Κάποιος Δοκιμαστικός")
+    _unresolved_invite(conn, 35, "Κλήση χωρίς όνομα", "")
+
+    assert get_person_context(conn, "blank@example.com")["last_met"] is None
+
+
+def test_a_one_word_name_claims_no_unresolved_invite(conn):
+    """'ΝΙΚΟΣ' fits every Nikos who ever sent an invite."""
+    from src.store.context import get_person_context
+
+    conn.execute("INSERT INTO people (id, name, email) VALUES (7, 'ΝΙΚΟΣ', 'nikos@example.com')")
+    _unresolved_invite(conn, 34, "Κλήση με άλλον Νίκο", "Νίκος Δοκιμαστικός")
+
+    assert get_person_context(conn, "nikos@example.com")["last_met"] is None
 
 
 def test_the_teams_cli_says_when_no_thread_held_every_word(conn, tmp_path, capsys, monkeypatch):

@@ -1123,7 +1123,7 @@ def cmd_prep(args):
     from src.store.schema import get_connection
 
     conn = get_connection(str(args.db))
-    people_list = [p.strip() for p in args.people.split(",")]
+    people_list = [p.strip() for p in args.people.split(",") if p.strip()]
     result = meeting_prep(
         conn, people_list, topic=args.topic, days=args.days, limit_per_person=args.limit
     )

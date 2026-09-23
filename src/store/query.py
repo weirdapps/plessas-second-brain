@@ -5,6 +5,7 @@ people, decisions, and action items. All queries return structured results
 optimized for CLI display.
 """
 
+import json
 import sqlite3
 from typing import Any
 
@@ -142,6 +143,50 @@ def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> li
     return [dict(r) for r in cursor.fetchall()]
 
 
+# A person filter picks its plan by how many emails the people it means are on.
+# Walking emails newest first until LIMIT suits the mailbox owner, who is on
+# nearly every email; collecting and sorting all of theirs took 0.4 s. For
+# anyone else the walk can cover the whole mailbox: a name that fits hundreds of
+# rarely emailed people took 0.8-1.3 s on the replica. Up to this many links,
+# their emails are collected and sorted instead.
+DENSE_PERSON_LINKS = 5000
+
+# The people a filter means, as a CTE over a JSON list of their ids.
+_IDS_CTE = "WITH ids(id) AS MATERIALIZED (SELECT value FROM json_each(?)) "
+
+
+def _person_ids(conn: sqlite3.Connection, name_or_email: str) -> list[int]:
+    """Every person a name or an address means, each name folded once.
+
+    Folded in a pass of its own over people: inside the email query, joined
+    through email_people, SQLite could fold once per link (1.3M rows).
+    """
+    if "@" in name_or_email:
+        sql = "SELECT id FROM people WHERE LOWER(email) = LOWER(?)"
+        arg = name_or_email.strip()
+    else:
+        sql = "SELECT id FROM people WHERE sb_fold(name) LIKE ?"
+        arg = f"%{search_fold(name_or_email)}%"
+    return [row[0] for row in conn.execute(sql, (arg,))]
+
+
+def _linked_to_ids(conn: sqlite3.Connection, ids_json: str) -> str:
+    """A WHERE clause for emails linked to `ids`, planned by DENSE_PERSON_LINKS."""
+    links = conn.execute(
+        _IDS_CTE
+        + "SELECT COUNT(*) FROM (SELECT 1 FROM email_people WHERE person_id IN ids LIMIT ?)",
+        (ids_json, DENSE_PERSON_LINKS + 1),
+    ).fetchone()[0]
+    if links > DENSE_PERSON_LINKS:
+        # The unary + stops SQLite probing every id for every email: it reads the
+        # email's few links and looks each one up in ids instead.
+        return (
+            "EXISTS (SELECT 1 FROM email_people ep "
+            "WHERE ep.email_id = e.id AND +ep.person_id IN ids)"
+        )
+    return "e.id IN (SELECT email_id FROM email_people WHERE person_id IN ids)"
+
+
 def query_by_person(conn: sqlite3.Connection, name_or_email: str, limit: int = 20) -> list[dict]:
     """Find emails involving a person (as sender, recipient, or mentioned in people_roles).
 
@@ -156,51 +201,31 @@ def query_by_person(conn: sqlite3.Connection, name_or_email: str, limit: int = 2
         List of dicts with keys: email_id, date, subject, summary, person_role, sentiment
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
-    # Determine if searching by email or name
-    if "@" in name_or_email:
-        # Search by email address
-        query = """
-            SELECT DISTINCT
-                e.id as email_id,
-                e.date_received as date,
-                e.subject,
-                e.summary,
-                ep.role_in_email as person_role,
-                e.sentiment
-            FROM emails e
-            JOIN email_people ep ON e.id = ep.email_id
-            JOIN people p ON ep.person_id = p.id
-            WHERE LOWER(p.email) = LOWER(?)
-            ORDER BY e.date_received DESC
-            LIMIT ?
-        """
-        params = (name_or_email.strip(), limit)
-    else:
-        # Search by name (partial match). People are folded once each, into a
-        # materialized id list. Emails are then walked newest first and kept when
-        # they link to one of them, so LIMIT stops early for the mailbox owner,
-        # who is on nearly every email; joined through email_people, SQLite
-        # could fold once per link (1.3M rows) or sort every linked email first.
-        query = """
-            WITH ids AS MATERIALIZED (SELECT id FROM people WHERE sb_fold(name) LIKE ?)
-            SELECT
-                e.id as email_id,
-                e.date_received as date,
-                e.subject,
-                e.summary,
-                (SELECT ep.role_in_email FROM email_people ep
-                  WHERE ep.email_id = e.id AND ep.person_id IN ids LIMIT 1) as person_role,
-                e.sentiment
-            FROM emails e
-            WHERE EXISTS (SELECT 1 FROM email_people ep
-                          WHERE ep.email_id = e.id AND ep.person_id IN ids)
-            ORDER BY e.date_received DESC
-            LIMIT ?
-        """
-        params = (f"%{search_fold(name_or_email)}%", limit)
-
-    cursor = conn.execute(query, params)
-    return [dict(row) for row in cursor.fetchall()]
+    ids = _person_ids(conn, name_or_email)
+    if not ids:
+        return []
+    ids_json = json.dumps(ids)
+    # One row per email. person_role is one of the roles they hold on it.
+    query = (
+        _IDS_CTE
+        + """
+        SELECT
+            e.id as email_id,
+            e.date_received as date,
+            e.subject,
+            e.summary,
+            (SELECT ep.role_in_email FROM email_people ep
+              WHERE ep.email_id = e.id AND +ep.person_id IN ids LIMIT 1) as person_role,
+            e.sentiment
+        FROM emails e
+        WHERE """
+        + _linked_to_ids(conn, ids_json)
+        + """
+        ORDER BY e.date_received DESC
+        LIMIT ?
+    """
+    )
+    return [dict(row) for row in conn.execute(query, (ids_json, limit))]
 
 
 def query_by_topic(conn: sqlite3.Connection, topic: str, limit: int = 20) -> list[dict]:
@@ -691,21 +716,15 @@ def query_combined(
     where_clauses = []
     params: list[Any] = []
 
-    # Person filter. Folded once per person into a materialized id list, then
-    # tested per email, as in query_by_person.
+    # Person filter, planned as in query_by_person.
     if person:
-        if "@" in person:
-            where_clauses.append(
-                "EXISTS (SELECT 1 FROM email_people ep WHERE ep.email_id = e.id AND "
-                "ep.person_id IN (SELECT id FROM people WHERE LOWER(email) = LOWER(?)))"
-            )
-            params.append(person.strip())
-        else:
-            cte = "WITH ids AS MATERIALIZED (SELECT id FROM people WHERE sb_fold(name) LIKE ?) "
-            cte_params.append(f"%{search_fold(person)}%")
-            where_clauses.append(
-                "EXISTS (SELECT 1 FROM email_people ep WHERE ep.email_id = e.id AND ep.person_id IN ids)"
-            )
+        ids = _person_ids(conn, person)
+        if not ids:
+            return []
+        ids_json = json.dumps(ids)
+        cte = _IDS_CTE
+        cte_params.append(ids_json)
+        where_clauses.append(_linked_to_ids(conn, ids_json))
 
     # Topic filter
     if topic:

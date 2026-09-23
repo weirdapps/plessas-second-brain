@@ -763,7 +763,7 @@ def attachment_image_search(
             conn,
             """
             WITH scored AS MATERIALIZED (
-                SELECT sha256, sb_match(vision_description, ?, ?) AS score
+                SELECT sha256, sb_match(vision_description, ?, ?, ?) AS score
                 FROM inline_images
                 WHERE classification = 'content' AND vision_description IS NOT NULL
             )

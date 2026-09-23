@@ -103,6 +103,8 @@ STOPWORDS = frozenset(
         # from an ALL-CAPS query. Not "it": IT is a department.
         "σε", "σαν", "ως", "αν", "is", "of", "or", "to", "in", "on", "at", "by",
         "an", "as", "be", "we", "if", "do", "so", "no",
+        # One-letter articles, so a question is not whole only where they appear.
+        "ο", "η", "a", "i",
     )
 )  # fmt: skip
 
@@ -152,8 +154,38 @@ def search_tokens(text: str | None) -> list[str]:
     return list(dict.fromkeys(tokens))
 
 
+def search_words(text: str | None) -> list[str]:
+    """Distinct folded words a row must hold, in any order, to hold the whole query.
+
+    Every word but the stopwords. Unlike search_tokens this keeps years and short
+    words: they are too common to find a row by, but a row without the query's
+    year does not answer it.
+    """
+    words = (search_fold(_strip_punctuation(word)) for word in (text or "").split())
+    return list(dict.fromkeys(w for w in words if w and w not in STOPWORDS))
+
+
 # sb_match's score for a row holding the whole query: above any token count.
 PHRASE_MATCH = 1 << 20
+
+
+def _word_end(word: str) -> str:
+    """What must follow a folded query word where it matches.
+
+    Nothing, for a word of three letters or more: it matches at the start of a
+    longer one, for Greek inflection (καρτ-ες, καρτ-ων). An acronym or code under
+    three letters must be the whole word, and a number the whole number, or 500
+    matched 5000 and the Greek 500.000.
+    """
+    if len(word) < 3:
+        return r"(?!\w)"
+    if word[-1].isdigit():
+        return r"(?![.,]?\d)"
+    return ""
+
+
+def _at_word_start(word: str) -> str:
+    return r"(?<!\w)" + re.escape(word) + _word_end(word)
 
 
 @lru_cache(maxsize=64)
@@ -161,62 +193,71 @@ def _token_pattern(joined_tokens: str) -> re.Pattern | None:
     """One regex for a query's tokens, each matched at the start of a word.
 
     A token used to count anywhere inside a word, so 'act' matched 'contract'.
-    At the start it still takes Greek inflection (καρτ-ες, καρτ-ων). A token
-    under three characters is an acronym and must be the whole word.
     """
-    tokens = sorted((t for t in joined_tokens.split("\x1f") if t), key=len, reverse=True)
+    tokens = sorted(_forms(joined_tokens), key=len, reverse=True)
     if not tokens:
         return None
-    parts = (re.escape(t) + (r"(?!\w)" if len(t) < 3 else "") for t in tokens)
-    return re.compile(r"(?<!\w)(?:" + "|".join(parts) + ")")
+    # One lookbehind for all of them: repeated on every branch it ran 30-50%
+    # slower on rows that hold a common token such as 'ai'.
+    return re.compile(r"(?<!\w)(?:" + "|".join(re.escape(t) + _word_end(t) for t in tokens) + ")")
 
 
 @lru_cache(maxsize=64)
-def _phrase_pattern(joined_phrases: str) -> re.Pattern | None:
-    """One regex for the forms of a query's phrase, each at the start of a word.
+def _phrase_pattern(phrase: str) -> re.Pattern:
+    """The phrase at the start of a word, ending as its last word must.
 
-    A plain substring test let a one-word query match inside other words: 'AI'
-    in 'email', 'UX' in 'Luxembourg'. A phrase under three characters is an
-    acronym and must be the whole word. The forms, separated by U+001E, are the
-    phrase as typed and without its punctuation, so a verbatim query with inner
-    punctuation still counts as whole.
+    A plain substring test let a one-word query match inside other words, 'AI'
+    in 'email' and 'UX' in 'Luxembourg', and 'digital EU' run into 'digital
+    Europe'.
     """
-    phrases = sorted((f for f in joined_phrases.split("\x1e") if f), key=len, reverse=True)
-    if not phrases:
-        return None
-    parts = (re.escape(f) + (r"(?!\w)" if len(f) < 3 else "") for f in phrases)
-    return re.compile(r"(?<!\w)(?:" + "|".join(parts) + ")")
+    last = phrase.rsplit(" ", 1)[-1]
+    return re.compile(r"(?<!\w)" + re.escape(phrase) + _word_end(last))
+
+
+@lru_cache(maxsize=64)
+def _word_patterns(joined_words: str) -> tuple[re.Pattern, ...]:
+    return tuple(re.compile(_at_word_start(w)) for w in _forms(joined_words))
 
 
 @lru_cache(maxsize=128)
-def _forms(joined: str, separator: str) -> tuple[str, ...]:
-    """The non-empty parts of a joined argument, split once per query, not per row."""
-    return tuple(f for f in joined.split(separator) if f)
+def _forms(joined: str) -> tuple[str, ...]:
+    """The non-empty parts of a U+001F-joined argument, split once per query."""
+    return tuple(f for f in joined.split("\x1f") if f)
 
 
-def _match_score(text: str | None, phrases: str, joined_tokens: str) -> int:
-    """PHRASE_MATCH if the folded text holds the phrase, else how many tokens it holds.
+def _match_score(text: str | None, phrase: str, words: str, joined_tokens: str) -> int:
+    """PHRASE_MATCH if the folded text holds the whole query, else how many tokens it holds.
 
-    One function, so a search that falls back from the whole query to its tokens
+    The whole query is the phrase, or every one of `words` in any order. One
+    function, so a search that falls back from the whole query to its tokens
     folds each row once, in one pass over the table: the fold runs in Python and
     a second pass cost as much again. A plain substring test runs first, in C,
     and rules out most rows; the regexes, which place a hit at the start of a
     word, run on the rest. The regexes alone cost about a microsecond more per
-    row, a third of a second per recall.
+    row, a third of a second per recall. The tokens are among the words, so the
+    words are only looked for in a row that holds every token.
     """
     folded = search_fold(text)
-    if any(map(folded.__contains__, _forms(phrases, "\x1e"))):
-        phrase = _phrase_pattern(phrases)
-        if phrase is not None and phrase.search(folded):
+    if phrase and phrase in folded and _phrase_pattern(phrase).search(folded):
+        return PHRASE_MATCH
+    contains = folded.__contains__
+    tokens = _forms(joined_tokens)
+    if tokens:
+        if not any(map(contains, tokens)):
+            return 0
+        pattern = _token_pattern(joined_tokens)
+        found = len(set(pattern.findall(folded))) if pattern else 0
+        if found < len(tokens):
+            return found
+    required = _forms(words)
+    if required and all(map(contains, required)):
+        if all(p.search(folded) for p in _word_patterns(words)):
             return PHRASE_MATCH
-    if not any(map(folded.__contains__, _forms(joined_tokens, "\x1f"))):
-        return 0
-    pattern = _token_pattern(joined_tokens)
-    return len(set(pattern.findall(folded))) if pattern else 0
+    return len(tokens)
 
 
 def register_sql_functions(conn) -> None:
-    """sb_fold(text) and sb_match(text, phrase, tokens) for the LIKE-based lookups.
+    """sb_fold(text) and sb_match(text, phrase, words, tokens) for the LIKE-based lookups.
 
     Registered by every connection the store opens (schema.create_database and
     get_connection), and again, lazily, by the entry points that use them. A
@@ -225,12 +266,12 @@ def register_sql_functions(conn) -> None:
     stay pure SQL, these only ever run inside a query issued by this code.
     """
     try:
-        conn.execute("SELECT sb_match('', '', '')").fetchone()
+        conn.execute("SELECT sb_match('', '', '', '')").fetchone()
         return
     except sqlite3.OperationalError:
         pass
     conn.create_function("sb_fold", 1, search_fold, deterministic=True)
-    conn.create_function("sb_match", 3, _match_score, deterministic=True)
+    conn.create_function("sb_match", 4, _match_score, deterministic=True)
 
 
 def fold_sql_expr(column: str) -> str:

@@ -1,6 +1,7 @@
 """The hourly sync's stages must sum to less than its unit timeout.
 
-`sb-outlook-sync` runs under `TimeoutStartSec=600`. Its stages were budgeted
+`sb-outlook-sync` ran under `TimeoutStartSec=600` (20 minutes since
+2026-09-11, catchup-timeout.conf). Its stages were budgeted
 independently — some by count, some not at all — and bounding them one at a
 time failed three times in a row on 2026-08-18: registration (#24), then Phase 2
 by count (#27), then Phase 1 (#28). Each fix stopped one overrun and revealed
@@ -19,24 +20,40 @@ modest and cost 6-8 minutes at ~15-25 s each. The giveaway on the last failed
 run was 1 min 20 s of CPU across 11 min 30 s of wall clock.
 """
 
+import pytest
+
 from src.cli import (
     CONVERSATION_SYNC_DEADLINE_S,
+    EXTRACT_DEADLINE_BY_UNIT_S,
+    EXTRACT_SYNC_DEADLINE_S,
     IMAGE_CLASSIFY_SYNC_BUDGET_S,
     PHASE1_SYNC_DEADLINE_S,
     PHASE2_SYNC_DEADLINE_S,
     SYNC_FIXED_WORK_S,
     SYNC_UNIT_TIMEOUT_S,
+    SYNC_WRAPPER_FETCH_OBSERVED_S,
 )
+from src.llm_deadline import _UNIT_TIMEOUT_SECONDS
 
 
-def _worst_case_run_s() -> float:
+def _sync_command_s(extract_s: float) -> float:
+    """One `src.cli sync` with ``extract_s`` for Step 2."""
     return (
         SYNC_FIXED_WORK_S
+        + extract_s
         + PHASE1_SYNC_DEADLINE_S
         + PHASE2_SYNC_DEADLINE_S
         + CONVERSATION_SYNC_DEADLINE_S
         + IMAGE_CLASSIFY_SYNC_BUDGET_S
     )
+
+
+def _worst_case_run_s() -> float:
+    """The hourly unit: the wrapper's mail fetch, then the sync, one timeout.
+
+    The fetch was once folded into SYNC_FIXED_WORK_S and then dropped from the
+    sum because it runs before the command, although the unit pays for it."""
+    return SYNC_WRAPPER_FETCH_OBSERVED_S + _sync_command_s(EXTRACT_SYNC_DEADLINE_S)
 
 
 def test_all_stage_budgets_fit_inside_the_unit_timeout():
@@ -156,3 +173,21 @@ def test_teams_discover_is_budgeted_even_though_it_is_unbounded():
     """Step 1 has no internal limit and measured 86.4 s against 1,219 chats. It
     still has to be counted, or the sum silently understates the run."""
     assert TEAMS_DISCOVER_OBSERVED_S >= 86.4
+
+
+def test_the_modelled_timeout_is_the_one_llm_deadline_budgets_against():
+    """Two copies of one number is how both went stale at 600 while the unit
+    ran at 1200."""
+    assert _UNIT_TIMEOUT_SECONDS["sb-outlook-sync"] == SYNC_UNIT_TIMEOUT_S
+
+
+@pytest.mark.parametrize("unit", ["sb-daily-sync", "sb-noon-catchup"])
+def test_the_backlog_units_extraction_slice_fits_their_timeout(unit):
+    """Neither wrapper fetches mail. sb-daily-sync runs its backup first, inside the
+    same unit; that time comes out of the extraction slice, because
+    _extract_deadline_s caps Step 2 by what is left of the unit."""
+    assert _sync_command_s(EXTRACT_DEADLINE_BY_UNIT_S[unit]) < _UNIT_TIMEOUT_SECONDS[unit] * 0.85
+
+
+def test_the_hourly_unit_uses_the_hourly_slice():
+    assert EXTRACT_DEADLINE_BY_UNIT_S["sb-outlook-sync"] == EXTRACT_SYNC_DEADLINE_S

@@ -150,3 +150,55 @@ def test_parse_event_with_recurrence():
 
     assert parsed["is_recurring"] is True
     assert parsed["recurrence_master_id"] == "series-abc-123"
+
+
+def test_list_events_reports_the_chunks_it_could_not_fetch(monkeypatch):
+    """A failed monthly chunk was logged and skipped, so the run reported a
+    partial window as complete. Failures are now handed back to the caller;
+    an answer that is not a list counts as one, not as zero events."""
+    from src.export import calendar_export
+
+    calls = []
+
+    def fake_cli(args):
+        calls.append(args)
+        if len(calls) == 2:
+            raise RuntimeError("outlook-cli timed out")
+        if len(calls) == 3:
+            return {"error": "unexpected shape"}
+        return [{"Id": f"e{len(calls)}"}]
+
+    monkeypatch.setattr(calendar_export, "run_outlook_cli", fake_cli)
+    failures: list[str] = []
+
+    events = calendar_export.list_events(
+        datetime(2026, 1, 1), datetime(2026, 4, 15), failures=failures
+    )
+
+    assert [e["Id"] for e in events] == ["e1", "e4"]
+    assert len(failures) == 2
+
+
+def test_get_event_body_lets_an_auth_failure_through(monkeypatch):
+    """Swallowed with everything else, an expired session read as one failed
+    fetch per event. The caller treats it as the outage it is."""
+    import pytest
+
+    from src.export import calendar_export
+    from src.export.outlook_cli import OutlookCliAuthRequired
+
+    def expired(args):
+        raise OutlookCliAuthRequired("session expired")
+
+    monkeypatch.setattr(calendar_export, "run_outlook_cli", expired)
+
+    with pytest.raises(OutlookCliAuthRequired):
+        calendar_export.get_event_body("e1")
+
+
+def test_parse_event_keeps_the_etag_a_list_entry_carries():
+    from src.export.calendar_export import parse_event
+
+    parsed = parse_event({"Id": "e1", "@odata.etag": 'W/"abc"'})
+
+    assert parsed["change_key"] == 'W/"abc"'

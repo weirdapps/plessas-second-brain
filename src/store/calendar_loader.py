@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # there is one spelling of each value; schema.migrate_add_calendar_llm_status explains what
 # each one means and why there are four rather than the attachment table's three.
 # 'pending' is load-bearing beyond bookkeeping: it is the ONLY value that makes
-# cmd_calendar_sync's change detector re-offer an event whose modified_at has not moved.
+# cmd_calendar_sync's change detector re-offer an event whose etag has not moved.
 LLM_STATUSES = ("extracted", "pending", "failed", "skipped")
 
 
@@ -169,8 +169,8 @@ def load_event(
             start_at, end_at, location, is_recurring, recurrence_master_id,
             response_status, is_cancelled, is_self_organized,
             created_at, modified_at, ingested_at, body_extracted_at, body_summary,
-            llm_status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            llm_status, change_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(outlook_event_id) DO UPDATE SET
             subject = excluded.subject,
             organizer_email = excluded.organizer_email,
@@ -188,7 +188,8 @@ def load_event(
             ingested_at = excluded.ingested_at,
             body_extracted_at = excluded.body_extracted_at,
             body_summary = excluded.body_summary,
-            llm_status = excluded.llm_status
+            llm_status = excluded.llm_status,
+            change_key = excluded.change_key
         """,
         (
             event["outlook_event_id"],
@@ -209,6 +210,7 @@ def load_event(
             body_extracted_at,
             extraction.get("body_summary"),
             llm_status,
+            event.get("change_key"),
         ),
     )
 

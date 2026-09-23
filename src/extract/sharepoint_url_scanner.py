@@ -60,8 +60,13 @@ def extract_sharepoint_urls(html: str | None) -> list[str]:
         # Strip trailing punctuation that regex might capture
         url = url.rstrip(".,;)\"'>")
 
-        # Parse URL
-        parsed = urlparse(url)
+        # Parse URL. urlparse raises on some shapes the regexes admit (an
+        # unclosed "[" reads as an IPv6 literal); skip that URL rather than let
+        # one email kill the nightly scan and starve every email behind it.
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            continue
 
         # Filter out tracking query params
         tracking_params = {"web", "source", "csf", "e", "cid", "nav"}

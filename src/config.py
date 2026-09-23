@@ -1,11 +1,75 @@
 """Configuration for the second-brain system.
 
-Settings are loaded from environment variables.
-Set these in your shell profile or a .env file.
+Settings are loaded from environment variables. Identity and tenant settings
+(BRAIN_* and SHAREPOINT_HOST) can also live in a per-host file, read below, so
+that they reach entry points that start with an empty environment. Nothing
+reads a .env file.
 """
 
 import os
+import re
+import sys
+from collections.abc import MutableMapping
 from pathlib import Path
+
+# Keys the settings file may set: identity and tenant, named one by one. A
+# credential, a backend switch (BRAIN_EXTRACT_ENGINE) or a relocated data home
+# (BRAIN_DATA_DIR) pasted into it must not be picked up silently.
+_CONFIG_FILE_KEYS = frozenset(
+    {"BRAIN_USER_NAME", "BRAIN_USER_ROLE", "BRAIN_USER_EMAIL_PATTERN", "SHAREPOINT_HOST"}
+)
+
+
+def _config_value(raw: str) -> str:
+    """The value part of a KEY=VALUE line: quotes removed, a # comment dropped.
+
+    A comment starts at a "#" at the start of the value or after whitespace
+    (a space or a tab), as in a shell; a "#" inside a word or quotes is kept.
+    """
+    value = raw.strip()
+    if value[:1] in ("'", '"'):
+        closing = value.find(value[0], 1)
+        if closing != -1:
+            return value[1:closing]
+    return re.split(r"(?:^|\s)#", value, maxsplit=1)[0].strip()
+
+
+def load_config_file(path: Path, environ: MutableMapping[str, str] = os.environ) -> None:
+    """Apply KEY=VALUE lines from ``path`` to ``environ``; the environment wins.
+
+    Claude Code starts the MCP server with an empty environment and systemd
+    starts the timers with a fixed one, so a setting exported in a shell profile
+    reaches neither. Before this existed, the producer ran with SHAREPOINT_HOST
+    at its placeholder and every Mac MCP server ran without
+    BRAIN_USER_EMAIL_PATTERN. Accepts ``export``, quotes and # comments. Runs at
+    import of every entry point, so an unreadable file is reported and ignored,
+    never fatal.
+    """
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return
+    except UnicodeDecodeError:
+        print(f"second-brain: {path} is not UTF-8; ignoring it", file=sys.stderr)
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if sep and key in _CONFIG_FILE_KEYS:
+            try:
+                environ.setdefault(key, _config_value(value))
+            except ValueError:  # os.environ refuses an embedded NUL
+                print(f"second-brain: skipping {key} in {path}: unusable value", file=sys.stderr)
+
+
+load_config_file(
+    Path(os.environ.get("BRAIN_CONFIG_FILE", str(Path.home() / ".config" / "second-brain" / "env")))
+)
 
 REPO_ROOT = Path(__file__).parent.parent
 # Data root — override with BRAIN_DATA_DIR to point at a stable, checkout-independent
@@ -50,10 +114,10 @@ IMAGE_CLASSIFY_BUDGET_S = float(os.environ.get("BRAIN_IMAGE_CLASSIFY_BUDGET_S", 
 NEWS_DB_PATH = Path(os.environ.get("BRAIN_NEWS_DB", Path.home() / "SourceCode/news/data/news.db"))
 
 # Host we hold an interactive SharePoint session for (captured via
-# `sharepoint-cli login --host <host>`). Auth failures on this host
-# mean the session expired and a re-login fixes them; auth failures on any
-# other host are external tenants we cannot authenticate to, and are skipped
-# rather than aborting a fetch pass.
+# `sharepoint-cli login --host <host>`). The session is only ever presented to
+# this host and its <tenant>-my OneDrive twin; links to any other tenant are
+# refused before a fetch. The default is a placeholder, so a host that fetches
+# must set it (process-sharepoint refuses to run until it is set).
 SHAREPOINT_HOST = os.environ.get("SHAREPOINT_HOST", "contoso.sharepoint.com")
 
 # Document roots scanned by `brain reverse-ingest` and policed by

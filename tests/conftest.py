@@ -11,16 +11,18 @@ days before this file existed they were not, each time costing a red CI push:
   reached a real client path.
 
 Both are the same class: a test that silently borrows the developer's machine.
-The two autouse fixtures below make that impossible rather than reviewable.
+The two autouse fixtures below make that impossible rather than reviewable. The
+per-host settings file src/config.py reads is redirected for the same reason.
 
-The data root is redirected in `pytest_configure`, NOT in a session fixture.
+The data root is redirected at import of this file, NOT in a session fixture.
 src/config.py resolves DATA_ROOT, DEFAULT_DB, ATTACHMENTS_DIR, RAW_BATCH_DIR,
 CONVERSATION_STAGING_DIR and SHAREPOINT_DATA_DIR at import time, and a test
 module that imports any of them at module level is imported during COLLECTION,
 which happens before the first fixture runs. A session fixture would therefore
 protect the lazily-importing tests and quietly miss the eager ones, which is the
-worst of both. pytest_configure runs before collection, so it catches every one.
-(See tests/test_config_paths.py for the derivation.)
+worst of both. pytest_configure runs before collection but NOT before a child
+directory's conftest, which can import src.config first; this file's own import
+precedes both, so it catches every one. (See tests/test_config_paths.py.)
 
 `no_network` blocks socket creation for the whole session. A test that genuinely
 needs the network marks itself `@pytest.mark.allow_network`; there are none
@@ -33,17 +35,34 @@ import tempfile
 
 import pytest
 
+# At module level, not in pytest_configure. When a run targets a subdirectory
+# (`pytest tests/teams/...`), pytest imports that directory's conftest as an
+# initial conftest BEFORE pytest_configure runs, and tests/teams/conftest.py
+# imports src.store.schema and therefore src.config, which resolves every path
+# and applies the settings file at import. This file is imported before any
+# child conftest, so setting the environment here is early enough in every case.
+#
+# Respect an explicit override so a developer can still point the suite at a
+# real tree on purpose; otherwise nothing under the repo's own data/ is
+# reachable from a test.
+if not os.environ.get("BRAIN_DATA_DIR"):
+    os.environ["BRAIN_DATA_DIR"] = tempfile.mkdtemp(prefix="brain-test-data-")
+# src/config.py applies the per-host settings file at import. A developer's real
+# one would hand every test this machine's identity and tenant, which CI never
+# has, so point it at a path that cannot exist, and drop a tenant exported in the
+# shell for the same reason. Unconditional, unlike the data root above: there is
+# no legitimate reason to test against either.
+os.environ["BRAIN_CONFIG_FILE"] = os.path.join(
+    tempfile.mkdtemp(prefix="brain-test-config-"), "absent"
+)
+os.environ.pop("SHAREPOINT_HOST", None)
+
 
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "allow_network: let this test open real sockets (default is blocked)",
     )
-    # Respect an explicit override so a developer can still point the suite at a
-    # real tree on purpose; otherwise nothing under the repo's own data/ is
-    # reachable from a test.
-    if not os.environ.get("BRAIN_DATA_DIR"):
-        os.environ["BRAIN_DATA_DIR"] = tempfile.mkdtemp(prefix="brain-test-data-")
 
 
 class _BlockedSocket(socket.socket):

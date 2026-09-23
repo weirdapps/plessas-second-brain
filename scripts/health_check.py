@@ -826,13 +826,26 @@ def check_sharepoint(db):
         # links with attempts=1 sat below the cap, aged past the threshold and
         # pinned this row to STALE permanently. A red no action can clear gets
         # ignored exactly as fast as a green no failure can trip.
+        # Our own tenant is the exception, again as in retry_candidates: it is
+        # never unsupported, so a link parked there under that status is retry
+        # work, and retry work nobody touches is exactly what this measures.
+        from src.export.sharepoint_fetcher import managed_sharepoint_hosts
+
+        own = [f"https://{h}/%" for h in sorted(managed_sharepoint_hosts(SHAREPOINT_HOST))]
+        own += ["", ""]
         overdue = db.execute(
             "SELECT COUNT(*) FROM sharepoint_links "
             "WHERE fetched_at IS NULL AND COALESCE(attempts, 0) < ? "
-            "AND COALESCE(last_status, '') != 'unsupported-host' "
+            "AND (COALESCE(last_status, '') != 'unsupported-host' "
+            "     OR url LIKE ? OR url LIKE ?) "
             "AND (last_attempt_at IS NULL "
             "     OR datetime(last_attempt_at) < datetime('now', ?))",
-            (SHAREPOINT_MAX_ATTEMPTS, f"-{STALE_THRESHOLDS['sharepoint'].days} days"),
+            (
+                SHAREPOINT_MAX_ATTEMPTS,
+                own[0],
+                own[1],
+                f"-{STALE_THRESHOLDS['sharepoint'].days} days",
+            ),
         ).fetchone()[0]
         # The complement of `overdue`, and the reason that check can be quiet and
         # still be hiding something. A never-fetched link past the attempt cap is

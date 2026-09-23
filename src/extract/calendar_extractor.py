@@ -3,6 +3,7 @@
 import json
 
 from src.extract.claude_extract import _get_client_and_model, _response_text, call_with_policy
+from src.redact import redact_secrets
 
 
 def parse_extraction_response(raw: str) -> dict:
@@ -64,14 +65,17 @@ def extract_event(event: dict, body: str | None = None) -> dict:
     if body is None or len(body.strip()) < 50:
         return {"body_summary": "", "decisions": [], "action_items": []}
 
-    # Truncate body to 4000 chars
-    truncated_body = body[:4000]
+    # Redact credentials, then truncate to 4000 chars. Redacting first means a
+    # key straddling the cut cannot survive as an unrecognisable fragment.
+    truncated_body = redact_secrets(body)[:4000]
 
     # Extract event metadata
     subject = event.get("subject", "")
     organizer = event.get("organizer", "")
+    # `or`, not a get() default: Graph sends "name": null, and get() returns the
+    # stored None rather than the default, which str.join rejects.
     attendees = ", ".join(
-        a.get("name", a.get("email", "")) if isinstance(a, dict) else str(a)
+        str(a.get("name") or a.get("email") or "") if isinstance(a, dict) else str(a)
         for a in event.get("attendees", [])
     )
     start_at = event.get("start_at", "")

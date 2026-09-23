@@ -103,14 +103,13 @@ class TestDedup:
         GROUP BY puts NULLs together: the same task in two threads, or in a
         thread and a meeting, was deleted as a duplicate of the other."""
         conn = create_database(":memory:")
-        _thread(conn, 1, OLD, OLD)
-        _thread(conn, 2, OLD, OLD)
-        _meeting(conn, 1, OLD)
-        _turn(conn, 1, OLD)
-        _add(conn, "send the deck", email_id=None, teams_thread_id=1)
-        _add(conn, "send the deck", email_id=None, teams_thread_id=2)
-        _add(conn, "send the deck", email_id=None, event_id=1)
-        _add(conn, "send the deck", email_id=None, conversation_turn_id=1)
+        for i in (1, 2):
+            _thread(conn, i, OLD, OLD)
+            _meeting(conn, i, OLD)
+            _turn(conn, i, OLD)
+            _add(conn, "send the deck", email_id=None, teams_thread_id=i)
+            _add(conn, "send the deck", email_id=None, event_id=i)
+            _add(conn, "send the deck", email_id=None, conversation_turn_id=i)
         conn.commit()
         assert dedup_exact_open_actions(conn) == 0
         conn.close()
@@ -140,6 +139,28 @@ class TestExpire:
         assert statuses["recent"] == "open"
         assert statuses["nodate"] == "open"
         assert statuses["freetext"] == "open"
+        conn.close()
+
+    def test_a_fresh_action_with_a_long_past_deadline_is_kept(self):
+        """A model that writes last year for 'by 30/9' dates a fresh action a
+        year overdue, and dated expiry now runs every day: it vanished the
+        morning after it arrived."""
+        conn = create_database(":memory:")
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received) VALUES (1, 1, ?), (2, 2, ?)",
+            (_now(), OLD),
+        )
+        _add(conn, "fresh email", deadline="2020-09-30", email_id=1)
+        _add(conn, "old email", deadline="2020-09-30", email_id=2)
+        _add(conn, "no parent", deadline="2020-09-30", email_id=None)
+        conn.commit()
+
+        assert expire_stale_actions(conn, days=180) == 2
+        assert dict(conn.execute("SELECT task, status FROM action_items")) == {
+            "fresh email": "open",
+            "old email": "expired",
+            "no parent": "expired",
+        }
         conn.close()
 
 
@@ -200,6 +221,35 @@ class TestExpireUndated:
             "future meeting": "open",
             "old turn": "expired",
             "recent turn": "open",
+        }
+        conn.close()
+
+    def test_a_parent_without_a_date_leaves_its_action_alone(self):
+        """'' is how a missing date is stored, and it sorted before every date,
+        so an undatable parent counted as infinitely old."""
+        conn = create_database(":memory:")
+        conn.execute("INSERT INTO emails (id, message_id, date_received) VALUES (1, 1, '')")
+        _turn(conn, 1, "")
+        _add(conn, "email without a date", email_id=1)
+        _add(conn, "turn without a date", email_id=None, conversation_turn_id=1)
+        conn.commit()
+
+        assert expire_undated_actions(conn, days=90) == 0
+        conn.close()
+
+    def test_a_free_text_deadline_in_a_coming_year_is_kept(self):
+        """'31/12/2027' is no ISO date, but it is still to come."""
+        conn = create_database(":memory:")
+        conn.execute("INSERT INTO emails (id, message_id, date_received) VALUES (1, 1, ?)", (OLD,))
+        next_year = datetime.now(UTC).year + 1
+        _add(conn, "due next year", deadline=f"31/12/{next_year}", email_id=1)
+        _add(conn, "due long ago", deadline="31/12/2020", email_id=1)
+        conn.commit()
+
+        assert expire_undated_actions(conn, days=90) == 1
+        assert dict(conn.execute("SELECT task, status FROM action_items")) == {
+            "due next year": "open",
+            "due long ago": "expired",
         }
         conn.close()
 

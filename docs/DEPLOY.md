@@ -184,6 +184,12 @@ news, SharePoint or the filesystem scan, so `calendar-sync`, `teams-sync`,
 `news-sync`, `process-sharepoint` and `reverse-ingest` each want their own
 schedule. `python -m src.cli --help` lists every subcommand.
 
+Nor does it close action items: extraction only appends, so run
+`python -m src.store.action_lifecycle` after a successful sync. It drops
+re-extracted duplicates and marks actions expired once their deadline, or
+for an undated one its source, is long past. The daily wrapper in
+`scripts/wrappers/systemd/sb-daily-sync.sh` does this.
+
 ## 7. Health check (optional)
 
 `scripts/health_check.py` reports per-source freshness and job status, and can

@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # than copied so this script cannot drift away from them again the way it did
 # while it lived untracked on the VPS.
 from src.extract.claude_extract import MAX_OUTPUT_TOKENS, _response_text  # noqa: E402
+from src.extract.untrusted import fence_fields  # noqa: E402
 from src.extract.vertex_fallback import create_with_refusal_fallback  # noqa: E402
 from src.llm_deadline import install_llm_deadline_for_this_process  # noqa: E402
 
@@ -185,14 +186,23 @@ def get_client():
 
 
 def classify_one(client, model, c: dict) -> dict:
-    prompt = CLASSIFY_PROMPT.format(
-        taxonomy=TAXONOMY,
+    # The sender wrote the filename, the subject and the document the summary
+    # came from, and the answer names a folder this job writes to.
+    intro, fenced = fence_fields(
         filename=c["filename"],
         subject=c["subject"] or "(none)",
         sender=c["sender"] or "(unknown)",
-        date=c["date"],
-        size_mb=round(c["file_size"] / 1024 / 1024, 2),
         summary=c["summary"][:1500],
+    )
+    prompt = (
+        intro
+        + "\n\n"
+        + CLASSIFY_PROMPT.format(
+            taxonomy=TAXONOMY,
+            date=c["date"],
+            size_mb=round(c["file_size"] / 1024 / 1024, 2),
+            **fenced,
+        )
     )
     response = create_with_refusal_fallback(
         client,
@@ -525,8 +535,11 @@ def main():
             log(f"  classify error for id={c['id']}: {e}")
             continue
         processed.add(c["id"])
-        folder = result.get("folder", "SKIP")
-        if folder == "SKIP" or not folder.startswith(tuple(f"{a}/" for a in AREAS)):
+        # Only a managed folder, exactly. The folder is the model's answer, and
+        # the model reads what the sender wrote: a prefix check let
+        # 'National/../../x' copy an attachment outside the tree.
+        folder = str(result.get("folder", "SKIP")).strip().rstrip("/")
+        if folder not in MANAGED_FOLDERS:
             continue
         if result.get("confidence") != "high":
             log(f"  SKIP (conf={result.get('confidence')}): {c['filename'][:40]}")

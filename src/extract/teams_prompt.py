@@ -7,7 +7,7 @@ the loader logic stays uniform across kinds.
 
 import json
 
-from src.extract.untrusted import DATA_NOT_INSTRUCTIONS, fence
+from src.extract.untrusted import fence
 
 SYSTEM_PROMPT = (
     "You are extracting structured knowledge from a Microsoft Teams thread "
@@ -34,8 +34,6 @@ MESSAGES (chronological; system messages already excluded):
 {transcript}"""
 
 USER_TEMPLATE = """\
-{data_not_instructions}
-
 {thread}
 
 Return JSON with these keys (use empty string / empty list when nothing applies):
@@ -81,9 +79,7 @@ def build_prompt(thread: dict, messages: list[dict]) -> tuple[str, str]:
         message_count=thread.get("message_count", len(messages)),
         transcript=transcript,
     )
-    user = USER_TEMPLATE.format(
-        data_not_instructions=DATA_NOT_INSTRUCTIONS, thread=fence(thread_text)
-    )
+    user = USER_TEMPLATE.format(thread=fence(thread_text))
     return SYSTEM_PROMPT, user
 
 

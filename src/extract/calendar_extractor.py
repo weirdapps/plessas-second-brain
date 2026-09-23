@@ -3,7 +3,7 @@
 import json
 
 from src.extract.claude_extract import _get_client_and_model, _response_text, call_with_policy
-from src.extract.untrusted import DATA_NOT_INSTRUCTIONS, fence
+from src.extract.untrusted import fence
 from src.redact import redact_secrets
 
 
@@ -100,8 +100,6 @@ Date: {start_at}
 Event body/description:
 {truncated_body}"""
     prompt = f"""You are analyzing a calendar event from a corporate email system.
-
-{DATA_NOT_INSTRUCTIONS}
 
 {fence(invite)}
 

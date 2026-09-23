@@ -26,12 +26,13 @@ mkdir -p "$LOG_DIR"
 # Without this, auth-watch's restoration trigger can overlap with the 07:00 cron
 # (or a manual run), doubling Vertex AI spend. Stale-lock recovery via PID check.
 # Overridable so the wrapper tests never touch a lock a real run may hold. The
-# lock is removed with rm -rf, so the override must name a *.lock directory.
+# lock is removed with rm -rf after a cd, so the override must be an absolute
+# path to a *.lock directory.
 LOCK_DIR="${SB_DAILY_SYNC_LOCK:-/tmp/sb-daily-sync.lock}"
 case "$LOCK_DIR" in
-  *.lock) ;;
+  /*.lock) ;;
   *)
-    echo "SB_DAILY_SYNC_LOCK must name a *.lock directory, got: $LOCK_DIR" >&2
+    echo "SB_DAILY_SYNC_LOCK must name an absolute *.lock directory, got: $LOCK_DIR" >&2
     exit 64
     ;;
 esac

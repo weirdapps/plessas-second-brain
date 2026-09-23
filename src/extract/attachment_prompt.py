@@ -1,7 +1,7 @@
 """Prompt template for Vertex AI attachment content extraction."""
 
 from src.config import USER_NAME, USER_ROLE
-from src.extract.untrusted import DATA_NOT_INSTRUCTIONS, fence
+from src.extract.untrusted import fence
 
 
 def build_attachment_prompt(
@@ -44,7 +44,6 @@ Document content:
 
     return f"""You are extracting structured information from a document attachment.
 {identity_context}
-{DATA_NOT_INSTRUCTIONS}
 {truncation_note}
 {fence(document)}
 

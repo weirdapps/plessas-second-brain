@@ -199,6 +199,8 @@ def test_a_failed_action_lifecycle_does_not_fail_the_daily_sync(tmp_path):
 
     assert result.returncode == 0
     assert any("src.store.action_lifecycle" in c for c in _calls(home))
+    log = (home / ".second-brain" / "logs" / "daily-sync.log").read_text()
+    assert "WARN: action lifecycle failed" in log
 
 
 def test_a_failed_daily_sync_keeps_its_code_and_skips_the_lifecycle(tmp_path):
@@ -208,6 +210,24 @@ def test_a_failed_daily_sync_keeps_its_code_and_skips_the_lifecycle(tmp_path):
 
     assert result.returncode == 3
     assert not any("action_lifecycle" in c for c in _calls(home))
+
+
+def test_a_relative_daily_sync_lock_override_is_refused(tmp_path):
+    """The wrapper changes directory before its EXIT trap removes the lock, so
+    a relative path was made in one directory and removed from another."""
+    home = _daily_home(tmp_path, "exit 0\n")
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-daily-sync.sh")],
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin", "SB_DAILY_SYNC_LOCK": "rel.lock"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=tmp_path,
+    )
+
+    assert result.returncode == 64
+    assert not (tmp_path / "rel.lock").exists()
 
 
 def test_a_daily_sync_lock_override_that_is_not_a_lock_path_is_refused(tmp_path):

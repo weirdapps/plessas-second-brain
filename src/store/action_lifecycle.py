@@ -16,6 +16,7 @@ database the replicas copy. By hand, `--dry-run` rolls back.
 """
 
 import sqlite3
+from datetime import date
 
 from src.config import DEFAULT_DB
 from src.store.schema import get_connection
@@ -70,19 +71,23 @@ def dedup_exact_open_actions(conn: sqlite3.Connection) -> int:
 def expire_stale_actions(conn: sqlite3.Connection, days: int = DEFAULT_EXPIRE_DAYS) -> int:
     """Mark OPEN actions with a parseable deadline older than `days` as 'expired'.
 
-    Only touches dated actions (NULL/free-text deadlines are left alone). Returns
-    the number of rows expired.
+    Only touches dated actions (NULL/free-text deadlines are left alone), and
+    never one whose parent is itself younger than `days`: a model that writes
+    last year for 'by 30/9' dates a fresh action a year overdue, and this runs
+    every day. Returns the number of rows expired.
     """
     cur = conn.execute(
-        """
+        f"""
         UPDATE action_items
         SET status = 'expired'
         WHERE status = 'open'
           AND deadline IS NOT NULL
-          AND deadline GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'
+          AND deadline GLOB {_ISO_DATE}
           AND date(substr(deadline, 1, 10)) < date('now', '-' || ? || ' day')
+          AND NOT COALESCE({_PARENT_LAST_ACTIVE} GLOB {_ISO_DATE}
+              AND substr({_PARENT_LAST_ACTIVE}, 1, 10) >= date('now', '-' || ? || ' day'), 0)
         """,
-        (days,),
+        (days, days),
     )
     return cur.rowcount
 
@@ -94,18 +99,25 @@ def expire_undated_actions(
 
     expire_stale_actions needs a deadline to have passed, and on 2026-09-23 128K
     of the 154K open actions had none (NULL or free text such as 'ASAP'), so they
-    stayed open for good. An action with no parent row cannot be dated and is left
-    alone. Returns the number of rows expired.
+    stayed open for good. Left alone: an action whose parent has no ISO date
+    (no parent row, or '', the store's word for a missing date, which sorts
+    before every date), and a free-text deadline naming this year or a later one
+    ('31/12/2027'), which is still to come. Returns the number of rows expired.
     """
+    this_year = date.today().year
+    coming_years = [f"%{year}%" for year in range(this_year, this_year + 6)]
+    names_a_coming_year = " OR ".join("deadline LIKE ?" for _ in coming_years)
     cur = conn.execute(
         f"""
         UPDATE action_items
         SET status = 'expired'
         WHERE status = 'open'
-          AND (deadline IS NULL OR deadline NOT GLOB {_ISO_DATE})
+          AND (deadline IS NULL
+               OR (deadline NOT GLOB {_ISO_DATE} AND NOT ({names_a_coming_year})))
+          AND {_PARENT_LAST_ACTIVE} GLOB {_ISO_DATE}
           AND substr({_PARENT_LAST_ACTIVE}, 1, 10) < date('now', '-' || ? || ' day')
         """,
-        (days,),
+        (*coming_years, days),
     )
     return cur.rowcount
 

@@ -320,6 +320,7 @@ src/
     prompt.py                  Email extraction prompt
     attachment_prompt.py       Attachment summarization prompt
     teams_prompt.py            Teams thread extraction prompt
+    untrusted.py               Fences third-party text in extraction prompts
     local.py                   Concurrent extraction dispatcher
     parser.py                  Tolerant LLM JSON parser
     claude_extract.py          Claude via Vertex AI or direct API

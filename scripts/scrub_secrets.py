@@ -38,7 +38,6 @@ ones in data/backups/, both of which age out under the retention policy.
 """
 
 import argparse
-import os
 import shutil
 import sqlite3
 import sys
@@ -112,6 +111,20 @@ def _fts5_indexes(conn: sqlite3.Connection) -> list[str]:
     )
 
 
+def _temp_dir_beside(conn: sqlite3.Connection, directory: Path) -> bool:
+    """Point this connection's temporary files at ``directory``. False if ignored.
+
+    Left to itself SQLite uses $SQLITE_TMPDIR, $TMPDIR, /var/tmp or /tmp, read
+    once when sqlite3 is imported, so setting the variable from here is too
+    late. The pragma is deprecated but compiled into the builds this runs on;
+    reading it back is how an omitted one is detected.
+    """
+    quoted = str(directory).replace("'", "''")
+    conn.execute(f"PRAGMA temp_store_directory = '{quoted}'")
+    row = conn.execute("PRAGMA temp_store_directory").fetchone()
+    return bool(row) and row[0] == str(directory)
+
+
 def _checkpoint(conn: sqlite3.Connection) -> bool:
     """Copy the WAL back into the main file and truncate it. False if a reader blocked it.
 
@@ -166,6 +179,8 @@ def main(argv: list[str] | None = None) -> int:
         help="with --apply, VACUUM afterwards to drop copies freed before the scrub",
     )
     args = parser.parse_args(argv)
+    if args.vacuum and not args.apply:
+        parser.error("--vacuum requires --apply")
 
     db = Path(DEFAULT_DB)
     if not db.exists():
@@ -183,17 +198,24 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.vacuum:
         # VACUUM builds a full temporary copy, then writes the result through
-        # the WAL: about twice the database. The temp copy goes beside the
-        # database, not to a small tmpfs /tmp.
+        # the WAL: about twice the database, all of it beside the database once
+        # the temp directory is pointed there below.
         need = 2 * db.stat().st_size
         if shutil.disk_usage(db.parent).free < need:
             print(f"Error: --vacuum needs about {need:,} bytes free beside {db}", file=sys.stderr)
             return 2
-        os.environ["SQLITE_TMPDIR"] = str(db.parent)
 
     conn = sqlite3.connect(db, isolation_level=None)
     conn.execute(f"PRAGMA busy_timeout = {int(BUSY_TIMEOUT_MS)}")
     conn.execute("PRAGMA secure_delete = ON")
+    if args.vacuum and not _temp_dir_beside(conn, db.parent):
+        conn.close()
+        print(
+            "Error: this SQLite build ignores PRAGMA temp_store_directory, so VACUUM's "
+            "temporary copy could land on a small tmpfs. Not vacuuming.",
+            file=sys.stderr,
+        )
+        return 2
     try:
         found = _scan(conn)
         _report(found)

@@ -165,6 +165,17 @@ def test_a_line_that_is_not_valid_utf8_is_still_scanned(repo, denylist):
     assert planted in result.stdout
 
 
+def test_an_unreachable_origin_fails_the_run_instead_of_passing_it(repo, denylist, tmp_path):
+    """A history audit that could not see the pull-request heads has not covered
+    what GitHub still serves, so it must not print PASS."""
+    _git(repo, "remote", "add", "origin", str(tmp_path / "no-such-remote.git"))
+
+    result = _run(repo, denylist)
+
+    assert result.returncode == 1
+    assert "pull-request heads" in result.stdout
+
+
 def test_pull_request_heads_on_origin_are_scanned_and_cleaned_up(repo, denylist, tmp_path):
     """--all sees local refs only. On GitHub a closed PR's head stays reachable
     through refs/pull/N/head, including after a history rewrite, so history mode

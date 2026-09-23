@@ -256,7 +256,7 @@ class TestExpireUndated:
         conn = create_database(":memory:")
         conn.execute("INSERT INTO emails (id, message_id, date_received) VALUES (1, 1, ?)", (OLD,))
         year = datetime.now(UTC).year
-        yy, nyy = f"{year % 100:02d}", f"{(year + 1) % 100:02d}"
+        pyy, yy, nyy = (f"{(year + k) % 100:02d}" for k in (-1, 0, 1))
         kept = [
             f"31/12/{year + 1}",
             f"31/12/{nyy}",
@@ -267,6 +267,14 @@ class TestExpireUndated:
             f"end H1-{nyy}",
             f"FY{yy}/{nyy}",
             f"by 12/{nyy}",
+            # A span that closes this year, a padded month, a spaced quarter and
+            # the digit-first quarter brokers write.
+            f"FY{pyy}/{yy}",
+            f"{year - 1}-{yy}",
+            f"card expiry 01/{nyy}",
+            f"Q4 {yy}",
+            f"4Q{yy}",
+            f"Q2 '{nyy}",
         ]
         expired = [
             "31/12/2020",
@@ -277,6 +285,12 @@ class TestExpireUndated:
             "by 17.30",
             "after v1.30",
             f"release v2.1.{nyy}",
+            # Greek clock times and decimals: a dot is no month separator.
+            f"Τρίτη 10.{yy}",
+            f"rate 3.{nyy}%",
+            f"FY{year - 3}/{(year - 2) % 100:02d}",
+            f"ref 1{year}",  # ends in a year, but is a longer number
+            f"ticket 123/10/{nyy}",  # a number path, not a month
         ]
         for i, deadline in enumerate(kept + expired):
             _add(conn, f"task {i}", deadline=deadline, email_id=1)

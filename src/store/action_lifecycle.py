@@ -96,27 +96,33 @@ def expire_stale_actions(conn: sqlite3.Connection, days: int = DEFAULT_EXPIRE_DA
     return cur.rowcount
 
 
-# How a free-text deadline names a year: four digits standing alone, or two in
-# a d/m/yy date, a m/yy month, a quarter or half ('Q4/26', 'H1-27') or a fiscal
-# year ('FY26'). A year inside a longer number names none ('PO 120265'), nor do
-# two digits after a time or a version ('17.30', 'v1.30'), nor the day of a full
-# date ('10/26/2023', '2023/10/26'). An amount beside the date is no obstacle
-# ('pay 4521 by 30/10/27').
+# How a free-text deadline names a year: four digits standing alone or opening
+# a span ('2025-26', whose close counts too), or two digits in a d/m/yy date, a
+# mm/yy month ('01/27'), a quarter or half ('Q4/26', 'Q4 26', '4Q26', "Q2 '27")
+# or a fiscal year ('FY26', 'FY25/26'). A year inside a longer number names
+# none ('PO 120265'), nor do the minutes of a time or the decimals of a number
+# ('10.30', '17.30', '3.27%'), a version ('v1.30'), or the day of a full date
+# ('10/26/2023', '2023/10/26'). An amount beside the date is no obstacle ('pay
+# 4521 by 30/10/27'). A US day ('due 6/30') cannot be told from June 2030, and
+# counts as the month: an action wrongly kept open is the cheaper mistake.
 _YEAR_FORMS = re.compile(
-    r"(?<![0-9])(?P<full>20[0-9]{2})(?![0-9])"
+    r"(?<![0-9])(?P<full>20[0-9]{2})(?:[/-](?P<span>[0-9]{2}))?(?![0-9])"
     r"|(?<![0-9A-Za-z])[0-9]{1,2}[/.-][0-9]{1,2}[/.-](?P<dmy>[0-9]{2})(?![0-9])"
-    r"|(?<![0-9A-Za-z/.-])(?:1[0-2]|[1-9])[/.-](?P<my>[0-9]{2})(?![0-9/-])"
-    r"|(?<![0-9A-Za-z])[QqHh][1-4][/.-]?(?P<quarter>[0-9]{2})(?![0-9])"
-    r"|(?<![0-9A-Za-z])[Ff][Yy] ?(?P<fiscal>[0-9]{2})(?![0-9])"
+    r"|(?<![0-9A-Za-z/.-])(?:0?[1-9]|1[0-2])/(?P<my>[0-9]{2})(?![0-9/-])"
+    r"|(?<![0-9A-Za-z])(?:[QqHh][1-4]|[1-4][QqHh])[/.\- ]?'?(?P<quarter>[0-9]{2})(?![0-9])"
+    r"|(?<![0-9A-Za-z])[Ff][Yy] ?'?(?:(?:20)?[0-9]{2}[/-])?(?P<fiscal>[0-9]{2})(?![0-9])"
 )
 
 
 def _names_a_coming_year(text: str | None, this_year: int) -> int:
     """1 if `text` names this year or one of the next ten, in a _YEAR_FORMS form."""
     for match in _YEAR_FORMS.finditer(text or ""):
-        full, *short = match.group("full", "dmy", "my", "quarter", "fiscal")
-        year = int(full) if full else 2000 + int(next(digits for digits in short if digits))
-        if this_year <= year <= this_year + 10:
+        full, span, *short = match.group("full", "span", "dmy", "my", "quarter", "fiscal")
+        if full:
+            years = [int(full)] + ([2000 + int(span)] if span else [])
+        else:
+            years = [2000 + int(next(digits for digits in short if digits))]
+        if any(this_year <= year <= this_year + 10 for year in years):
             return 1
     return 0
 

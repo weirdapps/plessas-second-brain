@@ -128,10 +128,13 @@ def _fetch_youtube_transcript(video_id: str) -> str | None:
         transcript = api.fetch(video_id, languages=["en", "en-US", "en-GB"])
     except Exception:
         try:
-            transcript_list = api.list(video_id)
-            if not transcript_list:
+            # TranscriptList iterates but does not index: `[0]` raised here,
+            # the except below swallowed it, and no non-English video ever
+            # had a transcript.
+            first = next(iter(api.list(video_id)), None)
+            if first is None:
                 return None
-            transcript = transcript_list[0].fetch()
+            transcript = first.fetch()
         except Exception:
             return None
 

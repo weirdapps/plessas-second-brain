@@ -967,6 +967,8 @@ def cmd_query_keyword(args):
         print(f"No emails found matching: {args.keyword}")
     else:
         print(f"Found {len(results)} emails matching '{args.keyword}':\n")
+        if results[0].get("partial_match"):
+            print("(No email held every word; these hold some of them.)\n")
 
         for i, email in enumerate(results, 1):
             print(f"{i}. {format_email_result(email)}")
@@ -1121,7 +1123,7 @@ def cmd_prep(args):
     from src.store.schema import get_connection
 
     conn = get_connection(str(args.db))
-    people_list = [p.strip() for p in args.people.split(",")]
+    people_list = [p.strip() for p in args.people.split(",") if p.strip()]
     result = meeting_prep(
         conn, people_list, topic=args.topic, days=args.days, limit_per_person=args.limit
     )
@@ -1524,6 +1526,8 @@ def cmd_teams_search(args):
     if not results:
         print(f"No teams matches for: {args.query}")
         return
+    if results[0].get("partial_match"):
+        print("(No thread held every word; these hold some of them.)")
     for i, r in enumerate(results, 1):
         print(f"\n{i}. [{r['team_name']} / {r['channel_topic']}] {r['title'] or '(untitled)'}")
         print(

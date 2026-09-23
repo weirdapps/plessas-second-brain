@@ -19,9 +19,29 @@ def search_teams(
         kind: 'thread' | 'message' | 'both'.
 
     Returns:
-        Deduped-by-thread list, newest first.
+        Deduped-by-thread list, newest first. The exact phrase is tried first,
+        then every token in any order, then any meaningful token; rows from that
+        last pass carry partial_match. Only the phrase used to be tried, so a
+        query whose words were all present but not adjacent found nothing.
     """
-    safe = _sanitize_fts(query)
+    from src.store.query import _sanitize_fts5_query, fts5_query_variants
+
+    variants = [(_sanitize_fts(query), False)]
+    for expression, partial in fts5_query_variants(query):
+        if expression != variants[0][0] and expression != _sanitize_fts5_query(""):
+            variants.append((expression, partial))
+    for safe, partial in variants:
+        out = _teams_hits(conn, safe, kind, limit)
+        if out:
+            if partial:
+                for row in out:
+                    row["partial_match"] = True
+            return out
+    return []
+
+
+def _teams_hits(conn: sqlite3.Connection, safe: str, kind: str, limit: int) -> list[dict]:
+    """search_teams for one sanitized MATCH expression."""
     results: dict[int, dict] = {}
 
     if kind in ("thread", "both"):

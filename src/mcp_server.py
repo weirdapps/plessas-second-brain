@@ -39,11 +39,15 @@ lag. `stats` returns data_as_of / age_hours / stale, and `recall` attaches \
 _stale_warning when it matters. For mail newer than the replica, use \
 `outlook_live_search`.
 
-Greek. Most of this corpus is Greek, and the full-text index is ACCENT-SENSITIVE: \
-it case-folds but does not strip the tonos. Searching "παρουσιαση" returns about \
-3% of what "παρουσίαση" returns. Always write Greek search terms WITH their \
-accents. If a Greek query returns suspiciously little, re-run it accented before \
-concluding the corpus has nothing.
+Matching. Most of this corpus is Greek. Every search ignores case, accents and \
+final sigma, so either form of a word works. Keyword search wants every word \
+but stopwords (the, what, και, για); \
+when nothing holds them all it falls back to any meaningful word and flags those \
+rows partial_match (recall's summary.partial_kinds names the kinds that only \
+matched partly). Plain words work best; quotes and operators are ignored. In \
+person_context, sender_brief and meeting_prep an ambiguous name resolves to the \
+most-emailed person, with match_count and other_candidates saying who else it \
+could be; the query_* filters match everyone the name fits.
 
 Not covered: anything not yet ingested, plus WhatsApp, Yahoo, personal Gmail and \
 sch.gr mail, which are separate MCP servers in this session.\
@@ -66,7 +70,9 @@ def person_context(name_or_email: str, days: int = 365, limit: int = 20) -> dict
     you can tell a complete answer from the head of a long one.
 
     Args:
-        name_or_email: Person's name (partial match) or email address
+        name_or_email: Person's name (partial match, case and accent blind) or email
+            address. An ambiguous name resolves to the most-emailed match;
+            match_count and other_candidates say how many matched and who else.
         days: Lookback period in days (default: 365)
         limit: Max rows per list (default: 20)
     """
@@ -123,7 +129,8 @@ def search_emails(query: str, search_type: str = "keyword", limit: int = 20) -> 
     """Search emails by keyword (FTS5) or semantic similarity (embeddings).
 
     Args:
-        query: Search query text
+        query: Search query text. Keyword mode wants every word, then falls back to
+            any meaningful word, flagging those rows partial_match.
         search_type: "keyword" for full-text search, "semantic" for embedding similarity
         limit: Maximum results (default: 20)
     """
@@ -154,8 +161,10 @@ def recall(query: str, limit_per_kind: int = 5, days: int = 365) -> dict:
     2026-09-09, which made three whole kinds invisible to a caller.
 
     Only the emails bucket fuses keyword and semantic ranking; every other
-    bucket is keyword-only. When the local replica is behind, the result carries
-    `_stale_warning` and `data_as_of`.
+    bucket is keyword-only. A bucket where nothing held the whole query falls
+    back to rows holding some of its words, each flagged partial_match, and
+    `summary.partial_kinds` names those buckets. When the local replica is
+    behind, the result carries `_stale_warning` and `data_as_of`.
 
     Args:
         query: Free-text query (keyword, name, topic, etc.)
@@ -351,7 +360,7 @@ def meeting_prep(people: str, topic: str | None = None, days: int = 365) -> dict
 
     conn = _get_conn()
     try:
-        people_list = [p.strip() for p in people.split(",")]
+        people_list = [p.strip() for p in people.split(",") if p.strip()]
         return _mp(conn, people_list, topic=topic, days=days)
     finally:
         conn.close()
@@ -365,7 +374,8 @@ def search_attachments(query: str, limit: int = 20) -> list[dict]:
     Returns filename, parent email subject, matching snippet, and summary.
 
     Args:
-        query: Search query text (FTS5 syntax supported)
+        query: Plain words: every word first, then any meaningful word, with those rows
+            flagged partial_match. Quotes and operators are ignored.
         limit: Maximum results (default: 20)
     """
     from src.store.query import search_attachments as _search
@@ -388,52 +398,74 @@ def query_calendar_events(
     """Query calendar events by person, date range, or keyword.
 
     Args:
-        person: Filter by attendee name or email (partial match)
+        person: Filter by attendee name or email (partial match, case and accent blind)
         since: Start date (YYYY-MM-DD)
-        until: End date (YYYY-MM-DD)
+        until: End date (YYYY-MM-DD, inclusive)
         keyword: Full-text search in subject and body_summary
         limit: Maximum results (default: 20)
     """
+    import re
+
+    from src.store.greek import search_fold
+
     conn = _get_conn()
     try:
         query = "SELECT ce.* FROM calendar_events ce"
         conditions = []
         params: list[str | int] = []
-        joins = []
 
         if person:
-            joins.append("JOIN event_attendees ea ON ea.event_id = ce.id")
-            conditions.append("(LOWER(ea.name) LIKE ? OR LOWER(ea.email) LIKE ?)")
-            pattern = f"%{person.lower()}%"
-            params.extend([pattern, pattern])
+            # Attendee names are mostly ALL-CAPS Greek, which LOWER() does not
+            # fold, and the JOIN this used to be listed an event once per
+            # matching attendee.
+            conditions.append(
+                "ce.id IN (SELECT event_id FROM event_attendees "
+                "WHERE sb_fold(name) LIKE ? OR LOWER(email) LIKE ?)"
+            )
+            params.extend([f"%{search_fold(person)}%", f"%{person.strip().lower()}%"])
 
         if since:
             conditions.append("ce.start_at >= ?")
             params.append(since)
         if until:
-            conditions.append("ce.start_at <= ?")
+            # start_at carries a time, so a bare date compared with <= dropped
+            # every event on that day. A bare date now means the whole day.
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", until):
+                conditions.append("ce.start_at < date(?, '+1 day')")
+            else:
+                conditions.append("ce.start_at <= ?")
             params.append(until)
 
-        if keyword:
-            from src.store.query import _sanitize_fts5_query
+        # The keyword runs through the same sanitized variants as every other
+        # MATCH: every word, then any meaningful word, whose rows are flagged
+        # partial_match. Raw text here raised OperationalError on ? & : or a
+        # leading hyphen.
+        from src.store.query import fts5_query_variants
 
-            conditions.append(
-                "ce.id IN (SELECT rowid FROM calendar_events_fts WHERE calendar_events_fts MATCH ?)"
-            )
-            # Raw text here raised OperationalError out of the tool on any query
-            # containing ? & : or a leading hyphen. Same defanging as every other
-            # MATCH in the codebase.
-            params.append(_sanitize_fts5_query(keyword))
+        variants: list[tuple[str | None, bool]] = (
+            list(fts5_query_variants(keyword)) if keyword else [(None, False)]
+        )
+        rows: list = []
+        partial = False
+        for expression, is_partial in variants:
+            where = list(conditions)
+            args: list[str | int] = list(params)
+            if expression is not None:
+                where.append(
+                    "ce.id IN (SELECT rowid FROM calendar_events_fts "
+                    "WHERE calendar_events_fts MATCH ?)"
+                )
+                args.append(expression)
+            sql = query
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY ce.start_at DESC LIMIT ?"
+            args.append(limit)
+            rows = conn.execute(sql, args).fetchall()
+            if rows:
+                partial = is_partial
+                break
 
-        sql = query
-        if joins:
-            sql += " " + " ".join(joins)
-        if conditions:
-            sql += " WHERE " + " AND ".join(conditions)
-        sql += " ORDER BY ce.start_at DESC LIMIT ?"
-        params.append(limit)
-
-        rows = conn.execute(sql, params).fetchall()
         events = []
         for row in rows:
             event_id = row["id"]
@@ -462,6 +494,8 @@ def query_calendar_events(
                     ],
                 }
             )
+            if partial:
+                events[-1]["partial_match"] = True
         return {"events": events, "count": len(events)}
     finally:
         conn.close()
@@ -522,7 +556,8 @@ def search_conversations(
     """Search past Claude Code conversations by keyword (FTS5) or semantic similarity.
 
     Args:
-        query: Search query text
+        query: Search query text. Keyword mode wants every word, then falls back to
+            any meaningful word, flagging those rows partial_match.
         search_type: "keyword" for full-text search, "semantic" for embedding similarity
         workspace: Optional workspace/project path filter
         limit: Maximum results (default: 20)
@@ -709,9 +744,11 @@ def attachment_image_search(
 ) -> dict:
     """Search classified content images by their vision-LLM description.
 
-    Currently uses a LIKE-based substring match on vision_description.
-    TODO: upgrade to vector similarity once inline_images carries an embedding
-    column (no `embed_text` / `cosine_similarity_query` helpers exist yet).
+    Matches the way recall's image bucket does: case and accent blind, the whole
+    query first, else any meaningful word, with those images flagged
+    partial_match. TODO: upgrade to vector similarity once inline_images carries
+    an embedding column (no `embed_text` / `cosine_similarity_query` helpers
+    exist yet).
 
     Returns ranked matches with all occurrences (sender, message_id, position).
 
@@ -719,21 +756,27 @@ def attachment_image_search(
         query: Free-text search across vision descriptions
         limit: Maximum number of distinct images to return (default: 10)
     """
+    from src.store.recall import _folded_bucket
+
     conn = _get_conn()
     try:
-        like = f"%{query}%"
-        image_rows = conn.execute(
+        image_rows = _folded_bucket(
+            conn,
             """
-            SELECT sha256, vision_description, classification
-            FROM inline_images
-            WHERE classification = 'content'
-              AND vision_description IS NOT NULL
-              AND vision_description LIKE ?
-            ORDER BY classified_at DESC
+            WITH scored AS MATERIALIZED (
+                SELECT sha256, sb_match(vision_description, ?, ?, ?) AS score
+                FROM inline_images
+                WHERE classification = 'content' AND vision_description IS NOT NULL
+            )
+            SELECT i.sha256, i.vision_description, s.score
+            FROM scored s JOIN inline_images i ON i.sha256 = s.sha256
+            WHERE s.score > 0
+            ORDER BY s.score DESC, i.classified_at DESC
             LIMIT ?
             """,
-            (like, limit),
-        ).fetchall()
+            query,
+            limit,
+        )
 
         results = []
         for img in image_rows:
@@ -747,13 +790,14 @@ def attachment_image_search(
                 """,
                 (sha,),
             ).fetchall()
-            results.append(
-                {
-                    "sha256": sha,
-                    "description": img["vision_description"],
-                    "occurrences": [dict(o) for o in occ_rows],
-                }
-            )
+            result = {
+                "sha256": sha,
+                "description": img["vision_description"],
+                "occurrences": [dict(o) for o in occ_rows],
+            }
+            if img.get("partial_match"):
+                result["partial_match"] = True
+            results.append(result)
         return {"results": results, "count": len(results)}
     finally:
         conn.close()
@@ -802,7 +846,8 @@ def search_teams(query: str, kind: str = "both", limit: int = 20) -> dict:
     """Search Teams content.
 
     Args:
-        query: Free-text query.
+        query: Free-text query: the exact phrase, then every word in any order, then any
+            meaningful word, with those rows flagged partial_match.
         kind: 'thread' (summaries+titles), 'message' (raw text), or 'both' (default).
         limit: Max results (default 20).
     """

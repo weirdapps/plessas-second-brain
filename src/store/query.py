@@ -463,6 +463,15 @@ def query_by_date_range(
     return [dict(row) for row in cursor.fetchall()]
 
 
+# A decision's date: its own when it is one, else its parent's. The extractor
+# writes free text too ('null', 'Q3 2026'), which sorted after every date and
+# fell to the bound that keeps meetings still to come from deciding anything.
+_DECISION_DATE = (
+    "COALESCE(CASE WHEN d.decision_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'"
+    " THEN d.decision_date END, e.date_received, tt.started_at, ce.start_at, c.started_at)"
+)
+
+
 def query_decisions(
     conn: sqlite3.Connection,
     topic: str | None = None,
@@ -496,13 +505,12 @@ def query_decisions(
     # display. The inner JOIN on emails dropped 13,785 decisions whose parent was
     # a Teams thread, a calendar event or a conversation turn, and the 4,674
     # calendar ones had no read path anywhere.
-    query = """
+    query = f"""
         SELECT
             d.id as decision_id,
             d.decision,
             d.decided_by,
-            COALESCE(d.decision_date, e.date_received, tt.started_at, ce.start_at,
-                     c.started_at) as date,
+            {_DECISION_DATE} as date,
             COALESCE(e.subject, tt.title, ce.subject, c.summary) as email_subject,
             CASE
                 WHEN e.id IS NOT NULL THEN 'email'
@@ -541,19 +549,13 @@ def query_decisions(
     # Nothing has been decided at a date still to come. A meeting next week
     # returned its agenda as decisions, and dated by the meeting they sorted
     # above every real one: on the replica, the whole first page.
-    where_clauses.append(
-        "COALESCE(d.decision_date, e.date_received, tt.started_at, ce.start_at,"
-        " c.started_at) <= strftime('%Y-%m-%dT%H:%M:%S', 'now')"
-    )
+    where_clauses.append(f"{_DECISION_DATE} <= strftime('%Y-%m-%dT%H:%M:%S', 'now')")
 
     if days is not None:
         from datetime import datetime, timedelta
 
         cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
-        where_clauses.append(
-            "COALESCE(d.decision_date, e.date_received, tt.started_at, ce.start_at,"
-            " c.started_at) >= ?"
-        )
+        where_clauses.append(f"{_DECISION_DATE} >= ?")
         params.append(cutoff)
 
     if where_clauses:
@@ -992,9 +994,16 @@ def meeting_prep(
 
 
 def _stale_threads_sql(select: str, days: int, max_days: int) -> tuple[str, tuple]:
-    """Threads whose last message the user sent between `days` and `max_days` ago."""
+    """Threads whose last message the user sent between `days` and `max_days` ago.
+
+    A threshold at or past the window widens it by 30 days: days=45 against
+    the 30-day default was an empty answer with a total of 0, read as 'nobody
+    owes you a reply'.
+    """
     from datetime import datetime, timedelta
 
+    if max_days <= days:
+        max_days = days + 30
     now = datetime.now()
     cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
     oldest = (now - timedelta(days=max_days)).strftime("%Y-%m-%dT%H:%M:%S")

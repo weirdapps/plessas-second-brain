@@ -45,7 +45,7 @@ result says to.
 Freshness. This is a REPLICA, synced from the machine that builds it, so it can \
 lag. `stats` returns data_as_of / age_hours / stale, and `recall` attaches \
 _stale_warning when it matters. For mail newer than the replica, use \
-`outlook_live_search`.
+`outlook_live_search`, which looks back 24 hours at most.
 
 Matching. Most of this corpus is Greek. Every search ignores case, accents and \
 final sigma, so either form of a word works. Keyword search wants every word \
@@ -297,9 +297,10 @@ def query_actions(
 
     Args:
         owner: Filter by action owner name
-        status: "open" (default) or "expired": an action past its deadline, or
-            undated with a parent long quiet, is closed as expired. Nothing
-            records that an action was done, so there is no other status.
+        status: "open" (default) or "expired": the lifecycle job marks an
+            action expired 180 days after its deadline or, with no date, 90 days
+            after its source last saw activity. Nothing records that an action
+            was done, so there is no other status.
         limit: Maximum results (default: 20)
         include_news: Include news-derived action items (default: False)
     """
@@ -338,6 +339,8 @@ def stale_threads(days: int = 5, limit: int = 20, max_days: int = 30) -> dict:
         find_stale_threads,
     )
 
+    # SQLite reads a negative LIMIT as none, which would undo the bound.
+    limit = max(1, min(limit, 200))
     conn = _get_conn()
     try:
         out: dict = {
@@ -512,7 +515,11 @@ def query_calendar_events(
 
 @mcp.tool()
 def stats() -> dict:
-    """Get database statistics: emails, conversations, topics, people, decisions, action items, attachments, date range."""
+    """Get database statistics: counts, freshness, and `coverage`, the first and last date held per mailbox, Teams, calendar and conversations.
+
+    `earliest_email` is the oldest row of any kind, a stray old document
+    included; where mail really starts is in `coverage`.
+    """
     from src.store.query import get_stats
 
     conn = _get_conn()
@@ -822,7 +829,9 @@ def outlook_live_search(
 
     Use for very recent messages (< 1 hour) that haven't been ingested yet.
     Each message comes back as its id, subject, sender, time, preview, whether
-    it has attachments and is read, and its web link: no bodies.
+    it has attachments and is read, and its web link: no bodies. The answer's
+    `since_minutes` is the window searched and `clamped` says it was cut to
+    24 hours, so a longer gap is not mistaken for no mail.
 
     Args:
         folder: Mailbox folder name (default: "Inbox")
@@ -833,8 +842,9 @@ def outlook_live_search(
 
     from src.export import outlook_cli
 
-    # Unbounded, a large window fetched up to 500 raw messages, bodies included,
-    # all of it third-party text going straight into the model's context.
+    # Unbounded, a large window fetched up to 500 messages into the model's
+    # context, all of it third-party text.
+    requested = since_minutes
     since_minutes = max(1, min(since_minutes, 1440))
     since_iso = (datetime.now(UTC) - timedelta(minutes=since_minutes)).isoformat()
     since_iso = since_iso.replace("+00:00", "Z")
@@ -847,13 +857,21 @@ def outlook_live_search(
         "--all",
         "--max",
         "500",
+        # list-mail sends no preview unless asked for one.
+        "--select",
+        ",".join(_LIVE_MAIL_FIELDS),
     ]
     raw = outlook_cli.run_outlook_cli(args)
     if subject_contains:
         needle = subject_contains.lower()
         raw = [m for m in raw if needle in (m.get("Subject", "") or "").lower()]
     messages = [{k: m[k] for k in _LIVE_MAIL_FIELDS if k in m} for m in raw]
-    return {"messages": messages, "count": len(messages)}
+    return {
+        "messages": messages,
+        "count": len(messages),
+        "since_minutes": since_minutes,
+        "clamped": since_minutes != requested,
+    }
 
 
 _LIVE_MAIL_FIELDS = (

@@ -20,7 +20,7 @@ then it is documentation of the intended workflow.
 > Per-kind tools: `search_emails`, `search_attachments`, `search_teams`,
 > `search_conversations`, `query_calendar_events`, `query_decisions`,
 > `query_actions`. Dossier tools: `person_context`, `topic_context`,
-> `sender_brief`, `meeting_prep`. Corpus size, date range and freshness:
+> `sender_brief`, `meeting_prep`. Corpus size, per-source coverage and freshness:
 > `stats`.
 
 ## Usage
@@ -124,7 +124,7 @@ Do not dump raw results. Turn them into a briefing.
 
 **Action item queries:**
 
-- Grouped by status (open, completed)
+- Grouped by status (open, expired: nothing records that an action was done)
 - Deadline proximity
 - Owner and context
 
@@ -157,14 +157,15 @@ which one you have.
 
 Recent decisions come from `src.store.query.query_decisions(conn, days=365,
 limit=20)`, which covers email, Teams, calendar and conversation decisions and
-skips news.
+skips news. `days` defaults to None, all time.
 
 ## Notes
 
 - The store holds email summaries, original content, and LLM summaries of
   attachments (PDF, Word, Excel, PowerPoint), plus Teams messages, calendar
   events, news digests and past Claude Code conversations. Call `stats` for
-  current counts and the date range; do not quote a number from memory.
+  current counts and `coverage`, where each source starts; do not quote a
+  number from memory.
 - FTS5 full-text indexes cover summaries, content, key facts and attachment text.
 - Semantic search uses embedding similarity and needs an index built by
   `python -m src.cli embed`. Without it, search degrades to keyword-only.

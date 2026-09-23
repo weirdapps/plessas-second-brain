@@ -1130,7 +1130,7 @@ class TestFindStaleThreads:
     def test_days_parameter(self):
         conn = self._make_stale_db()
         # With days=9999, nothing is stale
-        results = find_stale_threads(conn, days=9999)
+        results = find_stale_threads(conn, days=9999, max_days=self.WIDE)
         assert results == []
         conn.close()
 

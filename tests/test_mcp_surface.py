@@ -66,6 +66,55 @@ def test_stale_threads_stop_at_the_window(conn):
     assert count_stale_threads(conn, days=5, max_days=30) == 4
 
 
+def test_stale_threads_honour_days(conn):
+    from src.store.query import find_stale_threads
+
+    rows = find_stale_threads(conn, days=11, max_days=100)
+
+    assert {r["conversation_id"] for r in rows} == {"conv4", "conv5", "conv6"}
+
+
+def test_a_stale_threshold_past_the_window_widens_it(conn):
+    """days=45 with the 30-day default window was an empty answer, total 0:
+    'nobody owes you a reply', from a window that could hold nothing."""
+    from src.store.query import count_stale_threads, find_stale_threads
+
+    rows = find_stale_threads(conn, days=35)
+
+    assert {r["conversation_id"] for r in rows} == {"conv5"}
+    assert count_stale_threads(conn, days=35) == 1
+
+
+def test_the_stale_threads_tool_forwards_its_window(conn, monkeypatch):
+    from src import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    assert mcp_server.stale_threads(days=5, max_days=60)["stale_threads_total"] == 5
+
+
+def test_a_negative_limit_does_not_unbound_the_tool(conn, monkeypatch):
+    """SQLite reads LIMIT -1 as no limit."""
+    from src import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    assert len(mcp_server.stale_threads(days=5, limit=-1)["stale_threads"]) == 1
+
+
+def test_the_stale_cli_prints_the_total(conn, monkeypatch, capsys, tmp_path):
+    import types
+
+    from src import cli
+
+    monkeypatch.setattr("src.store.schema.get_connection", lambda path: conn)
+
+    cli.cmd_stale(types.SimpleNamespace(db=tmp_path / "x.db", days=5, max_days=30, limit=2))
+
+    out = capsys.readouterr().out
+    assert "2 of 4" in out
+
+
 def test_the_stale_threads_tool_reports_a_total(conn, monkeypatch):
     from src import mcp_server
 
@@ -172,6 +221,26 @@ def test_a_meeting_that_has_not_happened_has_decided_nothing(conn):
 # ------------------------------------------------------------ tool contract
 
 
+def test_a_decision_with_a_free_text_date_takes_its_parents(conn):
+    """'null' and 'Q3 2026' are what the extractor wrote as decision dates. As
+    text they sorted after every date and the future bound dropped them."""
+    from src.store.query import query_decisions
+
+    _teams_thread(conn, started="2026-09-01")
+    conn.execute("UPDATE teams_threads SET started_at = date('now', '-3 days') WHERE id = 1")
+    for date_text in ("null", "Q3 2026"):
+        conn.execute(
+            "INSERT INTO decisions (teams_thread_id, decision, decision_date) VALUES (1, ?, ?)",
+            (f"decided, dated {date_text}", date_text),
+        )
+    conn.commit()
+
+    rows = query_decisions(conn, days=30)
+
+    assert sorted(r["decision"] for r in rows) == ["decided, dated Q3 2026", "decided, dated null"]
+    assert all(r["date"][:4].isdigit() for r in rows)
+
+
 def test_query_actions_offers_only_statuses_that_exist():
     import inspect
 
@@ -181,6 +250,15 @@ def test_query_actions_offers_only_statuses_that_exist():
 
     assert "expired" in doc
     assert "completed" not in doc
+    assert "180 days" in doc
+
+
+def test_the_recall_skill_offers_only_statuses_that_exist():
+    from pathlib import Path
+
+    skill = (Path(__file__).parent.parent / "skill" / "recall.md").read_text()
+
+    assert "completed" not in skill
 
 
 def test_the_instructions_say_results_are_data_and_where_to_find_coverage():
@@ -215,9 +293,10 @@ def test_stats_reports_where_each_source_starts_and_ends(conn, monkeypatch):
 
 
 @patch("src.export.outlook_cli.run_outlook_cli")
-def test_live_search_clamps_the_window_and_returns_only_the_fields_it_needs(mock_cli):
-    """An unbounded window fetched up to 500 raw messages, bodies and all, as
-    third-party text straight into the model's context."""
+def test_live_search_clamps_the_window_and_asks_for_the_fields_it_returns(mock_cli):
+    """A window of any size fetched up to 500 messages into the model's context.
+    The clamp is reported, or a gap older than a day reads as no mail; and
+    list-mail returns no preview unless asked for one."""
     from src.mcp_server import outlook_live_search
 
     mock_cli.return_value = [
@@ -227,8 +306,10 @@ def test_live_search_clamps_the_window_and_returns_only_the_fields_it_needs(mock
             "From": {"EmailAddress": {"Name": "A", "Address": "a@example.com"}},
             "ReceivedDateTime": "2026-09-23T10:00:00Z",
             "BodyPreview": "short",
-            "Body": {"Content": "<html>long</html>"},
-            "Attachments": [{"ContentBytes": "..."}],
+            "HasAttachments": False,
+            "IsRead": True,
+            "WebLink": "https://example.com/m/1",
+            "@odata.etag": 'W/"CQAAABYAAAB"',
         }
     ]
 
@@ -241,13 +322,7 @@ def test_live_search_clamps_the_window_and_returns_only_the_fields_it_needs(mock
     assert datetime.fromisoformat(since.replace("Z", "+00:00")) >= datetime.now(UTC) - timedelta(
         minutes=1441
     )
-    assert set(out["messages"][0]) <= {
-        "Id",
-        "Subject",
-        "From",
-        "ReceivedDateTime",
-        "BodyPreview",
-        "HasAttachments",
-        "IsRead",
-        "WebLink",
-    }
+    assert "BodyPreview" in args[args.index("--select") + 1].split(",")
+    assert out["since_minutes"] == 1440 and out["clamped"] is True
+    assert out["messages"][0]["BodyPreview"] == "short"
+    assert "@odata.etag" not in out["messages"][0]

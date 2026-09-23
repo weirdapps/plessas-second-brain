@@ -38,6 +38,9 @@ export PATH="$HOME/.local/share/fnm/aliases/default/bin:$HOME/.local/bin:/opt/ho
 
 SENTINEL="$HOME/.second-brain/needs_reauth"
 TEAMS_SENTINEL="$HOME/.second-brain/needs_teams_reauth"
+# Epoch of the first pass that found Teams failing. See _teams_latch_or_suspect.
+TEAMS_SUSPECT="$HOME/.second-brain/teams_reauth_suspect"
+TEAMS_LATCH_AFTER_S=1200
 GCLOUD_SENTINEL="$HOME/.second-brain/needs_gcloud_reauth"
 LOG_DIR="$HOME/.second-brain/logs"
 LOG="$LOG_DIR/auth-watch.log"
@@ -310,6 +313,42 @@ print(int(datetime.datetime.fromisoformat(sys.argv[1].replace('Z','+00:00')).tim
 # returning 0 every hour while teams-sync 401'd 11 hours straight on chatsvcagg.
 # health-check probes Graph + chatsvc + chatsvcagg and exits non-zero when
 # overall != "ok".
+
+# ONE FAILING PASS IS NOT AN OUTAGE, SO IT DOES NOT CLOSE THE GATE (2026-09-23).
+# The Teams bearer this host holds is a copy pushed by the producer Mac every 15
+# minutes, and a copy captured late in its life expires here roughly ten minutes
+# before the next push replaces it. Every such gap was followed by a pass that
+# found health-check failing, tried the VPS renew (1 success in 87 attempts), and
+# latched needs_teams_reauth, which then held sb-teams-sync off for 25 minutes
+# after the next push had already fixed it, until a later pass cleared it.
+#
+# So the first failing pass only records WHEN it failed. The sentinel is set when
+# a pass still finds Teams failing TEAMS_LATCH_AFTER_S or more after that, and any
+# healthy pass clears both files. The clock runs from the first failure and is
+# never refreshed by a later one, so a session that keeps failing still latches
+# twenty minutes in rather than never. "interactive login required" is logged
+# only when the gate actually closes, as before.
+_teams_latch_or_suspect() {   # $1 = the reason, as the log has always phrased it
+  local now first age
+  now=$(date +%s)
+  first=$(tr -dc '0-9' 2>/dev/null < "$TEAMS_SUSPECT")
+  if [ -z "$first" ]; then
+    echo "$now" > "$TEAMS_SUSPECT"
+    log "teams: $1; first failed pass, marking suspect and NOT latching (needs_teams_reauth only if still failing on a pass ${TEAMS_LATCH_AFTER_S}s+ from now)"
+    return 1
+  fi
+  age=$(( now - first ))
+  if [ "$age" -lt "$TEAMS_LATCH_AFTER_S" ]; then
+    log "teams: $1; still failing ${age}s after the first failed pass, latching only from ${TEAMS_LATCH_AFTER_S}s"
+    return 1
+  fi
+  log "teams: $1; failing on two passes ${age}s apart: interactive login required"
+  notify_teams_reauth
+  touch "$TEAMS_SENTINEL"
+  rm -f "$TEAMS_SUSPECT"
+  return 1
+}
+
 auth_check_teams() {
   if ! command -v teams-cli >/dev/null 2>&1; then
     log "teams-cli not on PATH; skipping teams probe"
@@ -323,7 +362,7 @@ auth_check_teams() {
 
   if [ "$rc" -eq 0 ]; then
     log "teams-cli health-check ok (all audiences accepted)"
-    rm -f "$TEAMS_SENTINEL"
+    rm -f "$TEAMS_SENTINEL" "$TEAMS_SUSPECT"
     return 0
   fi
 
@@ -338,12 +377,10 @@ auth_check_teams() {
     # belt-and-braces: if the next health-check still fails, the renew lied.
     if teams-cli health-check >/dev/null 2>&1; then
       log "teams: silent renew + post-renew health-check ok"
-      rm -f "$TEAMS_SENTINEL"
+      rm -f "$TEAMS_SENTINEL" "$TEAMS_SUSPECT"
       return 0
     fi
-    log "teams: renew claimed ok but post-renew health-check still failing — interactive login required"
-    notify_teams_reauth
-    touch "$TEAMS_SENTINEL"
+    _teams_latch_or_suspect "renew claimed ok but post-renew health-check still failing"
     return 1
   fi
 
@@ -357,13 +394,11 @@ auth_check_teams() {
   # opposite reason; this is the same distrust applied symmetrically.
   if teams-cli health-check >/dev/null 2>&1; then
     log "teams: renew failed but health-check now passes; transient, not latching"
-    rm -f "$TEAMS_SENTINEL"
+    rm -f "$TEAMS_SENTINEL" "$TEAMS_SUSPECT"
     return 0
   fi
 
-  log "teams silent renew failed — interactive login required"
-  notify_teams_reauth
-  touch "$TEAMS_SENTINEL"
+  _teams_latch_or_suspect "silent renew failed"
   return 1
 }
 

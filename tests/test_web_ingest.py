@@ -292,3 +292,34 @@ class TestIngestedFilenameIsMeaningful:
 
         assert "/" not in result["filename"]
         assert ".." not in result["filename"]
+
+
+def test_a_video_without_an_english_transcript_falls_back_to_another_language(monkeypatch):
+    """TranscriptList iterates but does not index, so `list(...)[0]` raised, the
+    broad except swallowed it, and every non-English video had no transcript."""
+    import youtube_transcript_api
+
+    from src.extract.web_ingest import _fetch_youtube_transcript
+
+    class Segment:
+        def __init__(self, text):
+            self.text = text
+
+    class Greek:
+        def fetch(self):
+            return [Segment("Καλημέρα"), Segment("σας")]
+
+    class OnlyIterable:
+        def __iter__(self):
+            return iter([Greek()])
+
+    class Api:
+        def fetch(self, video_id, languages):
+            raise LookupError("no English transcript")
+
+        def list(self, video_id):
+            return OnlyIterable()
+
+    monkeypatch.setattr(youtube_transcript_api, "YouTubeTranscriptApi", Api)
+
+    assert _fetch_youtube_transcript("abc") == "Καλημέρα σας"

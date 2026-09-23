@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # than copied so this script cannot drift away from them again the way it did
 # while it lived untracked on the VPS.
 from src.extract.claude_extract import MAX_OUTPUT_TOKENS, _response_text  # noqa: E402
+from src.extract.untrusted import fence_fields  # noqa: E402
 from src.extract.vertex_fallback import create_with_refusal_fallback  # noqa: E402
 from src.llm_deadline import install_llm_deadline_for_this_process  # noqa: E402
 
@@ -185,14 +186,23 @@ def get_client():
 
 
 def classify_one(client, model, c: dict) -> dict:
-    prompt = CLASSIFY_PROMPT.format(
-        taxonomy=TAXONOMY,
+    # The sender wrote the filename, the subject and the document the summary
+    # came from, and the answer names a folder this job writes to.
+    intro, fenced = fence_fields(
         filename=c["filename"],
         subject=c["subject"] or "(none)",
         sender=c["sender"] or "(unknown)",
-        date=c["date"],
-        size_mb=round(c["file_size"] / 1024 / 1024, 2),
         summary=c["summary"][:1500],
+    )
+    prompt = (
+        intro
+        + "\n\n"
+        + CLASSIFY_PROMPT.format(
+            taxonomy=TAXONOMY,
+            date=c["date"],
+            size_mb=round(c["file_size"] / 1024 / 1024, 2),
+            **fenced,
+        )
     )
     response = create_with_refusal_fallback(
         client,
@@ -208,13 +218,39 @@ def classify_one(client, model, c: dict) -> dict:
         lines = text.split("\n")
         text = "\n".join(lines[1:-1] if lines[0].startswith("```") else lines[:-1])
     try:
-        return json.loads(text)
+        result = json.loads(text)
     except Exception:
         return {"folder": "SKIP", "confidence": "low", "reasoning": "parse error"}
+    # A bare string or list crashed main() at result.get(), losing every
+    # classification of the run, and the sender's text can steer the reply.
+    if not isinstance(result, dict):
+        return {"folder": "SKIP", "confidence": "low", "reasoning": "not an object"}
+    return result
+
+
+# The fields a folder summary may carry, and the type each must have. A reply
+# of another shape was cached and crashed every later run's write_index.
+_SUMMARY_TEXT = ("purpose", "date_range", "watchout")
+_SUMMARY_LISTS = ("themes", "key_documents")
+
+
+def _summary_fields(summary) -> dict:
+    """The fields of `summary` that have the right type; nothing else."""
+    if not isinstance(summary, dict):
+        return {}
+    kept = {k: summary[k] for k in _SUMMARY_TEXT if isinstance(summary.get(k), str)}
+    for k in _SUMMARY_LISTS:
+        value = summary.get(k)
+        if isinstance(value, list) and all(isinstance(v, str) for v in value):
+            kept[k] = value
+    return kept
 
 
 def summarize_folder(client, model, folder: str, readme_text: str) -> dict:
     truncated = readme_text[:18000]
+    # The README lists senders' subjects and summaries, and the answer is written
+    # into INDEX.md, which later sessions read as curated guidance.
+    intro, fenced = fence_fields(readme=truncated)
     response = create_with_refusal_fallback(
         client,
         model=model,
@@ -222,7 +258,7 @@ def summarize_folder(client, model, folder: str, readme_text: str) -> dict:
         messages=[
             {
                 "role": "user",
-                "content": SUMMARIZE_PROMPT.format(folder=folder, readme=truncated),
+                "content": intro + "\n\n" + SUMMARIZE_PROMPT.format(folder=folder, **fenced),
             }
         ],
     )
@@ -231,9 +267,10 @@ def summarize_folder(client, model, folder: str, readme_text: str) -> dict:
         lines = text.split("\n")
         text = "\n".join(lines[1:-1] if lines[0].startswith("```") else lines[:-1])
     try:
-        return json.loads(text)
+        summary = _summary_fields(json.loads(text))
     except Exception as e:
         return {"error": str(e)}
+    return summary or {"error": "no usable field"}
 
 
 def query_new_candidates(
@@ -414,7 +451,8 @@ def write_index(area: str, summaries: dict):
     rows = []
     for f in folders:
         cnt, mb = folder_size(f)
-        rows.append({"folder": f, "files": cnt, "mb": mb, **summaries.get(f, {})})
+        # The computed keys come last, so a summary cannot override them.
+        rows.append({**_summary_fields(summaries.get(f)), "folder": f, "files": cnt, "mb": mb})
 
     total_files = sum(r["files"] for r in rows)
     total_mb = sum(r["mb"] for r in rows)
@@ -525,8 +563,13 @@ def main():
             log(f"  classify error for id={c['id']}: {e}")
             continue
         processed.add(c["id"])
-        folder = result.get("folder", "SKIP")
-        if folder == "SKIP" or not folder.startswith(tuple(f"{a}/" for a in AREAS)):
+        # Only a managed folder, exactly. The folder is the model's answer, and
+        # the model reads what the sender wrote: a prefix check let
+        # 'National/../../x' copy an attachment outside the tree.
+        folder = str(result.get("folder", "SKIP")).strip().rstrip("/")
+        if folder not in MANAGED_FOLDERS:
+            if folder != "SKIP":
+                log(f"  REJECT folder {folder[:60]!r}: {c['filename'][:40]}")
             continue
         if result.get("confidence") != "high":
             log(f"  SKIP (conf={result.get('confidence')}): {c['filename'][:40]}")

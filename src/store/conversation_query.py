@@ -7,7 +7,7 @@ and context retrieval for Claude Code conversation history.
 import logging
 import sqlite3
 
-from src.store.query import _sanitize_fts5_query
+from src.store.query import _sanitize_fts5_query, fts5_query_variants
 
 logger = logging.getLogger(__name__)
 
@@ -27,16 +27,39 @@ def search_conversations_keyword(
         limit: Maximum results
 
     Returns:
-        List of matching conversations with turn excerpts
+        List of matching conversations with turn excerpts. When no conversation
+        carries every token, those matching any meaningful token come back
+        instead, flagged partial_match.
     """
-    results = []
-
     # Defang FTS5 operator syntax before every MATCH in this module. search_emails
     # and search_attachments have always done this; these three sites did not, so
     # any natural-language query raised OperationalError straight out of the MCP
     # tool: a question mark is "fts5: syntax error near "?"", an ampersand the
     # same, and a bare word after a hyphen becomes "no such column".
-    safe_query = _sanitize_fts5_query(query)
+    for safe_query, partial in fts5_query_variants(query):
+        results = _conversation_hits(conn, safe_query, workspace, limit)
+        if results:
+            if partial:
+                for row in results:
+                    row["partial_match"] = True
+            return results
+    return []
+
+
+def _conversation_hits(
+    conn: sqlite3.Connection,
+    safe_query: str,
+    workspace: str | None,
+    limit: int,
+) -> list[dict]:
+    """search_conversations_keyword for one sanitized MATCH expression.
+
+    The workspace filter is in the SQL, so LIMIT counts matches in that
+    workspace. Filtered afterwards, a page of matches from other workspaces
+    left this empty and sent the caller to the any-token fallback.
+    """
+    results: list[dict] = []
+    ws = workspace or ""
 
     # Search conversation-level summaries
     rows = conn.execute(
@@ -47,16 +70,15 @@ def search_conversations_keyword(
         FROM conversations_fts
         JOIN conversations c ON c.id = conversations_fts.rowid
         WHERE conversations_fts MATCH ?
+          AND (? = '' OR LOWER(c.workspace) LIKE LOWER(?))
         ORDER BY rank
         LIMIT ?
     """,
-        (safe_query, limit),
+        (safe_query, ws, f"%{ws}%", limit),
     ).fetchall()
 
     seen_ids = set()
     for r in rows:
-        if workspace and workspace.lower() not in (r["workspace"] or "").lower():
-            continue
         seen_ids.add(r["id"])
         results.append(
             {
@@ -83,16 +105,15 @@ def search_conversations_keyword(
             JOIN conversation_turns ct ON ct.id = conversation_turns_fts.rowid
             JOIN conversations c ON c.id = ct.conversation_id
             WHERE conversation_turns_fts MATCH ?
+              AND (? = '' OR LOWER(c.project_name) LIKE LOWER(?))
             ORDER BY rank
             LIMIT ?
         """,
-            (safe_query, remaining * 2),
+            (safe_query, ws, f"%{ws}%", remaining * 2),
         ).fetchall()
 
         for r in rows:
             if r["conversation_id"] in seen_ids:
-                continue
-            if workspace and workspace.lower() not in (r["project_name"] or "").lower():
                 continue
             seen_ids.add(r["conversation_id"])
             results.append(

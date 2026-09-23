@@ -2,12 +2,25 @@ import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from src.export.sharepoint_fetcher import (
     SharepointFetchResult,
     fetch_sharepoint_link,
     record_link_in_db,
 )
 from src.store.schema import create_database, run_migrations
+
+# The tenant the fetcher unit tests treat as ours. The process-sharepoint tests
+# further down use the config placeholder, contoso, through the environment.
+MANAGED = "x.sharepoint.com"
+
+
+@pytest.fixture(autouse=True)
+def _configured_tenant(monkeypatch):
+    """cmd_process_sharepoint refuses to fetch until a tenant is configured, so
+    every test here runs as a correctly configured host unless it says not."""
+    monkeypatch.setenv("SHAREPOINT_HOST", "contoso.sharepoint.com")
 
 
 def _setup_db(tmp_path: Path) -> sqlite3.Connection:
@@ -40,6 +53,7 @@ def test_fetch_invokes_sharepoint_cli_get(mock_cli, tmp_path):
     result = fetch_sharepoint_link(
         url="https://x.sharepoint.com/sites/foo/Eabc",
         out_dir=tmp_path,
+        managed_host=MANAGED,
     )
     assert result.status == "ok"
     # Saved under the server-supplied name, inside out_dir.
@@ -53,16 +67,20 @@ def test_fetch_invokes_sharepoint_cli_get(mock_cli, tmp_path):
 @patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
 def test_fetch_passes_the_urls_own_host(mock_cli, tmp_path):
     """--host is required, and for an absolute URL it must be that URL's host,
-    not the managed one, or external tenants would be misrouted."""
+    not the managed one: a OneDrive link lives on the tenant's -my twin."""
     mock_cli.side_effect = _cli_ok()
-    fetch_sharepoint_link(url="https://partner.sharepoint.com/:x:/s/Org/abc", out_dir=tmp_path)
-    assert mock_cli.call_args.kwargs["host"] == "partner.sharepoint.com"
+    fetch_sharepoint_link(
+        url="https://x-my.sharepoint.com/personal/a/Eabc",
+        out_dir=tmp_path,
+        managed_host=MANAGED,
+    )
+    assert mock_cli.call_args.kwargs["host"] == "x-my.sharepoint.com"
 
 
 @patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
 def test_fetch_leaves_no_temp_file_on_success(mock_cli, tmp_path):
     mock_cli.side_effect = _cli_ok()
-    fetch_sharepoint_link(url="https://x.sharepoint.com/a", out_dir=tmp_path)
+    fetch_sharepoint_link(url="https://x.sharepoint.com/a", out_dir=tmp_path, managed_host=MANAGED)
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".sp-")] == []
 
 
@@ -75,7 +93,9 @@ def test_fetch_records_404_as_stale(mock_cli, tmp_path):
         stderr='{"error":"not_found","message":"SharePoint 404","status":404}',
         retryable=True,
     )
-    result = fetch_sharepoint_link(url="https://x.sharepoint.com/missing", out_dir=tmp_path)
+    result = fetch_sharepoint_link(
+        url="https://x.sharepoint.com/missing", out_dir=tmp_path, managed_host=MANAGED
+    )
     assert result.status == "stale"
     assert result.http_status == 404
     assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".sp-")] == []
@@ -88,7 +108,9 @@ def test_fetch_maps_auth_required(mock_cli, tmp_path):
     from src.export.sharepoint_cli import SharepointCliAuthRequired
 
     mock_cli.side_effect = SharepointCliAuthRequired("session gone")
-    result = fetch_sharepoint_link(url="https://x.sharepoint.com/a", out_dir=tmp_path)
+    result = fetch_sharepoint_link(
+        url="https://x.sharepoint.com/a", out_dir=tmp_path, managed_host=MANAGED
+    )
     assert result.status == "auth-required"
 
 
@@ -99,7 +121,8 @@ def test_fetch_maps_access_denied_to_http_error(mock_cli, tmp_path):
     mock_cli.side_effect = SharepointCliError(
         exit_code=5, stderr='{"error":"access_denied","status":403}', retryable=True
     )
-    assert fetch_sharepoint_link("https://x.sharepoint.com/a", tmp_path).status == "http-error"
+    result = fetch_sharepoint_link("https://x.sharepoint.com/a", tmp_path, managed_host=MANAGED)
+    assert result.status == "http-error"
 
 
 @patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
@@ -109,7 +132,9 @@ def test_fetch_falls_back_to_url_name_when_server_sends_none(mock_cli, tmp_path)
         return {"size": 4}
 
     mock_cli.side_effect = _run
-    result = fetch_sharepoint_link("https://x.sharepoint.com/sites/foo/%CE%AD%CE%BA.pdf", tmp_path)
+    result = fetch_sharepoint_link(
+        "https://x.sharepoint.com/sites/foo/%CE%AD%CE%BA.pdf", tmp_path, managed_host=MANAGED
+    )
     assert result.file_name == "έκ.pdf"
 
 
@@ -122,7 +147,7 @@ def test_fetch_never_escapes_out_dir_via_filename(mock_cli, tmp_path):
         return {"size": 1, "filename": "../../escaped.pdf"}
 
     mock_cli.side_effect = _run
-    result = fetch_sharepoint_link("https://x.sharepoint.com/a", tmp_path)
+    result = fetch_sharepoint_link("https://x.sharepoint.com/a", tmp_path, managed_host=MANAGED)
     assert result.local_path is not None
     assert result.local_path.parent == tmp_path
     assert result.local_path.name == "escaped.pdf"
@@ -440,3 +465,220 @@ def test_process_sharepoint_never_resurrects_an_exhausted_404(tmp_path):
         args = argparse.Namespace(db=str(tmp_path / "test.db"), since=None, limit=0, dry_run=False)
         cmd_process_sharepoint(args)
         assert not mock_fetch.called
+
+
+# --- The session is only ever presented to our own tenant --------------------
+# sharepoint-cli retargets the one stored session at whatever --host it is given
+# and attaches its cookies, and the scanner accepts any *.sharepoint.com link
+# from any email body. The nightly process-sharepoint pass therefore handed the
+# mailbox's SharePoint session to any tenant a sender linked to; the DB shows two
+# foreign tenants contacted. PR #55 closed this for the MCP refetch tool only.
+# The gate now lives inside fetch_sharepoint_link, so every caller inherits it.
+
+
+def test_is_managed_sharepoint_host_accepts_the_onedrive_twin():
+    """OneDrive for Business lives on the tenant's "-my" twin host and is reached
+    with the same session, so it is ours in both directions."""
+    from src.export.sharepoint_fetcher import is_managed_sharepoint_host
+
+    assert is_managed_sharepoint_host(
+        "https://contoso-my.sharepoint.com/personal/a/Eabc", "contoso.sharepoint.com"
+    )
+    assert is_managed_sharepoint_host(
+        "https://contoso.sharepoint.com/sites/a/Eabc", "contoso-my.sharepoint.com"
+    )
+
+
+def test_is_managed_sharepoint_host_rejects_lookalikes():
+    from src.export.sharepoint_fetcher import is_managed_sharepoint_host
+
+    for url in (
+        "https://evilcontoso.sharepoint.com/a",
+        "https://contoso-my-x.sharepoint.com/a",
+        "https://contoso.sharepoint.com.evil.example/a",
+        "https://contoso.sharepoint.com@evil.example/a",
+        "https://contoso.sharepoint.com:8443/a",
+    ):
+        assert not is_managed_sharepoint_host(url, "contoso.sharepoint.com"), url
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_fetch_refuses_a_foreign_tenant_without_invoking_the_cli(mock_cli, tmp_path):
+    result = fetch_sharepoint_link(
+        url="https://partner.sharepoint.com/:x:/s/Org/abc",
+        out_dir=tmp_path,
+        managed_host=MANAGED,
+    )
+    assert result.status == "unsupported-host"
+    assert not mock_cli.called
+    assert list(tmp_path.iterdir()) == []  # not even a temp file
+
+
+def test_a_foreign_tenant_url_makes_zero_subprocess_calls(tmp_path, monkeypatch):
+    """Asserted at the real process boundary, not at a mock of our own wrapper."""
+    calls = []
+    monkeypatch.setattr("src.export.sharepoint_cli.subprocess.run", lambda *a, **k: calls.append(a))
+    result = fetch_sharepoint_link(
+        "https://dummy.sharepoint.com/sites/x/Edoc", tmp_path, managed_host=MANAGED
+    )
+    assert result.status == "unsupported-host"
+    assert calls == []
+
+
+def test_fetch_defaults_to_the_configured_tenant(tmp_path, monkeypatch):
+    """Callers that pass no managed_host get config.SHAREPOINT_HOST."""
+    import src.config
+
+    calls = []
+    monkeypatch.setattr(src.config, "SHAREPOINT_HOST", "contoso.sharepoint.com")
+    monkeypatch.setattr("src.export.sharepoint_cli.subprocess.run", lambda *a, **k: calls.append(a))
+    result = fetch_sharepoint_link("https://x.sharepoint.com/sites/a/Edoc", tmp_path)
+    assert result.status == "unsupported-host"
+    assert calls == []
+
+
+def test_process_sharepoint_refuses_to_fetch_without_a_configured_tenant(tmp_path, monkeypatch):
+    """Unconfigured, the gate would compare every real link against the contoso
+    placeholder and park each one as a permanent 'unsupported-host'. Refusing
+    loudly is the only safe answer."""
+    import argparse
+
+    from src.cli import cmd_process_sharepoint
+    from src.store.schema import get_connection
+
+    monkeypatch.delenv("SHAREPOINT_HOST", raising=False)
+    db_path = tmp_path / "test.db"
+    conn = _setup_db(tmp_path)
+    conn.execute(
+        "INSERT INTO emails (message_id, date_received, content) VALUES (?, ?, ?)",
+        ("m1", "2026-09-01T10:00:00", "doc https://contoso.sharepoint.com/sites/a/Edoc end"),
+    )
+    conn.commit()
+    conn.close()
+
+    with patch("src.export.sharepoint_fetcher.fetch_sharepoint_link") as mock_fetch:
+        args = argparse.Namespace(db=str(db_path), since=None, limit=0, dry_run=False)
+        with pytest.raises(SystemExit) as exc:
+            cmd_process_sharepoint(args)
+        assert exc.value.code == 2
+        assert not mock_fetch.called
+
+    conn = get_connection(str(db_path))
+    assert conn.execute("SELECT COUNT(*) FROM sharepoint_links").fetchone()[0] == 0
+    conn.close()
+
+
+def test_process_sharepoint_dry_run_needs_no_configured_tenant(tmp_path, monkeypatch):
+    import argparse
+
+    from src.cli import cmd_process_sharepoint
+
+    monkeypatch.delenv("SHAREPOINT_HOST", raising=False)
+    _setup_db(tmp_path).close()
+    args = argparse.Namespace(db=str(tmp_path / "test.db"), since=None, limit=0, dry_run=True)
+    cmd_process_sharepoint(args)  # must not raise
+
+
+def test_retry_pass_requeues_own_tenant_links_parked_as_unsupported_host(tmp_path):
+    """With SHAREPOINT_HOST at its placeholder, a session expiry on our OWN tenant
+    was recorded as the permanent 'unsupported-host' (5 managed-host links on
+    2026-09-03, 17 on the OneDrive twin). Our tenant is never unsupported, so
+    the retry pass takes those back, and still leaves foreign tenants parked."""
+    import argparse
+
+    from src.cli import cmd_process_sharepoint
+
+    own = "https://contoso.sharepoint.com/sites/a/E1"
+    twin = "https://contoso-my.sharepoint.com/personal/b/E2"
+    foreign = "https://partner.sharepoint.com/sites/c/E3"
+    conn = _setup_db(tmp_path)
+    for url in (own, twin, foreign):
+        conn.execute(
+            "INSERT INTO sharepoint_links (url, message_id, fetched_at, last_status, "
+            "last_attempt_at, attempts) VALUES (?, 'm', NULL, 'unsupported-host', "
+            "'2026-09-03T10:36:34+00:00', 1)",
+            (url,),
+        )
+    conn.commit()
+    conn.close()
+
+    with patch("src.export.sharepoint_fetcher.fetch_sharepoint_link") as mock_fetch:
+        mock_fetch.side_effect = lambda url, out_dir: SharepointFetchResult(
+            url=url, status="ok", local_path=tmp_path / "f.pdf", file_name="f.pdf", file_size=1
+        )
+        args = argparse.Namespace(db=str(tmp_path / "test.db"), since=None, limit=0, dry_run=False)
+        cmd_process_sharepoint(args)
+
+    assert sorted(c.args[0] for c in mock_fetch.call_args_list) == sorted([own, twin])
+
+
+def test_process_sharepoint_counts_a_refused_foreign_link_as_skipped(tmp_path, capsys):
+    """The fetcher answers 'unsupported-host' itself now; the pass records it as
+    such and reports it as an external skip, not a failure."""
+    import argparse
+
+    from src.cli import cmd_process_sharepoint
+    from src.store.schema import get_connection
+
+    url = "https://partner.sharepoint.com/sites/Org/Edoc"
+    conn = _setup_db(tmp_path)
+    conn.execute(
+        "INSERT INTO emails (message_id, date_received, content) VALUES (?, ?, ?)",
+        ("m1", "2026-09-01T10:00:00", f"see {url} here"),
+    )
+    conn.commit()
+    conn.close()
+
+    with patch("src.export.sharepoint_fetcher.fetch_sharepoint_link") as mock_fetch:
+        mock_fetch.return_value = SharepointFetchResult(url=url, status="unsupported-host")
+        args = argparse.Namespace(db=str(tmp_path / "test.db"), since=None, limit=0, dry_run=False)
+        cmd_process_sharepoint(args)
+
+    out = capsys.readouterr().out
+    assert "External hosts skipped (no session): 1" in out
+    assert "URLs failed: 0" in out
+    conn = get_connection(str(tmp_path / "test.db"))
+    row = conn.execute("SELECT last_status FROM sharepoint_links WHERE url = ?", (url,)).fetchone()
+    conn.close()
+    assert row[0] == "unsupported-host"
+
+
+def test_a_malformed_tenant_setting_yields_no_managed_host():
+    """A value that is not a bare host (an inline comment, a scheme, a path)
+    must not become a tenant that nothing can ever match."""
+    from src.export.sharepoint_fetcher import managed_sharepoint_hosts
+
+    for value in (
+        "contoso.sharepoint.com  # our tenant",
+        "https://contoso.sharepoint.com",
+        "contoso.sharepoint.com/sites",
+        "",
+        "contoso",
+    ):
+        assert managed_sharepoint_hosts(value) == frozenset(), value
+
+
+def test_process_sharepoint_refuses_a_malformed_tenant_setting(tmp_path, monkeypatch):
+    """Set but unusable is the same as unset: fetching would park every real link."""
+    import argparse
+
+    from src.cli import cmd_process_sharepoint
+
+    monkeypatch.setenv("SHAREPOINT_HOST", "contoso.sharepoint.com  # our tenant")
+    _setup_db(tmp_path).close()
+    with patch("src.export.sharepoint_fetcher.fetch_sharepoint_link") as mock_fetch:
+        args = argparse.Namespace(db=str(tmp_path / "test.db"), since=None, limit=0, dry_run=False)
+        with pytest.raises(SystemExit) as exc:
+            cmd_process_sharepoint(args)
+        assert exc.value.code == 2
+        assert not mock_fetch.called
+
+
+def test_fetch_never_raises_on_a_url_urlparse_rejects(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr("src.export.sharepoint_cli.subprocess.run", lambda *a, **k: calls.append(a))
+    result = fetch_sharepoint_link(
+        "https://[contoso.sharepoint.com/x", tmp_path, managed_host="contoso.sharepoint.com"
+    )
+    assert result.status == "exception"
+    assert calls == []

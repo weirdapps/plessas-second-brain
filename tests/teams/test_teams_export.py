@@ -599,3 +599,33 @@ def test_pull_messages_leaves_the_disable_date_unset_on_a_transient_error(db, fi
     ).fetchone()
     assert row["ingest_disabled"] == 0
     assert row["ingest_disabled_at"] is None
+
+
+def test_persisted_teams_message_has_credentials_redacted(db, fixture_loader):
+    """Teams messages go straight into brain.db, never through data/staging, so
+    the redaction write_json_atomic applies to every staging batch never saw
+    them. A token pasted into a chat would land in the store, every replica and
+    every snapshot. All three stored copies are covered: text, HTML and raw."""
+    from src.export.teams_export import _persist_messages
+
+    chat_id = _seed_channel(db, fixture_loader)
+    secret = "AIzaSy" + "A1b2C3d4E5" * 3 + "fghij"  # shape fixture, not a key
+    payload = {
+        "messages": [
+            {
+                "id": "1717000009999",
+                "composetime": "2026-09-01T10:00:00Z",
+                "messageType": "RichText/Html",
+                "contentType": "html",
+                "content": f"<p>the key is {secret}</p>",
+                "imDisplayName": "Tester",
+            }
+        ]
+    }
+
+    assert _persist_messages(db, chat_id, payload) == 1
+
+    row = db.execute("SELECT content_text, content_html, raw_json FROM teams_messages").fetchone()
+    for column in ("content_text", "content_html", "raw_json"):
+        assert secret not in row[column], column
+        assert "[REDACTED:google-key]" in row[column], column

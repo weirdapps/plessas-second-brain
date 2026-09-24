@@ -57,7 +57,9 @@ def build_set(conn: sqlite3.Connection, size: int, seed: int) -> list[dict]:
         "ORDER BY id"
     ).fetchall()
     usable = [r for r in rows if len(search_words(r["subject"])) >= QUERY_WORDS]
-    picked = random.Random(seed).sample(usable, min(size, len(usable)))
+    # Seeded on purpose: the same --seed has to give the same set, and a sample
+    # of the owner's own emails guards no secret.
+    picked = random.Random(seed).sample(usable, min(size, len(usable)))  # NOSONAR
     out = []
     for row in picked:
         words = sorted(search_words(row["subject"]), key=lambda w: (-len(w), w))

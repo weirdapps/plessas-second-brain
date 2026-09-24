@@ -112,6 +112,29 @@ def test_is_transient_knows_the_service_failures_the_sdk_raises():
     assert [is_transient(e) for e in cases] == [True] * len(cases)
 
 
+def test_is_transient_knows_the_gemini_engines_service_failures():
+    """The Gemini engine has no policy in front of it, and raises its SDK's own
+    5xx and httpx's transport errors unwrapped."""
+    import httpx
+    from google.genai import errors as genai_errors
+
+    from src.extract.policy_bridge import is_transient
+
+    assert is_transient(genai_errors.ServerError(503, {"error": {"status": "UNAVAILABLE"}}))
+    assert is_transient(httpx.ConnectError("connection refused"))
+    assert not is_transient(genai_errors.ClientError(400, {"error": {"status": "INVALID"}}))
+    for code in (408, 409, 499):
+        assert is_transient(genai_errors.ClientError(code, {"error": {}})), code
+
+
+def test_is_transient_knows_the_statuses_the_sdk_itself_retries():
+    from src.extract.policy_bridge import is_transient
+
+    assert is_transient(_status_error(anthropic.APIStatusError, 408))
+    assert is_transient(_status_error(anthropic.ConflictError, 409))
+    assert not is_transient(_status_error(anthropic.NotFoundError, 404))
+
+
 def test_is_transient_leaves_an_unusable_reply_permanent():
     from src.extract.policy_bridge import is_transient
 
@@ -134,3 +157,131 @@ def test_reset_client_cache_is_registered_as_a_post_reauth_callback():
         "names (e.g. both 'src.extract.policy_bridge' and 'extract.policy_bridge') "
         "causing the module-level register_post_reauth call to execute twice."
     )
+
+
+def test_an_unusable_reply_is_never_transient_whatever_its_message_says():
+    """A parser's column number read as a 429: calendar sync kept the event
+    pending and extracted it again every run."""
+    from src.extract.policy_bridge import is_transient
+
+    for message in (
+        "Failed to parse JSON: Expecting ',' delimiter: line 1 column 4291 (char 4290)",
+        "Failed to parse JSON: Unterminated string starting at: line 1 column 529",
+        "Failed to parse JSON: Expecting value: line 408 column 1 timeout",
+    ):
+        assert not is_transient(ValueError(message)), message
+
+
+def _sdk_timeout(cause=None):
+    exc = anthropic.APITimeoutError.__new__(anthropic.APITimeoutError)
+    exc.__cause__ = cause
+    return exc
+
+
+def test_a_timeout_of_the_request_is_told_apart_from_one_reaching_the_service():
+    """A request that runs out of time will again; a connection that could not be
+    made, or waited for a pooled one, says nothing about the request."""
+    import httpx
+    import httpx2
+    from google.genai import errors as genai_errors
+
+    from src.extract.policy_bridge import is_item_timeout
+
+    request = httpx.Request("POST", "https://example.invalid")
+    request2 = httpx2.Request("POST", "https://example.invalid")
+    of_the_request = [
+        TimeoutError(),
+        _sdk_timeout(),
+        _sdk_timeout(httpx2.ReadTimeout("read", request=request2)),
+        httpx.ReadTimeout("read", request=request),
+        _status_error(anthropic.APIStatusError, 408),
+        _status_error(anthropic.InternalServerError, 504),
+        genai_errors.ClientError(408, {"error": {}}),
+        genai_errors.ServerError(504, {"error": {"status": "DEADLINE_EXCEEDED"}}),
+    ]
+    reaching_the_service = [
+        _sdk_timeout(httpx2.ConnectTimeout("connect", request=request2)),
+        _sdk_timeout(httpx2.PoolTimeout("pool", request=request2)),
+        _sdk_timeout(httpx2.WriteTimeout("write", request=request2)),
+        httpx.ConnectTimeout("connect", request=request),
+        httpx.PoolTimeout("pool", request=request),
+        httpx.WriteTimeout("write", request=request),
+    ]
+    not_timeouts = [
+        _status_error(anthropic.InternalServerError, 500),
+        _status_error(anthropic.RateLimitError, 429),
+        genai_errors.ServerError(503, {"error": {"status": "UNAVAILABLE"}}),
+        ValueError("Failed to parse JSON"),
+        gauth.TimeoutError("token refresh timed out"),
+    ]
+
+    assert [is_item_timeout(e) for e in of_the_request] == [True] * len(of_the_request)
+    others = reaching_the_service + not_timeouts
+    assert [is_item_timeout(e) for e in others] == [False] * len(others)
+    # Still worth offering again, just not the request's doing.
+    assert all(is_transient_(e) for e in reaching_the_service)
+
+
+def is_transient_(exc):
+    from src.extract.policy_bridge import is_transient
+
+    return is_transient(exc)
+
+
+def _vertex_error(status):
+    """What the Vertex client itself makes of a status, not a hand-built class."""
+    import httpx2
+
+    client = anthropic.AnthropicVertex(region="eu", project_id="p", access_token="t")
+    response = httpx2.Response(status, request=httpx2.Request("POST", "https://example.invalid"))
+    return client._make_status_error("status", body=None, response=response)
+
+
+def test_a_vertex_overload_is_an_overload_but_keeps_the_api_error_budget():
+    """The Vertex client has no class for 529: an overload arrives as a plain
+    InternalServerError. The extraction loop treats it as quota (is_overload);
+    the retry policy keeps it on the API-error budget, since the rate-limit
+    backoff (60/120/240 s) held a call past the sync's slice."""
+    from src.extract.policy_bridge import is_overload
+
+    exc = _vertex_error(529)
+
+    assert type(exc) is anthropic.InternalServerError
+    assert is_overload(exc)
+    assert classify_exception(exc, None) is Outcome.API_ERROR
+    assert not is_overload(_vertex_error(500))
+
+
+def test_what_the_vertex_client_makes_of_a_504_is_the_requests_timeout():
+    from src.extract.policy_bridge import is_item_timeout
+
+    assert is_item_timeout(_vertex_error(504))
+    assert not is_item_timeout(_vertex_error(503))
+
+
+def test_a_gateways_504_on_the_way_to_gemini_is_not_the_requests_timeout():
+    """Gemini names its own deadline; an HTML 504 from a proxy is the network."""
+    import httpx
+    from google.genai import errors as genai_errors
+
+    from src.extract.policy_bridge import is_item_timeout
+
+    def raised(response):
+        try:
+            genai_errors.APIError.raise_for_response(response)
+        except genai_errors.APIError as e:
+            return e
+        raise AssertionError("no error raised")
+
+    request = httpx.Request("POST", "https://example.invalid")
+    gateway = raised(httpx.Response(504, text="<html>gateway</html>", request=request))
+    deadline = raised(
+        httpx.Response(
+            504,
+            json={"error": {"code": 504, "status": "DEADLINE_EXCEEDED", "message": "late"}},
+            request=request,
+        )
+    )
+
+    assert not is_item_timeout(gateway)
+    assert is_item_timeout(deadline)

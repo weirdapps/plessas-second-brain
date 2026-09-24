@@ -15,10 +15,29 @@ Two facts shape this file, both measured rather than assumed:
 
 import anthropic
 import google.auth.exceptions as gauth
+import httpx
+from google.genai import errors as genai_errors
 
 from src.extract.claude_extract import reset_client_cache
 from src.extract.vertex_auth import is_vertex_auth_error
 from src.llm_policy import Outcome, register_post_reauth
+
+# Timeouts of the network rather than of the request (see is_item_timeout):
+# connecting, waiting for a pooled connection, sending. httpx2 is the Anthropic
+# SDK's transport, a fork of httpx.
+try:
+    import httpx2
+
+    _NETWORK_TIMEOUTS: tuple[type[BaseException], ...] = (
+        httpx.ConnectTimeout,
+        httpx.PoolTimeout,
+        httpx.WriteTimeout,
+        httpx2.ConnectTimeout,
+        httpx2.PoolTimeout,
+        httpx2.WriteTimeout,
+    )
+except ImportError:  # an SDK back on plain httpx
+    _NETWORK_TIMEOUTS = (httpx.ConnectTimeout, httpx.PoolTimeout, httpx.WriteTimeout)
 
 _RATE_LIMIT_PATTERNS = ("429", "resource_exhausted")
 
@@ -79,6 +98,10 @@ def is_transient(exc: BaseException) -> bool:
     itself. A reply the caller cannot use (unparseable, truncated) raises
     ValueError there, and trying again would get the same reply.
     """
+    # Whatever its message says: a parser's column number can read as a '429'.
+    # google-auth's own ValueErrors are credentials, and are judged below.
+    if isinstance(exc, ValueError) and not isinstance(exc, gauth.GoogleAuthError):
+        return False
     if classify_exception(exc, None) in (Outcome.RATE_LIMIT, Outcome.TIMEOUT):
         return True
     if isinstance(exc, anthropic.APIConnectionError | anthropic.InternalServerError):
@@ -89,7 +112,60 @@ def is_transient(exc: BaseException) -> bool:
     # wrapping, so a network drop there arrives as google-auth's own types.
     if isinstance(exc, gauth.TransportError | gauth.TimeoutError):
         return True
+    # The Gemini engine raises its SDK's own 5xx, and httpx's transport errors
+    # unwrapped.
+    if isinstance(exc, genai_errors.ServerError | httpx.TransportError):
+        return True
+    # Worth offering again, below the 5xx line: a request timeout, a conflict, a
+    # client-closed request. Anthropic's SDK retries 408 and 409 itself; the
+    # Gemini client retries nothing unless it is told to.
+    if isinstance(exc, anthropic.APIStatusError) and exc.status_code in (408, 409):
+        return True
+    if isinstance(exc, genai_errors.APIError) and exc.code in (408, 409, 499):
+        return True
     return isinstance(exc, ConnectionError | TimeoutError)
+
+
+def is_overload(exc: BaseException) -> bool:
+    """The service is overloaded: the direct API's OverloadedError, or the 529 the
+    Vertex client raises as a plain InternalServerError, having no class for it.
+
+    The extraction loop treats both as quota (local._should_quota_pause). To the
+    retry policy they differ: the direct API's OverloadedError keeps the
+    rate-limit posture it has always had, while a Vertex 529 stays on the
+    API-error budget, because on the producer, which runs on Vertex, the
+    rate-limit backoff (60, 120, 240 s) held a call already running well past
+    the sync's slice.
+    """
+    return isinstance(exc, anthropic.OverloadedError) or (
+        isinstance(exc, anthropic.APIStatusError) and getattr(exc, "status_code", 0) == 529
+    )
+
+
+def is_item_timeout(exc: BaseException) -> bool:
+    """The request ran out of time, as the same request is likely to again.
+
+    On either side: the client waiting for the reply, or the service giving up
+    on it with a 408 or a 504. The Vertex client reports every 504 as
+    DeadlineExceededError, whatever answered; Gemini names its own deadline
+    (DEADLINE_EXCEEDED), so a gateway's 504 on the way there is not counted.
+    Nor is a timeout of the network: connecting, waiting for a pooled
+    connection, or sending a request body, which is at most ~50K characters
+    here. The Anthropic SDK wraps every timeout of its transport in
+    APITimeoutError, so the cause tells them apart. The Vertex mTLS transport
+    (requests) is not used here, and its timeouts are not classified.
+    """
+    if isinstance(exc, _NETWORK_TIMEOUTS) or isinstance(exc.__cause__, _NETWORK_TIMEOUTS):
+        return False
+    if classify_exception(exc, None) is Outcome.TIMEOUT:
+        return True
+    if isinstance(exc, TimeoutError | httpx.TimeoutException):
+        return True
+    if isinstance(exc, anthropic.APIStatusError) and getattr(exc, "status_code", 0) in (408, 504):
+        return True
+    if isinstance(exc, genai_errors.APIError):
+        return exc.code == 408 or (exc.code == 504 and exc.status == "DEADLINE_EXCEEDED")
+    return False
 
 
 register_post_reauth(reset_client_cache)

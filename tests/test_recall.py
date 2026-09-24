@@ -287,6 +287,62 @@ class TestRecallHybridFusion:
         ids = [e["email_id"] for e in res["emails"]]
         assert 1 in ids  # keyword hits preserved, no crash
 
+    def test_a_thread_takes_one_slot_in_the_fused_emails(self, recall_db):
+        """The keyword side keeps one row per thread; semantic candidates from
+        the same thread came back beside it."""
+        for i in range(10, 15):
+            recall_db.execute(
+                "INSERT INTO emails (id, message_id, date_received, subject, summary, "
+                "mailbox_name, content, conversation_id) "
+                "VALUES (?, ?, ?, 'Kiwi plan', 'nothing', 'INBOX', 'x', 'T')",
+                (i, i, f"2026-04-1{i - 10}T10:00:00"),
+            )
+        recall_db.commit()
+
+        def fake_sem(conn, query, limit):
+            return [10, 12, 1]
+
+        res = recall(recall_db, "kiwi plan", semantic_candidates=fake_sem)
+        ids = [e["email_id"] for e in res["emails"]]
+
+        assert sum(i in range(10, 15) for i in ids) == 1
+        assert 1 in ids
+
+    def test_the_keyword_row_of_a_thread_keeps_its_semantic_siblings_out(self, recall_db):
+        for i in range(10, 15):
+            recall_db.execute(
+                "INSERT INTO emails (id, message_id, date_received, subject, summary, "
+                "mailbox_name, content, conversation_id) "
+                "VALUES (?, ?, ?, 'Kiwi plan', 'nothing', 'INBOX', 'x', 'T')",
+                (i, i, f"2026-04-1{i - 10}T10:00:00"),
+            )
+        recall_db.commit()
+
+        def fake_sem(conn, query, limit):
+            return [14, 10, 12]
+
+        res = recall(recall_db, "kiwi plan", semantic_candidates=fake_sem)
+
+        assert [e["email_id"] for e in res["emails"]] == [14]
+
+    def test_semantic_candidates_of_one_thread_take_one_slot(self, recall_db):
+        for i in (20, 21, 22):
+            recall_db.execute(
+                "INSERT INTO emails (id, message_id, date_received, subject, summary, "
+                "mailbox_name, content, conversation_id) "
+                "VALUES (?, ?, '2026-04-20T10:00:00', 'Unrelated', 'nothing', 'INBOX', 'x', 'V')",
+                (i, i),
+            )
+        recall_db.commit()
+
+        def fake_sem(conn, query, limit):
+            return [20, 21, 22]
+
+        res = recall(recall_db, "unicornz9", semantic_candidates=fake_sem)
+        ids = [e["email_id"] for e in res["emails"]]
+
+        assert sum(i in (20, 21, 22) for i in ids) == 1
+
     def test_keyword_only_when_no_provider(self, recall_db):
         # Default path (no injected provider) is unchanged, keyword-only.
         res = recall(recall_db, "unicornz9")

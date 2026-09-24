@@ -8,7 +8,7 @@ on a busy Claude Code day is dozens of transcripts, each its own LLM call.
 
 The behaviour asserted here is the same contract Steps 6 and 8 already keep:
 spend up to `deadline_s`, then leave the rest queued for the next run and the
-nightly `sb-conversation-sync` unit, which has 1800 s rather than 600 s.
+separate `sb-conversation-sync` unit, which has 900 s to itself.
 """
 
 import itertools

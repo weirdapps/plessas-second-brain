@@ -804,8 +804,8 @@ def extract_conversation_inline(
             if _is_unusable_reply(e):
                 log(f"FAILED conv {session_id[:12]}: {e}")
                 return (session_id, None, False, FAULT)
-            # The same test as emails (a 529 overload is quota there), plus the
-            # retry-delay text this path has always recognised.
+            # The same test as emails (a 529 overload is quota, from either
+            # client), plus the retry-delay text this path has always recognised.
             if _parse_retry_delay(e) is not None or _should_quota_pause(e):
                 is_quota = True
                 if attempt < max_retries - 1:

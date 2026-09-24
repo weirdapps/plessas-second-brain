@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from src.config import DATA_ROOT, GEMINI_MODEL
@@ -36,6 +36,7 @@ QUOTA_PAUSE_SECONDS = 3600  # 1 hour default pause when quota exhausted
 # failure of the conversation (an unusable reply, a request the service
 # rejects), never quota, auth or a transient service error, and only in a run
 # where some conversation succeeded, so an outage cannot use up their attempts.
+# A timeout counts toward CONVERSATION_MAX_TIMEOUTS instead.
 #
 # Without it a conversation the model will not process is immortal: it fails,
 # never enters processed_ids, and is first in line again an hour later. Session
@@ -45,6 +46,13 @@ QUOTA_PAUSE_SECONDS = 3600  # 1 hour default pause when quota exhausted
 # retried") and SharePoint links ("43 given up") already had this idea; the
 # conversation pipeline was the one that did not.
 CONVERSATION_MAX_ATTEMPTS = 3
+CONVERSATION_MAX_TIMEOUTS = 10
+
+# A conversation that ended this recently may still be going on. It was staged
+# part-way through, and extracting it now would load its first turns for good,
+# since a loaded session is never staged again. It is staged again, fuller, by a
+# later export, and extracted once it has been quiet this long.
+CONVERSATION_SETTLE_HOURS = 2
 
 # Runs after which an email that keeps failing is loaded without its
 # extraction: the loader inserts it with its raw content, searchable by keyword,
@@ -59,6 +67,15 @@ CONVERSATION_MAX_ATTEMPTS = 3
 # a second run.
 EMAIL_MAX_ATTEMPTS = 3
 
+# A timeout counts toward its own, longer cap. An email too big to answer in
+# time times out on every run, and must stop being offered; so, now and then,
+# does an email caught in a slow spell, and that one must not be stubbed.
+EMAIL_MAX_TIMEOUTS = 10
+
+# What a final failure counts as (see _failure_kind); None counts as nothing.
+FAULT = "fault"
+TIMEOUT = "timeout"
+
 
 def _is_unusable_reply(exc: BaseException) -> bool:
     """A reply that cannot be used: unparseable, truncated, or with no text.
@@ -70,6 +87,31 @@ def _is_unusable_reply(exc: BaseException) -> bool:
     import google.auth.exceptions as gauth
 
     return isinstance(exc, ValueError) and not isinstance(exc, gauth.GoogleAuthError)
+
+
+def _failure_kind(exc: BaseException, is_quota: bool) -> str | None:
+    """FAULT for the item's own failure, TIMEOUT for a timeout, None for the service's.
+
+    A timeout is tested before the transient errors it belongs among, because
+    the same item timing out run after run is a property of the item.
+    """
+    import httpx
+
+    from src.extract.policy_bridge import classify_exception, is_transient
+    from src.llm_policy import Outcome
+
+    if is_quota:
+        return None
+    if _is_unusable_reply(exc):
+        return FAULT
+    outcome = classify_exception(exc, None)
+    if outcome is Outcome.AUTH_REAUTH_REQUIRED:
+        return None
+    if outcome is Outcome.TIMEOUT or isinstance(exc, TimeoutError | httpx.TimeoutException):
+        return TIMEOUT
+    if is_transient(exc):
+        return None
+    return FAULT
 
 
 _shutdown = False
@@ -240,13 +282,13 @@ def _should_quota_pause(exc: Exception) -> bool:
 
 def extract_inline(
     email: dict, api_key: str | None, max_retries: int = 3, engine: str = "gemini"
-) -> tuple[str, dict | None, bool, bool]:
+) -> tuple[str, dict | None, bool, str | None]:
     """Extract inline with retries. Thread-safe for Claude engine.
 
-    Returns (msg_id, extraction_or_None, is_quota_error, countable). The caller
-    uses is_quota_error to trigger a global pause, and countable (the email's
-    own failure: not quota, auth or a transient service error) to count it
-    against EMAIL_MAX_ATTEMPTS. An unusable reply is not retried here: it comes
+    Returns (msg_id, extraction_or_None, is_quota_error, failure). The caller
+    uses is_quota_error to trigger a global pause, and failure (FAULT, TIMEOUT
+    or None, see _failure_kind) to count it against EMAIL_MAX_ATTEMPTS or
+    EMAIL_MAX_TIMEOUTS. An unusable reply is not retried here: it comes
     back the same for the same input. Nor is anything on Claude, whose request
     has already been through the retry policy inside complete(); retrying it
     here multiplied that policy's attempts, and its waits, by max_retries.
@@ -272,7 +314,7 @@ def extract_inline(
             if use_alarm:
                 signal.alarm(0)
                 signal.signal(signal.SIGALRM, _handle_signal)
-            return (msg_id, result, False, False)
+            return (msg_id, result, False, None)
 
         except TimeoutError:
             if use_alarm:
@@ -280,11 +322,16 @@ def extract_inline(
             if attempt < max_retries - 1:
                 time.sleep(2 ** (attempt + 1))
             else:
-                return (msg_id, None, False, False)
+                return (msg_id, None, False, TIMEOUT)
 
         except Exception as e:
             if use_alarm:
                 signal.alarm(0)
+            # Before the quota test: a parser message can hold '429' (a column
+            # number), and a reply that cannot be used is never quota.
+            if _is_unusable_reply(e):
+                log(f"  ↳ msg {msg_id} error: {type(e).__name__}: {str(e)[:200]}")
+                return (msg_id, None, False, FAULT)
             if _should_quota_pause(e):
                 is_quota = True
                 if attempt < max_retries - 1:
@@ -294,8 +341,8 @@ def extract_inline(
                     time.sleep(min(30, 2 ** (attempt + 1)))
                     continue
                 else:
-                    return (msg_id, None, True, False)
-            from src.extract.policy_bridge import classify_exception, is_transient
+                    return (msg_id, None, True, None)
+            from src.extract.policy_bridge import classify_exception
             from src.llm_policy import Outcome
 
             if classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED:
@@ -307,24 +354,24 @@ def extract_inline(
                 )
                 touch_sentinel()
                 _shutdown = True
-                return (msg_id, None, False, False)
-            if not _is_unusable_reply(e) and attempt < max_retries - 1:
+                return (msg_id, None, False, None)
+            if attempt < max_retries - 1:
                 time.sleep(2 ** (attempt + 1))
             else:
                 log(f"  ↳ msg {msg_id} error: {type(e).__name__}: {str(e)[:200]}")
-                return (msg_id, None, is_quota, not (is_quota or is_transient(e)))
+                return (msg_id, None, is_quota, _failure_kind(e, is_quota))
 
-    return (msg_id, None, is_quota, False)
+    return (msg_id, None, is_quota, None)
 
 
 def _worker_fn(
     email: dict, api_key: str | None, engine: str
-) -> tuple[str, dict | None, bool, bool]:
+) -> tuple[str, dict | None, bool, str | None]:
     """Extract one staged email: news from its own text, anything else by the model."""
     from src.extract.news_extract import extract_news, is_news
 
     if is_news(email):
-        return (str(email.get("message_id", "unknown")), extract_news(email), False, False)
+        return (str(email.get("message_id", "unknown")), extract_news(email), False, None)
     return extract_inline(email, api_key, engine=engine)
 
 
@@ -376,11 +423,19 @@ def run_extraction(
 
     state = load_state()
     processed_ids = set(state.get("processed_ids", []))
-    # message_id -> runs that failed (see EMAIL_MAX_ATTEMPTS). This run's
-    # failures are counted at its end, and only if the model worked for some email.
+    # message_id -> runs that failed (see EMAIL_MAX_ATTEMPTS and
+    # EMAIL_MAX_TIMEOUTS). This run's failures are counted at its end, and only
+    # if the model worked for some email.
     attempt_counts: dict[str, int] = dict(state.get("failed_attempts", {}))
-    failed_this_run: set[str] = set()
+    timeout_counts: dict[str, int] = dict(state.get("timeout_attempts", {}))
+    failed_this_run: dict[str, str] = {}
     model_successes = 0
+
+    def note_failure(msg_id: str, failure: str | None) -> None:
+        # A fault outranks a timeout for an email met twice in one run.
+        if failure and failed_this_run.get(msg_id) != FAULT:
+            failed_this_run[msg_id] = failure
+
     log(f"Previously extracted: {len(processed_ids)} emails")
 
     def count_this_runs_failures() -> None:
@@ -392,16 +447,25 @@ def run_extraction(
                 "no email reached the model successfully this run"
             )
             return
-        for msg_id in sorted(failed_this_run - processed_ids):
-            attempts = attempt_counts.get(msg_id, 0) + 1
-            if attempts < EMAIL_MAX_ATTEMPTS:
-                attempt_counts[msg_id] = attempts
+        for msg_id in sorted(set(failed_this_run) - processed_ids):
+            kind = failed_this_run[msg_id]
+            counts, cap = (
+                (attempt_counts, EMAIL_MAX_ATTEMPTS)
+                if kind == FAULT
+                else (timeout_counts, EMAIL_MAX_TIMEOUTS)
+            )
+            runs = counts.get(msg_id, 0) + 1
+            if runs < cap:
+                counts[msg_id] = runs
                 continue
             attempt_counts.pop(msg_id, None)
+            timeout_counts.pop(msg_id, None)
             with open(EXTRACTED_DIR / f"{msg_id}.json", "w") as f:
                 json.dump(_stub_extraction(msg_id), f, indent=2, ensure_ascii=False)
             processed_ids.add(msg_id)
-            log(f"GAVE UP on msg {msg_id} after {attempts} runs; it loads without an extraction")
+            log(
+                f"GAVE UP on msg {msg_id} after {runs} runs ({kind}); it loads without an extraction"
+            )
 
     log("Loading staged emails...")
     all_emails = collect_emails()
@@ -458,7 +522,7 @@ def run_extraction(
                 break
 
             email = pending[i]
-            msg_id, extraction, is_quota, countable = _worker_fn(email, api_key, engine)
+            msg_id, extraction, is_quota, failure = _worker_fn(email, api_key, engine)
 
             if extraction is not None:
                 result_file = EXTRACTED_DIR / f"{msg_id}.json"
@@ -466,6 +530,7 @@ def run_extraction(
                     json.dump(extraction, f, indent=2, ensure_ascii=False)
                 processed_ids.add(msg_id)
                 attempt_counts.pop(msg_id, None)
+                timeout_counts.pop(msg_id, None)
                 total_done += 1
                 # News never reaches the model, so it says nothing about quota.
                 if not is_news(email):
@@ -477,13 +542,13 @@ def run_extraction(
                 if is_quota:
                     consecutive_failures += 1
                 log(f"FAILED msg {msg_id}")
-                if countable:
-                    failed_this_run.add(msg_id)
+                note_failure(msg_id, failure)
 
                 if consecutive_failures >= CONSECUTIVE_FAIL_THRESHOLD:
                     pause = QUOTA_PAUSE_SECONDS
                     state["processed_ids"] = list(processed_ids)
                     state["failed_attempts"] = attempt_counts
+                    state["timeout_attempts"] = timeout_counts
                     state["total_extracted"] = len(processed_ids)
                     state["failures"] = total_failed
                     save_state(state)
@@ -519,6 +584,7 @@ def run_extraction(
             if unsaved_count >= SAVE_INTERVAL:
                 state["processed_ids"] = list(processed_ids)
                 state["failed_attempts"] = attempt_counts
+                state["timeout_attempts"] = timeout_counts
                 state["total_extracted"] = len(processed_ids)
                 state["failures"] = total_failed
                 save_state(state)
@@ -565,7 +631,7 @@ def run_extraction(
                         if future.cancelled():
                             continue
 
-                    msg_id, extraction, is_quota, countable = future.result()
+                    msg_id, extraction, is_quota, failure = future.result()
                     email = futures[future]
 
                     if extraction is not None:
@@ -575,6 +641,7 @@ def run_extraction(
                         with _state_lock:
                             processed_ids.add(msg_id)
                             attempt_counts.pop(msg_id, None)
+                            timeout_counts.pop(msg_id, None)
                             total_done += 1
                             if not is_news(email):
                                 model_successes += 1
@@ -584,8 +651,7 @@ def run_extraction(
                             total_failed += 1
                             if is_quota:
                                 consecutive_failures += 1
-                            if countable:
-                                failed_this_run.add(msg_id)
+                            note_failure(msg_id, failure)
                         log(f"FAILED msg {msg_id}")
 
                     with _state_lock:
@@ -595,6 +661,7 @@ def run_extraction(
                         with _state_lock:
                             state["processed_ids"] = list(processed_ids)
                             state["failed_attempts"] = attempt_counts
+                            state["timeout_attempts"] = timeout_counts
                             state["total_extracted"] = len(processed_ids)
                             state["failures"] = total_failed
                             save_state(state)
@@ -618,6 +685,7 @@ def run_extraction(
                     with _state_lock:
                         state["processed_ids"] = list(processed_ids)
                         state["failed_attempts"] = attempt_counts
+                        state["timeout_attempts"] = timeout_counts
                         state["total_extracted"] = len(processed_ids)
                         state["failures"] = total_failed
                         save_state(state)
@@ -649,6 +717,7 @@ def run_extraction(
     # Final save
     state["processed_ids"] = list(processed_ids)
     state["failed_attempts"] = attempt_counts
+    state["timeout_attempts"] = timeout_counts
     state["total_extracted"] = len(processed_ids)
     state["failures"] = total_failed
     save_state(state)
@@ -701,14 +770,14 @@ def collect_conversations() -> list[dict]:
 def extract_conversation_inline(
     conversation: dict,
     max_retries: int = 1,
-) -> tuple[str, dict | None, bool, bool]:
+) -> tuple[str, dict | None, bool, str | None]:
     """Extract a single conversation.
 
-    Returns (session_id, extraction, is_quota, countable), as extract_inline
-    does for Claude: one attempt, because the request has already been through
-    the retry policy inside complete(), and only a failure of the conversation
-    itself (not quota, auth or a transient service error) is countable toward
-    CONVERSATION_MAX_ATTEMPTS.
+    Returns (session_id, extraction, is_quota, failure), as extract_inline does
+    for Claude: one attempt, because the request has already been through the
+    retry policy inside complete(), and failure (FAULT, TIMEOUT or None, see
+    _failure_kind) counts toward CONVERSATION_MAX_ATTEMPTS or
+    CONVERSATION_MAX_TIMEOUTS.
     """
     session_id = conversation.get("session_id", "unknown")
     is_quota = False
@@ -718,9 +787,14 @@ def extract_conversation_inline(
             from src.extract.claude_extract import extract_conversation
 
             result = extract_conversation(conversation)
-            return (session_id, result, False, False)
+            return (session_id, result, False, None)
 
         except Exception as e:
+            # Before the quota test: a parser message can hold '429', and a
+            # reply that cannot be used is never quota.
+            if _is_unusable_reply(e):
+                log(f"FAILED conv {session_id[:12]}: {e}")
+                return (session_id, None, False, FAULT)
             # The same test as emails (a 529 overload is quota there), plus the
             # retry-delay text this path has always recognised.
             if _parse_retry_delay(e) is not None or _should_quota_pause(e):
@@ -731,19 +805,15 @@ def extract_conversation_inline(
                     )
                     time.sleep(min(30, 2 ** (attempt + 1)))
                     continue
-                return (session_id, None, True, False)
+                return (session_id, None, True, None)
 
-            from src.extract.policy_bridge import classify_exception, is_transient
-            from src.llm_policy import Outcome
-
-            if not _is_unusable_reply(e) and attempt < max_retries - 1:
+            if attempt < max_retries - 1:
                 time.sleep(2 ** (attempt + 1))
             else:
                 log(f"FAILED conv {session_id[:12]}: {e}")
-                auth = classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED
-                return (session_id, None, is_quota, not (auth or is_quota or is_transient(e)))
+                return (session_id, None, is_quota, _failure_kind(e, is_quota))
 
-    return (session_id, None, is_quota, False)
+    return (session_id, None, is_quota, None)
 
 
 def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: float | None = None):
@@ -757,7 +827,7 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
             conversation is started and the ones already extracted are saved.
             Same contract as run_phase1/run_phase2/run_backfill: the remainder is
             left staged for the next run, and for sb-conversation-sync, which has
-            1800 s against this caller's 600 s. None keeps the old unbounded
+            900 s against this step's 30 s slice. None keeps the old unbounded
             behaviour, which is what a hand-run and the nightly unit both want.
     """
     global _shutdown
@@ -775,7 +845,14 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
     # session_id -> runs that ended in a failure. Separate from processed_ids so a
     # given-up conversation never reads as ingested to the loader.
     attempt_counts = dict(conv_state.get("failed_attempts", {}))
-    given_up = {sid for sid, n in attempt_counts.items() if n >= CONVERSATION_MAX_ATTEMPTS}
+    timeout_counts = dict(conv_state.get("timeout_attempts", {}))
+
+    def given_up_ids() -> set[str]:
+        return {sid for sid, n in attempt_counts.items() if n >= CONVERSATION_MAX_ATTEMPTS} | {
+            sid for sid, n in timeout_counts.items() if n >= CONVERSATION_MAX_TIMEOUTS
+        }
+
+    given_up = given_up_ids()
     log(f"Previously extracted: {len(processed_ids)} conversations")
     if given_up:
         log(f"Given up (no longer retried): {len(given_up)} conversations")
@@ -793,6 +870,15 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
     # old conversation the model will not take held the head of the list, spent
     # every hourly budget and, with nothing extracted after it, was never counted.
     pending.sort(key=lambda c: str(c.get("started_at") or ""), reverse=True)
+    settled_before = (datetime.now(UTC) - timedelta(hours=CONVERSATION_SETTLE_HOURS)).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
+    live = [c for c in pending if str(c.get("ended_at") or "")[:19] >= settled_before]
+    if live:
+        pending = [c for c in pending if c not in live]
+        log(
+            f"Held back {len(live)} conversation(s) active in the last {CONVERSATION_SETTLE_HOURS}h"
+        )
     log(f"Pending extraction: {len(pending)} conversations")
 
     if limit > 0:
@@ -814,7 +900,7 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
     total_failed = 0
     # Counted at the end of the run, and only if some conversation succeeded
     # (see CONVERSATION_MAX_ATTEMPTS).
-    failed_this_run: set[str] = set()
+    failed_this_run: dict[str, str] = {}
     start_time = time.time()
     # monotonic, not time(), for the same reason run_phase1 uses it: a clock step
     # mid-run must not hand this loop an unbounded or already-expired budget.
@@ -832,7 +918,7 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
             log(f"Deadline reached, deferring {len(pending) - i} conversation(s) to the next run")
             break
 
-        session_id, extraction, is_quota, countable = extract_conversation_inline(conv)
+        session_id, extraction, is_quota, failure = extract_conversation_inline(conv)
 
         if extraction is not None:
             result_file = CONV_EXTRACTED_DIR / f"{session_id}.json"
@@ -840,21 +926,23 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
                 json.dump(extraction, f, indent=2, ensure_ascii=False)
             processed_ids.add(session_id)
             # A success clears the record: the next failure starts from zero
-            # rather than inheriting an old transient one.
+            # rather than inheriting an earlier one.
             attempt_counts.pop(session_id, None)
-            failed_this_run.discard(session_id)
+            timeout_counts.pop(session_id, None)
+            failed_this_run.pop(session_id, None)
             total_done += 1
             log(f"Extracted conv {session_id[:12]}... ({i + 1}/{len(pending)})")
         else:
             total_failed += 1
-            if countable:
-                failed_this_run.add(session_id)
+            if failure:
+                failed_this_run[session_id] = failure
             log(f"FAILED conv {session_id[:12]}...")
 
         # Save state periodically
         if (i + 1) % SAVE_INTERVAL == 0 or i == len(pending) - 1:
             conv_state["processed_ids"] = list(processed_ids)
             conv_state["failed_attempts"] = attempt_counts
+            conv_state["timeout_attempts"] = timeout_counts
             conv_state["total_extracted"] = len(processed_ids)
             conv_state["failures"] = total_failed
             conv_state["last_updated"] = datetime.now().isoformat()
@@ -870,20 +958,24 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
         # conversations, and it must not use up their attempts.
         log(f"{len(failed_this_run)} conversation failures not counted: none succeeded this run")
     else:
-        for sid in sorted(failed_this_run):
-            attempts = attempt_counts.get(sid, 0) + 1
-            attempt_counts[sid] = attempts
-            if attempts >= CONVERSATION_MAX_ATTEMPTS:
-                log(f"GAVE UP on conv {sid[:12]}... after {attempts} runs; no longer retried")
+        for sid, kind in sorted(failed_this_run.items()):
+            counts, cap = (
+                (attempt_counts, CONVERSATION_MAX_ATTEMPTS)
+                if kind == FAULT
+                else (timeout_counts, CONVERSATION_MAX_TIMEOUTS)
+            )
+            runs = counts.get(sid, 0) + 1
+            counts[sid] = runs
+            if runs >= cap:
+                log(f"GAVE UP on conv {sid[:12]}... after {runs} runs ({kind}); no longer retried")
             else:
-                log(f"conv {sid[:12]}... failed {attempts}/{CONVERSATION_MAX_ATTEMPTS} runs")
+                log(f"conv {sid[:12]}... failed {runs}/{cap} runs ({kind})")
 
     # Final save
     conv_state["processed_ids"] = list(processed_ids)
     conv_state["failed_attempts"] = attempt_counts
-    conv_state["given_up_ids"] = [
-        sid for sid, n in attempt_counts.items() if n >= CONVERSATION_MAX_ATTEMPTS
-    ]
+    conv_state["timeout_attempts"] = timeout_counts
+    conv_state["given_up_ids"] = sorted(given_up_ids())
     conv_state["total_extracted"] = len(processed_ids)
     conv_state["failures"] = total_failed
     conv_state["last_updated"] = datetime.now().isoformat()

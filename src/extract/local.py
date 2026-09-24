@@ -921,11 +921,13 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
     # Quota errors in a row, as the email loop counts them: a success starts
     # again from zero, another failure leaves the count where it was.
     consecutive_quota = 0
+    cut_short = False
     for i, conv in enumerate(pending):
         if _shutdown:
             log("Shutdown requested, saving state...")
             break
         if consecutive_quota >= CONSECUTIVE_FAIL_THRESHOLD:
+            cut_short = True
             log(
                 f"QUOTA PAUSE: {consecutive_quota} consecutive quota errors; ending the run, "
                 f"{len(pending) - i} conversation(s) stay pending for the next one."
@@ -937,6 +939,7 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
         # for, so the useful question is whether to start another one.
         if deadline is not None and time.monotonic() >= deadline:
             log(f"Deadline reached, deferring {len(pending) - i} conversation(s) to the next run")
+            cut_short = True
             break
 
         session_id, extraction, is_quota, failure = extract_conversation_inline(conv)
@@ -1007,7 +1010,8 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
     CONV_STATE_FILE.write_text(json.dumps(conv_state, indent=2))
 
     elapsed = (time.time() - start_time) / 60
-    log(f"=== CONVERSATION EXTRACTION {'STOPPED' if _shutdown else 'COMPLETE'} ===")
+    ending = "STOPPED" if _shutdown else "CUT SHORT" if cut_short else "COMPLETE"
+    log(f"=== CONVERSATION EXTRACTION {ending} ===")
     log(f"Extracted: {total_done}, Failed: {total_failed}, Time: {elapsed:.1f}min")
 
 

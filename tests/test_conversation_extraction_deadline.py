@@ -379,10 +379,13 @@ def test_a_conversation_that_keeps_timing_out_is_given_up_on_the_longer_cap(stag
     assert len(gave_up()) == len(staged)
 
 
-def test_a_run_of_quota_errors_ends_the_run(staged):
+def test_a_run_of_quota_errors_ends_the_run(staged, monkeypatch):
     """The email loop stops after CONSECUTIVE_FAIL_THRESHOLD quota errors in a
     row; the conversation loop read the flag and went on, spending each
-    conversation's policy retries on an overloaded service until the unit's end."""
+    conversation's policy retries on an overloaded service until the unit's end.
+    The run then says it was cut short, not complete."""
+    logged: list[str] = []
+    monkeypatch.setattr(local, "log", logged.append)
 
     def quota(conv):
         return conv["session_id"], None, True, None
@@ -397,6 +400,25 @@ def test_a_run_of_quota_errors_ends_the_run(staged):
     assert ex.call_count == local.CONSECUTIVE_FAIL_THRESHOLD
     state = json.loads(local.CONV_STATE_FILE.read_text())
     assert state["failed_attempts"] == {} and state["timeout_attempts"] == {}
+    assert "=== CONVERSATION EXTRACTION CUT SHORT ===" in logged
+
+
+def test_a_fault_between_quota_errors_leaves_their_count(staged):
+    answers = iter(["quota", "fault"] + ["quota"] * len(staged))
+
+    def mixed(conv):
+        if next(answers) == "quota":
+            return conv["session_id"], None, True, None
+        return conv["session_id"], None, False, "fault"
+
+    with (
+        patch.object(local, "collect_conversations", return_value=staged),
+        patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
+        patch.object(local, "extract_conversation_inline", side_effect=mixed) as ex,
+    ):
+        local.run_conversation_extraction()
+
+    assert ex.call_count == local.CONSECUTIVE_FAIL_THRESHOLD + 1
 
 
 def test_a_success_between_quota_errors_starts_the_count_again(staged):

@@ -49,7 +49,7 @@ graph TD
 | SharePoint links | `src/extract/sharepoint_url_scanner.py`, `src/export/sharepoint_fetcher.py` | Managed host defaults to `contoso.sharepoint.com` (override via `SHAREPOINT_HOST`). |
 | Standalone documents | `src/cli.py ingest`, `reverse-ingest`, `src/ingest/reverse_scan.py` | Latest-version-per-logical-name dedup. |
 | Web and YouTube | `src/extract/web_ingest.py` | URL fetch plus transcript pull via `youtube-transcript-api`. |
-| News digests | `src/export/news_export.py` | Reads an external news-reader SQLite DB (`BRAIN_NEWS_DB`) read-only. Digest syntheses plus articles at or above `--relevance`. Landed under `mailbox_name = 'News'`, so mail counts exclude them. |
+| News digests | `src/export/news_export.py` | Reads an external news-reader SQLite DB (`BRAIN_NEWS_DB`) read-only. Digest syntheses plus articles at or above `--relevance`. Landed under `mailbox_name = 'News'`, so mail counts exclude them. Not sent to the model: the summary is the synthesis's brief or the article's opening, the topics its section categories or the article's categories (`src/extract/news_extract.py`). |
 | Claude Code sessions | `src/export/conversation_export.py` | Reads `~/.claude/projects`. |
 
 ### Bring your own source
@@ -321,6 +321,7 @@ src/
     teams_prompt.py            Teams thread extraction prompt
     untrusted.py               Fences third-party text in extraction prompts
     local.py                   Concurrent extraction dispatcher
+    news_extract.py            News items without the model: the synthesis brief or the article's opening
     parser.py                  Tolerant LLM JSON parser
     claude_extract.py          Claude via Vertex AI or direct API
     vertex_auth.py             Vertex AI credential resolution

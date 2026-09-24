@@ -45,8 +45,8 @@ def staged(monkeypatch, tmp_path):
             if call_seconds:
                 threading.Event().wait(call_seconds)  # not time.sleep, which is patched
             if behaviour == "quota":
-                return email["message_id"], None, True
-            return email["message_id"], {"summary": "s"}, False
+                return email["message_id"], None, True, None
+            return email["message_id"], {"summary": "s"}, False, None
 
         monkeypatch.setattr(local, "extract_inline", extract)
         return calls

@@ -25,7 +25,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from src.config import DATA_ROOT, DEFAULT_DB, is_replica, replica_refusal  # noqa: E402
 from src.store.loader import load_single_email  # noqa: E402
-from src.store.schema import get_connection  # noqa: E402
+from src.store.schema import get_connection, run_migrations  # noqa: E402
 
 STAGING = DATA_ROOT / "staging"
 EXTRACTED = DATA_ROOT / "extracted"
@@ -62,6 +62,9 @@ def main() -> int:
 
     conn = get_connection(str(DB))
     conn.execute("PRAGMA busy_timeout = 60000")
+    # The schema the loader writes: before email_html (v23), an HTML email lost
+    # its markup, the failure to keep it caught below and the text committed.
+    run_migrations(conn)
 
     targets: list[str] = []
     for ext_file in sorted(EXTRACTED.glob("*.json")):

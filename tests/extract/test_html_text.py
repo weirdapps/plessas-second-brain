@@ -202,6 +202,22 @@ def test_only_a_head_left_open_is_dropped_to_the_body():
     assert html_to_text(f"<html><head><style>{outlook}</head><body>Hello") == "Hello"
     island = "<xml><!-- settings --><w:View>Normal</w:View>"  # it goes on past its comment
     assert html_to_text(f"<html><head>{island}</head><body><p>Hi</p>") == "Hi"
+    # No comment skipped on the way takes the head past </head> or <body>: an
+    # empty one closes at once, '--!>' closes one, and '<!--' in a stylesheet or
+    # a script opens none.
+    body = "</head><body><p>Hello</p><!-- sig --><p>World</p>"
+    for held in (
+        "<!--><meta x>",
+        "<!---><meta x>",
+        "<!-- x --!><meta x>",
+        "<style><!-- p{color:red} </style>",
+        "<script>var a='<!--';</script>",
+        "<!-- never closed <meta x>",
+    ):
+        assert html_to_text(f"<html><head><title>Subj{held}{body}") == "Hello\n\nWorld", held
+    for held in ("<!-->", "<!--->", "<!-- x --!>"):  # and with neither to stop at
+        html = f"<html><head><title>Subj{held}<p>Hello</p><!-- sig --><p>World</p>"
+        assert html_to_text(html) == "Hello\n\nWorld", held
     for held in ("<noscript><link rel=x></noscript>", "<basefont size=3>", "<bgsound src=x>", "\f"):
         assert html_to_text(f"<html><head>{held}<title>Subj</head><body>Hello") == "Hello", held
     # A stylesheet left open in the head goes up to where the head ends, past

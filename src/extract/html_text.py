@@ -121,6 +121,9 @@ _HEAD_END = re.compile(
     r"|aside|form|a|b|i|u|em|strong|small|big|sub|sup)[\s/>]",
     re.IGNORECASE,
 )
+# Where it ends whatever comes before, and how a comment ends.
+_HARD_HEAD_END = re.compile(r"</head[\s>]|<body[\s/>]", re.IGNORECASE)
+_COMMENT_END = re.compile(r"--!?>")
 # What a head holds besides the hidden elements: an element left open before
 # any other element and any text is in the head, after its </head> too.
 _HEAD = {"html", "head", "meta", "link", "base", "noscript", "basefont", "bgsound"}
@@ -372,15 +375,18 @@ def _markup_after_css(html: str, pos: int) -> int:
 def _head_end(html: str, pos: int) -> int | None:
     """Where a head left open at `pos` ends (_HEAD_END), outside its comments,
     whose markup no browser shows (Outlook's conditional blocks hold tables);
-    None if nothing ends it."""
-    while (found := _HEAD_END.search(html, pos)) is not None:
+    None if nothing ends it. No comment carries it past </head> or <body>: the
+    parser may read one otherwise, or none at all in a stylesheet or a script."""
+    hard = _HARD_HEAD_END.search(html, pos)
+    limit = hard.start() if hard else len(html)
+    while (found := _HEAD_END.search(html, pos, limit)) is not None:
         if found.group() != "<!--":
             return found.start()
-        close = html.find("-->", found.end())
-        if close < 0:
-            return None  # a comment left open runs to the end
-        pos = close + 3
-    return None
+        close = _COMMENT_END.search(html, found.start() + 2, limit)  # '<!-->' closes at once
+        if close is None:
+            break
+        pos = close.end()
+    return hard.start() if hard else None
 
 
 def _read(html: str) -> _Reader:

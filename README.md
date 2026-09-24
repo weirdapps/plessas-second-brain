@@ -42,7 +42,7 @@ graph TD
 | Source | Module | Notes |
 | --- | --- | --- |
 | Microsoft 365 mail | `src/export/outlook_export.py` + `outlook_cli.py` | Primary. Hourly, `--since` cursor. |
-| Attachments | `src/export/outlook_attachments.py`, `src/extract/attachment_extractors.py` | PDF (PyMuPDF), DOCX (`python-docx`), PPTX (`python-pptx`), XLSX (`openpyxl`), XLSB (`pyxlsb`), XLS (`xlrd`), images (Tesseract OCR), EML, RPMSG (`compoundfiles`). |
+| Attachments | `src/export/outlook_attachments.py`, `src/extract/attachment_extractors.py` | PDF (PyMuPDF), DOCX (`python-docx`), PPTX (`python-pptx`), XLSX (`openpyxl`), XLSB (`pyxlsb`), XLS (`xlrd`), images (Tesseract OCR), EML. RPMSG is recognised and skipped: it is IRM-encrypted, and nothing reads it without rights. |
 | Inline email images | `src/extract/image_classifier.py`, `image_pipeline.py`, `image_vision.py` | Dimensions plus bytes plus sender-scoped SHA256 dedup cascade; vision LLM stage for content images, cached by SHA256. |
 | Calendar events | `src/export/calendar_export.py`, `src/extract/calendar_extractor.py` | Outlook events with attendees, body summary, decisions. |
 | MS Teams | `src/export/teams_cli.py`, `teams_export.py`, `src/extract/teams_pipeline.py` | Chats, threads, messages, MRI resolution. |
@@ -73,11 +73,11 @@ A staging batch is `{ "batch_number", "exported_at", "source", "folder", "emails
 }
 ```
 
-See [`examples/example_exporter.py`](examples/example_exporter.py) for a ~40-line reference exporter and [`examples/sample-batch.json`](examples/sample-batch.json) for a complete synthetic batch. Drop a batch into `data/staging/`, then run `python -m src.cli sync` (or `load`) to extract and index it.
+See [`examples/example_exporter.py`](examples/example_exporter.py) for a ~40-line reference exporter and [`examples/sample-batch.json`](examples/sample-batch.json) for a complete synthetic batch. Drop a batch into `staging/` under the data home (`<repo>/data` unless `BRAIN_DATA_DIR` moves it). On a fresh store, run `python -m src.extract.local && python -m src.cli load`: `load` creates the database but does not extract, and `sync` needs the database to exist. From then on `python -m src.cli sync` does both.
 
 ## MCP tools
 
-The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register the server once in `~/.claude/settings.json`, then every session picks them up.
+The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register the server once with `claude mcp add` (see [Register with Claude Code](#register-with-claude-code)), then every session picks them up.
 
 ### Unified recall
 
@@ -178,7 +178,7 @@ pip install -e ".[dev]"
 
 Read from environment variables. Only identity plus one extraction path (Vertex or Gemini) is strictly required.
 
-Four identity and tenant settings (`BRAIN_USER_NAME`, `BRAIN_USER_ROLE`, `BRAIN_USER_EMAIL_PATTERN`, `SHAREPOINT_HOST`) can also live in a per-host file, `~/.config/second-brain/env` (override the path with `BRAIN_CONFIG_FILE`), one `KEY=value` per line, `#` comments allowed. `src/config.py` applies it at import, and the environment wins over it. It exists because the processes that need these settings start without a login shell: Claude Code launches the MCP server with an empty environment, and systemd starts the timers with a fixed one. Any other key in the file is ignored, so a credential, a backend switch or a relocated data home pasted into it is never picked up. Nothing reads a `.env` file; the schedulers that want one source it themselves.
+Four identity and tenant settings (`BRAIN_USER_NAME`, `BRAIN_USER_ROLE`, `BRAIN_USER_EMAIL_PATTERN`, `SHAREPOINT_HOST`) can also live in a per-host file, `~/.config/second-brain/env` (override the path with `BRAIN_CONFIG_FILE`), one `KEY=value` per line, `#` comments allowed. `src/config.py` applies it at import, and the environment wins over it. It exists because the processes that need these settings may start without a login shell: Claude Code passes the MCP server the environment `claude` itself was launched with, which from a GUI or an IDE holds no shell profile, and systemd starts the timers with a fixed one. Any other key in the file is ignored, so a credential, a backend switch or a relocated data home pasted into it is never picked up. Nothing reads a `.env` file; the schedulers that want one source it themselves.
 
 ### Identity
 
@@ -237,17 +237,12 @@ python -m src.mcp_server
 
 ### Register with Claude Code
 
-Add to `~/.claude/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "second-brain": {
-      "command": "/absolute/path/to/second-brain/run_mcp.sh"
-    }
-  }
-}
+```bash
+claude mcp add --scope user second-brain -- /absolute/path/to/second-brain/run_mcp.sh
+claude mcp list    # second-brain should be listed as connected
 ```
+
+`--scope user` makes the server available in every project. The server inherits the environment `claude` was launched with, which sources no `.env` and, from a GUI or an IDE, no shell profile, so put the identity settings in `~/.config/second-brain/env` (see [Configuration](#configuration)).
 
 In any Claude Code session, ask "what do we know about X" and the agent calls `recall`. The `mail`, `meetings`, `chat`, and `decks` marketplace plugins consume these tools automatically.
 
@@ -423,15 +418,15 @@ Before and after changing how text is tokenised (stemming, prefix matching), run
 `ruff` is **not** in the `dev` extra, so the install above does not provide it. CI pins an exact version because an unpinned ruff drifts and breaks the format check:
 
 ```bash
-uvx ruff@0.15.13 check .
-uvx ruff@0.15.13 format --check .
+uvx ruff@0.16.8 check .
+uvx ruff@0.16.8 format --check .
 ```
 
-Pre-commit hooks are wired via `.pre-commit-config.yaml` (`ruff`, `mypy`, `gitleaks`, `yamllint` on workflows, `markdownlint`, plus a `pii-gauntlet` gate that blocks personal data from entering tracked files). The pre-commit `ruff` rev and the CI pin are set independently, so check both when a lint result differs between the two.
+Pre-commit hooks are wired via `.pre-commit-config.yaml` (`ruff`, `mypy`, `gitleaks`, `yamllint` on workflows, `markdownlint`, plus a `pii-gauntlet` gate that blocks personal data from entering tracked files). Keep the pre-commit `ruff` rev and the CI pin in lockstep (both 0.16.8 today): ruff's formatter changes between versions, and a mismatch passes locally and fails on the runner.
 
 ### CI
 
-- `.github/workflows/ci.yml`, on every push and PR to `master`, four jobs: `lint` (`ruff check` and `ruff format --check`), `test` (`uv sync --frozen --extra dev`, then `pytest` with coverage over `src` and `scripts`), `pii-gauntlet`, and `wrappers` (parses every script in `scripts/wrappers/` with the interpreter named in its shebang).
+- `.github/workflows/ci.yml`, on every push and PR to `master`, five jobs: `lint` (`ruff check` and `ruff format --check`), `test` (`uv sync --frozen --no-build --extra dev`, then `pytest` with coverage over `src` and `scripts`), `types` (`mypy` over `src/` and `scripts/`, pinned), `pii-gauntlet`, and `wrappers` (parses every script in `scripts/wrappers/` with the interpreter named in its shebang).
 - `.github/workflows/sonarcloud.yml`: SonarCloud coverage upload (skipped on private repos by design; runs only when `SONAR_TOKEN` is present and the repo is public).
 - `.github/workflows/dependabot-auto-merge.yml`: auto-merge for green Dependabot PRs.
 

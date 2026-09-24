@@ -2,8 +2,8 @@
 
 Settings are loaded from environment variables. Identity and tenant settings
 (BRAIN_* and SHAREPOINT_HOST) can also live in a per-host file, read below, so
-that they reach entry points that start with an empty environment. Nothing
-reads a .env file.
+that they reach entry points that start without a login shell. Nothing reads a
+.env file.
 """
 
 import os
@@ -37,9 +37,10 @@ def _config_value(raw: str) -> str:
 def load_config_file(path: Path, environ: MutableMapping[str, str] = os.environ) -> None:
     """Apply KEY=VALUE lines from ``path`` to ``environ``; the environment wins.
 
-    Claude Code starts the MCP server with an empty environment and systemd
-    starts the timers with a fixed one, so a setting exported in a shell profile
-    reaches neither. Before this existed, the producer ran with SHAREPOINT_HOST
+    Claude Code starts the MCP server with the environment claude was launched
+    with, which from a GUI or an IDE holds no shell profile, and systemd starts
+    the timers with a fixed one, so a setting exported in a shell profile may
+    reach neither. Before this existed, the producer ran with SHAREPOINT_HOST
     at its placeholder and every Mac MCP server ran without
     BRAIN_USER_EMAIL_PATTERN. Accepts ``export``, quotes and # comments. Runs at
     import of every entry point, so an unreadable file is reported and ignored,

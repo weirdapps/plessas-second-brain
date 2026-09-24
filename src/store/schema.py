@@ -5,6 +5,7 @@ Includes FTS5 full-text search indexes for emails and key facts.
 """
 
 import hashlib
+import json
 import re
 import sqlite3
 from pathlib import Path
@@ -477,6 +478,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_index_email_subjects(conn)
     if current < 23:
         migrate_add_email_html(conn)
+    if current < 24:
+        migrate_teams_call_records_are_system(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -634,6 +637,76 @@ def migrate_add_calendar_change_key(conn: sqlite3.Connection) -> None:
             if "duplicate column name" not in str(e):
                 raise
         conn.commit()
+
+
+def migrate_teams_call_records_are_system(conn: sqlite3.Connection) -> None:
+    """v24: Teams call records and recording or transcript notices are system messages.
+
+    Ingest took them for messages until this version (the types are in
+    teams_export.SYSTEM_MESSAGE_TYPES): 1,261 rows on 2026-09-24, all XML the
+    service writes. They counted as messages a person sent, and their markup went
+    into the threads the model reads. Every thread that held one is counted again
+    as the thread builder counts (teams_threads.bound_threads): its messages, time
+    and names without them, since the model is shown those. It goes back to
+    extraction when what is left clears extraction's floor (teams_pipeline's
+    MIN_SUBSTANTIVE_*, as they stood: a message over 20 characters, 100 in all),
+    since its summary read the calls' XML. One below the floor, or of calls alone,
+    keeps its summary, which describes them; a thread of calls alone keeps its
+    counts too, since its bounds cannot be empty. The threads are chosen from the
+    rows not yet marked, so a second run chooses none.
+    """
+    has_table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='teams_messages'"
+    ).fetchone()
+    if not has_table:
+        return
+
+    # A prefix, case and all, as ingest's startswith reads it.
+    calls = "(message_type GLOB 'Event/Call*' OR message_type GLOB 'RichText/Media_Call*')"
+    held = [
+        row[0]
+        for row in conn.execute(
+            f"SELECT DISTINCT thread_id FROM teams_messages "
+            f"WHERE thread_id IS NOT NULL AND is_system = 0 AND {calls}"
+        )
+    ]
+    conn.execute(f"UPDATE teams_messages SET is_system = 1 WHERE is_system = 0 AND {calls}")
+    for thread_id in held:
+        count, started, ended = conn.execute(
+            "SELECT COUNT(*), MIN(composed_at), MAX(composed_at) FROM teams_messages "
+            "WHERE thread_id = ? AND is_system = 0",
+            (thread_id,),
+        ).fetchone()
+        if not count:
+            continue
+        names = [
+            row[0]
+            for row in conn.execute(
+                "SELECT DISTINCT sender_display_name FROM teams_messages "
+                "WHERE thread_id = ? AND is_system = 0 AND sender_display_name IS NOT NULL",
+                (thread_id,),
+            )
+        ]
+        substantive, chars = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(length(content_text)), 0) FROM teams_messages "
+            "WHERE thread_id = ? AND is_system = 0 AND length(content_text) > 20",
+            (thread_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE teams_threads SET message_count = ?, started_at = ?, ended_at = ?, "
+            "participant_display_names = ?, extraction_status = CASE "
+            "WHEN ? AND extraction_status = 'extracted' THEN 'pending' "
+            "ELSE extraction_status END WHERE id = ?",
+            (
+                count,
+                started,
+                ended,
+                json.dumps(names),
+                substantive >= 1 and chars >= 100,
+                thread_id,
+            ),
+        )
+    conn.commit()
 
 
 def migrate_add_email_html(conn: sqlite3.Connection) -> None:

@@ -104,8 +104,15 @@ def _strip_html(html_str: str | None) -> str:
     return text.strip()
 
 
+# Written by the service, not said by anyone: membership and topic changes, call
+# records (who was on a call, for how long) and recording or transcript notices.
+# The last three are XML, which as messages went into the threads the model reads,
+# the vectors, and the caller's message counts.
+SYSTEM_MESSAGE_TYPES = ("ThreadActivity/", "Event/Call", "RichText/Media_Call")
+
+
 def _is_system_message(msg_type: str | None) -> bool:
-    return msg_type is not None and msg_type.startswith("ThreadActivity/")
+    return msg_type is not None and msg_type.startswith(SYSTEM_MESSAGE_TYPES)
 
 
 def _extract_mri(from_url: str | None) -> str | None:

@@ -237,3 +237,120 @@ def test_vacuum_removes_bytes_freed_before_the_scrub(scrub, tmp_path, monkeypatc
     for secret in (GOOGLE, ANTHROPIC):
         assert secret.encode() not in data
         assert secret.lower().encode() not in data
+
+
+def test_a_key_in_kept_html_is_found_and_redacted(scrub, tmp_path, capsys, monkeypatch):
+    """email_html holds compressed HTML (schema v23), so neither a scan of text
+    columns nor a grep of the file can see a key in it: the scrub decompresses."""
+    from src.store.email_html import pack, unpack
+
+    other = "sk-ant-api03-" + "Z9y8X7w6V5" * 9  # a second shape, found nowhere else
+    path = _db(tmp_path, scrub, monkeypatch)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO email_html (email_id, html) VALUES (2, ?)",
+        (pack(f"<html><body><p>{other}</p></body></html>"),),
+    )
+    conn.commit()
+    conn.close()
+    assert other.encode() not in _file_bytes(path)
+
+    assert scrub.main([]) == 1
+    assert "email_html.html: 1 row" in capsys.readouterr().out
+
+    assert scrub.main(["--apply"]) == 0
+    conn = sqlite3.connect(path)
+    (blob,) = conn.execute("SELECT html FROM email_html WHERE email_id = 2").fetchone()
+    conn.close()
+    assert unpack(blob) == "<html><body><p>[REDACTED:anthropic-key]</p></body></html>"
+    assert scrub.main([]) == 0
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [b"not zlib at all", __import__("zlib").compress(b"\xff\xfe not utf-8"), "a text value"],
+)
+def test_an_unreadable_kept_html_is_counted_not_fatal(scrub, tmp_path, capsys, monkeypatch, bad):
+    """One damaged email_html row stopped the scrub of every table, with the exit
+    code that means 'found credentials'. It is counted, the rest is scrubbed, and
+    the run exits 2: it could not check everything."""
+    path = _db(tmp_path, scrub, monkeypatch)
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO email_html (email_id, html) VALUES (2, ?)", (bad,))
+    conn.commit()
+    conn.close()
+
+    assert scrub.main([]) == 2
+    out = capsys.readouterr()
+    assert "emails.content: 1 row" in out.out
+    assert "1 email_html row could not be read" in out.err
+    assert "(rowid 2)" in out.err  # which one, to fix or delete it (an id is no secret)
+
+    assert scrub.main(["--apply"]) == 2
+    conn = sqlite3.connect(path)
+    (m1,) = conn.execute("SELECT content FROM emails WHERE message_id = 'm1'").fetchone()
+    conn.close()
+    assert "[REDACTED:google-key]" in m1
+
+
+def test_unreadable_is_not_reported_as_clean(scrub, tmp_path, capsys, monkeypatch):
+    """With nothing found but a row unread, the run cannot say the store is clean."""
+    path = _db(tmp_path, scrub, monkeypatch)
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE emails SET content = 'clean now' WHERE message_id = 'm1'")
+    conn.execute("DELETE FROM conversation_turns")
+    conn.execute("INSERT INTO email_html (email_id, html) VALUES (2, ?)", (b"not zlib",))
+    conn.commit()
+    conn.close()
+
+    assert scrub.main([]) == 2
+    assert "No credential-shaped values found." not in capsys.readouterr().out
+    assert scrub.main(["--apply"]) == 2
+    assert "No credential-shaped values found." not in capsys.readouterr().out
+
+
+def test_a_blocked_checkpoint_is_reported_beside_an_unreadable_row(
+    scrub, tmp_path, capsys, monkeypatch
+):
+    """Exit 2 for the unread row must not hide that the checkpoint was blocked."""
+    path = _db(tmp_path, scrub, monkeypatch)
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO email_html (email_id, html) VALUES (2, ?)", (b"not zlib",))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(scrub, "_checkpoint", lambda conn: False)
+
+    assert scrub.main(["--apply"]) == 2
+    err = capsys.readouterr().err
+    assert "could not be read" in err
+    assert "checkpoint was blocked" in err
+
+
+def test_more_than_twenty_unreadable_rows_are_listed_twenty(scrub, tmp_path, capsys, monkeypatch):
+    path = _db(tmp_path, scrub, monkeypatch)
+    conn = sqlite3.connect(path)
+    for i in range(1, 22):
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received, content) VALUES (?, ?, ?, 'x')",
+            (100 + i, f"u{i}", "2026-03-03T10:00:00"),
+        )
+        conn.execute("INSERT INTO email_html (email_id, html) VALUES (?, ?)", (100 + i, b"bad"))
+    conn.commit()
+    conn.close()
+
+    assert scrub.main([]) == 2
+    err = capsys.readouterr().err
+    assert "21 email_html rows could not be read" in err
+    assert "120 ...)" in err and "121" not in err
+
+
+def test_what_remains_is_listed_where_its_header_is(scrub, tmp_path, capsys, monkeypatch):
+    """The header went to stderr and its counts to stdout: a log that keeps one
+    stream had half the message."""
+    _db(tmp_path, scrub, monkeypatch)
+    monkeypatch.setattr(scrub, "_apply", lambda conn, found: 0)  # redacts nothing
+
+    assert scrub.main(["--apply"]) == 1
+    err = capsys.readouterr().err
+    assert "Credential-shaped values remain:" in err
+    assert "emails.content: 1 row" in err

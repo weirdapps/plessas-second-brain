@@ -8,6 +8,7 @@ import secrets
 from typing import Any
 
 from src.config import USER_NAME, USER_ROLE
+from src.extract.html_text import html_to_text, looks_like_html
 from src.extract.untrusted import fence
 
 # Cap on email body chars sent to the LLM. Long bodies (newsletters, deep reply
@@ -52,8 +53,12 @@ def build_extraction_prompt(email: dict[str, Any]) -> str:
     to_list = format_recipients(email.get("to_recipients", []))
     cc_list = format_recipients(email.get("cc_recipients", []))
 
-    # Cap the body so a long email can't push the response past max_tokens.
+    # Cap the body so a long email can't push the response past max_tokens. The
+    # cap is for the text a reader sees: Outlook sends HTML, and markup was most
+    # of what it cut.
     content = email.get("content", "") or ""
+    if looks_like_html(content):
+        content = html_to_text(content)
     if len(content) > MAX_CONTENT_CHARS:
         content = (
             content[:MAX_CONTENT_CHARS]

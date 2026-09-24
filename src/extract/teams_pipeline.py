@@ -271,40 +271,28 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
     incapable of triggering one itself. One unpoliced site reproduces in miniature the
     divergence this whole port exists to end.
 
-    ``_do_call`` re-fetches the client on every attempt, exactly as extract_one,
-    attachment_pipeline, image_vision and calendar_extractor do, so a successful reauth
-    (which calls reset_client_cache) is picked up by the retry rather than silently reusing
-    the dead credential.
+    It goes through claude_extract.complete, as every call site now does, which fetches
+    the client again on every attempt, so a successful reauth (which calls
+    reset_client_cache) is picked up by the retry rather than silently reusing the dead
+    credential.
 
     Returns the raw text response.
     """
     import os
 
-    from src.extract.claude_extract import (
-        _get_client_and_model,
-        _response_text,
-        call_with_policy,
-    )
-    from src.extract.vertex_fallback import create_with_refusal_fallback
+    from src.extract.claude_extract import _response_text, complete
 
     model = (
         os.environ.get("BRAIN_TEAMS_MODEL")
         or os.environ.get("VERTEX_MODEL_EXTRACT")
         or "claude-sonnet-4-6"
     )
-
-    def _do_call():
-        # Shared client — do not close it here (see claude_extract._get_client_and_model).
-        client, _ = _get_client_and_model()
-        return create_with_refusal_fallback(
-            client,
-            model=model,
-            max_tokens=2048,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-
-    resp = call_with_policy(_do_call, max_call_seconds=120.0)
+    resp = complete(
+        model=model,
+        max_tokens=2048,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
     # Same leading-ThinkingBlock hazard as every other call site. No teams_threads row
     # has hit it yet (extraction_error is NULL on all 6008), so this one is preventive:
     # the sixth site should not be the one left indexing position 0.

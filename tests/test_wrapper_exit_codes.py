@@ -8,7 +8,10 @@ over any failure. These run the real wrappers against a throwaway HOME whose
 venv python is a stub with a chosen exit code.
 """
 
+import os
+import signal
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -154,7 +157,7 @@ def test_a_failed_attachment_stage_is_named_on_stderr(tmp_path):
     assert "attachment registration FAILED (exit 4)" in result.stderr
 
 
-def _run_daily(home: Path) -> subprocess.CompletedProcess:
+def _run_daily(home: Path, **env: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["/bin/bash", str(_WRAPPERS / "sb-daily-sync.sh")],
         env={
@@ -162,6 +165,7 @@ def _run_daily(home: Path) -> subprocess.CompletedProcess:
             "PATH": "/usr/bin:/bin",
             "SHELL": "/bin/bash",
             "SB_DAILY_SYNC_LOCK": str(home / "daily-sync.lock"),
+            **env,
         },
         capture_output=True,
         text=True,
@@ -203,6 +207,188 @@ def test_a_failed_action_lifecycle_does_not_fail_the_daily_sync(tmp_path):
     assert "WARN: action lifecycle failed" in log
 
 
+@pytest.mark.parametrize(
+    ("variable", "engine"),
+    [
+        ("VERTEX_SDK_PROJECT", "claude"),
+        ("ANTHROPIC_VERTEX_PROJECT_ID", "claude"),
+        ("ANTHROPIC_API_KEY", "claude"),
+        (None, "gemini"),
+    ],
+)
+def test_daily_sync_extracts_with_claude_whenever_it_has_credentials(tmp_path, variable, engine):
+    """The wrapper looked for ANTHROPIC_VERTEX_PROJECT_ID and the API key only, so
+    a host that set just VERTEX_SDK_PROJECT, the name the extractor reads first,
+    was sent to Gemini."""
+    home = _daily_home(tmp_path, "exit 0\n")
+
+    _run_daily(home, **({variable: "x"} if variable else {}))
+
+    sync = next(c for c in _calls(home) if "src.cli sync" in c)
+    assert f"--engine {engine}" in sync
+
+
+@pytest.mark.parametrize(
+    ("variable", "runs"),
+    [("VERTEX_SDK_PROJECT", True), ("ANTHROPIC_VERTEX_PROJECT_ID", True), (None, False)],
+)
+def test_reverse_ingest_runs_with_either_vertex_project_name(tmp_path, variable, runs):
+    home = _daily_home(tmp_path, "exit 0\n")
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-reverse-ingest.sh")],
+        env={
+            "HOME": str(home),
+            "PATH": "/usr/bin:/bin",
+            "SHELL": "/bin/bash",
+            **({variable: "x"} if variable else {}),
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0
+    ran = (home / "calls.log").exists() and any("reverse-ingest" in c for c in _calls(home))
+    assert ran is runs
+
+
+@pytest.mark.parametrize(
+    ("variable", "runs"),
+    [("VERTEX_SDK_PROJECT", True), ("ANTHROPIC_VERTEX_PROJECT_ID", True), (None, False)],
+)
+def test_curate_runs_with_either_vertex_project_name_and_releases_its_lock(
+    tmp_path, variable, runs
+):
+    """Under exec the EXIT trap never ran, so every run left its lock behind."""
+    home = _daily_home(tmp_path, "exit 0\n")
+    lock = home / "curate-docs.lock"
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-curate-docs.sh")],
+        env={
+            "HOME": str(home),
+            "PATH": "/usr/bin:/bin",
+            "SHELL": "/bin/bash",
+            "SB_CURATE_DOCS_LOCK": str(lock),
+            **({variable: "x"} if variable else {}),
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0
+    ran = (home / "calls.log").exists() and any("curate_documents_daily" in c for c in _calls(home))
+    assert ran is runs
+    assert not lock.exists()
+
+
+def _bash_major() -> int:
+    out = subprocess.run(
+        ["/bin/bash", "-c", "echo ${BASH_VERSINFO[0]}"], capture_output=True, text=True
+    )
+    return int(out.stdout.strip() or 0)
+
+
+def _curate_env(home: Path) -> dict:
+    return {
+        "HOME": str(home),
+        "PATH": "/usr/bin:/bin",
+        "SHELL": "/bin/bash",
+        "VERTEX_SDK_PROJECT": "x",
+        "SB_CURATE_DOCS_LOCK": str(home / "curate-docs.lock"),
+    }
+
+
+def test_curate_passes_the_jobs_exit_code_through(tmp_path):
+    """Under exec the job's status was the unit's; after it, `exit $?` must keep it."""
+    home = _daily_home(tmp_path, "exit 3\n")
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-curate-docs.sh")],
+        env=_curate_env(home),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 3
+    assert not (home / "curate-docs.lock").exists()
+
+
+def test_a_skipped_curate_run_still_takes_and_releases_the_lock(tmp_path):
+    """A stale lock is reclaimed before the skip, so the skip ran under the lock."""
+    home = _daily_home(tmp_path, "exit 0\n")
+    (home / ".second-brain").mkdir()
+    (home / ".second-brain" / "needs_gcloud_reauth").write_text("")
+    lock = home / "curate-docs.lock"
+    lock.mkdir()
+    (lock / "pid").write_text("999999")
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-curate-docs.sh")],
+        env=_curate_env(home),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0
+    assert not (home / "calls.log").exists()
+    assert not lock.exists()
+
+
+def test_a_stopped_curate_run_releases_its_lock_and_dies_of_the_signal(tmp_path):
+    """systemd reads a death by SIGTERM as a clean stop, but not an exit status of
+    143, which is what the wrapper returned once it stopped exec'ing the job."""
+    started = tmp_path / "started"
+    home = _home_with_python(tmp_path, f"touch {started}\nsleep 30\n")
+    lock = home / "curate-docs.lock"
+    proc = subprocess.Popen(
+        ["/bin/bash", str(_WRAPPERS / "sb-curate-docs.sh")],
+        env=_curate_env(home),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        give_up = time.monotonic() + 20
+        while not started.exists():
+            assert proc.poll() is None, "the wrapper ended before the job started"
+            assert time.monotonic() < give_up, "the job never started"
+            time.sleep(0.05)
+        os.killpg(proc.pid, signal.SIGTERM)
+        returncode = proc.wait(timeout=20)
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+
+    # bash 3.2 (macOS /bin/bash) sometimes reaches `exit $?` before running a
+    # pending TERM trap and exits 143; production and CI run bash 5.
+    if _bash_major() >= 4:
+        assert returncode == -signal.SIGTERM
+    else:
+        assert returncode in (-signal.SIGTERM, 143)
+    assert not lock.exists()
+
+
+def test_a_relative_curate_lock_override_is_refused(tmp_path):
+    home = _daily_home(tmp_path, "exit 0\n")
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-curate-docs.sh")],
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin", "SB_CURATE_DOCS_LOCK": "rel.lock"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=tmp_path,
+    )
+
+    assert result.returncode == 64
+    assert not (tmp_path / "rel.lock").exists()
+
+
 def test_a_failed_daily_sync_keeps_its_code_and_skips_the_lifecycle(tmp_path):
     home = _daily_home(tmp_path, 'case "$*" in *"src.cli sync"*) exit 3;; esac\nexit 0\n')
 
@@ -235,6 +421,7 @@ def test_a_relative_daily_sync_lock_override_is_refused(tmp_path):
     [
         ("sb-daily-sync.sh", "SB_DAILY_SYNC_LOCK"),
         ("sb-conversation-sync.sh", "SB_CONVERSATION_SYNC_LOCK"),
+        ("sb-curate-docs.sh", "SB_CURATE_DOCS_LOCK"),
     ],
 )
 def test_a_lock_path_that_is_a_file_is_never_removed(tmp_path, wrapper, variable):
@@ -261,6 +448,7 @@ def test_a_lock_path_that_is_a_file_is_never_removed(tmp_path, wrapper, variable
     [
         ("sb-daily-sync.sh", "SB_DAILY_SYNC_LOCK"),
         ("sb-conversation-sync.sh", "SB_CONVERSATION_SYNC_LOCK"),
+        ("sb-curate-docs.sh", "SB_CURATE_DOCS_LOCK"),
     ],
 )
 def test_a_stale_lock_that_cannot_be_removed_fails_the_run(tmp_path, wrapper, variable):

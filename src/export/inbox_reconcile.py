@@ -24,6 +24,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from src.config import DEFAULT_DB
 from src.store.schema import get_connection
 
 logger = logging.getLogger(__name__)
@@ -157,7 +158,7 @@ def main() -> int:
     parser.add_argument(
         "--db",
         type=Path,
-        default=Path(__file__).parent.parent.parent / "data" / "brain.db",
+        default=DEFAULT_DB,
     )
     parser.add_argument(
         "--target-mailbox",

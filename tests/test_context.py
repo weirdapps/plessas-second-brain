@@ -405,3 +405,33 @@ class TestGetConversationContext:
         assert result["participants"] == []
         assert result["decisions"] == []
         assert result["action_items"] == []
+
+
+def test_the_conversation_context_thread_is_the_one_email_thread_knows():
+    """It selected every email sharing the raw conversation_id: a whole News day,
+    or every blank-subject email with no references, as one thread."""
+    from src.store.schema import create_database, subject_to_conversation_id
+
+    conn = create_database(":memory:")
+    blank = subject_to_conversation_id("")
+    rows = [
+        (1, "", "Inbox", blank),
+        (2, "", "Inbox", blank),
+        (3, "ECB holds", "News", "news:digest:2026-09-01"),
+        (4, "ECB warns", "News", "news:digest:2026-09-01"),
+        (5, "Plan", "Inbox", "T"),
+        (6, "RE: Plan", "Inbox", "T"),
+    ]
+    conn.executemany(
+        "INSERT INTO emails (id, message_id, date_received, subject, mailbox_name, "
+        "conversation_id) VALUES (?, ?, '2026-09-01T00:00:00Z', ?, ?, ?)",
+        [(i, i, subject, mailbox, thread) for i, subject, mailbox, thread in rows],
+    )
+    conn.commit()
+
+    def thread(email_id):
+        return [e["id"] for e in get_conversation_context(conn, email_id)["thread"]]
+
+    assert thread(1) == [1]
+    assert thread(3) == [3]
+    assert thread(5) == [5, 6]

@@ -1,8 +1,8 @@
 """Tests for registering attachments outlook-cli has already downloaded.
 
-The macOS path (`export_sync_attachments`) drives Mail.app over AppleScript and
-is correctly skipped on Linux (src/cli.py: `skip_export = ... or sys.platform
-!= "darwin"`). But it is also the ONLY writer of `attachments` rows for real
+The Apple Mail exporter's `export_sync_attachments` (since removed) drove
+Mail.app over AppleScript and was skipped on Linux. But it was also the ONLY
+writer of `attachments` rows for real
 mail, and nothing replaced it when ingestion moved to the VPS on 2026-06-30.
 
 outlook-cli kept downloading the binaries — 7,387 files across 2,944 message

@@ -109,8 +109,6 @@ def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
     # internet_message_id (a cross-source duplicate captured via another
     # export path under a different message_id — which load_single_email
     # correctly declines to re-insert, but whose batch must still drain).
-    # The seen-ids dedup cache (apple_mail.load_seen_ids) is unaffected
-    # because it's a separate cache file primed before deletion.
     db_msgids = {str(row[0]) for row in conn.execute("SELECT message_id FROM emails")}
     db_imids = {
         str(row[0])

@@ -1,8 +1,9 @@
 #!/bin/bash
 # Midday second-brain catchup — launchd surface for com.plessas.second-brain.noon-catchup.
 #
-# Lightweight counterpart to sb-daily-sync.sh: skips the slow AppleScript Mail.app
-# export step and processes whatever the hourly outlook-cli sync has already staged.
+# The same sync as sb-daily-sync.sh, at midday: it extracts and loads whatever the
+# hourly outlook-cli sync has staged. (--skip-export is kept for the schedules and
+# ignored: sync stages no mail itself.)
 # Closes the staleness window from 24h to ~6h between morning and noon runs.
 
 set -uo pipefail

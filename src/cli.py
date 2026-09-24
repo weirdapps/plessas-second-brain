@@ -290,37 +290,6 @@ def format_action_result(action: dict) -> str:
     return "\n".join(lines)
 
 
-def cmd_export(args):
-    """Execute email export command."""
-    from src.export.apple_mail import export_emails
-
-    print("Starting email export from Apple Mail Exchange mailboxes...")
-    if args.limit:
-        print(f"Limiting to {args.limit} emails per mailbox")
-    else:
-        print("Export will resume from last checkpoint (Archive) and scan other mailboxes")
-    print()
-
-    export_emails(limit=args.limit or 0)
-
-    print()
-    print("Export complete.")
-
-
-def cmd_export_attachments(args):
-    """Export attachments from Apple Mail."""
-    from src.export.attachments import export_attachments
-
-    print("Starting attachment export from Apple Mail...")
-    if args.limit:
-        print(f"Limiting to {args.limit} messages")
-    if args.dry_run:
-        print("DRY RUN — no files will be saved")
-    print()
-
-    export_attachments(limit=args.limit or 0, dry_run=args.dry_run)
-
-
 def cmd_process_attachments(args):
     """Extract text and structured data from attachments."""
     from src.extract.attachment_pipeline import run_phase1, run_phase2
@@ -1186,7 +1155,7 @@ def cmd_prep(args):
 
 
 def cmd_sync(args):
-    """Incremental sync: export new emails, extract, load."""
+    """Incremental sync over staged mail: extract, load, and the steps after."""
     from src.store.schema import get_connection, migrate_add_sync_metadata
 
     db_path = str(args.db)
@@ -1213,28 +1182,19 @@ def cmd_sync(args):
         if last_sync:
             print(f"No sync history. Using latest email date: {last_sync}")
         else:
-            print("Empty database. Run full export + load first.")
+            print(
+                "Empty database. Stage mail, then run `python -m src.extract.local` "
+                "and `python -m src.cli load` first."
+            )
             conn.close()
             return
 
     conn.close()
 
-    # Step 1: Export new emails. Skipped in catch-up mode (outlook-cli stages
-    # hourly) AND always on non-macOS: Apple Mail / osascript don't exist on
-    # Linux, so the VPS would die here — it ingests via outlook-cli, never Apple
-    # Mail. Folding the platform check in keeps `sync` working on the VPS without
-    # every caller having to pass --skip-export.
-    skip_export = getattr(args, "skip_export", False) or sys.platform != "darwin"
-    if skip_export:
-        if getattr(args, "skip_export", False):
-            print("\nStep 1: SKIPPED — using staged batches from hourly outlook-cli sync.")
-        else:
-            print("\nStep 1: SKIPPED — non-macOS host; mail is staged via outlook-cli.")
-    else:
-        print(f"\nStep 1: Exporting new emails (all mailboxes, after {last_sync})...")
-        from src.export.apple_mail import export_emails
-
-        export_emails(limit=args.limit or 0, since_date=last_sync)
+    # Step 1: sync stages no mail. `python -m src.export.outlook_export` does,
+    # through outlook-cli, on every host. On a Mac this step used to run the
+    # Apple Mail exporter, which force-quit Mail.app; it was removed.
+    print("\nStep 1: mail is staged by outlook_export (outlook-cli); using the staged batches.")
 
     # Step 2: Extract (local mode)
     engine = getattr(args, "engine", None) or EXTRACT_ENGINE
@@ -1258,19 +1218,9 @@ def cmd_sync(args):
     count = load_extractions(db_path, str(extracted_dir), str(staging_dir))
     print(f"Loaded {count} new emails")
 
-    # Step 3b: Export attachments from Mail.app for new emails
-    # (skipped in catch-up — outlook-cli already pulls attachments inline with the hourly sync)
+    # Step 3b: record the attachments outlook-cli downloaded with the mail.
     new_attachment_ids = []
-    if count > 0 and not skip_export:
-        print("\nStep 3b: Exporting attachments from Mail.app (Inbox + Sent)...")
-        from src.export.attachments import export_sync_attachments
-
-        att_result = export_sync_attachments(db_path)
-        new_attachment_ids = att_result.get("attachment_ids", [])
-        print(
-            f"Attachments: {att_result['saved']} saved from {att_result['scanned']} messages scanned"
-        )
-    elif count > 0:
+    if count > 0:
         # outlook-cli fetched the BINARIES hourly; it never recorded them. Every
         # downstream stage reads the attachments table, not the disk, so without
         # this the files are invisible — 7,387 of them accumulated unseen between
@@ -1331,7 +1281,7 @@ def cmd_sync(args):
     conn_mig.close()
 
     print("\nStep 6: Processing new attachment content...")
-    # Scope to newly exported attachments only — avoids competing with background backfill
+    # Scope to newly registered attachments only — avoids competing with background backfill
     scope_ids = new_attachment_ids or None
     # Phase 1 runs UNSCOPED so the deadline can converge. Scoped to this run's
     # own registrations, anything deferred for time would never be offered
@@ -2334,23 +2284,6 @@ def main():
     # Subcommands
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    # Export command
-    parser_export = subparsers.add_parser("export", help="Export emails from Apple Mail")
-    parser_export.add_argument(
-        "--limit", type=int, help="Limit number of emails to export (default: all)"
-    )
-    parser_export.set_defaults(func=cmd_export)
-
-    # Export attachments command
-    parser_export_att = subparsers.add_parser(
-        "export-attachments", help="Export attachments from Apple Mail"
-    )
-    parser_export_att.add_argument("--limit", type=int, help="Max messages to scan")
-    parser_export_att.add_argument(
-        "--dry-run", action="store_true", help="Show what would be saved"
-    )
-    parser_export_att.set_defaults(func=cmd_export_attachments)
-
     # Export conversations command
     parser_export_conv = subparsers.add_parser(
         "export-conversations", help="Export Claude Code conversation history"
@@ -2592,7 +2525,9 @@ def main():
     parser_prep.set_defaults(func=cmd_prep)
 
     # Sync command (incremental)
-    parser_sync = subparsers.add_parser("sync", help="Incremental sync (export + extract + load)")
+    parser_sync = subparsers.add_parser(
+        "sync", help="Incremental sync over staged mail (extract + load + the steps after)"
+    )
     parser_sync.add_argument("--limit", type=int, help="Max emails to process")
     parser_sync.add_argument(
         "--engine",
@@ -2609,8 +2544,8 @@ def main():
     parser_sync.add_argument(
         "--skip-export",
         action="store_true",
-        help="Skip Apple Mail export (use already-staged batches from outlook-cli). "
-        "Lets a midday catch-up run without restarting Mail.app.",
+        help="Accepted for the existing schedules and ignored: sync never exports "
+        "mail, it loads what outlook_export staged.",
     )
     parser_sync.set_defaults(func=cmd_sync)
 

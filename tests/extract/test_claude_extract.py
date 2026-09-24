@@ -41,12 +41,132 @@ def test_get_client_and_model_reuses_same_client(monkeypatch):
     """Repeated calls return the SAME client instance (built once, reused)."""
     # Direct-API branch avoids Vertex/gcloud/network entirely.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
+    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
 
     client1, model1 = claude_extract._get_client_and_model()
     client2, model2 = claude_extract._get_client_and_model()
 
     assert client1 is client2
     assert model1 == model2
+
+
+class _FakeSDKClient:
+    """Stands in for an SDK client class, recording how it was built."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+def _fake_sdk(monkeypatch):
+    vertex = type("Vertex", (_FakeSDKClient,), {})
+    direct = type("Direct", (_FakeSDKClient,), {})
+    monkeypatch.setattr("anthropic.AnthropicVertex", vertex)
+    monkeypatch.setattr("anthropic.Anthropic", direct)
+    return vertex, direct
+
+
+def test_a_vertex_project_wins_over_an_api_key(monkeypatch):
+    """A key left in a shell profile sent work mail to the direct API, not Vertex."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+    monkeypatch.setenv("VERTEX_SDK_REGION", "eu")
+    vertex, _ = _fake_sdk(monkeypatch)
+
+    client, _ = claude_extract._build_client_and_model()
+
+    assert isinstance(client, vertex)
+    assert client.kwargs["region"] == "eu"
+
+
+def test_the_api_key_is_used_only_without_a_vertex_project(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
+    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    _, direct = _fake_sdk(monkeypatch)
+
+    client, _ = claude_extract._build_client_and_model()
+
+    assert isinstance(client, direct)
+
+
+@pytest.mark.parametrize("vertex", [True, False])
+def test_the_backend_in_use_is_logged(monkeypatch, capsys, vertex):
+    """The sync logs could not tell which backend had run. Names no credential."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    if vertex:
+        monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+        monkeypatch.setenv("VERTEX_SDK_REGION", "eu")
+    else:
+        monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
+        monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    _fake_sdk(monkeypatch)
+    monkeypatch.setattr(claude_extract, "CLAUDE_MODEL_BASE", "claude-test-model")
+
+    claude_extract._build_client_and_model()
+
+    err = capsys.readouterr().err
+    assert "claude-test-model" in err
+    if vertex:
+        assert "Vertex AI, region eu" in err
+    else:
+        assert "direct Anthropic API" in err
+    assert "sk-ant" not in err
+    assert "test-project" not in err
+
+
+def test_complete_retries_a_refusal_on_the_fallback_tier(monkeypatch):
+    """Attachments, images and calendar called the SDK themselves, so a refusal
+    failed the item where extract_one retried it on the fallback tier."""
+    monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+    refusal = types.SimpleNamespace(content=[], stop_reason="refusal")
+    primary = MagicMock()
+    primary.messages.create.return_value = refusal
+    fallback = MagicMock()
+    fallback.messages.create.return_value = _fake_response("recovered")
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (primary, "m"))
+    monkeypatch.setattr("anthropic.AnthropicVertex", lambda **kwargs: fallback)
+
+    response = claude_extract.complete(max_tokens=10, messages=[{"role": "user", "content": "x"}])
+
+    assert claude_extract._response_text(response) == "recovered"
+
+
+def test_complete_sends_an_explicit_model():
+    """Teams names its own model; everything else takes the configured one."""
+    client = MagicMock()
+    client.messages.create.return_value = _fake_response()
+
+    with patch.object(claude_extract, "_get_client_and_model", lambda: (client, "configured")):
+        claude_extract.complete(max_tokens=10, messages=[])
+        claude_extract.complete(model="teams-model", max_tokens=10, messages=[])
+
+    models = [call.kwargs["model"] for call in client.messages.create.call_args_list]
+    assert models == ["configured", "teams-model"]
+
+
+def test_every_sdk_request_goes_through_complete():
+    """Seven call sites each built the same request, and one bug was fixed four times.
+    Only complete() may run the policy or the refusal fallback, and only the
+    fallback module may call the SDK."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    sources = {
+        str(path.relative_to(root)): path.read_text(encoding="utf-8")
+        for tree in ("src", "scripts")
+        for path in (root / tree).rglob("*.py")
+    }
+
+    def files_calling(name):
+        return sorted(path for path, text in sources.items() if f"{name}(" in text)
+
+    assert files_calling("messages.create") == ["src/extract/vertex_fallback.py"]
+    assert files_calling("create_with_refusal_fallback") == [
+        "src/extract/claude_extract.py",
+        "src/extract/vertex_fallback.py",
+    ]
+    assert files_calling("call_with_policy") == ["src/extract/claude_extract.py"]
 
 
 def test_extract_one_does_not_close_shared_client(monkeypatch):

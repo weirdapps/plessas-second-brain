@@ -73,9 +73,9 @@ def test_one_bad_event_is_recovered_rather_than_dropped(monkeypatch):
             )()
 
     fake = type("Client", (), {"messages": FakeMessages()})()
-    # Patch _get_client_and_model at calendar_extractor's module level (it is a
-    # module-level import there), so _do_call picks up the fake client on each attempt.
-    monkeypatch.setattr(calendar_extractor, "_get_client_and_model", lambda: (fake, "m"))
+    # extract_event sends through claude_extract.complete, which looks the client up
+    # there on each attempt.
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (fake, "m"))
     # Pin the platform so decide() uses the macOS budget (REAUTH_RETRY, not UNRECOVERABLE_AUTH).
     monkeypatch.setattr(claude_extract, "running_on_linux", lambda: False)
     with patch.object(claude_extract, "reauth", return_value=ReauthResult.SUCCEEDED):

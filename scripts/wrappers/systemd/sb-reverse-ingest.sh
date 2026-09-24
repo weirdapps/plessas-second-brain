@@ -29,8 +29,9 @@ if [ -f "$HOME/.second-brain/needs_gcloud_reauth" ]; then
   exit 0
 fi
 
-if [ -z "${ANTHROPIC_VERTEX_PROJECT_ID:-}" ]; then
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: no ANTHROPIC_VERTEX_PROJECT_ID" >> "$LOG_FILE"
+# Either project name will do; claude_extract reads VERTEX_SDK_PROJECT first.
+if [ -z "${VERTEX_SDK_PROJECT:-}${ANTHROPIC_VERTEX_PROJECT_ID:-}" ]; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: no Vertex project (VERTEX_SDK_PROJECT or ANTHROPIC_VERTEX_PROJECT_ID)" >> "$LOG_FILE"
   exit 0
 fi
 

@@ -6,7 +6,8 @@ set -e
 
 cd "$(dirname "$0")/.."
 PYTHON=".venv/bin/python"
-LOG="data/backfill.log"
+D="${BRAIN_DATA_DIR:-data}"  # the data home, as src/config.py resolves it
+LOG="$D/backfill.log"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG"
@@ -25,28 +26,28 @@ while true; do
         grep -v "UserWarning\|warnings.warn\|_CLOUD_SDK" | tee -a "$LOG"
 
     # Check how many were actually extracted
-    extracted=$(grep "Extracted:" data/extract.log 2>/dev/null | tail -1 | grep -oE '[0-9]+' | head -1)
+    extracted=$(grep "Extracted:" "$D/extract.log" 2>/dev/null | tail -1 | grep -oE '[0-9]+' | head -1)
 
     # Load into database
     log "--- Batch $batch: Loading into database ---"
     $PYTHON -m src.cli load 2>&1 | tee -a "$LOG"
 
     # Check remaining
-    state_file="data/state/conv_extract_state.json"
+    state_file="$D/state/conv_extract_state.json"
     if [ -f "$state_file" ]; then
         total_processed=$(python3 -c "import json; print(json.load(open('$state_file')).get('total_extracted', 0))")
         log "Total conversations extracted so far: $total_processed"
     fi
 
     # Count staged vs extracted to see if there's more work
-    staged=$(find data/staging/conversations -name "conversation-batch-*.json" -exec python3 -c "
+    staged=$(find "$D/staging/conversations" -name "conversation-batch-*.json" -exec python3 -c "
 import json, sys
 total = 0
 for f in sys.argv[1:]:
     total += len(json.load(open(f)).get('conversations', []))
 print(total)
 " {} +)
-    extracted_count=$(ls data/extracted/conversations/*.json 2>/dev/null | wc -l | tr -d ' ')
+    extracted_count=$(ls "$D"/extracted/conversations/*.json 2>/dev/null | wc -l | tr -d ' ')
     remaining=$((staged - extracted_count))
 
     log "Staged: $staged, Extracted: $extracted_count, Remaining: $remaining"

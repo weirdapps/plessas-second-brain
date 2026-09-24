@@ -6,12 +6,13 @@ path. Forward-only: historical data stays in the existing DB untouched.
 """
 
 import logging
+import shutil
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 
-from src.config import ATTACHMENTS_DIR, DATA_ROOT
+from src.config import ATTACHMENTS_DIR, DATA_ROOT, REPO_ROOT
 from src.export.outlook_cli import (
     OutlookCliAuthRequired,
     OutlookCliError,
@@ -374,7 +375,20 @@ def run_hourly_sync(
 
 
 def _default_state_path() -> Path:
-    return DATA_ROOT / "state" / "outlook_sync.json"
+    """The Inbox cursor, under DATA_ROOT with the rest of the data.
+
+    It used to live in the repository's data/state whatever BRAIN_DATA_DIR said.
+    On a host that set it, a cursor still there is copied across once: without
+    it the run exits 7, and the bootstrap that answers that fetches only the
+    newest 100 messages. The old file stays where it was.
+    """
+    path = DATA_ROOT / "state" / "outlook_sync.json"
+    legacy = REPO_ROOT / "data" / "state" / "outlook_sync.json"
+    if legacy != path and legacy.exists() and not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(legacy, path)
+        logger.warning("Carried the sync cursor over from %s to %s", legacy, path)
+    return path
 
 
 def main() -> int:

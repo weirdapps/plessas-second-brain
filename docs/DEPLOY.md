@@ -87,6 +87,16 @@ the cron recipe below; systemd's `EnvironmentFile=` and launchd's
 the database lives, and the systemd one would create a directory literally
 named `~` in its working directory.
 
+**Upgrading a host that already set `BRAIN_DATA_DIR`.** The Outlook exporter
+used to keep its cursors, staged batches and attachments in `<repo>/data`
+whatever the variable said, and extraction never read those batches. The Inbox
+cursor is carried over on the next run; with the timers stopped, move the rest
+yourself: `<repo>/data/state/outlook_sync_*.json` (the other folders' cursors),
+`<repo>/data/staging/batch-*.json` and `<repo>/data/attachments/*` into the same
+places under `$BRAIN_DATA_DIR`. A run that exits 7 has no cursor: move it
+across, and do not answer with `--bootstrap`, which fetches only the newest 100
+messages.
+
 ## 4. Bootstrap and verify
 
 ```bash

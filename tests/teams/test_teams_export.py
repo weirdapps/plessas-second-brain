@@ -692,7 +692,7 @@ def test_v24_marks_the_stored_call_records_and_requeues_their_threads(tmp_path):
         "INSERT INTO teams_chats (id, teams_chat_id, chat_kind, first_seen_at) "
         "VALUES (1, '19:t', 'oneOnOne', '2026-09-01T00:00:00')"
     )
-    names = ("calls", "mixed", "plain", "pending", "skipped", "untyped", "short")
+    names = ("calls", "mixed", "plain", "pending", "skipped", "untyped", "short", "brief")
     for thread_id, name in enumerate(names, 1):
         conn.execute(
             "INSERT INTO teams_threads (id, chat_id, thread_kind, anchor_message_id, started_at, "
@@ -715,7 +715,9 @@ def test_v24_marks_the_stored_call_records_and_requeues_their_threads(tmp_path):
         (6, "Event/Call", "Alice", xml),
         (6, None, "Bob", said),  # a message with no type is still a message
         (7, "Event/Call", "Alice", xml),
-        (7, "Text", "Bob", "ok, thanks"),  # below extraction's floor
+        *[(7, "Text", "Bob", "ok, sounds good!!")] * 6,  # none over 20 characters
+        (8, "Event/Call", "Alice", xml),
+        (8, "Text", "Bob", "Thirty characters, near enough."),  # over 20, under 100 in all
     ]
     for i, (thread_id, kind, sender, content) in enumerate(messages):
         conn.execute(
@@ -730,7 +732,7 @@ def test_v24_marks_the_stored_call_records_and_requeues_their_threads(tmp_path):
     run_migrations(conn)
 
     marked = dict(conn.execute("SELECT teams_message_id, is_system FROM teams_messages"))
-    calls = {0, 1, 2, 6, 8, 10}
+    calls = {0, 1, 2, 6, 8, 10, 17}
     assert marked == {f"m{i}": int(i in calls) for i in range(len(messages))}
     rows = {
         r["summary"]: (
@@ -750,7 +752,8 @@ def test_v24_marks_the_stored_call_records_and_requeues_their_threads(tmp_path):
         "pending": ("pending", 2, *before),
         "skipped": ("skipped", 1, "2026-09-01T10:07", "2026-09-01T10:07", ["Bob"]),
         "untyped": ("pending", 1, "2026-09-01T10:09", "2026-09-01T10:09", ["Bob"]),
-        "short": ("extracted", 1, "2026-09-01T10:11", "2026-09-01T10:11", ["Bob"]),
+        "short": ("extracted", 6, "2026-09-01T10:11", "2026-09-01T10:16", ["Bob"]),
+        "brief": ("extracted", 1, "2026-09-01T10:18", "2026-09-01T10:18", ["Bob"]),
     }
     assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION
 

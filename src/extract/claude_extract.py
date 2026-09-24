@@ -270,7 +270,7 @@ def call_with_policy(fn, *, max_call_seconds: float, refusal_is_final: bool = Fa
     while True:
         last_exc = None
         last_response = None
-        began = time.time()
+        began = time.monotonic()  # a duration: an NTP step must not bend it
         try:
             last_response = fn()
         except Exception as exc:
@@ -280,11 +280,13 @@ def call_with_policy(fn, *, max_call_seconds: float, refusal_is_final: bool = Fa
             quick_retry
             and last_exc is not None
             and is_dropped_connection(last_exc)
-            and time.time() - began < QUICK_RETRY_WITHIN_S
+            and time.monotonic() - began < QUICK_RETRY_WITHIN_S
+            and time.time() + max_call_seconds <= deadline
         ):
             # The SDK used to retry a dropped connection at once; the policy's
-            # backoff (30 s) is for errors that last. Once per call, and only
-            # after a quick failure, so the attempt still fits its reservation.
+            # backoff (30 s) is for errors that last. Once per call, after a
+            # quick failure, and only when a whole call still fits before the
+            # deadline, the check decide() would have made.
             quick_retry = False
             continue
 

@@ -632,7 +632,7 @@ def test_a_slow_drop_is_not_retried_at_once(monkeypatch):
     """A connection that dropped after most of its 120 s has spent the attempt's
     reservation; retrying at once could overrun the deadline."""
     clock = iter(range(1_000_000, 2_000_000, 10))  # every reading ten seconds on
-    monkeypatch.setattr(claude_extract.time, "time", lambda: next(clock))
+    monkeypatch.setattr(claude_extract.time, "monotonic", lambda: next(clock))
     slept = []
     monkeypatch.setattr(claude_extract.time, "sleep", slept.append)
     fn = _calls(_sdk_error("APIConnectionError"), _fake_response("ok"))
@@ -641,3 +641,22 @@ def test_a_slow_drop_is_not_retried_at_once(monkeypatch):
 
     assert claude_extract._response_text(response) == "ok"
     assert len(slept) == 1
+
+
+def test_a_quick_retry_needs_a_whole_call_before_the_deadline(monkeypatch):
+    """The quick retry skips the policy's budget check, so it makes its own: with
+    less than a call left, the drop goes to the policy, which gives up."""
+    monkeypatch.setenv("PTS_LLM_DEADLINE", str(claude_extract.time.time() + 60))
+    calls = []
+
+    def fn():
+        calls.append(1)
+        if len(calls) == 1:
+            raise _sdk_error("APIConnectionError")
+        return _fake_response("ok")
+
+    monkeypatch.setattr(claude_extract.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(type(_sdk_error("APIConnectionError"))):
+        claude_extract.call_with_policy(fn, max_call_seconds=120.0)
+    assert len(calls) == 1

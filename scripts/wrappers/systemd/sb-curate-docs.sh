@@ -56,6 +56,7 @@ echo $$ > "$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT
 trap 'rm -rf "$LOCK_DIR"; trap - TERM; kill -TERM $$' TERM
 trap 'rm -rf "$LOCK_DIR"; trap - INT; kill -INT $$' INT
+trap 'rm -rf "$LOCK_DIR"; trap - HUP; kill -HUP $$' HUP
 
 # No needs_reauth gate here on purpose. Curation reads brain.db and calls
 # Vertex; curate_documents_daily.py names neither outlook-cli nor sharepoint-cli,

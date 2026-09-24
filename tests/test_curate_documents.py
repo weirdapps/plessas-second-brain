@@ -445,6 +445,27 @@ def test_summaries_a_short_run_leaves_are_done_by_the_next(curate, brain, monkey
     assert state["folder_summaries"]["Area/one"] == {"purpose": "p"}
 
 
+def test_a_pending_summary_for_a_folder_no_longer_managed_is_dropped(curate, brain, monkeypatch):
+    curate.STATE.parent.mkdir(parents=True, exist_ok=True)
+    curate.STATE.write_text(json.dumps({"pending_summaries": ["Gone/x"]}))
+    (curate.DOCS / "Gone" / "x").mkdir(parents=True)
+    (curate.DOCS / "Gone" / "x" / "README.md").write_text("readme")
+    summarised = []
+
+    def summary(folder, readme_text):
+        summarised.append(folder)
+        return {"purpose": "p"}
+
+    monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+    monkeypatch.setattr(curate, "install_llm_deadline_for_this_process", lambda: None)
+    monkeypatch.setattr(curate, "_get_client_and_model", lambda: (object(), "model"))
+    monkeypatch.setattr(curate, "summarize_folder", summary)
+    monkeypatch.setattr(sys, "argv", ["curate_documents_daily.py"])
+
+    assert curate.main() == 0
+    assert summarised == []
+
+
 def test_a_run_short_of_time_stops_classifying_and_still_saves(curate, brain, monkeypatch):
     """Under the retry policy one candidate can wait out a token push. With no
     check between candidates the unit was SIGTERMed before save_state, losing the

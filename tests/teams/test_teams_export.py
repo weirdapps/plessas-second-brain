@@ -629,3 +629,106 @@ def test_persisted_teams_message_has_credentials_redacted(db, fixture_loader):
     for column in ("content_text", "content_html", "raw_json"):
         assert secret not in row[column], column
         assert "[REDACTED:google-key]" in row[column], column
+
+
+def test_call_records_are_system_messages(db, fixture_loader):
+    """A call record (who was on a call, for how long) and a recording or
+    transcript notice are XML the service writes, not something anyone said:
+    1,261 of them on the replica, each putting markup into the threads the
+    model reads and into the vectors, and counted as the caller's messages."""
+    from src.export.teams_export import _persist_messages
+
+    chat_id = _seed_channel(db, fixture_loader)
+    kinds = [
+        "Event/Call",
+        "RichText/Media_CallRecording",
+        "RichText/Media_CallTranscript",
+        "ThreadActivity/AddMember",
+        "RichText/Html",
+        "Text",
+        "RichText/Media_Card",
+    ]
+    payload = {
+        "messages": [
+            {
+                "id": str(1717000010000 + i),
+                "composetime": "2026-09-01T10:00:00Z",
+                "messageType": kind,
+                "contentType": "html",
+                "content": "<partlist><part><name>A</name></part></partlist>",
+                "imDisplayName": "Tester",
+            }
+            for i, kind in enumerate(kinds)
+        ]
+    }
+
+    assert _persist_messages(db, chat_id, payload) == len(kinds)
+
+    assert dict(db.execute("SELECT message_type, is_system FROM teams_messages")) == {
+        "Event/Call": 1,
+        "RichText/Media_CallRecording": 1,
+        "RichText/Media_CallTranscript": 1,
+        "ThreadActivity/AddMember": 1,
+        "RichText/Html": 0,
+        "Text": 0,
+        "RichText/Media_Card": 0,
+    }
+
+
+def test_v24_marks_the_stored_call_records_and_requeues_their_threads(tmp_path):
+    """Ingest took call records for messages until v24. The migration marks the
+    ones stored, and sends a thread that also holds a real message back to
+    extraction, which reads only those, since its summary read the calls' XML. A
+    thread of calls alone keeps its summary, which describes the calls."""
+    from src.config import CURRENT_SCHEMA_VERSION
+    from src.store.schema import create_database, get_schema_version, run_migrations
+
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.execute(
+        "INSERT INTO teams_chats (id, teams_chat_id, chat_kind, first_seen_at) "
+        "VALUES (1, '19:t', 'oneOnOne', '2026-09-01T00:00:00')"
+    )
+    names = ("calls", "mixed", "plain", "pending", "skipped", "untyped")
+    for thread_id, name in enumerate(names, 1):
+        conn.execute(
+            "INSERT INTO teams_threads (id, chat_id, thread_kind, anchor_message_id, started_at, "
+            "ended_at, extraction_status, summary) "
+            "VALUES (?, 1, 'chat_session', ?, '2026-09-01', '2026-09-01', ?, ?)",
+            (thread_id, name, name if name in ("pending", "skipped") else "extracted", name),
+        )
+    kinds = [
+        (1, "Event/Call"),
+        (1, "RichText/Media_CallRecording"),
+        (2, "RichText/Media_CallTranscript"),
+        (2, "RichText/Html"),
+        (3, "Text"),
+        (4, "event/call"),  # another case, which ingest's startswith does not take
+        (5, "Event/Call"),
+        (5, "Text"),  # skipped before, and left skipped
+        (6, "Event/Call"),
+        (6, None),  # a message with no type is still a message
+    ]
+    for i, (thread_id, kind) in enumerate(kinds):
+        conn.execute(
+            "INSERT INTO teams_messages (teams_message_id, chat_id, thread_id, composed_at, "
+            "message_type, content_text, is_system) VALUES (?, 1, ?, '2026-09-01', ?, 'x', 0)",
+            (f"m{i}", thread_id, kind),
+        )
+    conn.execute("UPDATE schema_version SET version = 23")
+    conn.commit()
+
+    run_migrations(conn)
+
+    marked = dict(conn.execute("SELECT teams_message_id, is_system FROM teams_messages"))
+    calls = {0, 1, 2, 6, 8}
+    assert marked == {f"m{i}": int(i in calls) for i in range(10)}
+    statuses = dict(conn.execute("SELECT summary, extraction_status FROM teams_threads"))
+    assert statuses == {
+        "calls": "extracted",
+        "mixed": "pending",
+        "plain": "extracted",
+        "pending": "pending",
+        "skipped": "skipped",
+        "untyped": "pending",
+    }
+    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION == 24

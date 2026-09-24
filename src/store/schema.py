@@ -477,6 +477,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_index_email_subjects(conn)
     if current < 23:
         migrate_add_email_html(conn)
+    if current < 24:
+        migrate_teams_call_records_are_system(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -634,6 +636,43 @@ def migrate_add_calendar_change_key(conn: sqlite3.Connection) -> None:
             if "duplicate column name" not in str(e):
                 raise
         conn.commit()
+
+
+def migrate_teams_call_records_are_system(conn: sqlite3.Connection) -> None:
+    """v24: Teams call records and recording or transcript notices are system messages.
+
+    Ingest took them for messages until this version (the types are in
+    teams_export.SYSTEM_MESSAGE_TYPES): 1,261 rows on 2026-09-24, all XML the
+    service writes. They counted as messages a person sent, and their markup went
+    into the threads the model reads. A thread that also holds a real message goes
+    back to extraction, which reads only those; a thread of calls alone keeps its
+    summary, which describes the calls. The threads are chosen before the rows are
+    marked, so nothing is chosen twice.
+    """
+    has_table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='teams_messages'"
+    ).fetchone()
+    if not has_table:
+        return
+
+    def calls(column: str) -> str:  # a prefix, case and all, as ingest's startswith reads it
+        return f"({column} GLOB 'Event/Call*' OR {column} GLOB 'RichText/Media_Call*')"
+
+    conn.execute(
+        f"""
+        UPDATE teams_threads SET extraction_status = 'pending'
+        WHERE extraction_status = 'extracted'
+          AND id IN (SELECT thread_id FROM teams_messages
+                     WHERE is_system = 0 AND {calls("message_type")})
+          AND EXISTS (SELECT 1 FROM teams_messages m
+                      WHERE m.thread_id = teams_threads.id AND m.is_system = 0
+                        AND NOT {calls("COALESCE(m.message_type, '')")})
+        """
+    )
+    conn.execute(
+        f"UPDATE teams_messages SET is_system = 1 WHERE is_system = 0 AND {calls('message_type')}"
+    )
+    conn.commit()
 
 
 def migrate_add_email_html(conn: sqlite3.Connection) -> None:

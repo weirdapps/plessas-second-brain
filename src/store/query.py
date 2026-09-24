@@ -105,6 +105,16 @@ def _has_attachment_fts(conn: sqlite3.Connection) -> bool:
     )
 
 
+def _has_subject_index(conn: sqlite3.Connection) -> bool:
+    """Whether emails_fts indexes the subject (schema v22).
+
+    A replica runs whatever code its checkout holds against whatever database it
+    last pulled, and the two do not move together: newer code must still search
+    a store the producer has not migrated yet.
+    """
+    return any(r[1] == "subject_f" for r in conn.execute("PRAGMA table_info(emails_fts)"))
+
+
 def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> list[dict]:
     """Get the full conversation thread for an email.
 
@@ -147,6 +157,16 @@ def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> li
         (conversation_id, limit),
     )
     return [dict(r) for r in cursor.fetchall()]
+
+
+def count_thread(conn: sqlite3.Connection, email_id: int) -> int:
+    """How many emails query_thread's thread holds, however many it returned."""
+    row = conn.execute(
+        "SELECT COUNT(*) FROM emails WHERE conversation_id = "
+        "(SELECT conversation_id FROM emails WHERE id = ? AND conversation_id <> '')",
+        (email_id,),
+    ).fetchone()
+    return row[0]
 
 
 # A person filter picks its plan by how many emails the people it means are on.
@@ -292,7 +312,8 @@ def query_by_keyword(
 
     Returns:
         List of dicts with keys: email_id, date, subject, summary, snippet, source
-        where source is 'summary', 'content', or 'key_fact'. When no row carries
+        where source is 'subject', 'summary', 'content', 'key_fact' or
+        'attachment'. When no row carries
         every token, rows matching any meaningful token come back instead, each
         flagged partial_match.
     """
@@ -312,6 +333,28 @@ def _keyword_waterfall(
     """query_by_keyword's source waterfall for one sanitized MATCH expression."""
     results = []
     seen_ids = set()
+
+    if not search_content_only and _has_subject_index(conn):
+        # The subject first: the words someone remembers an email by, and until
+        # v22 not indexed at all. snippet() is not needed; the subject is the row.
+        query_subjects = """
+            SELECT
+                e.id as email_id,
+                e.date_received as date,
+                e.subject,
+                e.summary,
+                e.subject as snippet,
+                'subject' as source
+            FROM emails_fts
+            JOIN emails e ON e.id = emails_fts.rowid
+            WHERE emails_fts.subject_f MATCH ?
+            ORDER BY rank
+            LIMIT ?
+        """
+        for row in conn.execute(query_subjects, (safe_keyword, limit)).fetchall():
+            r = dict(row)
+            seen_ids.add(r["email_id"])
+            results.append(r)
 
     if not search_content_only:
         # Search in email summaries
@@ -337,11 +380,12 @@ def _keyword_waterfall(
             LIMIT ?
         """
 
-        cursor = conn.execute(query_summaries, (safe_keyword, limit))
+        cursor = conn.execute(query_summaries, (safe_keyword, limit - len(results)))
         for row in cursor.fetchall():
             r = dict(row)
-            seen_ids.add(r["email_id"])
-            results.append(r)
+            if r["email_id"] not in seen_ids:
+                seen_ids.add(r["email_id"])
+                results.append(r)
 
     # Search in email content
     remaining = limit - len(results)

@@ -326,6 +326,8 @@ def get_person_context(
     except Exception:
         pass
 
+    teams = _person_teams(conn, person_id, cutoff, limit)
+
     del person["id"]
 
     return {
@@ -345,6 +347,65 @@ def get_person_context(
         "last_met": calendar_data.get("last_met"),
         "next_meeting": calendar_data.get("next_meeting"),
         "meeting_count_30d": calendar_data.get("meeting_count_30d"),
+        "teams": teams,
+    }
+
+
+def _person_teams(conn: sqlite3.Connection, person_id: int, cutoff: str, limit: int) -> dict:
+    """What the person wrote in Teams since `cutoff`, and the threads they wrote in.
+
+    By teams_messages.sender_person_id, which links about 83% of messages to a
+    person; system messages are not theirs. composed_at carries a UTC 'Z' and the
+    cutoff is local, which moves the window's edge by hours, not days.
+    """
+    empty: dict = {
+        "message_count": 0,
+        "last_message_at": None,
+        "recent_threads": [],
+        "recent_threads_total": 0,
+    }
+    try:
+        count, last = conn.execute(
+            "SELECT COUNT(*), MAX(composed_at) FROM teams_messages "
+            "WHERE sender_person_id = ? AND is_system = 0 AND composed_at >= ?",
+            (person_id, cutoff),
+        ).fetchone()
+        threads = conn.execute(
+            """
+            SELECT t.id AS thread_id, t.title, c.topic, c.team_name,
+                   COUNT(*) AS messages, MAX(m.composed_at) AS last_message_at
+            FROM teams_messages m
+            JOIN teams_threads t ON t.id = m.thread_id
+            JOIN teams_chats c ON c.id = t.chat_id
+            WHERE m.sender_person_id = ? AND m.is_system = 0 AND m.composed_at >= ?
+            GROUP BY t.id
+            ORDER BY last_message_at DESC
+            LIMIT ?
+            """,
+            (person_id, cutoff, limit),
+        ).fetchall()
+        total = conn.execute(
+            "SELECT COUNT(DISTINCT thread_id) FROM teams_messages "
+            "WHERE sender_person_id = ? AND is_system = 0 AND composed_at >= ? "
+            "AND thread_id IS NOT NULL",
+            (person_id, cutoff),
+        ).fetchone()[0]
+    except sqlite3.OperationalError:  # a store without the Teams tables
+        return empty
+    return {
+        "message_count": count,
+        "last_message_at": last,
+        "recent_threads": [
+            {
+                "thread_id": r["thread_id"],
+                "title": r["title"],
+                "chat": " / ".join(p for p in (r["team_name"], r["topic"]) if p),
+                "messages": r["messages"],
+                "last_message_at": r["last_message_at"],
+            }
+            for r in threads
+        ],
+        "recent_threads_total": total,
     }
 
 

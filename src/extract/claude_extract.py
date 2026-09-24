@@ -233,6 +233,11 @@ def _reauth_unless_latched(*, is_linux: bool) -> ReauthResult | None:
         return result
 
 
+# A connection that dropped within this long, with no answer, is retried once at
+# once instead of waiting out the policy's backoff.
+QUICK_RETRY_WITHIN_S = 5.0
+
+
 def call_with_policy(fn, *, max_call_seconds: float, refusal_is_final: bool = False) -> object:
     """Run fn() under the shared retry/reauth policy.
 
@@ -253,21 +258,35 @@ def call_with_policy(fn, *, max_call_seconds: float, refusal_is_final: bool = Fa
     # Local import: policy_bridge imports reset_client_cache from this module, so a
     # top-level import would create a circular dependency.  By the time this function
     # runs, claude_extract is fully initialised and the deferred import resolves cleanly.
-    from src.extract.policy_bridge import classify_exception
+    from src.extract.policy_bridge import classify_exception, is_dropped_connection
 
     deadline = resolve_deadline(time.time(), os.environ)
     attempt = Attempt()
     last_exc: BaseException | None = None
     last_response: object = None
     is_linux = running_on_linux()
+    quick_retry = True
 
     while True:
         last_exc = None
         last_response = None
+        began = time.time()
         try:
             last_response = fn()
         except Exception as exc:
             last_exc = exc
+
+        if (
+            quick_retry
+            and last_exc is not None
+            and is_dropped_connection(last_exc)
+            and time.time() - began < QUICK_RETRY_WITHIN_S
+        ):
+            # The SDK used to retry a dropped connection at once; the policy's
+            # backoff (30 s) is for errors that last. Once per call, and only
+            # after a quick failure, so the attempt still fits its reservation.
+            quick_retry = False
+            continue
 
         outcome = classify_exception(last_exc, last_response)
         if refusal_is_final and outcome is Outcome.REFUSAL:
@@ -336,10 +355,17 @@ def complete(*, max_tokens: int, messages: list, model: str | None = None, **kwa
     # reach this call.
     from src.extract.vertex_fallback import create_with_refusal_fallback
 
+    after_refusal: dict = {}
+
     def _do_call():
         client, configured = _get_client_and_model()
         return create_with_refusal_fallback(
-            client, model=model or configured, max_tokens=max_tokens, messages=messages, **kwargs
+            client,
+            model=model or configured,
+            after_refusal=after_refusal,
+            max_tokens=max_tokens,
+            messages=messages,
+            **kwargs,
         )
 
     return call_with_policy(_do_call, max_call_seconds=120.0, refusal_is_final=True)

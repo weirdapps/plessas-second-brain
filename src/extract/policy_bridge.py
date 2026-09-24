@@ -58,6 +58,14 @@ def _is_rate_limit_error(err: object) -> bool:
     return any(p in msg for p in _RATE_LIMIT_PATTERNS)
 
 
+def is_dropped_connection(exc: BaseException) -> bool:
+    """A connection that failed with no answer and without timing out: reset,
+    refused, or closed by the server. The SDK used to retry these at once."""
+    return isinstance(exc, anthropic.APIConnectionError) and not isinstance(
+        exc, anthropic.APITimeoutError
+    )
+
+
 def classify_exception(exc: BaseException | None, response: object | None) -> Outcome:
     """Map one SDK outcome to a policy Outcome. Types first, strings second."""
     if exc is not None:

@@ -14,14 +14,24 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def create_with_refusal_fallback(client: Any, *, model: str, **create_kwargs: Any) -> Any:
+def create_with_refusal_fallback(
+    client: Any, *, model: str, after_refusal: dict | None = None, **create_kwargs: Any
+) -> Any:
     """Call ``client.messages.create(model=model, **create_kwargs)``.
 
     If the response stop_reason is ``"refusal"``, retry once on a fresh AnthropicVertex
     client pinned to the configured fallback tier and return that response.
     On any non-refusal stop_reason (including ``max_tokens``), return the first response
     unchanged so existing callers keep their own handling.
+
+    ``after_refusal`` is a dict the caller keeps across its own retries. It records
+    the fallback tier once the primary has refused, so a retry after an error on
+    that tier (a 429, a dropped connection) goes to the tier alone: the primary's
+    answer cannot change, and replaying it would cost a billed call and an attempt.
     """
+    if after_refusal and "tier" in after_refusal:
+        project, fb_model, fb_region = after_refusal["tier"]
+        return _on_fallback_tier(project, fb_model, fb_region, create_kwargs)
     response = client.messages.create(model=model, **create_kwargs)
     if getattr(response, "stop_reason", None) != "refusal":
         return response
@@ -68,7 +78,12 @@ def create_with_refusal_fallback(client: Any, *, model: str, **create_kwargs: An
         fb_model,
         fb_region,
     )
+    if after_refusal is not None:
+        after_refusal["tier"] = (project, fb_model, fb_region)
+    return _on_fallback_tier(project, fb_model, fb_region, create_kwargs)
 
+
+def _on_fallback_tier(project: str, fb_model: str, fb_region: str, create_kwargs: dict) -> Any:
     from anthropic import AnthropicVertex
 
     # One request, as the primary client (claude_extract): the policy retries.

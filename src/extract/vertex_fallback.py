@@ -71,7 +71,8 @@ def create_with_refusal_fallback(client: Any, *, model: str, **create_kwargs: An
 
     from anthropic import AnthropicVertex
 
-    fb_client = AnthropicVertex(project_id=project, region=fb_region, timeout=120.0)
+    # One request, as the primary client (claude_extract): the policy retries.
+    fb_client = AnthropicVertex(project_id=project, region=fb_region, timeout=120.0, max_retries=0)
     try:
         return fb_client.messages.create(model=fb_model, **create_kwargs)
     finally:

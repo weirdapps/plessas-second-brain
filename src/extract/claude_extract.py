@@ -100,14 +100,19 @@ def _build_client_and_model():
         print(
             f"second-brain: Claude via Vertex AI, region {region}, model {model}", file=sys.stderr
         )
-        return AnthropicVertex(project_id=project_id, region=region, timeout=120.0), model
+        # max_retries=0: call_with_policy is the retry layer, and it reserves
+        # max_call_seconds for each attempt, which holds only if an attempt is
+        # one request. The SDK's default, two retries with timeouts among them,
+        # made one attempt up to three 120 s requests.
+        client = AnthropicVertex(project_id=project_id, region=region, timeout=120.0, max_retries=0)
+        return client, model
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if api_key:
         from anthropic import Anthropic
 
         print(f"second-brain: Claude via the direct Anthropic API, model {model}", file=sys.stderr)
-        return Anthropic(api_key=api_key, timeout=60.0), model
+        return Anthropic(api_key=api_key, timeout=60.0, max_retries=0), model  # as above
 
     raise RuntimeError(
         "No Claude credentials found. For Vertex AI set VERTEX_SDK_PROJECT (or "

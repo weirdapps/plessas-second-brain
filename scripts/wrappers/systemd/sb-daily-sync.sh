@@ -18,6 +18,9 @@ eval "$(pyenv init -)" 2>/dev/null || true
 
 REPO_DIR="$HOME/SourceCode/plessas-second-brain"
 PYTHON="$HOME/.venvs/second-brain/bin/python"
+# The data home as src/config.py resolves it: BRAIN_DATA_DIR, else the repo's.
+DATA_DIR="${BRAIN_DATA_DIR:-$REPO_DIR/data}"
+DB="$DATA_DIR/brain.db"
 LOG_DIR="$HOME/.second-brain/logs"
 LOG_FILE="$LOG_DIR/daily-sync.log"
 mkdir -p "$LOG_DIR"
@@ -75,13 +78,13 @@ echo "=== Daily sync started: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
 # WAL checkpoint: flush pending WAL pages before starting, to reduce lock
 # contention with concurrent hourly-sync processes.
 "$PYTHON" -c "
-import sqlite3, os
-db = os.path.expanduser('~/SourceCode/plessas-second-brain/data/brain.db')
+import sqlite3, os, sys
+db = sys.argv[1]
 if os.path.exists(db):
     c = sqlite3.connect(db)
     c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
     c.close()
-" >> "$LOG_FILE" 2>&1 || true
+" "$DB" >> "$LOG_FILE" 2>&1 || true
 
 # MVCC-safe local snapshot (sqlite .backup) + key-gated encrypted offsite copy.
 # Replaces the old shutil.copy2, which raw-copied a live WAL DB and could capture a
@@ -104,9 +107,9 @@ PING_ENV="$HOME/.config/healthchecks-ping.env"
 export HC_PING_URL="${HC_PING_URL:-}"
 
 "$PYTHON" "$REPO_DIR/scripts/backup_db.py" \
-  --db "$REPO_DIR/data/brain.db" \
-  --local-dir "$REPO_DIR/data/backups" --local-keep 7 \
-  --offsite-dir "$REPO_DIR/data/backups/offsite" \
+  --db "$DB" \
+  --local-dir "$DATA_DIR/backups" --local-keep 7 \
+  --offsite-dir "$DATA_DIR/backups/offsite" \
   --key-file "$HOME/.second-brain/backup.key" \
   --gfs-daily 14 --gfs-weekly 8 \
   --hc-slug brain-backup \
@@ -129,7 +132,7 @@ EXIT_CODE=$?
 if [ "$EXIT_CODE" -ne 0 ] && tail -20 "$LOG_FILE" | grep -qi "database is locked"; then
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] Retrying sync after database-lock failure..." >> "$LOG_FILE"
   sleep 10
-  "$PYTHON" -c "import sqlite3,os; c=sqlite3.connect(os.path.expanduser('~/SourceCode/plessas-second-brain/data/brain.db')); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()" 2>/dev/null || true
+  "$PYTHON" -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()" "$DB" 2>/dev/null || true
   "$PYTHON" -m src.cli sync --engine "$ENGINE" --workers 8 >> "$LOG_FILE" 2>&1
   EXIT_CODE=$?
 fi
@@ -154,9 +157,9 @@ if [ "$EXIT_CODE" -eq 0 ] && "$PYTHON" -c "import os,sys; sys.exit(0 if os.path.
 fi
 
 # Staleness check via python sqlite (kept from OneDrive era — shell sqlite3 now works fine).
-STALE_REPORT=$("$PYTHON" - <<'PYEOF' 2>/dev/null
-import sqlite3, os
-db = os.path.expanduser('~/SourceCode/plessas-second-brain/data/brain.db')
+STALE_REPORT=$("$PYTHON" - "$DB" <<'PYEOF' 2>/dev/null
+import sqlite3, sys
+db = sys.argv[1]
 conn = sqlite3.connect(db)
 rows = conn.execute("""
 SELECT mailbox_name || ': ' || MAX(date_received) || ' (' ||

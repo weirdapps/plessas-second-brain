@@ -35,6 +35,22 @@ class TestLoadIndex:
         assert unit1 is unit2  # served from cache, not reloaded
         assert np.allclose(np.linalg.norm(unit1, axis=1), 1.0)  # unit vectors
 
+    def test_normalises_without_a_full_size_temporary(self, tmp_path, monkeypatch):
+        """np.linalg.norm squares the whole array into a second one the same
+        size, and the allocator kept it: each MCP process held 2.84 GB after its
+        first recall instead of 1.43. A zero vector stays zero."""
+        p = tmp_path / "emb.npz"
+        _write_npz(p, [1, 2, 3], [[3.0, 4.0, 0.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]])
+
+        def full_size_temporary(*args, **kwargs):
+            raise AssertionError("np.linalg.norm allocates an N x D temporary")
+
+        monkeypatch.setattr(np.linalg, "norm", full_size_temporary)
+        _, unit = _load_index(str(p))
+
+        assert np.allclose(np.sqrt((unit * unit).sum(axis=1)), [1.0, 0.0, 1.0])
+        assert np.allclose(unit[0], [0.6, 0.8, 0.0])
+
 
 class TestSemanticEmailCandidates:
     def test_ranks_closest_email_first(self, tmp_path):

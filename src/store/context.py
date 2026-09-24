@@ -662,23 +662,23 @@ def get_conversation_context(conn: sqlite3.Connection, email_id: int) -> dict:
 
     email = dict(email_row)
 
-    # Try to get thread via conversation_id if column exists
+    # The thread as email_thread and search know it (query._THREAD): a News day or
+    # the hash every blank-subject email without references shares is no thread.
+    from src.store.query import query_thread
+
     thread = [email]
     try:
-        conv_row = conn.execute(
-            "SELECT conversation_id FROM emails WHERE id = ?", (email_id,)
-        ).fetchone()
-        if conv_row and conv_row["conversation_id"]:
+        rows = query_thread(conn, email_id, limit=-1)
+        if rows:
             thread = [
-                dict(r)
-                for r in conn.execute(
-                    """
-                SELECT id, date_received as date, subject, summary, sender_name as sender
-                FROM emails WHERE conversation_id = ?
-                ORDER BY date_received ASC
-            """,
-                    (conv_row["conversation_id"],),
-                ).fetchall()
+                {
+                    "id": r["email_id"],
+                    "date": r["date"],
+                    "subject": r["subject"],
+                    "summary": r["summary"],
+                    "sender": r["sender_name"],
+                }
+                for r in rows
             ]
     except sqlite3.OperationalError:
         pass

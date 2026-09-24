@@ -108,6 +108,10 @@ def get_person_context(
             "open_actions": [],
             "open_actions_total": 0,
             "communication_pattern": {},
+            "last_met": None,
+            "next_meeting": None,
+            "meeting_count_30d": None,
+            "teams": _no_teams(),
         }
 
     person = dict(person_row)
@@ -351,33 +355,42 @@ def get_person_context(
     }
 
 
-def _person_teams(conn: sqlite3.Connection, person_id: int, cutoff: str, limit: int) -> dict:
-    """What the person wrote in Teams since `cutoff`, and the threads they wrote in.
-
-    By teams_messages.sender_person_id, which links about 83% of messages to a
-    person; system messages are not theirs. composed_at carries a UTC 'Z' and the
-    cutoff is local, which moves the window's edge by hours, not days.
-    """
-    empty: dict = {
+def _no_teams() -> dict:
+    """_person_teams' answer for someone with no Teams activity, a fresh dict each time."""
+    return {
         "message_count": 0,
         "last_message_at": None,
         "recent_threads": [],
         "recent_threads_total": 0,
     }
+
+
+def _person_teams(conn: sqlite3.Connection, person_id: int, cutoff: str, limit: int) -> dict:
+    """What the person wrote in Teams since `cutoff`, and the threads they wrote in.
+
+    By teams_messages.sender_person_id, which links about 83% of messages to a
+    person; system messages are not theirs, nor are call events ('Event/Call'),
+    which arrive as ordinary messages from the caller. composed_at carries a UTC
+    'Z' and the cutoff is local, which moves the window's edge by hours, not days.
+    A chat with neither a team nor a topic (1:1 chats, most group chats) is named
+    by its kind.
+    """
     try:
         count, last = conn.execute(
             "SELECT COUNT(*), MAX(composed_at) FROM teams_messages "
-            "WHERE sender_person_id = ? AND is_system = 0 AND composed_at >= ?",
+            "WHERE sender_person_id = ? AND is_system = 0 "
+            "AND COALESCE(message_type, '') NOT LIKE 'Event/%' AND composed_at >= ?",
             (person_id, cutoff),
         ).fetchone()
         threads = conn.execute(
             """
-            SELECT t.id AS thread_id, t.title, c.topic, c.team_name,
+            SELECT t.id AS thread_id, t.title, c.topic, c.team_name, c.chat_kind,
                    COUNT(*) AS messages, MAX(m.composed_at) AS last_message_at
             FROM teams_messages m
             JOIN teams_threads t ON t.id = m.thread_id
             JOIN teams_chats c ON c.id = t.chat_id
-            WHERE m.sender_person_id = ? AND m.is_system = 0 AND m.composed_at >= ?
+            WHERE m.sender_person_id = ? AND m.is_system = 0
+              AND COALESCE(m.message_type, '') NOT LIKE 'Event/%' AND m.composed_at >= ?
             GROUP BY t.id
             ORDER BY last_message_at DESC
             LIMIT ?
@@ -386,12 +399,13 @@ def _person_teams(conn: sqlite3.Connection, person_id: int, cutoff: str, limit: 
         ).fetchall()
         total = conn.execute(
             "SELECT COUNT(DISTINCT thread_id) FROM teams_messages "
-            "WHERE sender_person_id = ? AND is_system = 0 AND composed_at >= ? "
+            "WHERE sender_person_id = ? AND is_system = 0 "
+            "AND COALESCE(message_type, '') NOT LIKE 'Event/%' AND composed_at >= ? "
             "AND thread_id IS NOT NULL",
             (person_id, cutoff),
         ).fetchone()[0]
     except sqlite3.OperationalError:  # a store without the Teams tables
-        return empty
+        return _no_teams()
     return {
         "message_count": count,
         "last_message_at": last,
@@ -399,7 +413,7 @@ def _person_teams(conn: sqlite3.Connection, person_id: int, cutoff: str, limit: 
             {
                 "thread_id": r["thread_id"],
                 "title": r["title"],
-                "chat": " / ".join(p for p in (r["team_name"], r["topic"]) if p),
+                "chat": " / ".join(p for p in (r["team_name"], r["topic"]) if p) or r["chat_kind"],
                 "messages": r["messages"],
                 "last_message_at": r["last_message_at"],
             }

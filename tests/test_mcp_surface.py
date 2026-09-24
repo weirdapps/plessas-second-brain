@@ -358,4 +358,65 @@ def test_email_thread_says_when_it_was_cut(conn, monkeypatch):
     out = mcp_server.email_thread(email_id=72, limit=2)
 
     assert len(out["emails"]) == 2
+    assert 72 in [e["email_id"] for e in out["emails"]]
     assert out["thread_total"] == 5
+
+
+def test_email_thread_centres_a_long_thread_on_the_email(conn, monkeypatch):
+    """The oldest 50 of a 60-email thread left out its newest email, the one a
+    search usually hits."""
+    from src import mcp_server
+
+    for i in range(100, 160):
+        _email(conn, i, 200 - i, "a@example.com", "convL")
+    conn.commit()
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    out = mcp_server.email_thread(email_id=159, limit=50)
+
+    assert [e["email_id"] for e in out["emails"]] == list(range(110, 160))
+    assert out["thread_total"] == 60
+
+
+def test_query_thread_centres_the_window_on_the_email(conn):
+    from src.store.query import query_thread
+
+    for i in range(100, 160):
+        _email(conn, i, 200 - i, "a@example.com", "convL")
+    conn.commit()
+
+    assert [e["email_id"] for e in query_thread(conn, 130, limit=10)] == list(range(125, 135))
+    assert [e["email_id"] for e in query_thread(conn, 100, limit=10)] == list(range(100, 110))
+    assert len(query_thread(conn, 130, limit=100)) == 60
+
+
+def test_email_thread_returns_at_least_the_email_itself(conn, monkeypatch):
+    from src import mcp_server
+
+    _email(conn, 60, 3, "a@example.com", "convX")
+    _email(conn, 61, 2, "b@example.com", "convX")
+    conn.commit()
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    out = mcp_server.email_thread(email_id=61, limit=0)
+
+    assert [e["email_id"] for e in out["emails"]] == [61]
+
+
+def test_email_thread_caps_the_limit(conn, monkeypatch):
+    import src.store.query as query
+    from src import mcp_server
+
+    asked = []
+    real = query.query_thread
+
+    def spy(c, email_id, limit):
+        asked.append(limit)
+        return real(c, email_id, limit=limit)
+
+    monkeypatch.setattr(query, "query_thread", spy)
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    mcp_server.email_thread(email_id=1, limit=10**6)
+
+    assert asked == [200]

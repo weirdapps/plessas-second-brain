@@ -694,7 +694,9 @@ def migrate_index_email_subjects(conn: sqlite3.Connection) -> None:
         conn.execute("INSERT INTO emails_fts(emails_fts) VALUES('rebuild')")
         conn.execute("COMMIT")
     except BaseException:
-        conn.execute("ROLLBACK")
+        # Not an explicit ROLLBACK: a full disk rolls the transaction back itself,
+        # and ROLLBACK would then raise "no transaction is active" over the cause.
+        conn.rollback()
         raise
 
 

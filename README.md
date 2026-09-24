@@ -90,7 +90,7 @@ The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register t
 ### Emails
 
 - `search_emails(query, search_type, limit)`. Keyword (FTS5) or semantic (embedding). Keyword search tries the subject first, then the summary, the body, key facts and attachments.
-- `email_thread(email_id, limit)`. Every email in a hit's thread, oldest first, with `thread_total`.
+- `email_thread(email_id, limit)`. The emails of a hit's thread, oldest first, with `thread_total`; a thread longer than `limit` comes back as the `limit` emails centred on the hit.
 - `query_emails(person, topic, keyword, start_date, end_date, limit)`. Combined filters.
 - `outlook_live_search(folder, since_minutes, subject_contains)`. Bypasses the DB and queries the live Outlook mailbox directly, for mail newer than the store. `since_minutes` defaults to 60 and is capped at 1440 (24 hours); the answer's `since_minutes` and `clamped` say what was searched. This is the escape hatch when `stats` says the local copy is stale.
 
@@ -415,7 +415,7 @@ pytest -k recall                    # filter by expression
 pytest --cov=src --cov-report=term  # with coverage
 ```
 
-Before changing how text is tokenised (stemming, prefix matching), measure it. `scripts/retrieval_eval.py build` samples emails and keeps two words of each subject as a query; `run` reports how often keyword search returns the email first, in the top 5 and in the top 10. The set holds subjects, so it is written to `~/.second-brain/retrieval-eval.json`, outside the repository, and both steps open the database read-only.
+Before and after changing how text is tokenised (stemming, prefix matching), run the regression guard. `scripts/retrieval_eval.py build` samples emails and keeps two words of each subject as a query; `run` reports how often keyword search returns the email, and its thread, first, in the top 5 and in the top 10. Compare the thread figures: replies share a subject, and a subject match returns one email per thread. It can show a loss, not a gain, because the queries are the subject's own words. The set holds subjects, so it is written to `~/.second-brain/retrieval-eval.json`, outside the repository, and both steps open the database read-only.
 
 ### Lint and format
 

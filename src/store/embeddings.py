@@ -410,6 +410,12 @@ def build_index(conn: sqlite3.Connection, force: bool = False) -> int:
                 )
             present = set(existing_id_order)
             fresh = [i for i, vid in enumerate(ids) if vid not in present]
+            gone = _conversation_vectors_gone(conn, existing_id_order)
+            if gone:
+                _log(f"Dropping {len(gone)} vectors of conversations no longer stored")
+                kept = np.array([vid not in gone for vid in existing_id_order], dtype=bool)
+                existing_id_order = [vid for vid in existing_id_order if vid not in gone]
+                existing_vectors = existing_vectors[kept]
             all_ids = existing_id_order + [ids[i] for i in fresh]
             all_vectors = np.vstack([existing_vectors, new_vectors[fresh]])
             del data, existing_vectors
@@ -427,6 +433,23 @@ def build_index(conn: sqlite3.Connection, force: bool = False) -> int:
 
     _log(f"Saved {len(all_ids)} embeddings to {EMBEDDINGS_FILE}")
     return len(to_embed)
+
+
+def _conversation_vectors_gone(conn: sqlite3.Connection, ids) -> set[int]:
+    """The conversation vectors among `ids` whose conversation the store no longer
+    holds. One loaded again gets a new id (load_single_conversation), and the old
+    id's vector, matching no row, would take a search result's place beside the
+    new one. build_index reads this under the index lock, and is the only writer
+    of conversation vectors, so no vector whose row it has not seen can go."""
+    try:
+        held = {CONVERSATION_ID_OFFSET - r[0] for r in conn.execute("SELECT id FROM conversations")}
+    except sqlite3.OperationalError:  # a schema without conversations
+        return set()
+    return {
+        vid
+        for vid in ids
+        if TEAMS_THREAD_ID_OFFSET < vid <= CONVERSATION_ID_OFFSET and vid not in held
+    }
 
 
 def _kind_mask(ids, kinds) -> np.ndarray:

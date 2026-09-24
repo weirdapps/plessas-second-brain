@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-from src.config import DATA_ROOT
+from src.config import DATA_ROOT, GEMINI_MODEL
 
 # Repo root
 REPO_ROOT = Path(__file__).parent.parent.parent
@@ -25,7 +25,6 @@ EXTRACTED_DIR = DATA_DIR / "extracted"
 STATE_FILE = DATA_DIR / "state" / "extract_state.json"
 LOG_FILE = DATA_DIR / "extract.log"
 
-GEMINI_MODEL = "gemini-2.5-flash"
 SAVE_INTERVAL = 50
 CALL_TIMEOUT = 60  # seconds per API call
 DEFAULT_ENGINE = os.environ.get("BRAIN_EXTRACT_ENGINE", "claude")  # "gemini" or "claude"

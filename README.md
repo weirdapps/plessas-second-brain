@@ -205,7 +205,7 @@ Preferred credential path. Uses Application Default Credentials, no API key requ
 
 ### Alternative credentials
 
-- `ANTHROPIC_API_KEY`: direct Anthropic API. Used only if no Vertex credentials are found.
+- `ANTHROPIC_API_KEY`: direct Anthropic API. Used only when no Vertex project is set; a key left in the environment never overrides Vertex. The backend in use is printed on stderr when the client is built.
 - `GEMINI_API_KEY`: required when `BRAIN_EXTRACT_ENGINE=gemini`.
 
 ### Paths and hosts

@@ -38,7 +38,8 @@ CI (`.github/workflows/ci.yml`), four jobs on every push and PR to `master`: `li
 
 ## Key conventions
 
-- **Extraction engine** (`src/extract/claude_extract.py`): if `ANTHROPIC_API_KEY` is set it wins (direct API); otherwise Vertex AI + ADC (`VERTEX_SDK_PROJECT` / `ANTHROPIC_VERTEX_PROJECT_ID` + `VERTEX_SDK_REGION` / `CLOUD_ML_REGION`); otherwise the client raises. Gemini via `BRAIN_EXTRACT_ENGINE=gemini` + `GEMINI_API_KEY`.
+- **Extraction engine** (`src/extract/claude_extract.py`): Vertex AI + ADC whenever a project is set (`VERTEX_SDK_PROJECT` / `ANTHROPIC_VERTEX_PROJECT_ID` + `VERTEX_SDK_REGION` / `CLOUD_ML_REGION`); `ANTHROPIC_API_KEY` (direct API) only without one; otherwise the client raises. The backend, region and model go to stderr when the client is built. Gemini via `BRAIN_EXTRACT_ENGINE=gemini` + `GEMINI_API_KEY`.
+- **One way to call Claude**: every call site sends through `claude_extract.complete()`, which carries the shared client, the retry and re-auth policy, and the refusal fallback. A test fails if anything else calls `messages.create`.
 - **Vertex model/region pairing**: Claude 4.7+ → `eu`; 4.6 and older → `europe-west1`. A mismatch returns HTTP 429. Override the model with `CLAUDE_EXTRACT_MODEL` / `VERTEX_MODEL_EXTRACT`.
 - **Identity**: `BRAIN_USER_NAME` / `BRAIN_USER_ROLE` / `BRAIN_USER_EMAIL_PATTERN` feed extraction prompts and stale-thread detection.
 - **Staging batches**: `data/staging/batch-NNNNN.json`; same shape regardless of source, so extract + load are source-agnostic.

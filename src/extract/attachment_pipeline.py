@@ -211,11 +211,7 @@ def _extract_one_attachment(row):
     with the exception in hand, and hand the answer on.
     """
     from src.extract.attachment_prompt import build_attachment_prompt
-    from src.extract.claude_extract import (
-        _get_client_and_model,
-        _response_text,
-        call_with_policy,
-    )
+    from src.extract.claude_extract import _response_text, complete
     from src.extract.parser import parse_extraction
     from src.extract.policy_bridge import classify_exception
     from src.llm_policy import Outcome
@@ -231,24 +227,15 @@ def _extract_one_attachment(row):
             email_date=email_date,
         )
 
-        # _do_call re-fetches the client on every attempt so a successful reauth
-        # (which calls reset_client_cache) is picked up by the retry rather than
-        # silently reusing the stale credential.
-        def _do_call():
-            cur_client, cur_model = _get_client_and_model()
-            return cur_client.messages.create(
-                model=cur_model,
-                # Dense documents (large spreadsheets/decks) yield long extraction
-                # JSON; 2048 truncated it mid-structure on ~40K-char docs, so every
-                # such attachment failed with "Expecting ',' delimiter". Give the
-                # structured output room to complete; parse_extraction additionally
-                # salvages any residual truncation rather than dropping the summary.
-                max_tokens=8192,
-                messages=[{"role": "user", "content": prompt}],
-            )
-
-        response = call_with_policy(_do_call, max_call_seconds=120.0)
-        # Do not close: this is the shared client from _get_client_and_model.
+        response = complete(
+            # Dense documents (large spreadsheets/decks) yield long extraction
+            # JSON; 2048 truncated it mid-structure on ~40K-char docs, so every
+            # such attachment failed with "Expecting ',' delimiter". Give the
+            # structured output room to complete; parse_extraction additionally
+            # salvages any residual truncation rather than dropping the summary.
+            max_tokens=8192,
+            messages=[{"role": "user", "content": prompt}],
+        )
 
         # _response_text, never content[0]. With extended thinking the model leads the
         # content list with a ThinkingBlock, which carries .thinking and no .text, so

@@ -41,12 +41,204 @@ def test_get_client_and_model_reuses_same_client(monkeypatch):
     """Repeated calls return the SAME client instance (built once, reused)."""
     # Direct-API branch avoids Vertex/gcloud/network entirely.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
+    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
 
     client1, model1 = claude_extract._get_client_and_model()
     client2, model2 = claude_extract._get_client_and_model()
 
     assert client1 is client2
     assert model1 == model2
+
+
+class _FakeSDKClient:
+    """Stands in for an SDK client class, recording how it was built."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+def _fake_sdk(monkeypatch):
+    vertex = type("Vertex", (_FakeSDKClient,), {})
+    direct = type("Direct", (_FakeSDKClient,), {})
+    monkeypatch.setattr("anthropic.AnthropicVertex", vertex)
+    monkeypatch.setattr("anthropic.Anthropic", direct)
+    return vertex, direct
+
+
+@pytest.mark.parametrize("name", ["VERTEX_SDK_PROJECT", "ANTHROPIC_VERTEX_PROJECT_ID"])
+def test_a_vertex_project_wins_over_an_api_key(monkeypatch, name):
+    """A key left in a shell profile sent work mail to the direct API, not Vertex."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
+    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    monkeypatch.setenv(name, "test-project")
+    monkeypatch.setenv("VERTEX_SDK_REGION", "eu")
+    vertex, _ = _fake_sdk(monkeypatch)
+
+    client, _ = claude_extract._build_client_and_model()
+
+    assert isinstance(client, vertex)
+    assert client.kwargs["region"] == "eu"
+
+
+def test_the_api_key_is_used_only_without_a_vertex_project(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
+    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    _, direct = _fake_sdk(monkeypatch)
+
+    client, _ = claude_extract._build_client_and_model()
+
+    assert isinstance(client, direct)
+
+
+@pytest.mark.parametrize("vertex", [True, False])
+def test_the_backend_in_use_is_logged(monkeypatch, capsys, vertex):
+    """The sync logs could not tell which backend had run. Names no credential."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    if vertex:
+        monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+        monkeypatch.setenv("VERTEX_SDK_REGION", "eu")
+    else:
+        monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
+        monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    _fake_sdk(monkeypatch)
+    monkeypatch.setattr(claude_extract, "CLAUDE_MODEL_BASE", "claude-test-model")
+
+    claude_extract._build_client_and_model()
+
+    err = capsys.readouterr().err
+    assert "claude-test-model" in err
+    if vertex:
+        assert "Vertex AI, region eu" in err
+    else:
+        assert "direct Anthropic API" in err
+    assert "sk-ant" not in err
+    assert "test-project" not in err
+
+
+def test_complete_retries_a_refusal_on_the_fallback_tier(monkeypatch):
+    """Attachments, images and calendar called the SDK themselves, so a refusal
+    failed the item where extract_one retried it on the fallback tier."""
+    monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+    refusal = types.SimpleNamespace(content=[], stop_reason="refusal")
+    primary = MagicMock()
+    primary.messages.create.return_value = refusal
+    fallback = MagicMock()
+    fallback.messages.create.return_value = _fake_response("recovered")
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (primary, "m"))
+    monkeypatch.setattr("anthropic.AnthropicVertex", lambda **kwargs: fallback)
+
+    response = claude_extract.complete(max_tokens=10, messages=[{"role": "user", "content": "x"}])
+
+    assert claude_extract._response_text(response) == "recovered"
+
+
+def test_complete_does_not_replay_a_refusal_the_fallback_tier_saw(monkeypatch):
+    """The policy retries a refusal twice, and each retry replayed the primary and
+    the fallback again: six calls and 90 s of sleep for an answer that could not
+    change. The fallback tier is the one retry a refusal gets."""
+    monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+    refusal = types.SimpleNamespace(content=[], stop_reason="refusal")
+    primary = MagicMock()
+    primary.messages.create.return_value = refusal
+    fallback = MagicMock()
+    fallback.messages.create.return_value = refusal
+    slept = []
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (primary, "m"))
+    monkeypatch.setattr("anthropic.AnthropicVertex", lambda **kwargs: fallback)
+    monkeypatch.setattr(claude_extract.time, "sleep", slept.append)
+
+    response = claude_extract.complete(max_tokens=10, messages=[])
+
+    assert response.stop_reason == "refusal"
+    assert primary.messages.create.call_count + fallback.messages.create.call_count == 2
+    assert slept == []
+
+
+def test_complete_sends_an_explicit_model_and_the_system_prompt():
+    """Teams names its own model and a system prompt; everything else takes the
+    configured model."""
+    client = MagicMock()
+    client.messages.create.return_value = _fake_response()
+
+    with patch.object(claude_extract, "_get_client_and_model", lambda: (client, "configured")):
+        claude_extract.complete(max_tokens=10, messages=[])
+        claude_extract.complete(model="teams-model", max_tokens=10, messages=[], system="s")
+
+    first, second = (call.kwargs for call in client.messages.create.call_args_list)
+    assert (first["model"], second["model"]) == ("configured", "teams-model")
+    assert second["system"] == "s"
+    assert "system" not in first
+
+
+def _sdk_and_policy_references(tree):
+    """Names each place in `tree` that reaches the SDK's messages API or the policy.
+
+    From the syntax tree, not the text: any use of `.messages` counts (create,
+    stream, a raw response, an alias, a getattr), and a docstring or comment
+    that mentions them does not.
+    """
+    import ast
+
+    guarded = {"call_with_policy", "create_with_refusal_fallback"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "messages":
+            yield "messages"
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) > 1
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "messages"
+        ):
+            yield "messages"
+        elif isinstance(node, ast.Name) and node.id in guarded:
+            yield node.id
+        elif isinstance(node, ast.Attribute) and node.attr in guarded:
+            yield node.attr
+        elif isinstance(node, ast.ImportFrom):
+            yield from (alias.name for alias in node.names if alias.name in guarded)
+
+
+def test_the_reference_finder_sees_aliases_and_ignores_docstrings():
+    import ast
+
+    source = """
+def f(client):
+    \"\"\"It used to call client.messages.create() itself.\"\"\"
+    send = client.messages.create
+    other = getattr(client, "messages").create
+    raw = client.messages.with_raw_response.create
+    stream = client.messages.stream
+    from src.extract.claude_extract import call_with_policy
+    return send, other, raw, stream
+"""
+    found = sorted(_sdk_and_policy_references(ast.parse(source)))
+
+    assert found == ["call_with_policy"] + ["messages"] * 4
+
+
+def test_every_sdk_request_goes_through_complete():
+    """The call sites each built the same request, and one bug was fixed four times.
+    Only claude_extract.py, where complete() lives, may run the policy or the
+    refusal fallback, and only the fallback module may touch the messages API."""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    found: dict[str, set[str]] = {}
+    for tree in ("src", "scripts"):
+        for path in (root / tree).rglob("*.py"):
+            parsed = ast.parse(path.read_text(encoding="utf-8"))
+            for name in _sdk_and_policy_references(parsed):
+                found.setdefault(name, set()).add(str(path.relative_to(root)))
+
+    assert found["messages"] == {"src/extract/vertex_fallback.py"}
+    assert found["create_with_refusal_fallback"] == {"src/extract/claude_extract.py"}
+    assert found["call_with_policy"] == {"src/extract/claude_extract.py"}
 
 
 def test_extract_one_does_not_close_shared_client(monkeypatch):

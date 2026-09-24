@@ -953,21 +953,20 @@ def test_max_call_seconds_matches_every_call_site():
     """The budget is only honest while the reserve's max_call matches what callers pass.
 
     news reads this per profile from config; here it is one constant, so nothing but
-    this test connects it to reality. All six sites pass 120.0: claude_extract's
-    extract_one and extract_conversation, attachment_pipeline, image_vision,
-    calendar_extractor and teams_pipeline.
+    this test connects it to reality. Every call site (extract_one and
+    extract_conversation, attachment_pipeline, image_vision, calendar_extractor,
+    teams_pipeline and the curate job) sends through claude_extract.complete, the one
+    place that calls the policy, with 120.0.
 
-    THE COUNT IS AS LOAD-BEARING AS THE VALUE, which this project has now demonstrated
-    twice over. It was five, and the sixth was teams_pipeline._call_llm, which reached the
-    SDK directly and so had no retry, no re-auth and no deadline; this assertion is what
-    fired the moment it was routed through the policy. Read the other way, a count that
-    silently grows is a call site somebody added WITHOUT the policy, and a count that
-    shrinks is one that left it.
+    THE COUNT IS AS LOAD-BEARING AS THE VALUE. It was six, one per call site, until
+    they shared complete(); before that it was five, and the sixth was
+    teams_pipeline._call_llm, which reached the SDK directly and so had no retry, no
+    re-auth and no deadline. A second call now is a site that bypasses complete().
+    test_claude_extract's structural test names the file.
 
     Would this pass with the behaviour removed? It guards a constant rather than a
-    behaviour, so the mutation is elsewhere: change any call site to a different
-    max_call_seconds, or change MAX_CALL_SECONDS alone, and the two assertions diverge.
-    Removing the policy from any one site drops the count to 5 and fails the first.
+    behaviour, so the mutation is elsewhere: change complete()'s max_call_seconds, or
+    change MAX_CALL_SECONDS alone, and the two assertions diverge.
     """
     src = Path(__file__).resolve().parents[1] / "src"
     sites = [
@@ -977,6 +976,6 @@ def test_max_call_seconds_matches_every_call_site():
             r"call_with_policy\([^)]*max_call_seconds=([0-9.]+)", py.read_text(), re.S
         )
     ]
-    assert len(sites) == 6, f"expected 6 call_with_policy sites, found {len(sites)}"
+    assert len(sites) == 1, f"expected 1 call_with_policy site, found {len(sites)}"
     assert set(sites) == {120.0}
     assert llm_deadline.MAX_CALL_SECONDS == 120.0

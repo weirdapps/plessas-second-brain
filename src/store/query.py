@@ -12,6 +12,21 @@ from typing import Any
 from src.config import USER_EMAIL_PATTERN
 from src.store.greek import register_sql_functions, search_fold
 from src.store.normalizer import normalize_topic
+from src.store.schema import subject_to_conversation_id
+
+# The loader threads an email with no conversation id and no references by the
+# hash of its normalized subject, so every blank subject shares this id: 92
+# unrelated emails on the replica.
+_BLANK_SUBJECT_THREAD = subject_to_conversation_id("")
+
+# The thread an email row belongs to, for one row per thread and for the thread
+# view: NULL for an email with none (no id, a blank one, the blank-subject hash),
+# and for News, whose conversation_id is a day per pipeline rather than a thread.
+# Anything else is the id as stored, which is what query_thread selects on.
+_THREAD = (
+    "CASE WHEN e.mailbox_name = 'News' OR TRIM(e.conversation_id) = '' "
+    f"OR e.conversation_id = '{_BLANK_SUBJECT_THREAD}' THEN NULL ELSE e.conversation_id END"
+)
 
 
 def _sanitize_fts5_query(keyword: str) -> str:
@@ -121,7 +136,8 @@ def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> li
     Given an email_id, finds its conversation_id and returns the emails in that
     conversation ordered chronologically. A thread longer than `limit` gives the
     `limit` emails centred on this one: the oldest could leave it out, and a
-    search usually hits a recent one.
+    search usually hits a recent one. An email with no thread (_THREAD: News, no
+    or a blank conversation id) is a thread of one; an unknown id gives [].
 
     Args:
         conn: Database connection
@@ -132,25 +148,21 @@ def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> li
         List of dicts with keys: email_id, date, subject, summary,
         sender_name, sender_address, sentiment
     """
-    # Find conversation_id for the given email. News and a blank id are no
-    # thread, as keyword search treats them (_THREAD): News keeps a day per
-    # pipeline there, and strangers can share a blank id.
-    cursor = conn.execute(
-        "SELECT conversation_id, mailbox_name FROM emails WHERE id = ?", (email_id,)
-    )
-    row = cursor.fetchone()
-    if not row or not (row["conversation_id"] or "").strip() or row["mailbox_name"] == "News":
+    row = conn.execute(f"SELECT {_THREAD} FROM emails e WHERE e.id = ?", (email_id,)).fetchone()
+    if not row:
         return []
-
-    conversation_id = row["conversation_id"]
-
-    ids = [
-        r[0]
-        for r in conn.execute(
-            "SELECT id FROM emails WHERE conversation_id = ? ORDER BY date_received ASC, id ASC",
-            (conversation_id,),
-        )
-    ]
+    thread = row[0]
+    ids = (
+        [
+            r[0]
+            for r in conn.execute(
+                "SELECT id FROM emails WHERE conversation_id = ? ORDER BY date_received ASC, id ASC",
+                (thread,),
+            )
+        ]
+        if thread is not None
+        else [email_id]
+    )
     if 0 <= limit < len(ids):
         at = ids.index(email_id) if email_id in ids else len(ids) - 1
         start = max(0, min(at - limit // 2, len(ids) - limit))
@@ -176,14 +188,16 @@ def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> li
 
 
 def count_thread(conn: sqlite3.Connection, email_id: int) -> int:
-    """How many emails query_thread's thread holds, however many it returned."""
-    row = conn.execute(
-        "SELECT COUNT(*) FROM emails WHERE conversation_id = "
-        "(SELECT conversation_id FROM emails WHERE id = ? AND TRIM(conversation_id) <> '' "
-        "AND COALESCE(mailbox_name, '') <> 'News')",
-        (email_id,),
-    ).fetchone()
-    return row[0]
+    """How many emails query_thread's thread holds, however many it returned: 1
+    for an email with no thread, 0 for an unknown id."""
+    row = conn.execute(f"SELECT {_THREAD} FROM emails e WHERE e.id = ?", (email_id,)).fetchone()
+    if not row:
+        return 0
+    if row[0] is None:
+        return 1
+    return conn.execute(
+        "SELECT COUNT(*) FROM emails WHERE conversation_id = ?", (row[0],)
+    ).fetchone()[0]
 
 
 # A person filter picks its plan by how many emails the people it means are on.
@@ -342,25 +356,23 @@ def query_by_keyword(
     return []
 
 
-# The thread an email row belongs to, for one row per thread: NULL for an email
-# with none (or a blank id), and for News, whose conversation_id is a day per
-# pipeline rather than a thread.
-_THREAD = "CASE WHEN e.mailbox_name = 'News' THEN NULL ELSE NULLIF(TRIM(e.conversation_id), '') END"
-
 # Leaves out the threads already on the page: in the query, not after it, since
 # skipped after the LIMIT they used it up. One parameter, a JSON list.
 _NOT_TAKEN = f"AND COALESCE({_THREAD}, '') NOT IN (SELECT value FROM json_each(?))"
 
 
-def _best_of_each_thread(rank: str) -> str:
+def _best_of_each_thread(rank: str, then: str = "") -> str:
     """Numbers each thread's rows by `rank`, so nth = 1 is its best match.
 
-    An email with no thread partitions by its id, an integer, which no
-    conversation_id (always text) can equal. SQLite refuses snippet() in a query
-    with a window function, so the sources that need one pick their rows first,
-    in a CTE, and take the snippet in the query around it.
+    Equal ranks go to the newest email, as a subject match does, then to `then`
+    (the newest attachment of one email). An email with no thread partitions by
+    its id, an integer, which no conversation_id (always text) can equal. SQLite
+    refuses snippet() in a query with a window function, so the sources that
+    need one pick their rows first, in a CTE, and take the snippet in the query
+    around it.
     """
-    return f"ROW_NUMBER() OVER (PARTITION BY COALESCE({_THREAD}, e.id) ORDER BY {rank})"
+    order = f"{rank}, e.date_received DESC, e.id DESC" + (f", {then}" if then else "")
+    return f"ROW_NUMBER() OVER (PARTITION BY COALESCE({_THREAD}, e.id) ORDER BY {order})"
 
 
 def thread_keys(conn: sqlite3.Connection, email_ids) -> dict:
@@ -548,7 +560,7 @@ def _keyword_waterfall(
                         attachment_content_fts.rank as score,
                         e.date_received as date,
                         e.id as email_id,
-                        {_best_of_each_thread("attachment_content_fts.rank")} as nth
+                        {_best_of_each_thread("attachment_content_fts.rank", then="ac.id DESC")} as nth
                     FROM attachment_content_fts
                     JOIN attachment_content ac ON ac.id = attachment_content_fts.rowid
                     JOIN attachments a ON a.id = ac.attachment_id

@@ -137,7 +137,9 @@ def email_thread(email_id: int, limit: int = 50) -> dict:
     """The emails of one email's thread, oldest first: date, sender, subject, summary.
 
     For reading the exchange around a search hit. `thread_total` is the thread's
-    size; above `limit`, the `limit` emails centred on `email_id` come back.
+    size; above `limit`, the `limit` emails centred on `email_id` come back. A
+    News item or an email with no conversation id is a thread of one; an unknown
+    id gives no emails and a total of 0.
 
     Args:
         email_id: emails.id of any email in the thread

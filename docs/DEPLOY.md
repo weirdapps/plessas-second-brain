@@ -273,19 +273,20 @@ the second one is worth a green check on the backup.
 reader sees, each link's address after its text (bar an image's, and a long
 query string), with the HTML kept compressed in `email_html`. Emails loaded
 before it keep their HTML body until `python -m src.cli split-html` converts
-them, on the producer. It reads and
-converts a batch with no lock held and writes it in one short transaction, so it
-can run beside the timers; it redacts credentials on the way, as the ingest path
-does; and it ends by optimizing the full-text index. `--dry-run` opens the
-database read-only, so it changes nothing, the schema included. Run it once
-more after every timer that started before the deploy has exited (or the next
-day): a job still running the old code loads HTML bodies as before, and a re-run
-converts only those. On a copy of a 3.5 GB store it converted 19,780 bodies
-(964 MB of HTML to 155 MB of text, the HTML kept in 123 MB) in 115 s, and the
-body index went from 425 to 226 MB. The file shrinks only after a `VACUUM`,
-which needs the writers stopped and about twice the database free: 3.5 GB became
-2.6 GB. `scripts/scrub_secrets.py --apply --vacuum` does both jobs in one quiet
-window, and scrubs the kept HTML as well.
+them, on the producer. It reads and converts a batch with no lock held and
+writes it in one short transaction, so it can run beside the timers; it redacts
+credentials on the way, as the ingest path does, and zeroes the pages it frees,
+so no copy of a redacted key is left for a pull or a snapshot to take; and it
+ends by optimizing the full-text index. `--dry-run` opens the database
+read-only, so it changes nothing, the schema included. Run it once more after
+every timer that started before the deploy has exited (or the next day): a job
+still running the old code loads HTML bodies as before, and a re-run converts
+only those. On a copy of a 3.5 GB store it converted 19,780 bodies (964 MB of
+HTML to 155 MB of text, the HTML kept in 123 MB) in 131 s, and the body index
+went from 425 to 226 MB. The file shrinks only after a `VACUUM`, which needs the
+writers stopped and about twice the database free: 3.5 GB became 2.6 GB.
+`scripts/scrub_secrets.py --apply --vacuum` does both jobs in one quiet window,
+and scrubs the kept HTML as well.
 
 ## 8. Backup and restore
 

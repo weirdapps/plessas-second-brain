@@ -55,10 +55,12 @@ def test_plain_text_is_not_mistaken_for_html():
     assert looks_like_html("<style>" + "p { margin: 0 }" * 400 + "</style><div>x</div>")
     assert looks_like_html('<?xml version="1.0"?>\n<!DOCTYPE html><html><body>x</body></html>')
     assert looks_like_html("<blockquote>x</blockquote>")
-    assert looks_like_html("<strong>x</strong> and more")
+    assert looks_like_html('<?xml version="1.0"?>\n<html><body>x</body></html>')
     assert looks_like_html("<o:p></o:p><p>x</p>")
     assert looks_like_html("\xa0\u200b<html><body>x</body></html>")
     assert not looks_like_html("<mailto:a@example.com> wrote")
+    assert not looks_like_html("<sip:alice> called you")
+    assert not looks_like_html("<?xml version='1.0'?>\n<root/>")  # XML, not a web page
     assert not looks_like_html("<https://example.com/a> is the link")
     assert not looks_like_html("Plain text that mentions <angle> brackets")
     assert not looks_like_html("a < b and c > d")
@@ -72,6 +74,10 @@ def test_text_quoting_markup_or_addresses_stays_text():
     assert not looks_like_html("Call me.\nFrom: Petros <p.petrou@example.com>\nSent: Monday")
     assert not looks_like_html("Please use <br> tags.\nContact: Maria <maria@example.com>")
     assert not looks_like_html("<maria@example.com> wrote:\n> the <p> tag is fine")
+    # An inline tag or a title at the top of a text mail: converted, it lost its
+    # line breaks, and a title swallowed the whole body.
+    assert not looks_like_html("<title> of the book is X")
+    assert not looks_like_html("<b>Note:</b> the meeting moved.\nThanks")
 
 
 def test_a_head_left_open_hides_nothing():
@@ -94,11 +100,22 @@ def test_an_element_never_closed_hides_nothing_after_it():
     assert html_to_text("<p>a</p><title>b<p>c</p><xml>d<p>e</p>") == "a\n\nb\n\nc\n\nd\n\ne"
 
 
-def test_an_element_never_closed_hides_itself_when_nothing_follows_it():
-    """Re-read only when markup was swallowed: a script cut off at the end of a
-    body is code, and stays out of the text."""
+def test_a_script_never_closed_stays_code():
+    """Any other element never closed is read again without its tag, whatever
+    follows it; a script is code, even when it writes markup."""
     assert html_to_text("<p>hello</p><script>var token = 1;") == "hello"
-    assert html_to_text("<p>a</p><title>b<p>c</p><style>d") == "a\n\nb\n\nc"
+    assert html_to_text('<p>Hello</p><script>document.write("<p>ad</p>"); var s = 1;') == "Hello"
+    assert html_to_text("<p>a</p><title>b<p>c</p><style>d") == "a\n\nb\n\nc\n\nd"
+    assert html_to_text("<div>Hi</div><title>Subj\nBody text only") == "Hi\nSubj Body text only"
+    assert html_to_text("<p>A</p><style>.x{}</head><body><p>B real</p>") == "A\n\n.x{}\n\nB real"
+
+
+def test_frames_and_embeds_show_no_fallback_markup():
+    """Newer Python tokenizers read iframe, noembed and noframes as raw text, which
+    came out as literal tags; a browser renders none of it."""
+    assert html_to_text('<p>A</p><iframe src="x"><p>inner</p></iframe><p>B</p>') == "A\n\nB"
+    assert html_to_text("<noembed><b>fallback</b></noembed>x") == "x"
+    assert html_to_text("<noframes><p>No frames</p></noframes><p>y</p>") == "y"
 
 
 def test_only_the_first_body_ends_the_head():
@@ -189,6 +206,45 @@ def test_a_link_shows_where_it_really_goes():
     html = '<a href="https://evil.example/login" originalsrc="https://bank.example/">Bank login</a>'
     assert html_to_text(html) == "Bank login (https://evil.example/login)"
     assert html_to_text('<a href="http://[::1">x</a>') == "x"  # urlsplit refuses it
+    # A browser reads a backslash as a slash, so the host is evil.example.
+    tricked = "https://evil.example\\@eur01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fbank.example"
+    assert html_to_text(f'<a href="{tricked}">Log in</a>') == (
+        "Log in (https://evil.example/@eur01.safelinks.protection.outlook.com/"
+        "?url=https%3A%2F%2Fbank.example)"
+    )
+
+
+def test_a_lookalike_in_the_text_does_not_hide_the_address():
+    """The text shows the address only when it holds it whole, not a longer name
+    that ends with it: pal.com is not paypal.com."""
+    assert html_to_text(
+        '<a href="https://pal.example/login">https://www.paypal.example/login</a>'
+    ) == ("https://www.paypal.example/login (https://pal.example/login)")
+    assert html_to_text('<a href="https://ybank.example">Log in at mybank.example</a>') == (
+        "Log in at mybank.example (https://ybank.example)"
+    )
+    assert html_to_text('<a href="https://bank.example/login">bank.example/login-help</a>') == (
+        "bank.example/login-help (https://bank.example/login)"
+    )
+    assert html_to_text('<a href="https://example.com/">example.com/</a>') == "example.com/"
+    assert html_to_text('<a href="https://example.com/doc">see example.com/doc.</a>') == (
+        "see example.com/doc."
+    )
+
+
+def test_a_safe_link_wrapped_twice_is_unwrapped_twice():
+    """Mail forwarded between tenants is wrapped by each one's Safe Links."""
+    from urllib.parse import quote
+
+    inner = (
+        "https://eur01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fexample.com"
+        "%2Fdoc%3Fid%3D7&data=1"
+    )
+    outer = f"https://eur02.safelinks.protection.outlook.com/?url={quote(inner, safe='')}&data=2"
+
+    assert (
+        html_to_text(f'<a href="{outer}">the doc</a>') == "the doc (https://example.com/doc?id=7)"
+    )
 
 
 def test_a_link_adds_little_to_the_text():
@@ -239,6 +295,38 @@ def test_css_white_space_pre_keeps_its_lines():
     assert html_to_text('<span style="WHITE-SPACE: pre">x  y</span><b>z  w</b>') == "x  yz w"
     assert html_to_text('<br style="white-space:pre"><p>a\nb</p>') == "a b"  # no end tag
     assert html_to_text("<textarea>a  b\nc</textarea>") == "a  b\nc"
+
+
+def test_white_space_follows_the_element_tree():
+    """A same-named element inside a pre element does not end it; an element whose
+    end tag HTML lets you leave out ends at its next sibling or its container;
+    pre-line keeps the lines and not the spaces; normal inside pre collapses."""
+    fields = (
+        '<p><span style="white-space:pre">f1:  v1\n<span style="color:red">f2</span>:  v2\n'
+        "f3:  v3</span></p>"
+    )
+    assert html_to_text(fields) == "f1:  v1\nf2:  v2\nf3:  v3"
+    nested = '<div style="white-space:pre">a    b\nline2<div>x</div>c    d\nline4</div>'
+    assert html_to_text(nested) == "a    b\nline2\nx\nc    d\nline4"
+    items = '<ul><li style="white-space:pre-wrap">one  two<li>three</ul><p>Tail\n  wrapped</p>'
+    assert html_to_text(items) == "one  two\nthree\n\nTail wrapped"
+    cells = (
+        '<table><tr><td style="white-space:pre">A  B<td>C\n   D</table>\n'
+        "<p>After\n    table   text</p>"
+    )
+    assert html_to_text(cells) == "A  B C D\n\nAfter table text"
+    assert html_to_text('<div style="white-space: pre-line">a     b\nc</div>') == "a b\nc"
+    normal = '<pre>a  b<span style="white-space:normal">c  d\ne</span>f  g</pre>'
+    assert html_to_text(normal) == "a  bc d ef  g"
+    inner = (
+        '<table><tr><td style="white-space:pre">a  b<table><tr><td>x</td></tr></table>'
+        "c  d</td></tr></table>"
+    )
+    assert html_to_text(inner) == "a  b\n\nx\n\nc  d"  # a cell in a nested table is no sibling
+    assert html_to_text("<pre>a  b</span>c  d</pre>") == "a  bc  d"  # a stray end tag ends nothing
+    rows = '<table><tr style="white-space:pre"><td>a  b<tr><td>c  d</table>'
+    assert html_to_text(rows) == "a  b\nc d"  # the next row ends a row left open
+    assert html_to_text('<p style="white-space:pre">a  b<div>c  d</div>') == "a  b\nc d"
 
 
 def test_private_use_characters_are_text():

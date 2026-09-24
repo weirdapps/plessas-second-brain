@@ -412,6 +412,11 @@ def cmd_process_images(args):
     print(f"  Failed: {stats['failed']}")
 
 
+# split-html holds a batch in memory until it writes it, so a batch ends at this
+# many characters of bodies as well as at --batch emails.
+SPLIT_HTML_BATCH_BYTES = 64_000_000
+
+
 def cmd_split_html(args) -> int:
     """Keep the HTML of emails loaded before schema v23 beside their text.
 
@@ -423,10 +428,10 @@ def cmd_split_html(args) -> int:
 
     Credentials are redacted on the way, as the ingest path has done since #55:
     an older body can hold one, and in email_html it would be compressed, out of
-    sight of the index and of a grep of the file. A dry run opens the database
-    read-only, so it neither migrates nor converts.
+    sight of the index and of a grep of the file. secure_delete zeroes the pages
+    the rewrite frees, which the replica pull and the snapshots would copy. A dry
+    run opens the database read-only, so it neither migrates nor converts.
     """
-    import json
     import sqlite3
 
     from src.extract.html_text import LEADING
@@ -446,6 +451,7 @@ def cmd_split_html(args) -> int:
     else:
         conn = get_connection(db_path)
         run_migrations(conn)
+        conn.execute("PRAGMA secure_delete = ON")
         migrated = True
     # A prefilter in SQL, on the same opening looks_like_html reads; it decides.
     not_kept = (
@@ -461,21 +467,24 @@ def cmd_split_html(args) -> int:
     ]
     converted = before = after = kept = 0
     size = max(1, args.batch)
-    for start in range(0, len(candidates), size):
+    pos = 0
+    while pos < len(candidates):
         # Read and convert with no lock held: the writers sharing the database
         # wait for the writes only, not for the parsing.
-        ids = candidates[start : start + size]
-        ready = []
-        for email_id, content in conn.execute(
-            "SELECT id, content FROM emails WHERE id IN (SELECT value FROM json_each(?))",
-            (json.dumps(ids),),
-        ).fetchall():
-            if content is None:
+        ready: list[tuple[int, str, str | None, bytes, int]] = []
+        held = 0
+        while pos < len(candidates) and len(ready) < size and held < SPLIT_HTML_BATCH_BYTES:
+            email_id = candidates[pos]
+            pos += 1
+            row = conn.execute("SELECT content FROM emails WHERE id = ?", (email_id,)).fetchone()
+            if row is None or row[0] is None:
                 continue
+            content = row[0]
             body, html = split_body(redact_secrets(content))
             if html is not None:
-                ready.append((email_id, content, body, html, pack(html)))
-        for email_id, content, body, html, blob in ready:
+                ready.append((email_id, content, body, pack(html), len(html.encode("utf-8"))))
+                held += len(content)
+        for email_id, content, body, blob, html_bytes in ready:
             if not args.dry_run:
                 # Unless the body changed since it was read: a re-load wins.
                 if not conn.execute(
@@ -488,7 +497,7 @@ def cmd_split_html(args) -> int:
                     (email_id, blob),
                 )
             converted += 1
-            before += len(html.encode("utf-8"))
+            before += html_bytes
             after += len((body or "").encode("utf-8"))
             kept += len(blob)
         if not args.dry_run:

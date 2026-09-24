@@ -264,3 +264,29 @@ def test_a_key_in_kept_html_is_found_and_redacted(scrub, tmp_path, capsys, monke
     conn.close()
     assert unpack(blob) == "<html><body><p>[REDACTED:anthropic-key]</p></body></html>"
     assert scrub.main([]) == 0
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [b"not zlib at all", __import__("zlib").compress(b"\xff\xfe not utf-8"), "a text value"],
+)
+def test_an_unreadable_kept_html_is_counted_not_fatal(scrub, tmp_path, capsys, monkeypatch, bad):
+    """One damaged email_html row stopped the scrub of every table, with the exit
+    code that means 'found credentials'. It is counted, the rest is scrubbed, and
+    the run exits 2: it could not check everything."""
+    path = _db(tmp_path, scrub, monkeypatch)
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO email_html (email_id, html) VALUES (2, ?)", (bad,))
+    conn.commit()
+    conn.close()
+
+    assert scrub.main([]) == 2
+    out = capsys.readouterr()
+    assert "emails.content: 1 row" in out.out
+    assert "1 email_html row could not be read" in out.err
+
+    assert scrub.main(["--apply"]) == 2
+    conn = sqlite3.connect(path)
+    (m1,) = conn.execute("SELECT content FROM emails WHERE message_id = 'm1'").fetchone()
+    conn.close()
+    assert "[REDACTED:google-key]" in m1

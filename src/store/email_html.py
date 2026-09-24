@@ -1,7 +1,7 @@
 """The HTML of an email body, kept compressed beside the text the body holds.
 
-Outlook sends HTML: 19,774 emails held 964 MB of it, two thirds of the
-emails.content column. The body now holds the text a reader sees (see
+Outlook sends HTML: 19,780 emails held 964 MB of it on 2026-09-24, two thirds
+of the emails.content column. The body now holds the text a reader sees (see
 src.extract.html_text), which is what gets indexed and read. Two readers need
 the markup itself, so it is kept here (schema v23): the SharePoint link scan,
 which takes URLs from hrefs, and the inline-image positions, which look for cid:

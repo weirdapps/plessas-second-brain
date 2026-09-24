@@ -256,6 +256,15 @@ def test_a_run_in_which_nothing_succeeded_counts_nothing(staged, monkeypatch):
     assert state["given_up_ids"] == []
 
 
+def _status(code):
+    from src.extract import policy_bridge
+
+    cls = policy_bridge.anthropic.APIStatusError
+    exc = cls.__new__(cls)
+    exc.status_code = code
+    return exc
+
+
 def _overloaded():
     """The SDK's 529, through the module that already imports the SDK."""
     from src.extract import policy_bridge
@@ -274,6 +283,7 @@ def _overloaded():
         pytest.param(ConnectionError("connection reset"), False, None, id="service"),
         pytest.param(RuntimeError("429 RESOURCE_EXHAUSTED"), True, None, id="quota"),
         pytest.param(_overloaded(), True, None, id="overloaded-529"),
+        pytest.param(_status(408), False, "timeout", id="request-timeout-408"),
         pytest.param(
             ValueError("Failed to parse JSON: Expecting ',' delimiter: line 1 column 4291"),
             False,

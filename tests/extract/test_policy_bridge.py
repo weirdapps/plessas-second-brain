@@ -157,3 +157,70 @@ def test_reset_client_cache_is_registered_as_a_post_reauth_callback():
         "names (e.g. both 'src.extract.policy_bridge' and 'extract.policy_bridge') "
         "causing the module-level register_post_reauth call to execute twice."
     )
+
+
+def test_an_unusable_reply_is_never_transient_whatever_its_message_says():
+    """A parser's column number read as a 429: calendar sync kept the event
+    pending and extracted it again every run."""
+    from src.extract.policy_bridge import is_transient
+
+    for message in (
+        "Failed to parse JSON: Expecting ',' delimiter: line 1 column 4291 (char 4290)",
+        "Failed to parse JSON: Unterminated string starting at: line 1 column 529",
+        "Failed to parse JSON: Expecting value: line 408 column 1 timeout",
+    ):
+        assert not is_transient(ValueError(message)), message
+
+
+def _sdk_timeout(cause=None):
+    exc = anthropic.APITimeoutError.__new__(anthropic.APITimeoutError)
+    exc.__cause__ = cause
+    return exc
+
+
+def test_a_timeout_of_the_request_is_told_apart_from_one_reaching_the_service():
+    """A request that runs out of time will again; a connection that could not be
+    made, or waited for a pooled one, says nothing about the request."""
+    import httpx
+    import httpx2
+    from google.genai import errors as genai_errors
+
+    from src.extract.policy_bridge import is_item_timeout
+
+    request = httpx.Request("POST", "https://example.invalid")
+    request2 = httpx2.Request("POST", "https://example.invalid")
+    of_the_request = [
+        TimeoutError(),
+        _sdk_timeout(),
+        _sdk_timeout(httpx2.ReadTimeout("read", request=request2)),
+        httpx.ReadTimeout("read", request=request),
+        _status_error(anthropic.APIStatusError, 408),
+        _status_error(anthropic.InternalServerError, 504),
+        genai_errors.ClientError(408, {"error": {}}),
+        genai_errors.ServerError(504, {"error": {"status": "DEADLINE_EXCEEDED"}}),
+    ]
+    reaching_the_service = [
+        _sdk_timeout(httpx2.ConnectTimeout("connect", request=request2)),
+        _sdk_timeout(httpx2.PoolTimeout("pool", request=request2)),
+        httpx.ConnectTimeout("connect", request=request),
+        httpx.PoolTimeout("pool", request=request),
+    ]
+    not_timeouts = [
+        _status_error(anthropic.InternalServerError, 500),
+        _status_error(anthropic.RateLimitError, 429),
+        genai_errors.ServerError(503, {"error": {"status": "UNAVAILABLE"}}),
+        ValueError("Failed to parse JSON"),
+        gauth.TimeoutError("token refresh timed out"),
+    ]
+
+    assert [is_item_timeout(e) for e in of_the_request] == [True] * len(of_the_request)
+    others = reaching_the_service + not_timeouts
+    assert [is_item_timeout(e) for e in others] == [False] * len(others)
+    # Still worth offering again, just not the request's doing.
+    assert all(is_transient_(e) for e in reaching_the_service)
+
+
+def is_transient_(exc):
+    from src.extract.policy_bridge import is_transient
+
+    return is_transient(exc)

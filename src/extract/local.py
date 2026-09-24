@@ -51,7 +51,10 @@ CONVERSATION_MAX_TIMEOUTS = 10
 # A conversation that ended this recently may still be going on. It was staged
 # part-way through, and extracting it now would load its first turns for good,
 # since a loaded session is never staged again. It is staged again, fuller, by a
-# later export, and extracted once it has been quiet this long.
+# later export, and extracted once it has been quiet this long. This narrows the
+# loss, it does not close it: "quiet" is judged from the copy this host holds,
+# so a session resumed after a longer pause, or whose last turns had not reached
+# this host yet, still loads without its later turns.
 CONVERSATION_SETTLE_HOURS = 2
 
 # Runs after which an email that keeps failing is loaded without its
@@ -92,22 +95,21 @@ def _is_unusable_reply(exc: BaseException) -> bool:
 def _failure_kind(exc: BaseException, is_quota: bool) -> str | None:
     """FAULT for the item's own failure, TIMEOUT for a timeout, None for the service's.
 
-    A timeout is tested before the transient errors it belongs among, because
-    the same item timing out run after run is a property of the item.
+    A timeout of the request, on either side, is tested before the transient
+    errors it belongs among, because the same request timing out run after run
+    is a property of the item. A timeout reaching the service is the network's
+    (see policy_bridge.is_item_timeout).
     """
-    import httpx
-
-    from src.extract.policy_bridge import classify_exception, is_transient
+    from src.extract.policy_bridge import classify_exception, is_item_timeout, is_transient
     from src.llm_policy import Outcome
 
     if is_quota:
         return None
     if _is_unusable_reply(exc):
         return FAULT
-    outcome = classify_exception(exc, None)
-    if outcome is Outcome.AUTH_REAUTH_REQUIRED:
+    if classify_exception(exc, None) is Outcome.AUTH_REAUTH_REQUIRED:
         return None
-    if outcome is Outcome.TIMEOUT or isinstance(exc, TimeoutError | httpx.TimeoutException):
+    if is_item_timeout(exc):
         return TIMEOUT
     if is_transient(exc):
         return None
@@ -176,7 +178,14 @@ def extract_one(email: dict, api_key: str | None, engine: str = "gemini") -> dic
     from src.extract.parser import parse_extraction
     from src.extract.prompt import build_extraction_prompt
 
-    client = genai.Client(api_key=api_key) if api_key else genai.Client()
+    # Worker threads have no SIGALRM, and the client's own default is no timeout
+    # at all. In milliseconds.
+    http_options = types.HttpOptions(timeout=CALL_TIMEOUT * 1000)
+    client = (
+        genai.Client(api_key=api_key, http_options=http_options)
+        if api_key
+        else genai.Client(http_options=http_options)
+    )
     prompt = build_extraction_prompt(email)
 
     response = client.models.generate_content(

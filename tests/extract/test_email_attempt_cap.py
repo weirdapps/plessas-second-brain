@@ -203,12 +203,31 @@ def test_news_does_not_hold_the_quota_breaker_open(run, workers):
 # --- extract_inline: what is retried, and what counts
 
 
-def _sdk_timeout():
+def _sdk_timeout(cause=None):
     """The SDK's own timeout, through the module that already imports the SDK."""
     from src.extract import policy_bridge
 
     cls = policy_bridge.anthropic.APITimeoutError
-    return cls.__new__(cls)
+    exc = cls.__new__(cls)
+    exc.__cause__ = cause
+    return exc
+
+
+def _sdk_status(name, status):
+    from src.extract import policy_bridge
+
+    cls = getattr(policy_bridge.anthropic, name)
+    exc = cls.__new__(cls)
+    exc.status_code = status
+    return exc
+
+
+def _connect_timeout():
+    import httpx2
+
+    return httpx2.ConnectTimeout(
+        "connect", request=httpx2.Request("POST", "https://example.invalid")
+    )
 
 
 @pytest.fixture
@@ -253,6 +272,16 @@ def inline(monkeypatch, tmp_path):
         ),
         pytest.param(TimeoutError(), 3, False, "timeout", id="timeout"),
         pytest.param(_sdk_timeout(), 3, False, "timeout", id="sdk-timeout"),
+        pytest.param(_sdk_timeout(_connect_timeout()), 3, False, None, id="connect-timeout"),
+        pytest.param(_sdk_status("APIStatusError", 408), 3, False, "timeout", id="408"),
+        pytest.param(_sdk_status("InternalServerError", 504), 3, False, "timeout", id="504"),
+        pytest.param(
+            genai_errors.ServerError(504, {"error": {"status": "DEADLINE_EXCEEDED"}}),
+            3,
+            False,
+            "timeout",
+            id="gemini-504",
+        ),
         pytest.param(RuntimeError("429 RESOURCE_EXHAUSTED"), 3, True, None, id="quota"),
     ],
 )
@@ -303,3 +332,28 @@ def test_a_fault_outranks_a_timeout_in_the_same_run(run, order):
 
     assert run.state()["failed_attempts"] == {"both": 1}
     assert run.state()["timeout_attempts"] == {}
+
+
+@pytest.mark.parametrize("api_key", ["k", None])
+def test_the_gemini_client_gives_up_on_a_call_in_time(monkeypatch, api_key):
+    """Worker threads have no SIGALRM, and the client's own default is no timeout
+    at all: an email too big to answer hung its worker, never counted."""
+    from google import genai
+
+    made: dict = {}
+
+    class Client:
+        def __init__(self, **kwargs):
+            made.update(kwargs)
+            self.models = self
+
+        def generate_content(self, **kwargs):
+            return type("Reply", (), {"text": '{"summary": "s"}'})()
+
+    monkeypatch.setattr(genai, "Client", Client)
+
+    out = local.extract_one(_mail("m"), api_key, engine="gemini")
+
+    assert out["summary"] == "s"
+    assert made["http_options"].timeout == local.CALL_TIMEOUT * 1000
+    assert made.get("api_key") == api_key

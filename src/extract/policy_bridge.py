@@ -22,6 +22,20 @@ from src.extract.claude_extract import reset_client_cache
 from src.extract.vertex_auth import is_vertex_auth_error
 from src.llm_policy import Outcome, register_post_reauth
 
+# Timeouts reaching the service rather than of the request (see is_item_timeout).
+# httpx2 is the Anthropic SDK's transport, a fork of httpx.
+try:
+    import httpx2
+
+    _REACHING_TIMEOUTS: tuple[type[BaseException], ...] = (
+        httpx.ConnectTimeout,
+        httpx.PoolTimeout,
+        httpx2.ConnectTimeout,
+        httpx2.PoolTimeout,
+    )
+except ImportError:  # an SDK back on plain httpx
+    _REACHING_TIMEOUTS = (httpx.ConnectTimeout, httpx.PoolTimeout)
+
 _RATE_LIMIT_PATTERNS = ("429", "resource_exhausted")
 
 
@@ -81,6 +95,10 @@ def is_transient(exc: BaseException) -> bool:
     itself. A reply the caller cannot use (unparseable, truncated) raises
     ValueError there, and trying again would get the same reply.
     """
+    # Whatever its message says: a parser's column number can read as a '429'.
+    # google-auth's own ValueErrors are credentials, and are judged below.
+    if isinstance(exc, ValueError) and not isinstance(exc, gauth.GoogleAuthError):
+        return False
     if classify_exception(exc, None) in (Outcome.RATE_LIMIT, Outcome.TIMEOUT):
         return True
     if isinstance(exc, anthropic.APIConnectionError | anthropic.InternalServerError):
@@ -95,13 +113,34 @@ def is_transient(exc: BaseException) -> bool:
     # unwrapped.
     if isinstance(exc, genai_errors.ServerError | httpx.TransportError):
         return True
-    # A request timeout, a conflict and a client-closed request: statuses the
-    # SDKs retry themselves, below the 5xx line.
+    # Worth offering again, below the 5xx line: a request timeout, a conflict, a
+    # client-closed request. Anthropic's SDK retries 408 and 409 itself; the
+    # Gemini client retries nothing unless it is told to.
     if isinstance(exc, anthropic.APIStatusError) and exc.status_code in (408, 409):
         return True
     if isinstance(exc, genai_errors.APIError) and exc.code in (408, 409, 499):
         return True
     return isinstance(exc, ConnectionError | TimeoutError)
+
+
+def is_item_timeout(exc: BaseException) -> bool:
+    """The request ran out of time, as the same request is likely to again.
+
+    On either side: the client's own timeout, or the service giving up on it (a
+    408, or a 504 such as Gemini's DEADLINE_EXCEEDED). Not a timeout reaching the
+    service, while connecting or waiting for a pooled connection: that is the
+    network's, and says nothing about the request. The Anthropic SDK wraps every
+    timeout of its transport in APITimeoutError, so the cause tells them apart.
+    """
+    if isinstance(exc, _REACHING_TIMEOUTS) or isinstance(exc.__cause__, _REACHING_TIMEOUTS):
+        return False
+    if classify_exception(exc, None) is Outcome.TIMEOUT:
+        return True
+    if isinstance(exc, TimeoutError | httpx.TimeoutException):
+        return True
+    if isinstance(exc, anthropic.APIStatusError) and exc.status_code in (408, 504):
+        return True
+    return isinstance(exc, genai_errors.APIError) and exc.code in (408, 504)
 
 
 register_post_reauth(reset_client_cache)

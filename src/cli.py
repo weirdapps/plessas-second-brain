@@ -88,7 +88,7 @@ IMAGE_CLASSIFY_SYNC_BUDGET_S = 90.0
 # 23:28 the previous evening was SIGTERMed seconds after printing "Sync
 # complete". 30 s holds the previously assumed sum exactly, so the margin tests
 # keep the same headroom they were written against; the remainder drains on
-# sb-conversation-sync, which has 1800 s.
+# sb-conversation-sync, which has 900 s.
 CONVERSATION_SYNC_DEADLINE_S = 30.0
 
 # Step 2 (email extraction) had no bound either, and could sleep an hour

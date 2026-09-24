@@ -116,10 +116,12 @@ def _has_subject_index(conn: sqlite3.Connection) -> bool:
 
 
 def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> list[dict]:
-    """Get the full conversation thread for an email.
+    """Get the conversation thread for an email.
 
-    Given an email_id, finds its conversation_id and returns all emails
-    in that conversation ordered chronologically.
+    Given an email_id, finds its conversation_id and returns the emails in that
+    conversation ordered chronologically. A thread longer than `limit` gives the
+    `limit` emails centred on this one: the oldest could leave it out, and a
+    search usually hits a recent one.
 
     Args:
         conn: Database connection
@@ -138,7 +140,18 @@ def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> li
 
     conversation_id = row["conversation_id"]
 
-    # Get all emails in this conversation
+    ids = [
+        r[0]
+        for r in conn.execute(
+            "SELECT id FROM emails WHERE conversation_id = ? ORDER BY date_received ASC, id ASC",
+            (conversation_id,),
+        )
+    ]
+    if 0 <= limit < len(ids):
+        at = ids.index(email_id) if email_id in ids else len(ids) - 1
+        start = max(0, min(at - limit // 2, len(ids) - limit))
+        ids = ids[start : start + limit]
+
     cursor = conn.execute(
         """
         SELECT
@@ -150,11 +163,10 @@ def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> li
             sender_address,
             sentiment
         FROM emails
-        WHERE conversation_id = ?
-        ORDER BY date_received ASC
-        LIMIT ?
+        WHERE id IN (SELECT value FROM json_each(?))
+        ORDER BY date_received ASC, id ASC
         """,
-        (conversation_id, limit),
+        (json.dumps(ids),),
     )
     return [dict(r) for r in cursor.fetchall()]
 
@@ -302,7 +314,8 @@ def query_by_keyword(
     limit: int = 20,
     search_content_only: bool = False,
 ) -> list[dict]:
-    """Full-text search using FTS5 on email summaries, content, and key facts.
+    """Full-text search using FTS5 on email subjects, summaries, content, key facts
+    and attachments.
 
     Args:
         conn: Database connection
@@ -331,37 +344,60 @@ def _keyword_waterfall(
     search_content_only: bool,
 ) -> list[dict]:
     """query_by_keyword's source waterfall for one sanitized MATCH expression."""
-    results = []
-    seen_ids = set()
+    results: list[dict] = []
+    seen_ids: set[int] = set()
+
+    def take(rows) -> None:
+        """Append the rows not found already, until the page is full.
+
+        Every source asks for a whole page: rows an earlier source returned are
+        skipped here, and asking only for the slots left gave them away.
+        """
+        for row in rows:
+            if len(results) >= limit:
+                return
+            r = dict(row)
+            if r["email_id"] not in seen_ids:
+                seen_ids.add(r["email_id"])
+                results.append(r)
 
     if not search_content_only and _has_subject_index(conn):
         # The subject first: the words someone remembers an email by, and until
         # v22 not indexed at all. snippet() is not needed; the subject is the row.
+        # One row per thread, its best match: every email of a thread carries its
+        # subject, and a long thread filled the page. An email with no thread is
+        # a thread of its own.
         query_subjects = """
-            SELECT
-                e.id as email_id,
-                e.date_received as date,
-                e.subject,
-                e.summary,
-                e.subject as snippet,
-                'subject' as source
-            FROM emails_fts
-            JOIN emails e ON e.id = emails_fts.rowid
-            WHERE emails_fts.subject_f MATCH ?
-            ORDER BY rank
+            SELECT email_id, date, subject, summary, snippet, source FROM (
+                SELECT
+                    e.id as email_id,
+                    e.date_received as date,
+                    e.subject,
+                    e.summary,
+                    e.subject as snippet,
+                    'subject' as source,
+                    emails_fts.rank as score,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY COALESCE(NULLIF(e.conversation_id, ''), '#' || e.id)
+                        ORDER BY emails_fts.rank, e.date_received DESC
+                    ) as nth
+                FROM emails_fts
+                JOIN emails e ON e.id = emails_fts.rowid
+                WHERE emails_fts.subject_f MATCH ?
+            )
+            WHERE nth = 1
+            ORDER BY score
             LIMIT ?
         """
-        for row in conn.execute(query_subjects, (safe_keyword, limit)).fetchall():
-            r = dict(row)
-            seen_ids.add(r["email_id"])
-            results.append(r)
+        take(conn.execute(query_subjects, (safe_keyword, limit)))
 
     if not search_content_only:
         # Search in email summaries
         # Rank by FTS5 BM25 relevance (ORDER BY rank), not recency. rank is only
         # comparable within a single MATCH query, so each source is ranked on its
-        # own; the source-priority waterfall (summary -> content -> key_fact ->
-        # attachment) plus seen_ids dedup preserves the cross-source order.
+        # own; the source-priority waterfall (subject -> summary -> content ->
+        # key_fact -> attachment) plus seen_ids dedup preserves the cross-source
+        # order.
         query_summaries = """
             SELECT
                 e.id as email_id,
@@ -380,16 +416,10 @@ def _keyword_waterfall(
             LIMIT ?
         """
 
-        cursor = conn.execute(query_summaries, (safe_keyword, limit - len(results)))
-        for row in cursor.fetchall():
-            r = dict(row)
-            if r["email_id"] not in seen_ids:
-                seen_ids.add(r["email_id"])
-                results.append(r)
+        take(conn.execute(query_summaries, (safe_keyword, limit)))
 
     # Search in email content
-    remaining = limit - len(results)
-    if remaining > 0:
+    if len(results) < limit:
         query_content = """
             SELECT
                 e.id as email_id,
@@ -405,16 +435,10 @@ def _keyword_waterfall(
             LIMIT ?
         """
 
-        cursor = conn.execute(query_content, (safe_keyword, remaining))
-        for row in cursor.fetchall():
-            r = dict(row)
-            if r["email_id"] not in seen_ids:
-                seen_ids.add(r["email_id"])
-                results.append(r)
+        take(conn.execute(query_content, (safe_keyword, limit)))
 
     # Search in key facts (only if we haven't hit the limit and not content-only)
-    remaining = limit - len(results)
-    if remaining > 0 and not search_content_only:
+    if len(results) < limit and not search_content_only:
         query_facts = """
             SELECT
                 e.id as email_id,
@@ -431,18 +455,12 @@ def _keyword_waterfall(
             LIMIT ?
         """
 
-        cursor = conn.execute(query_facts, (safe_keyword, remaining))
-        for row in cursor.fetchall():
-            r = dict(row)
-            if r["email_id"] not in seen_ids:
-                seen_ids.add(r["email_id"])
-                results.append(r)
+        take(conn.execute(query_facts, (safe_keyword, limit)))
 
     # Search in attachment content (PDF/Office text + LLM summary).
     # Surfaces attachment-only matches as the parent email row, with
     # source='attachment' and the matched filename for caller transparency.
-    remaining = limit - len(results)
-    if remaining > 0 and not search_content_only and _has_attachment_fts(conn):
+    if len(results) < limit and not search_content_only and _has_attachment_fts(conn):
         query_attachments = """
             SELECT
                 e.id as email_id,
@@ -461,19 +479,14 @@ def _keyword_waterfall(
             LIMIT ?
         """
 
-        cursor = conn.execute(query_attachments, (safe_keyword, remaining))
-        for row in cursor.fetchall():
-            r = dict(row)
-            if r["email_id"] not in seen_ids:
-                seen_ids.add(r["email_id"])
-                results.append(r)
+        take(conn.execute(query_attachments, (safe_keyword, limit)))
 
     # Results are relevance-ranked within each source (ORDER BY rank) and appended
-    # in source-priority order (summary -> content -> key_fact -> attachment); keep
-    # that order rather than re-sorting by date, so BM25 relevance is not discarded.
-    # (True cross-source ranking via score fusion / RRF is a later change.)
-    # Limit to requested number
-    return results[:limit]
+    # in source-priority order (subject -> summary -> content -> key_fact ->
+    # attachment); keep that order rather than re-sorting by date, so BM25
+    # relevance is not discarded. (True cross-source ranking via score fusion / RRF
+    # is a later change.) take() stops at the requested number.
+    return results
 
 
 def query_by_date_range(

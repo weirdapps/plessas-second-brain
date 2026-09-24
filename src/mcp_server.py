@@ -134,10 +134,10 @@ def sender_brief(name_or_email: str, days: int = 365) -> dict:
 
 @mcp.tool()
 def email_thread(email_id: int, limit: int = 50) -> dict:
-    """Every email in one email's thread, oldest first: date, sender, subject, summary.
+    """The emails of one email's thread, oldest first: date, sender, subject, summary.
 
     For reading the exchange around a search hit. `thread_total` is the thread's
-    size; above `limit`, the newest emails were left out.
+    size; above `limit`, the `limit` emails centred on `email_id` come back.
 
     Args:
         email_id: emails.id of any email in the thread

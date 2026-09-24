@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """A known-item baseline for keyword search: can an email be found by its subject?
 
-Measure before changing how text is tokenised (stemming, prefix matching): a
-change to the index is only an improvement if a fixed set of queries does better
-after it than before.
+A regression guard, run before and after changing how text is tokenised
+(stemming, prefix matching): a change that loses emails shows up as a drop. It
+cannot show a gain. The queries are the subject's own words, which the subject
+index matches exactly already, so a looser match can only add competition.
 
 `build` samples emails with at least two search words in their subject, leaving
 news out, and keeps two of those words as the query for each; the email is the
 answer. The set holds subjects, so it is written outside the repository
 (default ~/.second-brain/retrieval-eval.json). `run` searches each query the way
-search_emails does and reports how often the email comes back first, in the top
-5 and in the top 10, and the mean reciprocal rank.
+search_emails does and reports how often the answer comes back first, in the top
+5 and in the top 10, and the mean reciprocal rank, twice: for the email itself,
+and for its thread (the email or any other in its conversation). Replies share
+the subject, so which of them ranks first is a tie-break, and keyword search
+returns one email per thread for a subject match; the thread figures are the
+ones to compare.
 
     python scripts/retrieval_eval.py build [--size 20] [--seed 7]
     python scripts/retrieval_eval.py run
@@ -60,12 +65,21 @@ def build_set(conn: sqlite3.Connection, size: int, seed: int) -> list[dict]:
     return out
 
 
-def rank_of(results: list[dict], email_id: int) -> int | None:
-    """1-based position of `email_id` in `results`, or None."""
+def rank_of(results: list[dict], email_ids: set[int]) -> int | None:
+    """1-based position of the first of `email_ids` in `results`, or None."""
     for n, row in enumerate(results, start=1):
-        if row.get("email_id") == email_id:
+        if row.get("email_id") in email_ids:
             return n
     return None
+
+
+def thread_of(conn: sqlite3.Connection, email_id: int) -> set[int]:
+    """The ids of every email in `email_id`'s conversation, itself included."""
+    row = conn.execute("SELECT conversation_id FROM emails WHERE id = ?", (email_id,)).fetchone()
+    if not row or not row[0]:
+        return {email_id}
+    ids = conn.execute("SELECT id FROM emails WHERE conversation_id = ?", (row[0],))
+    return {r[0] for r in ids} | {email_id}
 
 
 def score(ranks: list[int | None]) -> dict:
@@ -86,13 +100,16 @@ def run_set(conn: sqlite3.Connection, items: list[dict]) -> tuple[dict, list[dic
     from src.store.query import query_by_keyword
 
     register_sql_functions(conn)
-    ranks, misses = [], []
+    ranks, thread_ranks, misses = [], [], []
     for item in items:
-        rank = rank_of(query_by_keyword(conn, item["query"], limit=10), item["email_id"])
+        results = query_by_keyword(conn, item["query"], limit=10)
+        rank = rank_of(results, {item["email_id"]})
+        thread_rank = rank_of(results, thread_of(conn, item["email_id"]))
         ranks.append(rank)
-        if rank != 1:
-            misses.append({**item, "rank": rank})
-    return score(ranks), misses
+        thread_ranks.append(thread_rank)
+        if thread_rank != 1:
+            misses.append({**item, "rank": thread_rank})
+    return {"email": score(ranks), "thread": score(thread_ranks)}, misses
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -118,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         conn.close()
     print(json.dumps(result, indent=2))
     for miss in misses:
-        print(f"  rank {miss['rank']}: email {miss['email_id']} for {miss['query']!r}")
+        print(f"  thread rank {miss['rank']}: email {miss['email_id']} for {miss['query']!r}")
     return 0
 
 

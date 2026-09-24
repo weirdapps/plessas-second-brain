@@ -8,6 +8,7 @@ import numpy as np
 
 from src.store.embeddings import (
     CONVERSATION_ID_OFFSET,
+    TEAMS_THREAD_ID_OFFSET,
     _atomic_savez,
     _email_embed_text,
     _load_index,
@@ -374,6 +375,69 @@ class TestGenerateEmbeddingsMemory:
         assert out[200][0] == 3.0
 
 
+def _teams_thread(conn, thread_id):
+    conn.execute(
+        "INSERT INTO teams_chats (id, teams_chat_id, chat_kind, first_seen_at) "
+        "VALUES (1, 'c1', 'group', '2026-01-01')"
+    )
+    conn.execute(
+        "INSERT INTO teams_threads (id, chat_id, thread_kind, anchor_message_id, started_at, "
+        "ended_at, title) VALUES (?, 1, 'chat_session', 'a', '2026-01-01', '2026-01-01', 't')",
+        (thread_id,),
+    )
+
+
+def test_kind_masks_split_the_id_space_at_the_offsets():
+    from src.store.embeddings import _kind_mask
+
+    c, t = CONVERSATION_ID_OFFSET, TEAMS_THREAD_ID_OFFSET
+    ids = np.array([1, -1, c + 1, c, c - 1, t + 1, t, t - 1], dtype=np.int64)
+
+    def picked(kind):
+        return ids[_kind_mask(ids, {kind})].tolist()
+
+    assert picked("email") == [1]
+    assert picked("attachment") == [-1, c + 1]
+    assert picked("conversation") == [c, c - 1, t + 1]
+    assert picked("teams_thread") == [t, t - 1]
+
+
+def test_semantic_search_conversations_returns_only_conversations(tmp_path, monkeypatch):
+    """The tool trusts kinds={'conversation'} alone: closer emails and a closer
+    Teams thread must not come back."""
+    import src.store.embeddings as embeddings
+    from src import mcp_server
+
+    conn = create_database(":memory:")
+    conn.execute(
+        "INSERT INTO conversations (id, session_id, started_at, ended_at, project_name, "
+        "turn_count, summary, created_at) VALUES (3, 's3', '2026-01-01', '2026-01-01', "
+        "'p', 1, 'the conversation', '2026-01-01')"
+    )
+    for n in range(1, 11):
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received, summary) "
+            "VALUES (?, ?, '2026-01-01', 'e')",
+            (n, n),
+        )
+    _teams_thread(conn, 1)
+    conn.commit()
+    p = tmp_path / "emb.npz"
+    _write_npz(
+        p,
+        [CONVERSATION_ID_OFFSET - 3, TEAMS_THREAD_ID_OFFSET - 1, *range(1, 11)],
+        [[0.6, 0.8, 0.0]] + [[0.0, 1.0, 0.0]] * 11,
+    )
+    monkeypatch.setattr(embeddings, "EMBEDDINGS_FILE", p)
+    monkeypatch.setattr(embeddings, "generate_embeddings", _fake_embedder([0.0, 1.0, 0.0]))
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    out = mcp_server.search_conversations("q", search_type="semantic", limit=2)
+
+    assert [r["type"] for r in out] == ["conversation"]
+    assert out[0]["session_id"] == "s3"
+
+
 class TestKindsAreFilteredBeforeTheTopResults:
     """The top results were taken over every vector and filtered by kind after,
     so a kind with few vectors (conversations, about 1K of 120K) mostly came back
@@ -408,12 +472,13 @@ class TestKindsAreFilteredBeforeTheTopResults:
                 "VALUES (?, ?, '2026-01-01', 'e')",
                 (n, n),
             )
+        _teams_thread(conn, 1)
         conn.commit()
         p = tmp_path / "emb.npz"
         _write_npz(
             p,
-            [CONVERSATION_ID_OFFSET - 3, *range(1, 11)],
-            [[0.6, 0.8, 0.0]] + [[0.0, 1.0, 0.0]] * 10,
+            [CONVERSATION_ID_OFFSET - 3, TEAMS_THREAD_ID_OFFSET - 1, *range(1, 11)],
+            [[0.6, 0.8, 0.0]] + [[0.0, 1.0, 0.0]] * 11,
         )
 
         from src.store.embeddings import query_semantic

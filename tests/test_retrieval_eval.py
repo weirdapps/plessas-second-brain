@@ -64,8 +64,9 @@ def test_build_then_run_finds_the_email_by_its_subject(ev, db, tmp_path, capsys)
     assert ev.main(["run", "--db", str(db), "--file", str(eval_set)]) == 0
 
     out = capsys.readouterr().out
-    result = json.loads(out[out.index("{") : out.index("}") + 1])
-    assert result["hit@1"] == 1.0
+    result = json.loads(out[out.index("{") : out.rindex("}") + 1])
+    assert result["email"]["hit@1"] == 1.0
+    assert result["thread"]["hit@1"] == 1.0
     assert json.loads(eval_set.read_text())[0]["email_id"] == 1
 
 
@@ -76,3 +77,23 @@ def test_the_database_is_opened_read_only(ev, db):
 
     with pytest.raises(sqlite3.OperationalError, match="readonly"):
         conn.execute("DELETE FROM emails")
+
+
+def test_another_email_of_the_thread_counts_for_the_thread_only(ev, tmp_path):
+    """Replies share their subject, so a sibling often ranks first; counted as a
+    miss, that was noise about tie-breaking, not a retrieval failure."""
+    path = tmp_path / "t.db"
+    conn = create_database(str(path))
+    conn.executemany(
+        "INSERT INTO emails (id, message_id, date_received, subject, mailbox_name, summary, "
+        "conversation_id) VALUES (?, ?, '2026-09-01T00:00:00Z', ?, 'Inbox', 'nothing', 'T1')",
+        [(1, 1, "RE: Quarterly zebrafinch budget"), (2, 2, "Quarterly zebrafinch budget")],
+    )
+    conn.commit()
+    conn.close()
+
+    result, misses = ev.run_set(ev._open(path), [{"email_id": 1, "query": "zebrafinch quarterly"}])
+
+    assert result["email"]["hit@1"] == 0.0
+    assert result["thread"]["hit@1"] == 1.0
+    assert misses == []

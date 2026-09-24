@@ -7,9 +7,17 @@ subject as a third column, and keyword search tries it first.
 
 import sqlite3
 
+import pytest
+
 from src.config import CURRENT_SCHEMA_VERSION
 from src.store.query import _sanitize_fts5_query, query_by_keyword
-from src.store.schema import create_database, get_connection, get_schema_version, run_migrations
+from src.store.schema import (
+    create_database,
+    get_connection,
+    get_schema_version,
+    migrate_index_email_subjects,
+    run_migrations,
+)
 
 _EMAIL = (
     "INSERT INTO emails (message_id, date_received, subject, summary, content) "
@@ -79,12 +87,21 @@ def test_the_migration_is_a_no_op_the_second_time(tmp_path):
     conn.execute(_EMAIL, (1, "Quarterly zebrafinch review"))
     conn.commit()
 
+    first: list[str] = []
+    conn.set_trace_callback(first.append)
     run_migrations(conn)
     conn.execute("UPDATE schema_version SET version = 21")
     conn.commit()
+    again: list[str] = []
+    conn.set_trace_callback(again.append)
     run_migrations(conn)
+    conn.set_trace_callback(None)
 
     assert _subject_hits(conn, "zebrafinch") == 1
+    # Immediate: a second unit started with the first waits for it, then finds
+    # the work done instead of rebuilding the table the first has just built.
+    assert "BEGIN IMMEDIATE" in first
+    assert [s for s in again if "DROP TABLE" in s or "'rebuild'" in s] == []
 
 
 def test_the_subject_is_folded_like_the_rest(tmp_path):
@@ -128,3 +145,134 @@ def test_keyword_search_finds_an_email_by_its_subject_alone(tmp_path):
 
     assert results[0]["email_id"] == 1
     assert results[0]["source"] == "subject"
+
+
+def test_a_failed_migration_raises_its_own_error(tmp_path):
+    """On a full disk SQLite rolls the transaction back itself, and an explicit
+    ROLLBACK then raised 'no transaction is active' in place of the cause."""
+    path = tmp_path / "b.db"
+    create_database(str(path)).close()
+    conn = _as_v21(path)
+    for n in range(300):
+        conn.execute(_EMAIL, (n, " ".join(f"s{n}w{j}" for j in range(60))))
+    conn.commit()
+    pages = conn.execute("PRAGMA page_count").fetchone()[0]
+    conn.execute(f"PRAGMA max_page_count = {pages + 5}")
+
+    with pytest.raises(sqlite3.OperationalError, match="full"):
+        migrate_index_email_subjects(conn)
+
+    assert not conn.in_transaction
+    assert [r[1] for r in conn.execute("PRAGMA table_info(emails_fts)")] == [
+        "summary_f",
+        "content_f",
+    ]
+
+
+def _mail(
+    conn, n, subject, summary="a note about something else", content="nothing here", thread=None
+):
+    conn.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, summary, content, "
+        "conversation_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (n, n, f"2026-09-01T00:{n:02d}:00Z", subject, summary, content, thread),
+    )
+
+
+def test_one_long_thread_takes_one_slot(tmp_path):
+    """Every email of a thread carries its subject: 30 replies filled the page
+    and left no room for the emails whose summary was about the words."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    for n in range(1, 31):
+        _mail(conn, n, ("RE: " if n > 1 else "") + "Okapi budget planning", thread="CONV-1")
+    for n in range(31, 36):
+        _mail(conn, n, "Board", summary="The board approved the okapi budget", thread=f"C{n}")
+    conn.commit()
+
+    results = query_by_keyword(conn, "okapi budget", limit=5)
+
+    assert len(results) == 5
+    assert sum(r["email_id"] <= 30 for r in results) == 1
+    assert sum(r["source"] == "summary" and r["email_id"] > 30 for r in results) == 4
+
+
+def test_emails_with_no_thread_are_each_their_own(tmp_path):
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Okapi budget", thread=None)
+    _mail(conn, 2, "Okapi budget", thread="")
+    _mail(conn, 3, "Okapi budget", thread=None)
+    _mail(conn, 4, "Okapi budget", thread="")
+    conn.commit()
+
+    results = query_by_keyword(conn, "okapi budget", limit=5)
+
+    assert sorted(r["email_id"] for r in results) == [1, 2, 3, 4]
+
+
+def test_summary_matches_come_before_body_matches(tmp_path):
+    """The subject hits matched in the summary too and used up the summary
+    stage's slots, so summary-only emails lost to body-only ones."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Kiwi plan", summary="kiwi", thread="A")
+    _mail(conn, 2, "Kiwi plan two", summary="kiwi", thread="B")
+    _mail(conn, 3, "Other", summary="notes on the kiwi crop this year", thread="C")
+    _mail(conn, 4, "Another", summary="notes on the kiwi harvest this year", thread="D")
+    _mail(conn, 5, "Third", content="kiwi", thread="E")
+    _mail(conn, 6, "Fourth", content="kiwi", thread="F")
+    conn.commit()
+
+    results = query_by_keyword(conn, "kiwi", limit=4)
+
+    assert sorted(r["email_id"] for r in results) == [1, 2, 3, 4]
+    assert "content" not in {r["source"] for r in results}
+
+
+def test_a_later_source_fills_the_page_past_rows_already_found(tmp_path):
+    """Asked only for the slots left, the body search spent them on emails the
+    summary search had already returned, and the page came back short."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Alpha", summary="kiwi", thread="A")
+    _mail(conn, 2, "Beta", summary="kiwi notes", content="kiwi", thread="B")
+    _mail(conn, 3, "Gamma", content="the kiwi was mentioned in passing here", thread="C")
+    conn.commit()
+
+    results = query_by_keyword(conn, "kiwi", limit=3)
+
+    assert sorted(r["email_id"] for r in results) == [1, 2, 3]
+
+
+def _found_by(conn, n, source, text):
+    if source == "key_fact":
+        conn.execute("INSERT INTO key_facts (email_id, fact) VALUES (?, ?)", (n, text))
+        return
+    conn.execute(
+        "INSERT INTO attachments (id, email_id, message_id, filename, file_path, exported_at) "
+        "VALUES (?, ?, ?, 'a.pdf', '/tmp/a.pdf', '2026-09-01')",
+        (n, n, n),
+    )
+    conn.execute(
+        "INSERT INTO attachment_content (attachment_id, extracted_text, extraction_status) "
+        "VALUES (?, ?, 'done')",
+        (n, text),
+    )
+
+
+@pytest.mark.parametrize("source", ["key_fact", "attachment"])
+def test_the_last_sources_fill_the_page_past_rows_already_found(tmp_path, source):
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Alpha", summary="kiwi", thread="A")
+    _mail(conn, 2, "Beta", summary="kiwi notes", thread="B")
+    _found_by(conn, 2, source, "kiwi")
+    _mail(conn, 3, "Gamma", thread="C")
+    _found_by(conn, 3, source, "the kiwi was mentioned in passing here")
+    conn.commit()
+
+    results = query_by_keyword(conn, "kiwi", limit=3)
+
+    assert sorted(r["email_id"] for r in results) == [1, 2, 3]
+    assert results[-1]["source"] == source

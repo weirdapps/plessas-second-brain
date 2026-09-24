@@ -644,7 +644,9 @@ def migrate_index_email_subjects(conn: sqlite3.Connection) -> None:
 
     One immediate transaction, checked inside it: two units can start together
     after a deploy, and the second must find the work done rather than drop the
-    table the first has just built. The rebuild reads every email once.
+    table the first has just built. The rebuild reads every email once: about
+    40 s on a replica copy, and on a slower host longer than the connection's
+    60 s busy timeout, so the wait for the lock is raised to ten minutes here.
     """
     from src.store.greek import fold_sql_expr
 
@@ -652,6 +654,16 @@ def migrate_index_email_subjects(conn: sqlite3.Connection) -> None:
         return
     if conn.in_transaction:
         conn.commit()
+    busy_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    conn.execute("PRAGMA busy_timeout = 600000")
+    try:
+        _index_email_subjects(conn, fold_sql_expr)
+    finally:
+        conn.execute(f"PRAGMA busy_timeout = {int(busy_ms)}")
+
+
+def _index_email_subjects(conn: sqlite3.Connection, fold_sql_expr) -> None:
+    """migrate_index_email_subjects' one immediate transaction."""
     conn.execute("BEGIN IMMEDIATE")
     try:
         indexed = {r[1] for r in conn.execute("PRAGMA table_info(emails_fts)")}

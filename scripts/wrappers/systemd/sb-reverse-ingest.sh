@@ -14,6 +14,8 @@ export PATH="$HOME/.local/bin:$PATH"
 
 PROJECT="$HOME/SourceCode/plessas-second-brain"
 PYTHON="$HOME/.venvs/second-brain/bin/python"
+# The data home as src/config.py resolves it: BRAIN_DATA_DIR, else the repo's.
+DB="${BRAIN_DATA_DIR:-$PROJECT/data}/brain.db"
 LOG_DIR="$HOME/.second-brain/logs"
 LOG_FILE="$LOG_DIR/reverse-ingest.log"
 SENTINEL="$HOME/.second-brain/needs_reauth"
@@ -44,7 +46,7 @@ EXIT_CODE=$?
 if [ "$EXIT_CODE" -ne 0 ] && tail -20 "$LOG_FILE" | grep -qi "database is locked"; then
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] Retrying reverse-ingest after database-lock failure..." >> "$LOG_FILE"
   sleep 10
-  "$PYTHON" -c "import sqlite3,os; c=sqlite3.connect(os.path.expanduser('~/SourceCode/plessas-second-brain/data/brain.db')); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()" 2>/dev/null || true
+  "$PYTHON" -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()" "$DB" 2>/dev/null || true
   "$PYTHON" -m src.cli reverse-ingest --workers "${REVERSE_INGEST_WORKERS:-4}" >> "$LOG_FILE" 2>&1
   EXIT_CODE=$?
 fi

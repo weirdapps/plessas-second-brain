@@ -2,12 +2,14 @@
 """Reference exporter — the "bring your own source" contract.
 
 The extract + load chain is source-agnostic: it only reads staging batches
-from ``data/staging/batch-*.json``. This script writes one such batch with no
+from ``staging/batch-*.json`` under the data home (``data/`` in the repository
+unless BRAIN_DATA_DIR moves it). This script writes one such batch with no
 Microsoft 365 dependency. Adapt ``load_your_messages()`` to read from wherever
 your data lives (Gmail API, IMAP, an .mbox, a CSV, a custom API), then run:
 
-    python examples/example_exporter.py     # writes data/staging/batch-90000.json
-    python -m src.cli sync                   # extract + load it
+    python examples/example_exporter.py     # writes staging/batch-90000.json
+    python -m src.extract.local && python -m src.cli load   # on a fresh store
+    python -m src.cli sync                   # from then on, extract + load
 
 The only contract is the JSON shape below. Required per-email fields:
 message_id, date_received, subject, sender, to_recipients, cc_recipients,
@@ -15,9 +17,14 @@ mailbox_name, content. Optional: conversation_id, internet_message_id.
 """
 
 import json
+import os
 from pathlib import Path
 
-STAGING = Path(__file__).resolve().parent.parent / "data" / "staging"
+# The data home as src/config.py resolves it: BRAIN_DATA_DIR, else the repo's data/.
+STAGING = (
+    Path(os.environ.get("BRAIN_DATA_DIR") or Path(__file__).resolve().parent.parent / "data")
+    / "staging"
+)
 
 
 def load_your_messages() -> list[dict]:

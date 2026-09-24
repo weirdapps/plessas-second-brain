@@ -95,6 +95,12 @@ def is_transient(exc: BaseException) -> bool:
     # unwrapped.
     if isinstance(exc, genai_errors.ServerError | httpx.TransportError):
         return True
+    # A request timeout, a conflict and a client-closed request: statuses the
+    # SDKs retry themselves, below the 5xx line.
+    if isinstance(exc, anthropic.APIStatusError) and exc.status_code in (408, 409):
+        return True
+    if isinstance(exc, genai_errors.APIError) and exc.code in (408, 409, 499):
+        return True
     return isinstance(exc, ConnectionError | TimeoutError)
 
 

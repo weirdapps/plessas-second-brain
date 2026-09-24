@@ -38,7 +38,7 @@ def run(monkeypatch, tmp_path):
     def extract(email, api_key, engine="claude"):
         calls.append(email["message_id"])
         if email["message_id"].startswith("ok"):
-            return email["message_id"], {"summary": "s"}, False, False
+            return email["message_id"], {"summary": "s"}, False, None
         return go.failure(email)
 
     monkeypatch.setattr(local, "extract_inline", extract)
@@ -47,7 +47,7 @@ def run(monkeypatch, tmp_path):
         monkeypatch.setattr(local, "collect_emails", lambda: emails)
         return local.run_extraction(workers=workers, deadline_s=600.0)
 
-    go.failure = lambda e: (e["message_id"], None, False, True)
+    go.failure = lambda e: (e["message_id"], None, False, "fault")
     go.calls = calls
     go.extracted = tmp_path / "extracted"
     go.state = lambda: json.loads((tmp_path / "state.json").read_text())
@@ -121,12 +121,14 @@ def test_an_email_that_both_fails_and_extracts_in_one_run_is_not_counted(run, wo
             nth = seen.count(email["message_id"])
         failing = (nth == 1) == (first == "fails")
         if nth == 2:
-            first_done.wait(5)  # the second copy finishes second, whatever the pool does
+            # Usually lands after the first call's result, so `first` picks the
+            # order; the assertions hold either way.
+            first_done.wait(5)
         else:
             first_done.set()
         if failing:
-            return email["message_id"], None, False, True
-        return email["message_id"], {"summary": "real"}, False, False
+            return email["message_id"], None, False, "fault"
+        return email["message_id"], {"summary": "real"}, False, None
 
     run.failure = one_of_each
     run([_mail("dup"), _mail("dup"), _mail("ok0")], workers)
@@ -136,7 +138,7 @@ def test_an_email_that_both_fails_and_extracts_in_one_run_is_not_counted(run, wo
 
 
 def test_quota_failures_never_count(run):
-    run.failure = lambda e: (e["message_id"], None, True, False)
+    run.failure = lambda e: (e["message_id"], None, True, None)
     for n in range(local.EMAIL_MAX_ATTEMPTS + 2):
         run([_mail("m"), _mail(f"ok{n}")])
 
@@ -145,14 +147,17 @@ def test_quota_failures_never_count(run):
 
 
 @pytest.mark.parametrize("workers", [1, 3])
-def test_a_success_clears_the_count(run, workers):
+@pytest.mark.parametrize("kind", ["fault", "timeout"])
+def test_a_success_clears_the_count(run, workers, kind):
+    counts = {"fault": "failed_attempts", "timeout": "timeout_attempts"}[kind]
+    run.failure = lambda e: (e["message_id"], None, False, kind)
     run([_mail("m"), _mail("ok0")], workers)
-    assert run.state()["failed_attempts"] == {"m": 1}
-    run.failure = lambda e: (e["message_id"], {"summary": "s"}, False, False)
+    assert run.state()[counts] == {"m": 1}
+    run.failure = lambda e: (e["message_id"], {"summary": "s"}, False, None)
 
     run([_mail("m")], workers)
 
-    assert run.state()["failed_attempts"] == {}
+    assert run.state()[counts] == {}
 
 
 def test_an_email_staged_twice_counts_once_a_run(run):
@@ -181,7 +186,7 @@ def test_news_does_not_hold_the_quota_breaker_open(run, workers):
     """Interleaved with news, a quota outage kept the run calling the exhausted
     model to its deadline, because every news item reset the count. The
     concurrent path checks between chunks, so it stops at a chunk boundary."""
-    run.failure = lambda e: (e["message_id"], None, True, False)
+    run.failure = lambda e: (e["message_id"], None, True, None)
     emails = []
     for n in range(100):
         emails.append(_mail(f"m{n}"))
@@ -196,6 +201,14 @@ def test_news_does_not_hold_the_quota_breaker_open(run, workers):
 
 
 # --- extract_inline: what is retried, and what counts
+
+
+def _sdk_timeout():
+    """The SDK's own timeout, through the module that already imports the SDK."""
+    from src.extract import policy_bridge
+
+    cls = policy_bridge.anthropic.APITimeoutError
+    return cls.__new__(cls)
 
 
 @pytest.fixture
@@ -223,35 +236,70 @@ def inline(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("engine", ["claude", "gemini"])
 @pytest.mark.parametrize(
-    ("error", "gemini_calls", "quota", "countable"),
+    ("error", "gemini_calls", "quota", "failure"),
     [
-        pytest.param(ValueError("Failed to parse JSON"), 1, False, True, id="unusable-reply"),
-        pytest.param(RuntimeError("400 prompt is too long"), 3, False, True, id="rejected"),
+        pytest.param(ValueError("Failed to parse JSON"), 1, False, "fault", id="unusable-reply"),
+        pytest.param(RuntimeError("400 prompt is too long"), 3, False, "fault", id="rejected"),
         pytest.param(
-            gauth.MalformedError("half-written ADC"), 3, False, True, id="auth-valueerror"
+            gauth.MalformedError("half-written ADC"), 3, False, "fault", id="auth-valueerror"
         ),
-        pytest.param(ConnectionError("connection reset"), 3, False, False, id="service"),
+        pytest.param(ConnectionError("connection reset"), 3, False, None, id="service"),
         pytest.param(
             genai_errors.ServerError(503, {"error": {"status": "UNAVAILABLE"}}),
             3,
             False,
-            False,
+            None,
             id="gemini-503",
         ),
-        pytest.param(TimeoutError(), 3, False, False, id="timeout"),
-        pytest.param(RuntimeError("429 RESOURCE_EXHAUSTED"), 3, True, False, id="quota"),
+        pytest.param(TimeoutError(), 3, False, "timeout", id="timeout"),
+        pytest.param(_sdk_timeout(), 3, False, "timeout", id="sdk-timeout"),
+        pytest.param(RuntimeError("429 RESOURCE_EXHAUSTED"), 3, True, None, id="quota"),
     ],
 )
-def test_what_is_retried_and_what_counts(inline, engine, error, gemini_calls, quota, countable):
-    """Only the email's own failure is countable; a transient one is the service's.
+def test_what_is_retried_and_what_counts(inline, engine, error, gemini_calls, quota, failure):
+    """The email's own failure is a fault, a timeout counts slower, a transient one
+    is the service's.
     Claude is tried once here, its retries being the policy's inside complete();
     Gemini, which has no policy, is retried unless the reply was unusable. The run
     still counts nothing when the model worked for no email."""
-    assert inline(error, engine) == ("m", None, quota, countable)
+    assert inline(error, engine) == ("m", None, quota, failure)
     assert len(inline.calls) == (1 if engine == "claude" else gemini_calls)
 
 
 def test_an_expired_credential_never_counts_and_stops_the_run(inline):
-    assert inline(gauth.RefreshError("invalid_grant")) == ("m", None, False, False)
+    assert inline(gauth.RefreshError("invalid_grant")) == ("m", None, False, None)
     assert inline.calls == ["m"]
     assert local._shutdown is True
+
+
+def test_a_reply_whose_error_mentions_429_is_a_fault_not_quota(inline):
+    """The parser's message carries a column number, and one of them was 429."""
+    error = ValueError("Failed to parse JSON: Expecting ',' delimiter: line 1 column 4291")
+
+    assert inline(error) == ("m", None, False, "fault")
+
+
+def test_an_email_that_keeps_timing_out_is_retired_on_the_longer_cap(run):
+    """Too big to answer in time, it timed out every run and was offered forever;
+    a slow spell times out now and then, so timeouts count ten times slower."""
+    run.failure = lambda e: (e["message_id"], None, False, "timeout")
+    for n in range(local.EMAIL_MAX_TIMEOUTS - 1):
+        run([_mail("huge"), _mail(f"ok{n}")])
+    assert run.state()["timeout_attempts"] == {"huge": local.EMAIL_MAX_TIMEOUTS - 1}
+    assert not (run.extracted / "huge.json").exists()
+
+    run([_mail("huge"), _mail("ok-last")])
+
+    assert json.loads((run.extracted / "huge.json").read_text())["summary"] == ""
+    assert run.state()["timeout_attempts"] == {}
+
+
+@pytest.mark.parametrize("order", [["timeout", "fault"], ["fault", "timeout"]])
+def test_a_fault_outranks_a_timeout_in_the_same_run(run, order):
+    kinds = iter(order)
+    run.failure = lambda e: (e["message_id"], None, False, next(kinds))
+
+    run([_mail("both"), _mail("both"), _mail("ok0")])
+
+    assert run.state()["failed_attempts"] == {"both": 1}
+    assert run.state()["timeout_attempts"] == {}

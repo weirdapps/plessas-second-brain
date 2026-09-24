@@ -123,6 +123,16 @@ def test_is_transient_knows_the_gemini_engines_service_failures():
     assert is_transient(genai_errors.ServerError(503, {"error": {"status": "UNAVAILABLE"}}))
     assert is_transient(httpx.ConnectError("connection refused"))
     assert not is_transient(genai_errors.ClientError(400, {"error": {"status": "INVALID"}}))
+    for code in (408, 409, 499):
+        assert is_transient(genai_errors.ClientError(code, {"error": {}})), code
+
+
+def test_is_transient_knows_the_statuses_the_sdk_itself_retries():
+    from src.extract.policy_bridge import is_transient
+
+    assert is_transient(_status_error(anthropic.APIStatusError, 408))
+    assert is_transient(_status_error(anthropic.ConflictError, 409))
+    assert not is_transient(_status_error(anthropic.NotFoundError, 404))
 
 
 def test_is_transient_leaves_an_unusable_reply_permanent():

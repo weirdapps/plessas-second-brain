@@ -36,7 +36,7 @@ def staged(tmp_path, monkeypatch):
 
 
 def _extraction_for(conv):
-    return conv["session_id"], {"summary": "x"}, False, False
+    return conv["session_id"], {"summary": "x"}, False, None
 
 
 def _with_a_fresh_success(staged):
@@ -49,7 +49,7 @@ def _with_a_fresh_success(staged):
 def _refuses_but_the_fresh_ones(conv):
     if conv["session_id"].startswith("ok-"):
         return _extraction_for(conv)
-    return conv["session_id"], None, False, True
+    return conv["session_id"], None, False, "fault"
 
 
 def test_stops_once_the_deadline_is_spent(staged, monkeypatch):
@@ -220,7 +220,7 @@ def test_a_quota_or_auth_failure_never_counts_toward_giving_up(staged, monkeypat
     def not_countable(conv):
         if conv["session_id"].startswith("ok-"):
             return _extraction_for(conv)
-        return conv["session_id"], None, False, False
+        return conv["session_id"], None, False, None
 
     with (
         patch.object(local, "collect_conversations", side_effect=_with_a_fresh_success(staged)),
@@ -265,19 +265,25 @@ def _overloaded():
 
 
 @pytest.mark.parametrize(
-    ("error", "quota", "countable"),
+    ("error", "quota", "failure"),
     [
         pytest.param(
-            ValueError("no text block (stop_reason='refusal')"), False, True, id="refusal"
+            ValueError("no text block (stop_reason='refusal')"), False, "fault", id="refusal"
         ),
-        pytest.param(RuntimeError("400 prompt is too long"), False, True, id="rejected"),
-        pytest.param(ConnectionError("connection reset"), False, False, id="service"),
-        pytest.param(RuntimeError("429 RESOURCE_EXHAUSTED"), True, False, id="quota"),
-        pytest.param(_overloaded(), True, False, id="overloaded-529"),
+        pytest.param(RuntimeError("400 prompt is too long"), False, "fault", id="rejected"),
+        pytest.param(ConnectionError("connection reset"), False, None, id="service"),
+        pytest.param(RuntimeError("429 RESOURCE_EXHAUSTED"), True, None, id="quota"),
+        pytest.param(_overloaded(), True, None, id="overloaded-529"),
+        pytest.param(
+            ValueError("Failed to parse JSON: Expecting ',' delimiter: line 1 column 4291"),
+            False,
+            "fault",
+            id="429-in-a-reply-error",
+        ),
     ],
 )
 def test_one_attempt_and_only_the_conversations_own_failure_counts(
-    staged, monkeypatch, error, quota, countable
+    staged, monkeypatch, error, quota, failure
 ):
     """The policy inside complete() is the only retry; a 529 overload is quota, as
     it is for email."""
@@ -292,7 +298,7 @@ def test_one_attempt_and_only_the_conversations_own_failure_counts(
 
     result = local.extract_conversation_inline({"session_id": "s"})
 
-    assert result == ("s", None, quota, countable)
+    assert result == ("s", None, quota, failure)
     assert len(seen) == 1
 
 
@@ -305,4 +311,59 @@ def test_an_expired_credential_is_not_the_conversations_fault(staged, monkeypatc
     monkeypatch.setattr("src.extract.claude_extract.extract_conversation", expired)
     monkeypatch.setattr(local.time, "sleep", lambda s: None)
 
-    assert local.extract_conversation_inline({"session_id": "s"}) == ("s", None, False, False)
+    assert local.extract_conversation_inline({"session_id": "s"}) == ("s", None, False, None)
+
+
+def test_a_conversation_still_going_on_waits(staged, monkeypatch):
+    """Staged part-way through, it would load its first turns for good: a loaded
+    session is never staged again."""
+    from datetime import UTC, datetime, timedelta
+
+    def ended(minutes_ago):
+        return (datetime.now(UTC) - timedelta(minutes=minutes_ago)).strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z"
+        )
+
+    convs = [
+        {"session_id": "live", "started_at": "2026-09-24T09:00:00Z", "ended_at": ended(5)},
+        {"session_id": "done", "started_at": "2026-09-24T06:00:00Z", "ended_at": ended(180)},
+    ]
+
+    with (
+        patch.object(local, "collect_conversations", return_value=convs),
+        patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
+        patch.object(local, "extract_conversation_inline", side_effect=_extraction_for) as ex,
+    ):
+        local.run_conversation_extraction()
+
+    assert [c.args[0]["session_id"] for c in ex.call_args_list] == ["done"]
+
+
+def test_a_conversation_that_keeps_timing_out_is_given_up_on_the_longer_cap(staged, monkeypatch):
+    def times_out(conv):
+        if conv["session_id"].startswith("ok-"):
+            return _extraction_for(conv)
+        return conv["session_id"], None, False, "timeout"
+
+    logged: list[str] = []
+    monkeypatch.setattr(local, "log", logged.append)
+
+    def gave_up():
+        return [m for m in logged if m.startswith("GAVE UP")]
+
+    with (
+        patch.object(local, "collect_conversations", side_effect=_with_a_fresh_success(staged)),
+        patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
+        patch.object(local, "extract_conversation_inline", side_effect=times_out),
+    ):
+        for _ in range(local.CONVERSATION_MAX_TIMEOUTS - 1):
+            local.run_conversation_extraction()
+        state = json.loads(local.CONV_STATE_FILE.read_text())
+        assert state["given_up_ids"] == []
+        assert gave_up() == []
+
+        local.run_conversation_extraction()
+
+    state = json.loads(local.CONV_STATE_FILE.read_text())
+    assert set(state["given_up_ids"]) == {c["session_id"] for c in staged}
+    assert len(gave_up()) == len(staged)

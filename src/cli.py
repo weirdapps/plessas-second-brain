@@ -1034,7 +1034,7 @@ def cmd_query_thread(args):
     conn.close()
 
     if not results:
-        print(f"No thread found for email ID: {args.email_id}")
+        print(f"No email with ID: {args.email_id}")
         return
 
     if total > len(results):

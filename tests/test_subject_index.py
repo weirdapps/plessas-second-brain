@@ -323,7 +323,9 @@ def test_a_thread_found_by_its_subject_does_not_come_back_for_its_summaries(tmp_
     conn = create_database(str(tmp_path / "b.db"))
     conn.row_factory = sqlite3.Row
     for n in range(1, 31):
-        _mail(conn, n, "RE: Kiwi rollout", summary=f"kiwi rollout update {n}", thread="T")
+        # The oldest has the best summary: the subject stage shows the newest.
+        summary = "kiwi" if n == 1 else f"kiwi rollout update {n}"
+        _mail(conn, n, "RE: Kiwi rollout", summary=summary, thread="T")
     for n in range(31, 36):
         _mail(conn, n, "Other", summary=f"notes that mention the kiwi {n}", thread=f"C{n}")
     conn.commit()
@@ -438,7 +440,8 @@ def test_a_subject_thread_does_not_come_back_through_a_later_source(tmp_path, so
             _found_by(conn, n, source, text)
 
     for n in range(1, 31):
-        mail(n, "RE: Kiwi rollout", f"kiwi rollout update {n}", "T")
+        # The oldest matches best: the subject stage shows the newest.
+        mail(n, "RE: Kiwi rollout", "kiwi" if n == 1 else f"kiwi rollout update {n}", "T")
     for n in range(31, 36):
         mail(n, "Other", f"notes that mention the kiwi {n}", f"C{n}")
     conn.commit()
@@ -530,3 +533,76 @@ def test_an_unthreaded_email_found_by_two_sources_comes_back_once(tmp_path):
     results = query_by_keyword(conn, "kiwi", limit=5)
 
     assert sorted(r["email_id"] for r in results) == [1, 2]
+
+
+def test_blank_subject_emails_are_not_one_thread(tmp_path):
+    """With no conversation id and no references, the loader threads an email by
+    the hash of its normalized subject: every blank subject shares one hash, and
+    strangers collapsed into a single result."""
+    from src.store.schema import subject_to_conversation_id
+
+    blank = subject_to_conversation_id("")
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    for n in range(1, 4):
+        _mail(conn, n, "", content=f"the okapi report number {n}", thread=blank)
+    conn.commit()
+
+    results = query_by_keyword(conn, "okapi", limit=10)
+
+    assert sorted(r["email_id"] for r in results) == [1, 2, 3]
+
+
+def test_equal_matches_in_a_thread_show_its_newest(tmp_path):
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    for n in range(1, 4):
+        _mail(conn, n, "Status", summary="kiwi", thread="T")
+    conn.commit()
+
+    results = query_by_keyword(conn, "kiwi", limit=5)
+
+    assert [(r["email_id"], r["source"]) for r in results] == [(3, "summary")]
+
+
+def test_equal_attachment_matches_show_the_newest_attachment(tmp_path):
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Deck", thread="T")
+    for aid, name in ((1, "v1.pdf"), (2, "v2.pdf")):
+        conn.execute(
+            "INSERT INTO attachments (id, email_id, message_id, filename, file_path, exported_at) "
+            "VALUES (?, 1, 1, ?, '/tmp/x.pdf', '2026-09-01')",
+            (aid, name),
+        )
+        conn.execute(
+            "INSERT INTO attachment_content (attachment_id, extracted_text, extraction_status) "
+            "VALUES (?, 'the okapi figures', 'done')",
+            (aid,),
+        )
+    conn.commit()
+
+    results = query_by_keyword(conn, "okapi", limit=5)
+
+    assert [(r["email_id"], r["attachment_filename"]) for r in results] == [(1, "v2.pdf")]
+
+
+def test_a_padded_thread_id_is_its_own_thread_in_search_and_in_the_thread_view(tmp_path):
+    """Search trimmed the id, the thread view did not, so a collapsed thread's
+    other email could not be reached."""
+    from src.store.query import count_thread, query_thread
+
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Okapi", thread="abc")
+    _mail(conn, 2, "Okapi", thread="abc ")
+    _mail(conn, 3, "Okapi", thread="\t")
+    _mail(conn, 4, "Okapi", thread="\t")
+    conn.commit()
+
+    results = query_by_keyword(conn, "okapi", limit=10)
+
+    assert sorted(r["email_id"] for r in results) == [1, 2, 4]
+    assert [e["email_id"] for e in query_thread(conn, 2)] == [2]
+    assert [e["email_id"] for e in query_thread(conn, 4)] == [3, 4]
+    assert count_thread(conn, 3) == 2

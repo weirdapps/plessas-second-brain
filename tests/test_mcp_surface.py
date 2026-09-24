@@ -442,9 +442,10 @@ def test_the_cli_says_when_it_shows_part_of_a_thread(tmp_path, capsys):
     assert "Thread with 30 emails, showing 5 around #30" in out
 
 
-def test_a_news_article_or_a_blank_thread_id_has_no_thread(conn):
+def test_a_news_article_or_a_blank_thread_id_is_a_thread_of_one(conn):
     """Search treats both as unthreaded; the thread view showed a day's
-    unrelated articles, or strangers sharing a blank id, as one exchange."""
+    unrelated articles, or strangers sharing a blank id, as one exchange. Alone
+    rather than empty: empty reads as an unknown id."""
     from src.store.query import count_thread, query_thread
 
     for i in range(200, 205):
@@ -453,5 +454,7 @@ def test_a_news_article_or_a_blank_thread_id_has_no_thread(conn):
     _email(conn, 211, 2, "b@example.com", "  ")
     conn.commit()
 
-    assert (query_thread(conn, 202), count_thread(conn, 202)) == ([], 0)
-    assert (query_thread(conn, 210), count_thread(conn, 210)) == ([], 0)
+    for email_id in (202, 210):
+        assert [e["email_id"] for e in query_thread(conn, email_id)] == [email_id]
+        assert count_thread(conn, email_id) == 1
+    assert (query_thread(conn, 99999), count_thread(conn, 99999)) == ([], 0)

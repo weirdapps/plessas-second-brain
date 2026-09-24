@@ -343,6 +343,56 @@ class TestRecallHybridFusion:
 
         assert sum(i in (20, 21, 22) for i in ids) == 1
 
+    def test_a_thread_both_rankings_put_first_comes_first(self, recall_db):
+        """Fused by email, a thread's keyword row (its newest) and its semantic
+        pick (another email) never met, and a runner-up in both won."""
+        for i in range(10, 15):
+            recall_db.execute(
+                "INSERT INTO emails (id, message_id, date_received, subject, summary, "
+                "mailbox_name, content, conversation_id) "
+                "VALUES (?, ?, ?, 'Kiwi plan', 'nothing', 'INBOX', 'x', 'T')",
+                (i, i, f"2026-04-1{i - 10}T10:00:00"),
+            )
+        recall_db.execute(
+            "INSERT INTO emails (id, message_id, date_received, subject, summary, "
+            "mailbox_name, content, conversation_id) "
+            "VALUES (30, 30, '2026-04-20T10:00:00', 'Kiwi plan for the second half', "
+            "'nothing', 'INBOX', 'x', 'U')"
+        )
+        recall_db.commit()
+
+        def fake_sem(conn, query, limit):
+            return [10, 30, 11, 12, 13]
+
+        res = recall(recall_db, "kiwi plan", semantic_candidates=fake_sem)
+
+        assert [e["email_id"] for e in res["emails"]][:2] == [14, 30]
+
+    def test_a_thread_is_shown_by_its_keyword_hit_not_a_semantic_sibling(self, recall_db):
+        """The sibling carries no evidence of the match: no snippet, no source."""
+        rows = [
+            (40, "Contract", "the okapi contract terms and all the other clauses", "T"),
+            (41, "RE: Contract", "agreement signed", "T"),
+            (42, "Other", "okapi", "U"),
+        ]
+        for i, subject, content, thread in rows:
+            recall_db.execute(
+                "INSERT INTO emails (id, message_id, date_received, subject, summary, "
+                "mailbox_name, content, conversation_id) "
+                "VALUES (?, ?, '2026-04-20T10:00:00', ?, 'nothing', 'INBOX', ?, ?)",
+                (i, i, subject, content, thread),
+            )
+        recall_db.commit()
+
+        def fake_sem(conn, query, limit):
+            return [41, 42]
+
+        res = recall(recall_db, "okapi", semantic_candidates=fake_sem)
+        shown = {e["email_id"]: e["source"] for e in res["emails"]}
+
+        assert shown.get(40) == "content"
+        assert 41 not in shown
+
     def test_keyword_only_when_no_provider(self, recall_db):
         # Default path (no injected provider) is unchanged, keyword-only.
         res = recall(recall_db, "unicornz9")

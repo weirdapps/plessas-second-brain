@@ -345,8 +345,8 @@ def query_by_keyword(
     Returns:
         List of dicts with keys: email_id, date, subject, summary, snippet, source
         where source is 'subject', 'summary', 'content', 'key_fact' or
-        'attachment'; a subject, summary or content row whose thread matched in
-        more than one email adds thread_matches, the count. When no row carries
+        'attachment'; a row whose thread has more than one email matching in its
+        subject, summary or body adds thread_matches, that count. When no row carries
         every token, rows matching any meaningful token come back instead, each
         flagged partial_match.
     """
@@ -376,11 +376,34 @@ def _best_of_each_thread(rank: str, then: str = "") -> str:
     return f"ROW_NUMBER() OVER (PARTITION BY COALESCE({_THREAD}, e.id) ORDER BY {order})"
 
 
-# How many of a thread's emails the source matched, for the sources with one row
-# per email (subject, summary, body): the row shown stands for all of them, and a
-# caller should know when to open email_thread. Half the corpus is threaded by
-# subject alone, so a recurring report's matches read as one row.
-_MATCHES_IN_THREAD = f"COUNT(*) OVER (PARTITION BY COALESCE({_THREAD}, e.id))"
+def _matching_emails_per_thread(
+    conn: sqlite3.Connection, expression: str, keys: set, search_content_only: bool
+) -> dict:
+    """Thread key -> how many of its emails match `expression` in the subject, the
+    summary or the body (the body alone for a content-only search), each column
+    on its own, as each stage of the waterfall matches it.
+
+    Driven from the page's threads, through the conversation_id index, with one
+    index seek per member: a common word matches thousands of emails, and
+    reading every match cost 20 to 90 ms a search where this costs under 5.
+    """
+    columns = ["content_f"]
+    if not search_content_only:
+        columns.append("summary_f")
+        if _has_subject_index(conn):
+            columns.append("subject_f")
+    matches = " OR ".join(
+        "EXISTS (SELECT 1 FROM emails_fts "
+        f"WHERE emails_fts.rowid = e.id AND emails_fts.{column} MATCH ?)"
+        for column in columns
+    )
+    rows = conn.execute(
+        "SELECT j.value, COUNT(*) FROM json_each(?) j "
+        f"JOIN emails e ON e.conversation_id = j.value AND {_THREAD} = j.value "
+        f"WHERE {matches} GROUP BY j.value",
+        (json.dumps(sorted(keys)), *[expression] * len(columns)),
+    )
+    return dict(rows)
 
 
 def thread_keys(conn: sqlite3.Connection, email_ids) -> dict:
@@ -408,6 +431,7 @@ def _keyword_waterfall(
     results: list[dict] = []
     seen_ids: set[int] = set()
     taken_threads: set[str] = set()
+    thread_of: dict[int, str] = {}
 
     def take(rows) -> None:
         """Append the rows not found already, until the page is full.
@@ -422,14 +446,12 @@ def _keyword_waterfall(
                 return
             r = dict(row)
             thread = r.pop("thread", None)
-            matches = r.pop("thread_matches", None)
             if r["email_id"] in seen_ids:
                 continue
-            if matches and matches > 1:
-                r["thread_matches"] = matches
             seen_ids.add(r["email_id"])
             if thread is not None:
                 taken_threads.add(thread)
+                thread_of[r["email_id"]] = thread
             results.append(r)
 
     def taken() -> str:
@@ -443,8 +465,7 @@ def _keyword_waterfall(
         # RE:/FW: prefixes a subject carries. Equal ranks (a recurring subject)
         # go newest first.
         query_subjects = f"""
-            SELECT email_id, date, subject, summary, snippet, source, thread, thread_matches
-            FROM (
+            SELECT email_id, date, subject, summary, snippet, source, thread FROM (
                 SELECT
                     e.id as email_id,
                     e.date_received as date,
@@ -453,7 +474,6 @@ def _keyword_waterfall(
                     e.subject as snippet,
                     'subject' as source,
                     {_THREAD} as thread,
-                    COUNT(*) OVER t as thread_matches,
                     MIN(emails_fts.rank) OVER t as score,
                     ROW_NUMBER() OVER (t ORDER BY e.date_received DESC, e.id DESC) as nth
                 FROM emails_fts
@@ -475,8 +495,7 @@ def _keyword_waterfall(
         # key_fact -> attachment) plus seen_ids dedup preserves the cross-source
         # order.
         query_summaries = f"""
-            SELECT email_id, date, subject, summary, snippet, source, thread, thread_matches
-            FROM (
+            SELECT email_id, date, subject, summary, snippet, source, thread FROM (
                 SELECT
                     e.id as email_id,
                     e.date_received as date,
@@ -485,7 +504,6 @@ def _keyword_waterfall(
                     e.summary as snippet,
                     'summary' as source,
                     {_THREAD} as thread,
-                    {_MATCHES_IN_THREAD} as thread_matches,
                     emails_fts.rank as score,
                     {_best_of_each_thread("emails_fts.rank")} as nth
                 FROM emails_fts
@@ -506,12 +524,11 @@ def _keyword_waterfall(
     if len(results) < limit:
         query_content = f"""
             WITH picked AS (
-                SELECT email_id, thread_matches FROM (
+                SELECT email_id FROM (
                     SELECT
                         e.id as email_id,
                         emails_fts.rank as score,
                         e.date_received as date,
-                        {_MATCHES_IN_THREAD} as thread_matches,
                         {_best_of_each_thread("emails_fts.rank")} as nth
                     FROM emails e
                     JOIN emails_fts ON emails_fts.rowid = e.id
@@ -528,8 +545,7 @@ def _keyword_waterfall(
                 e.summary,
                 snippet(emails_fts, 1, '<b>', '</b>', '...', 30) as snippet,
                 'content' as source,
-                {_THREAD} as thread,
-                picked.thread_matches
+                {_THREAD} as thread
             FROM emails e
             JOIN picked ON picked.email_id = e.id
             JOIN emails_fts ON emails_fts.rowid = e.id
@@ -613,6 +629,19 @@ def _keyword_waterfall(
     # attachment); keep that order rather than re-sorting by date, so BM25
     # relevance is not discarded. (True cross-source ranking via score fusion / RRF
     # is a later change.) take() stops at the requested number.
+
+    # The row shown stands for all of its thread's matches, in any field: a reply
+    # chain holds the words in one subject or summary and in every quoting body,
+    # and half the corpus is threaded by subject alone (recurring reports). Say
+    # how many matched, so a caller knows to open email_thread.
+    if thread_of:
+        counts = _matching_emails_per_thread(
+            conn, safe_keyword, set(thread_of.values()), search_content_only
+        )
+        for r in results:
+            matched = counts.get(thread_of.get(r["email_id"]), 0)
+            if matched > 1:
+                r["thread_matches"] = matched
     return results
 
 

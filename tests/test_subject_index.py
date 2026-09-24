@@ -365,7 +365,8 @@ def test_a_full_page_of_subjects_skips_the_summary_search(tmp_path):
 
     conn.set_trace_callback(None)
     assert len(results) == 2
-    assert not [s for s in ran if "summary_f MATCH" in s]
+    # The summary stage itself; the thread_matches count reads every column.
+    assert not [s for s in ran if "'summary' as source" in s]
 
 
 def test_results_carry_no_thread_key(tmp_path):
@@ -637,3 +638,38 @@ def test_a_threads_row_says_how_many_of_its_emails_matched(tmp_path, source):
     assert results[4]["thread_matches"] == 4
     assert "thread_matches" not in results[5]  # alone in its thread
     assert "thread_matches" not in results[6]  # no thread at all
+
+
+def test_thread_matches_counts_every_field(tmp_path):
+    """A reply chain holds the term in one email's subject or summary and in every
+    body that quotes it. The subject or summary stage claims the thread, and a
+    count of that stage's matches alone said nothing else had matched."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Weekly", summary="the okapi deal", content="okapi terms", thread="T")
+    for n in range(2, 6):
+        _mail(conn, n, "Weekly", content="re: okapi terms", thread="T")
+    _mail(conn, 6, "Okapi terms", content="okapi terms", thread="U")
+    for n in range(7, 10):
+        _mail(conn, n, "Status", content="quoted: okapi terms", thread="U")
+    _mail(conn, 10, "Digest", content="okapi terms", thread="U", mailbox="News")  # no thread
+    conn.commit()
+
+    results = {r["email_id"]: r for r in query_by_keyword(conn, "okapi", limit=10)}
+
+    assert results[6]["source"] == "subject" and results[6]["thread_matches"] == 4
+    assert results[1]["source"] == "summary" and results[1]["thread_matches"] == 5
+
+
+def test_a_content_only_search_counts_bodies_only(tmp_path):
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Okapi", content="okapi terms", thread="T")
+    _mail(conn, 2, "Okapi", summary="the okapi deal", thread="T")
+    _mail(conn, 3, "Okapi", summary="the okapi deal", thread="T")
+    conn.commit()
+
+    results = query_by_keyword(conn, "okapi", limit=10, search_content_only=True)
+
+    assert [r["email_id"] for r in results] == [1]
+    assert "thread_matches" not in results[0]  # the subjects and summaries were not searched

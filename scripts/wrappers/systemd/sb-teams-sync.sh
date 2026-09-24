@@ -8,7 +8,8 @@
 set -uo pipefail
 
 # Env setup — sources $HOME files only; brings Vertex AI creds via .zprofile.
-# Step 5 (thread extraction) needs ANTHROPIC_VERTEX_PROJECT_ID for Vertex AI
+# Step 5 (thread extraction) needs VERTEX_SDK_PROJECT (or
+# ANTHROPIC_VERTEX_PROJECT_ID) for Vertex AI
 # Claude; without it, steps 1-4 (network IO) succeed but extraction fails.
 [ -f "$HOME/.zprofile" ] && source "$HOME/.zprofile" 2>/dev/null || true
 

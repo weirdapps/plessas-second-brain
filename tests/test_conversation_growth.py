@@ -87,33 +87,38 @@ def _extract(staged):
 
 
 def test_a_conversation_that_went_on_is_extracted_again_once(extraction_paths):
-    """A session extracted before it went on is extracted again, once: the end it
-    was extracted at is kept, and only a later one brings it back."""
+    """A session extracted before it went on is extracted again, once: the copy it
+    was extracted from is kept, and only a copy that went on past it (a later end
+    and more turns) brings it back."""
     local.CONV_STATE_FILE.write_text(json.dumps({"processed_ids": ["grew", "same", "legacy"]}))
     staged = [
         {
             "session_id": "grew",
             "ended_at": "2026-09-01T12:00:00",
+            "turn_count": 2,
             "regrown_from": "2026-09-01T10:00:00",
         },
         {
             "session_id": "same",
             "ended_at": "2026-09-01T10:00:00",
+            "turn_count": 1,
             "regrown_from": "2026-09-01T10:00:00",
         },
-        {"session_id": "legacy", "ended_at": "2026-09-01T10:00:00"},  # no record: as extracted
+        {"session_id": "legacy", "ended_at": "2026-09-01T10:00:00", "turn_count": 1},
     ]
 
     assert _extract(staged) == ["grew"]
     state = json.loads(local.CONV_STATE_FILE.read_text())
-    assert state["extracted_ended_at"]["grew"] == "2026-09-01T12:00:00"
+    assert state["extracted_from"]["grew"] == ["2026-09-01T12:00:00", 2]
     assert _extract(staged) == []
 
-    staged[0] = {**staged[0], "ended_at": "2026-09-01T15:00:00"}  # it went on again
+    staged[0] = {**staged[0], "ended_at": "2026-09-01T15:00:00"}  # a later end alone
+    assert _extract(staged) == []
+    staged[0] = {**staged[0], "turn_count": 3}  # and a new turn: it went on again
     assert _extract(staged) == ["grew"]
 
 
-def test_the_end_extracted_at_is_saved_where_processed_ids_is(extraction_paths, monkeypatch):
+def test_the_copy_extracted_from_is_saved_where_processed_ids_is(extraction_paths, monkeypatch):
     """At every save: the periodic one, which is all a run that dies part-way
     leaves, and the last, which is all a run the deadline cuts short gets."""
     import itertools
@@ -123,13 +128,14 @@ def test_the_end_extracted_at_is_saved_where_processed_ids_is(extraction_paths, 
             "session_id": f"s{i}",
             "started_at": f"2026-09-01T1{i}:00",
             "ended_at": f"2026-09-01T1{i}:00",
+            "turn_count": 1,
         }
         for i in range(4)
     ]
     ended = {c["session_id"]: c["ended_at"] for c in staged}
 
     def saved():
-        return json.loads(local.CONV_STATE_FILE.read_text()).get("extracted_ended_at")
+        return json.loads(local.CONV_STATE_FILE.read_text()).get("extracted_from")
 
     def run(extract, **kwargs):
         with (
@@ -150,7 +156,7 @@ def test_the_end_extracted_at_is_saved_where_processed_ids_is(extraction_paths, 
 
     with pytest.raises(RuntimeError):
         run(dies_on_the_third)
-    assert saved() == {"s3": ended["s3"], "s2": ended["s2"]}  # newest first
+    assert saved() == {"s3": [ended["s3"], 1], "s2": [ended["s2"], 1]}  # newest first
 
     local.CONV_STATE_FILE.unlink()
     monkeypatch.setattr(local, "SAVE_INTERVAL", 50)
@@ -158,19 +164,27 @@ def test_the_end_extracted_at_is_saved_where_processed_ids_is(extraction_paths, 
     monkeypatch.setattr(local.time, "monotonic", lambda: next(clock))
     done = run(lambda conv: (conv["session_id"], {"summary": "x"}, False, None), deadline_s=25.0)
     assert 0 < len(done) < len(staged)
-    assert saved() == {sid: ended[sid] for sid in done}
+    assert saved() == {sid: [ended[sid], 1] for sid in done}
 
 
 def test_a_conversation_extracted_but_not_yet_loaded_that_went_on_is_extracted_again(
     extraction_paths,
 ):
-    """Loading pairs the newest staged turns with the extraction: an extraction of
-    fewer turns described a transcript it had not read."""
+    """Loaded or not, a session extracted before it went on is extracted again; one
+    whose newer copy only ends later (a tab closed, which adds an event and no
+    turn) is not."""
+    extracted = ["2026-09-01T10:00:00", 1]
     local.CONV_STATE_FILE.write_text(
-        json.dumps({"processed_ids": ["s"], "extracted_ended_at": {"s": "2026-09-01T10:00:00"}})
+        json.dumps(
+            {"processed_ids": ["s", "t"], "extracted_from": {"s": extracted, "t": extracted}}
+        )
     )
+    staged = [
+        {"session_id": "s", "ended_at": "2026-09-01T11:00:00", "turn_count": 2},
+        {"session_id": "t", "ended_at": "2026-09-01T11:00:00", "turn_count": 1},
+    ]
 
-    assert _extract([{"session_id": "s", "ended_at": "2026-09-01T11:00:00"}]) == ["s"]
+    assert _extract(staged) == ["s"]
 
 
 def _extraction(summary, decision, task, fact, topic):
@@ -278,9 +292,19 @@ def test_a_conversation_loaded_again_is_embedded_again_and_its_old_vector_goes(
         return np.ones((len(texts), 4), dtype=np.float32)
 
     monkeypatch.setattr(embeddings, "generate_embeddings", embed)
-    others = [7, -3, embeddings.TEAMS_THREAD_ID_OFFSET - 5]  # an email, an attachment, a thread
-    np.savez(str(index), ids=np.array(others, dtype=np.int64), vectors=np.ones((3, 4), np.float32))
+    # An email, two attachments, a thread. Attachment 2,000,003 is past the
+    # conversation offset, where its vector id reads as a conversation's.
+    others = [7, -3, -2_000_003, embeddings.TEAMS_THREAD_ID_OFFSET - 5]
+    np.savez(str(index), ids=np.array(others, dtype=np.int64), vectors=np.ones((4, 4), np.float32))
     conn = create_database(str(tmp_path / "b.db"))
+    conn.execute(
+        "INSERT INTO attachments (id, message_id, filename, file_path, exported_at) "
+        "VALUES (1, 1, 'a.pdf', '/a.pdf', '')"
+    )
+    conn.execute(
+        "INSERT INTO attachment_content (id, attachment_id, extraction_status) "
+        "VALUES (2000003, 1, 'extracted')"
+    )
     first = _transcript("s", "2026-09-01T10:00:00Z", [("user", "a")])
     load_single_conversation(conn, first, _extraction("first", "d1", "t1", "f1", "alpha"))
     conn.commit()
@@ -339,6 +363,76 @@ def test_the_running_session_hook_replaces_what_it_loaded(tmp_path, monkeypatch)
     assert rows == [(1, "first"), (2, "second")]
 
 
+def test_an_extraction_is_loaded_with_the_copy_it_read(tmp_path, monkeypatch):
+    """The loader took the newest staged copy, which is ahead of the extraction
+    when a session goes on between the two. Refused, a session never loaded
+    stayed out of the store for good once the newer copy was given up."""
+    from src import config
+    from src.store.loader import load_conversations
+    from src.store.schema import get_connection
+
+    monkeypatch.setattr(config, "DATA_ROOT", tmp_path)
+    staging = tmp_path / "staging" / "conversations"
+    extracted = tmp_path / "extracted" / "conversations"
+    staging.mkdir(parents=True)
+    extracted.mkdir(parents=True)
+    first = _transcript("s", "2026-09-01T10:00:00Z", [("user", "a")])
+    grown = _transcript("s", "2026-09-01T12:00:00Z", [("user", "a"), ("assistant", "b")])
+    for n, copy in enumerate((first, grown), 1):
+        batch = {"conversations": [copy]}
+        (staging / f"conversation-batch-{n:03d}.json").write_text(json.dumps(batch))
+    db = tmp_path / "b.db"
+    create_database(str(db)).close()
+
+    def load(copy, summary):
+        extraction = _of(copy, _extraction(summary, "d", "t", "f", "x"))
+        (extracted / "s.json").write_text(json.dumps(extraction))
+        load_conversations(str(db))
+        conn = get_connection(str(db))
+        rows = [tuple(r) for r in conn.execute("SELECT summary, turn_count FROM conversations")]
+        conn.close()
+        return rows
+
+    assert load(first, "first") == [("first", 1)]
+    assert load(grown, "second") == [("second", 2)]
+    assert load(first, "stale") == [("second", 2)]  # never back to an older copy
+
+
+def test_the_new_id_is_taken_under_the_write_lock(tmp_path):
+    """MAX(id) was read before the delete, outside any transaction, so another
+    writer could take that id first, and the insert failed."""
+    import sqlite3
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    first = _transcript("s", "2026-09-01T10:00:00Z", [("user", "a")])
+    load_single_conversation(conn, first, _extraction("first", "d", "t", "f", "x"))
+    conn.commit()
+    other = sqlite3.connect(str(db), timeout=0)
+    blocked = []
+
+    class Racing:
+        """The store's connection, with another writer adding a conversation just
+        before the new id is read."""
+
+        def execute(self, sql, *args):
+            if "MAX(id)" in sql:
+                try:
+                    other.execute(
+                        "INSERT INTO conversations (session_id, started_at, created_at) "
+                        "VALUES ('t', '', '')"
+                    )
+                    other.commit()
+                except sqlite3.OperationalError:
+                    blocked.append(sql)
+            return conn.execute(sql, *args)
+
+    grown = _transcript("s", "2026-09-01T12:00:00Z", [("user", "a"), ("user", "b")])
+    extraction = _of(grown, _extraction("second", "d", "t", "f", "x"))
+    assert load_single_conversation(Racing(), grown, extraction)
+    assert blocked  # the other writer waited for this one
+
+
 def test_an_extraction_says_which_transcript_it_describes(extraction_paths):
     _extract([{"session_id": "s", "ended_at": "2026-09-01T10:00:00"}])
 
@@ -369,3 +463,50 @@ def test_the_loader_waits_for_an_extraction_of_the_transcript_staged(tmp_path):
     assert load_single_conversation(conn, other, legacy)  # a first load, as before
     stale = {**legacy, "transcript_ended_at": "2026-09-01T09:00:00Z"}
     assert load_single_conversation(conn, other, stale, replace=True)  # the caller's own
+
+
+def test_sync_embeds_the_conversations_it_loads(tmp_path, monkeypatch):
+    """Step 5 embeds before Step 7 loads, and only when mail came in, so a session
+    loaded again had no vector, and semantic search could not find it, until a
+    sync with new mail. Failing to embed does not stop the sync."""
+    from src import cli, llm_deadline
+
+    db_path = tmp_path / "brain.db"
+    conn = create_database(str(db_path))
+    conn.execute(
+        "INSERT INTO sync_metadata (key, value) VALUES ('last_sync_date', '2026-01-01T00:00:00')"
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr("src.cli.DATA_ROOT", tmp_path)
+    monkeypatch.setattr(llm_deadline, "_detect_systemd_unit", lambda: None)
+    args = type(
+        "Args",
+        (),
+        {"db": db_path, "limit": None, "engine": "claude", "workers": 1, "skip_export": True},
+    )()
+    embedded = []
+
+    def sync(loaded, embed):
+        ok = {"extracted": 0, "failed": 0, "quota_paused": False}
+        with (
+            patch("src.extract.local.run_extraction", return_value=ok),
+            patch("src.store.loader.load_extractions", return_value=0),
+            patch("src.extract.attachment_pipeline.run_phase1", return_value={"processed": 0}),
+            patch(
+                "src.export.conversation_export.export_conversations", return_value={"exported": 1}
+            ),
+            patch("src.extract.local.run_conversation_extraction"),
+            patch("src.store.loader.load_conversations", return_value=loaded),
+            patch("src.store.embeddings.build_index", side_effect=embed),
+            patch("src.extract.image_pipeline.run_backfill", return_value={}),
+        ):
+            return cli.cmd_sync(args)
+
+    def down(conn):
+        raise RuntimeError("embedding service down")
+
+    assert sync(1, lambda conn: embedded.append("loaded")) == 0
+    assert sync(0, lambda conn: embedded.append("none loaded")) == 0
+    assert embedded == ["loaded"]
+    assert sync(1, down) == 0

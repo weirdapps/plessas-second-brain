@@ -677,9 +677,13 @@ def test_call_records_are_system_messages(db, fixture_loader):
 
 def test_v24_marks_the_stored_call_records_and_requeues_their_threads(tmp_path):
     """Ingest took call records for messages until v24. The migration marks the
-    ones stored, and sends a thread that also holds a real message back to
-    extraction, which reads only those, since its summary read the calls' XML. A
-    thread of calls alone keeps its summary, which describes the calls."""
+    ones stored and counts every thread that held one again, as the thread builder
+    counts: its messages, time and names, without the calls, which the model is
+    shown. A thread goes back to extraction when what is left clears extraction's
+    floor, since its summary read the calls' XML; one that does not, or holds calls
+    alone, keeps its summary, which describes them."""
+    import json
+
     from src.config import CURRENT_SCHEMA_VERSION
     from src.store.schema import create_database, get_schema_version, run_migrations
 
@@ -688,31 +692,37 @@ def test_v24_marks_the_stored_call_records_and_requeues_their_threads(tmp_path):
         "INSERT INTO teams_chats (id, teams_chat_id, chat_kind, first_seen_at) "
         "VALUES (1, '19:t', 'oneOnOne', '2026-09-01T00:00:00')"
     )
-    names = ("calls", "mixed", "plain", "pending", "skipped", "untyped")
+    names = ("calls", "mixed", "plain", "pending", "skipped", "untyped", "short")
     for thread_id, name in enumerate(names, 1):
         conn.execute(
             "INSERT INTO teams_threads (id, chat_id, thread_kind, anchor_message_id, started_at, "
-            "ended_at, extraction_status, summary) "
-            "VALUES (?, 1, 'chat_session', ?, '2026-09-01', '2026-09-01', ?, ?)",
+            "ended_at, message_count, participant_display_names, extraction_status, summary) "
+            "VALUES (?, 1, 'chat_session', ?, '2026-09-01T09:00', '2026-09-01T09:00', 2, "
+            '\'["Alice", "Bob"]\', ?, ?)',
             (thread_id, name, name if name in ("pending", "skipped") else "extracted", name),
         )
-    kinds = [
-        (1, "Event/Call"),
-        (1, "RichText/Media_CallRecording"),
-        (2, "RichText/Media_CallTranscript"),
-        (2, "RichText/Html"),
-        (3, "Text"),
-        (4, "event/call"),  # another case, which ingest's startswith does not take
-        (5, "Event/Call"),
-        (5, "Text"),  # skipped before, and left skipped
-        (6, "Event/Call"),
-        (6, None),  # a message with no type is still a message
+    xml = "<partlist type='ended'><part><name>Alice</name></part></partlist>"
+    said = "Here is where the budget stands, and what we still need to agree on. " * 2
+    messages = [
+        (1, "Event/Call", "Alice", xml),
+        (1, "RichText/Media_CallRecording", "Carol", xml),
+        (2, "RichText/Media_CallTranscript", "Carol", xml),
+        (2, "RichText/Html", "Bob", said),
+        (3, "Text", "Bob", said),
+        (4, "event/call", "Alice", xml),  # another case, which ingest's startswith does not take
+        (5, "Event/Call", "Alice", xml),
+        (5, "Text", "Bob", said),  # skipped before, and left skipped
+        (6, "Event/Call", "Alice", xml),
+        (6, None, "Bob", said),  # a message with no type is still a message
+        (7, "Event/Call", "Alice", xml),
+        (7, "Text", "Bob", "ok, thanks"),  # below extraction's floor
     ]
-    for i, (thread_id, kind) in enumerate(kinds):
+    for i, (thread_id, kind, sender, content) in enumerate(messages):
         conn.execute(
             "INSERT INTO teams_messages (teams_message_id, chat_id, thread_id, composed_at, "
-            "message_type, content_text, is_system) VALUES (?, 1, ?, '2026-09-01', ?, 'x', 0)",
-            (f"m{i}", thread_id, kind),
+            "message_type, sender_display_name, content_text, is_system) "
+            "VALUES (?, 1, ?, ?, ?, ?, ?, 0)",
+            (f"m{i}", thread_id, f"2026-09-01T10:{i:02d}", kind, sender, content),
         )
     conn.execute("UPDATE schema_version SET version = 23")
     conn.commit()
@@ -720,15 +730,52 @@ def test_v24_marks_the_stored_call_records_and_requeues_their_threads(tmp_path):
     run_migrations(conn)
 
     marked = dict(conn.execute("SELECT teams_message_id, is_system FROM teams_messages"))
-    calls = {0, 1, 2, 6, 8}
-    assert marked == {f"m{i}": int(i in calls) for i in range(10)}
-    statuses = dict(conn.execute("SELECT summary, extraction_status FROM teams_threads"))
-    assert statuses == {
-        "calls": "extracted",
-        "mixed": "pending",
-        "plain": "extracted",
-        "pending": "pending",
-        "skipped": "skipped",
-        "untyped": "pending",
+    calls = {0, 1, 2, 6, 8, 10}
+    assert marked == {f"m{i}": int(i in calls) for i in range(len(messages))}
+    rows = {
+        r["summary"]: (
+            r["extraction_status"],
+            r["message_count"],
+            r["started_at"],
+            r["ended_at"],
+            json.loads(r["participant_display_names"]),
+        )
+        for r in conn.execute("SELECT * FROM teams_threads")
     }
-    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION == 24
+    before = ("2026-09-01T09:00", "2026-09-01T09:00", ["Alice", "Bob"])
+    assert rows == {
+        "calls": ("extracted", 2, *before),
+        "mixed": ("pending", 1, "2026-09-01T10:03", "2026-09-01T10:03", ["Bob"]),
+        "plain": ("extracted", 2, *before),
+        "pending": ("pending", 2, *before),
+        "skipped": ("skipped", 1, "2026-09-01T10:07", "2026-09-01T10:07", ["Bob"]),
+        "untyped": ("pending", 1, "2026-09-01T10:09", "2026-09-01T10:09", ["Bob"]),
+        "short": ("extracted", 1, "2026-09-01T10:11", "2026-09-01T10:11", ["Bob"]),
+    }
+    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION
+
+
+def test_a_chat_summary_leaves_system_messages_out(tmp_path):
+    """Call records and membership changes came back as a chat's last messages,
+    their XML and all, and their senders ranked as its most active people."""
+    from src.store.schema import create_database
+    from src.store.teams_query import chat_summary
+
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.execute(
+        "INSERT INTO teams_chats (id, teams_chat_id, chat_kind, first_seen_at) "
+        "VALUES (1, '19:t', 'oneOnOne', '2026-09-01T00:00:00')"
+    )
+    rows = [("Alice", "<partlist/>", 1)] * 3 + [("Admin", "<addmember/>", 1), ("Bob", "hi", 0)]
+    for i, (sender, content, is_system) in enumerate(rows):
+        conn.execute(
+            "INSERT INTO teams_messages (teams_message_id, chat_id, composed_at, "
+            "sender_display_name, content_text, is_system) "
+            "VALUES (?, 1, datetime('now'), ?, ?, ?)",
+            (f"m{i}", sender, content, is_system),
+        )
+
+    summary = chat_summary(conn, 1)
+
+    assert [m["content_text"] for m in summary["last_messages"]] == ["hi"]
+    assert summary["top_senders"] == [{"name": "Bob", "n": 1}]

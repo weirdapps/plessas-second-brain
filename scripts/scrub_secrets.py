@@ -33,7 +33,9 @@ that write the database first.
 
 Run it on the host that builds the database, with the writers stopped. Counts
 only are printed, never a value. Defaults to a dry run, which opens the database
-read-only and exits 1 when it finds anything. On a replica --apply is refused
+read-only and exits 1 when it finds anything. Either mode exits 2 when a kept
+HTML value cannot be decompressed: it scrubs everything else, but cannot say the
+database is clean. On a replica --apply is refused
 with exit 3, since the next pull replaces the file. Snapshots taken before the scrub
 still hold the old rows: the encrypted offsite ones, and the plaintext local
 ones in data/backups/, both of which age out under the retention policy.
@@ -43,6 +45,7 @@ import argparse
 import shutil
 import sqlite3
 import sys
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -103,21 +106,36 @@ def _has_secret(value) -> bool:
     return isinstance(value, str) and any(p.search(value) for _n, p in _PATTERNS)
 
 
-def _scan(conn: sqlite3.Connection) -> dict[tuple[str, str], list[int]]:
-    """(table, column) -> rowids of rows whose value holds a credential."""
+def _unpacked(value) -> str | None:
+    """A compressed value's text, or None for one that is not zlib, not UTF-8
+    inside, or not bytes at all."""
+    try:
+        return unpack(value)
+    except (zlib.error, UnicodeDecodeError, TypeError):
+        return None
+
+
+def _scan(
+    conn: sqlite3.Connection,
+) -> tuple[dict[tuple[str, str], list[int]], dict[str, int]]:
+    """(table, column) -> rowids of rows whose value holds a credential, and
+    table -> how many compressed values could not be read."""
     found: dict[tuple[str, str], list[int]] = {}
+    unreadable: dict[str, int] = {}
     for table, column in _text_columns(conn) + _packed_columns(conn):
         packed = (table, column) in _PACKED
-        rowids = [
-            rowid
-            for rowid, value in conn.execute(
-                f'SELECT rowid, "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL'
-            )
-            if _has_secret(unpack(value) if packed else value)
-        ]
+        rowids = []
+        for rowid, value in conn.execute(
+            f'SELECT rowid, "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL'
+        ):
+            text = _unpacked(value) if packed else value
+            if packed and text is None:
+                unreadable[table] = unreadable.get(table, 0) + 1
+            elif _has_secret(text):
+                rowids.append(rowid)
         if rowids:
             found[(table, column)] = rowids
-    return found
+    return found, unreadable
 
 
 def _fts5_indexes(conn: sqlite3.Connection) -> list[str]:
@@ -151,6 +169,12 @@ def _checkpoint(conn: sqlite3.Connection) -> bool:
     return busy == 0 and log_frames == checkpointed
 
 
+def _report_unreadable(unreadable: dict[str, int]) -> None:
+    for table, count in sorted(unreadable.items()):
+        noun = "row" if count == 1 else "rows"
+        print(f"  {count} {table} {noun} could not be read, so were not checked", file=sys.stderr)
+
+
 def _report(found: dict[tuple[str, str], list[int]]) -> None:
     if not found:
         print("No credential-shaped values found.")
@@ -170,7 +194,7 @@ def _apply(conn: sqlite3.Connection, found: dict[tuple[str, str], list[int]]) ->
                 row = conn.execute(
                     f'SELECT "{column}" FROM "{table}" WHERE rowid = ?', (rowid,)
                 ).fetchone()
-                value = None if row is None else unpack(row[0]) if packed else row[0]
+                value = None if row is None else _unpacked(row[0]) if packed else row[0]
                 if value is None or not _has_secret(value):
                     continue  # changed since the scan
                 clean = redact_secrets(value)
@@ -215,10 +239,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.apply:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         try:
-            found = _scan(conn)
+            found, unreadable = _scan(conn)
         finally:
             conn.close()
         _report(found)
+        if unreadable:
+            _report_unreadable(unreadable)
+            return 2
         return 1 if found else 0
 
     if args.vacuum:
@@ -242,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     try:
-        found = _scan(conn)
+        found, _unreadable = _scan(conn)
         _report(found)
         changed = _apply(conn, found) if found else 0
         print(f"{changed} rows redacted")
@@ -253,12 +280,16 @@ def main(argv: list[str] | None = None) -> int:
             conn.execute("VACUUM")
             print("  vacuumed")
         checkpointed = _checkpoint(conn)
-        left = _scan(conn)
+        left, unreadable = _scan(conn)
     finally:
         conn.close()
     if left:
         print("Credential-shaped values remain:", file=sys.stderr)
         _report(left)
+    if unreadable:
+        _report_unreadable(unreadable)
+        return 2
+    if left:
         return 1
     if not checkpointed:
         print(

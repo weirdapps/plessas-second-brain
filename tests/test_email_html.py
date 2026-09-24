@@ -353,6 +353,97 @@ def test_split_html_redacts_what_it_keeps(tmp_path):
     assert html == "<html><body><p>the key is [REDACTED:anthropic-key]</p></body></html>"
 
 
+def test_split_html_leaves_no_copy_of_what_it_redacted(tmp_path):
+    """Redacting a key only rewrites the row; the old bytes stay in free pages,
+    which every pull copies, unless secure_delete zeroes them."""
+    from src.cli import cmd_split_html
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    markup = "<div style='color:red;margin:0;padding:0'>x</div>" * 2000
+    for i in range(1, 21):
+        key = f"<p>the key is {ANTHROPIC}</p>" if i == 20 else ""  # freed last: no reuse
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received, subject, content) "
+            "VALUES (?, ?, '2026-09-01', 's', ?)",
+            (i, f"m{i}", f"<html><body>{markup}{key}</body></html>"),
+        )
+    conn.commit()
+    conn.close()
+    assert ANTHROPIC.encode() in db.read_bytes()
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=100, dry_run=False)) == 0
+
+    data = db.read_bytes()
+    wal = db.with_name(db.name + "-wal")
+    if wal.exists():
+        data += wal.read_bytes()
+    assert ANTHROPIC.encode() not in data
+
+
+def test_split_html_skips_a_text_body_that_opens_with_a_bracket(tmp_path, capsys):
+    """The SQL prefilter admits any body that opens with '<'; looks_like_html
+    decides, and a text body stays as it came."""
+    from src.cli import cmd_split_html
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    text = "<maria@example.com> wrote:\nhi"
+    conn.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, content) "
+        "VALUES (1, 'a', '2026-09-01', 's', ?)",
+        (text,),
+    )
+    conn.commit()
+    conn.close()
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=10, dry_run=False)) == 0
+
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT content FROM emails").fetchone()[0] == text
+    assert conn.execute("SELECT count(*) FROM email_html").fetchone()[0] == 0
+    assert "converted 0 emails" in capsys.readouterr().out
+
+
+def test_split_html_ends_a_batch_at_its_byte_budget(tmp_path, monkeypatch):
+    """A batch is held in memory until it is written: large bodies end it early."""
+    import src.cli as cli
+    from src.store import schema
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    for i in range(1, 6):
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received, subject, content) "
+            "VALUES (?, ?, '2026-09-01', 's', ?)",
+            (i, f"m{i}", HTML),
+        )
+    conn.commit()
+    conn.close()
+    commits = []
+    connect = schema.get_connection
+
+    class Counting:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def commit(self):
+            commits.append(1)
+            return self._conn.commit()
+
+    monkeypatch.setattr(schema, "get_connection", lambda path: Counting(connect(path)))
+    monkeypatch.setattr(cli, "SPLIT_HTML_BATCH_BYTES", len(HTML))
+
+    assert cli.cmd_split_html(argparse.Namespace(db=str(db), batch=500, dry_run=False)) == 0
+
+    assert len(commits) >= 5  # one batch per body, then the optimize
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT count(*) FROM email_html").fetchone()[0] == 5
+
+
 def test_split_html_finds_a_body_behind_a_byte_order_mark(tmp_path):
     """Its SQL prefilter skips the same leading characters looks_like_html does."""
     from src.cli import cmd_split_html

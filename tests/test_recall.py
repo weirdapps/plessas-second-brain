@@ -393,6 +393,24 @@ class TestRecallHybridFusion:
         assert shown.get(40) == "content"
         assert 41 not in shown
 
+    def test_a_provider_that_yields_its_candidates_still_counts(self, recall_db):
+        """The candidates were read twice, so a generator gave nothing the second
+        time and recall went keyword-only without a word."""
+        recall_db.execute(
+            "INSERT INTO emails (id, message_id, date_received, sender_name, sender_address, "
+            "subject, summary, sentiment, urgency, language, mailbox_name, content) "
+            "VALUES (99, 99, '2026-04-09T10:00:00', 'Z', 'z@example.com', 'No kw', "
+            "'totally unrelated content', 'informational', 'low', 'english', 'INBOX', 'x')"
+        )
+        recall_db.commit()
+
+        def fake_sem(conn, query, limit):
+            return (i for i in [99])
+
+        res = recall(recall_db, "unicornz9", semantic_candidates=fake_sem)
+
+        assert any(e["email_id"] == 99 for e in res["emails"])
+
     def test_keyword_only_when_no_provider(self, recall_db):
         # Default path (no injected provider) is unchanged, keyword-only.
         res = recall(recall_db, "unicornz9")

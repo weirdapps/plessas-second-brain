@@ -1029,7 +1029,8 @@ def cmd_query_thread(args):
     from src.store.schema import get_connection
 
     conn = get_connection(str(args.db))
-    results = query_thread(conn, args.email_id, limit=args.limit)
+    # At least the email itself: an empty answer means no such email.
+    results = query_thread(conn, args.email_id, limit=max(1, args.limit))
     total = count_thread(conn, args.email_id)
     conn.close()
 
@@ -1045,9 +1046,9 @@ def cmd_query_thread(args):
 
     for i, email in enumerate(results, 1):
         marker = ">>>" if email["email_id"] == args.email_id else "   "
-        date = email.get("date", "N/A")[:16]
-        sender = email.get("sender_name", "Unknown")
-        subject = email.get("subject", "(no subject)")[:60]
+        date = (email.get("date") or "N/A")[:16]
+        sender = email.get("sender_name") or "Unknown"
+        subject = (email.get("subject") or "(no subject)")[:60]
         print(f"{marker} {i}. [{date}] {sender}: {subject}")
         if args.verbose and email.get("summary"):
             print(f"       Summary: {email['summary']}")

@@ -458,3 +458,43 @@ def test_a_news_article_or_a_blank_thread_id_is_a_thread_of_one(conn):
         assert [e["email_id"] for e in query_thread(conn, email_id)] == [email_id]
         assert count_thread(conn, email_id) == 1
     assert (query_thread(conn, 99999), count_thread(conn, 99999)) == ([], 0)
+
+
+def test_a_blank_subject_email_is_no_stale_thread(conn):
+    """Every email with neither a conversation id nor references and a blank
+    subject shares one id; a stranger's later one hid the owner's, and the id it
+    reported was one email_thread calls a thread of one."""
+    from src.store.query import find_stale_threads
+    from src.store.schema import subject_to_conversation_id
+
+    blank = subject_to_conversation_id("")
+    _email(conn, 90, 10, "owner@example.com", blank, subject="")
+    _email(conn, 91, 12, "someone@example.com", blank, subject="")
+    _email(conn, 92, 10, "owner@example.com", "  ", subject="x")
+    _email(conn, 93, 12, "someone@example.com", "  ", subject="y")
+    conn.commit()
+
+    reported = [r["conversation_id"] for r in find_stale_threads(conn, days=5)]
+    assert blank not in reported
+    assert "  " not in reported
+
+
+def test_the_cli_thread_view_survives_a_blank_subject_and_a_zero_limit(tmp_path, capsys):
+    import argparse
+
+    from src.cli import cmd_query_thread
+
+    path = tmp_path / "b.db"
+    c = create_database(str(path))
+    c.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, conversation_id) "
+        "VALUES (5, 5, '2026-09-01T00:00:00Z', NULL, NULL)"
+    )
+    c.commit()
+    c.close()
+
+    cmd_query_thread(argparse.Namespace(db=path, email_id=5, limit=0, verbose=False))
+
+    out = capsys.readouterr().out
+    assert "Thread with 1 emails" in out
+    assert "(no subject)" in out

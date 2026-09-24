@@ -1179,7 +1179,11 @@ def _stale_threads_sql(select: str, days: int, max_days: int) -> tuple[str, tupl
             SELECT conversation_id,
                    MAX(date_received) as last_date
             FROM emails
-            WHERE conversation_id IS NOT NULL
+            -- A thread by _THREAD's rule: no blank id, nor the hash every email
+            -- with neither a conversation id nor references and a blank subject
+            -- shares. News never matches the owner as sender.
+            WHERE conversation_id IS NOT NULL AND TRIM(conversation_id) <> ''
+              AND conversation_id <> ?
             GROUP BY conversation_id
         )
         SELECT {select}
@@ -1190,7 +1194,7 @@ def _stale_threads_sql(select: str, days: int, max_days: int) -> tuple[str, tupl
           AND lpt.last_date < ?
           AND lpt.last_date >= ?
     """
-    return sql, (f"%{USER_EMAIL_PATTERN}%", cutoff, oldest)
+    return sql, (_BLANK_SUBJECT_THREAD, f"%{USER_EMAIL_PATTERN}%", cutoff, oldest)
 
 
 def find_stale_threads(

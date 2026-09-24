@@ -266,7 +266,8 @@ def _hybrid_emails(
     pool = max(limit * 4, limit)
     keyword_hits = query_by_keyword(conn, query, limit=pool)
     try:
-        sem_ids = semantic_candidates(conn, query, pool)
+        # Read twice below: a provider that yields would be empty the second time.
+        sem_ids = list(semantic_candidates(conn, query, pool))
     except Exception:
         return keyword_hits[:limit]
     if not sem_ids:

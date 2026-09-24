@@ -6,7 +6,8 @@ on a single host or split across two (see "Topology" below).
 
 ## 1. Prerequisites
 
-- Python 3.12+.
+- Python 3.12+, and [`uv`](https://docs.astral.sh/uv/), which installs from the
+  committed `uv.lock`.
 - `sqlite3` on `PATH`. `scripts/health_check.py` and the replica pull both shell
   out to it.
 - `tesseract`, plus the language data for the languages your attachments are
@@ -52,6 +53,7 @@ exporter) works without any of the three.
 git clone https://github.com/weirdapps/plessas-second-brain.git
 cd plessas-second-brain
 uv sync --frozen --no-build   # .venv from uv.lock; add --extra dev for the tests
+source .venv/bin/activate     # the commands below run its python
 ```
 
 For a venv outside the checkout (the reference producer keeps it in
@@ -75,8 +77,9 @@ extraction path (Vertex ADC, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`). See
 `.env.example` for the full list.
 
 Nothing in the code reads `.env`: the scheduling recipes in section 6 source it
-(`set -a; . ./.env`, `EnvironmentFile=`). The MCP server starts with an empty
-environment and sources nothing, so put the identity settings
+(`set -a; . ./.env`, `EnvironmentFile=`). The MCP server inherits the
+environment `claude` was launched with, which sources no `.env` and, from a GUI
+or an IDE, no shell profile, so put the identity settings
 (`BRAIN_USER_NAME`, `BRAIN_USER_ROLE`, `BRAIN_USER_EMAIL_PATTERN`,
 `SHAREPOINT_HOST`) in `~/.config/second-brain/env` too; `src/config.py` reads
 that file at import, and ignores any other key in it.

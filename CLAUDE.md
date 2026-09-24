@@ -5,7 +5,7 @@ Multi-modal personal knowledge base: ingests emails, attachments, calendar event
 ## Tech stack
 
 - **Python 3.12+**. `uv` is the canonical package manager (`uv.lock` is committed); `pip install -e ".[dev]"` also works.
-- Runtime deps (see `pyproject.toml`): `anthropic[vertex]`, `google-genai` (embeddings and the Gemini engine), `mcp[cli]`, `numpy`, `pymupdf`, `python-docx`, `python-pptx`, `openpyxl`, `pyxlsb`, `xlrd`, `pytesseract`, `pillow`, `pillow-heif`, `youtube-transcript-api`. None is source-only, so CI installs with `--no-build` and runs no `setup.py`.
+- Runtime deps (see `pyproject.toml`): `anthropic[vertex]`, `google-genai` (embeddings and the Gemini engine), `mcp[cli]`, `numpy`, `pymupdf`, `python-docx`, `python-pptx`, `openpyxl`, `pyxlsb`, `xlrd`, `pytesseract`, `pillow`, `pillow-heif`, `youtube-transcript-api`, and `anyio` (a security floor on a transitive dependency). None is source-only, so CI installs with `--no-build` and runs no `setup.py`.
 - System packages `pip` cannot install: **`tesseract` plus the `eng` and `ell` traineddata** (`attachment_extractors.py` calls `lang="eng+ell"`, and `pytesseract` is only the wrapper), and **`zstd` + `openssl`** for `scripts/backup_db.py` offsite snapshots. Verify with `tesseract --list-langs | grep -x ell`.
 - Dev extra is `pytest` + `pytest-cov` only. **`ruff` is not in it**: CI pins `ruff==0.16.8` and pre-commit pins the same `v0.16.8` (keep them in lockstep), so run `uvx ruff@0.16.8 check .` locally. Pre-commit: `ruff` (check + format), `mypy`, `gitleaks`, `yamllint` (workflows only), `markdownlint`, and a `pii-gauntlet` gate.
 - DB: SQLite at `data/brain.db` (override with `--db`, or relocate the whole data home with `BRAIN_DATA_DIR`, which must be an absolute path). `data/` is gitignored and never committed.
@@ -19,7 +19,7 @@ Multi-modal personal knowledge base: ingests emails, attachments, calendar event
 ## Hosts
 
 - The producer, a Linux VPS in this deployment, runs every ingest job on `systemd --user` timers and owns the only writable `brain.db`. Deploy code there by pulling; the wrappers the units run are archived in `scripts/wrappers/systemd/`.
-- A Mac is a replica: an hourly pull (`scripts/wrappers/launchd/sb-db-pull.sh`) copies `brain.db` and `embeddings.npz` down, and the local MCP server reads that copy. Every writing command refuses to run on a replica (`BRAIN_ROLE=replica`, or the pull's stamp `~/.second-brain/db-pull.stamp`); `BRAIN_ROLE=producer` overrides the stamp.
+- A Mac is a replica: an hourly pull (`scripts/wrappers/launchd/sb-db-pull.sh`) copies `brain.db` and `embeddings.npz` down, and the local MCP server reads that copy. Every `python -m src.cli` subcommand that writes, and the action lifecycle, refuses to run on a replica (`BRAIN_ROLE=replica`, or the pull's stamp `~/.second-brain/db-pull.stamp`); `BRAIN_ROLE=producer` overrides the stamp. Other writers are not guarded, so do not run them on a Mac either: the MCP `sharepoint_index` refetch, `python -m src.store.dedup_people`, `python -m src.export.inbox_reconcile`.
 - Schema migrations run on the producer and reach replicas with the next pull.
 
 ## Tests

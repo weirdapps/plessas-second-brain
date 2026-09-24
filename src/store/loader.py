@@ -101,9 +101,9 @@ def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
                 conn.commit()
                 batch_count = 0
 
-    # Final commit for remaining emails
-    if batch_count > 0:
-        conn.commit()
+    # Final commit, whatever loaded: a stored email's move to another folder is
+    # written too, and the transaction the first check opened is closed.
+    conn.commit()
 
     # Prune fully-resolved batch files — keeps staging dir from growing
     # forever. A staged email is "resolved" when it's already represented in
@@ -195,6 +195,16 @@ def prune_staged_batches(db_path: str, staging_dir: str) -> tuple[int, int]:
     return _prune_loaded_batches(batch_to_msgids, db_msgids)
 
 
+def _hold_the_write_lock(conn: sqlite3.Connection) -> None:
+    """Take the write lock before a loader's first check, unless its transaction
+    has it already. The sync units overlap (the noon catch-up and the hourly one),
+    and each found an item not stored, stored it, and failed on the other's copy
+    of its unique key, which ended that sync. The second now waits for the first
+    (busy_timeout) and finds the item stored."""
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+
+
 def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict) -> bool:
     """Load a single email with its extraction into the database.
 
@@ -209,6 +219,7 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
     message_id = metadata["message_id"]
     internet_message_id = metadata.get("internet_message_id") or None
     new_mailbox = metadata.get("mailbox_name") or metadata.get("mailbox")
+    _hold_the_write_lock(conn)
 
     # Check if already exists by source-specific message_id.
     # If found AND the folder changed (e.g. user moved Inbox→Archive via
@@ -586,6 +597,7 @@ def load_single_conversation(
         True if loaded, False if the store holds it and it has not gone on since
     """
     session_id = metadata["session_id"]
+    _hold_the_write_lock(conn)
 
     existing = conn.execute(
         "SELECT id, ended_at, turn_count FROM conversations WHERE session_id = ?", (session_id,)

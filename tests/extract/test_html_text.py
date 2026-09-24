@@ -182,7 +182,28 @@ def test_only_a_head_left_open_is_dropped_to_the_body():
             assert html_to_text(f"{before}<{element}>x{quoted}") == (
                 f"Reply{then}x\n\nMiddle text\n\nQuoted"
             ), element
-    assert html_to_text(f"<html><head></head><title>x{quoted}") == "x\n\nMiddle text\n\nQuoted"
+    # A head ends at its first element a head cannot hold, as in a browser, so an
+    # implicit body is not cut to a quoted document's <body>; a title after
+    # </head> is still the head's.
+    assert html_to_text(f"<html><head><title>T{quoted}") == "Middle text\n\nQuoted"
+    assert html_to_text(f"<html><head></head><title>x{quoted}") == "Middle text\n\nQuoted"
+    assert html_to_text("<head></head><title>Subj<body>Hello") == "Hello"
+    assert html_to_text("<html><head><title>T</head>Plain text first<p>then this") == (
+        "Plain text first\n\nthen this"
+    )
+    for held in ("<noscript><link rel=x></noscript>", "<basefont size=3>", "<bgsound src=x>", "\f"):
+        assert html_to_text(f"<html><head>{held}<title>Subj</head><body>Hello") == "Hello", held
+    # A stylesheet left open in the head goes up to where the head ends, past
+    # the markup a stylesheet can hold: Outlook's comment wrapper, a conditional
+    # comment, CDATA, an inline SVG.
+    for css in (
+        "<!-- p{color:red} --> .b{x:y}",
+        "p{}<!--[if mso]><x><![endif]--> td{color:red}",
+        "<![CDATA[ p{color:red} ]]> .b{x:y}",
+        "p{background:url(data:image/svg+xml,<svg xmlns='x'><path/></svg>)} .a{color:red}",
+        "/* <p> spacing */ p{margin:0}",
+    ):
+        assert html_to_text(f"<html><head><style>{css}</head><body>Hello") == "Hello", css
     attribute = '<html><head><title>T</head><p>kept</p><a title="<body >">link</a><p>after</p>'
     assert html_to_text(attribute) == "kept\n\nlink\n\nafter"
     comment = "<html><head><xml>settings</head><p>visible</p><!-- <body> --><p>two</p>"
@@ -194,6 +215,43 @@ def test_only_a_head_left_open_is_dropped_to_the_body():
     assert html_to_text(f"{head}<body><p>text</p>") == "text"
 
 
+def test_an_inline_tag_looks_for_nothing_to_end(monkeypatch):
+    """Every start tag in an open paragraph, cell or item searched up to 32 open
+    elements for one it ends, and a re-read parses it all again: a crafted
+    1.6 MB body took 11 s. An inline tag ends none of them."""
+    from src.extract import html_text
+
+    searched = []
+    search = html_text._Reader._end_left_open
+    monkeypatch.setattr(
+        html_text._Reader,
+        "_end_left_open",
+        lambda self, tag: searched.append(tag) or search(self, tag),
+    )
+    html = '<p>a <b>b</b> <i>c</i> <a href="https://x.example/">x.example</a> <span>d</span><div>e'
+    assert html_text.html_to_text(html) == "a b c x.example d\ne"
+    assert searched == ["div"]
+
+
+def test_the_re_reads_read_two_megabytes_at_most(monkeypatch):
+    """Read four times, a crafted body cost 7 s a megabyte; no body in the corpus
+    needs a re-read at all (19,804 on 2026-09-24, the largest 1.7 MB)."""
+    from src.extract import html_text
+
+    reads = []
+    read = html_text._read
+    monkeypatch.setattr(html_text, "_read", lambda html: reads.append(len(html)) or read(html))
+    html = "<p>" + "x" * 900_000 + "</p><title>a<title>b<title>c<p>after"
+    html_text.html_to_text(html)
+    assert len(reads) == 3  # the first read and two re-reads: a third would pass 2 MB
+    reads.clear()
+    html_text.html_to_text("<p>a</p><title>a<p>b</p><title>b<p>c</p><title>c<p>d")
+    assert len(reads) == 4
+    reads.clear()
+    html_text.html_to_text("<p>" + "x" * 1_999_988 + "</p><title>after")  # 2 MB re-read, exactly
+    assert reads == [2_000_007, 2_000_000]
+
+
 def test_key_headers_hidden_by_markup_cost_no_time():
     """The decoded text is redacted, and a key header broken up by an entity and an
     empty element only comes together there: 400 KB of them took 9 s."""
@@ -203,7 +261,7 @@ def test_key_headers_hidden_by_markup_cost_no_time():
     started = time.perf_counter()
     text = html_to_text("<html><body>" + unit * 9_000)
     assert time.perf_counter() - started < 1.0
-    assert text.count("PRIVATE KEY") == 9_000
+    assert text == "[REDACTED:private-key]" * 8_999 + "-----BEGIN RSA PRIVATE KEY-----"
 
 
 def test_a_position_that_misses_the_tag_is_not_trusted(monkeypatch):

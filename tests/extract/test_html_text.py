@@ -114,8 +114,19 @@ def test_a_script_never_closed_stays_code():
     # A tag in a CSS comment or string is not markup after the stylesheet.
     assert html_to_text("<p>a</p><style>/* <td> widths */ td{padding:0}") == "a"
     assert html_to_text('<html><head><style>a[title="<b>"]{color:red} p{margin:0}') == ""
+    assert html_to_text("<html><head><style>p:after{content:'it\\'s <b>'}") == ""  # escaped
+
+
+def test_an_unterminated_css_comment_costs_no_time():
+    """Looking for markup after a stylesheet left open was quadratic in the
+    comments that never close: 240 KB of '/* ' took 40 s, and anyone can send it."""
+    import time
+
+    started = time.perf_counter()
+    assert html_to_text("<html><head><style>" + "/* " * 30_000 + "</p>") == ""
+    assert time.perf_counter() - started < 1.0
     assert html_to_text("<div>Hi</div><title>Subj\nBody text only") == "Hi\nSubj Body text only"
-    assert html_to_text("<p>A</p><style>.x{}</head><body><p>B real</p>") == "A\n\n.x{}\n\nB real"
+    assert html_to_text("<p>A</p><style>.x{}</head><body><p>B real</p>") == "A\n\nB real"
 
 
 def test_frames_and_embeds_show_no_fallback_markup():
@@ -138,11 +149,18 @@ def test_a_body_inside_a_template_or_xml_shows_nothing():
     )
     assert html_to_text(injected) == "real"
     assert html_to_text("<head><xml><body>hid</body></xml></head><body>real") == "real"
-    # An xml island left open shows its text on the re-read, as a browser shows
-    # an unknown element's.
-    assert html_to_text("<html><head><xml><o:v>1</o:v><body><p>text</p></body></html>") == (
-        "1\n\ntext"
+    # An element left open in the head is dropped up to the body on the re-read:
+    # a Word island's settings are no text, and several left open lose nothing.
+    assert html_to_text("<html><head><xml><o:v>1</o:v><body><p>text</p></body></html>") == "text"
+    word = (
+        "<html><head><xml><w:WordDocument><w:View>Normal</w:View><w:Zoom>0</w:Zoom>"
+        "</w:WordDocument></head><body><p>Hello team</p>"
     )
+    assert html_to_text(word) == "Hello team"
+    assert html_to_text("<html><head><xml>a<xml>b<xml>c<xml>d<body><p>Body text</p>") == (
+        "Body text"
+    )
+    assert html_to_text("<title>a<xml>b<xml>c<xml>d<body><p>Body text") == "Body text"
 
 
 def test_a_position_that_misses_the_tag_is_not_trusted(monkeypatch):
@@ -383,6 +401,11 @@ def test_white_space_follows_the_element_tree():
     # A rule, a void element, ends an open paragraph like any block.
     assert html_to_text('<p style="white-space:pre">a  b<hr>c  d') == "a  b\nc d"
     assert html_to_text('<pre><span style="white-space:initial">a   b</span></pre>') == "a b"
+    # inherit, unset and revert are the parent's value, not an invalid one.
+    assert html_to_text('<div style="white-space:pre; white-space:inherit">a   b</div>') == "a b"
+    assert html_to_text('<pre style="white-space: unset">a   b</pre>') == "a b"
+    notimportant = '<div style="white-space:pre !importantx; white-space:normal">a   b</div>'
+    assert html_to_text(notimportant) == "a b"
     rows = '<table><tr style="white-space:pre"><td>a  b<tr><td>c  d</table>'
     assert html_to_text(rows) == "a  b\nc d"  # the next row ends a row left open
     assert html_to_text('<p style="white-space:pre">a  b<div>c  d</div>') == "a  b\nc d"

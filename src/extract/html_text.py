@@ -56,7 +56,9 @@ _OPENING = re.compile(
 # line. A void element has no end tag, so a style on one would never end.
 _SPACING, _LINES, _NEITHER = 2, 1, 0
 _PRE_TAGS = {"pre", "textarea", "xmp", "listing", "plaintext"}
-_WHITE_SPACE = re.compile(r"white-space\s*:\s*([a-z-]+)\s*(!\s*important)?", re.IGNORECASE)
+_WHITE_SPACE = re.compile(r"white-space\s*:\s*([a-z-]+)\s*(!\s*important\b)?", re.IGNORECASE)
+# Valid, and meaning the parent's value (white-space is inherited).
+_INHERIT = {"inherit", "unset", "revert", "revert-layer"}
 _KEEPS = {
     "pre": _SPACING, "pre-wrap": _SPACING, "break-spaces": _SPACING,
     "pre-line": _LINES, "normal": _NEITHER, "nowrap": _NEITHER, "initial": _NEITHER,
@@ -99,8 +101,12 @@ _NO_PLACEHOLDERS = str.maketrans("", "", "\ufdd0\ufdd1")
 # tag, at most this many times: not after a script, which is code even when it
 # writes markup, nor after a style that nothing but its own CSS followed.
 _REREADS = 3
-_MARKUP = re.compile(r"<[a-zA-Z/!]")
-_CSS_QUOTED = re.compile(r"/\*.*?\*/|\"[^\"]*\"|'[^']*'", re.DOTALL)
+# What the scan after a stylesheet stops at: a comment, a string, or markup.
+_CSS_TOKEN = re.compile(r"/\*|[\"']|<[a-zA-Z/!]")
+# A CSS string ends at its quote or, unterminated, at the line's end.
+_CSS_STRING = {q: re.compile(rf"{q}(?:[^{q}\\\n]|\\.)*{q}?") for q in ("'", '"')}
+# The start of the body, where a head element left open ends.
+_BODY = re.compile(r"<body[\s/>]", re.IGNORECASE)
 
 # A longer address loses its query string (click tracking, mostly), and one
 # still longer is left out: newsletters grew twelvefold with every one in full.
@@ -229,11 +235,14 @@ class _Reader(HTMLParser):
         valid = [
             (value.lower(), bool(important))
             for value, important in _WHITE_SPACE.findall(dict(attrs).get("style") or "")
-            if value.lower() in _KEEPS
+            if value.lower() in _KEEPS or value.lower() in _INHERIT
         ]
         ranked = [value for value, important in valid if important] or [v for v, _ in valid]
-        keeps = _KEEPS[ranked[-1]] if ranked else None
-        if keeps is None:
+        if ranked and ranked[-1] in _INHERIT:
+            keeps = self._keeps()
+        elif ranked:
+            keeps = _KEEPS[ranked[-1]]
+        else:
             keeps = _SPACING if tag in _PRE_TAGS else self._keeps()
         self.stack.append((tag, keeps))
         self.open_count[tag] = self.open_count.get(tag, 0) + 1
@@ -313,6 +322,27 @@ class _Reader(HTMLParser):
         self._end_link()
 
 
+def _markup_after_css(css: str) -> bool:
+    """Whether markup follows the CSS of a stylesheet left open: a '<' and a
+    letter, '/' or '!' outside its comments and strings. One pass, each step a C
+    search: a regex over the whole rest was quadratic in comments that never
+    close, 240 KB of '/* ' taking 40 s, and anyone can send that."""
+    pos = 0
+    while (found := _CSS_TOKEN.search(css, pos)) is not None:
+        token = found.group()
+        if token == "/*":
+            end = css.find("*/", found.end())
+            if end < 0:
+                return False  # a comment left open runs to the end
+            pos = end + 2
+        elif token in "'\"":
+            string = _CSS_STRING[token].match(css, found.start())  # matches its quote at least
+            pos = string.end() if string else found.end()
+        else:
+            return True
+    return False
+
+
 def _read(html: str) -> _Reader:
     reader = _Reader()
     reader.feed(html)
@@ -337,9 +367,11 @@ def html_to_text(html: str) -> str:
         if not reader.hidden or reader.opened is None:
             break
         # The body ended inside a hidden element: a <title> or <xml> never
-        # closed hid every word after it. Read it again without that tag, if
-        # the parser's position really points at it; not a script, which is
-        # code even when it writes markup.
+        # closed hid every word after it. Read it again without it, if the
+        # parser's position really points at its tag: up to the body when one
+        # follows (an island's settings are no text, and whatever else was
+        # left open in the head goes with it), else the tag alone. Not a
+        # script, which is code even when it writes markup.
         (line, column), tag = reader.opened
         if tag[1:7].lower() == "script":
             break
@@ -349,11 +381,10 @@ def html_to_text(html: str) -> str:
             break
         if html[start : start + len(tag)] != tag:
             break
-        if tag[1:6].lower() == "style" and not _MARKUP.search(
-            _CSS_QUOTED.sub("", html[start + len(tag) :])
-        ):
+        if tag[1:6].lower() == "style" and not _markup_after_css(html[start + len(tag) :]):
             break  # a stylesheet the body was cut off inside
-        html = html[:start] + html[start + len(tag) :]
+        body = _BODY.search(html, start + len(tag))
+        html = html[:start] + html[body.start() if body else start + len(tag) :]
         reader = _read(html)
     text = "".join(reader.parts).replace("\xa0", " ").replace("\ufeff", "")
     lines = (

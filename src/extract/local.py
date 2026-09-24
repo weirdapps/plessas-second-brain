@@ -277,16 +277,19 @@ def _parse_retry_delay(exc: Exception) -> int | None:
 
 
 def _should_quota_pause(exc: Exception) -> bool:
-    """Return True for genuine quota exhaustion, False for auth and other errors.
+    """Return True for genuine quota exhaustion or an overload, False for auth and
+    other errors.
 
     Delegates to classify_exception, which now has a secondary rate-limit string
     widener matching the auth widener's shape.  An auth exception cannot reach
-    RATE_LIMIT because type checks run before either string widener.
+    RATE_LIMIT because type checks run before either string widener. An overload
+    counts too (policy_bridge.is_overload): the Vertex client raises its 529 as a
+    plain 5xx, which the policy does not call a rate limit.
     """
-    from src.extract.policy_bridge import classify_exception
+    from src.extract.policy_bridge import classify_exception, is_overload
     from src.llm_policy import Outcome
 
-    return classify_exception(exc, None) is Outcome.RATE_LIMIT
+    return classify_exception(exc, None) is Outcome.RATE_LIMIT or is_overload(exc)
 
 
 def extract_inline(

@@ -237,13 +237,19 @@ def _vertex_error(status):
     return client._make_status_error("status", body=None, response=response)
 
 
-def test_a_vertex_overload_is_rate_limited_as_the_direct_apis_is():
-    """The Vertex client has no class for 529: an overload arrived as a plain
-    InternalServerError, and never slowed anything down."""
+def test_a_vertex_overload_is_an_overload_but_keeps_the_api_error_budget():
+    """The Vertex client has no class for 529: an overload arrives as a plain
+    InternalServerError. The extraction loop treats it as quota (is_overload);
+    the retry policy keeps it on the API-error budget, since the rate-limit
+    backoff (60/120/240 s) held a call past the sync's slice."""
+    from src.extract.policy_bridge import is_overload
+
     exc = _vertex_error(529)
 
     assert type(exc) is anthropic.InternalServerError
-    assert classify_exception(exc, None) is Outcome.RATE_LIMIT
+    assert is_overload(exc)
+    assert classify_exception(exc, None) is Outcome.API_ERROR
+    assert not is_overload(_vertex_error(500))
 
 
 def test_what_the_vertex_client_makes_of_a_504_is_the_requests_timeout():

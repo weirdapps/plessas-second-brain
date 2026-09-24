@@ -67,10 +67,6 @@ def classify_exception(exc: BaseException | None, response: object | None) -> Ou
             return Outcome.AUTH_REAUTH_REQUIRED
         if isinstance(exc, anthropic.RateLimitError | anthropic.OverloadedError):
             return Outcome.RATE_LIMIT
-        # The Vertex client has no class for 529: an overload arrives as
-        # InternalServerError with that status.
-        if isinstance(exc, anthropic.APIStatusError) and getattr(exc, "status_code", 0) == 529:
-            return Outcome.RATE_LIMIT
         if isinstance(exc, anthropic.APITimeoutError):
             return Outcome.TIMEOUT
         # Secondary wideners — type checks always run first; strings catch only
@@ -128,6 +124,19 @@ def is_transient(exc: BaseException) -> bool:
     if isinstance(exc, genai_errors.APIError) and exc.code in (408, 409, 499):
         return True
     return isinstance(exc, ConnectionError | TimeoutError)
+
+
+def is_overload(exc: BaseException) -> bool:
+    """The service is overloaded: the direct API's OverloadedError, or the 529 the
+    Vertex client raises as a plain InternalServerError, having no class for it.
+
+    The extraction loop treats it as quota (local._should_quota_pause). The retry
+    policy keeps a Vertex 529 on the API-error budget: the rate-limit backoff
+    (60, 120, 240 s) held a call already running well past the sync's slice.
+    """
+    return isinstance(exc, anthropic.OverloadedError) or (
+        isinstance(exc, anthropic.APIStatusError) and getattr(exc, "status_code", 0) == 529
+    )
 
 
 def is_item_timeout(exc: BaseException) -> bool:

@@ -435,8 +435,8 @@ def test_split_html_ends_a_batch_at_its_budget(tmp_path, monkeypatch):
             return self._conn.commit()
 
     monkeypatch.setattr(schema, "get_connection", lambda path: Counting(connect(path)))
-    # Crossed by a body with its text and its kept HTML, not by the body alone.
-    monkeypatch.setattr(cli, "SPLIT_HTML_BATCH_CHARS", len(HTML) + len(TEXT) // 2)
+    # Crossed by a body with its text and its kept HTML, not by the two alone.
+    monkeypatch.setattr(cli, "SPLIT_HTML_BATCH_CHARS", len(HTML) + len(TEXT) + 1)
 
     assert cli.cmd_split_html(argparse.Namespace(db=str(db), batch=500, dry_run=False)) == 0
 

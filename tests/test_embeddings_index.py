@@ -372,3 +372,60 @@ class TestGenerateEmbeddingsMemory:
         assert out[0][0] == 1.0
         assert out[100][0] == 2.0
         assert out[200][0] == 3.0
+
+
+class TestKindsAreFilteredBeforeTheTopResults:
+    """The top results were taken over every vector and filtered by kind after,
+    so a kind with few vectors (conversations, about 1K of 120K) mostly came back
+    empty, and emails lost their slots to Teams threads and conversations."""
+
+    def test_email_candidates_reach_past_closer_vectors_of_other_kinds(self, tmp_path):
+        conn = create_database(":memory:")
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received, summary) VALUES (7, 7, '2026-01-01', 'e')"
+        )
+        conn.commit()
+        p = tmp_path / "emb.npz"
+        closer = [CONVERSATION_ID_OFFSET - n for n in range(1, 11)]
+        _write_npz(p, [7, *closer], [[0.6, 0.8, 0.0]] + [[0.0, 1.0, 0.0]] * len(closer))
+
+        out = semantic_email_candidates(
+            conn, "q", limit=1, embed_fn=_fake_embedder([0.0, 1.0, 0.0]), index_path=str(p)
+        )
+
+        assert out == [7]
+
+    def test_a_conversation_search_reaches_past_closer_emails(self, tmp_path):
+        conn = create_database(":memory:")
+        conn.execute(
+            "INSERT INTO conversations (id, session_id, started_at, ended_at, project_name, "
+            "turn_count, summary, created_at) VALUES (3, 's3', '2026-01-01', '2026-01-01', "
+            "'p', 1, 'the conversation', '2026-01-01')"
+        )
+        for n in range(1, 11):
+            conn.execute(
+                "INSERT INTO emails (id, message_id, date_received, summary) "
+                "VALUES (?, ?, '2026-01-01', 'e')",
+                (n, n),
+            )
+        conn.commit()
+        p = tmp_path / "emb.npz"
+        _write_npz(
+            p,
+            [CONVERSATION_ID_OFFSET - 3, *range(1, 11)],
+            [[0.6, 0.8, 0.0]] + [[0.0, 1.0, 0.0]] * 10,
+        )
+
+        from src.store.embeddings import query_semantic
+
+        out = query_semantic(
+            conn,
+            "q",
+            limit=2,
+            kinds={"conversation"},
+            embed_fn=_fake_embedder([0.0, 1.0, 0.0]),
+            index_path=str(p),
+        )
+
+        assert [r["type"] for r in out] == ["conversation"]
+        assert out[0]["session_id"] == "s3"

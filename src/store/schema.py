@@ -473,6 +473,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_fold_greek_accents(conn)
     if current < 21:
         migrate_add_calendar_change_key(conn)
+    if current < 22:
+        migrate_index_email_subjects(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -630,6 +632,70 @@ def migrate_add_calendar_change_key(conn: sqlite3.Connection) -> None:
             if "duplicate column name" not in str(e):
                 raise
         conn.commit()
+
+
+def migrate_index_email_subjects(conn: sqlite3.Connection) -> None:
+    """v22: index the email subject in emails_fts, folded like the other columns.
+
+    emails_fts held the summary and the body, and 14% of emails could not be
+    found by two words of their own subject. The subject goes in as a third
+    column, after the two existing ones, so the column numbers that snippet()
+    uses do not move.
+
+    One immediate transaction, checked inside it: two units can start together
+    after a deploy, and the second must find the work done rather than drop the
+    table the first has just built. The rebuild reads every email once.
+    """
+    from src.store.greek import fold_sql_expr
+
+    if not _table_exists(conn, "emails") or not _table_exists(conn, "emails_fts"):
+        return
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        indexed = {r[1] for r in conn.execute("PRAGMA table_info(emails_fts)")}
+        if "subject_f" in indexed:
+            conn.execute("COMMIT")
+            return
+        # table_xinfo: a VIRTUAL generated column is hidden from table_info.
+        existing = {r[1] for r in conn.execute("PRAGMA table_xinfo(emails)")}
+        if "subject_f" not in existing:
+            conn.execute(
+                "ALTER TABLE emails ADD COLUMN subject_f TEXT "
+                f"GENERATED ALWAYS AS ({fold_sql_expr('subject')}) VIRTUAL"
+            )
+        columns = ("summary_f", "content_f", "subject_f")
+        names = ", ".join(columns)
+        new_vals = ", ".join(f"new.{c}" for c in columns)
+        old_vals = ", ".join(f"old.{c}" for c in columns)
+        for suffix in ("ai", "ad", "au"):
+            conn.execute(f"DROP TRIGGER IF EXISTS emails_{suffix}")
+        conn.execute("DROP TABLE emails_fts")
+        conn.execute(
+            f"CREATE VIRTUAL TABLE emails_fts USING fts5({names}, "
+            "content='emails', content_rowid='id')"
+        )
+        conn.execute(
+            "CREATE TRIGGER emails_ai AFTER INSERT ON emails BEGIN "
+            f"INSERT INTO emails_fts(rowid, {names}) VALUES (new.id, {new_vals}); END"
+        )
+        conn.execute(
+            "CREATE TRIGGER emails_ad AFTER DELETE ON emails BEGIN "
+            f"INSERT INTO emails_fts(emails_fts, rowid, {names}) "
+            f"VALUES('delete', old.id, {old_vals}); END"
+        )
+        conn.execute(
+            "CREATE TRIGGER emails_au AFTER UPDATE ON emails BEGIN "
+            f"INSERT INTO emails_fts(emails_fts, rowid, {names}) "
+            f"VALUES('delete', old.id, {old_vals}); "
+            f"INSERT INTO emails_fts(rowid, {names}) VALUES (new.id, {new_vals}); END"
+        )
+        conn.execute("INSERT INTO emails_fts(emails_fts) VALUES('rebuild')")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def migrate_add_teams_ingest_disabled_at(conn: sqlite3.Connection) -> None:

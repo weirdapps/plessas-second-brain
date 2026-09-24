@@ -326,3 +326,36 @@ def test_live_search_clamps_the_window_and_asks_for_the_fields_it_returns(mock_c
     assert out["since_minutes"] == 1440 and out["clamped"] is True
     assert out["messages"][0]["BodyPreview"] == "short"
     assert "@odata.etag" not in out["messages"][0]
+
+
+# ------------------------------------------------------------ email thread
+
+
+def test_email_thread_returns_the_exchange_around_a_hit(conn, monkeypatch):
+    """search_emails returns single emails; the thread around one had no tool."""
+    from src import mcp_server
+
+    _email(conn, 60, 3, "a@example.com", "convX")
+    _email(conn, 61, 2, "b@example.com", "convX")
+    _email(conn, 62, 1, "a@example.com", "convY")
+    conn.commit()
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    out = mcp_server.email_thread(email_id=61)
+
+    assert [e["email_id"] for e in out["emails"]] == [60, 61]
+    assert out["thread_total"] == 2
+
+
+def test_email_thread_says_when_it_was_cut(conn, monkeypatch):
+    from src import mcp_server
+
+    for i in range(70, 75):
+        _email(conn, i, 80 - i, "a@example.com", "convZ")
+    conn.commit()
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    out = mcp_server.email_thread(email_id=72, limit=2)
+
+    assert len(out["emails"]) == 2
+    assert out["thread_total"] == 5

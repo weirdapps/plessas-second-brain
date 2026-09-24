@@ -548,7 +548,9 @@ def main():
 
     candidates = query_new_candidates(processed, args.max_new, deferred)
     log(f"New candidates after filter: {len(candidates)}")
-    if not candidates and not args.refresh_index:
+    # Folders whose summary a run that ran out of time left undone.
+    pending_summaries = set(state.get("pending_summaries", [])) & set(MANAGED_FOLDERS)
+    if not candidates and not args.refresh_index and not pending_summaries:
         log("Nothing to do.")
         return 0
 
@@ -650,14 +652,17 @@ def main():
             write_readme(folder, conn)
         conn.close()
 
-    # Re-summarize affected folders (skip if no change AND not forced)
+    # Re-summarize affected folders (skip if no change AND not forced), and any
+    # an earlier run ran out of time for.
     summaries = state.get("folder_summaries", {})
-    to_summarize = affected if (affected or args.refresh_index) else set()
+    to_summarize = sorted(affected | pending_summaries)
+    left: list[str] = []
     if to_summarize:
         log(f"Re-summarizing {len(to_summarize)} folders via LLM")
-        for folder in to_summarize:
+        for n, folder in enumerate(to_summarize):
             if out_of_time():
-                log("Out of time: the remaining folder summaries are left as they were.")
+                left = to_summarize[n:]
+                log(f"Out of time: {len(left)} folder summaries left for the next run.")
                 break
             readme = DOCS / folder / "README.md"
             if not readme.exists():
@@ -670,6 +675,7 @@ def main():
                 log(f"  summarize error for {folder}: {e}")
 
     state["folder_summaries"] = summaries
+    state["pending_summaries"] = left
     save_state(state)
 
     # Always rebuild INDEX (cheap — uses cached summaries)

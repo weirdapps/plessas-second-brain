@@ -335,9 +335,13 @@ def test_a_hand_run_without_a_vertex_project_is_refused(curate, brain, monkeypat
     assert curate.main() == 1
 
 
-def test_missing_credentials_stop_the_run_before_any_candidate(curate, brain, monkeypatch):
-    """Built lazily, a missing credential would fail inside classify_one, where
-    each candidate's error is caught and logged, and the run would end green."""
+def test_a_client_that_cannot_be_built_stops_the_run_before_any_candidate(
+    curate, brain, monkeypatch
+):
+    """Built lazily, a failure to build the client would come up inside
+    classify_one, where each candidate's error is caught and logged, and the run
+    would end green. With a project set the build does not fail today (ADC is
+    read at the first request), so this pins the order for a check that could."""
     _seed_candidate(
         brain.conn,
         brain.src_dir,
@@ -362,6 +366,83 @@ def test_missing_credentials_stop_the_run_before_any_candidate(curate, brain, mo
 
     with pytest.raises(RuntimeError, match="No Claude credentials"):
         curate.main()
+
+
+@pytest.mark.parametrize("name", ["VERTEX_SDK_PROJECT", "ANTHROPIC_VERTEX_PROJECT_ID"])
+def test_either_vertex_project_name_lets_a_run_through(curate, brain, monkeypatch, name):
+    _seed_candidate(
+        brain.conn,
+        brain.src_dir,
+        row_id=1,
+        filename="deck.pdf",
+        mailbox_name="Inbox",
+        message_id="AAMkADk1ZTRiexample",
+    )
+    brain.conn.commit()
+    monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
+    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    monkeypatch.setenv(name, "test-project")
+    seen = []
+
+    def fake_classify(c):
+        seen.append(c["id"])
+        return {"folder": "SKIP", "confidence": "low"}
+
+    monkeypatch.setattr(curate, "install_llm_deadline_for_this_process", lambda: None)
+    monkeypatch.setattr(curate, "_get_client_and_model", lambda: (object(), "model"))
+    monkeypatch.setattr(curate, "classify_one", fake_classify)
+    monkeypatch.setattr(sys, "argv", ["curate_documents_daily.py"])
+
+    assert curate.main() == 0
+    assert seen == [1]
+
+
+def test_summaries_a_short_run_leaves_are_done_by_the_next(curate, brain, monkeypatch):
+    """The summary step is an LLM call too. A run out of time skips it, and the
+    folders it skipped used to wait for their next placement."""
+    _seed_candidate(
+        brain.conn,
+        brain.src_dir,
+        row_id=1,
+        filename="deck.pdf",
+        mailbox_name="Inbox",
+        message_id="AAMkADk1ZTRiexample",
+    )
+    brain.conn.commit()
+    monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+    monkeypatch.setattr(curate, "_get_client_and_model", lambda: (object(), "model"))
+    monkeypatch.setattr(
+        curate, "classify_one", lambda c: {"folder": "Area/one", "confidence": "high"}
+    )
+    monkeypatch.setattr(sys, "argv", ["curate_documents_daily.py"])
+
+    def no_summary(*args, **kwargs):
+        raise AssertionError("summarised past the deadline")
+
+    clock = iter([800.0, 900.0])  # the candidate fits before 1000; the summary does not
+    monkeypatch.setattr(curate, "time", types.SimpleNamespace(time=lambda: next(clock)))
+    monkeypatch.setattr(curate, "install_llm_deadline_for_this_process", lambda: 1000.0)
+    monkeypatch.setattr(curate, "summarize_folder", no_summary)
+    assert curate.main() == 0
+
+    state = _state(curate)
+    assert len(state["copied"]) == 1
+    assert state["pending_summaries"] == ["Area/one"]
+
+    summarised = []
+
+    def summary(folder, readme_text):
+        summarised.append(folder)
+        return {"purpose": "p"}
+
+    monkeypatch.setattr(curate, "install_llm_deadline_for_this_process", lambda: None)
+    monkeypatch.setattr(curate, "summarize_folder", summary)
+    assert curate.main() == 0
+
+    state = _state(curate)
+    assert summarised == ["Area/one"]
+    assert state["pending_summaries"] == []
+    assert state["folder_summaries"]["Area/one"] == {"purpose": "p"}
 
 
 def test_a_run_short_of_time_stops_classifying_and_still_saves(curate, brain, monkeypatch):

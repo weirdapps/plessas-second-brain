@@ -174,28 +174,27 @@ def test_complete_sends_an_explicit_model_and_the_system_prompt():
 
 
 def _sdk_and_policy_references(tree):
-    """Names each place in `tree` that reaches the SDK request or the policy.
+    """Names each place in `tree` that reaches the SDK's messages API or the policy.
 
-    From the syntax tree, not the text: an alias (`send = client.messages.create`)
-    or a getattr still counts, and a docstring that mentions them does not.
+    From the syntax tree, not the text: any use of `.messages` counts (create,
+    stream, a raw response, an alias, a getattr), and a docstring or comment
+    that mentions them does not.
     """
     import ast
 
     guarded = {"call_with_policy", "create_with_refusal_fallback"}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr == "create":
-            owner = node.value
-            if isinstance(owner, ast.Attribute) and owner.attr == "messages":
-                yield "messages.create"
-            elif (
-                isinstance(owner, ast.Call)
-                and isinstance(owner.func, ast.Name)
-                and owner.func.id == "getattr"
-                and len(owner.args) > 1
-                and isinstance(owner.args[1], ast.Constant)
-                and owner.args[1].value == "messages"
-            ):
-                yield "messages.create"
+        if isinstance(node, ast.Attribute) and node.attr == "messages":
+            yield "messages"
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) > 1
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "messages"
+        ):
+            yield "messages"
         elif isinstance(node, ast.Name) and node.id in guarded:
             yield node.id
         elif isinstance(node, ast.Attribute) and node.attr in guarded:
@@ -212,18 +211,20 @@ def f(client):
     \"\"\"It used to call client.messages.create() itself.\"\"\"
     send = client.messages.create
     other = getattr(client, "messages").create
+    raw = client.messages.with_raw_response.create
+    stream = client.messages.stream
     from src.extract.claude_extract import call_with_policy
-    return send, other
+    return send, other, raw, stream
 """
     found = sorted(_sdk_and_policy_references(ast.parse(source)))
 
-    assert found == ["call_with_policy", "messages.create", "messages.create"]
+    assert found == ["call_with_policy"] + ["messages"] * 4
 
 
 def test_every_sdk_request_goes_through_complete():
     """The call sites each built the same request, and one bug was fixed four times.
-    Only complete() may run the policy or the refusal fallback, and only the
-    fallback module may call the SDK."""
+    Only claude_extract.py, where complete() lives, may run the policy or the
+    refusal fallback, and only the fallback module may touch the messages API."""
     import ast
     from pathlib import Path
 
@@ -235,7 +236,7 @@ def test_every_sdk_request_goes_through_complete():
             for name in _sdk_and_policy_references(parsed):
                 found.setdefault(name, set()).add(str(path.relative_to(root)))
 
-    assert found["messages.create"] == {"src/extract/vertex_fallback.py"}
+    assert found["messages"] == {"src/extract/vertex_fallback.py"}
     assert found["create_with_refusal_fallback"] == {"src/extract/claude_extract.py"}
     assert found["call_with_policy"] == {"src/extract/claude_extract.py"}
 

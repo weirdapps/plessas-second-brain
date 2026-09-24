@@ -124,9 +124,9 @@ rc3=$?
 # 4. Drain staged batches into the DB (extract + load) every hour.
 #    The three passes above only *stage* bodies to data/staging; loading used to
 #    happen only in the 07:00 daily + 12:00 noon batch runs, so mail arriving
-#    after midday sat unloaded → "Emails STALE" by evening. --skip-export is the
-#    catch-up path cmd_sync exposes (same command noon-catchup uses): no
-#    re-export, just extract the staged bodies and load them. The load rc is
+#    after midday sat unloaded → "Emails STALE" by evening. sync stages no mail
+#    itself (--skip-export is kept and ignored): it extracts the staged bodies
+#    and loads them. The load rc is
 #    logged but deliberately NOT folded into overall_rc — export health (Outlook
 #    reachable) drives the wrapper's failure notifications; load has the
 #    daily/noon batch runs plus the 23:55 health-check backstop behind it.

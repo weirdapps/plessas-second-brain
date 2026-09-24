@@ -93,8 +93,18 @@ named `~` in its working directory.
 mkdir -p "$BRAIN_DATA_DIR/staging" "$BRAIN_DATA_DIR/extracted"
 python -m src.cli load    # creates brain.db, then runs every migration
 python -m src.cli stats   # opens it; every count is 0 on a fresh host
-python -m src.cli sync    # one ingest, extract, load cycle
 ```
+
+Mail reaches the store in two steps, and `sync` is only the second:
+
+1. **Stage.** With Microsoft 365, `python -m src.export.outlook_export --folder Inbox --bootstrap`
+   stages mail through `outlook-cli`: the first run takes the 100 most recent
+   messages, later runs continue from the cursor it saves (`--state-path`, one
+   file per folder). Any other source writes staging batches itself; see "Bring
+   your own source" in the README.
+2. **Extract and load.** On a fresh store, `python -m src.extract.local && python -m src.cli load`,
+   because `sync` skips an empty store. From then on `python -m src.cli sync`
+   does both.
 
 `load` is the only command that creates the database. It stamps schema version 0
 and calls `run_migrations`, so a store built this way ends up with exactly the
@@ -144,9 +154,10 @@ its own README.
 The pipeline is just CLI commands, so schedule them however you like. Source your
 `.env` first so the job inherits `BRAIN_DATA_DIR` and credentials.
 
-**cron** (hourly incremental sync, daily embed):
+**cron** (hourly staging and sync, daily embed):
 
 ```cron
+5 * * * *  cd /path/to/repo && set -a && . ./.env && set +a && .venv/bin/python -m src.export.outlook_export --folder Inbox >> ~/.second-brain/logs/sync.log 2>&1
 7 * * * *  cd /path/to/repo && set -a && . ./.env && set +a && .venv/bin/python -m src.cli sync  >> ~/.second-brain/logs/sync.log 2>&1
 23 3 * * * cd /path/to/repo && set -a && . ./.env && set +a && .venv/bin/python -m src.cli embed >> ~/.second-brain/logs/embed.log 2>&1
 ```
@@ -159,6 +170,7 @@ The pipeline is just CLI commands, so schedule them however you like. Source you
 Type=oneshot
 WorkingDirectory=%h/plessas-second-brain
 EnvironmentFile=%h/plessas-second-brain/.env
+ExecStart=%h/plessas-second-brain/.venv/bin/python -m src.export.outlook_export --folder Inbox
 ExecStart=%h/plessas-second-brain/.venv/bin/python -m src.cli sync
 ```
 
@@ -175,11 +187,16 @@ Enable: `systemctl --user enable --now sb-sync.timer`, then confirm linger is on
 
 **macOS, launchd.** A `LaunchAgent` in `~/Library/LaunchAgents/` running a
 wrapper that `cd`s into `$BRAIN_REPO`, sources `.env`, and runs
-`python -m src.cli sync` on `StartInterval` (or `StartCalendarInterval`). Set
-`BRAIN_LABEL_PREFIX` to namespace the labels.
+`python -m src.export.outlook_export` then `python -m src.cli sync` on
+`StartInterval` (or `StartCalendarInterval`). Set `BRAIN_LABEL_PREFIX` to
+namespace the labels.
 
-`sync` covers mail, extraction, load, attachments, people dedup, embeddings,
-Claude Code conversations and inline images. It does not cover Teams, calendar,
+`sync` covers staged mail: extraction, load, attachments, people dedup,
+embeddings, Claude Code conversations and inline images. It stages no mail
+itself; `outlook_export` does, one run per folder (Inbox, Archive, Sent Items),
+and `python -m src.export.inbox_reconcile` records Inbox mail you have since
+moved. `scripts/wrappers/systemd/sb-outlook-sync.sh` runs all of these hourly.
+It does not cover Teams, calendar,
 news, SharePoint or the filesystem scan, so `calendar-sync`, `teams-sync`,
 `news-sync`, `process-sharepoint` and `reverse-ingest` each want their own
 schedule. `python -m src.cli --help` lists every subcommand.

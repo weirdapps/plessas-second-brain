@@ -22,7 +22,7 @@ then it is documentation of the intended workflow.
 > `query_actions`. Dossier tools: `person_context` (email and Teams),
 > `topic_context`, `sender_brief`, `meeting_prep`. The rest of a hit's thread:
 > `email_thread` (a keyword row's `thread_matches` says how many of its emails
-> matched). Corpus size, per-source coverage and freshness: `stats`.
+> match in subject, summary or body). Corpus size, per-source coverage and freshness: `stats`.
 
 ## Usage
 

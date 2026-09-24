@@ -101,9 +101,9 @@ def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
                 conn.commit()
                 batch_count = 0
 
-    # Final commit for remaining emails
-    if batch_count > 0:
-        conn.commit()
+    # Final commit, whatever loaded: a stored email's move to another folder is
+    # written too, and whatever transaction a write opened is closed.
+    conn.commit()
 
     # Prune fully-resolved batch files — keeps staging dir from growing
     # forever. A staged email is "resolved" when it's already represented in
@@ -195,6 +195,29 @@ def prune_staged_batches(db_path: str, staging_dir: str) -> tuple[int, int]:
     return _prune_loaded_batches(batch_to_msgids, db_msgids)
 
 
+def _take_the_write_lock(conn: sqlite3.Connection) -> bool:
+    """Take the write lock before a loader writes, unless its transaction has it;
+    True when this call took it, and the loader then checks again under it. The
+    sync units overlap (the noon catch-up and the hourly one), and each found an
+    item not stored, stored it, and failed on the other's copy of its unique key,
+    which ended that sync. The second now waits for the first (busy_timeout) and
+    finds the item stored; an item already stored, in its folder, waits for no one."""
+    if conn.in_transaction:
+        return False
+    conn.execute("BEGIN IMMEDIATE")
+    return True
+
+
+def _moved(stored: str | None, staged: str | None) -> bool:
+    """Whether a staged copy moves a stored email to another folder. Never into the
+    Inbox: its export takes new arrivals, bar a bootstrap, so a staged Inbox copy of
+    a stored email is almost always an old one (a batch stays staged while any
+    email in it is unextracted), and a move out of the Inbox is inbox_reconcile's
+    to record. The cost: an email moved back into the Inbox and staged again by a
+    bootstrap keeps the folder it had."""
+    return bool(staged) and staged != stored and (staged != "Inbox" or not stored)
+
+
 def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict) -> bool:
     """Load a single email with its extraction into the database.
 
@@ -217,7 +240,7 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
     cursor = conn.execute("SELECT id, mailbox_name FROM emails WHERE message_id = ?", (message_id,))
     row = cursor.fetchone()
     if row:
-        if new_mailbox and row[1] != new_mailbox:
+        if _moved(row[1], new_mailbox):
             conn.execute(
                 "UPDATE emails SET mailbox_name = ? WHERE id = ?",
                 (new_mailbox, row[0]),
@@ -233,12 +256,16 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
         )
         row = cursor.fetchone()
         if row:
-            if new_mailbox and row[1] != new_mailbox:
+            if _moved(row[1], new_mailbox):
                 conn.execute(
                     "UPDATE emails SET mailbox_name = ? WHERE id = ?",
                     (new_mailbox, row[0]),
                 )
             return False  # Duplicate by RFC822 Message-ID; mailbox reconciled
+
+    # Not stored: about to write, so the checks again under the write lock.
+    if _take_the_write_lock(conn):
+        return load_single_email(conn, metadata, extraction)
 
     # Extract sender info
     sender_name = metadata.get("sender", {}).get("name")
@@ -605,10 +632,13 @@ def load_single_conversation(
         stale = conversation_went_on(metadata, described, extraction["transcript_turn_count"])
     if stale and not replace:
         return False
+    if existing and not (replace or conversation_went_on(metadata, existing[1], existing[2])):
+        return False
+    # About to write: the checks again under the write lock.
+    if _take_the_write_lock(conn):
+        return load_single_conversation(conn, metadata, extraction, replace=replace)
     new_id = None  # SQLite's next
     if existing:
-        if not (replace or conversation_went_on(metadata, existing[1], existing[2])):
-            return False
         delete_conversation(conn, existing[0])
         # Loaded again, whole, under an id above every one in use, read once the
         # delete holds the write lock: SQLite would give the top id to the next

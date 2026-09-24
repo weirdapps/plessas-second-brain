@@ -439,6 +439,9 @@ def test_the_new_id_is_taken_under_the_write_lock(tmp_path):
         """The store's connection, with another writer adding a conversation just
         before the new id is read."""
 
+        def __getattr__(self, name):
+            return getattr(conn, name)
+
         def execute(self, sql, *args):
             if "MAX(id)" in sql:
                 try:

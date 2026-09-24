@@ -8,7 +8,6 @@ Resumable state tracking.
 import json
 import os
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -124,60 +123,6 @@ def extract_one(email: dict, api_key: str | None, engine: str = "gemini") -> dic
     extraction = parse_extraction(text)
     extraction["message_id"] = email["message_id"]
     return extraction
-
-
-def extract_with_timeout(
-    email: dict, api_key: str | None, timeout: int = CALL_TIMEOUT
-) -> tuple[str, dict | None]:
-    """Run extraction in a subprocess with hard timeout."""
-    msg_id = str(email.get("message_id", "unknown"))
-
-    # Write email to temp file for subprocess
-    tmp_in = DATA_DIR / "state" / f"_tmp_email_{os.getpid()}.json"
-    tmp_out = DATA_DIR / "state" / f"_tmp_result_{os.getpid()}.json"
-
-    try:
-        tmp_in.write_text(json.dumps(email, ensure_ascii=False))
-
-        env = os.environ.copy()
-        if api_key:
-            env["GEMINI_API_KEY"] = api_key
-
-        # Run extraction in subprocess
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                f"""
-import json, sys, os
-sys.path.insert(0, {str(REPO_ROOT)!r})
-from src.extract.local import extract_one
-
-email = json.loads(open({str(tmp_in)!r}).read())
-api_key = os.environ.get("GEMINI_API_KEY")
-result = extract_one(email, api_key)
-open({str(tmp_out)!r}, "w").write(json.dumps(result, ensure_ascii=False))
-""",
-            ],
-            timeout=timeout,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-
-        if result.returncode == 0 and tmp_out.exists():
-            extraction = json.loads(tmp_out.read_text())
-            return (msg_id, extraction)
-        else:
-            return (msg_id, None)
-
-    except subprocess.TimeoutExpired:
-        return (msg_id, None)
-    except Exception:
-        return (msg_id, None)
-    finally:
-        tmp_in.unlink(missing_ok=True)
-        tmp_out.unlink(missing_ok=True)
 
 
 def _parse_retry_delay(exc: Exception) -> int | None:

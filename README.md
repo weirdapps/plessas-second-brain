@@ -42,7 +42,6 @@ graph TD
 | Source | Module | Notes |
 | --- | --- | --- |
 | Microsoft 365 mail | `src/export/outlook_export.py` + `outlook_cli.py` | Primary. Hourly, `--since` cursor. |
-| Apple Mail archive | `src/export/apple_mail.py` | Frozen. Kept for historical rollback. |
 | Attachments | `src/export/outlook_attachments.py`, `src/extract/attachment_extractors.py` | PDF (PyMuPDF), DOCX (`python-docx`), PPTX (`python-pptx`), XLSX (`openpyxl`), XLSB (`pyxlsb`), XLS (`xlrd`), images (Tesseract OCR), EML, RPMSG (`compoundfiles`). |
 | Inline email images | `src/extract/image_classifier.py`, `image_pipeline.py`, `image_vision.py` | Dimensions plus bytes plus sender-scoped SHA256 dedup cascade; vision LLM stage for content images, cached by SHA256. |
 | Calendar events | `src/export/calendar_export.py`, `src/extract/calendar_extractor.py` | Outlook events with attendees, body summary, decisions. |
@@ -256,8 +255,9 @@ In any Claude Code session, ask "what do we know about X" and the agent calls `r
 `./brain` (wrapper) or `python -m src.cli`. Highlights:
 
 ```bash
-# Incremental sync: export, extract, load, register+process attachments, dedup people,
-# embed, Claude Code conversations, inline images. Not Teams, calendar, news, SharePoint.
+# Incremental sync over what `python -m src.export.outlook_export` staged: extract, load,
+# register+process attachments, dedup people, embed, Claude Code conversations, inline
+# images. Not Teams, calendar, news, SharePoint.
 python -m src.cli sync --engine claude --workers 4
 
 # Ingestion by source
@@ -305,9 +305,6 @@ src/
     outlook_export.py          Hourly Outlook ingestion via outlook-cli
     outlook_cli.py             outlook-cli subprocess wrapper
     outlook_attachments.py     Attachment fetch for Outlook messages
-    apple_mail.py              Historical Apple Mail export (frozen)
-    attachments.py             Apple Mail attachment export
-    attachment_state.py        Per-attachment fetch cursor
     calendar_export.py         Outlook calendar events
     conversation_export.py     Claude Code session transcripts
     news_export.py             News-reader digests and articles into staging batches
@@ -316,7 +313,7 @@ src/
     inbox_reconcile.py         Cursor recovery
     sharepoint_fetcher.py      SharePoint link fetch and host classification
     sharepoint_cli.py          sharepoint-cli subprocess wrapper (cookie session, not bearer)
-    state.py                   Export state
+    state.py                   Atomic staging writes and the Outlook sync cursor
   extract/
     prompt.py                  Email extraction prompt
     attachment_prompt.py       Attachment summarization prompt
@@ -440,10 +437,10 @@ Dependabot is configured for the `uv` ecosystem (see `.github/dependabot.yml`), 
 
 The pipeline is just CLI commands, so schedule them however you like. Examples:
 
-- **cron** (hourly incremental sync): `7 * * * * cd /path/to/repo && .venv/bin/python -m src.cli sync >> ~/second-brain.log 2>&1`
-- **macOS launchd** / **systemd timers**: wrap `python -m src.cli sync` (and `embed`) in a service unit pointing at your checkout and venv.
+- **cron** (hourly staging and sync): `5 * * * * cd /path/to/repo && .venv/bin/python -m src.export.outlook_export --folder Inbox >> ~/second-brain.log 2>&1`, then `7 * * * * cd /path/to/repo && .venv/bin/python -m src.cli sync >> ~/second-brain.log 2>&1`
+- **macOS launchd** / **systemd timers**: wrap the same two commands (and `embed`) in a service unit pointing at your checkout and venv.
 
-Typical cadence: `sync` hourly, `embed` daily. `sync` does not cover every source: `calendar-sync`, `teams-sync`, `news-sync`, `process-sharepoint` and `reverse-ingest` each want their own schedule.
+Typical cadence: staging and `sync` hourly, `embed` daily. `sync` stages no mail itself: it extracts and loads what `outlook_export` (or your own exporter) staged. Nor does it cover every source: `calendar-sync`, `teams-sync`, `news-sync`, `process-sharepoint` and `reverse-ingest` each want their own schedule.
 
 [`docs/DEPLOY.md`](docs/DEPLOY.md) has the full recipe, including the two-host shape (one producer that ingests, workstations that read an rsync'd replica) and the `loginctl enable-linger` without which `systemd --user` timers die at logout.
 

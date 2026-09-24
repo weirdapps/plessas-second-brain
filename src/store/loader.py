@@ -583,16 +583,19 @@ def load_single_conversation(
     existing = conn.execute(
         "SELECT id, ended_at, turn_count FROM conversations WHERE session_id = ?", (session_id,)
     ).fetchone()
-    # An extraction names the end of the transcript it read
-    # (run_conversation_extraction). One of an earlier transcript than this
-    # waits to be done again: loaded, the new turns would carry the old summary,
-    # and the new extraction would find the store already holding them. One
-    # that names none, written before it did, may still make a first load.
+    # An extraction names the end and turn count of the transcript it read
+    # (run_conversation_extraction). One of a transcript this one went on past
+    # waits to be done again, as extraction's own rule has it: loaded, the new
+    # turns would carry the old summary, and the new extraction would find the
+    # store already holding them. One that names no end, written before it did,
+    # may still make a first load.
     described = extraction.get("transcript_ended_at")
     if described is None:
         stale = existing is not None
-    else:
+    elif extraction.get("transcript_turn_count") is None:
         stale = str(described) < str(metadata.get("ended_at") or "")
+    else:
+        stale = conversation_went_on(metadata, described, extraction["transcript_turn_count"])
     if stale and not replace:
         return False
     new_id = None  # SQLite's next

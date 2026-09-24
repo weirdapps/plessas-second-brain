@@ -202,9 +202,13 @@ def _count(conn, rows, *params):
 
 
 def _of(transcript, extraction):
-    """An extraction as run_conversation_extraction writes it: naming the end of
-    the transcript it read."""
-    return {**extraction, "transcript_ended_at": transcript["ended_at"]}
+    """An extraction as run_conversation_extraction writes it: naming the end and
+    the turn count of the transcript it read."""
+    return {
+        **extraction,
+        "transcript_ended_at": transcript["ended_at"],
+        "transcript_turn_count": transcript["turn_count"],
+    }
 
 
 def test_the_loader_replaces_a_conversation_that_went_on(tmp_path):
@@ -292,9 +296,9 @@ def test_a_conversation_loaded_again_is_embedded_again_and_its_old_vector_goes(
         return np.ones((len(texts), 4), dtype=np.float32)
 
     monkeypatch.setattr(embeddings, "generate_embeddings", embed)
-    # An email, two attachments, a thread. Attachment 2,000,003 is past the
+    # An email, two attachments, a thread. Attachment 2,000,050 is past the
     # conversation offset, where its vector id reads as a conversation's.
-    others = [7, -3, -2_000_003, embeddings.TEAMS_THREAD_ID_OFFSET - 5]
+    others = [7, -3, -2_000_050, embeddings.TEAMS_THREAD_ID_OFFSET - 5]
     np.savez(str(index), ids=np.array(others, dtype=np.int64), vectors=np.ones((4, 4), np.float32))
     conn = create_database(str(tmp_path / "b.db"))
     conn.execute(
@@ -303,7 +307,7 @@ def test_a_conversation_loaded_again_is_embedded_again_and_its_old_vector_goes(
     )
     conn.execute(
         "INSERT INTO attachment_content (id, attachment_id, extraction_status) "
-        "VALUES (2000003, 1, 'extracted')"
+        "VALUES (2000050, 1, 'extracted')"
     )
     first = _transcript("s", "2026-09-01T10:00:00Z", [("user", "a")])
     load_single_conversation(conn, first, _extraction("first", "d1", "t1", "f1", "alpha"))
@@ -322,6 +326,26 @@ def test_a_conversation_loaded_again_is_embedded_again_and_its_old_vector_goes(
     (new_id,) = conn.execute("SELECT id FROM conversations").fetchone()
     ids = sorted(int(i) for i in np.load(index, allow_pickle=False)["ids"])
     assert ids == sorted([*others, embeddings.CONVERSATION_ID_OFFSET - new_id])
+
+    # A conversation whose row goes while it is embedded (loaded again
+    # elsewhere) leaves no vector behind either.
+    third = _transcript(
+        "s", "2026-09-01T14:00:00Z", [("user", "a"), ("assistant", "b"), ("c", "d")]
+    )
+    load_single_conversation(conn, third, _of(third, _extraction("third", "d", "t", "f", "x")))
+    conn.commit()
+
+    def reloaded_meanwhile(texts, client=None):
+        from src.store.loader import delete_conversation
+
+        delete_conversation(conn, conn.execute("SELECT id FROM conversations").fetchone()[0])
+        conn.commit()
+        return np.ones((len(texts), 4), dtype=np.float32)
+
+    monkeypatch.setattr(embeddings, "generate_embeddings", reloaded_meanwhile)
+    embeddings.build_index(conn)
+    ids = sorted(int(i) for i in np.load(index, allow_pickle=False)["ids"])
+    assert ids == sorted(others)  # the old vector pruned, the fresh one dropped
 
 
 def test_the_running_session_hook_replaces_what_it_loaded(tmp_path, monkeypatch):
@@ -434,10 +458,26 @@ def test_the_new_id_is_taken_under_the_write_lock(tmp_path):
 
 
 def test_an_extraction_says_which_transcript_it_describes(extraction_paths):
-    _extract([{"session_id": "s", "ended_at": "2026-09-01T10:00:00"}])
+    _extract([{"session_id": "s", "ended_at": "2026-09-01T10:00:00", "turn_count": 3}])
 
     saved = json.loads((local.CONV_EXTRACTED_DIR / "s.json").read_text())
     assert saved["transcript_ended_at"] == "2026-09-01T10:00:00"
+    assert saved["transcript_turn_count"] == 3
+
+
+def test_an_extraction_loads_with_a_copy_that_only_ends_later(tmp_path):
+    """Where the copy it read is no longer staged, an extraction loads with the
+    newest unless that one went on past it, the rule extraction applies: a copy
+    that only ends later (a tab closed) waits for nothing, since nothing extracts
+    it again."""
+    conn = create_database(str(tmp_path / "b.db"))
+    read = _transcript("s", "2026-09-01T10:00:00Z", [("user", "a"), ("user", "b")])
+    extraction = _of(read, _extraction("first", "d", "t", "f", "x"))
+    closed = {**read, "ended_at": "2026-09-01T10:05:00Z"}  # a later end, no new turn
+    grown = _transcript("s", "2026-09-01T10:05:00Z", [("user", "a"), ("user", "b"), ("user", "c")])
+
+    assert not load_single_conversation(conn, grown, extraction)
+    assert load_single_conversation(conn, closed, extraction)
 
 
 def test_the_loader_waits_for_an_extraction_of_the_transcript_staged(tmp_path):

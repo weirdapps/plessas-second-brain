@@ -905,13 +905,16 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
         if extraction is not None:
             # The transcript it read, which the loader pairs it with and no later one.
             extraction["transcript_ended_at"] = str(conv.get("ended_at") or "")
+            extraction["transcript_turn_count"] = conv.get("turn_count") or len(
+                conv.get("turns", [])
+            )
             result_file = CONV_EXTRACTED_DIR / f"{session_id}.json"
             with open(result_file, "w") as f:
                 json.dump(extraction, f, indent=2, ensure_ascii=False)
             processed_ids.add(session_id)
             extracted_from[session_id] = [
                 extraction["transcript_ended_at"],
-                conv.get("turn_count") or len(conv.get("turns", [])),
+                extraction["transcript_turn_count"],
             ]
             # A success clears the record: the next failure starts from zero
             # rather than inheriting an earlier one.

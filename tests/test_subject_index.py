@@ -365,7 +365,8 @@ def test_a_full_page_of_subjects_skips_the_summary_search(tmp_path):
 
     conn.set_trace_callback(None)
     assert len(results) == 2
-    assert not [s for s in ran if "summary_f MATCH" in s]
+    # The summary stage itself; the thread_matches count reads every column.
+    assert not [s for s in ran if "'summary' as source" in s]
 
 
 def test_results_carry_no_thread_key(tmp_path):
@@ -606,3 +607,118 @@ def test_a_padded_thread_id_is_its_own_thread_in_search_and_in_the_thread_view(t
     assert [e["email_id"] for e in query_thread(conn, 2)] == [2]
     assert [e["email_id"] for e in query_thread(conn, 4)] == [3, 4]
     assert count_thread(conn, 3) == 2
+
+
+@pytest.mark.parametrize("source", ["subject", "summary", "content"])
+def test_a_threads_row_says_how_many_of_its_emails_matched(tmp_path, source):
+    """One row per thread hides the rest of it. Half the corpus is threaded by
+    subject alone (43,399 emails, from before Outlook's conversation ids), and a
+    recurring report's matching emails read as one row. thread_matches says how
+    many matched, so a caller knows to open email_thread."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+
+    def mail(n, thread):
+        if source == "subject":
+            _mail(conn, n, "Okapi weekly report", thread=thread)
+        elif source == "summary":
+            _mail(conn, n, "Report", summary="the okapi weekly report", thread=thread)
+        else:
+            _mail(conn, n, "Report", content="the okapi weekly report", thread=thread)
+
+    for n in range(1, 5):
+        mail(n, "T")
+    mail(5, "C5")
+    mail(6, None)
+    conn.commit()
+
+    results = {r["email_id"]: r for r in query_by_keyword(conn, "okapi weekly", limit=10)}
+
+    assert sorted(results) == [4, 5, 6]
+    assert results[4]["thread_matches"] == 4
+    assert "thread_matches" not in results[5]  # alone in its thread
+    assert "thread_matches" not in results[6]  # no thread at all
+
+
+def test_thread_matches_counts_every_field(tmp_path):
+    """A reply chain holds the term in one email's subject or summary and in every
+    body that quotes it. The subject or summary stage claims the thread, and a
+    count of that stage's matches alone said nothing else had matched."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Weekly", summary="the okapi deal", content="okapi terms", thread="T")
+    for n in range(2, 6):
+        _mail(conn, n, "Weekly", content="re: okapi terms", thread="T")
+    _mail(conn, 6, "Okapi terms", content="okapi terms", thread="U")
+    for n in range(7, 10):
+        _mail(conn, n, "Status", content="quoted: okapi terms", thread="U")
+    _mail(conn, 10, "Digest", content="okapi terms", thread="U", mailbox="News")  # no thread
+    conn.commit()
+    ran: list[str] = []
+    conn.set_trace_callback(ran.append)
+
+    results = {r["email_id"]: r for r in query_by_keyword(conn, "okapi", limit=10)}
+
+    conn.set_trace_callback(None)
+    assert results[6]["source"] == "subject" and results[6]["thread_matches"] == 4
+    assert results[1]["source"] == "summary" and results[1]["thread_matches"] == 5
+    assert any("EXISTS (SELECT 1 FROM emails_fts" in s for s in ran)  # a short page: seeks
+
+
+def test_a_content_only_search_counts_bodies_only(tmp_path):
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Okapi", content="okapi terms", thread="T")
+    _mail(conn, 2, "Okapi", summary="the okapi deal", thread="T")
+    _mail(conn, 3, "Okapi", summary="the okapi deal", thread="T")
+    conn.commit()
+
+    results = query_by_keyword(conn, "okapi", limit=10, search_content_only=True)
+
+    assert [r["email_id"] for r in results] == [1]
+    assert "thread_matches" not in results[0]  # the subjects and summaries were not searched
+
+
+def test_long_threads_are_counted_the_same_way_faster(tmp_path, monkeypatch):
+    """Per-member seeks cost seconds once long threads reach the page (20 of 700
+    emails: 2.5 s), so past a member count the count reads each column's matches
+    once instead. Both give the same numbers."""
+    from src.store import query
+
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Weekly", summary="the okapi deal", content="okapi terms", thread="T")
+    for n in range(2, 6):
+        _mail(conn, n, "Weekly", content="re: okapi terms", thread="T")
+    _mail(conn, 6, "Okapi terms", content="okapi terms", thread="U")
+    for n in range(7, 10):
+        _mail(conn, n, "Status", content="quoted: okapi terms", thread="U")
+    _mail(conn, 10, "Digest", content="okapi terms", thread="U", mailbox="News")
+    conn.commit()
+    monkeypatch.setattr(query, "_SEEKS_UP_TO", 0)
+    ran: list[str] = []
+    conn.set_trace_callback(ran.append)
+
+    results = {r["email_id"]: r for r in query_by_keyword(conn, "okapi", limit=10)}
+
+    conn.set_trace_callback(None)
+    assert results[6]["thread_matches"] == 4
+    assert results[1]["thread_matches"] == 5
+    assert any("m.id IN (SELECT rowid FROM emails_fts" in s for s in ran)  # one pass
+    assert not any("EXISTS (SELECT 1 FROM emails_fts" in s for s in ran)
+
+
+def test_a_page_past_the_threshold_is_counted_in_one_pass(tmp_path):
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    for n in range(1, 202):  # a thread longer than the threshold, 200
+        _mail(conn, n, "Okapi weekly", thread="T")
+    conn.commit()
+    ran: list[str] = []
+    conn.set_trace_callback(ran.append)
+
+    results = query_by_keyword(conn, "okapi", limit=5)
+
+    conn.set_trace_callback(None)
+    assert results[0]["thread_matches"] == 201
+    assert any("m.id IN (SELECT rowid FROM emails_fts" in s for s in ran)

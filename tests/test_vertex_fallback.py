@@ -49,6 +49,8 @@ def test_downgrades_to_fallback_on_refusal(monkeypatch):
     assert out.content[0].text == "RECOVERED"
     # fallback client pinned to europe-west1
     assert mk_vertex.call_args.kwargs["region"] == "europe-west1"
+    # one request: the policy around complete() is the retry layer
+    assert mk_vertex.call_args.kwargs["max_retries"] == 0
     # fallback create used the SDK fallback model id (no [1m] suffix)
     assert fb_client.messages.create.call_args.kwargs["model"] == "claude-opus-4-6"
     fb_client.close.assert_called_once()

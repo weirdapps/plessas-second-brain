@@ -100,14 +100,19 @@ def _build_client_and_model():
         print(
             f"second-brain: Claude via Vertex AI, region {region}, model {model}", file=sys.stderr
         )
-        return AnthropicVertex(project_id=project_id, region=region, timeout=120.0), model
+        # max_retries=0: call_with_policy is the retry layer, and it reserves
+        # max_call_seconds for each attempt, which holds only if an attempt is
+        # one request. The SDK's default, two retries with timeouts among them,
+        # made one attempt up to three 120 s requests.
+        client = AnthropicVertex(project_id=project_id, region=region, timeout=120.0, max_retries=0)
+        return client, model
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if api_key:
         from anthropic import Anthropic
 
         print(f"second-brain: Claude via the direct Anthropic API, model {model}", file=sys.stderr)
-        return Anthropic(api_key=api_key, timeout=60.0), model
+        return Anthropic(api_key=api_key, timeout=60.0, max_retries=0), model  # as above
 
     raise RuntimeError(
         "No Claude credentials found. For Vertex AI set VERTEX_SDK_PROJECT (or "
@@ -228,6 +233,11 @@ def _reauth_unless_latched(*, is_linux: bool) -> ReauthResult | None:
         return result
 
 
+# A connection that dropped within this long, with no answer, is retried once at
+# once instead of waiting out the policy's backoff.
+QUICK_RETRY_WITHIN_S = 5.0
+
+
 def call_with_policy(fn, *, max_call_seconds: float, refusal_is_final: bool = False) -> object:
     """Run fn() under the shared retry/reauth policy.
 
@@ -248,21 +258,37 @@ def call_with_policy(fn, *, max_call_seconds: float, refusal_is_final: bool = Fa
     # Local import: policy_bridge imports reset_client_cache from this module, so a
     # top-level import would create a circular dependency.  By the time this function
     # runs, claude_extract is fully initialised and the deferred import resolves cleanly.
-    from src.extract.policy_bridge import classify_exception
+    from src.extract.policy_bridge import classify_exception, is_dropped_connection
 
     deadline = resolve_deadline(time.time(), os.environ)
     attempt = Attempt()
     last_exc: BaseException | None = None
     last_response: object = None
     is_linux = running_on_linux()
+    quick_retry = True
 
     while True:
         last_exc = None
         last_response = None
+        began = time.monotonic()  # a duration: an NTP step must not bend it
         try:
             last_response = fn()
         except Exception as exc:
             last_exc = exc
+
+        if (
+            quick_retry
+            and last_exc is not None
+            and is_dropped_connection(last_exc)
+            and time.monotonic() - began < QUICK_RETRY_WITHIN_S
+            and time.time() + max_call_seconds <= deadline
+        ):
+            # The SDK used to retry a dropped connection at once; the policy's
+            # backoff (30 s) is for errors that last. Once per call, after a
+            # quick failure, and only when a whole call still fits before the
+            # deadline, the check decide() would have made.
+            quick_retry = False
+            continue
 
         outcome = classify_exception(last_exc, last_response)
         if refusal_is_final and outcome is Outcome.REFUSAL:
@@ -331,10 +357,17 @@ def complete(*, max_tokens: int, messages: list, model: str | None = None, **kwa
     # reach this call.
     from src.extract.vertex_fallback import create_with_refusal_fallback
 
+    after_refusal: dict = {}
+
     def _do_call():
         client, configured = _get_client_and_model()
         return create_with_refusal_fallback(
-            client, model=model or configured, max_tokens=max_tokens, messages=messages, **kwargs
+            client,
+            model=model or configured,
+            after_refusal=after_refusal,
+            max_tokens=max_tokens,
+            messages=messages,
+            **kwargs,
         )
 
     return call_with_policy(_do_call, max_call_seconds=120.0, refusal_is_final=True)

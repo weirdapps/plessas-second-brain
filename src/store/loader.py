@@ -526,10 +526,37 @@ def load_conversations(db_path: str) -> int:
     return loaded_count
 
 
+def conversation_went_on(metadata: dict, ended_at: str | None, turns: int | None) -> bool:
+    """Whether a transcript has gone on past a copy that ended at `ended_at` with
+    `turns` turns: it ends later AND holds more turns. A later end alone comes
+    from trailing events that add no conversation, and more turns alone would
+    follow any change in how the parser counts them. A copy with no end on
+    record never counts as overtaken."""
+    if not ended_at:
+        return False
+    count = metadata.get("turn_count") or len(metadata.get("turns", []))
+    return (metadata.get("ended_at") or "") > ended_at and count > (turns or 0)
+
+
+def delete_conversation(conn: sqlite3.Connection, conversation_id: int) -> None:
+    """A conversation and everything loaded from it; the triggers update the
+    full-text indexes. Its vector goes the next time build_index saves."""
+    conn.execute("DELETE FROM conversation_topics WHERE conversation_id = ?", (conversation_id,))
+    turns = "SELECT id FROM conversation_turns WHERE conversation_id = ?"
+    for table in ("decisions", "action_items", "key_facts"):
+        conn.execute(
+            f"DELETE FROM {table} WHERE conversation_turn_id IN ({turns})", (conversation_id,)
+        )
+    conn.execute("DELETE FROM conversation_turns WHERE conversation_id = ?", (conversation_id,))
+    conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+
+
 def load_single_conversation(
     conn: sqlite3.Connection,
     metadata: dict,
     extraction: dict,
+    *,
+    replace: bool = False,
 ) -> bool:
     """Load a single conversation with its extraction into the database.
 
@@ -537,25 +564,49 @@ def load_single_conversation(
         conn: Database connection
         metadata: Conversation metadata from staging (session_id, turns, etc.)
         extraction: Extracted data from LLM (summary, topics, decisions, etc.)
+        replace: Load it again even if it has not gone on since it was loaded
+            (the hook that ingests a session while it runs)
 
     Returns:
-        True if loaded successfully, False if duplicate
+        True if loaded, False if the store holds it and it has not gone on since
     """
     session_id = metadata["session_id"]
 
-    # Check if already exists
-    if conn.execute("SELECT id FROM conversations WHERE session_id = ?", (session_id,)).fetchone():
+    existing = conn.execute(
+        "SELECT id, ended_at, turn_count FROM conversations WHERE session_id = ?", (session_id,)
+    ).fetchone()
+    # An extraction names the end of the transcript it read
+    # (run_conversation_extraction). One of an earlier transcript than this
+    # waits to be done again: loaded, the new turns would carry the old summary,
+    # and the new extraction would find the store already holding them. One
+    # that names none, written before it did, may still make a first load.
+    described = extraction.get("transcript_ended_at")
+    if described is None:
+        stale = existing is not None
+    else:
+        stale = str(described) < str(metadata.get("ended_at") or "")
+    if stale and not replace:
         return False
+    new_id = None  # SQLite's next
+    if existing:
+        if not (replace or conversation_went_on(metadata, existing[1], existing[2])):
+            return False
+        # Loaded again, whole, under an id above every one in use: SQLite would
+        # give the top id to the next row once it is deleted, and build_index
+        # embeds only an id it holds no vector for.
+        new_id = conn.execute("SELECT MAX(id) FROM conversations").fetchone()[0] + 1
+        delete_conversation(conn, existing[0])
 
     # Insert conversation record
     cursor = conn.execute(
         """
         INSERT INTO conversations (
-            session_id, started_at, ended_at, workspace, project_name,
+            id, session_id, started_at, ended_at, workspace, project_name,
             turn_count, summary, topics_summary, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         """,
         (
+            new_id,
             session_id,
             metadata.get("started_at", ""),
             metadata.get("ended_at"),

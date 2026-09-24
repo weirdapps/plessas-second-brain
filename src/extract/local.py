@@ -47,13 +47,10 @@ QUOTA_PAUSE_SECONDS = 3600  # 1 hour default pause when quota exhausted
 CONVERSATION_MAX_ATTEMPTS = 3
 CONVERSATION_MAX_TIMEOUTS = 10
 
-# A conversation that ended this recently may still be going on. It was staged
-# part-way through, and extracting it now would load its first turns for good,
-# since a loaded session is never staged again. It is staged again, fuller, by a
-# later export, and extracted once it has been quiet this long. This narrows the
-# loss, it does not close it: "quiet" is judged from the copy this host holds,
-# so a session resumed after a longer pause, or whose last turns had not reached
-# this host yet, still loads without its later turns.
+# A conversation that ended this recently may still be going on, so it waits
+# until it has been quiet this long. Extracted now, it would be staged, extracted
+# and loaded again as soon as it went on (store.loader.conversation_went_on): a
+# second extraction where one would have done.
 CONVERSATION_SETTLE_HOURS = 2
 
 # Runs after which an email that keeps failing is loaded without its
@@ -803,6 +800,15 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
     # given-up conversation never reads as ingested to the loader.
     attempt_counts = dict(conv_state.get("failed_attempts", {}))
     timeout_counts = dict(conv_state.get("timeout_attempts", {}))
+    # session_id -> the end of the transcript it was last extracted from.
+    extracted_ended_at = dict(conv_state.get("extracted_ended_at", {}))
+
+    def went_on(conv: dict) -> bool:
+        """Extracted before, and staged since with a later end: past the end it
+        was extracted at, or (no record, from before this was kept) the end it
+        was loaded at, which the export marks on a conversation that went on."""
+        since = extracted_ended_at.get(conv.get("session_id", "")) or conv.get("regrown_from")
+        return bool(since) and str(conv.get("ended_at") or "") > str(since)
 
     def given_up_ids() -> set[str]:
         return {sid for sid, n in attempt_counts.items() if n >= CONVERSATION_MAX_ATTEMPTS} | {
@@ -821,7 +827,8 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
     pending = [
         c
         for c in all_convs
-        if c.get("session_id", "") not in processed_ids and c.get("session_id", "") not in given_up
+        if (c.get("session_id", "") not in processed_ids or went_on(c))
+        and c.get("session_id", "") not in given_up
     ]
     # Newest first, as emails go under a deadline: sync's Step 7 has 30 s, and an
     # old conversation the model will not take held the head of the list, spent
@@ -890,10 +897,13 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
         session_id, extraction, is_quota, failure = extract_conversation_inline(conv)
 
         if extraction is not None:
+            # The transcript it read, which the loader pairs it with and no later one.
+            extraction["transcript_ended_at"] = str(conv.get("ended_at") or "")
             result_file = CONV_EXTRACTED_DIR / f"{session_id}.json"
             with open(result_file, "w") as f:
                 json.dump(extraction, f, indent=2, ensure_ascii=False)
             processed_ids.add(session_id)
+            extracted_ended_at[session_id] = extraction["transcript_ended_at"]
             # A success clears the record: the next failure starts from zero
             # rather than inheriting an earlier one.
             attempt_counts.pop(session_id, None)
@@ -913,6 +923,7 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
         # Save state periodically
         if (i + 1) % SAVE_INTERVAL == 0 or i == len(pending) - 1:
             conv_state["processed_ids"] = list(processed_ids)
+            conv_state["extracted_ended_at"] = extracted_ended_at
             conv_state["failed_attempts"] = attempt_counts
             conv_state["timeout_attempts"] = timeout_counts
             conv_state["total_extracted"] = len(processed_ids)
@@ -945,6 +956,7 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
 
     # Final save
     conv_state["processed_ids"] = list(processed_ids)
+    conv_state["extracted_ended_at"] = extracted_ended_at
     conv_state["failed_attempts"] = attempt_counts
     conv_state["timeout_attempts"] = timeout_counts
     conv_state["given_up_ids"] = sorted(given_up_ids())

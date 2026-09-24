@@ -32,7 +32,8 @@ that write the database first.
 
 Run it on the host that builds the database, with the writers stopped. Counts
 only are printed, never a value. Defaults to a dry run, which opens the database
-read-only and exits 1 when it finds anything. Snapshots taken before the scrub
+read-only and exits 1 when it finds anything. On a replica --apply is refused
+with exit 3, since the next pull replaces the file. Snapshots taken before the scrub
 still hold the old rows: the encrypted offsite ones, and the plaintext local
 ones in data/backups/, both of which age out under the retention policy.
 """
@@ -44,7 +45,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.config import DEFAULT_DB  # noqa: E402
+from src.config import DEFAULT_DB, is_replica, replica_refusal  # noqa: E402
 from src.redact import _PATTERNS, redact_secrets  # noqa: E402
 
 _FTS_SHADOW_SUFFIXES = ("_data", "_idx", "_content", "_docsize", "_config")
@@ -181,6 +182,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.vacuum and not args.apply:
         parser.error("--vacuum requires --apply")
+    if args.apply and is_replica():
+        # The dry run reads only; the scrub rewrites rows, and a replica's copy
+        # is replaced by the next pull (see src/config.py). 3, since 1 and 2
+        # already mean "found some" and "cannot run".
+        print(replica_refusal("the secret scrub"), file=sys.stderr)
+        return 3
 
     db = Path(DEFAULT_DB)
     if not db.exists():

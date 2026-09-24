@@ -118,6 +118,26 @@ def test_the_backend_in_use_is_logged(monkeypatch, capsys, vertex):
     assert "test-project" not in err
 
 
+@pytest.mark.parametrize("vertex", [True, False])
+def test_the_sdk_makes_one_request_per_attempt(monkeypatch, vertex):
+    """call_with_policy is the retry layer, and reserves max_call_seconds for each
+    attempt. That holds only if an attempt is one request: the SDK's own default,
+    two retries with timeouts among them, made one attempt up to three 120 s
+    requests, and the policy then retried the lot."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    if vertex:
+        monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+        monkeypatch.setenv("VERTEX_SDK_REGION", "eu")
+    else:
+        monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
+        monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    _fake_sdk(monkeypatch)
+
+    client, _ = claude_extract._build_client_and_model()
+
+    assert client.kwargs["max_retries"] == 0
+
+
 def test_complete_retries_a_refusal_on_the_fallback_tier(monkeypatch):
     """Attachments, images and calendar called the SDK themselves, so a refusal
     failed the item where extract_one retried it on the fallback tier."""
@@ -531,3 +551,112 @@ def test_response_text_handles_an_empty_content_list():
 
     with pytest.raises(ValueError, match="no text block"):
         claude_extract._response_text(resp)
+
+
+def _sdk_error(name):
+    """An anthropic error of the named class, built without an HTTP response."""
+    from src.extract import policy_bridge
+
+    cls = getattr(policy_bridge.anthropic, name)
+    return cls.__new__(cls)
+
+
+def test_after_a_refusal_the_policy_retries_the_fallback_tier_alone(monkeypatch):
+    """With the SDK retrying nothing, a 429 on the fallback tier reached the policy,
+    whose retry replayed the primary that had already refused: a billed call that
+    cannot change its answer, and one of the four attempts."""
+    monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+    primary = MagicMock()
+    primary.messages.create.return_value = types.SimpleNamespace(content=[], stop_reason="refusal")
+    fallback = MagicMock()
+    fallback.messages.create.side_effect = [
+        _sdk_error("RateLimitError"),
+        _fake_response("recovered"),
+    ]
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (primary, "m"))
+    monkeypatch.setattr("anthropic.AnthropicVertex", lambda **kwargs: fallback)
+    monkeypatch.setattr(claude_extract.time, "sleep", lambda seconds: None)
+
+    response = claude_extract.complete(max_tokens=10, messages=[])
+
+    assert claude_extract._response_text(response) == "recovered"
+    assert primary.messages.create.call_count == 1
+    assert fallback.messages.create.call_count == 2
+
+
+def _calls(*outcomes):
+    """A zero-argument call that raises or returns each outcome in turn."""
+    queue = list(outcomes)
+
+    def fn():
+        item = queue.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    return fn
+
+
+def test_a_dropped_connection_is_retried_at_once(monkeypatch):
+    """The SDK retried a dropped connection within a second; the policy waits 30 s,
+    which is for errors that last. One quick retry, after a quick failure."""
+    slept = []
+    monkeypatch.setattr(claude_extract.time, "sleep", slept.append)
+    fn = _calls(_sdk_error("APIConnectionError"), _fake_response("ok"))
+
+    response = claude_extract.call_with_policy(fn, max_call_seconds=120.0)
+
+    assert claude_extract._response_text(response) == "ok"
+    assert slept == []
+
+
+@pytest.mark.parametrize(
+    "first",
+    [("APIConnectionError", "APIConnectionError"), ("APITimeoutError",)],
+    ids=["second drop", "timeout"],
+)
+def test_one_quick_retry_and_none_after_a_timeout(monkeypatch, first):
+    """A second drop, or a timeout (which took its full 120 s), waits the policy's
+    backoff: a quick retry after either could overrun the attempt's reservation."""
+    slept = []
+    monkeypatch.setattr(claude_extract.time, "sleep", slept.append)
+    fn = _calls(*[_sdk_error(name) for name in first], _fake_response("ok"))
+
+    response = claude_extract.call_with_policy(fn, max_call_seconds=120.0)
+
+    assert claude_extract._response_text(response) == "ok"
+    assert len(slept) == 1
+
+
+def test_a_slow_drop_is_not_retried_at_once(monkeypatch):
+    """A connection that dropped after most of its 120 s has spent the attempt's
+    reservation; retrying at once could overrun the deadline."""
+    clock = iter(range(1_000_000, 2_000_000, 10))  # every reading ten seconds on
+    monkeypatch.setattr(claude_extract.time, "monotonic", lambda: next(clock))
+    slept = []
+    monkeypatch.setattr(claude_extract.time, "sleep", slept.append)
+    fn = _calls(_sdk_error("APIConnectionError"), _fake_response("ok"))
+
+    response = claude_extract.call_with_policy(fn, max_call_seconds=120.0)
+
+    assert claude_extract._response_text(response) == "ok"
+    assert len(slept) == 1
+
+
+def test_a_quick_retry_needs_a_whole_call_before_the_deadline(monkeypatch):
+    """The quick retry skips the policy's budget check, so it makes its own: with
+    less than a call left, the drop goes to the policy, which gives up."""
+    monkeypatch.setenv("PTS_LLM_DEADLINE", str(claude_extract.time.time() + 60))
+    calls = []
+
+    def fn():
+        calls.append(1)
+        if len(calls) == 1:
+            raise _sdk_error("APIConnectionError")
+        return _fake_response("ok")
+
+    monkeypatch.setattr(claude_extract.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(type(_sdk_error("APIConnectionError"))):
+        claude_extract.call_with_policy(fn, max_call_seconds=120.0)
+    assert len(calls) == 1

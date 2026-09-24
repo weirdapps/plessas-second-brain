@@ -201,7 +201,7 @@ def _take_the_write_lock(conn: sqlite3.Connection) -> bool:
     sync units overlap (the noon catch-up and the hourly one), and each found an
     item not stored, stored it, and failed on the other's copy of its unique key,
     which ended that sync. The second now waits for the first (busy_timeout) and
-    finds the item stored; an item already stored waits for no one."""
+    finds the item stored; an item already stored, in its folder, waits for no one."""
     if conn.in_transaction:
         return False
     conn.execute("BEGIN IMMEDIATE")
@@ -210,9 +210,11 @@ def _take_the_write_lock(conn: sqlite3.Connection) -> bool:
 
 def _moved(stored: str | None, staged: str | None) -> bool:
     """Whether a staged copy moves a stored email to another folder. Never into the
-    Inbox: its export takes new arrivals only, so a staged Inbox copy of a stored
-    email is an old one (a batch stays staged while any email in it is
-    unextracted), and a move out of the Inbox is inbox_reconcile's to record."""
+    Inbox: its export takes new arrivals, bar a bootstrap, so a staged Inbox copy of
+    a stored email is almost always an old one (a batch stays staged while any
+    email in it is unextracted), and a move out of the Inbox is inbox_reconcile's
+    to record. The cost: an email moved back into the Inbox and staged again by a
+    bootstrap keeps the folder it had."""
     return bool(staged) and staged != stored and (staged != "Inbox" or not stored)
 
 

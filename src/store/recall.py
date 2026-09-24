@@ -22,7 +22,12 @@ from src.store.greek import (
     search_words,
 )
 from src.store.normalizer import normalize_topic
-from src.store.query import fts5_query_variants, query_by_keyword, search_attachments
+from src.store.query import (
+    fts5_query_variants,
+    query_by_keyword,
+    search_attachments,
+    thread_keys,
+)
 from src.store.teams_query import search_teams as _search_teams_q
 
 logger = logging.getLogger(__name__)
@@ -270,14 +275,23 @@ def _hybrid_emails(
     kw_ids = [h["email_id"] for h in keyword_hits]
     fused = reciprocal_rank_fusion([kw_ids, sem_ids])
     kw_by_id = {h["email_id"]: h for h in keyword_hits}
+    # One email per thread, as keyword search returns: a semantic candidate from
+    # a thread already shown adds a copy of the thread, not a new result.
+    threads = thread_keys(conn, [email_id for email_id, _score in fused])
+    shown: set[str] = set()
 
     out: list[dict] = []
     for email_id, _score in fused:
         if len(out) >= limit:
             break
+        thread = threads.get(email_id)
+        if thread is not None and thread in shown:
+            continue
         hit = kw_by_id.get(email_id)
         if hit is not None:
             out.append(hit)
+            if thread is not None:
+                shown.add(thread)
             continue
         row = conn.execute(
             """
@@ -291,6 +305,8 @@ def _hybrid_emails(
             hit = dict(row)
             hit["source"] = "semantic"
             out.append(hit)
+            if thread is not None:
+                shown.add(thread)
     return out
 
 

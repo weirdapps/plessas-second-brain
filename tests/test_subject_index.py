@@ -447,3 +447,86 @@ def test_a_subject_thread_does_not_come_back_through_a_later_source(tmp_path, so
 
     assert sum(r["email_id"] <= 30 for r in results) == 1
     assert sorted(r["email_id"] for r in results if r["email_id"] > 30) == [31, 32, 33, 34, 35]
+
+
+def test_a_recurring_subject_shows_its_newest_threads(tmp_path):
+    """Equal scores fell back to conversation_id order, so a weekly report's
+    oldest threads could take the page."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    for n in range(1, 13):
+        _mail(conn, n, "Weekly report", thread=f"T{n}")
+    conn.commit()
+
+    results = query_by_keyword(conn, "weekly report", limit=3)
+
+    assert [r["email_id"] for r in results] == [12, 11, 10]
+
+
+@pytest.mark.parametrize("source", ["summary", "content", "key_fact", "attachment"])
+def test_one_thread_takes_one_slot_whichever_source_found_it(tmp_path, source):
+    """Replies quote each other: a thread whose subject did not match still
+    filled the page through its bodies or its summaries."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+
+    def mail(n, text, thread):
+        if source == "summary":
+            _mail(conn, n, "Q3 numbers", summary=text, thread=thread)
+        elif source == "content":
+            _mail(conn, n, "Q3 numbers", content=text, thread=thread)
+        else:
+            _mail(conn, n, "Q3 numbers", thread=thread)
+            _found_by(conn, n, source, text)
+
+    for n in range(1, 21):
+        mail(n, f"the okapi contract is signed {n}", "T")
+    for n in range(21, 26):
+        mail(n, f"other notes that mention the okapi {n}", f"C{n}")
+    conn.commit()
+
+    results = query_by_keyword(conn, "okapi", limit=10)
+
+    assert sum(r["email_id"] <= 20 for r in results) == 1
+    assert sorted(r["email_id"] for r in results if r["email_id"] > 20) == [21, 22, 23, 24, 25]
+
+
+def test_a_thread_one_source_found_is_not_found_again_by_the_next(tmp_path):
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Alpha", summary="kiwi", thread="T")
+    _mail(conn, 2, "RE: Alpha", content="kiwi", thread="T")
+    _mail(conn, 3, "Beta", content="kiwi", thread="U")
+    conn.commit()
+
+    results = query_by_keyword(conn, "kiwi", limit=10)
+
+    assert [(r["email_id"], r["source"]) for r in results] == [(1, "summary"), (3, "content")]
+
+
+def test_a_body_only_search_is_one_row_per_thread_too(tmp_path):
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    for n in range(1, 11):
+        _mail(conn, n, "Q3", content=f"okapi {n}", thread="T")
+    _mail(conn, 11, "Other", content="okapi elsewhere in a longer body", thread="U")
+    conn.commit()
+
+    results = query_by_keyword(conn, "okapi", limit=5, search_content_only=True)
+
+    assert sum(r["email_id"] <= 10 for r in results) == 1
+    assert 11 in [r["email_id"] for r in results]
+
+
+def test_an_unthreaded_email_found_by_two_sources_comes_back_once(tmp_path):
+    """Only threads are left out in the query; an email with none can come back
+    from the next source, and is skipped there."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Alpha", summary="kiwi", content="kiwi", thread=None)
+    _mail(conn, 2, "Beta", content="kiwi in the body of another email", thread=None)
+    conn.commit()
+
+    results = query_by_keyword(conn, "kiwi", limit=5)
+
+    assert sorted(r["email_id"] for r in results) == [1, 2]

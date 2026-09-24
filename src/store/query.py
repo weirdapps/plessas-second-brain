@@ -132,10 +132,14 @@ def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> li
         List of dicts with keys: email_id, date, subject, summary,
         sender_name, sender_address, sentiment
     """
-    # Find conversation_id for the given email
-    cursor = conn.execute("SELECT conversation_id FROM emails WHERE id = ?", (email_id,))
+    # Find conversation_id for the given email. News and a blank id are no
+    # thread, as keyword search treats them (_THREAD): News keeps a day per
+    # pipeline there, and strangers can share a blank id.
+    cursor = conn.execute(
+        "SELECT conversation_id, mailbox_name FROM emails WHERE id = ?", (email_id,)
+    )
     row = cursor.fetchone()
-    if not row or not row["conversation_id"]:
+    if not row or not (row["conversation_id"] or "").strip() or row["mailbox_name"] == "News":
         return []
 
     conversation_id = row["conversation_id"]
@@ -175,7 +179,8 @@ def count_thread(conn: sqlite3.Connection, email_id: int) -> int:
     """How many emails query_thread's thread holds, however many it returned."""
     row = conn.execute(
         "SELECT COUNT(*) FROM emails WHERE conversation_id = "
-        "(SELECT conversation_id FROM emails WHERE id = ? AND conversation_id <> '')",
+        "(SELECT conversation_id FROM emails WHERE id = ? AND TRIM(conversation_id) <> '' "
+        "AND COALESCE(mailbox_name, '') <> 'News')",
         (email_id,),
     ).fetchone()
     return row[0]
@@ -342,11 +347,30 @@ def query_by_keyword(
 # pipeline rather than a thread.
 _THREAD = "CASE WHEN e.mailbox_name = 'News' THEN NULL ELSE NULLIF(TRIM(e.conversation_id), '') END"
 
-# Leaves out the threads the subject stage returned: their other emails'
-# summaries and bodies repeat the words too, and one thread took half the page.
-# In the query, not after it: skipped after the LIMIT, they used it up. One
-# parameter, a JSON list.
-_NOT_SUBJECT_THREAD = f"AND COALESCE({_THREAD}, '') NOT IN (SELECT value FROM json_each(?))"
+# Leaves out the threads already on the page: in the query, not after it, since
+# skipped after the LIMIT they used it up. One parameter, a JSON list.
+_NOT_TAKEN = f"AND COALESCE({_THREAD}, '') NOT IN (SELECT value FROM json_each(?))"
+
+
+def _best_of_each_thread(rank: str) -> str:
+    """Numbers each thread's rows by `rank`, so nth = 1 is its best match.
+
+    An email with no thread partitions by its id, an integer, which no
+    conversation_id (always text) can equal. SQLite refuses snippet() in a query
+    with a window function, so the sources that need one pick their rows first,
+    in a CTE, and take the snippet in the query around it.
+    """
+    return f"ROW_NUMBER() OVER (PARTITION BY COALESCE({_THREAD}, e.id) ORDER BY {rank})"
+
+
+def thread_keys(conn: sqlite3.Connection, email_ids) -> dict:
+    """Each email's thread as keyword search counts threads (_THREAD), by id;
+    None for an email with none."""
+    rows = conn.execute(
+        f"SELECT e.id, {_THREAD} FROM emails e WHERE e.id IN (SELECT value FROM json_each(?))",
+        (json.dumps(list(email_ids)),),
+    )
+    return {row[0]: row[1] for row in rows}
 
 
 def _keyword_waterfall(
@@ -355,18 +379,23 @@ def _keyword_waterfall(
     limit: int,
     search_content_only: bool,
 ) -> list[dict]:
-    """query_by_keyword's source waterfall for one sanitized MATCH expression."""
+    """query_by_keyword's source waterfall for one sanitized MATCH expression.
+
+    One row per thread, from whichever source found the thread first: a thread's
+    emails share its subject and quote each other, and one thread filled the
+    page. email_thread shows the rest of it.
+    """
     results: list[dict] = []
     seen_ids: set[int] = set()
-    subject_threads: set[str] = set()
+    taken_threads: set[str] = set()
 
-    def take(rows, from_subjects: bool = False) -> None:
+    def take(rows) -> None:
         """Append the rows not found already, until the page is full.
 
-        Every source asks for a whole page: of what it returns, only the rows
-        taken so far can be taken already, so the rest still fills the page,
-        where asking only for the slots left gave them away. One source can
-        return an email twice (two of its key facts match).
+        Every source asks for a whole page of threads not yet on it: of what it
+        returns, only an unthreaded email taken by an earlier source can be here
+        already, so the rest still fills the page, where asking only for the
+        slots left gave them away.
         """
         for row in rows:
             if len(results) >= limit:
@@ -376,19 +405,20 @@ def _keyword_waterfall(
             if r["email_id"] in seen_ids:
                 continue
             seen_ids.add(r["email_id"])
-            if from_subjects and thread is not None:
-                subject_threads.add(thread)
+            if thread is not None:
+                taken_threads.add(thread)
             results.append(r)
+
+    def taken() -> str:
+        return json.dumps(sorted(taken_threads))
 
     if not search_content_only and _has_subject_index(conn):
         # The subject first: the words someone remembers an email by, and until
         # v22 not indexed at all. snippet() is not needed; the subject is the row.
-        # One row per thread: every email of a thread carries its subject, and a
-        # long thread filled the page. The thread ranks by its best match and is
-        # shown by its newest email, where it stands now; within a thread the
-        # ranks differ only by how many RE:/FW: prefixes a subject carries. An
-        # email with no thread partitions by its id, an integer, which no
-        # conversation_id (always text) can equal.
+        # The thread ranks by its best match and is shown by its newest email,
+        # where it stands now; within a thread the ranks differ only by how many
+        # RE:/FW: prefixes a subject carries. Equal ranks (a recurring subject)
+        # go newest first.
         query_subjects = f"""
             SELECT email_id, date, subject, summary, snippet, source, thread FROM (
                 SELECT
@@ -407,10 +437,10 @@ def _keyword_waterfall(
                 WINDOW t AS (PARTITION BY COALESCE({_THREAD}, e.id))
             )
             WHERE nth = 1
-            ORDER BY score
+            ORDER BY score, date DESC, email_id DESC
             LIMIT ?
         """
-        take(conn.execute(query_subjects, (safe_keyword, limit)), from_subjects=True)
+        take(conn.execute(query_subjects, (safe_keyword, limit)))
 
     if len(results) < limit and not search_content_only:
         # Search in email summaries
@@ -420,33 +450,49 @@ def _keyword_waterfall(
         # key_fact -> attachment) plus seen_ids dedup preserves the cross-source
         # order.
         query_summaries = f"""
-            SELECT
-                e.id as email_id,
-                e.date_received as date,
-                e.subject,
-                e.summary,
-                e.summary as snippet,
-                'summary' as source,
-                {_THREAD} as thread
-            FROM emails_fts
-            JOIN emails e ON e.id = emails_fts.rowid
-            -- Column names carry the _f suffix from schema v20: the FTS indexes
-            -- the folded GENERATED columns, and an external-content FTS5's
-            -- column names are by definition its content table's column names.
-            WHERE emails_fts.summary_f MATCH ? {_NOT_SUBJECT_THREAD}
-            ORDER BY rank
+            SELECT email_id, date, subject, summary, snippet, source, thread FROM (
+                SELECT
+                    e.id as email_id,
+                    e.date_received as date,
+                    e.subject,
+                    e.summary,
+                    e.summary as snippet,
+                    'summary' as source,
+                    {_THREAD} as thread,
+                    emails_fts.rank as score,
+                    {_best_of_each_thread("emails_fts.rank")} as nth
+                FROM emails_fts
+                JOIN emails e ON e.id = emails_fts.rowid
+                -- Column names carry the _f suffix from schema v20: the FTS indexes
+                -- the folded GENERATED columns, and an external-content FTS5's
+                -- column names are by definition its content table's column names.
+                WHERE emails_fts.summary_f MATCH ? {_NOT_TAKEN}
+            )
+            WHERE nth = 1
+            ORDER BY score, date DESC, email_id DESC
             LIMIT ?
         """
 
-        take(
-            conn.execute(
-                query_summaries, (safe_keyword, json.dumps(sorted(subject_threads)), limit)
-            )
-        )
+        take(conn.execute(query_summaries, (safe_keyword, taken(), limit)))
 
     # Search in email content
     if len(results) < limit:
         query_content = f"""
+            WITH picked AS (
+                SELECT email_id FROM (
+                    SELECT
+                        e.id as email_id,
+                        emails_fts.rank as score,
+                        e.date_received as date,
+                        {_best_of_each_thread("emails_fts.rank")} as nth
+                    FROM emails e
+                    JOIN emails_fts ON emails_fts.rowid = e.id
+                    WHERE emails_fts.content_f MATCH ? {_NOT_TAKEN}
+                )
+                WHERE nth = 1
+                ORDER BY score, date DESC, email_id DESC
+                LIMIT ?
+            )
             SELECT
                 e.id as email_id,
                 e.date_received as date,
@@ -456,42 +502,63 @@ def _keyword_waterfall(
                 'content' as source,
                 {_THREAD} as thread
             FROM emails e
+            JOIN picked ON picked.email_id = e.id
             JOIN emails_fts ON emails_fts.rowid = e.id
-            WHERE emails_fts.content_f MATCH ? {_NOT_SUBJECT_THREAD}
-            ORDER BY rank
-            LIMIT ?
+            WHERE emails_fts.content_f MATCH ?
+            ORDER BY rank, e.date_received DESC, e.id DESC
         """
 
-        take(
-            conn.execute(query_content, (safe_keyword, json.dumps(sorted(subject_threads)), limit))
-        )
+        take(conn.execute(query_content, (safe_keyword, taken(), limit, safe_keyword)))
 
     # Search in key facts (only if we haven't hit the limit and not content-only)
     if len(results) < limit and not search_content_only:
         query_facts = f"""
-            SELECT
-                e.id as email_id,
-                e.date_received as date,
-                e.subject,
-                e.summary,
-                kf.fact as snippet,
-                'key_fact' as source,
-                {_THREAD} as thread
-            FROM key_facts_fts
-            JOIN key_facts kf ON kf.id = key_facts_fts.rowid
-            JOIN emails e ON e.id = kf.email_id
-            WHERE key_facts_fts MATCH ? {_NOT_SUBJECT_THREAD}
-            ORDER BY rank
+            SELECT email_id, date, subject, summary, snippet, source, thread FROM (
+                SELECT
+                    e.id as email_id,
+                    e.date_received as date,
+                    e.subject,
+                    e.summary,
+                    kf.fact as snippet,
+                    'key_fact' as source,
+                    {_THREAD} as thread,
+                    key_facts_fts.rank as score,
+                    {_best_of_each_thread("key_facts_fts.rank")} as nth
+                FROM key_facts_fts
+                JOIN key_facts kf ON kf.id = key_facts_fts.rowid
+                JOIN emails e ON e.id = kf.email_id
+                WHERE key_facts_fts MATCH ? {_NOT_TAKEN}
+            )
+            WHERE nth = 1
+            ORDER BY score, date DESC, email_id DESC
             LIMIT ?
         """
 
-        take(conn.execute(query_facts, (safe_keyword, json.dumps(sorted(subject_threads)), limit)))
+        take(conn.execute(query_facts, (safe_keyword, taken(), limit)))
 
     # Search in attachment content (PDF/Office text + LLM summary).
     # Surfaces attachment-only matches as the parent email row, with
     # source='attachment' and the matched filename for caller transparency.
     if len(results) < limit and not search_content_only and _has_attachment_fts(conn):
         query_attachments = f"""
+            WITH picked AS (
+                SELECT content_id FROM (
+                    SELECT
+                        ac.id as content_id,
+                        attachment_content_fts.rank as score,
+                        e.date_received as date,
+                        e.id as email_id,
+                        {_best_of_each_thread("attachment_content_fts.rank")} as nth
+                    FROM attachment_content_fts
+                    JOIN attachment_content ac ON ac.id = attachment_content_fts.rowid
+                    JOIN attachments a ON a.id = ac.attachment_id
+                    JOIN emails e ON e.id = a.email_id
+                    WHERE attachment_content_fts MATCH ? {_NOT_TAKEN}
+                )
+                WHERE nth = 1
+                ORDER BY score, date DESC, email_id DESC
+                LIMIT ?
+            )
             SELECT
                 e.id as email_id,
                 e.date_received as date,
@@ -502,19 +569,15 @@ def _keyword_waterfall(
                 a.filename as attachment_filename,
                 {_THREAD} as thread
             FROM attachment_content_fts
+            JOIN picked ON picked.content_id = attachment_content_fts.rowid
             JOIN attachment_content ac ON ac.id = attachment_content_fts.rowid
             JOIN attachments a ON a.id = ac.attachment_id
             JOIN emails e ON e.id = a.email_id
-            WHERE attachment_content_fts MATCH ? {_NOT_SUBJECT_THREAD}
-            ORDER BY rank
-            LIMIT ?
+            WHERE attachment_content_fts MATCH ?
+            ORDER BY rank, e.date_received DESC, e.id DESC
         """
 
-        take(
-            conn.execute(
-                query_attachments, (safe_keyword, json.dumps(sorted(subject_threads)), limit)
-            )
-        )
+        take(conn.execute(query_attachments, (safe_keyword, taken(), limit, safe_keyword)))
 
     # Results are relevance-ranked within each source (ORDER BY rank) and appended
     # in source-priority order (subject -> summary -> content -> key_fact ->

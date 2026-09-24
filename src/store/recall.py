@@ -22,7 +22,12 @@ from src.store.greek import (
     search_words,
 )
 from src.store.normalizer import normalize_topic
-from src.store.query import fts5_query_variants, query_by_keyword, search_attachments
+from src.store.query import (
+    fts5_query_variants,
+    query_by_keyword,
+    search_attachments,
+    thread_keys,
+)
 from src.store.teams_query import search_teams as _search_teams_q
 
 logger = logging.getLogger(__name__)
@@ -261,21 +266,36 @@ def _hybrid_emails(
     pool = max(limit * 4, limit)
     keyword_hits = query_by_keyword(conn, query, limit=pool)
     try:
-        sem_ids = semantic_candidates(conn, query, pool)
+        # Read twice below: a provider that yields would be empty the second time.
+        sem_ids = list(semantic_candidates(conn, query, pool))
     except Exception:
         return keyword_hits[:limit]
     if not sem_ids:
         return keyword_hits[:limit]
 
+    # Fused by thread, not by email: keyword search returns one email per thread,
+    # and the email that embeds best is rarely that one, so a thread both
+    # rankings put first never got the credit for it. A thread with a keyword
+    # hit is shown by that hit, which carries the evidence of the match.
     kw_ids = [h["email_id"] for h in keyword_hits]
-    fused = reciprocal_rank_fusion([kw_ids, sem_ids])
-    kw_by_id = {h["email_id"]: h for h in keyword_hits}
+    threads = thread_keys(conn, kw_ids + list(sem_ids))
+
+    def key(email_id):
+        return threads.get(email_id) or ("email", email_id)
+
+    kw_by_key: dict = {}
+    for kw_hit in keyword_hits:
+        kw_by_key.setdefault(key(kw_hit["email_id"]), kw_hit)
+    sem_by_key: dict = {}
+    for email_id in sem_ids:
+        sem_by_key.setdefault(key(email_id), email_id)
+    fused = reciprocal_rank_fusion([list(kw_by_key), list(sem_by_key)])
 
     out: list[dict] = []
-    for email_id, _score in fused:
+    for thread, _score in fused:
         if len(out) >= limit:
             break
-        hit = kw_by_id.get(email_id)
+        hit = kw_by_key.get(thread)
         if hit is not None:
             out.append(hit)
             continue
@@ -285,7 +305,7 @@ def _hybrid_emails(
                    summary, summary as snippet
             FROM emails WHERE id = ?
             """,
-            (email_id,),
+            (sem_by_key[thread],),
         ).fetchone()
         if row:
             hit = dict(row)

@@ -12,6 +12,21 @@ from typing import Any
 from src.config import USER_EMAIL_PATTERN
 from src.store.greek import register_sql_functions, search_fold
 from src.store.normalizer import normalize_topic
+from src.store.schema import subject_to_conversation_id
+
+# The loader threads an email with no conversation id and no references by the
+# hash of its normalized subject, so every blank subject shares this id: 92
+# unrelated emails on the replica.
+_BLANK_SUBJECT_THREAD = subject_to_conversation_id("")
+
+# The thread an email row belongs to, for one row per thread and for the thread
+# view: NULL for an email with none (no id, a blank one, the blank-subject hash),
+# and for News, whose conversation_id is a day per pipeline rather than a thread.
+# Anything else is the id as stored, which is what query_thread selects on.
+_THREAD = (
+    "CASE WHEN e.mailbox_name = 'News' OR TRIM(e.conversation_id) = '' "
+    f"OR e.conversation_id = '{_BLANK_SUBJECT_THREAD}' THEN NULL ELSE e.conversation_id END"
+)
 
 
 def _sanitize_fts5_query(keyword: str) -> str:
@@ -105,11 +120,24 @@ def _has_attachment_fts(conn: sqlite3.Connection) -> bool:
     )
 
 
-def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> list[dict]:
-    """Get the full conversation thread for an email.
+def _has_subject_index(conn: sqlite3.Connection) -> bool:
+    """Whether emails_fts indexes the subject (schema v22).
 
-    Given an email_id, finds its conversation_id and returns all emails
-    in that conversation ordered chronologically.
+    A replica runs whatever code its checkout holds against whatever database it
+    last pulled, and the two do not move together: newer code must still search
+    a store the producer has not migrated yet.
+    """
+    return any(r[1] == "subject_f" for r in conn.execute("PRAGMA table_info(emails_fts)"))
+
+
+def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> list[dict]:
+    """Get the conversation thread for an email.
+
+    Given an email_id, finds its conversation_id and returns the emails in that
+    conversation ordered chronologically. A thread longer than `limit` gives the
+    `limit` emails centred on this one: the oldest could leave it out, and a
+    search usually hits a recent one. An email with no thread (_THREAD: News, no
+    or a blank conversation id) is a thread of one; an unknown id gives [].
 
     Args:
         conn: Database connection
@@ -120,15 +148,26 @@ def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> li
         List of dicts with keys: email_id, date, subject, summary,
         sender_name, sender_address, sentiment
     """
-    # Find conversation_id for the given email
-    cursor = conn.execute("SELECT conversation_id FROM emails WHERE id = ?", (email_id,))
-    row = cursor.fetchone()
-    if not row or not row["conversation_id"]:
+    row = conn.execute(f"SELECT {_THREAD} FROM emails e WHERE e.id = ?", (email_id,)).fetchone()
+    if not row:
         return []
+    thread = row[0]
+    ids = (
+        [
+            r[0]
+            for r in conn.execute(
+                "SELECT id FROM emails WHERE conversation_id = ? ORDER BY date_received ASC, id ASC",
+                (thread,),
+            )
+        ]
+        if thread is not None
+        else [email_id]
+    )
+    if 0 <= limit < len(ids):
+        at = ids.index(email_id) if email_id in ids else len(ids) - 1
+        start = max(0, min(at - limit // 2, len(ids) - limit))
+        ids = ids[start : start + limit]
 
-    conversation_id = row["conversation_id"]
-
-    # Get all emails in this conversation
     cursor = conn.execute(
         """
         SELECT
@@ -140,13 +179,25 @@ def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> li
             sender_address,
             sentiment
         FROM emails
-        WHERE conversation_id = ?
-        ORDER BY date_received ASC
-        LIMIT ?
+        WHERE id IN (SELECT value FROM json_each(?))
+        ORDER BY date_received ASC, id ASC
         """,
-        (conversation_id, limit),
+        (json.dumps(ids),),
     )
     return [dict(r) for r in cursor.fetchall()]
+
+
+def count_thread(conn: sqlite3.Connection, email_id: int) -> int:
+    """How many emails query_thread's thread holds, however many it returned: 1
+    for an email with no thread, 0 for an unknown id."""
+    row = conn.execute(f"SELECT {_THREAD} FROM emails e WHERE e.id = ?", (email_id,)).fetchone()
+    if not row:
+        return 0
+    if row[0] is None:
+        return 1
+    return conn.execute(
+        "SELECT COUNT(*) FROM emails WHERE conversation_id = ?", (row[0],)
+    ).fetchone()[0]
 
 
 # A person filter picks its plan by how many emails the people it means are on.
@@ -282,7 +333,8 @@ def query_by_keyword(
     limit: int = 20,
     search_content_only: bool = False,
 ) -> list[dict]:
-    """Full-text search using FTS5 on email summaries, content, and key facts.
+    """Full-text search using FTS5 on email subjects, summaries, content, key facts
+    and attachments.
 
     Args:
         conn: Database connection
@@ -292,7 +344,8 @@ def query_by_keyword(
 
     Returns:
         List of dicts with keys: email_id, date, subject, summary, snippet, source
-        where source is 'summary', 'content', or 'key_fact'. When no row carries
+        where source is 'subject', 'summary', 'content', 'key_fact' or
+        'attachment'. When no row carries
         every token, rows matching any meaningful token come back instead, each
         flagged partial_match.
     """
@@ -303,103 +356,221 @@ def query_by_keyword(
     return []
 
 
+# Leaves out the threads already on the page: in the query, not after it, since
+# skipped after the LIMIT they used it up. One parameter, a JSON list.
+_NOT_TAKEN = f"AND COALESCE({_THREAD}, '') NOT IN (SELECT value FROM json_each(?))"
+
+
+def _best_of_each_thread(rank: str, then: str = "") -> str:
+    """Numbers each thread's rows by `rank`, so nth = 1 is its best match.
+
+    Equal ranks go to the newest email, as a subject match does, then to `then`
+    (the newest attachment of one email). An email with no thread partitions by
+    its id, an integer, which no conversation_id (always text) can equal. SQLite
+    refuses snippet() in a query with a window function, so the sources that
+    need one pick their rows first, in a CTE, and take the snippet in the query
+    around it.
+    """
+    order = f"{rank}, e.date_received DESC, e.id DESC" + (f", {then}" if then else "")
+    return f"ROW_NUMBER() OVER (PARTITION BY COALESCE({_THREAD}, e.id) ORDER BY {order})"
+
+
+def thread_keys(conn: sqlite3.Connection, email_ids) -> dict:
+    """Each email's thread as keyword search counts threads (_THREAD), by id;
+    None for an email with none."""
+    rows = conn.execute(
+        f"SELECT e.id, {_THREAD} FROM emails e WHERE e.id IN (SELECT value FROM json_each(?))",
+        (json.dumps(list(email_ids)),),
+    )
+    return {row[0]: row[1] for row in rows}
+
+
 def _keyword_waterfall(
     conn: sqlite3.Connection,
     safe_keyword: str,
     limit: int,
     search_content_only: bool,
 ) -> list[dict]:
-    """query_by_keyword's source waterfall for one sanitized MATCH expression."""
-    results = []
-    seen_ids = set()
+    """query_by_keyword's source waterfall for one sanitized MATCH expression.
 
-    if not search_content_only:
+    One row per thread, from whichever source found the thread first: a thread's
+    emails share its subject and quote each other, and one thread filled the
+    page. email_thread shows the rest of it.
+    """
+    results: list[dict] = []
+    seen_ids: set[int] = set()
+    taken_threads: set[str] = set()
+
+    def take(rows) -> None:
+        """Append the rows not found already, until the page is full.
+
+        Every source asks for a whole page of threads not yet on it: of what it
+        returns, only an unthreaded email taken by an earlier source can be here
+        already, so the rest still fills the page, where asking only for the
+        slots left gave them away.
+        """
+        for row in rows:
+            if len(results) >= limit:
+                return
+            r = dict(row)
+            thread = r.pop("thread", None)
+            if r["email_id"] in seen_ids:
+                continue
+            seen_ids.add(r["email_id"])
+            if thread is not None:
+                taken_threads.add(thread)
+            results.append(r)
+
+    def taken() -> str:
+        return json.dumps(sorted(taken_threads))
+
+    if not search_content_only and _has_subject_index(conn):
+        # The subject first: the words someone remembers an email by, and until
+        # v22 not indexed at all. snippet() is not needed; the subject is the row.
+        # The thread ranks by its best match and is shown by its newest email,
+        # where it stands now; within a thread the ranks differ only by how many
+        # RE:/FW: prefixes a subject carries. Equal ranks (a recurring subject)
+        # go newest first.
+        query_subjects = f"""
+            SELECT email_id, date, subject, summary, snippet, source, thread FROM (
+                SELECT
+                    e.id as email_id,
+                    e.date_received as date,
+                    e.subject,
+                    e.summary,
+                    e.subject as snippet,
+                    'subject' as source,
+                    {_THREAD} as thread,
+                    MIN(emails_fts.rank) OVER t as score,
+                    ROW_NUMBER() OVER (t ORDER BY e.date_received DESC, e.id DESC) as nth
+                FROM emails_fts
+                JOIN emails e ON e.id = emails_fts.rowid
+                WHERE emails_fts.subject_f MATCH ?
+                WINDOW t AS (PARTITION BY COALESCE({_THREAD}, e.id))
+            )
+            WHERE nth = 1
+            ORDER BY score, date DESC, email_id DESC
+            LIMIT ?
+        """
+        take(conn.execute(query_subjects, (safe_keyword, limit)))
+
+    if len(results) < limit and not search_content_only:
         # Search in email summaries
         # Rank by FTS5 BM25 relevance (ORDER BY rank), not recency. rank is only
         # comparable within a single MATCH query, so each source is ranked on its
-        # own; the source-priority waterfall (summary -> content -> key_fact ->
-        # attachment) plus seen_ids dedup preserves the cross-source order.
-        query_summaries = """
-            SELECT
-                e.id as email_id,
-                e.date_received as date,
-                e.subject,
-                e.summary,
-                e.summary as snippet,
-                'summary' as source
-            FROM emails_fts
-            JOIN emails e ON e.id = emails_fts.rowid
-            -- Column names carry the _f suffix from schema v20: the FTS indexes
-            -- the folded GENERATED columns, and an external-content FTS5's
-            -- column names are by definition its content table's column names.
-            WHERE emails_fts.summary_f MATCH ?
-            ORDER BY rank
+        # own; the source-priority waterfall (subject -> summary -> content ->
+        # key_fact -> attachment) plus seen_ids dedup preserves the cross-source
+        # order.
+        query_summaries = f"""
+            SELECT email_id, date, subject, summary, snippet, source, thread FROM (
+                SELECT
+                    e.id as email_id,
+                    e.date_received as date,
+                    e.subject,
+                    e.summary,
+                    e.summary as snippet,
+                    'summary' as source,
+                    {_THREAD} as thread,
+                    emails_fts.rank as score,
+                    {_best_of_each_thread("emails_fts.rank")} as nth
+                FROM emails_fts
+                JOIN emails e ON e.id = emails_fts.rowid
+                -- Column names carry the _f suffix from schema v20: the FTS indexes
+                -- the folded GENERATED columns, and an external-content FTS5's
+                -- column names are by definition its content table's column names.
+                WHERE emails_fts.summary_f MATCH ? {_NOT_TAKEN}
+            )
+            WHERE nth = 1
+            ORDER BY score, date DESC, email_id DESC
             LIMIT ?
         """
 
-        cursor = conn.execute(query_summaries, (safe_keyword, limit))
-        for row in cursor.fetchall():
-            r = dict(row)
-            seen_ids.add(r["email_id"])
-            results.append(r)
+        take(conn.execute(query_summaries, (safe_keyword, taken(), limit)))
 
     # Search in email content
-    remaining = limit - len(results)
-    if remaining > 0:
-        query_content = """
+    if len(results) < limit:
+        query_content = f"""
+            WITH picked AS (
+                SELECT email_id FROM (
+                    SELECT
+                        e.id as email_id,
+                        emails_fts.rank as score,
+                        e.date_received as date,
+                        {_best_of_each_thread("emails_fts.rank")} as nth
+                    FROM emails e
+                    JOIN emails_fts ON emails_fts.rowid = e.id
+                    WHERE emails_fts.content_f MATCH ? {_NOT_TAKEN}
+                )
+                WHERE nth = 1
+                ORDER BY score, date DESC, email_id DESC
+                LIMIT ?
+            )
             SELECT
                 e.id as email_id,
                 e.date_received as date,
                 e.subject,
                 e.summary,
                 snippet(emails_fts, 1, '<b>', '</b>', '...', 30) as snippet,
-                'content' as source
+                'content' as source,
+                {_THREAD} as thread
             FROM emails e
+            JOIN picked ON picked.email_id = e.id
             JOIN emails_fts ON emails_fts.rowid = e.id
             WHERE emails_fts.content_f MATCH ?
-            ORDER BY rank
-            LIMIT ?
+            ORDER BY rank, e.date_received DESC, e.id DESC
         """
 
-        cursor = conn.execute(query_content, (safe_keyword, remaining))
-        for row in cursor.fetchall():
-            r = dict(row)
-            if r["email_id"] not in seen_ids:
-                seen_ids.add(r["email_id"])
-                results.append(r)
+        take(conn.execute(query_content, (safe_keyword, taken(), limit, safe_keyword)))
 
     # Search in key facts (only if we haven't hit the limit and not content-only)
-    remaining = limit - len(results)
-    if remaining > 0 and not search_content_only:
-        query_facts = """
-            SELECT
-                e.id as email_id,
-                e.date_received as date,
-                e.subject,
-                e.summary,
-                kf.fact as snippet,
-                'key_fact' as source
-            FROM key_facts_fts
-            JOIN key_facts kf ON kf.id = key_facts_fts.rowid
-            JOIN emails e ON e.id = kf.email_id
-            WHERE key_facts_fts MATCH ?
-            ORDER BY rank
+    if len(results) < limit and not search_content_only:
+        query_facts = f"""
+            SELECT email_id, date, subject, summary, snippet, source, thread FROM (
+                SELECT
+                    e.id as email_id,
+                    e.date_received as date,
+                    e.subject,
+                    e.summary,
+                    kf.fact as snippet,
+                    'key_fact' as source,
+                    {_THREAD} as thread,
+                    key_facts_fts.rank as score,
+                    {_best_of_each_thread("key_facts_fts.rank")} as nth
+                FROM key_facts_fts
+                JOIN key_facts kf ON kf.id = key_facts_fts.rowid
+                JOIN emails e ON e.id = kf.email_id
+                WHERE key_facts_fts MATCH ? {_NOT_TAKEN}
+            )
+            WHERE nth = 1
+            ORDER BY score, date DESC, email_id DESC
             LIMIT ?
         """
 
-        cursor = conn.execute(query_facts, (safe_keyword, remaining))
-        for row in cursor.fetchall():
-            r = dict(row)
-            if r["email_id"] not in seen_ids:
-                seen_ids.add(r["email_id"])
-                results.append(r)
+        take(conn.execute(query_facts, (safe_keyword, taken(), limit)))
 
     # Search in attachment content (PDF/Office text + LLM summary).
     # Surfaces attachment-only matches as the parent email row, with
     # source='attachment' and the matched filename for caller transparency.
-    remaining = limit - len(results)
-    if remaining > 0 and not search_content_only and _has_attachment_fts(conn):
-        query_attachments = """
+    if len(results) < limit and not search_content_only and _has_attachment_fts(conn):
+        query_attachments = f"""
+            WITH picked AS (
+                SELECT content_id FROM (
+                    SELECT
+                        ac.id as content_id,
+                        attachment_content_fts.rank as score,
+                        e.date_received as date,
+                        e.id as email_id,
+                        {_best_of_each_thread("attachment_content_fts.rank", then="ac.id DESC")} as nth
+                    FROM attachment_content_fts
+                    JOIN attachment_content ac ON ac.id = attachment_content_fts.rowid
+                    JOIN attachments a ON a.id = ac.attachment_id
+                    JOIN emails e ON e.id = a.email_id
+                    WHERE attachment_content_fts MATCH ? {_NOT_TAKEN}
+                )
+                WHERE nth = 1
+                ORDER BY score, date DESC, email_id DESC
+                LIMIT ?
+            )
             SELECT
                 e.id as email_id,
                 e.date_received as date,
@@ -407,29 +578,25 @@ def _keyword_waterfall(
                 e.summary,
                 snippet(attachment_content_fts, 0, '<b>', '</b>', '...', 30) as snippet,
                 'attachment' as source,
-                a.filename as attachment_filename
+                a.filename as attachment_filename,
+                {_THREAD} as thread
             FROM attachment_content_fts
+            JOIN picked ON picked.content_id = attachment_content_fts.rowid
             JOIN attachment_content ac ON ac.id = attachment_content_fts.rowid
             JOIN attachments a ON a.id = ac.attachment_id
             JOIN emails e ON e.id = a.email_id
             WHERE attachment_content_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
+            ORDER BY rank, e.date_received DESC, e.id DESC
         """
 
-        cursor = conn.execute(query_attachments, (safe_keyword, remaining))
-        for row in cursor.fetchall():
-            r = dict(row)
-            if r["email_id"] not in seen_ids:
-                seen_ids.add(r["email_id"])
-                results.append(r)
+        take(conn.execute(query_attachments, (safe_keyword, taken(), limit, safe_keyword)))
 
     # Results are relevance-ranked within each source (ORDER BY rank) and appended
-    # in source-priority order (summary -> content -> key_fact -> attachment); keep
-    # that order rather than re-sorting by date, so BM25 relevance is not discarded.
-    # (True cross-source ranking via score fusion / RRF is a later change.)
-    # Limit to requested number
-    return results[:limit]
+    # in source-priority order (subject -> summary -> content -> key_fact ->
+    # attachment); keep that order rather than re-sorting by date, so BM25
+    # relevance is not discarded. (True cross-source ranking via score fusion / RRF
+    # is a later change.) take() stops at the requested number.
+    return results
 
 
 def query_by_date_range(
@@ -1012,7 +1179,11 @@ def _stale_threads_sql(select: str, days: int, max_days: int) -> tuple[str, tupl
             SELECT conversation_id,
                    MAX(date_received) as last_date
             FROM emails
-            WHERE conversation_id IS NOT NULL
+            -- A thread by _THREAD's rule: no blank id, nor the hash every email
+            -- with neither a conversation id nor references and a blank subject
+            -- shares. News never matches the owner as sender.
+            WHERE conversation_id IS NOT NULL AND TRIM(conversation_id) <> ''
+              AND conversation_id <> ?
             GROUP BY conversation_id
         )
         SELECT {select}
@@ -1023,7 +1194,7 @@ def _stale_threads_sql(select: str, days: int, max_days: int) -> tuple[str, tupl
           AND lpt.last_date < ?
           AND lpt.last_date >= ?
     """
-    return sql, (f"%{USER_EMAIL_PATTERN}%", cutoff, oldest)
+    return sql, (_BLANK_SUBJECT_THREAD, f"%{USER_EMAIL_PATTERN}%", cutoff, oldest)
 
 
 def find_stale_threads(

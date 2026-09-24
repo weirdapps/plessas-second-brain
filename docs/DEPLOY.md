@@ -51,13 +51,18 @@ exporter) works without any of the three.
 ```bash
 git clone https://github.com/weirdapps/plessas-second-brain.git
 cd plessas-second-brain
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+uv sync --frozen --no-build   # .venv from uv.lock; add --extra dev for the tests
 ```
+
+For a venv outside the checkout (the reference producer keeps it in
+`~/.venvs/second-brain`), set `UV_PROJECT_ENVIRONMENT` to its path first. A venv
+uv builds has no `pip`, so a deploy script should run `uv sync`, not
+`pip install`. `--no-build` refuses to run a package's `setup.py`, as CI does. (`pip install -e ".[dev]"` into a Python 3.12+ venv of your own
+also works.)
 
 The `dev` extra installs `pytest` and `pytest-cov` only. `ruff` is deliberately
 not in it because CI pins an exact version; run it with
-`uvx ruff@0.15.13 check .` (see `README.md`, "Lint and format").
+`uvx ruff@0.16.8 check .` (see `README.md`, "Lint and format").
 
 ## 3. Configure
 
@@ -68,6 +73,13 @@ cp .env.example .env      # then edit .env
 Required: `BRAIN_USER_NAME`, `BRAIN_USER_ROLE`, `BRAIN_USER_EMAIL_PATTERN`, and one
 extraction path (Vertex ADC, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`). See
 `.env.example` for the full list.
+
+Nothing in the code reads `.env`: the scheduling recipes in section 6 source it
+(`set -a; . ./.env`, `EnvironmentFile=`). The MCP server starts with an empty
+environment and sources nothing, so put the identity settings
+(`BRAIN_USER_NAME`, `BRAIN_USER_ROLE`, `BRAIN_USER_EMAIL_PATTERN`,
+`SHAREPOINT_HOST`) in `~/.config/second-brain/env` too; `src/config.py` reads
+that file at import, and ignores any other key in it.
 
 **Data home.** By default the DB and all ingested data live in `<repo>/data`. For
 a scheduled deployment, point them at a stable, checkout-independent location so

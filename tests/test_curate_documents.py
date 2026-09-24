@@ -335,6 +335,35 @@ def test_a_hand_run_without_a_vertex_project_is_refused(curate, brain, monkeypat
     assert curate.main() == 1
 
 
+def test_missing_credentials_stop_the_run_before_any_candidate(curate, brain, monkeypatch):
+    """Built lazily, a missing credential would fail inside classify_one, where
+    each candidate's error is caught and logged, and the run would end green."""
+    _seed_candidate(
+        brain.conn,
+        brain.src_dir,
+        row_id=1,
+        filename="deck.pdf",
+        mailbox_name="Inbox",
+        message_id="AAMkADk1ZTRiexample",
+    )
+    brain.conn.commit()
+    monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+
+    def no_credentials():
+        raise RuntimeError("No Claude credentials found.")
+
+    def classify(c):
+        raise AssertionError("classified without credentials")
+
+    monkeypatch.setattr(curate, "install_llm_deadline_for_this_process", lambda: None)
+    monkeypatch.setattr(curate, "_get_client_and_model", no_credentials)
+    monkeypatch.setattr(curate, "classify_one", classify)
+    monkeypatch.setattr(sys, "argv", ["curate_documents_daily.py"])
+
+    with pytest.raises(RuntimeError, match="No Claude credentials"):
+        curate.main()
+
+
 def test_a_run_short_of_time_stops_classifying_and_still_saves(curate, brain, monkeypatch):
     """Under the retry policy one candidate can wait out a token push. With no
     check between candidates the unit was SIGTERMed before save_state, losing the

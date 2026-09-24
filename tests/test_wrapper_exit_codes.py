@@ -250,6 +250,53 @@ def test_reverse_ingest_runs_with_either_vertex_project_name(tmp_path, variable,
     assert ran is runs
 
 
+@pytest.mark.parametrize(
+    ("variable", "runs"),
+    [("VERTEX_SDK_PROJECT", True), ("ANTHROPIC_VERTEX_PROJECT_ID", True), (None, False)],
+)
+def test_curate_runs_with_either_vertex_project_name_and_releases_its_lock(
+    tmp_path, variable, runs
+):
+    """Under exec the EXIT trap never ran, so every run left its lock behind."""
+    home = _daily_home(tmp_path, "exit 0\n")
+    lock = home / "curate-docs.lock"
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-curate-docs.sh")],
+        env={
+            "HOME": str(home),
+            "PATH": "/usr/bin:/bin",
+            "SHELL": "/bin/bash",
+            "SB_CURATE_DOCS_LOCK": str(lock),
+            **({variable: "x"} if variable else {}),
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert result.returncode == 0
+    ran = (home / "calls.log").exists() and any("curate_documents_daily" in c for c in _calls(home))
+    assert ran is runs
+    assert not lock.exists()
+
+
+def test_a_relative_curate_lock_override_is_refused(tmp_path):
+    home = _daily_home(tmp_path, "exit 0\n")
+
+    result = subprocess.run(
+        ["/bin/bash", str(_WRAPPERS / "sb-curate-docs.sh")],
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin", "SB_CURATE_DOCS_LOCK": "rel.lock"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=tmp_path,
+    )
+
+    assert result.returncode == 64
+    assert not (tmp_path / "rel.lock").exists()
+
+
 def test_a_failed_daily_sync_keeps_its_code_and_skips_the_lifecycle(tmp_path):
     home = _daily_home(tmp_path, 'case "$*" in *"src.cli sync"*) exit 3;; esac\nexit 0\n')
 
@@ -282,6 +329,7 @@ def test_a_relative_daily_sync_lock_override_is_refused(tmp_path):
     [
         ("sb-daily-sync.sh", "SB_DAILY_SYNC_LOCK"),
         ("sb-conversation-sync.sh", "SB_CONVERSATION_SYNC_LOCK"),
+        ("sb-curate-docs.sh", "SB_CURATE_DOCS_LOCK"),
     ],
 )
 def test_a_lock_path_that_is_a_file_is_never_removed(tmp_path, wrapper, variable):
@@ -308,6 +356,7 @@ def test_a_lock_path_that_is_a_file_is_never_removed(tmp_path, wrapper, variable
     [
         ("sb-daily-sync.sh", "SB_DAILY_SYNC_LOCK"),
         ("sb-conversation-sync.sh", "SB_CONVERSATION_SYNC_LOCK"),
+        ("sb-curate-docs.sh", "SB_CURATE_DOCS_LOCK"),
     ],
 )
 def test_a_stale_lock_that_cannot_be_removed_fails_the_run(tmp_path, wrapper, variable):

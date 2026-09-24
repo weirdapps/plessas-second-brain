@@ -1,14 +1,13 @@
 """
 Hourly Outlook ingestion entry point.
 
-Replaces apple_mail.py for the live ingestion path. Forward-only —
-historical data stays in the existing DB untouched.
+Replaced the Apple Mail exporter (since removed) for the live ingestion
+path. Forward-only: historical data stays in the existing DB untouched.
 """
 
 import logging
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -30,15 +29,6 @@ DEFAULT_SELECT_FIELDS = (
     "Id,Subject,From,ToRecipients,CcRecipients,ReceivedDateTime,"
     "HasAttachments,IsRead,WebLink,ConversationId,InternetMessageId"
 )
-
-
-@dataclass
-class MessageSummary:
-    id: str
-    subject: str
-    received_at: str
-    conversation_id: str | None
-    has_attachments: bool
 
 
 def parse_received_dt(iso: str) -> datetime:
@@ -182,7 +172,7 @@ def _outlook_to_staging_email(msg: dict, folder: str) -> dict:
 def _next_outlook_batch_number(staging_dir: Path) -> int:
     """
     Pick the next batch-NNNNN number, starting at 50000 to leave a wide
-    margin above any apple_mail batches (which are <10000 in practice).
+    margin above the Apple Mail exporter's batches (which were <10000 in practice).
     """
     OUTLOOK_BATCH_FLOOR = 50000
     existing = [p.name for p in staging_dir.glob("batch-*.json")]
@@ -202,7 +192,7 @@ def commit_messages_to_db(messages: list[dict], folder: str = "Inbox") -> Path:
     Write messages as a staging batch the existing LLM extractor + loader
     will pick up via its sorted glob over data/staging/batch-*.json.
 
-    Outlook fields are mapped to the apple_mail staging shape so the
+    Outlook fields are mapped to the Apple Mail exporter's staging shape so the
     downstream pipeline doesn't need to learn a new format.
     """
     staging_dir = Path(__file__).parent.parent.parent / "data" / "staging"

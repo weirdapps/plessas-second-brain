@@ -42,7 +42,6 @@ graph TD
 | Source | Module | Notes |
 | --- | --- | --- |
 | Microsoft 365 mail | `src/export/outlook_export.py` + `outlook_cli.py` | Primary. Hourly, `--since` cursor. |
-| Apple Mail archive | `src/export/apple_mail.py` | Frozen. Kept for historical rollback. |
 | Attachments | `src/export/outlook_attachments.py`, `src/extract/attachment_extractors.py` | PDF (PyMuPDF), DOCX (`python-docx`), PPTX (`python-pptx`), XLSX (`openpyxl`), XLSB (`pyxlsb`), XLS (`xlrd`), images (Tesseract OCR), EML, RPMSG (`compoundfiles`). |
 | Inline email images | `src/extract/image_classifier.py`, `image_pipeline.py`, `image_vision.py` | Dimensions plus bytes plus sender-scoped SHA256 dedup cascade; vision LLM stage for content images, cached by SHA256. |
 | Calendar events | `src/export/calendar_export.py`, `src/extract/calendar_extractor.py` | Outlook events with attendees, body summary, decisions. |
@@ -256,8 +255,9 @@ In any Claude Code session, ask "what do we know about X" and the agent calls `r
 `./brain` (wrapper) or `python -m src.cli`. Highlights:
 
 ```bash
-# Incremental sync: export, extract, load, register+process attachments, dedup people,
-# embed, Claude Code conversations, inline images. Not Teams, calendar, news, SharePoint.
+# Incremental sync over what `python -m src.export.outlook_export` staged: extract, load,
+# register+process attachments, dedup people, embed, Claude Code conversations, inline
+# images. Not Teams, calendar, news, SharePoint.
 python -m src.cli sync --engine claude --workers 4
 
 # Ingestion by source
@@ -305,9 +305,6 @@ src/
     outlook_export.py          Hourly Outlook ingestion via outlook-cli
     outlook_cli.py             outlook-cli subprocess wrapper
     outlook_attachments.py     Attachment fetch for Outlook messages
-    apple_mail.py              Historical Apple Mail export (frozen)
-    attachments.py             Apple Mail attachment export
-    attachment_state.py        Per-attachment fetch cursor
     calendar_export.py         Outlook calendar events
     conversation_export.py     Claude Code session transcripts
     news_export.py             News-reader digests and articles into staging batches
@@ -316,7 +313,7 @@ src/
     inbox_reconcile.py         Cursor recovery
     sharepoint_fetcher.py      SharePoint link fetch and host classification
     sharepoint_cli.py          sharepoint-cli subprocess wrapper (cookie session, not bearer)
-    state.py                   Export state
+    state.py                   Atomic staging writes and the Outlook sync cursor
   extract/
     prompt.py                  Email extraction prompt
     attachment_prompt.py       Attachment summarization prompt

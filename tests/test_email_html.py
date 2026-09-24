@@ -11,6 +11,7 @@ import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
+from src.config import CURRENT_SCHEMA_VERSION
 from src.store.email_html import markup_or_text, pack, split_body, unpack
 from src.store.schema import create_database, get_connection, run_migrations
 
@@ -482,7 +483,7 @@ def test_loading_emails_migrates_an_older_store_first(tmp_path):
 
     assert load_extractions(str(db), str(extracted), str(staging)) == 1
 
-    assert _kept(db) == (TEXT, True, 23)
+    assert _kept(db) == (TEXT, True, CURRENT_SCHEMA_VERSION)
 
 
 def test_recovering_extractions_migrates_an_older_store_first(tmp_path, monkeypatch):
@@ -504,7 +505,7 @@ def test_recovering_extractions_migrates_an_older_store_first(tmp_path, monkeypa
 
     assert recover.main() == 0
 
-    assert _kept(db) == (TEXT, True, 23)
+    assert _kept(db) == (TEXT, True, CURRENT_SCHEMA_VERSION)
 
 
 def test_split_html_skips_a_text_body_that_opens_with_a_bracket(tmp_path, capsys):

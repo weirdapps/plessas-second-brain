@@ -56,6 +56,7 @@ def test_plain_text_is_not_mistaken_for_html():
     assert looks_like_html('<?xml version="1.0"?>\n<!DOCTYPE html><html><body>x</body></html>')
     assert looks_like_html("<blockquote>x</blockquote>")
     assert looks_like_html('<?xml version="1.0"?>\n<html><body>x</body></html>')
+    assert looks_like_html('<?xml version="1.0"?><?xml-stylesheet href="s"?><html>x</html>')
     assert looks_like_html("<o:p></o:p><p>x</p>")
     assert looks_like_html("\xa0\u200b<html><body>x</body></html>")
     assert not looks_like_html("<mailto:a@example.com> wrote")
@@ -101,11 +102,15 @@ def test_an_element_never_closed_hides_nothing_after_it():
 
 
 def test_a_script_never_closed_stays_code():
-    """Any other element never closed is read again without its tag, whatever
-    follows it; a script is code, even when it writes markup."""
+    """A script never closed is code, even when it writes markup, and a style
+    never closed is CSS unless markup follows it; any other element never
+    closed is read again without its tag, whatever follows it."""
     assert html_to_text("<p>hello</p><script>var token = 1;") == "hello"
     assert html_to_text('<p>Hello</p><script>document.write("<p>ad</p>"); var s = 1;') == "Hello"
-    assert html_to_text("<p>a</p><title>b<p>c</p><style>d") == "a\n\nb\n\nc\n\nd"
+    assert html_to_text("<p>a</p><title>b<p>c</p><style>d") == "a\n\nb\n\nc"
+    # A body cut off inside its stylesheet: the CSS is not text.
+    assert html_to_text("<html><head><style>body{font-family:Aptos} p.x{margin:0}") == ""
+    assert html_to_text("<html><body><p>Hello</p><style>.x{color:red}") == "Hello"
     assert html_to_text("<div>Hi</div><title>Subj\nBody text only") == "Hi\nSubj Body text only"
     assert html_to_text("<p>A</p><style>.x{}</head><body><p>B real</p>") == "A\n\n.x{}\n\nB real"
 
@@ -208,6 +213,9 @@ def test_a_link_shows_where_it_really_goes():
     assert html_to_text('<a href="http://[::1">x</a>') == "x"  # urlsplit refuses it
     # A browser reads a backslash as a slash, so the host is evil.example.
     tricked = "https://evil.example\\@eur01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fbank.example"
+    assert html_to_text('<a href="https://a.example/p\\q?u=x\\y#f\\g">go</a>') == (
+        "go (https://a.example/p/q?u=x\\y#f\\g)"
+    )
     assert html_to_text(f'<a href="{tricked}">Log in</a>') == (
         "Log in (https://evil.example/@eur01.safelinks.protection.outlook.com/"
         "?url=https%3A%2F%2Fbank.example)"
@@ -227,6 +235,16 @@ def test_a_lookalike_in_the_text_does_not_hide_the_address():
         "bank.example/login-help (https://bank.example/login)"
     )
     assert html_to_text('<a href="https://example.com/">example.com/</a>') == "example.com/"
+    # A host that is the front of the one shown: mybank.co is not mybank.co.uk.
+    assert html_to_text('<a href="https://mybank.example">at www.mybank.example.uk</a>') == (
+        "at www.mybank.example.uk (https://mybank.example)"
+    )
+    assert html_to_text('<a href="https://paypal.example/">paypal.example.evil.test</a>') == (
+        "paypal.example.evil.test (https://paypal.example/)"
+    )
+    assert html_to_text('<a href="https://a.example">mail a.example@b.test</a>') == (
+        "mail a.example@b.test (https://a.example)"
+    )
     assert html_to_text('<a href="https://example.com/doc">see example.com/doc.</a>') == (
         "see example.com/doc."
     )
@@ -324,6 +342,22 @@ def test_white_space_follows_the_element_tree():
     )
     assert html_to_text(inner) == "a  b\n\nx\n\nc  d"  # a cell in a nested table is no sibling
     assert html_to_text("<pre>a  b</span>c  d</pre>") == "a  bc  d"  # a stray end tag ends nothing
+    # The next item, row or block ends one left open through an inline child.
+    assert html_to_text('<ul><li style="white-space:pre">a  b<span>x<li>c  d</ul>') == (
+        "a  bx\nc d"
+    )
+    through = '<table><tr><td style="white-space:pre"><span>a  b<tr><td>c  d</td></tr></table>'
+    assert html_to_text(through) == "a  b\nc d"
+    sections = '<table><thead><tr><td style="white-space:pre">h  1<tbody><tr><td>x\ny  z</table>'
+    assert html_to_text(sections) == "h  1\nx y z"
+    assert html_to_text('<p style="white-space:pre"><span>a  b<div>c  d</div>') == "a  b\nc d"
+    # What a template holds is never rendered, so it sets nothing for the page.
+    assert html_to_text('<template><div style="white-space:pre"></template><p>a     b</p>') == "a b"
+    assert html_to_text("<pre>a  b<template></pre></template>c  d</pre>") == "a  bc  d"
+    assert html_to_text("a<template><div>x</div><br></template>b") == "ab"  # nor its breaks
+    # The last declaration wins, and initial is normal.
+    assert html_to_text('<div style="white-space:normal;white-space:pre">a   b</div>') == "a   b"
+    assert html_to_text('<pre><span style="white-space:initial">a   b</span></pre>') == "a b"
     rows = '<table><tr style="white-space:pre"><td>a  b<tr><td>c  d</table>'
     assert html_to_text(rows) == "a  b\nc d"  # the next row ends a row left open
     assert html_to_text('<p style="white-space:pre">a  b<div>c  d</div>') == "a  b\nc d"

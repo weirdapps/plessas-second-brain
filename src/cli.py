@@ -412,9 +412,9 @@ def cmd_process_images(args):
     print(f"  Failed: {stats['failed']}")
 
 
-# split-html holds a batch in memory until it writes it, so a batch ends at this
-# many characters of bodies as well as at --batch emails.
-SPLIT_HTML_BATCH_BYTES = 64_000_000
+# split-html holds a batch in memory until it writes it, so a batch ends at about
+# this many characters of bodies and their text as well as at --batch emails.
+SPLIT_HTML_BATCH_CHARS = 64_000_000
 
 
 def cmd_split_html(args) -> int:
@@ -473,7 +473,7 @@ def cmd_split_html(args) -> int:
         # wait for the writes only, not for the parsing.
         ready: list[tuple[int, str, str | None, bytes, int]] = []
         held = 0
-        while pos < len(candidates) and len(ready) < size and held < SPLIT_HTML_BATCH_BYTES:
+        while pos < len(candidates) and len(ready) < size and held < SPLIT_HTML_BATCH_CHARS:
             email_id = candidates[pos]
             pos += 1
             row = conn.execute("SELECT content FROM emails WHERE id = ?", (email_id,)).fetchone()
@@ -483,7 +483,7 @@ def cmd_split_html(args) -> int:
             body, html = split_body(redact_secrets(content))
             if html is not None:
                 ready.append((email_id, content, body, pack(html), len(html.encode("utf-8"))))
-                held += len(content)
+                held += len(content) + len(body or "")
         for email_id, content, body, blob, html_bytes in ready:
             if not args.dry_run:
                 # Unless the body changed since it was read: a re-load wins.

@@ -117,11 +117,11 @@ def _unpacked(value) -> str | None:
 
 def _scan(
     conn: sqlite3.Connection,
-) -> tuple[dict[tuple[str, str], list[int]], dict[str, int]]:
+) -> tuple[dict[tuple[str, str], list[int]], dict[str, list[int]]]:
     """(table, column) -> rowids of rows whose value holds a credential, and
-    table -> how many compressed values could not be read."""
+    table -> rowids of the compressed values that could not be read."""
     found: dict[tuple[str, str], list[int]] = {}
-    unreadable: dict[str, int] = {}
+    unreadable: dict[str, list[int]] = {}
     for table, column in _text_columns(conn) + _packed_columns(conn):
         packed = (table, column) in _PACKED
         rowids = []
@@ -130,7 +130,7 @@ def _scan(
         ):
             text = _unpacked(value) if packed else value
             if packed and text is None:
-                unreadable[table] = unreadable.get(table, 0) + 1
+                unreadable.setdefault(table, []).append(rowid)
             elif _has_secret(text):
                 rowids.append(rowid)
         if rowids:
@@ -169,15 +169,22 @@ def _checkpoint(conn: sqlite3.Connection) -> bool:
     return busy == 0 and log_frames == checkpointed
 
 
-def _report_unreadable(unreadable: dict[str, int]) -> None:
-    for table, count in sorted(unreadable.items()):
-        noun = "row" if count == 1 else "rows"
-        print(f"  {count} {table} {noun} could not be read, so were not checked", file=sys.stderr)
+def _report_unreadable(unreadable: dict[str, list[int]]) -> None:
+    """Counts and rowids, which are no secret, so the rows can be fixed or deleted."""
+    for table, rowids in sorted(unreadable.items()):
+        noun = "row" if len(rowids) == 1 else "rows"
+        shown = ", ".join(str(r) for r in rowids[:20]) + (" ..." if len(rowids) > 20 else "")
+        print(
+            f"  {len(rowids)} {table} {noun} could not be read, so were not checked "
+            f"(rowid {shown})",
+            file=sys.stderr,
+        )
 
 
-def _report(found: dict[tuple[str, str], list[int]]) -> None:
+def _report(found: dict[tuple[str, str], list[int]], unread: bool = False) -> None:
     if not found:
-        print("No credential-shaped values found.")
+        if not unread:  # an unread row may hold one
+            print("No credential-shaped values found.")
         return
     for (table, column), rowids in sorted(found.items()):
         noun = "row" if len(rowids) == 1 else "rows"
@@ -242,7 +249,7 @@ def main(argv: list[str] | None = None) -> int:
             found, unreadable = _scan(conn)
         finally:
             conn.close()
-        _report(found)
+        _report(found, unread=bool(unreadable))
         if unreadable:
             _report_unreadable(unreadable)
             return 2
@@ -283,22 +290,22 @@ def main(argv: list[str] | None = None) -> int:
         left, unreadable = _scan(conn)
     finally:
         conn.close()
+    # Every warning first, then one exit code: 2 for an unread row wins, since
+    # the run cannot vouch for what it could not read.
     if left:
         print("Credential-shaped values remain:", file=sys.stderr)
         _report(left)
     if unreadable:
         _report_unreadable(unreadable)
-        return 2
-    if left:
-        return 1
     if not checkpointed:
         print(
             "The WAL checkpoint was blocked by a reader, so the main file still holds "
             "pre-scrub pages. Stop the readers and re-run.",
             file=sys.stderr,
         )
-        return 1
-    return 0
+    if unreadable:
+        return 2
+    return 1 if left or not checkpointed else 0
 
 
 if __name__ == "__main__":

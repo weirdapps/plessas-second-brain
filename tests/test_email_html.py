@@ -435,7 +435,7 @@ def test_split_html_ends_a_batch_at_its_byte_budget(tmp_path, monkeypatch):
             return self._conn.commit()
 
     monkeypatch.setattr(schema, "get_connection", lambda path: Counting(connect(path)))
-    monkeypatch.setattr(cli, "SPLIT_HTML_BATCH_BYTES", len(HTML))
+    monkeypatch.setattr(cli, "SPLIT_HTML_BATCH_CHARS", len(HTML))
 
     assert cli.cmd_split_html(argparse.Namespace(db=str(db), batch=500, dry_run=False)) == 0
 

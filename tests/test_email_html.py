@@ -405,7 +405,7 @@ def test_split_html_skips_a_text_body_that_opens_with_a_bracket(tmp_path, capsys
     assert "converted 0 emails" in capsys.readouterr().out
 
 
-def test_split_html_ends_a_batch_at_its_byte_budget(tmp_path, monkeypatch):
+def test_split_html_ends_a_batch_at_its_budget(tmp_path, monkeypatch):
     """A batch is held in memory until it is written: large bodies end it early."""
     import src.cli as cli
     from src.store import schema
@@ -435,11 +435,12 @@ def test_split_html_ends_a_batch_at_its_byte_budget(tmp_path, monkeypatch):
             return self._conn.commit()
 
     monkeypatch.setattr(schema, "get_connection", lambda path: Counting(connect(path)))
-    monkeypatch.setattr(cli, "SPLIT_HTML_BATCH_CHARS", len(HTML))
+    # Crossed by a body with its text and its kept HTML, not by the body alone.
+    monkeypatch.setattr(cli, "SPLIT_HTML_BATCH_CHARS", len(HTML) + len(TEXT) // 2)
 
     assert cli.cmd_split_html(argparse.Namespace(db=str(db), batch=500, dry_run=False)) == 0
 
-    assert len(commits) >= 5  # one batch per body, then the optimize
+    assert len(commits) == 6  # one batch per body, then the optimize
     conn = sqlite3.connect(db)
     assert conn.execute("SELECT count(*) FROM email_html").fetchone()[0] == 5
 

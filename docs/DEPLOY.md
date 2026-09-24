@@ -96,7 +96,11 @@ holds none; with the timers stopped, move the rest yourself:
 places under `$BRAIN_DATA_DIR`. A run that exits 7 has no cursor: move it
 across, and do not answer with `--bootstrap`, which fetches only the newest 100
 messages. A replica's pull (`sb-db-pull.sh`) reads the producer's
-`<repo>/data`: edit its `REMOTE_DATA` to the new data home too.
+`<repo>/data`: edit its `REMOTE_DATA` to the new data home too. The wrappers in
+`scripts/wrappers/` are an archive, so copy the updated `sb-outlook-sync.sh`,
+`sb-daily-sync.sh` and `sb-reverse-ingest.sh` into `~/.local/bin` as well. To
+roll back, rename `<repo>/data/state/*.json.carried` back to `*.json`, after
+copying across any newer cursor from `$BRAIN_DATA_DIR/state`.
 
 ## 4. Bootstrap and verify
 

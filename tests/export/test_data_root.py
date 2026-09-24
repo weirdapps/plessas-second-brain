@@ -11,8 +11,19 @@ import json
 import shutil
 import sys
 
+import pytest
+
 from src import config
 from src.export import inbox_reconcile, outlook_export
+
+
+@pytest.fixture(autouse=True)
+def _only_against_the_test_data_home():
+    """These tests write, delete and overwrite under DATA_ROOT. conftest points it
+    at a temporary directory unless BRAIN_DATA_DIR is already exported, and then
+    it is someone's real data home: its attachments, cursors and staging."""
+    if not config.DATA_ROOT.name.startswith("brain-test-data-"):
+        pytest.skip("refuses to run against a real data home (BRAIN_DATA_DIR is exported)")
 
 
 def test_outlook_batches_are_staged_under_the_data_root():

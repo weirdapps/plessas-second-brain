@@ -13,7 +13,8 @@ document in its old segments until they are merged. So --apply:
 
   1. scans every TEXT column of every content table with the src/redact.py
      patterns (generated columns and FTS shadow tables are derived, not stored
-     input, and are skipped),
+     input, and are skipped), and the HTML kept in email_html, decompressed
+     first: compressed, a key is invisible to a column scan and to a grep,
   2. rewrites each hit with redact_secrets under PRAGMA secure_delete=ON, in one
      transaction, re-reading the row inside it,
   3. runs FTS5 'optimize' on EVERY full-text index, hits or not, which merges its
@@ -46,11 +47,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import DEFAULT_DB  # noqa: E402
 from src.redact import _PATTERNS, redact_secrets  # noqa: E402
+from src.store.email_html import pack, unpack  # noqa: E402
 
 _FTS_SHADOW_SUFFIXES = ("_data", "_idx", "_content", "_docsize", "_config")
 
 # How long the write connection waits on a lock. Tests shorten it.
 BUSY_TIMEOUT_MS = 60000
+
+# Columns holding zlib-compressed text (schema v23 keeps an HTML body's markup
+# in email_html), read and written through src.store.email_html.
+_PACKED = (("email_html", "html"),)
 
 
 def _virtual_tables(conn: sqlite3.Connection) -> dict[str, str]:
@@ -84,6 +90,14 @@ def _text_columns(conn: sqlite3.Connection) -> list[tuple[str, str]]:
     return targets
 
 
+def _packed_columns(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """(table, column) for every compressed column this database has."""
+    tables = {
+        name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    return [(table, column) for table, column in _PACKED if table in tables]
+
+
 def _has_secret(value) -> bool:
     return isinstance(value, str) and any(p.search(value) for _n, p in _PATTERNS)
 
@@ -91,13 +105,14 @@ def _has_secret(value) -> bool:
 def _scan(conn: sqlite3.Connection) -> dict[tuple[str, str], list[int]]:
     """(table, column) -> rowids of rows whose value holds a credential."""
     found: dict[tuple[str, str], list[int]] = {}
-    for table, column in _text_columns(conn):
+    for table, column in _text_columns(conn) + _packed_columns(conn):
+        packed = (table, column) in _PACKED
         rowids = [
             rowid
             for rowid, value in conn.execute(
                 f'SELECT rowid, "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL'
             )
-            if _has_secret(value)
+            if _has_secret(unpack(value) if packed else value)
         ]
         if rowids:
             found[(table, column)] = rowids
@@ -149,15 +164,18 @@ def _apply(conn: sqlite3.Connection, found: dict[tuple[str, str], list[int]]) ->
     conn.execute("BEGIN IMMEDIATE")
     try:
         for (table, column), rowids in found.items():
+            packed = (table, column) in _PACKED
             for rowid in rowids:
                 row = conn.execute(
                     f'SELECT "{column}" FROM "{table}" WHERE rowid = ?', (rowid,)
                 ).fetchone()
-                if row is None or not _has_secret(row[0]):
+                value = None if row is None else unpack(row[0]) if packed else row[0]
+                if value is None or not _has_secret(value):
                     continue  # changed since the scan
+                clean = redact_secrets(value)
                 conn.execute(
                     f'UPDATE "{table}" SET "{column}" = ? WHERE rowid = ?',
-                    (redact_secrets(row[0]), rowid),
+                    (pack(clean) if packed else clean, rowid),
                 )
                 changed += 1
         conn.execute("COMMIT")

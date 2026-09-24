@@ -9,10 +9,13 @@ positions.
 
 import re
 from html.parser import HTMLParser
+from urllib.parse import parse_qs, urlsplit
 
-# Whatever these hold is never shown to a reader. Outlook puts its <xml> and
-# <style> blocks in <head>.
-_HIDDEN = {"head", "script", "style", "title", "xml", "template", "noscript"}
+# Whatever these hold is never shown to a reader. Not <head>: the elements in it
+# that hold text are all here, and a <head> never closed (the closing tag is
+# optional) hid the whole body. Not <noscript>: mail clients run no script, so
+# they show it.
+_HIDDEN = {"script", "style", "title", "xml", "template"}
 
 # On a line of their own, as a browser lays them out...
 _BLOCKS = {
@@ -24,12 +27,47 @@ _BLOCKS = {
 # ...and these with a blank line around them.
 _PARAGRAPHS = {"blockquote", "h1", "h2", "h3", "h4", "h5", "h6", "ol", "p", "table", "ul"}
 
-_TAG = re.compile(r"<\s*(html|body|head|div|p|table|br|span|meta|!doctype)\b", re.IGNORECASE)
+# What an HTML body opens with, once a byte-order mark and blank lines are
+# skipped: of the 19,774 bodies in the corpus that open with a bracket, 19,773
+# open with <html and one with <div. Anchoring on the opening keeps out plain
+# text, whatever markup it quotes: a tag anywhere in the first 4 KB used to be
+# enough, and a quoted header's <p.petrou@example.com> passed for one.
+LEADING = "\ufeff \t\r\n"
+_OPENING = re.compile(
+    r"<(?:!doctype\s|!--|(?:html|head|body|meta|title|style|div|p|br|span|table|font"
+    r"|center|a|b|i|u|img|ul|ol|li|h[1-6])[\s/>])",
+    re.IGNORECASE,
+)
+
+# Inside <pre> the spacing is the layout, so its spaces and tabs are held as
+# characters the whitespace collapse leaves alone, then put back.
+_KEEP_SPACING = str.maketrans({" ": "\ue000", "\xa0": "\ue000", "\t": "\ue001"})
+_RESTORE_SPACING = str.maketrans({"\ue000": " ", "\ue001": "\t"})
+
+# A body that ends inside a hidden element is read again without its opening
+# tag, at most this many times.
+_REREADS = 3
 
 
 def looks_like_html(content: str | None) -> bool:
-    """Whether a body is HTML markup rather than text that mentions a bracket."""
-    return bool(content) and _TAG.search((content or "")[:4096]) is not None
+    """Whether a body is an HTML document or fragment, not text that quotes markup."""
+    if not content:
+        return False
+    return _OPENING.match(content.lstrip(LEADING)) is not None
+
+
+def _link_target(attrs) -> str | None:
+    """Where a link goes, if to a web page. Safe Links wraps the address Outlook
+    shows: its own copy (originalsrc) comes first, else the wrapper's url=."""
+    found = dict(attrs)
+    for key in ("originalsrc", "href"):
+        # A browser drops tabs and line breaks from an address; Word wraps them.
+        url = re.sub(r"[\t\r\n]", "", found.get(key) or "").strip()
+        if ".safelinks.protection.outlook.com" in url.lower():
+            url = parse_qs(urlsplit(url).query).get("url", [""])[0]
+        if url.lower().startswith(("http://", "https://")):
+            return url
+    return None
 
 
 class _Reader(HTMLParser):
@@ -37,6 +75,11 @@ class _Reader(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.hidden = 0
+        # The outermost hidden element open: its position and its opening tag.
+        self.opened: tuple[tuple[int, int], str] | None = None
+        self.pre = 0
+        # The link being read: where it goes, and where its text starts in parts.
+        self.link: tuple[str | None, int] | None = None
         # Line breaks at the end of the text so far; the start counts as a
         # paragraph break, so nothing opens with blank lines.
         self.newlines = 2
@@ -46,9 +89,28 @@ class _Reader(HTMLParser):
             self.parts.append("\n" * (count - self.newlines))
             self.newlines = count
 
+    def _end_link(self) -> None:
+        """After a link's text, the address, unless the text already shows it."""
+        if self.link is None:
+            return
+        url, start = self.link
+        self.link = None
+        if url is None:
+            return
+        bare = re.sub(r"^https?://(?:www\.)?", "", url, flags=re.IGNORECASE).rstrip("/").lower()
+        if bare not in "".join(self.parts[start:]).lower():
+            self.handle_data(f" ({url})")  # dropped, like any text, inside a hidden element
+
     def handle_starttag(self, tag: str, attrs) -> None:
         if tag in _HIDDEN:
+            if not self.hidden:
+                self.opened = (self.getpos(), self.get_starttag_text() or "")
             self.hidden += 1
+        elif tag == "body":
+            self.hidden = 0  # the head ends where the body starts, whatever it left open
+        elif tag == "a":
+            self._end_link()  # a link inside a link closes the first, as in a browser
+            self.link = (_link_target(attrs), len(self.parts))
         elif tag == "br":
             self.parts.append("\n")
             self.newlines += 1
@@ -63,32 +125,82 @@ class _Reader(HTMLParser):
         elif tag in _PARAGRAPHS:
             self._break(2)
         elif tag in _BLOCKS:
+            if tag == "pre":
+                self.pre += 1
             self._break(1)
 
     def handle_endtag(self, tag: str) -> None:
         if tag in _HIDDEN:
             self.hidden = max(0, self.hidden - 1)
+        elif tag == "a":
+            self._end_link()
         elif tag in _PARAGRAPHS:
             self._break(2)
         elif tag in _BLOCKS:
+            if tag == "pre":
+                self.pre = max(0, self.pre - 1)
             self._break(1)
 
     def handle_data(self, data: str) -> None:
         if self.hidden:
             return
+        if self.pre:
+            data = data.translate(_KEEP_SPACING)
+        else:
+            # A line break in the source is a space, as in a browser: Outlook
+            # wraps its HTML mid-sentence.
+            data = data.replace("\r", " ").replace("\n", " ")
         if data.strip():
             self.parts.append(data)
-            self.newlines = 0
+            self.newlines = len(data) - len(data.rstrip("\n"))
+        elif "\n" in data:  # blank lines inside <pre>
+            self.parts.append(data)
+            self.newlines += data.count("\n")
         elif data:
             self.parts.append(" ")  # between two inline elements, a space is a space
+
+    def close(self) -> None:
+        super().close()
+        self._end_link()
+
+
+def _read(html: str) -> _Reader:
+    reader = _Reader()
+    reader.feed(html)
+    reader.close()
+    return reader
+
+
+def _offset(text: str, line: int, column: int) -> int:
+    """The index in `text` of an HTMLParser position (lines count from 1)."""
+    start = 0
+    for _ in range(line - 1):
+        start = text.index("\n", start) + 1
+    return start + column
 
 
 def html_to_text(html: str) -> str:
     """The visible text of `html`: no markup, entities decoded, one space between
-    words, a newline between lines and a blank line between paragraphs."""
-    reader = _Reader()
-    reader.feed(html)
-    reader.close()
-    text = "".join(reader.parts).replace("\xa0", " ")
-    lines = [" ".join(line.split()) for line in text.split("\n")]
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    words (the spacing of <pre> kept), a newline between lines, a blank line
+    between paragraphs, and after a link's text the address it goes to."""
+    reader = _read(html)
+    for _ in range(_REREADS):
+        if not reader.hidden or reader.opened is None:
+            break
+        # The body ended inside a hidden element: a <title> or <xml> never
+        # closed hid every word after it. Read it again without that tag, if
+        # the parser's position really points at it.
+        (line, column), tag = reader.opened
+        try:
+            start = _offset(html, line, column)
+        except ValueError:
+            break
+        if html[start : start + len(tag)] != tag:
+            break
+        html = html[:start] + html[start + len(tag) :]
+        reader = _read(html)
+    text = "".join(reader.parts).replace("\xa0", " ").replace("\ufeff", "")
+    lines = (
+        " ".join(line.split()).translate(_RESTORE_SPACING).rstrip() for line in text.split("\n")
+    )
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip("\n")

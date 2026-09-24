@@ -1,6 +1,6 @@
 """The HTML of an email body, kept compressed beside the text the body holds.
 
-Outlook sends HTML: 19,753 emails held 963 MB of it, two thirds of the
+Outlook sends HTML: 19,774 emails held 964 MB of it, two thirds of the
 emails.content column. The body now holds the text a reader sees (see
 src.extract.html_text), which is what gets indexed and read. Two readers need
 the markup itself, so it is kept here (schema v23): the SharePoint link scan,

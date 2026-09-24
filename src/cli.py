@@ -420,7 +420,16 @@ def cmd_split_html(args) -> int:
     writers that share the database wait seconds, not minutes, and a stopped run
     resumes where it was. Ends with an FTS optimize, which drops the deleted
     terms. The file only shrinks after a VACUUM.
+
+    Credentials are redacted on the way, as the ingest path has done since #55:
+    an older body can hold one, and in email_html it would be compressed, out of
+    sight of the index and of a grep of the file. A dry run opens the database
+    read-only, so it neither migrates nor converts.
     """
+    import sqlite3
+
+    from src.extract.html_text import LEADING
+    from src.redact import redact_secrets
     from src.store.email_html import pack, split_body
     from src.store.schema import get_connection, run_migrations
 
@@ -428,38 +437,58 @@ def cmd_split_html(args) -> int:
     if not Path(db_path).exists():
         print(f"Database not found: {db_path}", file=sys.stderr)
         return 1
-    conn = get_connection(db_path)
-    run_migrations(conn)
-    # A prefilter in SQL; looks_like_html decides.
+    if args.dry_run:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        migrated = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'email_html'"
+        ).fetchone()
+    else:
+        conn = get_connection(db_path)
+        run_migrations(conn)
+        migrated = True
+    # A prefilter in SQL, on the same opening looks_like_html reads; it decides.
+    not_kept = (
+        "NOT EXISTS (SELECT 1 FROM email_html h WHERE h.email_id = e.id) AND " if migrated else ""
+    )
+    blanks = ", ".join(str(ord(c)) for c in LEADING)
     candidates = [
         row[0]
         for row in conn.execute(
-            "SELECT e.id FROM emails e WHERE NOT EXISTS "
-            "(SELECT 1 FROM email_html h WHERE h.email_id = e.id) AND ("
-            "e.content LIKE '%<html%' OR e.content LIKE '%<body%' OR e.content LIKE '%<div%' "
-            "OR e.content LIKE '%<p%' OR e.content LIKE '%<table%' OR e.content LIKE '%<br%' "
-            "OR e.content LIKE '%<span%' OR e.content LIKE '%<meta%' "
-            "OR e.content LIKE '%<!doctype%') ORDER BY e.id"
+            f"SELECT e.id FROM emails e WHERE {not_kept}"
+            f"ltrim(e.content, char({blanks})) LIKE '<%' ORDER BY e.id"
         )
     ]
     converted = before = after = kept = 0
-    for start in range(0, len(candidates), max(1, args.batch)):
-        for email_id in candidates[start : start + max(1, args.batch)]:
-            row = conn.execute("SELECT content FROM emails WHERE id = ?", (email_id,)).fetchone()
-            body, html = split_body(row[0] if row else None)
-            if html is None:
+    size = max(1, args.batch)
+    for start in range(0, len(candidates), size):
+        # Read and convert with no lock held: the writers sharing the database
+        # wait for the writes only, not for the parsing.
+        ids = candidates[start : start + size]
+        ready = []
+        for email_id, content in conn.execute(
+            f"SELECT id, content FROM emails WHERE id IN ({', '.join('?' * len(ids))})", ids
+        ).fetchall():
+            if content is None:
                 continue
-            blob = pack(html)
-            converted += 1
-            before += len(html.encode("utf-8"))
-            after += len((body or "").encode("utf-8"))
-            kept += len(blob)
+            body, html = split_body(redact_secrets(content))
+            if html is not None:
+                ready.append((email_id, content, body, html, pack(html)))
+        for email_id, content, body, html, blob in ready:
             if not args.dry_run:
+                # Unless the body changed since it was read: a re-load wins.
+                if not conn.execute(
+                    "UPDATE emails SET content = ? WHERE id = ? AND content = ?",
+                    (body, email_id, content),
+                ).rowcount:
+                    continue
                 conn.execute(
                     "INSERT OR REPLACE INTO email_html (email_id, html) VALUES (?, ?)",
                     (email_id, blob),
                 )
-                conn.execute("UPDATE emails SET content = ? WHERE id = ?", (body, email_id))
+            converted += 1
+            before += len(html.encode("utf-8"))
+            after += len((body or "").encode("utf-8"))
+            kept += len(blob)
         if not args.dry_run:
             conn.commit()
     verb = "would convert" if args.dry_run else "converted"
@@ -2487,7 +2516,9 @@ def main():
         "--batch", type=int, default=500, help="Emails per transaction (default 500)"
     )
     parser_split_html.add_argument(
-        "--dry-run", action="store_true", help="Count and measure only, change nothing"
+        "--dry-run",
+        action="store_true",
+        help="Count and measure only, read-only: no migration, no conversion",
     )
     parser_split_html.set_defaults(func=cmd_split_html)
 

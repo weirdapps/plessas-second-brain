@@ -37,11 +37,14 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
     # AWS access key id, which is enough to identify the account.
     ("aws-key-id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     # Private key blocks: replace the whole armoured body, not just the header.
+    # The body stops at any run of five dashes, so a header with no END line
+    # stops looking at the next header: looking to the end of the text for
+    # every header made the cost grow with the square of the size.
     (
         "private-key",
         re.compile(
-            r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
-            re.DOTALL,
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:[^-]|-(?!----))*+"
+            r"-----END [A-Z ]*PRIVATE KEY-----"
         ),
     ),
     # Telegram bot tokens: <digits>:<35 char base64ish>.

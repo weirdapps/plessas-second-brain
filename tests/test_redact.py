@@ -50,6 +50,24 @@ class TestCatchesRealCredentials:
         assert "[REDACTED:private-key]" in out
         assert "before" in out and "after" in out
 
+    def test_an_encrypted_key_block_is_removed_whole(self):
+        head = "-----BEGIN RSA PRIVATE KEY-----"  # gitleaks:allow
+        tail = "-----END RSA PRIVATE KEY-----"  # gitleaks:allow
+        body = f"{head}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\n{'a' * 20}\n{tail}"
+        assert redact_secrets(f"before\n{body}\nafter") == "before\n[REDACTED:private-key]\nafter"
+
+    def test_key_headers_that_never_end_cost_no_time(self):
+        """Each header scanned the rest of the text for its END line, so the cost
+        grew with the square of the size: 400 KB of headers took 12 s, and anyone
+        can send them in a mail."""
+        import time
+
+        head = "-----BEGIN RSA PRIVATE KEY-----"  # gitleaks:allow
+        text = f"{head} x\n" * 10_000
+        started = time.perf_counter()
+        assert redact_secrets(text) == text
+        assert time.perf_counter() - started < 1.0
+
     def test_several_secrets_in_one_string(self):
         text = f"{REAL['github-token']} and {REAL['google-key']}"
         out = redact_secrets(text)

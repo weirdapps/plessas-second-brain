@@ -57,8 +57,10 @@ _OPENING = re.compile(
 _SPACING, _LINES, _NEITHER = 2, 1, 0
 _PRE_TAGS = {"pre", "textarea", "xmp", "listing", "plaintext"}
 _WHITE_SPACE = re.compile(r"white-space\s*:\s*([a-z-]+)\s*(!\s*important\b)?", re.IGNORECASE)
-# Valid, and meaning the parent's value (white-space is inherited).
-_INHERIT = {"inherit", "unset", "revert", "revert-layer"}
+# Valid, and meaning the parent's value (white-space is inherited)...
+_INHERIT = {"inherit", "unset"}
+# ...or the browser's own, as if no style set it.
+_REVERT = {"revert", "revert-layer"}
 _KEEPS = {
     "pre": _SPACING, "pre-wrap": _SPACING, "break-spaces": _SPACING,
     "pre-line": _LINES, "normal": _NEITHER, "nowrap": _NEITHER, "initial": _NEITHER,
@@ -105,8 +107,11 @@ _REREADS = 3
 _CSS_TOKEN = re.compile(r"/\*|[\"']|<[a-zA-Z/!]")
 # A CSS string ends at its quote or, unterminated, at the line's end.
 _CSS_STRING = {q: re.compile(rf"{q}(?:[^{q}\\\n]|\\.)*{q}?") for q in ("'", '"')}
-# The start of the body, where a head element left open ends.
-_BODY = re.compile(r"<body[\s/>]", re.IGNORECASE)
+# Where a head ends: at its end tag or at the body's start tag.
+_HEAD_END = re.compile(r"</head[\s>]|<body[\s/>]", re.IGNORECASE)
+# What a head holds besides the hidden elements: an element left open before
+# any other element and any text is in the head.
+_HEAD = {"html", "head", "meta", "link", "base"}
 
 # A longer address loses its query string (click tracking, mostly), and one
 # still longer is left out: newsletters grew twelvefold with every one in full.
@@ -167,8 +172,11 @@ class _Reader(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.hidden = 0
-        # The outermost hidden element open: its position and its opening tag.
-        self.opened: tuple[tuple[int, int], str] | None = None
+        # Whether the body has started: an element or text the head cannot hold.
+        self.in_body = False
+        # The outermost hidden element open: its position, its opening tag, and
+        # whether it opened in the body.
+        self.opened: tuple[tuple[int, int], str, bool] | None = None
         # The open elements, each with what white-space keeps inside it: its
         # own setting, else its parent's, as CSS inherits it.
         self.stack: list[tuple[str, int]] = []
@@ -235,14 +243,14 @@ class _Reader(HTMLParser):
         valid = [
             (value.lower(), bool(important))
             for value, important in _WHITE_SPACE.findall(dict(attrs).get("style") or "")
-            if value.lower() in _KEEPS or value.lower() in _INHERIT
+            if value.lower() in _KEEPS or value.lower() in _INHERIT or value.lower() in _REVERT
         ]
         ranked = [value for value, important in valid if important] or [v for v, _ in valid]
         if ranked and ranked[-1] in _INHERIT:
             keeps = self._keeps()
-        elif ranked:
+        elif ranked and ranked[-1] in _KEEPS:
             keeps = _KEEPS[ranked[-1]]
-        else:
+        else:  # no style, or one reverted to the browser's own
             keeps = _SPACING if tag in _PRE_TAGS else self._keeps()
         self.stack.append((tag, keeps))
         self.open_count[tag] = self.open_count.get(tag, 0) + 1
@@ -256,11 +264,13 @@ class _Reader(HTMLParser):
     def handle_starttag(self, tag: str, attrs) -> None:
         if tag in _HIDDEN:
             if not self.hidden:
-                self.opened = (self.getpos(), self.get_starttag_text() or "")
+                self.opened = (self.getpos(), self.get_starttag_text() or "", self.in_body)
             self.hidden += 1
             return
         if self.hidden:
             return  # what a template or an xml island holds, a <body> included, is never rendered
+        if tag not in _HEAD:
+            self.in_body = True
         if any(self.open_count.get(kind) for kind in _ENDED_BY):
             self._end_left_open(tag)  # an <hr> too, though it is void
         if tag not in _VOID:
@@ -290,6 +300,8 @@ class _Reader(HTMLParser):
             return
         if self.hidden:
             return
+        if tag == "head":
+            self.in_body = True
         self._close(tag)
         if tag == "a":
             self._end_link()
@@ -300,6 +312,8 @@ class _Reader(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self.hidden:
             return
+        if data.strip(LEADING):
+            self.in_body = True
         data = data.translate(_NO_PLACEHOLDERS)
         keeps = self._keeps()
         if keeps == _SPACING:
@@ -322,25 +336,25 @@ class _Reader(HTMLParser):
         self._end_link()
 
 
-def _markup_after_css(css: str) -> bool:
-    """Whether markup follows the CSS of a stylesheet left open: a '<' and a
-    letter, '/' or '!' outside its comments and strings. One pass, each step a C
-    search: a regex over the whole rest was quadratic in comments that never
-    close, 240 KB of '/* ' taking 40 s, and anyone can send that."""
-    pos = 0
-    while (found := _CSS_TOKEN.search(css, pos)) is not None:
+def _markup_after_css(html: str, pos: int) -> int:
+    """Where markup follows the CSS of a stylesheet left open at `pos`: a '<' and
+    a letter, '/' or '!' outside its comments and strings; -1 if none does. One
+    pass, each step a C search: a regex over the whole rest was quadratic in
+    comments that never close, 240 KB of '/* ' taking 40 s, and anyone can send
+    that."""
+    while (found := _CSS_TOKEN.search(html, pos)) is not None:
         token = found.group()
         if token == "/*":
-            end = css.find("*/", found.end())
+            end = html.find("*/", found.end())
             if end < 0:
-                return False  # a comment left open runs to the end
+                return -1  # a comment left open runs to the end
             pos = end + 2
         elif token in "'\"":
-            string = _CSS_STRING[token].match(css, found.start())  # matches its quote at least
+            string = _CSS_STRING[token].match(html, found.start())  # matches its quote at least
             pos = string.end() if string else found.end()
         else:
-            return True
-    return False
+            return found.start()
+    return -1
 
 
 def _read(html: str) -> _Reader:
@@ -368,23 +382,32 @@ def html_to_text(html: str) -> str:
             break
         # The body ended inside a hidden element: a <title> or <xml> never
         # closed hid every word after it. Read it again without it, if the
-        # parser's position really points at its tag: up to the body when one
-        # follows (an island's settings are no text, and whatever else was
-        # left open in the head goes with it), else the tag alone. Not a
-        # script, which is code even when it writes markup.
-        (line, column), tag = reader.opened
+        # parser's position really points at its tag: a stylesheet up to the
+        # markup after its CSS; in the head, up to where the head ends (an
+        # island's settings are no text, and whatever else was left open in
+        # the head goes with it); in the body, the tag alone, since what
+        # follows it there is text. Not a script, which is code even when it
+        # writes markup.
+        (line, column), tag, in_body = reader.opened
         if tag[1:7].lower() == "script":
             break
         try:
             start = _offset(html, line, column)
         except ValueError:
             break
-        if html[start : start + len(tag)] != tag:
+        rest = start + len(tag)
+        if html[start:rest] != tag:
             break
-        if tag[1:6].lower() == "style" and not _markup_after_css(html[start + len(tag) :]):
-            break  # a stylesheet the body was cut off inside
-        body = _BODY.search(html, start + len(tag))
-        html = html[:start] + html[body.start() if body else start + len(tag) :]
+        if tag[1:6].lower() == "style":
+            end = _markup_after_css(html, rest)
+            if end < 0:
+                break  # a stylesheet the body was cut off inside
+        elif in_body:
+            end = rest
+        else:
+            head_end = _HEAD_END.search(html, rest)
+            end = head_end.start() if head_end else rest
+        html = html[:start] + html[end:]
         reader = _read(html)
     text = "".join(reader.parts).replace("\xa0", " ").replace("\ufeff", "")
     lines = (

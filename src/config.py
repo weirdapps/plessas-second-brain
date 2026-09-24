@@ -102,7 +102,8 @@ def replica_refusal(what: str) -> str:
 REPO_ROOT = Path(__file__).parent.parent
 # Data root — override with BRAIN_DATA_DIR to point at a stable, checkout-independent
 # location (e.g. ~/.second-brain/data). Everything under data/ derives from this.
-DATA_ROOT = Path(os.environ.get("BRAIN_DATA_DIR", REPO_ROOT / "data"))
+# An empty value is the default too, as the wrappers' ${BRAIN_DATA_DIR:-...} read it.
+DATA_ROOT = Path(os.environ.get("BRAIN_DATA_DIR") or REPO_ROOT / "data")
 DEFAULT_DB = DATA_ROOT / "brain.db"
 
 # User identity for extraction context and ownership detection.

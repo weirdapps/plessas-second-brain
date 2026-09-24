@@ -16,7 +16,9 @@ mkdir -p "$LOG_DIR"
 
 VPS="vps"
 LOCAL_DATA="$HOME/SourceCode/plessas-second-brain/data"
-REMOTE_DATA="SourceCode/plessas-second-brain/data"
+# The producer's data home, relative to its $HOME; set it if BRAIN_DATA_DIR
+# moved it there.
+REMOTE_DATA="${SB_REMOTE_DATA:-SourceCode/plessas-second-brain/data}"
 # rsync will not create a two-level destination, and `data/` is gitignored, so a
 # fresh clone does not have it: the Pro rebuilt on 2026-09-05 had the plist, both
 # scripts and a reachable VPS, and the pull would still have failed on every run

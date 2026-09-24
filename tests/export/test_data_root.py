@@ -7,6 +7,7 @@ it. tests/conftest.py points BRAIN_DATA_DIR at a temporary directory, so
 DATA_ROOT here is not the repository's data/.
 """
 
+import json
 import shutil
 import sys
 
@@ -50,33 +51,79 @@ def test_the_reconcile_reads_the_configured_database(monkeypatch):
     assert seen == [config.DEFAULT_DB]
 
 
-def _legacy_cursor(tmp_path, monkeypatch, text):
+def _cursor(received_at):
+    return json.dumps({"last_seen_received_at": received_at, "last_seen_message_id": "m"})
+
+
+def _legacy_cursor(tmp_path, monkeypatch, received_at, name="outlook_sync.json"):
     """A cursor where the exporter used to keep it: the repository's data/."""
     repo = tmp_path / "repo"
-    legacy = repo / "data" / "state" / "outlook_sync.json"
-    legacy.parent.mkdir(parents=True)
-    legacy.write_text(text, encoding="utf-8")
+    legacy = repo / "data" / "state" / name
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text(_cursor(received_at), encoding="utf-8")
     monkeypatch.setattr(outlook_export, "REPO_ROOT", repo)
-    target = config.DATA_ROOT / "state" / "outlook_sync.json"
+    target = config.DATA_ROOT / "state" / name
     target.unlink(missing_ok=True)
     return legacy, target
+
+
+def _run(monkeypatch, *args):
+    """main() with these arguments; returns the cursor the sync would start from."""
+    seen = {}
+
+    def sync(state_path, **kwargs):
+        seen["cursor"] = outlook_export.load_outlook_sync_state(state_path).last_seen_received_at
+        return {}
+
+    monkeypatch.setattr(outlook_export, "run_hourly_sync", sync)
+    monkeypatch.setattr(sys, "argv", ["outlook_export", *args])
+    assert outlook_export.main() == 0
+    return seen["cursor"]
 
 
 def test_a_cursor_left_in_the_repository_is_carried_over(tmp_path, monkeypatch):
     """A host that set BRAIN_DATA_DIR kept its cursor in the repository. Without
     it the next run exits 7, and the bootstrap that answers that fetches only
     the newest 100 messages."""
-    legacy, target = _legacy_cursor(tmp_path, monkeypatch, '{"Inbox": {"delta": "x"}}')
+    legacy, target = _legacy_cursor(tmp_path, monkeypatch, "2026-09-01T00:00:00Z")
 
-    assert outlook_export._default_state_path() == target
-    assert target.read_text(encoding="utf-8") == '{"Inbox": {"delta": "x"}}'
+    assert _run(monkeypatch, "--folder", "Inbox") == "2026-09-01T00:00:00Z"
+    assert json.loads(target.read_text())["last_seen_received_at"] == "2026-09-01T00:00:00Z"
     assert legacy.exists()
 
 
-def test_a_cursor_already_in_the_data_root_is_not_overwritten(tmp_path, monkeypatch):
-    legacy, target = _legacy_cursor(tmp_path, monkeypatch, '{"Inbox": {"delta": "old"}}')
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text('{"Inbox": {"delta": "new"}}', encoding="utf-8")
+def test_the_wrappers_explicit_paths_are_carried_over_too(tmp_path, monkeypatch):
+    """The wrapper passes --state-path for every folder, so a carry-over only on
+    the default path never ran; Archive and Sent Items would bootstrap."""
+    legacy, target = _legacy_cursor(
+        tmp_path, monkeypatch, "2026-09-02T00:00:00Z", name="outlook_sync_archive.json"
+    )
 
-    assert outlook_export._default_state_path() == target
-    assert target.read_text(encoding="utf-8") == '{"Inbox": {"delta": "new"}}'
+    cursor = _run(monkeypatch, "--folder", "Archive", "--state-path", str(target))
+
+    assert cursor == "2026-09-02T00:00:00Z"
+
+
+def test_a_cursorless_file_left_by_a_failed_run_counts_as_none(tmp_path, monkeypatch):
+    """A failed run saves its state without a cursor, and an existence check then
+    kept the carry-over off for good."""
+    legacy, target = _legacy_cursor(tmp_path, monkeypatch, "2026-09-01T00:00:00Z")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps({"last_seen_received_at": None, "consecutive_failures": 2}))
+
+    assert _run(monkeypatch, "--folder", "Inbox") == "2026-09-01T00:00:00Z"
+
+
+def test_a_cursor_already_in_the_data_root_is_not_overwritten(tmp_path, monkeypatch):
+    legacy, target = _legacy_cursor(tmp_path, monkeypatch, "2026-09-01T00:00:00Z")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_cursor("2026-09-20T00:00:00Z"), encoding="utf-8")
+
+    assert _run(monkeypatch, "--folder", "Inbox") == "2026-09-20T00:00:00Z"
+
+
+def test_a_path_outside_the_data_root_is_left_alone(tmp_path, monkeypatch):
+    legacy, _target = _legacy_cursor(tmp_path, monkeypatch, "2026-09-01T00:00:00Z")
+    elsewhere = tmp_path / "elsewhere" / "outlook_sync.json"
+
+    assert _run(monkeypatch, "--folder", "Inbox", "--state-path", str(elsewhere)) is None

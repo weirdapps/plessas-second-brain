@@ -7,11 +7,18 @@ store then hides by default.
 
 import json
 
-from src.extract.news_extract import extract_news, is_news
+import pytest
+
+from src.extract.news_extract import ARTICLE_SUMMARY_CHARS, BRIEF_CHARS, extract_news, is_news
 
 BRIEF = {
     "executive_brief": ["Rates held.", "A bank launched instant payments."],
-    "sections": [{"display_name": "Payments"}, {"display_name": "Macro"}, {"category": "x"}],
+    "sections": [
+        {"category": "macro_rates", "display_name": "Fed Holds, Signals One Cut"},
+        {"category": "payments", "display_name": "Instant Payments Arrive"},
+        {"display_name": "Uncategorised"},
+        {"category": "payments", "display_name": "More Payments"},
+    ],
 }
 
 
@@ -41,12 +48,20 @@ def test_only_the_news_mailbox_is_news():
     assert not is_news({"message_id": "m2"})
 
 
-def test_a_synthesis_takes_its_brief_and_its_section_names():
+def test_a_synthesis_takes_its_brief_and_its_section_categories():
+    """Display names are written new for each day's news; the category is stable."""
     extraction = extract_news(_synthesis(json.dumps(BRIEF, indent=2)))
 
     assert extraction["summary"] == "Rates held. A bank launched instant payments."
-    assert extraction["topics"] == ["Payments", "Macro"]
+    assert extraction["topics"] == ["macro rates", "payments", "Uncategorised"]
     assert extraction["message_id"] == "news:synthesis:digest:7"
+
+
+def test_a_brief_of_text_objects_reads_as_text():
+    """news-reader writes its bullets as {text, article_ids} before flattening them."""
+    brief = {"executive_brief": [{"text": "ECB holds.", "article_ids": [3]}, {"text": ""}, 7]}
+
+    assert extract_news(_synthesis(json.dumps(brief)))["summary"] == "ECB holds."
 
 
 def test_nothing_else_is_invented_for_news():
@@ -63,22 +78,8 @@ def test_an_article_takes_its_opening_and_its_categories():
     extraction = extract_news(ARTICLE)
 
     assert extraction["summary"].startswith("Opening paragraph.")
-    assert len(extraction["summary"]) <= 600
-    assert "URL:" not in extraction["summary"]
+    assert len(extraction["summary"]) <= ARTICLE_SUMMARY_CHARS
     assert extraction["topics"] == ["fintech", "payments"]
-
-
-def test_a_synthesis_that_is_not_json_still_gets_a_summary():
-    extraction = extract_news(_synthesis("plain text brief, not JSON"))
-
-    assert extraction["summary"] == "plain text brief, not JSON"
-    assert extraction["topics"] == []
-
-
-def test_a_brief_given_as_one_string_is_kept():
-    extraction = extract_news(_synthesis(json.dumps({"executive_brief": "One line."})))
-
-    assert extraction["summary"] == "One line."
 
 
 def test_a_short_article_leaves_its_footer_out():
@@ -88,3 +89,47 @@ def test_a_short_article_leaves_its_footer_out():
     }
 
     assert extract_news(article)["summary"] == "Short body."
+
+
+def test_an_article_with_a_rule_in_its_text_keeps_what_follows_it():
+    """The footer is the last separator news_export appends, not the first."""
+    article = {
+        **ARTICLE,
+        "content": "Part one.\n---\nPart two.\n\n---\nURL: https://example.com/a\nCategories: x",
+    }
+
+    extraction = extract_news(article)
+
+    assert extraction["summary"] == "Part one.\n---\nPart two."
+    assert extraction["topics"] == ["x"]
+
+
+def test_the_text_is_kept_as_written():
+    """Parsing it as JSON ran the parser's clean-up over the words themselves."""
+    article = {**ARTICLE, "content": "Rates were [1.5, ] and {a, } ```json code"}
+
+    assert extract_news(article)["summary"] == "Rates were [1.5, ] and {a, } ```json code"
+
+
+@pytest.mark.parametrize(
+    ("body", "summary"),
+    [
+        pytest.param("plain text brief, not JSON", "plain text brief, not JSON", id="not-json"),
+        pytest.param(json.dumps({"executive_brief": "One line."}), "One line.", id="one-string"),
+        pytest.param(json.dumps(["a", "b"]), '["a", "b"]', id="json-list"),
+    ],
+)
+def test_a_synthesis_in_another_shape_still_gets_a_summary(body, summary):
+    assert extract_news(_synthesis(body))["summary"] == summary
+
+
+def test_an_empty_brief_falls_back_to_the_synthesis_itself():
+    body = json.dumps({"executive_brief": [], "alerts": ["quiet day"]})
+
+    assert extract_news(_synthesis(body))["summary"] == body
+
+
+def test_a_long_brief_is_capped():
+    body = json.dumps({"executive_brief": ["x" * (BRIEF_CHARS * 3)]})
+
+    assert len(extract_news(_synthesis(body))["summary"]) == BRIEF_CHARS

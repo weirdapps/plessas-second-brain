@@ -39,6 +39,19 @@ def _extraction_for(conv):
     return conv["session_id"], {"summary": "x"}, False, False
 
 
+def _with_a_fresh_success(staged):
+    """collect_conversations for successive runs: the staged ones, plus a new
+    conversation each run that extracts, so every run shows the model working."""
+    runs = iter(range(1000))
+    return lambda: [*staged, {"session_id": f"ok-{next(runs)}"}]
+
+
+def _refuses_but_the_fresh_ones(conv):
+    if conv["session_id"].startswith("ok-"):
+        return _extraction_for(conv)
+    return conv["session_id"], None, False, True
+
+
 def test_stops_once_the_deadline_is_spent(staged, monkeypatch):
     """Each item costs 10 s of a 25 s budget, so the third check is the one that
     trips. Asserting "fewer than all ten" rather than an exact count keeps this
@@ -101,21 +114,20 @@ def test_a_conversation_that_keeps_being_refused_is_given_up_on(staged, monkeypa
     retried"); conversations were the pipeline that did not."""
     monkeypatch.setattr(local, "CONVERSATION_MAX_ATTEMPTS", 2)
 
-    def always_refuses(conv):
-        return conv["session_id"], None, False, True
-
     with (
-        patch.object(local, "collect_conversations", return_value=staged),
+        patch.object(local, "collect_conversations", side_effect=_with_a_fresh_success(staged)),
         patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
-        patch.object(local, "extract_conversation_inline", side_effect=always_refuses),
+        patch.object(local, "extract_conversation_inline", side_effect=_refuses_but_the_fresh_ones),
     ):
         for _ in range(local.CONVERSATION_MAX_ATTEMPTS):
             local.run_conversation_extraction()
 
-        with patch.object(local, "extract_conversation_inline") as ex:
+        with patch.object(
+            local, "extract_conversation_inline", side_effect=_refuses_but_the_fresh_ones
+        ) as ex:
             local.run_conversation_extraction()
 
-    assert ex.call_count == 0
+    assert [c.args[0]["session_id"] for c in ex.call_args_list] == ["ok-2"]
 
 
 def test_giving_up_does_not_mark_a_conversation_extracted(staged, monkeypatch):
@@ -124,38 +136,32 @@ def test_giving_up_does_not_mark_a_conversation_extracted(staged, monkeypatch):
     monkeypatch.setattr(local, "CONVERSATION_MAX_ATTEMPTS", 1)
 
     with (
-        patch.object(local, "collect_conversations", return_value=staged),
+        patch.object(local, "collect_conversations", side_effect=_with_a_fresh_success(staged)),
         patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
-        patch.object(
-            local,
-            "extract_conversation_inline",
-            side_effect=lambda c: (c["session_id"], None, False, True),
-        ),
+        patch.object(local, "extract_conversation_inline", side_effect=_refuses_but_the_fresh_ones),
     ):
         local.run_conversation_extraction()
 
     state = json.loads(local.CONV_STATE_FILE.read_text())
 
-    assert state["processed_ids"] == []
+    assert state["processed_ids"] == ["ok-0"]
     assert set(state["given_up_ids"]) == {c["session_id"] for c in staged}
 
 
-def test_a_transient_failure_is_retried_before_the_cap(staged, monkeypatch):
-    """Give-up must not fire on the first bad call. A single quota blip or a
-    network reset has to stay recoverable, or one flaky minute permanently
-    drops a conversation from the knowledge base."""
+def test_a_failure_below_the_cap_is_offered_again(staged, monkeypatch):
+    """Give-up must not fire on the first bad run: one flaky run must not
+    permanently drop a conversation from the knowledge base."""
     monkeypatch.setattr(local, "CONVERSATION_MAX_ATTEMPTS", 3)
 
     with (
         patch.object(local, "collect_conversations", return_value=staged),
         patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
-        patch.object(
-            local,
-            "extract_conversation_inline",
-            side_effect=lambda c: (c["session_id"], None, False, True),
-        ),
+        patch.object(local, "extract_conversation_inline", side_effect=_refuses_but_the_fresh_ones),
     ):
-        local.run_conversation_extraction()
+        with patch.object(
+            local, "collect_conversations", return_value=[*staged, {"session_id": "ok-0"}]
+        ):
+            local.run_conversation_extraction()
 
         with patch.object(local, "extract_conversation_inline", side_effect=_extraction_for) as ex:
             local.run_conversation_extraction()
@@ -187,19 +193,20 @@ def test_work_done_before_the_deadline_is_saved(staged, tmp_path, monkeypatch):
     assert len(processed) > 0
 
 
-def test_a_service_failure_never_counts_toward_giving_up(staged, monkeypatch):
-    """An outage failed every conversation it touched, and three outage runs gave
-    them all up for good. Only a failure of the conversation itself counts."""
+def test_a_quota_or_auth_failure_never_counts_toward_giving_up(staged, monkeypatch):
+    """extract_conversation_inline says a quota or auth failure is not countable,
+    and it is not counted even in runs where other conversations succeed."""
     monkeypatch.setattr(local, "CONVERSATION_MAX_ATTEMPTS", 1)
 
+    def not_countable(conv):
+        if conv["session_id"].startswith("ok-"):
+            return _extraction_for(conv)
+        return conv["session_id"], None, False, False
+
     with (
-        patch.object(local, "collect_conversations", return_value=staged),
+        patch.object(local, "collect_conversations", side_effect=_with_a_fresh_success(staged)),
         patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
-        patch.object(
-            local,
-            "extract_conversation_inline",
-            side_effect=lambda c: (c["session_id"], None, False, False),
-        ),
+        patch.object(local, "extract_conversation_inline", side_effect=not_countable),
     ):
         local.run_conversation_extraction()
         local.run_conversation_extraction()
@@ -207,18 +214,37 @@ def test_a_service_failure_never_counts_toward_giving_up(staged, monkeypatch):
         with patch.object(local, "extract_conversation_inline", side_effect=_extraction_for) as ex:
             local.run_conversation_extraction()
 
-    assert ex.call_count == len(staged)
+    assert ex.call_count == len(staged) + 1
+
+
+def test_a_run_in_which_nothing_succeeded_counts_nothing(staged, monkeypatch):
+    """An outage failed every conversation it touched, and three outage runs gave
+    them all up for good."""
+    monkeypatch.setattr(local, "CONVERSATION_MAX_ATTEMPTS", 1)
+
+    with (
+        patch.object(local, "collect_conversations", return_value=staged),
+        patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
+        patch.object(local, "extract_conversation_inline", side_effect=_refuses_but_the_fresh_ones),
+    ):
+        local.run_conversation_extraction()
+        local.run_conversation_extraction()
+
+    state = json.loads(local.CONV_STATE_FILE.read_text())
+    assert state["failed_attempts"] == {}
+    assert state["given_up_ids"] == []
 
 
 @pytest.mark.parametrize(
-    ("error", "calls", "item_fault"),
+    ("error", "calls", "countable"),
     [
         pytest.param(ValueError("no text block (stop_reason='refusal')"), 1, True, id="refusal"),
-        pytest.param(ConnectionError("connection reset"), 3, False, id="service"),
+        pytest.param(ConnectionError("connection reset"), 3, True, id="service"),
+        pytest.param(RuntimeError("429 RESOURCE_EXHAUSTED"), 3, False, id="quota"),
     ],
 )
-def test_only_a_service_error_is_retried_and_only_a_bad_item_is_its_fault(
-    staged, monkeypatch, error, calls, item_fault
+def test_only_an_unusable_reply_goes_unretried_and_quota_never_counts(
+    staged, monkeypatch, error, calls, countable
 ):
     seen = []
 
@@ -231,7 +257,7 @@ def test_only_a_service_error_is_retried_and_only_a_bad_item_is_its_fault(
 
     result = local.extract_conversation_inline({"session_id": "s"})
 
-    assert result == ("s", None, False, item_fault)
+    assert result == ("s", None, not countable, countable)
     assert len(seen) == calls
 
 

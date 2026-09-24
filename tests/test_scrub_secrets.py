@@ -284,9 +284,41 @@ def test_an_unreadable_kept_html_is_counted_not_fatal(scrub, tmp_path, capsys, m
     out = capsys.readouterr()
     assert "emails.content: 1 row" in out.out
     assert "1 email_html row could not be read" in out.err
+    assert "rowid 2" in out.err  # which one, to fix or delete it (an id is no secret)
 
     assert scrub.main(["--apply"]) == 2
     conn = sqlite3.connect(path)
     (m1,) = conn.execute("SELECT content FROM emails WHERE message_id = 'm1'").fetchone()
     conn.close()
     assert "[REDACTED:google-key]" in m1
+
+
+def test_unreadable_is_not_reported_as_clean(scrub, tmp_path, capsys, monkeypatch):
+    """With nothing found but a row unread, the run cannot say the store is clean."""
+    path = _db(tmp_path, scrub, monkeypatch)
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE emails SET content = 'clean now' WHERE message_id = 'm1'")
+    conn.execute("DELETE FROM conversation_turns")
+    conn.execute("INSERT INTO email_html (email_id, html) VALUES (2, ?)", (b"not zlib",))
+    conn.commit()
+    conn.close()
+
+    assert scrub.main([]) == 2
+    assert "No credential-shaped values found." not in capsys.readouterr().out
+
+
+def test_a_blocked_checkpoint_is_reported_beside_an_unreadable_row(
+    scrub, tmp_path, capsys, monkeypatch
+):
+    """Exit 2 for the unread row must not hide that the checkpoint was blocked."""
+    path = _db(tmp_path, scrub, monkeypatch)
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO email_html (email_id, html) VALUES (2, ?)", (b"not zlib",))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(scrub, "_checkpoint", lambda conn: False)
+
+    assert scrub.main(["--apply"]) == 2
+    err = capsys.readouterr().err
+    assert "could not be read" in err
+    assert "checkpoint was blocked" in err

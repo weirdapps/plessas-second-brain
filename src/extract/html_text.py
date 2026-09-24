@@ -37,11 +37,12 @@ _PARAGRAPHS = {"blockquote", "h1", "h2", "h3", "h4", "h5", "h6", "ol", "p", "tab
 # opening keeps out plain text, whatever markup it quotes: a tag anywhere in the
 # first 4 KB used to be enough, and a quoted header's <p.petrou@example.com>
 # passed for one. The rest of the list is for other sources' documents and
-# fragments (Word's <o:p>; XHTML's prolog is skipped first). Inline tags and
-# <title> are not on it: a text mail that opens with one lost its line breaks,
-# or its whole body to the title.
+# fragments (Word's <o:p>; XHTML's prolog and stylesheet instructions are
+# skipped first). The phrase tags a text mail can open with (b, i, u, a, em,
+# strong) and <title> are not on it: converted, such a mail lost its line
+# breaks, or its whole body to the title.
 LEADING = "\ufeff\u200b\xa0 \t\r\n"
-_PROLOG = re.compile(r"<\?xml\b[^>]*>", re.IGNORECASE)
+_PROLOG = re.compile(r"(?:<\?xml[^>]*>[\ufeff\u200b\xa0 \t\r\n]*)+", re.IGNORECASE)
 _OPENING = re.compile(
     r"<(?:!doctype\s|!--|(?:html|head|body|meta|link|base|style|div|p|br|span|font|center"
     r"|table|tbody|thead|tr|td|th|img|ul|ol|li|h[1-6]|hr|pre|blockquote|section|article"
@@ -58,7 +59,7 @@ _PRE_TAGS = {"pre", "textarea", "xmp", "listing", "plaintext"}
 _WHITE_SPACE = re.compile(r"white-space\s*:\s*([a-z-]+)", re.IGNORECASE)
 _KEEPS = {
     "pre": _SPACING, "pre-wrap": _SPACING, "break-spaces": _SPACING,
-    "pre-line": _LINES, "normal": _NEITHER, "nowrap": _NEITHER,
+    "pre-line": _LINES, "normal": _NEITHER, "nowrap": _NEITHER, "initial": _NEITHER,
 }  # fmt: skip
 _VOID = {
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
@@ -66,12 +67,24 @@ _VOID = {
 }  # fmt: skip
 # End tags HTML lets a writer leave out: a block ends an open paragraph, and
 # these are ended by the next sibling (a cell by the next cell or row, a row by
-# the next row). The end of a container ends them as any end tag ends what was
-# left open in it.
+# the next row or table section), through any inline element left open in
+# them, but not past their container. The end of a container ends them as any
+# end tag ends what was left open in it.
+_SECTIONS = {"tbody", "thead", "tfoot"}
 _ENDED_BY = {
-    "td": {"td", "th", "tr"}, "th": {"td", "th", "tr"}, "tr": {"tr"},
-    "li": {"li"}, "dt": {"dt", "dd"}, "dd": {"dt", "dd"},
+    "td": {"td", "th", "tr"} | _SECTIONS, "th": {"td", "th", "tr"} | _SECTIONS,
+    "tr": {"tr"} | _SECTIONS, "li": {"li"}, "dt": {"dt", "dd"}, "dd": {"dt", "dd"},
+    "p": _BLOCKS | _PARAGRAPHS,
 }  # fmt: skip
+_CONTAINER = {
+    "td": {"tr", "table"}, "th": {"tr", "table"}, "tr": {"table"} | _SECTIONS,
+    "tbody": {"table"}, "thead": {"table"}, "tfoot": {"table"},
+    "li": {"ul", "ol", "menu"}, "dt": {"dl"}, "dd": {"dl"},
+}  # fmt: skip
+# A block's search for an open paragraph stops at the first element that may
+# hold paragraphs, and no search looks deeper than this many open elements.
+_HOLDS_P = (_BLOCKS | _PARAGRAPHS | {"td", "th", "body", "html"}) - {"p"}
+_SEARCH_DEPTH = 32
 
 # The spacing is held as noncharacters, which the whitespace collapse leaves
 # alone and no text holds (private-use characters are icon-font glyphs), then
@@ -80,9 +93,11 @@ _KEEP_SPACING = str.maketrans({" ": "\ufdd0", "\xa0": "\ufdd0", "\t": "\ufdd1"})
 _RESTORE_SPACING = str.maketrans({"\ufdd0": " ", "\ufdd1": "\t"})
 _NO_PLACEHOLDERS = str.maketrans("", "", "\ufdd0\ufdd1")
 
-# A body that ends inside a hidden element other than a script is read again
-# without its opening tag, at most this many times.
+# A body that ends inside a hidden element is read again without its opening
+# tag, at most this many times: not after a script, which is code even when it
+# writes markup, nor after a style that nothing but its own CSS followed.
 _REREADS = 3
+_MARKUP = re.compile(r"<[a-zA-Z/!]")
 
 # A longer address loses its query string (click tracking, mostly), and one
 # still longer is left out: newsletters grew twelvefold with every one in full.
@@ -104,18 +119,24 @@ def looks_like_html(content: str | None) -> bool:
     return _OPENING.match(body) is not None
 
 
+def _slashes(url: str) -> str:
+    """A browser reads a backslash in the host or the path as a slash, which
+    urlsplit does not; the query and the fragment keep theirs."""
+    cut = min((i for i in (url.find("?"), url.find("#")) if i >= 0), default=len(url))
+    return url[:cut].replace("\\", "/") + url[cut:]
+
+
 def _link_target(attrs) -> str | None:
     """Where a link goes, if to a web page. A Safe Links wrapper is unwrapped to
     its url=, where the click goes; only its real host counts as one, and
     Outlook's originalsrc is not believed, since a sender can write either."""
-    # A browser drops tabs and line breaks from an address, which Word wraps,
-    # and reads a backslash as a slash, which urlsplit does not.
-    url = re.sub(r"[\t\r\n]", "", dict(attrs).get("href") or "").strip().replace("\\", "/")
+    # A browser drops tabs and line breaks from an address, which Word wraps.
+    url = _slashes(re.sub(r"[\t\r\n]", "", dict(attrs).get("href") or "").strip())
     try:
         for _ in range(_UNWRAPS):
             if not (urlsplit(url).hostname or "").endswith(".safelinks.protection.outlook.com"):
                 break
-            url = parse_qs(urlsplit(url).query).get("url", [""])[0].replace("\\", "/")
+            url = _slashes(parse_qs(urlsplit(url).query).get("url", [""])[0])
         urlsplit(url)
     except ValueError:  # an address urlsplit refuses, like an unclosed IPv6 bracket
         return None
@@ -124,10 +145,10 @@ def _link_target(attrs) -> str | None:
 
 def _shows(text: str, bare: str) -> bool:
     """Whether a link's text holds its address whole: at a word's start (or after
-    www.), and not running on into a longer name or path. pal.com is not
-    paypal.com."""
+    www.), and not running on into a longer name, path or address. pal.com is
+    not paypal.com, and mybank.co is not mybank.co.uk."""
     return (
-        re.search(r"(?:^|[^\w.-]|www\.)" + re.escape(bare) + r"(?!/?[\w-])", text.lower())
+        re.search(r"(?:^|[^\w.-]|www\.)" + re.escape(bare) + r"(?![/.@:]?[\w-])", text.lower())
         is not None
     )
 
@@ -181,13 +202,30 @@ class _Reader(HTMLParser):
         tag, _keeps = self.stack.pop()
         self.open_count[tag] -= 1
 
+    def _end_left_open(self, tag: str) -> None:
+        """End what `tag` ends: the nearest open cell, row, item, term or paragraph
+        it is the next sibling of (see _ENDED_BY), through any inline element left
+        open inside it, but not past its container; then whatever that uncovers
+        (a row, after its last cell)."""
+        stops = _CONTAINER.get(tag, _HOLDS_P)
+        found = True
+        while found:
+            found = False
+            for i in range(len(self.stack) - 1, max(-1, len(self.stack) - 1 - _SEARCH_DEPTH), -1):
+                open_tag = self.stack[i][0]
+                if tag in _ENDED_BY.get(open_tag, ()):
+                    while len(self.stack) > i:
+                        self._pop()
+                    found = True
+                    break
+                if open_tag in stops:
+                    return
+
     def _open(self, tag: str, attrs) -> None:
-        if self.stack and self.stack[-1][0] == "p" and (tag in _BLOCKS or tag in _PARAGRAPHS):
-            self._pop()  # a block ends an open paragraph
-        while self.stack and tag in _ENDED_BY.get(self.stack[-1][0], ()):
-            self._pop()  # the next sibling ends one left open
-        declared = _WHITE_SPACE.search(dict(attrs).get("style") or "")
-        keeps = _KEEPS.get(declared.group(1).lower()) if declared else None
+        if any(self.open_count.get(kind) for kind in _ENDED_BY):
+            self._end_left_open(tag)
+        declared = _WHITE_SPACE.findall(dict(attrs).get("style") or "")
+        keeps = _KEEPS.get(declared[-1].lower()) if declared else None  # the last one wins
         if keeps is None:
             keeps = _SPACING if tag in _PRE_TAGS else self._keeps()
         self.stack.append((tag, keeps))
@@ -205,13 +243,14 @@ class _Reader(HTMLParser):
                 self.opened = (self.getpos(), self.get_starttag_text() or "")
             self.hidden += 1
             return
+        if tag == "body" and not self.bodied:
+            self.hidden = 0  # the head ends where the body starts, whatever it left open
+            self.bodied = True
+        if self.hidden:
+            return  # what a template or an xml island holds is never rendered
         if tag not in _VOID:
             self._open(tag, attrs)
-        if tag == "body":
-            if not self.bodied:  # the head ends where the body starts, whatever it left open
-                self.hidden = 0
-                self.bodied = True
-        elif tag == "a":
+        if tag == "a":
             self._end_link(" ")  # a link inside a link closes the first, as in a browser
             self.link = (_link_target(attrs), len(self.parts))
         elif tag == "br":
@@ -233,6 +272,8 @@ class _Reader(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag in _HIDDEN:
             self.hidden = max(0, self.hidden - 1)
+            return
+        if self.hidden:
             return
         self._close(tag)
         if tag == "a":
@@ -302,6 +343,8 @@ def html_to_text(html: str) -> str:
             break
         if html[start : start + len(tag)] != tag:
             break
+        if tag[1:6].lower() == "style" and not _MARKUP.search(html, start + len(tag)):
+            break  # a stylesheet the body was cut off inside
         html = html[:start] + html[start + len(tag) :]
         reader = _read(html)
     text = "".join(reader.parts).replace("\xa0", " ").replace("\ufeff", "")

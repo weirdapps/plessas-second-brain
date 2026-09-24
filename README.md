@@ -73,7 +73,7 @@ A staging batch is `{ "batch_number", "exported_at", "source", "folder", "emails
 }
 ```
 
-An HTML `content` is recognised by how it opens: a common HTML tag, a comment, a doctype or an XML prolog (`looks_like_html` in `src/extract/html_text.py` has the list). It is stored as the text a reader sees, with the markup kept beside it; a body that opens with text is stored as it came.
+An HTML `content` is recognised by how it opens: a document or block-level tag (or `span`, `font`, `br`, `img`), a comment, a doctype, or an XML prolog followed by one of those; `looks_like_html` in `src/extract/html_text.py` has the list. It is stored as the text a reader sees, with the markup kept beside it; a body that opens with text is stored as it came.
 
 See [`examples/example_exporter.py`](examples/example_exporter.py) for a ~40-line reference exporter and [`examples/sample-batch.json`](examples/sample-batch.json) for a complete synthetic batch. Drop a batch into `staging/` under the data home (`<repo>/data` unless `BRAIN_DATA_DIR` moves it). On a fresh store, run `python -m src.extract.local && python -m src.cli load`: `load` creates the database but does not extract, and `sync` needs the database to exist. From then on `python -m src.cli sync` does both.
 

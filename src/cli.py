@@ -110,8 +110,9 @@ EXTRACT_DEADLINE_BY_UNIT_S = {
 
 # Observed span for the stages that have no budget of their own: load,
 # registration (count-bounded), people dedup, and the incremental embeddings
-# update (about 10 s). Mail fetch is SYNC_WRAPPER_FETCH_OBSERVED_S above.
-SYNC_FIXED_WORK_S = 60.0
+# update (about 10 s), made twice when Step 7 loads conversations, and each
+# rewrites the whole index. Mail fetch is SYNC_WRAPPER_FETCH_OBSERVED_S above.
+SYNC_FIXED_WORK_S = 80.0
 
 # What the stages after Step 2 need, held back from the unit's remaining time.
 SYNC_AFTER_EXTRACTION_S = (
@@ -797,17 +798,18 @@ def cmd_export_conversations(args):
 
     print("Exporting Claude Code conversations...")
 
-    # Get already-exported session IDs from database
-    exported_ids = set()
+    # The sessions in the database, with the end and turn count they were loaded
+    # at: each is skipped unless it has gone on since.
+    loaded = {}
     db_path = str(args.db)
     if Path(db_path).exists():
         try:
             conn = get_connection(db_path)
-            rows = conn.execute("SELECT session_id FROM conversations").fetchall()
-            exported_ids = {r[0] for r in rows}
+            rows = conn.execute("SELECT session_id, ended_at, turn_count FROM conversations")
+            loaded = {r[0]: (r[1], r[2]) for r in rows}
             conn.close()
-            if exported_ids:
-                print(f"  {len(exported_ids)} conversations already in database (will skip)")
+            if loaded:
+                print(f"  {len(loaded)} conversations already in database (skipped unless grown)")
         except Exception:
             pass
 
@@ -819,7 +821,7 @@ def cmd_export_conversations(args):
         days=days,
         limit=args.limit or 0,
         workspace_filter=getattr(args, "workspace", None),
-        exported_ids=exported_ids,
+        loaded=loaded,
     )
 
     print(f"\nExported: {result['exported']}")
@@ -903,30 +905,8 @@ def cmd_ingest_conversation_incremental(args):
     conn = get_connection(db_path)
     run_migrations(conn)
 
-    # Delete existing record if re-ingesting (incremental update)
-    existing = conn.execute(
-        "SELECT id FROM conversations WHERE session_id = ?", (session_id,)
-    ).fetchone()
-    if existing:
-        conv_id = existing["id"]
-        # Delete dependent records first
-        conn.execute("DELETE FROM conversation_topics WHERE conversation_id = ?", (conv_id,))
-        turn_ids = [
-            r["id"]
-            for r in conn.execute(
-                "SELECT id FROM conversation_turns WHERE conversation_id = ?",
-                (conv_id,),
-            ).fetchall()
-        ]
-        for tid in turn_ids:
-            conn.execute("DELETE FROM decisions WHERE conversation_turn_id = ?", (tid,))
-            conn.execute("DELETE FROM action_items WHERE conversation_turn_id = ?", (tid,))
-            conn.execute("DELETE FROM key_facts WHERE conversation_turn_id = ?", (tid,))
-        conn.execute("DELETE FROM conversation_turns WHERE conversation_id = ?", (conv_id,))
-        conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
-        conn.commit()
-
-    load_single_conversation(conn, conv, extraction)
+    # What it loaded before is replaced, in one transaction, under a new id.
+    load_single_conversation(conn, conv, extraction, replace=True)
     conn.commit()
     conn.close()
 
@@ -1431,18 +1411,33 @@ def cmd_sync(args):
 
     conn_conv = get_conn(db_path)
     run_mig(conn_conv)
-    existing_convs = conn_conv.execute("SELECT session_id FROM conversations").fetchall()
-    exported_ids = {r["session_id"] for r in existing_convs} if existing_convs else set()
+    loaded = {
+        r["session_id"]: (r["ended_at"], r["turn_count"])
+        for r in conn_conv.execute("SELECT session_id, ended_at, turn_count FROM conversations")
+    }
     conn_conv.close()
 
-    conv_export = export_conversations(days=7, exported_ids=exported_ids)
+    conv_export = export_conversations(days=7, loaded=loaded)
     if conv_export["exported"] > 0:
-        print(f"  Exported {conv_export['exported']} new conversations")
+        print(f"  Exported {conv_export['exported']} new or grown conversations")
         from src.extract.local import run_conversation_extraction
 
         run_conversation_extraction(deadline_s=CONVERSATION_SYNC_DEADLINE_S)
         conv_loaded = load_convs(db_path)
         print(f"  Loaded {conv_loaded} conversations")
+        if conv_loaded:
+            # Their vectors now, not at the next sync with new mail (Step 5 ran
+            # before them): a session loaded again has a new id, which semantic
+            # search cannot find until it has one.
+            from src.store.embeddings import build_index
+
+            conn_embed = get_conn(db_path)
+            try:
+                build_index(conn_embed)
+            except Exception as e:  # the next sync embeds what this one could not
+                print(f"  Embedding the conversations failed: {e}", file=sys.stderr)
+            finally:
+                conn_embed.close()
     else:
         print("  No new conversations to sync")
 

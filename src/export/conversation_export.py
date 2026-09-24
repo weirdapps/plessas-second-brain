@@ -272,7 +272,7 @@ def export_conversations(
     days: int | None = None,
     limit: int = 0,
     workspace_filter: str | None = None,
-    exported_ids: set[str] | None = None,
+    loaded: dict[str, tuple[str | None, int | None]] | None = None,
 ) -> dict:
     """Export Claude Code conversations to staging directory.
 
@@ -280,7 +280,10 @@ def export_conversations(
         days: Only export conversations from last N days (None = all)
         limit: Max conversations to export (0 = unlimited)
         workspace_filter: Only export from matching workspace
-        exported_ids: Set of session_ids already exported (skip these)
+        loaded: session_id -> (ended_at, turn_count) of each conversation the
+            store holds. One that has gone on since (conversation_went_on) is
+            staged again, marked regrown_from with the end it was loaded at,
+            so extraction takes it again; the rest are skipped.
 
     Returns:
         Dict with 'exported', 'skipped', 'errors', 'batch_file' keys
@@ -291,7 +294,9 @@ def export_conversations(
     if not files:
         return {"exported": 0, "skipped": 0, "errors": 0, "batch_file": None}
 
-    exported_ids = exported_ids or set()
+    from src.store.loader import conversation_went_on
+
+    loaded = loaded or {}
     conversations: list[dict] = []
     skipped = 0
     errors = 0
@@ -310,9 +315,12 @@ def export_conversations(
             skipped += 1
             continue
 
-        if conv["session_id"] in exported_ids:
-            skipped += 1
-            continue
+        previous = loaded.get(conv["session_id"])
+        if previous is not None:
+            if not conversation_went_on(conv, *previous):
+                skipped += 1
+                continue
+            conv["regrown_from"] = previous[0]
 
         conversations.append(conv)
 

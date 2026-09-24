@@ -5,9 +5,9 @@ Multi-modal personal knowledge base: ingests emails, attachments, calendar event
 ## Tech stack
 
 - **Python 3.12+**. `uv` is the canonical package manager (`uv.lock` is committed); `pip install -e ".[dev]"` also works.
-- Runtime deps (see `pyproject.toml`): `anthropic[vertex]`, `google-genai` (embeddings; `google-cloud-aiplatform` was dropped in 59b5fde, it imports nowhere here and only supplied `google-genai` by transitive accident), `mcp[cli]`, `numpy`, `pymupdf`, `python-docx`, `python-pptx`, `openpyxl`, `pyxlsb`, `xlrd`, `pytesseract`, `pillow`, `pillow-heif`, `compoundfiles`, `youtube-transcript-api`.
+- Runtime deps (see `pyproject.toml`): `anthropic[vertex]`, `google-genai` (embeddings and the Gemini engine), `mcp[cli]`, `numpy`, `pymupdf`, `python-docx`, `python-pptx`, `openpyxl`, `pyxlsb`, `xlrd`, `pytesseract`, `pillow`, `pillow-heif`, `youtube-transcript-api`, and `anyio` (a security floor on a transitive dependency). None is source-only, so CI installs with `--no-build` and runs no `setup.py`.
 - System packages `pip` cannot install: **`tesseract` plus the `eng` and `ell` traineddata** (`attachment_extractors.py` calls `lang="eng+ell"`, and `pytesseract` is only the wrapper), and **`zstd` + `openssl`** for `scripts/backup_db.py` offsite snapshots. Verify with `tesseract --list-langs | grep -x ell`.
-- Dev extra is `pytest` + `pytest-cov` only. **`ruff` is not in it**: CI pins `ruff==0.15.13` and pre-commit pins `v0.15.12`, so run `uvx ruff@0.15.13 check .` locally. Pre-commit: `ruff` (check + format), `mypy`, `gitleaks`, `yamllint` (workflows only), `markdownlint`, and a `pii-gauntlet` gate.
+- Dev extra is `pytest` + `pytest-cov` only. **`ruff` is not in it**: CI pins `ruff==0.16.8` and pre-commit pins the same `v0.16.8` (keep them in lockstep), so run `uvx ruff@0.16.8 check .` locally. Pre-commit: `ruff` (check + format), `mypy`, `gitleaks`, `yamllint` (workflows only), `markdownlint`, and a `pii-gauntlet` gate.
 - DB: SQLite at `data/brain.db` (override with `--db`, or relocate the whole data home with `BRAIN_DATA_DIR`, which must be an absolute path). `data/` is gitignored and never committed.
 
 ## Running
@@ -15,6 +15,12 @@ Multi-modal personal knowledge base: ingests emails, attachments, calendar event
 - MCP server: `./run_mcp.sh` (auto-detects the venv: `$SECOND_BRAIN_VENV_PYTHON`, `./.venv`, `./venv`, `~/.venvs/second-brain`, then `python3`).
 - CLI: `python -m src.cli --help` (or the `./brain` wrapper).
 - Incremental sync over staged mail (extract → load → attachments → dedup → embed → conversations → images): `python -m src.cli sync`. Mail is staged by `python -m src.export.outlook_export` (outlook-cli); `sync` never exports it. Teams, calendar, news, SharePoint and the filesystem scan are separate subcommands and need their own schedule.
+
+## Hosts
+
+- The producer, a Linux VPS in this deployment, runs every ingest job on `systemd --user` timers and owns the only writable `brain.db`. Deploy code there by pulling; the wrappers the units run are archived in `scripts/wrappers/systemd/`.
+- A Mac is a replica: an hourly pull (`scripts/wrappers/launchd/sb-db-pull.sh`) copies `brain.db` and `embeddings.npz` down, and the local MCP server reads that copy. Every writer refuses to run on a replica: the `python -m src.cli` subcommands that write, the action lifecycle, the store maintenance modules, the scripts that write and the MCP `sharepoint_index` refetch (`BRAIN_ROLE=replica`, or the pull's stamp `~/.second-brain/db-pull.stamp`); `BRAIN_ROLE=producer` overrides the stamp.
+- Schema migrations run on the producer and reach replicas with the next pull.
 
 ## Tests
 
@@ -27,7 +33,7 @@ pytest --cov=src --cov-report=term
 
 `tests/conftest.py` redirects the data root to a temp dir in `pytest_configure` (before collection, because `src/config.py` resolves paths at import time) and blocks sockets for the whole session. Do not re-do either by hand in a test, and do not assume this machine's `data/` tree exists on CI.
 
-CI (`.github/workflows/ci.yml`), four jobs on every push and PR to `master`: `lint` (`ruff check` + `ruff format --check`), `test` (`uv sync --frozen --extra dev`, then `pytest` with coverage over `src` and `scripts`), `pii-gauntlet`, and `wrappers` (parses each `scripts/wrappers/` script with its declared interpreter).
+CI (`.github/workflows/ci.yml`), five jobs on every push and PR to `master`: `lint` (`ruff check` + `ruff format --check`), `test` (`uv sync --frozen --no-build --extra dev`, then `pytest` with coverage over `src` and `scripts`), `types` (pinned `mypy` over `src/` and `scripts/`), `pii-gauntlet`, and `wrappers` (parses each `scripts/wrappers/` script with its declared interpreter).
 
 ## Architecture (four stages)
 

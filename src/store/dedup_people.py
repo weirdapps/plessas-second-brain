@@ -419,11 +419,24 @@ def run_dedup(db_path: str | None = None, dry_run: bool = False) -> dict:
     return results
 
 
-if __name__ == "__main__":
+def main() -> int:
     import argparse
+    import sys
+
+    from src.config import is_replica, replica_refusal
 
     parser = argparse.ArgumentParser(description="Deduplicate people table")
     parser.add_argument("--db", type=str, default=str(DB_PATH))
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if is_replica():
+        # Even a dry run writes and rolls back, and a replica's copy is replaced
+        # by the next pull (see src/config.py).
+        print(replica_refusal("the people dedup"), file=sys.stderr)
+        return 2
     run_dedup(args.db, args.dry_run)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

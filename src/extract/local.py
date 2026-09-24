@@ -918,9 +918,18 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
     # mid-run must not hand this loop an unbounded or already-expired budget.
     deadline = None if deadline_s is None else time.monotonic() + deadline_s
 
+    # Quota errors in a row, as the email loop counts them: a success starts
+    # again from zero, another failure leaves the count where it was.
+    consecutive_quota = 0
     for i, conv in enumerate(pending):
         if _shutdown:
             log("Shutdown requested, saving state...")
+            break
+        if consecutive_quota >= CONSECUTIVE_FAIL_THRESHOLD:
+            log(
+                f"QUOTA PAUSE: {consecutive_quota} consecutive quota errors; ending the run, "
+                f"{len(pending) - i} conversation(s) stay pending for the next one."
+            )
             break
 
         # Checked before the call, never during: one extraction is a single
@@ -943,9 +952,12 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
             timeout_counts.pop(session_id, None)
             failed_this_run.pop(session_id, None)
             total_done += 1
+            consecutive_quota = 0
             log(f"Extracted conv {session_id[:12]}... ({i + 1}/{len(pending)})")
         else:
             total_failed += 1
+            if is_quota:
+                consecutive_quota += 1
             if failure:
                 failed_this_run[session_id] = failure
             log(f"FAILED conv {session_id[:12]}...")

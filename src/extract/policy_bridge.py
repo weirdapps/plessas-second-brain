@@ -130,9 +130,12 @@ def is_overload(exc: BaseException) -> bool:
     """The service is overloaded: the direct API's OverloadedError, or the 529 the
     Vertex client raises as a plain InternalServerError, having no class for it.
 
-    The extraction loop treats it as quota (local._should_quota_pause). The retry
-    policy keeps a Vertex 529 on the API-error budget: the rate-limit backoff
-    (60, 120, 240 s) held a call already running well past the sync's slice.
+    The extraction loop treats both as quota (local._should_quota_pause). To the
+    retry policy they differ: the direct API's OverloadedError keeps the
+    rate-limit posture it has always had, while a Vertex 529 stays on the
+    API-error budget, because on the producer, which runs on Vertex, the
+    rate-limit backoff (60, 120, 240 s) held a call already running well past
+    the sync's slice.
     """
     return isinstance(exc, anthropic.OverloadedError) or (
         isinstance(exc, anthropic.APIStatusError) and getattr(exc, "status_code", 0) == 529

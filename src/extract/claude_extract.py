@@ -14,6 +14,7 @@ from typing import Any
 from src.llm_policy import (
     Action,
     Attempt,
+    Outcome,
     ReauthResult,
     decide,
     default_adc_probe,
@@ -69,14 +70,14 @@ _cached_client_and_model = None
 
 
 def _build_client_and_model():
-    """Build a new Anthropic client + resolved model name (no caching)."""
+    """Build a new Anthropic client + resolved model name (no caching).
+
+    Vertex wins whenever a project is set. ANTHROPIC_API_KEY counts only without
+    one: it used to win, so a key left in a shell profile sent work mail to the
+    direct API instead of Vertex. The backend in use goes to stderr, which the
+    sync logs capture.
+    """
     model = CLAUDE_MODEL_BASE
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if api_key:
-        from anthropic import Anthropic
-
-        return Anthropic(api_key=api_key, timeout=60.0), model
 
     project_id = os.environ.get("VERTEX_SDK_PROJECT") or os.environ.get(
         "ANTHROPIC_VERTEX_PROJECT_ID"
@@ -96,11 +97,22 @@ def _build_client_and_model():
             parts = model.rsplit("-", 1)
             if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) >= 8:
                 model = f"{parts[0]}@{parts[1]}"
+        print(
+            f"second-brain: Claude via Vertex AI, region {region}, model {model}", file=sys.stderr
+        )
         return AnthropicVertex(project_id=project_id, region=region, timeout=120.0), model
 
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key:
+        from anthropic import Anthropic
+
+        print(f"second-brain: Claude via the direct Anthropic API, model {model}", file=sys.stderr)
+        return Anthropic(api_key=api_key, timeout=60.0), model
+
     raise RuntimeError(
-        "No Claude credentials found. Set ANTHROPIC_API_KEY for direct API, "
-        "or ANTHROPIC_VERTEX_PROJECT_ID + CLOUD_ML_REGION for Vertex AI."
+        "No Claude credentials found. For Vertex AI set VERTEX_SDK_PROJECT (or "
+        "ANTHROPIC_VERTEX_PROJECT_ID), with the region in VERTEX_SDK_REGION or "
+        "CLOUD_ML_REGION (default europe-west1); for the direct API set ANTHROPIC_API_KEY."
     )
 
 
@@ -128,9 +140,9 @@ def reset_client_cache():
 # Process-wide latch: once a re-auth has FAILED, no other worker repeats the wait.
 #
 # On Linux reauth() has no local remedy and polls for PUSH_WAIT_SECONDS (1020s) waiting
-# for the Mac's token push. call_with_policy runs per item, and three of its call sites
-# drive a ThreadPoolExecutor (local.py:397, attachment_pipeline.py:361,
-# image_pipeline.py:284). Without a latch each worker in turn pays its own full wait, so
+# for the Mac's token push. complete() runs per item, and three of its callers drive a
+# ThreadPoolExecutor (local.py, attachment_pipeline.py, image_pipeline.py). Without a
+# latch each worker in turn pays its own full wait, so
 # four workers spend 68 minutes discovering, four times over, the one fact the first
 # worker already established in 17: the push is not coming.
 #
@@ -216,14 +228,17 @@ def _reauth_unless_latched(*, is_linux: bool) -> ReauthResult | None:
         return result
 
 
-def call_with_policy(fn, *, max_call_seconds: float) -> object:
+def call_with_policy(fn, *, max_call_seconds: float, refusal_is_final: bool = False) -> object:
     """Run fn() under the shared retry/reauth policy.
 
     fn is a zero-argument callable that performs a single SDK request and returns
     the response or raises.  Returns the response when the policy says RETURN, or
-    raises the last exception when the policy gives up.  Both extract_one and
-    extract_conversation route through this so that auth failures trigger a re-auth
-    and a retry rather than propagating immediately.
+    raises the last exception when the policy gives up.  complete() routes every
+    Claude call site through this so that auth failures trigger a re-auth and a
+    retry rather than propagating immediately.
+
+    refusal_is_final returns a refusal at once instead of letting the policy's
+    REFUSAL row retry it, for an fn() that has already retried it elsewhere.
 
     now is always time.time() (wall clock), never time.monotonic().
     PTS_LLM_DEADLINE is wall-clock arithmetic; a monotonic now (~1e5) against an
@@ -250,6 +265,8 @@ def call_with_policy(fn, *, max_call_seconds: float) -> object:
             last_exc = exc
 
         outcome = classify_exception(last_exc, last_response)
+        if refusal_is_final and outcome is Outcome.REFUSAL:
+            return last_response
         attempt = attempt.bump(outcome)
         decision = decide(
             outcome,
@@ -288,30 +305,51 @@ def call_with_policy(fn, *, max_call_seconds: float) -> object:
     return last_response
 
 
+def complete(*, max_tokens: int, messages: list, model: str | None = None, **kwargs: Any) -> Any:
+    """Send one Claude request, the way every extraction call site does.
+
+    The call sites used to build this themselves, and drifted: attachments,
+    images and calendar had no refusal fallback, and the curate job had no
+    retry policy. Here each gets all of it: the shared client, fetched again on
+    every attempt so that a re-auth (which drops the cached client) reaches the
+    retry; the retry and re-auth policy; and one retry on the fallback tier when
+    the model refuses. `model` overrides the configured model (Teams has its
+    own); `kwargs` go to the SDK as they are (`system`). Do not close the
+    client: it is shared.
+
+    The policy does not retry a refusal here: the fallback tier has usually had
+    it already (see vertex_fallback for when it has not), and the policy's
+    REFUSAL row would replay primary and fallback twice more, when replaying a
+    pair cannot change its answer. A refused attempt can take two calls,
+    primary then fallback. When the
+    attempt was checked against the deadline first (a retry decide() allowed,
+    or a caller that checks before starting, like the curate job) the reserve
+    holds room for the second; an unchecked first call refused near the
+    deadline can run into the shutdown grace.
+    """
+    # Imported here, not at the top, so tests that patch it in vertex_fallback
+    # reach this call.
+    from src.extract.vertex_fallback import create_with_refusal_fallback
+
+    def _do_call():
+        client, configured = _get_client_and_model()
+        return create_with_refusal_fallback(
+            client, model=model or configured, max_tokens=max_tokens, messages=messages, **kwargs
+        )
+
+    return call_with_policy(_do_call, max_call_seconds=120.0, refusal_is_final=True)
+
+
 def extract_one(email: dict) -> dict | None:
     """Extract structured data from a single email using Claude."""
     sys.path.insert(0, str(REPO_ROOT))
     from src.extract.parser import parse_extraction
     from src.extract.prompt import build_extraction_prompt
-    from src.extract.vertex_fallback import create_with_refusal_fallback
 
     prompt = build_extraction_prompt(email)
-
-    # _do_call calls _get_client_and_model() on each attempt so that a successful
-    # reauth (which calls reset_client_cache) is picked up on the retry rather than
-    # silently reusing the stale in-memory credential.  Do not close the returned
-    # client — it is the shared, long-lived instance (see _get_client_and_model).
-    def _do_call():
-        current_client, current_model = _get_client_and_model()
-        return create_with_refusal_fallback(
-            current_client,
-            model=current_model,
-            max_tokens=MAX_OUTPUT_TOKENS,
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-    # call_with_policy is typed to return object; this is the SDK's Message.
-    response: Any = call_with_policy(_do_call, max_call_seconds=120.0)
+    response = complete(
+        max_tokens=MAX_OUTPUT_TOKENS, messages=[{"role": "user", "content": prompt}]
+    )
 
     text = _response_text(response)
     if text.startswith("```"):
@@ -332,24 +370,11 @@ def extract_conversation(conversation: dict) -> dict | None:
     sys.path.insert(0, str(REPO_ROOT))
     from src.extract.parser import CONVERSATION_SENTIMENT_VALUES, parse_extraction
     from src.extract.prompt import build_conversation_extraction_prompt
-    from src.extract.vertex_fallback import create_with_refusal_fallback
 
     prompt = build_conversation_extraction_prompt(conversation)
-
-    # _do_call calls _get_client_and_model() on each attempt so that a successful
-    # reauth (which calls reset_client_cache) is picked up on the retry rather than
-    # silently reusing the stale in-memory credential.  Do not close the returned
-    # client — it is the shared, long-lived instance (see _get_client_and_model).
-    def _do_call():
-        current_client, current_model = _get_client_and_model()
-        return create_with_refusal_fallback(
-            current_client,
-            model=current_model,
-            max_tokens=MAX_OUTPUT_TOKENS,
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-    response = call_with_policy(_do_call, max_call_seconds=120.0)
+    response = complete(
+        max_tokens=MAX_OUTPUT_TOKENS, messages=[{"role": "user", "content": prompt}]
+    )
 
     text = _response_text(response)
     if text.startswith("```"):

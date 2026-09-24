@@ -133,3 +133,21 @@ def test_retries_when_the_primary_region_is_unknowable(monkeypatch):
         )
 
     assert out.content[0].text == "RECOVERED"
+
+
+def test_without_a_project_it_logs_no_downgrade_it_cannot_make(monkeypatch, caplog):
+    """On the direct API the log said 'downgrading to fallback' and then that no
+    project existed: a Vertex call that never happened, in the record of where
+    content went."""
+    monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
+    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    primary = MagicMock()
+    primary.messages.create.return_value = _resp("refused", stop_reason="refusal")
+
+    with patch("anthropic.AnthropicVertex") as mk_vertex:
+        out = create_with_refusal_fallback(primary, model="m", max_tokens=10, messages=[])
+
+    assert out.stop_reason == "refusal"
+    mk_vertex.assert_not_called()
+    assert "downgrading" not in caplog.text
+    assert "No Vertex project" in caplog.text

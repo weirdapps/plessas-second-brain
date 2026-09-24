@@ -782,3 +782,32 @@ def test_a_chat_summary_leaves_system_messages_out(tmp_path):
 
     assert [m["content_text"] for m in summary["last_messages"]] == ["hi"]
     assert summary["top_senders"] == [{"name": "Bob", "n": 1}]
+
+
+def test_a_teams_search_matches_no_system_message(tmp_path):
+    """A call record names who was on the call, so a search for a name found the
+    record's XML as that person's message."""
+    from src.store.schema import create_database
+    from src.store.teams_query import search_teams
+
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.execute(
+        "INSERT INTO teams_chats (id, teams_chat_id, chat_kind, first_seen_at) "
+        "VALUES (1, '19:t', 'oneOnOne', '2026-09-01T00:00:00')"
+    )
+    rows = [
+        ("m0", "<partlist><part><name>Okapi Zebrafish</name></part></partlist>", 1),
+        ("m1", "the okapi report is ready", 0),
+    ]
+    for message_id, content, is_system in rows:
+        conn.execute(
+            "INSERT INTO teams_messages (teams_message_id, chat_id, composed_at, "
+            "sender_display_name, content_text, is_system) VALUES (?, 1, '2026-09-01', 'X', ?, ?)",
+            (message_id, content, is_system),
+        )
+    conn.commit()
+
+    assert search_teams(conn, "zebrafish", kind="message") == []
+    assert [r["snippet"] for r in search_teams(conn, "okapi", kind="message")] == [
+        "the [okapi] report is ready"
+    ]

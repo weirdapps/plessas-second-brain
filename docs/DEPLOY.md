@@ -299,7 +299,7 @@ replica on 2026-09-24: 1,261 rows marked, 123 threads counted again, 95 queued,
 in 0.2 s. A thread of calls alone, or with too little else, keeps its summary. Stop
 `sb-teams-sync.timer`, and let a running sync exit, before the pull: a sync still
 running the old code stores call records unmarked, and the migration runs once.
-`python -m src.cli migrate` runs it, as does the first sync after the pull.
+Then run `python -m src.cli migrate` and start the timer again.
 
 ## 8. Backup and restore
 

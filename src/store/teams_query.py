@@ -87,7 +87,7 @@ def _teams_hits(conn: sqlite3.Connection, safe: str, kind: str, limit: int) -> l
             JOIN teams_messages m ON m.id = teams_messages_fts.rowid
             LEFT JOIN teams_threads t ON t.id = m.thread_id
             JOIN teams_chats c ON c.id = m.chat_id
-            WHERE teams_messages_fts MATCH ?
+            WHERE teams_messages_fts MATCH ? AND m.is_system = 0
             ORDER BY rank
             LIMIT ?
             """,

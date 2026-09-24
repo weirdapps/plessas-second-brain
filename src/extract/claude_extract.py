@@ -317,11 +317,14 @@ def complete(*, max_tokens: int, messages: list, model: str | None = None, **kwa
     own); `kwargs` go to the SDK as they are (`system`). Do not close the
     client: it is shared.
 
-    The fallback tier is the only retry a refusal gets. The policy would replay
-    it twice more, primary and fallback each time, and replaying a pair cannot
-    change its answer (see vertex_fallback). A refused attempt can still take
-    two calls, primary then fallback: the deadline reserve's one-call allowance
-    beyond max_call_seconds is what covers the second.
+    The policy does not retry a refusal here: the fallback tier has already had
+    it, and the policy's REFUSAL row would replay primary and fallback twice
+    more, when replaying a pair cannot change its answer (see vertex_fallback).
+    A refused attempt still takes two calls, primary then fallback. When the
+    attempt was checked against the deadline first (a retry decide() allowed,
+    or a caller that checks before starting, like the curate job) the reserve
+    holds room for the second; an unchecked first call refused near the
+    deadline can run into the shutdown grace.
     """
     # Imported here, not at the top, so tests that patch it in vertex_fallback
     # reach this call.

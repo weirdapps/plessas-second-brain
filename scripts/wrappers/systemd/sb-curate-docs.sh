@@ -20,9 +20,9 @@ LOG_FILE="$LOG_DIR/curate-docs.log"
 mkdir -p "$LOG_DIR"
 
 # --- Concurrency guard (PID-aware mkdir lock), the same as sb-daily-sync.sh's,
-# where the reasons are. Overridable so the wrapper tests never touch a lock a
-# real run may hold; it is removed with rm -rf, so the override must be an
-# absolute path to a *.lock directory.
+# where the reasons are, but for the traps below. Overridable so the wrapper
+# tests never touch a lock a real run may hold; it is removed with rm -rf, so
+# the override must be an absolute path to a *.lock directory.
 LOCK_DIR="${SB_CURATE_DOCS_LOCK:-/tmp/sb-curate-docs.lock}"
 case "$LOCK_DIR" in
   /*.lock) ;;
@@ -50,7 +50,12 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   exit 73
 fi
 echo $$ > "$LOCK_DIR/pid"
-trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+# A stop signal removes the lock and then dies of that signal. Exiting with
+# status 143 would mark the unit failed, where a death by SIGTERM, which is what
+# systemd saw while the job was exec'd, is a clean stop.
+trap 'rm -rf "$LOCK_DIR"' EXIT
+trap 'rm -rf "$LOCK_DIR"; trap - TERM; kill -TERM $$' TERM
+trap 'rm -rf "$LOCK_DIR"; trap - INT; kill -INT $$' INT
 
 # No needs_reauth gate here on purpose. Curation reads brain.db and calls
 # Vertex; curate_documents_daily.py names neither outlook-cli nor sharepoint-cli,

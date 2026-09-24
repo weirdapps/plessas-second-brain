@@ -14,7 +14,7 @@ Multi-modal personal knowledge base: ingests emails, attachments, calendar event
 
 - MCP server: `./run_mcp.sh` (auto-detects the venv: `$SECOND_BRAIN_VENV_PYTHON`, `./.venv`, `./venv`, `~/.venvs/second-brain`, then `python3`).
 - CLI: `python -m src.cli --help` (or the `./brain` wrapper).
-- Incremental sync (export → extract → load → attachments → dedup → embed → conversations → images): `python -m src.cli sync`. Teams, calendar, news, SharePoint and the filesystem scan are separate subcommands and need their own schedule.
+- Incremental sync over staged mail (extract → load → attachments → dedup → embed → conversations → images): `python -m src.cli sync`. Mail is staged by `python -m src.export.outlook_export` (outlook-cli); `sync` never exports it. Teams, calendar, news, SharePoint and the filesystem scan are separate subcommands and need their own schedule.
 
 ## Tests
 

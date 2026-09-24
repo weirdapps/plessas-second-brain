@@ -143,8 +143,9 @@ def register_downloaded_attachments(
     Downloading and recording are separate halves, and only the download half
     was ever built for the outlook-cli path — `download_attachments_for_messages`
     writes binaries to <base_dir>/<message_id>/ and returns. The recording half
-    lived exclusively in `export_sync_attachments`, which drives Mail.app over
-    AppleScript and is skipped off macOS. So the VPS accumulated 7,387 files
+    lived exclusively in the Apple Mail exporter (since removed), which drove
+    Mail.app over AppleScript and was skipped off macOS. So the VPS accumulated
+    7,387 files
     that no downstream stage could see, because every one of them reads the
     table rather than the disk.
 

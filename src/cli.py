@@ -110,8 +110,9 @@ EXTRACT_DEADLINE_BY_UNIT_S = {
 
 # Observed span for the stages that have no budget of their own: load,
 # registration (count-bounded), people dedup, and the incremental embeddings
-# update (about 10 s). Mail fetch is SYNC_WRAPPER_FETCH_OBSERVED_S above.
-SYNC_FIXED_WORK_S = 60.0
+# update (about 10 s), made twice when Step 7 loads conversations, and each
+# rewrites the whole index. Mail fetch is SYNC_WRAPPER_FETCH_OBSERVED_S above.
+SYNC_FIXED_WORK_S = 80.0
 
 # What the stages after Step 2 need, held back from the unit's remaining time.
 SYNC_AFTER_EXTRACTION_S = (

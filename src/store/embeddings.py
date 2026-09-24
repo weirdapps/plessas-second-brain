@@ -410,7 +410,9 @@ def build_index(conn: sqlite3.Connection, force: bool = False) -> int:
                 )
             present = set(existing_id_order)
             fresh = [i for i, vid in enumerate(ids) if vid not in present]
-            gone = _conversation_vectors_gone(conn, existing_id_order)
+            # Fresh ones too: a conversation loaded again while it was embedded.
+            gone = _conversation_vectors_gone(conn, existing_id_order + [ids[i] for i in fresh])
+            fresh = [i for i in fresh if ids[i] not in gone]
             if gone:
                 _log(f"Dropping {len(gone)} vectors of conversations no longer stored")
                 kept = np.array([vid not in gone for vid in existing_id_order], dtype=bool)

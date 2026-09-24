@@ -345,7 +345,8 @@ def query_by_keyword(
     Returns:
         List of dicts with keys: email_id, date, subject, summary, snippet, source
         where source is 'subject', 'summary', 'content', 'key_fact' or
-        'attachment'. When no row carries
+        'attachment'; a row whose thread has more than one email matching in its
+        subject, summary or body adds thread_matches, that count. When no row carries
         every token, rows matching any meaningful token come back instead, each
         flagged partial_match.
     """
@@ -375,6 +376,58 @@ def _best_of_each_thread(rank: str, then: str = "") -> str:
     return f"ROW_NUMBER() OVER (PARTITION BY COALESCE({_THREAD}, e.id) ORDER BY {order})"
 
 
+# Up to this many emails in the page's threads, their matches are counted one
+# full-text seek per email; past it, from one pass over each column's matches.
+_SEEKS_UP_TO = 200
+
+
+def _matching_emails_per_thread(
+    conn: sqlite3.Connection, expression: str, keys: set, search_content_only: bool
+) -> dict:
+    """Thread key -> how many of its emails match `expression` in the subject, the
+    summary or the body (the body alone for a content-only search), each column
+    on its own, as each stage of the waterfall matches it.
+
+    The page's threads are read through the conversation_id index, then their
+    emails are checked one seek each, or, past _SEEKS_UP_TO emails, against one
+    pass over each column's matches. On the replica a page's threads hold 2 to
+    122 emails: seeks take 0 to 5 ms, a pass 22 to 111 ms. A seek costs 0.03 to
+    1 ms by the query, so 20 threads of 700 emails took 1.6 to 14 s by seeks
+    and 20 to 87 ms in one pass; the counts are the same.
+    """
+    columns = ["content_f"]
+    if not search_content_only:
+        columns.append("summary_f")
+        if _has_subject_index(conn):
+            columns.append("subject_f")
+    members = (
+        "SELECT e.id AS id, j.value AS thread FROM json_each(?) j "
+        f"JOIN emails e ON e.conversation_id = j.value AND {_THREAD} = j.value"
+    )
+    threads = json.dumps(sorted(keys))
+    (count,) = conn.execute(f"SELECT COUNT(*) FROM ({members})", (threads,)).fetchone()
+    if count <= _SEEKS_UP_TO:
+        matched = " OR ".join(
+            "EXISTS (SELECT 1 FROM emails_fts "
+            f"WHERE emails_fts.rowid = m.id AND emails_fts.{column} MATCH ?)"
+            for column in columns
+        )
+    else:
+        matched = (
+            "m.id IN ("
+            + " UNION ".join(
+                f"SELECT rowid FROM emails_fts WHERE emails_fts.{column} MATCH ?"
+                for column in columns
+            )
+            + ")"
+        )
+    rows = conn.execute(
+        f"WITH m AS ({members}) SELECT m.thread, COUNT(*) FROM m WHERE {matched} GROUP BY m.thread",
+        (threads, *[expression] * len(columns)),
+    )
+    return dict(rows)
+
+
 def thread_keys(conn: sqlite3.Connection, email_ids) -> dict:
     """Each email's thread as keyword search counts threads (_THREAD), by id;
     None for an email with none."""
@@ -400,6 +453,7 @@ def _keyword_waterfall(
     results: list[dict] = []
     seen_ids: set[int] = set()
     taken_threads: set[str] = set()
+    thread_of: dict[int, str] = {}
 
     def take(rows) -> None:
         """Append the rows not found already, until the page is full.
@@ -419,6 +473,7 @@ def _keyword_waterfall(
             seen_ids.add(r["email_id"])
             if thread is not None:
                 taken_threads.add(thread)
+                thread_of[r["email_id"]] = thread
             results.append(r)
 
     def taken() -> str:
@@ -596,6 +651,19 @@ def _keyword_waterfall(
     # attachment); keep that order rather than re-sorting by date, so BM25
     # relevance is not discarded. (True cross-source ranking via score fusion / RRF
     # is a later change.) take() stops at the requested number.
+
+    # The row shown stands for all of its thread's matches, in any field: a reply
+    # chain holds the words in one subject or summary and in every quoting body,
+    # and half the corpus is threaded by subject alone (recurring reports). Say
+    # how many matched, so a caller knows to open email_thread.
+    if thread_of:
+        counts = _matching_emails_per_thread(
+            conn, safe_keyword, set(thread_of.values()), search_content_only
+        )
+        for r in results:
+            matched = counts.get(thread_of.get(r["email_id"]), 0)
+            if matched > 1:
+                r["thread_matches"] = matched
     return results
 
 

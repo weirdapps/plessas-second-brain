@@ -140,8 +140,11 @@ def apply_reviewed_merges(conn: sqlite3.Connection, rows: list[dict]) -> int:
     return merged
 
 
-def _cli() -> None:
+def _cli() -> int:
     import argparse
+    import sys
+
+    from src.config import is_replica, replica_refusal
 
     parser = argparse.ArgumentParser(description="Review-gated fuzzy people matching")
     parser.add_argument("--db", type=str, default=str(DB_PATH))
@@ -154,6 +157,11 @@ def _cli() -> None:
     )
     parser.add_argument("--threshold", type=float, default=0.82)
     args = parser.parse_args()
+    if args.apply and is_replica():
+        # Generating only reads; applying merges people, and a replica's copy
+        # is replaced by the next pull (see src/config.py).
+        print(replica_refusal("applying people merges"), file=sys.stderr)
+        return 2
 
     conn = get_connection(args.db)
     if args.apply:
@@ -167,7 +175,8 @@ def _cli() -> None:
             f"Wrote {n} candidate pair(s) to {args.out} — review, keep decision:'merge', then --apply"
         )
     conn.close()
+    return 0
 
 
 if __name__ == "__main__":
-    _cli()
+    raise SystemExit(_cli())

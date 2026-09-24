@@ -2299,6 +2299,24 @@ def cmd_stats(args):
         print(f"Date Range:          {earliest} to {latest}")
 
 
+# Subcommands that only read, and so may run on a replica. Everything else
+# writes to the database or starts an export, and a new subcommand is refused
+# there until it is added here.
+READ_ONLY_COMMANDS = frozenset(
+    {
+        "query",
+        "prep",
+        "stale",
+        "stats",
+        "teams-search",
+        "teams-thread",
+        "teams-chat",
+        "teams-stats",
+        "prune-staged",
+    }
+)
+
+
 def main():
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -2775,6 +2793,12 @@ def main():
     if args.command == "query" and not args.query_type:
         parser_query.print_help()
         sys.exit(1)
+
+    from src import config
+
+    if args.command not in READ_ONLY_COMMANDS and config.is_replica():
+        print(config.replica_refusal(f"'{args.command}'"), file=sys.stderr)
+        sys.exit(2)
 
     # Execute command
     try:

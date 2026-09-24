@@ -85,3 +85,24 @@ def test_the_skip_export_flag_the_schedules_pass_still_reaches_sync(monkeypatch,
     cli.main()
 
     assert seen == [True]
+
+
+def test_sync_on_an_empty_store_says_how_to_fill_it(tmp_path, capsys):
+    """It skips an empty store, and used to send the reader to an export command
+    that no longer exists."""
+    from src import cli
+    from src.store.schema import create_database
+
+    db_path = tmp_path / "brain.db"
+    create_database(str(db_path)).close()
+    args = types.SimpleNamespace(
+        db=db_path, limit=None, engine="claude", workers=1, skip_export=False
+    )
+
+    with patch("src.extract.local.run_extraction") as extraction:
+        cli.cmd_sync(args)
+
+    out = capsys.readouterr().out
+    assert "python -m src.extract.local" in out
+    assert "python -m src.cli load" in out
+    extraction.assert_not_called()

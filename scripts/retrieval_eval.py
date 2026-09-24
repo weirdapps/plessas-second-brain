@@ -74,12 +74,12 @@ def rank_of(results: list[dict], email_ids: set[int]) -> int | None:
 
 
 def thread_of(conn: sqlite3.Connection, email_id: int) -> set[int]:
-    """The ids of every email in `email_id`'s conversation, itself included."""
-    row = conn.execute("SELECT conversation_id FROM emails WHERE id = ?", (email_id,)).fetchone()
-    if not row or not row[0]:
-        return {email_id}
-    ids = conn.execute("SELECT id FROM emails WHERE conversation_id = ?", (row[0],))
-    return {r[0] for r in ids} | {email_id}
+    """The ids of every email in `email_id`'s thread, itself included: the thread
+    search and email_thread know, so a News day or the blank-subject hash is not
+    one."""
+    from src.store.query import query_thread
+
+    return {e["email_id"] for e in query_thread(conn, email_id, limit=-1)} | {email_id}
 
 
 def score(ranks: list[int | None]) -> dict:

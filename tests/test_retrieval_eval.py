@@ -97,3 +97,32 @@ def test_another_email_of_the_thread_counts_for_the_thread_only(ev, tmp_path):
     assert result["email"]["hit@1"] == 0.0
     assert result["thread"]["hit@1"] == 1.0
     assert misses == []
+
+
+def test_a_thread_is_the_one_search_and_email_thread_know(ev, tmp_path):
+    """News keeps a day per pipeline as its conversation_id and blank subjects
+    share one hash: neither makes their emails one thread, so neither is a hit."""
+    from src.store.schema import subject_to_conversation_id
+
+    path = tmp_path / "t.db"
+    conn = create_database(str(path))
+    blank = subject_to_conversation_id("")
+    conn.executemany(
+        "INSERT INTO emails (id, message_id, date_received, subject, mailbox_name, summary, "
+        "conversation_id) VALUES (?, ?, '2026-09-01T00:00:00Z', ?, ?, 'nothing', ?)",
+        [
+            (1, 1, "", "Inbox", blank),
+            (2, 2, "", "Inbox", blank),
+            (3, 3, "ECB holds", "News", "news:digest:2026-09-01"),
+            (4, 4, "ECB warns", "News", "news:digest:2026-09-01"),
+            (5, 5, "Plan", "Inbox", "T"),
+            (6, 6, "RE: Plan", "Inbox", "T"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+    ro = ev._open(path)
+
+    assert ev.thread_of(ro, 1) == {1}
+    assert ev.thread_of(ro, 3) == {3}
+    assert ev.thread_of(ro, 5) == {5, 6}

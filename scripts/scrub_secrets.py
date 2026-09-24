@@ -32,7 +32,8 @@ that write the database first.
 
 Run it on the host that builds the database, with the writers stopped. Counts
 only are printed, never a value. Defaults to a dry run, which opens the database
-read-only and exits 1 when it finds anything. Snapshots taken before the scrub
+read-only and exits 1 when it finds anything. On a replica --apply is refused
+with exit 3, since the next pull replaces the file. Snapshots taken before the scrub
 still hold the old rows: the encrypted offsite ones, and the plaintext local
 ones in data/backups/, both of which age out under the retention policy.
 """

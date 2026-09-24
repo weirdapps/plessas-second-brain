@@ -11,7 +11,8 @@ labelled `mailbox_name='Inbox'` whose `message_id` is no longer there has
 been moved out. We assume → Archive (matches the dominant /triage-inbox
 flow). Subfolder routing would mislabel — accept that until it bites.
 
-Runs after every hourly Inbox sync (~1s — current Inbox is tiny).
+Runs after every hourly Inbox sync (~1s — current Inbox is tiny). Exits 5,
+touching nothing, on a replica (see src.config.is_replica).
 """
 
 from __future__ import annotations

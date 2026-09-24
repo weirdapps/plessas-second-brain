@@ -80,6 +80,8 @@ _ENDED_BY = {
     "tr": {"tr"} | _SECTIONS, "li": {"li"}, "dt": {"dt", "dd"}, "dd": {"dt", "dd"},
     "p": _BLOCKS | _PARAGRAPHS,
 }  # fmt: skip
+# What ends any of them. Any other tag, an inline one say, ends nothing.
+_ENDS = frozenset().union(*_ENDED_BY.values())
 _CONTAINER = {
     "td": {"tr", "table"}, "th": {"tr", "table"}, "tr": {"table"} | _SECTIONS,
     "tbody": {"table"}, "thead": {"table"}, "tfoot": {"table"},
@@ -101,17 +103,29 @@ _NO_PLACEHOLDERS = str.maketrans("", "", "\ufdd0\ufdd1")
 
 # A body that ends inside a hidden element is read again without its opening
 # tag, at most this many times: not after a script, which is code even when it
-# writes markup, nor after a style that nothing but its own CSS followed.
+# writes markup, nor after a style that nothing but its own CSS followed...
 _REREADS = 3
+# ...and the re-reads read no more than this between them: read four times, a
+# crafted body cost 7 s a megabyte, and no body in the corpus needs a re-read at
+# all (19,804 on 2026-09-24, the largest 1.7 MB).
+_REREAD_BYTES = 2_000_000
 # What the scan after a stylesheet stops at: a comment, a string, or markup.
 _CSS_TOKEN = re.compile(r"/\*|[\"']|<[a-zA-Z/!]")
 # A CSS string ends at its quote or, unterminated, at the line's end.
 _CSS_STRING = {q: re.compile(rf"{q}(?:[^{q}\\\n]|\\.)*{q}?") for q in ("'", '"')}
-# Where a head ends: at its end tag or at the body's start tag.
-_HEAD_END = re.compile(r"</head[\s>]|<body[\s/>]", re.IGNORECASE)
+# Where a head ends: at its end tag, at the body's start tag, or, as a browser
+# ends it, at the first element a head cannot hold.
+_HEAD_END = re.compile(
+    r"</head[\s>]|<(?:body|div|p|br|span|font|center|table|tbody|thead|tfoot|tr|td|th|img"
+    r"|ul|ol|li|dl|dt|dd|h[1-6]|hr|pre|blockquote|section|article|header|footer|main|nav"
+    r"|aside|form|a|b|i|u|em|strong|small|big|sub|sup)[\s/>]",
+    re.IGNORECASE,
+)
 # What a head holds besides the hidden elements: an element left open before
-# any other element and any text is in the head.
-_HEAD = {"html", "head", "meta", "link", "base"}
+# any other element and any text is in the head, after its </head> too.
+_HEAD = {"html", "head", "meta", "link", "base", "noscript", "basefont", "bgsound"}
+# White space as HTML counts it, which a head may hold: a form feed too.
+_BLANK = LEADING + "\f"
 
 # A longer address loses its query string (click tracking, mostly), and one
 # still longer is left out: newsletters grew twelvefold with every one in full.
@@ -271,7 +285,7 @@ class _Reader(HTMLParser):
             return  # what a template or an xml island holds, a <body> included, is never rendered
         if tag not in _HEAD:
             self.in_body = True
-        if any(self.open_count.get(kind) for kind in _ENDED_BY):
+        if tag in _ENDS and any(self.open_count.get(kind) for kind in _ENDED_BY):
             self._end_left_open(tag)  # an <hr> too, though it is void
         if tag not in _VOID:
             self._open(tag, attrs)
@@ -300,8 +314,6 @@ class _Reader(HTMLParser):
             return
         if self.hidden:
             return
-        if tag == "head":
-            self.in_body = True
         self._close(tag)
         if tag == "a":
             self._end_link()
@@ -312,7 +324,7 @@ class _Reader(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self.hidden:
             return
-        if data.strip(LEADING):
+        if data.strip(_BLANK):
             self.in_body = True
         data = data.translate(_NO_PLACEHOLDERS)
         keeps = self._keeps()
@@ -377,17 +389,17 @@ def html_to_text(html: str) -> str:
     words (the spacing of <pre> kept), a newline between lines, a blank line
     between paragraphs, and after a link's text the address it goes to."""
     reader = _read(html)
+    reread = 0
     for _ in range(_REREADS):
         if not reader.hidden or reader.opened is None:
             break
         # The body ended inside a hidden element: a <title> or <xml> never
         # closed hid every word after it. Read it again without it, if the
-        # parser's position really points at its tag: a stylesheet up to the
-        # markup after its CSS; in the head, up to where the head ends (an
-        # island's settings are no text, and whatever else was left open in
-        # the head goes with it); in the body, the tag alone, since what
-        # follows it there is text. Not a script, which is code even when it
-        # writes markup.
+        # parser's position really points at its tag: a stylesheet together
+        # with its CSS, then in the head up to where the head ends (an island's
+        # settings are no text, and whatever else was left open in the head
+        # goes with it), in the body no further, since what follows there is
+        # text. Not a script, which is code even when it writes markup.
         (line, column), tag, in_body = reader.opened
         if tag[1:7].lower() == "script":
             break
@@ -399,15 +411,14 @@ def html_to_text(html: str) -> str:
         if html[start:rest] != tag:
             break
         if tag[1:6].lower() == "style":
-            end = _markup_after_css(html, rest)
-            if end < 0:
+            rest = _markup_after_css(html, rest)  # what follows the CSS
+            if rest < 0:
                 break  # a stylesheet the body was cut off inside
-        elif in_body:
-            end = rest
-        else:
-            head_end = _HEAD_END.search(html, rest)
-            end = head_end.start() if head_end else rest
-        html = html[:start] + html[end:]
+        head_end = None if in_body else _HEAD_END.search(html, rest)
+        html = html[:start] + html[head_end.start() if head_end else rest :]
+        reread += len(html)
+        if reread > _REREAD_BYTES:
+            break
         reader = _read(html)
     text = "".join(reader.parts).replace("\xa0", " ").replace("\ufeff", "")
     lines = (

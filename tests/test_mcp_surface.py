@@ -420,3 +420,23 @@ def test_email_thread_caps_the_limit(conn, monkeypatch):
     mcp_server.email_thread(email_id=1, limit=10**6)
 
     assert asked == [200]
+
+
+def test_the_cli_says_when_it_shows_part_of_a_thread(tmp_path, capsys):
+    """query thread centres on the email too, and said 'Thread with 5 emails' of
+    a 30-email thread, numbering the slice from 1."""
+    import argparse
+
+    from src.cli import cmd_query_thread
+
+    path = tmp_path / "b.db"
+    c = create_database(str(path))
+    for i in range(1, 31):
+        _email(c, i, 40 - i, "a@example.com", "convC")
+    c.commit()
+    c.close()
+
+    cmd_query_thread(argparse.Namespace(db=path, email_id=30, limit=5, verbose=False))
+
+    out = capsys.readouterr().out
+    assert "Thread with 30 emails, showing 5 around #30" in out

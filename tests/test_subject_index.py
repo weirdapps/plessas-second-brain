@@ -170,12 +170,18 @@ def test_a_failed_migration_raises_its_own_error(tmp_path):
 
 
 def _mail(
-    conn, n, subject, summary="a note about something else", content="nothing here", thread=None
+    conn,
+    n,
+    subject,
+    summary="a note about something else",
+    content="nothing here",
+    thread=None,
+    mailbox="Inbox",
 ):
     conn.execute(
         "INSERT INTO emails (id, message_id, date_received, subject, summary, content, "
-        "conversation_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (n, n, f"2026-09-01T00:{n:02d}:00Z", subject, summary, content, thread),
+        "conversation_id, mailbox_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (n, n, f"2026-09-01T00:{n:02d}:00Z", subject, summary, content, thread, mailbox),
     )
 
 
@@ -276,3 +282,168 @@ def test_the_last_sources_fill_the_page_past_rows_already_found(tmp_path, source
 
     assert sorted(r["email_id"] for r in results) == [1, 2, 3]
     assert results[-1]["source"] == source
+
+
+def test_a_thread_is_shown_by_its_newest_email(tmp_path):
+    """The shortest subject ranks best, and in a thread that is the first email;
+    the newest is where the thread stands now."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    for n, subject in enumerate(
+        ["Kiwi plan", "RE: Kiwi plan", "RE: RE: Kiwi plan", "FW: RE: RE: Kiwi plan"], start=1
+    ):
+        _mail(conn, n, subject, thread="T")
+    conn.commit()
+
+    results = query_by_keyword(conn, "kiwi plan", limit=5)
+
+    assert [(r["email_id"], r["source"]) for r in results] == [(4, "subject")]
+
+
+def test_news_articles_of_one_day_are_not_a_thread(tmp_path):
+    """News stores a day per pipeline as its conversation_id, a bucket, not a
+    thread: same-day articles collapsed to one, and those whose body did not
+    repeat the headline were lost."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    for n, subject in enumerate(
+        ["ECB holds rates steady", "ECB chief warns on inflation", "ECB ends bond buying"],
+        start=1,
+    ):
+        _mail(conn, n, subject, thread="news:digest:2026-09-01", mailbox="News")
+    conn.commit()
+
+    results = query_by_keyword(conn, "ECB", limit=10)
+
+    assert sorted(r["email_id"] for r in results) == [1, 2, 3]
+
+
+def test_a_thread_found_by_its_subject_does_not_come_back_for_its_summaries(tmp_path):
+    """Its replies' summaries repeat the words too, and took half the page."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    for n in range(1, 31):
+        _mail(conn, n, "RE: Kiwi rollout", summary=f"kiwi rollout update {n}", thread="T")
+    for n in range(31, 36):
+        _mail(conn, n, "Other", summary=f"notes that mention the kiwi {n}", thread=f"C{n}")
+    conn.commit()
+
+    results = query_by_keyword(conn, "kiwi", limit=10)
+
+    assert sum(r["email_id"] <= 30 for r in results) == 1
+    assert sorted(r["email_id"] for r in results if r["email_id"] > 30) == [31, 32, 33, 34, 35]
+
+
+def test_unthreaded_emails_never_share_a_thread_key(tmp_path):
+    """The key for an email with no thread was '#<id>', which a real
+    conversation_id could equal; and a blank id grouped strangers."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 7, "Okapi budget", thread=None)
+    _mail(conn, 8, "Okapi budget", thread="#7")
+    _mail(conn, 11, "Okapi budget", thread="  ")
+    _mail(conn, 12, "Okapi budget", thread="  ")
+    conn.commit()
+
+    results = query_by_keyword(conn, "okapi budget", limit=10)
+
+    assert sorted(r["email_id"] for r in results) == [7, 8, 11, 12]
+
+
+def test_a_full_page_of_subjects_skips_the_summary_search(tmp_path):
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    for n in range(1, 4):
+        _mail(conn, n, f"Okapi {n}", summary="okapi", thread=f"T{n}")
+    conn.commit()
+    ran: list[str] = []
+    conn.set_trace_callback(ran.append)
+
+    results = query_by_keyword(conn, "okapi", limit=2)
+
+    conn.set_trace_callback(None)
+    assert len(results) == 2
+    assert not [s for s in ran if "summary_f MATCH" in s]
+
+
+def test_results_carry_no_thread_key(tmp_path):
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Okapi", thread="T")
+    _mail(conn, 2, "Other", summary="okapi", thread="U")
+    _mail(conn, 3, "Third", content="okapi", thread="V")
+    conn.commit()
+
+    results = query_by_keyword(conn, "okapi", limit=10)
+
+    assert [r["source"] for r in results] == ["subject", "summary", "content"]
+    assert all("thread" not in r for r in results)
+
+
+def test_a_thread_ranks_by_its_best_match(tmp_path):
+    """Shown by its newest email, but ranked by its best: a reply chain's
+    prefixes must not sink the thread below a weaker one."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Kiwi", thread="A")
+    _mail(conn, 2, "RE: RE: FW: RE: FW: Kiwi", thread="A")
+    _mail(conn, 3, "Kiwi plan for the year", thread="B")
+    conn.commit()
+
+    results = query_by_keyword(conn, "kiwi", limit=5)
+
+    assert [r["email_id"] for r in results] == [2, 3]
+
+
+def test_an_email_with_two_matching_facts_comes_back_once(tmp_path):
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Alpha", thread="A")
+    _found_by(conn, 1, "key_fact", "kiwi")
+    _found_by(conn, 1, "key_fact", "kiwi again")
+    _mail(conn, 2, "Beta", thread="B")
+    _found_by(conn, 2, "key_fact", "the kiwi was mentioned in passing here")
+    conn.commit()
+
+    results = query_by_keyword(conn, "kiwi", limit=5)
+
+    assert sorted(r["email_id"] for r in results) == [1, 2]
+
+
+def test_an_unthreaded_email_ranks_on_its_own_match(tmp_path):
+    """Keyed '#<id>', it shared a partition, and so a rank, with a thread whose
+    conversation_id happened to be that string."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 7, "Okapi budget review for the whole quarter", thread=None)
+    _mail(conn, 8, "Okapi", thread="#7")
+    _mail(conn, 9, "Okapi budget", thread="X")
+    conn.commit()
+
+    results = query_by_keyword(conn, "okapi", limit=10)
+
+    assert [r["email_id"] for r in results] == [8, 9, 7]
+
+
+@pytest.mark.parametrize("source", ["content", "key_fact", "attachment"])
+def test_a_subject_thread_does_not_come_back_through_a_later_source(tmp_path, source):
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+
+    def mail(n, subject, text, thread):
+        if source == "content":
+            _mail(conn, n, subject, content=text, thread=thread)
+        else:
+            _mail(conn, n, subject, thread=thread)
+            _found_by(conn, n, source, text)
+
+    for n in range(1, 31):
+        mail(n, "RE: Kiwi rollout", f"kiwi rollout update {n}", "T")
+    for n in range(31, 36):
+        mail(n, "Other", f"notes that mention the kiwi {n}", f"C{n}")
+    conn.commit()
+
+    results = query_by_keyword(conn, "kiwi", limit=10)
+
+    assert sum(r["email_id"] <= 30 for r in results) == 1
+    assert sorted(r["email_id"] for r in results if r["email_id"] > 30) == [31, 32, 33, 34, 35]

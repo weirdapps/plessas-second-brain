@@ -89,7 +89,26 @@ def test_a_cursor_left_in_the_repository_is_carried_over(tmp_path, monkeypatch):
 
     assert _run(monkeypatch, "--folder", "Inbox") == "2026-09-01T00:00:00Z"
     assert json.loads(target.read_text())["last_seen_received_at"] == "2026-09-01T00:00:00Z"
-    assert legacy.exists()
+    # Kept, renamed, so a rollback still has it and a later reset cannot.
+    assert not legacy.exists()
+    assert legacy.with_name(legacy.name + ".carried").exists()
+
+
+def test_the_carry_over_happens_once(tmp_path, monkeypatch):
+    """Deleting the cursor later is how a folder is bootstrapped again; a legacy
+    file still in place would bring back a months-old cursor instead."""
+    legacy, target = _legacy_cursor(tmp_path, monkeypatch, "2026-09-01T00:00:00Z")
+    _run(monkeypatch, "--folder", "Inbox")
+    target.unlink()
+
+    assert _run(monkeypatch, "--folder", "Inbox") is None
+
+
+def test_a_legacy_file_that_is_not_a_cursor_is_ignored(tmp_path, monkeypatch):
+    legacy, target = _legacy_cursor(tmp_path, monkeypatch, "2026-09-01T00:00:00Z")
+    legacy.write_text("null", encoding="utf-8")
+
+    assert _run(monkeypatch, "--folder", "Inbox") is None
 
 
 def test_the_wrappers_explicit_paths_are_carried_over_too(tmp_path, monkeypatch):

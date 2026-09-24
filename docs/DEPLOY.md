@@ -95,8 +95,8 @@ holds none; with the timers stopped, move the rest yourself:
 `<repo>/data/staging/batch-*.json` and `<repo>/data/attachments/*` into the same
 places under `$BRAIN_DATA_DIR`. A run that exits 7 has no cursor: move it
 across, and do not answer with `--bootstrap`, which fetches only the newest 100
-messages. A replica's pull reads the producer's data home from `SB_REMOTE_DATA`
-(relative to the producer's home), so set it there too.
+messages. A replica's pull (`sb-db-pull.sh`) reads the producer's
+`<repo>/data`: edit its `REMOTE_DATA` to the new data home too.
 
 ## 4. Bootstrap and verify
 

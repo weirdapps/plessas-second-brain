@@ -19,18 +19,37 @@ LOG_DIR="$HOME/.second-brain/logs"
 LOG_FILE="$LOG_DIR/curate-docs.log"
 mkdir -p "$LOG_DIR"
 
-# --- Concurrency guard (PID-aware mkdir lock). See sb-daily-sync.sh for rationale.
-LOCK_DIR="/tmp/sb-curate-docs.lock"
+# --- Concurrency guard (PID-aware mkdir lock), the same as sb-daily-sync.sh's,
+# where the reasons are. Overridable so the wrapper tests never touch a lock a
+# real run may hold; it is removed with rm -rf, so the override must be an
+# absolute path to a *.lock directory.
+LOCK_DIR="${SB_CURATE_DOCS_LOCK:-/tmp/sb-curate-docs.lock}"
+case "$LOCK_DIR" in
+  /*.lock) ;;
+  *)
+    echo "SB_CURATE_DOCS_LOCK must name an absolute *.lock directory, got: $LOCK_DIR" >&2
+    exit 64
+    ;;
+esac
 if [ -d "$LOCK_DIR" ]; then
   stored_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
   if [ -z "$stored_pid" ] || ! kill -0 "$stored_pid" 2>/dev/null; then
-    rm -rf "$LOCK_DIR"
+    rm -rf "$LOCK_DIR"  # stale (previous run crashed without trap cleanup)
+    [ -e "$LOCK_DIR" ] && { echo "cannot remove the stale lock $LOCK_DIR" >&2; exit 73; }
   else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: already running (pid=$stored_pid)" >> "$LOG_FILE"
     exit 0
   fi
 fi
-mkdir -p "$LOCK_DIR" && echo $$ > "$LOCK_DIR/pid"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  if [ -d "$LOCK_DIR" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: another run took the lock" >> "$LOG_FILE"
+    exit 0
+  fi
+  echo "cannot create the lock directory $LOCK_DIR" >&2
+  exit 73
+fi
+echo $$ > "$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 
 # No needs_reauth gate here on purpose. Curation reads brain.db and calls
@@ -54,5 +73,7 @@ if [ -z "${VERTEX_SDK_PROJECT:-}${ANTHROPIC_VERTEX_PROJECT_ID:-}" ]; then
 fi
 
 echo "=== Daily curate started: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
-exec "$PYTHON" "$PROJECT/scripts/curate_documents_daily.py" \
-  --max-new "${CURATE_MAX_NEW:-30}"
+# Not exec: the EXIT trap has to outlive the job to remove the lock. Under exec
+# every run left its lock behind, and only the dead-pid check let the next one in.
+"$PYTHON" "$PROJECT/scripts/curate_documents_daily.py" --max-new "${CURATE_MAX_NEW:-30}"
+exit $?

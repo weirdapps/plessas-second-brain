@@ -66,10 +66,13 @@ def _fake_sdk(monkeypatch):
     return vertex, direct
 
 
-def test_a_vertex_project_wins_over_an_api_key(monkeypatch):
+@pytest.mark.parametrize("name", ["VERTEX_SDK_PROJECT", "ANTHROPIC_VERTEX_PROJECT_ID"])
+def test_a_vertex_project_wins_over_an_api_key(monkeypatch, name):
     """A key left in a shell profile sent work mail to the direct API, not Vertex."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
-    monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+    monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
+    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    monkeypatch.setenv(name, "test-project")
     monkeypatch.setenv("VERTEX_SDK_REGION", "eu")
     vertex, _ = _fake_sdk(monkeypatch)
 
@@ -154,41 +157,87 @@ def test_complete_does_not_replay_a_refusal_the_fallback_tier_saw(monkeypatch):
     assert slept == []
 
 
-def test_complete_sends_an_explicit_model():
-    """Teams names its own model; everything else takes the configured one."""
+def test_complete_sends_an_explicit_model_and_the_system_prompt():
+    """Teams names its own model and a system prompt; everything else takes the
+    configured model."""
     client = MagicMock()
     client.messages.create.return_value = _fake_response()
 
     with patch.object(claude_extract, "_get_client_and_model", lambda: (client, "configured")):
         claude_extract.complete(max_tokens=10, messages=[])
-        claude_extract.complete(model="teams-model", max_tokens=10, messages=[])
+        claude_extract.complete(model="teams-model", max_tokens=10, messages=[], system="s")
 
-    models = [call.kwargs["model"] for call in client.messages.create.call_args_list]
-    assert models == ["configured", "teams-model"]
+    first, second = (call.kwargs for call in client.messages.create.call_args_list)
+    assert (first["model"], second["model"]) == ("configured", "teams-model")
+    assert second["system"] == "s"
+    assert "system" not in first
+
+
+def _sdk_and_policy_references(tree):
+    """Names each place in `tree` that reaches the SDK request or the policy.
+
+    From the syntax tree, not the text: an alias (`send = client.messages.create`)
+    or a getattr still counts, and a docstring that mentions them does not.
+    """
+    import ast
+
+    guarded = {"call_with_policy", "create_with_refusal_fallback"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "create":
+            owner = node.value
+            if isinstance(owner, ast.Attribute) and owner.attr == "messages":
+                yield "messages.create"
+            elif (
+                isinstance(owner, ast.Call)
+                and isinstance(owner.func, ast.Name)
+                and owner.func.id == "getattr"
+                and len(owner.args) > 1
+                and isinstance(owner.args[1], ast.Constant)
+                and owner.args[1].value == "messages"
+            ):
+                yield "messages.create"
+        elif isinstance(node, ast.Name) and node.id in guarded:
+            yield node.id
+        elif isinstance(node, ast.Attribute) and node.attr in guarded:
+            yield node.attr
+        elif isinstance(node, ast.ImportFrom):
+            yield from (alias.name for alias in node.names if alias.name in guarded)
+
+
+def test_the_reference_finder_sees_aliases_and_ignores_docstrings():
+    import ast
+
+    source = """
+def f(client):
+    \"\"\"It used to call client.messages.create() itself.\"\"\"
+    send = client.messages.create
+    other = getattr(client, "messages").create
+    from src.extract.claude_extract import call_with_policy
+    return send, other
+"""
+    found = sorted(_sdk_and_policy_references(ast.parse(source)))
+
+    assert found == ["call_with_policy", "messages.create", "messages.create"]
 
 
 def test_every_sdk_request_goes_through_complete():
     """The call sites each built the same request, and one bug was fixed four times.
     Only complete() may run the policy or the refusal fallback, and only the
     fallback module may call the SDK."""
+    import ast
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[2]
-    sources = {
-        str(path.relative_to(root)): path.read_text(encoding="utf-8")
-        for tree in ("src", "scripts")
-        for path in (root / tree).rglob("*.py")
-    }
+    found: dict[str, set[str]] = {}
+    for tree in ("src", "scripts"):
+        for path in (root / tree).rglob("*.py"):
+            parsed = ast.parse(path.read_text(encoding="utf-8"))
+            for name in _sdk_and_policy_references(parsed):
+                found.setdefault(name, set()).add(str(path.relative_to(root)))
 
-    def files_calling(name):
-        return sorted(path for path, text in sources.items() if f"{name}(" in text)
-
-    assert files_calling("messages.create") == ["src/extract/vertex_fallback.py"]
-    assert files_calling("create_with_refusal_fallback") == [
-        "src/extract/claude_extract.py",
-        "src/extract/vertex_fallback.py",
-    ]
-    assert files_calling("call_with_policy") == ["src/extract/claude_extract.py"]
+    assert found["messages.create"] == {"src/extract/vertex_fallback.py"}
+    assert found["create_with_refusal_fallback"] == {"src/extract/claude_extract.py"}
+    assert found["call_with_policy"] == {"src/extract/claude_extract.py"}
 
 
 def test_extract_one_does_not_close_shared_client(monkeypatch):

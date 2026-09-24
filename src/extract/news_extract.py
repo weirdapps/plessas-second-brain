@@ -64,7 +64,7 @@ def _synthesis_fields(body: str) -> tuple[str, list[str]]:
     """Summary and topics from a synthesis body, JSON when news-reader wrote JSON."""
     try:
         data = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):
         return _opening(body), []
     if not isinstance(data, dict):
         return _opening(body), []

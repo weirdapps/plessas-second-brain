@@ -9,7 +9,13 @@ import json
 
 import pytest
 
-from src.extract.news_extract import ARTICLE_SUMMARY_CHARS, BRIEF_CHARS, extract_news, is_news
+from src.extract.news_extract import (
+    ARTICLE_SUMMARY_CHARS,
+    BRIEF_CHARS,
+    MAX_TOPICS,
+    extract_news,
+    is_news,
+)
 
 BRIEF = {
     "executive_brief": ["Rates held.", "A bank launched instant payments."],
@@ -133,3 +139,25 @@ def test_a_long_brief_is_capped():
     body = json.dumps({"executive_brief": ["x" * (BRIEF_CHARS * 3)]})
 
     assert len(extract_news(_synthesis(body))["summary"]) == BRIEF_CHARS
+
+
+def test_the_fallback_summary_is_capped_too():
+    body = json.dumps({"executive_brief": [], "alerts": ["x" * (ARTICLE_SUMMARY_CHARS * 3)]})
+
+    assert len(extract_news(_synthesis(body))["summary"]) == ARTICLE_SUMMARY_CHARS
+
+
+def test_section_topics_are_capped():
+    sections = [{"category": f"topic_{n}"} for n in range(MAX_TOPICS + 5)]
+
+    topics = extract_news(_synthesis(json.dumps({"sections": sections})))["topics"]
+
+    assert len(topics) == MAX_TOPICS
+
+
+def test_a_pathologically_nested_synthesis_does_not_raise():
+    """json.loads raises RecursionError, not ValueError, and one such item would
+    have stopped every extraction run at the same place."""
+    extraction = extract_news(_synthesis("[" * 100_000))
+
+    assert extraction["summary"] == "[" * ARTICLE_SUMMARY_CHARS

@@ -32,10 +32,10 @@ DEFAULT_ENGINE = os.environ.get("BRAIN_EXTRACT_ENGINE", "claude")  # "gemini" or
 CONSECUTIVE_FAIL_THRESHOLD = 5  # pause after this many consecutive failures
 QUOTA_PAUSE_SECONDS = 3600  # 1 hour default pause when quota exhausted
 
-# Runs at which a conversation stops being offered again. An unusable reply (see
-# _is_unusable_reply) is not retried within a run, other failures up to three
-# times, and a run in which no conversation succeeded counts nothing, so an
-# outage cannot use up every conversation's attempts.
+# Runs at which a conversation stops being offered again. What counts is a
+# failure of the conversation (an unusable reply, a request the service
+# rejects), never quota, auth or a transient service error, and only in a run
+# where some conversation succeeded, so an outage cannot use up their attempts.
 #
 # Without it a conversation the model will not process is immortal: it fails,
 # never enters processed_ids, and is first in line again an hour later. Session
@@ -50,11 +50,13 @@ CONVERSATION_MAX_ATTEMPTS = 3
 # extraction: the loader inserts it with its raw content, searchable by keyword,
 # and it stops being offered. Before this a refused or unparseable email never
 # entered processed_ids, was first in line again every run, and was never
-# inserted at all. Quota and auth failures never count, and nor does any failure
-# in a run where no email reached the model successfully: a wrong model id, a
-# missing credential or an outage fails every email alike, and must not turn
-# them all into stubs. A failure counts once per run of the extraction; a
-# wrapper that re-runs sync after a database lock gives it a second run.
+# inserted at all. What counts is a failure of the email (an unusable reply, a
+# request the service rejects), never quota, auth or a transient service error
+# (policy_bridge.is_transient), and only in a run where some email reached the
+# model successfully: a wrong model id or a missing credential fails every email
+# alike, and must not turn them all into stubs. A failure counts once per run
+# of the extraction; a wrapper that re-runs sync after a database lock gives it
+# a second run.
 EMAIL_MAX_ATTEMPTS = 3
 
 
@@ -242,10 +244,12 @@ def extract_inline(
     """Extract inline with retries. Thread-safe for Claude engine.
 
     Returns (msg_id, extraction_or_None, is_quota_error, countable). The caller
-    uses is_quota_error to trigger a global pause, and countable (every failure
-    but quota and auth) to count the failure against EMAIL_MAX_ATTEMPTS. An
-    unusable reply is not retried here: it comes back the same for the same
-    input.
+    uses is_quota_error to trigger a global pause, and countable (the email's
+    own failure: not quota, auth or a transient service error) to count it
+    against EMAIL_MAX_ATTEMPTS. An unusable reply is not retried here: it comes
+    back the same for the same input. Nor is anything on Claude, whose request
+    has already been through the retry policy inside complete(); retrying it
+    here multiplied that policy's attempts, and its waits, by max_retries.
 
     For Gemini: uses SIGALRM-based timeout (main thread only).
     For Claude: relies on SDK's built-in HTTP timeout (no SIGALRM).
@@ -254,6 +258,8 @@ def extract_inline(
     msg_id = str(email.get("message_id", "unknown"))
     is_quota = False
     use_alarm = (engine != "claude") and threading.current_thread() is threading.main_thread()
+    if engine == "claude":
+        max_retries = 1
 
     for attempt in range(max_retries):
         try:
@@ -274,7 +280,7 @@ def extract_inline(
             if attempt < max_retries - 1:
                 time.sleep(2 ** (attempt + 1))
             else:
-                return (msg_id, None, False, True)
+                return (msg_id, None, False, False)
 
         except Exception as e:
             if use_alarm:
@@ -289,7 +295,7 @@ def extract_inline(
                     continue
                 else:
                     return (msg_id, None, True, False)
-            from src.extract.policy_bridge import classify_exception
+            from src.extract.policy_bridge import classify_exception, is_transient
             from src.llm_policy import Outcome
 
             if classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED:
@@ -306,7 +312,7 @@ def extract_inline(
                 time.sleep(2 ** (attempt + 1))
             else:
                 log(f"  ↳ msg {msg_id} error: {type(e).__name__}: {str(e)[:200]}")
-                return (msg_id, None, is_quota, not is_quota)
+                return (msg_id, None, is_quota, not (is_quota or is_transient(e)))
 
     return (msg_id, None, is_quota, False)
 
@@ -386,7 +392,7 @@ def run_extraction(
                 "no email reached the model successfully this run"
             )
             return
-        for msg_id in sorted(failed_this_run):
+        for msg_id in sorted(failed_this_run - processed_ids):
             attempts = attempt_counts.get(msg_id, 0) + 1
             if attempts < EMAIL_MAX_ATTEMPTS:
                 attempt_counts[msg_id] = attempts
@@ -460,7 +466,6 @@ def run_extraction(
                     json.dump(extraction, f, indent=2, ensure_ascii=False)
                 processed_ids.add(msg_id)
                 attempt_counts.pop(msg_id, None)
-                failed_this_run.discard(msg_id)
                 total_done += 1
                 # News never reaches the model, so it says nothing about quota.
                 if not is_news(email):
@@ -570,7 +575,6 @@ def run_extraction(
                         with _state_lock:
                             processed_ids.add(msg_id)
                             attempt_counts.pop(msg_id, None)
-                            failed_this_run.discard(msg_id)
                             total_done += 1
                             if not is_news(email):
                                 model_successes += 1
@@ -696,13 +700,15 @@ def collect_conversations() -> list[dict]:
 
 def extract_conversation_inline(
     conversation: dict,
-    max_retries: int = 3,
+    max_retries: int = 1,
 ) -> tuple[str, dict | None, bool, bool]:
-    """Extract a single conversation with retries.
+    """Extract a single conversation.
 
     Returns (session_id, extraction, is_quota, countable), as extract_inline
-    does: an unusable reply is not retried, and every failure but quota and
-    auth counts toward CONVERSATION_MAX_ATTEMPTS.
+    does for Claude: one attempt, because the request has already been through
+    the retry policy inside complete(), and only a failure of the conversation
+    itself (not quota, auth or a transient service error) is countable toward
+    CONVERSATION_MAX_ATTEMPTS.
     """
     session_id = conversation.get("session_id", "unknown")
     is_quota = False
@@ -715,8 +721,9 @@ def extract_conversation_inline(
             return (session_id, result, False, False)
 
         except Exception as e:
-            retry_delay = _parse_retry_delay(e)
-            if retry_delay is not None:
+            # The same test as emails (a 529 overload is quota there), plus the
+            # retry-delay text this path has always recognised.
+            if _parse_retry_delay(e) is not None or _should_quota_pause(e):
                 is_quota = True
                 if attempt < max_retries - 1:
                     log(
@@ -726,7 +733,7 @@ def extract_conversation_inline(
                     continue
                 return (session_id, None, True, False)
 
-            from src.extract.policy_bridge import classify_exception
+            from src.extract.policy_bridge import classify_exception, is_transient
             from src.llm_policy import Outcome
 
             if not _is_unusable_reply(e) and attempt < max_retries - 1:
@@ -734,7 +741,7 @@ def extract_conversation_inline(
             else:
                 log(f"FAILED conv {session_id[:12]}: {e}")
                 auth = classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED
-                return (session_id, None, is_quota, not (auth or is_quota))
+                return (session_id, None, is_quota, not (auth or is_quota or is_transient(e)))
 
     return (session_id, None, is_quota, False)
 
@@ -782,6 +789,10 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
         for c in all_convs
         if c.get("session_id", "") not in processed_ids and c.get("session_id", "") not in given_up
     ]
+    # Newest first, as emails go under a deadline: sync's Step 7 has 30 s, and an
+    # old conversation the model will not take held the head of the list, spent
+    # every hourly budget and, with nothing extracted after it, was never counted.
+    pending.sort(key=lambda c: str(c.get("started_at") or ""), reverse=True)
     log(f"Pending extraction: {len(pending)} conversations")
 
     if limit > 0:

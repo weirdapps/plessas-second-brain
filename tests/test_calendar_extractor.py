@@ -139,16 +139,15 @@ _BODY = "Agenda: review the Q3 numbers, agree the budget, and assign the follow-
 
 
 def _patch_llm(monkeypatch, response):
-    """calendar_extractor binds _get_client_and_model at MODULE level (line 5), so the
-    interception point is the name in calendar_extractor, not the one in claude_extract.
-    Patching the wrong one lets the real Vertex client be built and a real call go out."""
+    """extract_event sends through claude_extract.complete, which looks the client up
+    in claude_extract on every attempt, so that is the interception point."""
 
     class FakeMessages:
         def create(self, **kw):
             return response
 
     fake = type("Client", (), {"messages": FakeMessages()})()
-    monkeypatch.setattr("src.extract.calendar_extractor._get_client_and_model", lambda: (fake, "m"))
+    monkeypatch.setattr("src.extract.claude_extract._get_client_and_model", lambda: (fake, "m"))
 
 
 def test_extract_event_reads_past_a_leading_thinking_block(monkeypatch):
@@ -216,7 +215,7 @@ def test_extract_event_redacts_credentials_before_the_prompt(monkeypatch):
             )
 
     fake = type("Client", (), {"messages": FakeMessages()})()
-    monkeypatch.setattr("src.extract.calendar_extractor._get_client_and_model", lambda: (fake, "m"))
+    monkeypatch.setattr("src.extract.claude_extract._get_client_and_model", lambda: (fake, "m"))
     secret = "AIzaSy" + "A1b2C3d4E5" * 3 + "fghij"  # shape fixture, not a key
     body = "x" * 3990 + secret + " and the agenda follows."
 
@@ -240,7 +239,7 @@ def test_extract_event_survives_an_attendee_with_a_null_name(monkeypatch):
             )
 
     fake = type("Client", (), {"messages": FakeMessages()})()
-    monkeypatch.setattr("src.extract.calendar_extractor._get_client_and_model", lambda: (fake, "m"))
+    monkeypatch.setattr("src.extract.claude_extract._get_client_and_model", lambda: (fake, "m"))
     event = {**_EVENT, "attendees": [{"name": None, "email": "a@example.com"}]}
 
     extract_event(event, _BODY)
@@ -264,7 +263,7 @@ def test_the_prompt_does_not_pre_fill_decision_dates_with_the_meeting_date(monke
             )
 
     fake = type("Client", (), {"messages": FakeMessages()})()
-    monkeypatch.setattr("src.extract.calendar_extractor._get_client_and_model", lambda: (fake, "m"))
+    monkeypatch.setattr("src.extract.claude_extract._get_client_and_model", lambda: (fake, "m"))
 
     extract_event(_EVENT, _BODY)
 

@@ -11,6 +11,7 @@ from pathlib import Path
 
 from src.export.state import load_json_or_quarantine
 
+from .email_html import save_html, split_body
 from .normalizer import find_or_create_person, find_or_create_topic
 from .schema import normalize_subject
 
@@ -42,10 +43,11 @@ def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
     if not staging_path.exists():
         raise FileNotFoundError(f"Staging directory not found: {staging_dir}")
 
-    # Open database connection
-    from .schema import get_connection
+    # Open database connection, at the schema this code writes (email_html, v23)
+    from .schema import get_connection, run_migrations
 
     conn = get_connection(db_path)
+    run_migrations(conn)
 
     # Build index of staged emails by message_id.
     # Also remember which message_ids each batch contains, so we can prune
@@ -261,6 +263,9 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
         normalized = normalize_subject(metadata.get("subject", ""))
         conversation_id = hashlib.sha256(normalized.encode()).hexdigest()[:16]
 
+    # The body as the text a reader sees; an HTML body is kept beside it.
+    body, html = split_body(metadata.get("content"))
+
     # Insert email record
     cursor = conn.execute(
         """
@@ -282,13 +287,15 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
             extraction.get("urgency"),
             extraction.get("language"),
             metadata.get("mailbox_name", metadata.get("mailbox")),
-            metadata.get("content"),
+            body,
             in_reply_to or None,
             references or None,
             conversation_id,
         ),
     )
     email_id = cursor.lastrowid
+    if html is not None and email_id is not None:
+        save_html(conn, email_id, html)
 
     # Load topics
     for topic_name in extraction.get("topics", []):

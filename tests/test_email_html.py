@@ -1,0 +1,608 @@
+"""Email bodies hold the text a reader sees; the HTML is kept compressed beside it.
+
+19,753 Outlook emails held 963 MB of raw HTML, two thirds of emails.content:
+styles, tables and markup were indexed as words and sent to the extraction
+prompt, whose character cap then cut the text. The SharePoint link scan and the
+inline-image positions read the markup, so it is kept (schema v23).
+"""
+
+import argparse
+import sqlite3
+from pathlib import Path
+from unittest.mock import patch
+
+from src.store.email_html import markup_or_text, pack, split_body, unpack
+from src.store.schema import create_database, get_connection, run_migrations
+
+LINK = "https://contoso.sharepoint.com/sites/x/deck.pptx"
+HTML = (
+    "<html><head><style>p { color: red; }</style></head><body><p>Καλησπέρα,</p>"
+    f'<p>the deck: <a href="{LINK}">deck</a></p>'
+    + "<p>notes</p>" * 20
+    + '<p><img src="cid:chart.png"></p></body></html>'
+)
+TEXT = f"Καλησπέρα,\n\nthe deck: deck ({LINK})\n\n" + "\n\n".join(["notes"] * 20)
+# A shape fixture, not a credential (as in tests/test_scrub_secrets.py).
+ANTHROPIC = "sk-ant-api03-" + "a1B2c3D4e5" * 9
+
+
+def test_the_body_is_split_into_text_and_the_html_kept_beside_it():
+    assert split_body(HTML) == (TEXT, HTML)
+    assert split_body("plain text") == ("plain text", None)
+    assert split_body(None) == (None, None)
+
+
+def test_the_kept_html_is_compressed_and_read_back_whole():
+    blob = pack(HTML)
+
+    assert len(blob) < len(HTML.encode("utf-8"))
+    assert unpack(blob) == HTML
+    assert markup_or_text(TEXT, blob) == HTML
+    assert markup_or_text(TEXT, None) == TEXT
+
+
+def _load(conn, content, message_id="m1"):
+    from src.store.loader import load_single_email
+
+    metadata = {
+        "message_id": message_id,
+        "date_received": "2026-09-01T00:00:00Z",
+        "subject": "Deck",
+        "sender": {"name": "A", "address": "a@example.com"},
+        "to_recipients": [],
+        "cc_recipients": [],
+        "mailbox_name": "Inbox",
+        "content": content,
+    }
+    assert load_single_email(conn, metadata, {"summary": "s"})
+    return conn.execute(
+        "SELECT id, content FROM emails WHERE message_id = ?", (message_id,)
+    ).fetchone()
+
+
+def test_the_loader_stores_the_text_and_keeps_the_html(tmp_path):
+    conn = create_database(str(tmp_path / "b.db"))
+
+    email_id, content = _load(conn, HTML)
+
+    assert content == TEXT
+    (blob,) = conn.execute("SELECT html FROM email_html WHERE email_id = ?", (email_id,)).fetchone()
+    assert unpack(blob) == HTML
+
+
+def test_a_text_body_is_stored_as_it_came(tmp_path):
+    conn = create_database(str(tmp_path / "b.db"))
+
+    _email_id, content = _load(conn, "just text")
+
+    assert content == "just text"
+    assert conn.execute("SELECT count(*) FROM email_html").fetchone()[0] == 0
+
+
+def test_the_body_index_holds_words_not_markup(tmp_path):
+    conn = create_database(str(tmp_path / "b.db"))
+    _load(conn, HTML)
+
+    def hits(word):
+        return conn.execute(
+            "SELECT count(*) FROM emails_fts WHERE emails_fts.content_f MATCH ?", (word,)
+        ).fetchone()[0]
+
+    assert hits("deck") == 1
+    assert hits("color") == 0
+
+
+def test_the_extraction_prompt_reads_the_text_not_the_markup():
+    from src.extract.prompt import MAX_CONTENT_CHARS, build_extraction_prompt
+
+    html = "<html><body>" + "<div style='x'>" * 10000 + "<p>the decision is last</p></body></html>"
+    assert len(html) > MAX_CONTENT_CHARS
+
+    prompt = build_extraction_prompt({"message_id": "m", "subject": "s", "content": html})
+
+    assert "the decision is last" in prompt
+    assert "<div" not in prompt
+    assert "truncated" not in prompt
+
+
+def test_the_sharepoint_scan_reads_links_from_the_kept_html(tmp_path, monkeypatch):
+    from src.cli import cmd_process_sharepoint
+    from src.export.sharepoint_fetcher import SharepointFetchResult
+
+    monkeypatch.setenv("SHAREPOINT_HOST", "contoso.sharepoint.com")
+    db = tmp_path / "test.db"
+    conn = create_database(str(db))
+    _load(conn, HTML)
+    conn.commit()
+    conn.close()
+
+    with patch("src.export.sharepoint_fetcher.fetch_sharepoint_link") as fetch:
+        fetch.return_value = SharepointFetchResult(url=LINK, status="stale")
+        cmd_process_sharepoint(argparse.Namespace(db=str(db), since=None, limit=0, dry_run=False))
+
+    assert [c.args[0] for c in fetch.call_args_list] == [LINK]
+
+
+def test_inline_image_positions_come_from_the_kept_html(tmp_path, monkeypatch):
+    from PIL import Image
+
+    from src.extract import image_pipeline
+
+    conn = create_database(str(tmp_path / "b.db"))
+    email_id, _ = _load(conn, HTML)
+    image = tmp_path / "chart.png"
+    Image.new("RGB", (200, 200), color="red").save(image, "PNG")
+    conn.execute(
+        "INSERT INTO attachments (email_id, message_id, filename, file_path, mime_type, "
+        "file_size, exported_at) VALUES (?, 'm1', 'chart.png', ?, 'image/png', ?, "
+        "datetime('now'))",
+        (email_id, str(image), image.stat().st_size),
+    )
+    conn.commit()
+    seen = []
+    monkeypatch.setattr(
+        image_pipeline,
+        "process_single_image",
+        lambda **kw: seen.append(kw["position_in_body"]) or {"status": "processed"},
+    )
+
+    image_pipeline.run_backfill(conn=conn, run_vision=False)
+
+    assert len(seen) == 1
+    assert seen[0] > 0.9  # the cid sits at the end of the markup; the text has none
+
+
+def _html_store(tmp_path):
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    conn.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, content) "
+        "VALUES (1, 'a', '2026-09-01', 's', ?), (2, 'b', '2026-09-01', 's', 'plain')",
+        (HTML,),
+    )
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_split_html_converts_the_emails_loaded_before_it(tmp_path, capsys):
+    from src.cli import cmd_split_html
+
+    db = _html_store(tmp_path)
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=1, dry_run=False)) == 0
+
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT content FROM emails WHERE id = 1").fetchone()[0] == TEXT
+    assert conn.execute("SELECT content FROM emails WHERE id = 2").fetchone()[0] == "plain"
+    blob = conn.execute("SELECT html FROM email_html WHERE email_id = 1").fetchone()[0]
+    assert unpack(blob) == HTML
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM emails_fts WHERE emails_fts.content_f MATCH 'color'"
+        ).fetchone()[0]
+        == 0
+    )
+    conn.close()
+    assert "1 email" in capsys.readouterr().out
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=1, dry_run=False)) == 0
+    assert "0 emails" in capsys.readouterr().out
+
+
+def test_split_html_converts_every_email_of_a_batch(tmp_path, capsys):
+    from src.cli import cmd_split_html
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    for i in range(1, 6):
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received, subject, content) "
+            "VALUES (?, ?, '2026-09-01', 's', ?)",
+            (i, f"m{i}", HTML if i != 3 else "plain"),
+        )
+    conn.commit()
+    conn.close()
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=2, dry_run=False)) == 0
+
+    conn = sqlite3.connect(db)
+    assert [r[0] for r in conn.execute("SELECT email_id FROM email_html ORDER BY 1")] == [
+        1,
+        2,
+        4,
+        5,
+    ]
+    assert {r[0] for r in conn.execute("SELECT content FROM emails WHERE id != 3")} == {TEXT}
+    assert "converted 4 emails:" in capsys.readouterr().out
+
+
+def test_split_html_takes_a_batch_bigger_than_sqlites_variable_limit(tmp_path, monkeypatch):
+    """A batch's ids go to SQLite as one JSON list, not one variable each."""
+    from src.cli import cmd_split_html
+    from src.store import schema
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    for i in range(1, 13):
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received, subject, content) "
+            "VALUES (?, ?, '2026-09-01', 's', ?)",
+            (i, f"m{i}", HTML),
+        )
+    conn.commit()
+    conn.close()
+    connect = schema.get_connection
+
+    def limited(path):
+        c = connect(path)
+        c.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 10)
+        return c
+
+    monkeypatch.setattr(schema, "get_connection", limited)
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=12, dry_run=False)) == 0
+
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT count(*) FROM email_html").fetchone()[0] == 12
+
+
+def test_split_html_leaves_a_body_that_changed_under_it(tmp_path, monkeypatch):
+    """A batch is read and converted before the write lock is taken, so the
+    timers sharing the database wait for the writes only. A body re-loaded in
+    between is left as the re-load wrote it."""
+    from src.cli import cmd_split_html
+    from src.store import email_html
+
+    db = _html_store(tmp_path)
+    convert = email_html.split_body
+
+    def racing(content):
+        other = sqlite3.connect(db)
+        other.execute("UPDATE emails SET content = 'reloaded' WHERE id = 1")
+        other.commit()
+        other.close()
+        return convert(content)
+
+    monkeypatch.setattr(email_html, "split_body", racing)
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=10, dry_run=False)) == 0
+
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT content FROM emails WHERE id = 1").fetchone()[0] == "reloaded"
+    assert conn.execute("SELECT count(*) FROM email_html").fetchone()[0] == 0
+
+
+def test_split_html_never_converts_an_email_twice(tmp_path):
+    """Text converted from HTML can itself open like markup (an escaped &lt;p&gt;).
+    A second run must leave it and its kept HTML alone."""
+    from src.cli import cmd_split_html
+
+    html = "<html><body>&lt;p&gt; marks a paragraph</body></html>"
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    conn.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, content) "
+        "VALUES (1, 'a', '2026-09-01', 's', ?)",
+        (html,),
+    )
+    conn.commit()
+    conn.close()
+
+    for _ in range(2):
+        assert cmd_split_html(argparse.Namespace(db=str(db), batch=10, dry_run=False)) == 0
+
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT content FROM emails").fetchone()[0] == "<p> marks a paragraph"
+    assert unpack(conn.execute("SELECT html FROM email_html").fetchone()[0]) == html
+
+
+def test_split_html_dry_run_changes_nothing(tmp_path, capsys):
+    from src.cli import cmd_split_html
+
+    db = _html_store(tmp_path)
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=100, dry_run=True)) == 0
+
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT content FROM emails WHERE id = 1").fetchone()[0] == HTML
+    assert conn.execute("SELECT count(*) FROM email_html").fetchone()[0] == 0
+    assert "would" in capsys.readouterr().out
+
+
+def test_split_html_dry_run_does_not_migrate_an_older_store(tmp_path, capsys):
+    """A rehearsal on a copy of a v22 store must leave it at v22."""
+    from src.cli import cmd_split_html
+
+    db = _html_store(tmp_path)
+    conn = get_connection(str(db))
+    conn.execute("DROP TABLE email_html")
+    conn.execute("UPDATE schema_version SET version = 22")
+    conn.commit()
+    conn.close()
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=100, dry_run=True)) == 0
+
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 22
+    assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'email_html'").fetchone()
+    assert "would convert 1 email:" in capsys.readouterr().out
+
+
+def test_split_html_redacts_what_it_keeps(tmp_path):
+    """A body loaded before the ingest path redacted (#55) can hold a key. Moved
+    into email_html it would be compressed, out of sight of the index, of a grep
+    of the file and of any scan of text columns."""
+    from src.cli import cmd_split_html
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    conn.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, content) "
+        "VALUES (1, 'a', '2026-09-01', 's', ?)",
+        (f"<html><body><p>the key is {ANTHROPIC}</p></body></html>",),
+    )
+    conn.commit()
+    conn.close()
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=10, dry_run=False)) == 0
+
+    conn = sqlite3.connect(db)
+    content = conn.execute("SELECT content FROM emails WHERE id = 1").fetchone()[0]
+    html = unpack(conn.execute("SELECT html FROM email_html WHERE email_id = 1").fetchone()[0])
+    assert content == "the key is [REDACTED:anthropic-key]"
+    assert html == "<html><body><p>the key is [REDACTED:anthropic-key]</p></body></html>"
+
+
+def test_split_html_leaves_no_copy_of_what_it_redacted(tmp_path):
+    """Redacting a key only rewrites the row; the old bytes stay in free pages,
+    which every pull copies, unless secure_delete zeroes them."""
+    from src.cli import cmd_split_html
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    markup = "<div style='color:red;margin:0;padding:0'>x</div>" * 2000
+    for i in range(1, 21):
+        key = f"<p>the key is {ANTHROPIC}</p>" if i == 20 else ""  # freed last: no reuse
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received, subject, content) "
+            "VALUES (?, ?, '2026-09-01', 's', ?)",
+            (i, f"m{i}", f"<html><body>{markup}{key}</body></html>"),
+        )
+    conn.commit()
+    conn.close()
+    assert ANTHROPIC.encode() in db.read_bytes()
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=100, dry_run=False)) == 0
+
+    data = db.read_bytes()
+    wal = db.with_name(db.name + "-wal")
+    if wal.exists():
+        data += wal.read_bytes()
+    assert ANTHROPIC.encode() not in data
+
+
+def test_split_html_optimizes_after_a_run_that_was_stopped(tmp_path, monkeypatch):
+    """Killed between its last commit and the optimize, a run left old index
+    segments holding the words of the bodies it had redacted, and a re-run, with
+    nothing left to convert, skipped the optimize."""
+    from src import cli
+    from src.store import schema
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    conn.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, content) "
+        "VALUES (1, 'a', '2026-09-01', 's', ?)",
+        (f"<html><body><p>the key is {ANTHROPIC}</p></body></html>",),
+    )
+    conn.commit()
+    conn.close()
+    token = ANTHROPIC.rsplit("-", 1)[-1].lower().encode()  # as the index holds it
+    real = schema.get_connection
+
+    class Killed:
+        """The store's connection, until the optimize, where the process dies."""
+
+        def __init__(self, path):
+            self.conn = real(path)
+
+        def __getattr__(self, name):
+            return getattr(self.conn, name)
+
+        def execute(self, sql, *args):
+            if "optimize" in sql:
+                self.conn.close()
+                raise SystemExit("killed")
+            return self.conn.execute(sql, *args)
+
+    monkeypatch.setattr(schema, "get_connection", Killed)
+    try:
+        cli.cmd_split_html(argparse.Namespace(db=str(db), batch=100, dry_run=False))
+    except SystemExit:
+        pass
+    assert token in db.read_bytes()
+    monkeypatch.setattr(schema, "get_connection", real)
+
+    assert cli.cmd_split_html(argparse.Namespace(db=str(db), batch=100, dry_run=False)) == 0
+
+    data = db.read_bytes()
+    wal = db.with_name(db.name + "-wal")
+    if wal.exists():
+        data += wal.read_bytes()
+    assert token not in data
+
+
+def _older_store(path):
+    """A store at v22, before email_html."""
+    create_database(str(path)).close()
+    conn = get_connection(str(path))
+    conn.execute("DROP TABLE email_html")
+    conn.execute("UPDATE schema_version SET version = 22")
+    conn.commit()
+    conn.close()
+
+
+def _staged(tmp_path, message_id="m1"):
+    import json
+
+    staging, extracted = tmp_path / "staging", tmp_path / "extracted"
+    staging.mkdir()
+    extracted.mkdir()
+    email = {
+        "message_id": message_id,
+        "date_received": "2026-09-01T00:00:00Z",
+        "subject": "Deck",
+        "sender": {"name": "A", "address": "a@example.com"},
+        "content": HTML,
+    }
+    (staging / "batch-00001.json").write_text(json.dumps({"emails": [email]}))
+    (extracted / f"{message_id}.json").write_text(json.dumps({"summary": "s"}))
+    return staging, extracted
+
+
+def _kept(path):
+    conn = sqlite3.connect(path)
+    row = conn.execute(
+        "SELECT e.content, h.html FROM emails e LEFT JOIN email_html h ON h.email_id = e.id"
+    ).fetchone()
+    version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+    conn.close()
+    return row[0], row[1] is not None and unpack(row[1]) == HTML, version
+
+
+def test_loading_emails_migrates_an_older_store_first(tmp_path):
+    """Loaded into a v22 store, an HTML body was converted, and saving its HTML
+    failed: pulled before the migration ran, the code would lose it."""
+    from src.store.loader import load_extractions
+
+    db = tmp_path / "b.db"
+    _older_store(db)
+    staging, extracted = _staged(tmp_path)
+
+    assert load_extractions(str(db), str(extracted), str(staging)) == 1
+
+    assert _kept(db) == (TEXT, True, 23)
+
+
+def test_recovering_extractions_migrates_an_older_store_first(tmp_path, monkeypatch):
+    """The recovery script caught the failure to save the HTML and committed the
+    text: the markup was gone for good, and split-html cannot bring it back."""
+    import importlib.util
+
+    path = Path(__file__).parent.parent / "scripts" / "recover_missing_extractions.py"
+    spec = importlib.util.spec_from_file_location("recover_missing_extractions", path)
+    assert spec and spec.loader
+    recover = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(recover)
+    db = tmp_path / "b.db"
+    _older_store(db)
+    staging, extracted = _staged(tmp_path)
+    monkeypatch.setattr(recover, "DB", db)
+    monkeypatch.setattr(recover, "STAGING", staging)
+    monkeypatch.setattr(recover, "EXTRACTED", extracted)
+
+    assert recover.main() == 0
+
+    assert _kept(db) == (TEXT, True, 23)
+
+
+def test_split_html_skips_a_text_body_that_opens_with_a_bracket(tmp_path, capsys):
+    """The SQL prefilter admits any body that opens with '<'; looks_like_html
+    decides, and a text body stays as it came."""
+    from src.cli import cmd_split_html
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    text = "<maria@example.com> wrote:\nhi"
+    conn.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, content) "
+        "VALUES (1, 'a', '2026-09-01', 's', ?)",
+        (text,),
+    )
+    conn.commit()
+    conn.close()
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=10, dry_run=False)) == 0
+
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT content FROM emails").fetchone()[0] == text
+    assert conn.execute("SELECT count(*) FROM email_html").fetchone()[0] == 0
+    assert "converted 0 emails" in capsys.readouterr().out
+
+
+def test_split_html_ends_a_batch_at_its_budget(tmp_path, monkeypatch):
+    """A batch is held in memory until it is written: large bodies end it early."""
+    import src.cli as cli
+    from src.store import schema
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    for i in range(1, 6):
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received, subject, content) "
+            "VALUES (?, ?, '2026-09-01', 's', ?)",
+            (i, f"m{i}", HTML),
+        )
+    conn.commit()
+    conn.close()
+    commits = []
+    connect = schema.get_connection
+
+    class Counting:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        def commit(self):
+            commits.append(1)
+            return self._conn.commit()
+
+    monkeypatch.setattr(schema, "get_connection", lambda path: Counting(connect(path)))
+    # Crossed by a body with its text and its kept HTML, not by the two alone.
+    monkeypatch.setattr(cli, "SPLIT_HTML_BATCH_CHARS", len(HTML) + len(TEXT) + 1)
+
+    assert cli.cmd_split_html(argparse.Namespace(db=str(db), batch=500, dry_run=False)) == 0
+
+    assert len(commits) == 6  # one batch per body, then the optimize
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT count(*) FROM email_html").fetchone()[0] == 5
+
+
+def test_split_html_finds_a_body_behind_a_byte_order_mark(tmp_path):
+    """Its SQL prefilter skips the same leading characters looks_like_html does."""
+    from src.cli import cmd_split_html
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    conn.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, content) "
+        "VALUES (1, 'a', '2026-09-01', 's', ?), (2, 'b', '2026-09-01', 's', ?)",
+        ("\ufeff\r\n\t " + HTML, "From: Petros <p.petrou@example.com>"),
+    )
+    conn.commit()
+    conn.close()
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=10, dry_run=False)) == 0
+
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT content FROM emails WHERE id = 1").fetchone()[0] == TEXT
+    assert conn.execute("SELECT content FROM emails WHERE id = 2").fetchone()[0] == (
+        "From: Petros <p.petrou@example.com>"
+    )
+    assert conn.execute("SELECT count(*) FROM email_html").fetchone()[0] == 1
+
+
+def test_an_older_store_gets_the_table(tmp_path):
+    path = tmp_path / "b.db"
+    create_database(str(path)).close()
+    conn = get_connection(str(path))
+    conn.execute("DROP TABLE email_html")
+    conn.execute("UPDATE schema_version SET version = 22")
+    conn.commit()
+
+    run_migrations(conn)
+
+    assert conn.execute("SELECT count(*) FROM email_html").fetchone()[0] == 0

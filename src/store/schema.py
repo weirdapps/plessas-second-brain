@@ -475,6 +475,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_calendar_change_key(conn)
     if current < 22:
         migrate_index_email_subjects(conn)
+    if current < 23:
+        migrate_add_email_html(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -632,6 +634,24 @@ def migrate_add_calendar_change_key(conn: sqlite3.Connection) -> None:
             if "duplicate column name" not in str(e):
                 raise
         conn.commit()
+
+
+def migrate_add_email_html(conn: sqlite3.Connection) -> None:
+    """v23: a table for the HTML of email bodies, kept compressed beside their text.
+
+    The body now holds the text a reader sees (src.store.email_html). Emails
+    loaded before this keep their HTML body until `python -m src.cli split-html`
+    converts them; the table is created empty and nothing else moves here.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS email_html (
+            email_id INTEGER PRIMARY KEY REFERENCES emails(id),
+            html BLOB NOT NULL
+        )
+        """
+    )
+    conn.commit()
 
 
 def migrate_index_email_subjects(conn: sqlite3.Connection) -> None:

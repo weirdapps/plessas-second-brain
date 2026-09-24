@@ -654,11 +654,15 @@ def test_thread_matches_counts_every_field(tmp_path):
         _mail(conn, n, "Status", content="quoted: okapi terms", thread="U")
     _mail(conn, 10, "Digest", content="okapi terms", thread="U", mailbox="News")  # no thread
     conn.commit()
+    ran: list[str] = []
+    conn.set_trace_callback(ran.append)
 
     results = {r["email_id"]: r for r in query_by_keyword(conn, "okapi", limit=10)}
 
+    conn.set_trace_callback(None)
     assert results[6]["source"] == "subject" and results[6]["thread_matches"] == 4
     assert results[1]["source"] == "summary" and results[1]["thread_matches"] == 5
+    assert any("EXISTS (SELECT 1 FROM emails_fts" in s for s in ran)  # a short page: seeks
 
 
 def test_a_content_only_search_counts_bodies_only(tmp_path):
@@ -673,3 +677,48 @@ def test_a_content_only_search_counts_bodies_only(tmp_path):
 
     assert [r["email_id"] for r in results] == [1]
     assert "thread_matches" not in results[0]  # the subjects and summaries were not searched
+
+
+def test_long_threads_are_counted_the_same_way_faster(tmp_path, monkeypatch):
+    """Per-member seeks cost seconds once long threads reach the page (20 of 700
+    emails: 2.5 s), so past a member count the count reads each column's matches
+    once instead. Both give the same numbers."""
+    from src.store import query
+
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    _mail(conn, 1, "Weekly", summary="the okapi deal", content="okapi terms", thread="T")
+    for n in range(2, 6):
+        _mail(conn, n, "Weekly", content="re: okapi terms", thread="T")
+    _mail(conn, 6, "Okapi terms", content="okapi terms", thread="U")
+    for n in range(7, 10):
+        _mail(conn, n, "Status", content="quoted: okapi terms", thread="U")
+    _mail(conn, 10, "Digest", content="okapi terms", thread="U", mailbox="News")
+    conn.commit()
+    monkeypatch.setattr(query, "_SEEKS_UP_TO", 0)
+    ran: list[str] = []
+    conn.set_trace_callback(ran.append)
+
+    results = {r["email_id"]: r for r in query_by_keyword(conn, "okapi", limit=10)}
+
+    conn.set_trace_callback(None)
+    assert results[6]["thread_matches"] == 4
+    assert results[1]["thread_matches"] == 5
+    assert any("m.id IN (SELECT rowid FROM emails_fts" in s for s in ran)  # one pass
+    assert not any("EXISTS (SELECT 1 FROM emails_fts" in s for s in ran)
+
+
+def test_a_page_past_the_threshold_is_counted_in_one_pass(tmp_path):
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+    for n in range(1, 202):  # a thread longer than the threshold, 200
+        _mail(conn, n, "Okapi weekly", thread="T")
+    conn.commit()
+    ran: list[str] = []
+    conn.set_trace_callback(ran.append)
+
+    results = query_by_keyword(conn, "okapi", limit=5)
+
+    conn.set_trace_callback(None)
+    assert results[0]["thread_matches"] == 201
+    assert any("m.id IN (SELECT rowid FROM emails_fts" in s for s in ran)

@@ -376,6 +376,11 @@ def _best_of_each_thread(rank: str, then: str = "") -> str:
     return f"ROW_NUMBER() OVER (PARTITION BY COALESCE({_THREAD}, e.id) ORDER BY {order})"
 
 
+# Up to this many emails in the page's threads, their matches are counted one
+# full-text seek per email; past it, from one pass over each column's matches.
+_SEEKS_UP_TO = 200
+
+
 def _matching_emails_per_thread(
     conn: sqlite3.Connection, expression: str, keys: set, search_content_only: bool
 ) -> dict:
@@ -383,25 +388,42 @@ def _matching_emails_per_thread(
     summary or the body (the body alone for a content-only search), each column
     on its own, as each stage of the waterfall matches it.
 
-    Driven from the page's threads, through the conversation_id index, with one
-    index seek per member: a common word matches thousands of emails, and
-    reading every match cost 20 to 90 ms a search where this costs under 5.
+    The page's threads are read through the conversation_id index, then their
+    emails are checked one seek each, or, past _SEEKS_UP_TO emails, against one
+    pass over each column's matches. On the replica a page's threads hold 2 to
+    122 emails: seeks take 0 to 5 ms, a pass 22 to 111 ms. A seek costs 0.03 to
+    1 ms by the query, so 20 threads of 700 emails took 1.6 to 14 s by seeks
+    and 20 to 87 ms in one pass; the counts are the same.
     """
     columns = ["content_f"]
     if not search_content_only:
         columns.append("summary_f")
         if _has_subject_index(conn):
             columns.append("subject_f")
-    matches = " OR ".join(
-        "EXISTS (SELECT 1 FROM emails_fts "
-        f"WHERE emails_fts.rowid = e.id AND emails_fts.{column} MATCH ?)"
-        for column in columns
+    members = (
+        "SELECT e.id AS id, j.value AS thread FROM json_each(?) j "
+        f"JOIN emails e ON e.conversation_id = j.value AND {_THREAD} = j.value"
     )
+    threads = json.dumps(sorted(keys))
+    (count,) = conn.execute(f"SELECT COUNT(*) FROM ({members})", (threads,)).fetchone()
+    if count <= _SEEKS_UP_TO:
+        matched = " OR ".join(
+            "EXISTS (SELECT 1 FROM emails_fts "
+            f"WHERE emails_fts.rowid = m.id AND emails_fts.{column} MATCH ?)"
+            for column in columns
+        )
+    else:
+        matched = (
+            "m.id IN ("
+            + " UNION ".join(
+                f"SELECT rowid FROM emails_fts WHERE emails_fts.{column} MATCH ?"
+                for column in columns
+            )
+            + ")"
+        )
     rows = conn.execute(
-        "SELECT j.value, COUNT(*) FROM json_each(?) j "
-        f"JOIN emails e ON e.conversation_id = j.value AND {_THREAD} = j.value "
-        f"WHERE {matches} GROUP BY j.value",
-        (json.dumps(sorted(keys)), *[expression] * len(columns)),
+        f"WITH m AS ({members}) SELECT m.thread, COUNT(*) FROM m WHERE {matched} GROUP BY m.thread",
+        (threads, *[expression] * len(columns)),
     )
     return dict(rows)
 

@@ -24,8 +24,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from src.config import DEFAULT_DB
+from src.config import DEFAULT_DB, is_replica, replica_refusal
 from src.store.schema import get_connection
+
+# Exit code for a run refused on a replica; 1-4 already name other failures.
+REFUSED_ON_REPLICA = 5
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +174,12 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    if is_replica():
+        # It relabels emails, and a replica's copy is replaced by the next pull
+        # (see src/config.py).
+        logger.error(replica_refusal("the Inbox reconcile"))
+        return REFUSED_ON_REPLICA
 
     if not args.db.exists():
         logger.error("DB not found: %s", args.db)

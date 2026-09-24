@@ -36,7 +36,7 @@ def staged(tmp_path, monkeypatch):
 
 
 def _extraction_for(conv):
-    return conv["session_id"], {"summary": "x"}, False
+    return conv["session_id"], {"summary": "x"}, False, False
 
 
 def test_stops_once_the_deadline_is_spent(staged, monkeypatch):
@@ -102,7 +102,7 @@ def test_a_conversation_that_keeps_being_refused_is_given_up_on(staged, monkeypa
     monkeypatch.setattr(local, "CONVERSATION_MAX_ATTEMPTS", 2)
 
     def always_refuses(conv):
-        return conv["session_id"], None, False
+        return conv["session_id"], None, False, True
 
     with (
         patch.object(local, "collect_conversations", return_value=staged),
@@ -129,7 +129,7 @@ def test_giving_up_does_not_mark_a_conversation_extracted(staged, monkeypatch):
         patch.object(
             local,
             "extract_conversation_inline",
-            side_effect=lambda c: (c["session_id"], None, False),
+            side_effect=lambda c: (c["session_id"], None, False, True),
         ),
     ):
         local.run_conversation_extraction()
@@ -152,7 +152,7 @@ def test_a_transient_failure_is_retried_before_the_cap(staged, monkeypatch):
         patch.object(
             local,
             "extract_conversation_inline",
-            side_effect=lambda c: (c["session_id"], None, False),
+            side_effect=lambda c: (c["session_id"], None, False, True),
         ),
     ):
         local.run_conversation_extraction()
@@ -185,3 +185,63 @@ def test_work_done_before_the_deadline_is_saved(staged, tmp_path, monkeypatch):
 
     processed = json.loads(state.read_text())["processed_ids"]
     assert len(processed) > 0
+
+
+def test_a_service_failure_never_counts_toward_giving_up(staged, monkeypatch):
+    """An outage failed every conversation it touched, and three outage runs gave
+    them all up for good. Only a failure of the conversation itself counts."""
+    monkeypatch.setattr(local, "CONVERSATION_MAX_ATTEMPTS", 1)
+
+    with (
+        patch.object(local, "collect_conversations", return_value=staged),
+        patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
+        patch.object(
+            local,
+            "extract_conversation_inline",
+            side_effect=lambda c: (c["session_id"], None, False, False),
+        ),
+    ):
+        local.run_conversation_extraction()
+        local.run_conversation_extraction()
+
+        with patch.object(local, "extract_conversation_inline", side_effect=_extraction_for) as ex:
+            local.run_conversation_extraction()
+
+    assert ex.call_count == len(staged)
+
+
+@pytest.mark.parametrize(
+    ("error", "calls", "item_fault"),
+    [
+        pytest.param(ValueError("no text block (stop_reason='refusal')"), 1, True, id="refusal"),
+        pytest.param(ConnectionError("connection reset"), 3, False, id="service"),
+    ],
+)
+def test_only_a_service_error_is_retried_and_only_a_bad_item_is_its_fault(
+    staged, monkeypatch, error, calls, item_fault
+):
+    seen = []
+
+    def fail(conversation):
+        seen.append(conversation["session_id"])
+        raise error
+
+    monkeypatch.setattr("src.extract.claude_extract.extract_conversation", fail)
+    monkeypatch.setattr(local.time, "sleep", lambda s: None)
+
+    result = local.extract_conversation_inline({"session_id": "s"})
+
+    assert result == ("s", None, False, item_fault)
+    assert len(seen) == calls
+
+
+def test_an_expired_credential_is_not_the_conversations_fault(staged, monkeypatch):
+    import google.auth.exceptions as gauth
+
+    def expired(conversation):
+        raise gauth.RefreshError("invalid_grant")
+
+    monkeypatch.setattr("src.extract.claude_extract.extract_conversation", expired)
+    monkeypatch.setattr(local.time, "sleep", lambda s: None)
+
+    assert local.extract_conversation_inline({"session_id": "s"}) == ("s", None, False, False)

@@ -45,6 +45,15 @@ QUOTA_PAUSE_SECONDS = 3600  # 1 hour default pause when quota exhausted
 # conversation pipeline was the one that did not.
 CONVERSATION_MAX_ATTEMPTS = 3
 
+# Runs after which an email that keeps failing on its own account is loaded
+# without its extraction: the loader inserts it with its raw content, searchable
+# by keyword, and it stops being offered. Before this a refused or unparseable
+# email never entered processed_ids, was first in line again every run, and was
+# never inserted at all. Only failures of the email count (an unusable reply);
+# quota, auth and transient service errors belong to the service, and an outage
+# must not turn every email it touched into a stub.
+EMAIL_MAX_ATTEMPTS = 3
+
 _shutdown = False
 _state_lock = threading.Lock()
 _log_lock = threading.Lock()
@@ -213,11 +222,14 @@ def _should_quota_pause(exc: Exception) -> bool:
 
 def extract_inline(
     email: dict, api_key: str | None, max_retries: int = 3, engine: str = "gemini"
-) -> tuple[str, dict | None, bool]:
+) -> tuple[str, dict | None, bool, bool]:
     """Extract inline with retries. Thread-safe for Claude engine.
 
-    Returns (msg_id, extraction_or_None, is_quota_error).
-    The caller uses is_quota_error to trigger a global pause.
+    Returns (msg_id, extraction_or_None, is_quota_error, is_item_fault).
+    The caller uses is_quota_error to trigger a global pause, and is_item_fault
+    to count the failure against EMAIL_MAX_ATTEMPTS. Only a service error (see
+    policy_bridge.is_transient) is retried here: an unusable reply comes back
+    the same for the same input.
 
     For Gemini: uses SIGALRM-based timeout (main thread only).
     For Claude: relies on SDK's built-in HTTP timeout (no SIGALRM).
@@ -238,7 +250,7 @@ def extract_inline(
             if use_alarm:
                 signal.alarm(0)
                 signal.signal(signal.SIGALRM, _handle_signal)
-            return (msg_id, result, False)
+            return (msg_id, result, False, False)
 
         except TimeoutError:
             if use_alarm:
@@ -246,7 +258,7 @@ def extract_inline(
             if attempt < max_retries - 1:
                 time.sleep(2 ** (attempt + 1))
             else:
-                return (msg_id, None, False)
+                return (msg_id, None, False, False)
 
         except Exception as e:
             if use_alarm:
@@ -260,8 +272,8 @@ def extract_inline(
                     time.sleep(min(30, 2 ** (attempt + 1)))
                     continue
                 else:
-                    return (msg_id, None, True)
-            from src.extract.policy_bridge import classify_exception
+                    return (msg_id, None, True, False)
+            from src.extract.policy_bridge import classify_exception, is_transient
             from src.llm_policy import Outcome
 
             if classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED:
@@ -273,19 +285,35 @@ def extract_inline(
                 )
                 touch_sentinel()
                 _shutdown = True
-                return (msg_id, None, False)
-            if attempt < max_retries - 1:
+                return (msg_id, None, False, False)
+            transient = is_transient(e)
+            if transient and attempt < max_retries - 1:
                 time.sleep(2 ** (attempt + 1))
             else:
                 log(f"  ↳ msg {msg_id} error: {type(e).__name__}: {str(e)[:200]}")
-                return (msg_id, None, is_quota)
+                return (msg_id, None, is_quota, not transient and not is_quota)
 
-    return (msg_id, None, is_quota)
+    return (msg_id, None, is_quota, False)
 
 
-def _worker_fn(email: dict, api_key: str | None, engine: str) -> tuple[str, dict | None, bool]:
-    """Worker function for ThreadPoolExecutor."""
+def _worker_fn(
+    email: dict, api_key: str | None, engine: str
+) -> tuple[str, dict | None, bool, bool]:
+    """Extract one staged email: news from its own text, anything else by the model."""
+    from src.extract.news_extract import extract_news, is_news
+
+    if is_news(email):
+        return (str(email.get("message_id", "unknown")), extract_news(email), False, False)
     return extract_inline(email, api_key, engine=engine)
+
+
+def _stub_extraction(msg_id: str) -> dict:
+    """What an email the model could not process is loaded with: nothing extracted."""
+    from src.extract.parser import parse_extraction
+
+    stub = parse_extraction("{}")
+    stub["message_id"] = msg_id
+    return stub
 
 
 def run_extraction(
@@ -325,7 +353,26 @@ def run_extraction(
 
     state = load_state()
     processed_ids = set(state.get("processed_ids", []))
+    # message_id -> runs that failed because of the email itself (see
+    # EMAIL_MAX_ATTEMPTS). Counted once per run, whatever the retries inside it.
+    attempt_counts: dict[str, int] = dict(state.get("failed_attempts", {}))
+    counted_this_run: set[str] = set()
     log(f"Previously extracted: {len(processed_ids)} emails")
+
+    def count_item_failure(msg_id: str) -> None:
+        # Callers in the concurrent path hold _state_lock.
+        if msg_id in counted_this_run:
+            return
+        counted_this_run.add(msg_id)
+        attempts = attempt_counts.get(msg_id, 0) + 1
+        if attempts < EMAIL_MAX_ATTEMPTS:
+            attempt_counts[msg_id] = attempts
+            return
+        attempt_counts.pop(msg_id, None)
+        with open(EXTRACTED_DIR / f"{msg_id}.json", "w") as f:
+            json.dump(_stub_extraction(msg_id), f, indent=2, ensure_ascii=False)
+        processed_ids.add(msg_id)
+        log(f"GAVE UP on msg {msg_id} after {attempts} runs; it loads without an extraction")
 
     log("Loading staged emails...")
     all_emails = collect_emails()
@@ -382,13 +429,14 @@ def run_extraction(
                 break
 
             email = pending[i]
-            msg_id, extraction, is_quota = extract_inline(email, api_key, engine=engine)
+            msg_id, extraction, is_quota, item_fault = _worker_fn(email, api_key, engine)
 
             if extraction is not None:
                 result_file = EXTRACTED_DIR / f"{msg_id}.json"
                 with open(result_file, "w") as f:
                     json.dump(extraction, f, indent=2, ensure_ascii=False)
                 processed_ids.add(msg_id)
+                attempt_counts.pop(msg_id, None)
                 total_done += 1
                 consecutive_failures = 0
                 i += 1
@@ -397,10 +445,13 @@ def run_extraction(
                 if is_quota:
                     consecutive_failures += 1
                 log(f"FAILED msg {msg_id}")
+                if item_fault:
+                    count_item_failure(msg_id)
 
                 if consecutive_failures >= CONSECUTIVE_FAIL_THRESHOLD:
                     pause = QUOTA_PAUSE_SECONDS
                     state["processed_ids"] = list(processed_ids)
+                    state["failed_attempts"] = attempt_counts
                     state["total_extracted"] = len(processed_ids)
                     state["failures"] = total_failed
                     save_state(state)
@@ -435,6 +486,7 @@ def run_extraction(
 
             if unsaved_count >= SAVE_INTERVAL:
                 state["processed_ids"] = list(processed_ids)
+                state["failed_attempts"] = attempt_counts
                 state["total_extracted"] = len(processed_ids)
                 state["failures"] = total_failed
                 save_state(state)
@@ -481,7 +533,7 @@ def run_extraction(
                         if future.cancelled():
                             continue
 
-                    msg_id, extraction, is_quota = future.result()
+                    msg_id, extraction, is_quota, item_fault = future.result()
 
                     if extraction is not None:
                         result_file = EXTRACTED_DIR / f"{msg_id}.json"
@@ -489,6 +541,7 @@ def run_extraction(
                             json.dump(extraction, f, indent=2, ensure_ascii=False)
                         with _state_lock:
                             processed_ids.add(msg_id)
+                            attempt_counts.pop(msg_id, None)
                             total_done += 1
                             consecutive_failures = 0
                     else:
@@ -496,6 +549,8 @@ def run_extraction(
                             total_failed += 1
                             if is_quota:
                                 consecutive_failures += 1
+                            if item_fault:
+                                count_item_failure(msg_id)
                         log(f"FAILED msg {msg_id}")
 
                     with _state_lock:
@@ -504,6 +559,7 @@ def run_extraction(
                     if unsaved_count >= SAVE_INTERVAL:
                         with _state_lock:
                             state["processed_ids"] = list(processed_ids)
+                            state["failed_attempts"] = attempt_counts
                             state["total_extracted"] = len(processed_ids)
                             state["failures"] = total_failed
                             save_state(state)
@@ -526,6 +582,7 @@ def run_extraction(
                     pause = QUOTA_PAUSE_SECONDS
                     with _state_lock:
                         state["processed_ids"] = list(processed_ids)
+                        state["failed_attempts"] = attempt_counts
                         state["total_extracted"] = len(processed_ids)
                         state["failures"] = total_failed
                         save_state(state)
@@ -554,6 +611,7 @@ def run_extraction(
 
     # Final save
     state["processed_ids"] = list(processed_ids)
+    state["failed_attempts"] = attempt_counts
     state["total_extracted"] = len(processed_ids)
     state["failures"] = total_failed
     save_state(state)
@@ -606,8 +664,13 @@ def collect_conversations() -> list[dict]:
 def extract_conversation_inline(
     conversation: dict,
     max_retries: int = 3,
-) -> tuple[str, dict | None, bool]:
-    """Extract a single conversation with retries. Returns (session_id, extraction, is_quota)."""
+) -> tuple[str, dict | None, bool, bool]:
+    """Extract a single conversation with retries.
+
+    Returns (session_id, extraction, is_quota, is_item_fault), as extract_inline
+    does: only a service error is retried, and only a failure of the
+    conversation itself counts toward CONVERSATION_MAX_ATTEMPTS.
+    """
     session_id = conversation.get("session_id", "unknown")
     is_quota = False
 
@@ -616,7 +679,7 @@ def extract_conversation_inline(
             from src.extract.claude_extract import extract_conversation
 
             result = extract_conversation(conversation)
-            return (session_id, result, False)
+            return (session_id, result, False, False)
 
         except Exception as e:
             retry_delay = _parse_retry_delay(e)
@@ -628,15 +691,20 @@ def extract_conversation_inline(
                     )
                     time.sleep(min(30, 2 ** (attempt + 1)))
                     continue
-                return (session_id, None, True)
+                return (session_id, None, True, False)
 
-            if attempt < max_retries - 1:
+            from src.extract.policy_bridge import classify_exception, is_transient
+            from src.llm_policy import Outcome
+
+            transient = is_transient(e)
+            if transient and attempt < max_retries - 1:
                 time.sleep(2 ** (attempt + 1))
             else:
                 log(f"FAILED conv {session_id[:12]}: {e}")
-                return (session_id, None, is_quota)
+                auth = classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED
+                return (session_id, None, is_quota, not (transient or auth or is_quota))
 
-    return (session_id, None, is_quota)
+    return (session_id, None, is_quota, False)
 
 
 def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: float | None = None):
@@ -718,7 +786,7 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
             log(f"Deadline reached, deferring {len(pending) - i} conversation(s) to the next run")
             break
 
-        session_id, extraction, is_quota = extract_conversation_inline(conv)
+        session_id, extraction, is_quota, item_fault = extract_conversation_inline(conv)
 
         if extraction is not None:
             result_file = CONV_EXTRACTED_DIR / f"{session_id}.json"
@@ -730,6 +798,11 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
             attempt_counts.pop(session_id, None)
             total_done += 1
             log(f"Extracted conv {session_id[:12]}... ({i + 1}/{len(pending)})")
+        elif not item_fault:
+            # The service's failure, not the conversation's: an outage must not
+            # use up every conversation's attempts and give them all up.
+            total_failed += 1
+            log(f"FAILED conv {session_id[:12]}... (service error, not counted)")
         else:
             total_failed += 1
             attempts = attempt_counts.get(session_id, 0) + 1

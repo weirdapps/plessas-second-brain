@@ -58,16 +58,16 @@ def create_with_refusal_fallback(client: Any, *, model: str, **create_kwargs: An
         )
         return response
 
+    if not project:
+        # Direct-API path (ANTHROPIC_API_KEY): no Vertex project to build a fallback on.
+        logger.error("No Vertex project available for fallback; returning the refusal.")
+        return response
     logger.warning(
         "Vertex policy refusal on %s — downgrading to fallback %s @ %s",
         model,
         fb_model,
         fb_region,
     )
-    if not project:
-        # Direct-API path (ANTHROPIC_API_KEY): no Vertex project to build a fallback on.
-        logger.error("No Vertex project available for fallback; returning the refusal.")
-        return response
 
     from anthropic import AnthropicVertex
 

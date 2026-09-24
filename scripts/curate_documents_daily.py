@@ -19,10 +19,12 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import re
 import shutil
 import sqlite3
 import sys
+import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -41,7 +43,10 @@ from src.extract.claude_extract import (  # noqa: E402
     complete,
 )
 from src.extract.untrusted import fence_fields  # noqa: E402
-from src.llm_deadline import install_llm_deadline_for_this_process  # noqa: E402
+from src.llm_deadline import (  # noqa: E402
+    MAX_CALL_SECONDS,
+    install_llm_deadline_for_this_process,
+)
 
 # --- Paths ---------------------------------------------------------------
 DB = Path.home() / "SourceCode/plessas-second-brain/data/brain.db"
@@ -511,7 +516,13 @@ def main():
     # host (developer Mac, CI) this is a no-op.  If the unit's TimeoutStartSec
     # cannot fund one worst-case call plus shutdown grace, it raises RuntimeError
     # and exits loud — the same loud refusal that cli.py uses.
-    install_llm_deadline_for_this_process()
+    deadline = install_llm_deadline_for_this_process()
+
+    def out_of_time() -> bool:
+        # One more call must fit before the deadline. Under the retry policy a
+        # single candidate can wait out a token push, and a run SIGTERMed before
+        # save_state loses every placement it made.
+        return deadline is not None and time.time() + MAX_CALL_SECONDS > deadline
 
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -541,13 +552,20 @@ def main():
         log("Nothing to do.")
         return 0
 
-    # Built here, not at the first call, so missing credentials stop the run
-    # before any candidate is tried.
+    # Vertex only, as with the job's own client before it shared the
+    # extractor's: that one falls back to ANTHROPIC_API_KEY without a project,
+    # and a hand run must not send attachment text to the direct API.
+    if not (os.environ.get("VERTEX_SDK_PROJECT") or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")):
+        log("No Vertex project (VERTEX_SDK_PROJECT or ANTHROPIC_VERTEX_PROJECT_ID); refusing.")
+        return 1
     _, model = _get_client_and_model()
     log(f"Using model: {model}")
 
     new_placements = []
-    for c in candidates:
+    for i, c in enumerate(candidates):
+        if out_of_time():
+            log(f"Out of time: {len(candidates) - i} candidates left for the next run.")
+            break
         try:
             result = classify_one(c)
         except Exception as e:
@@ -638,6 +656,9 @@ def main():
     if to_summarize:
         log(f"Re-summarizing {len(to_summarize)} folders via LLM")
         for folder in to_summarize:
+            if out_of_time():
+                log("Out of time: the remaining folder summaries are left as they were.")
+                break
             readme = DOCS / folder / "README.md"
             if not readme.exists():
                 continue

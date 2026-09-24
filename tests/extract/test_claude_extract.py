@@ -132,6 +132,28 @@ def test_complete_retries_a_refusal_on_the_fallback_tier(monkeypatch):
     assert claude_extract._response_text(response) == "recovered"
 
 
+def test_complete_does_not_replay_a_refusal_the_fallback_tier_saw(monkeypatch):
+    """The policy retries a refusal twice, and each retry replayed the primary and
+    the fallback again: six calls and 90 s of sleep for an answer that could not
+    change. The fallback tier is the one retry a refusal gets."""
+    monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+    refusal = types.SimpleNamespace(content=[], stop_reason="refusal")
+    primary = MagicMock()
+    primary.messages.create.return_value = refusal
+    fallback = MagicMock()
+    fallback.messages.create.return_value = refusal
+    slept = []
+    monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (primary, "m"))
+    monkeypatch.setattr("anthropic.AnthropicVertex", lambda **kwargs: fallback)
+    monkeypatch.setattr(claude_extract.time, "sleep", slept.append)
+
+    response = claude_extract.complete(max_tokens=10, messages=[])
+
+    assert response.stop_reason == "refusal"
+    assert primary.messages.create.call_count + fallback.messages.create.call_count == 2
+    assert slept == []
+
+
 def test_complete_sends_an_explicit_model():
     """Teams names its own model; everything else takes the configured one."""
     client = MagicMock()
@@ -146,7 +168,7 @@ def test_complete_sends_an_explicit_model():
 
 
 def test_every_sdk_request_goes_through_complete():
-    """Seven call sites each built the same request, and one bug was fixed four times.
+    """The call sites each built the same request, and one bug was fixed four times.
     Only complete() may run the policy or the refusal fallback, and only the
     fallback module may call the SDK."""
     from pathlib import Path

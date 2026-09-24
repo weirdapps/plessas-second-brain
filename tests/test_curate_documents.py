@@ -25,6 +25,7 @@ import importlib.util
 import json
 import sqlite3
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -297,6 +298,7 @@ def _run(curate, monkeypatch, verdicts, max_new=30) -> list[int]:
         seen.append(c["id"])
         return verdicts[c["id"]]
 
+    monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
     monkeypatch.setattr(curate, "install_llm_deadline_for_this_process", lambda: None)
     monkeypatch.setattr(curate, "_get_client_and_model", lambda: (object(), "model"))
     monkeypatch.setattr(curate, "classify_one", fake_classify)
@@ -304,6 +306,67 @@ def _run(curate, monkeypatch, verdicts, max_new=30) -> list[int]:
     monkeypatch.setattr(sys, "argv", ["curate_documents_daily.py", "--max-new", str(max_new)])
     assert curate.main() == 0
     return seen
+
+
+def test_a_hand_run_without_a_vertex_project_is_refused(curate, brain, monkeypatch):
+    """The shared client falls back to ANTHROPIC_API_KEY without a project; this
+    job's own client never did, and a hand run must not start sending attachment
+    text to the direct API."""
+    _seed_candidate(
+        brain.conn,
+        brain.src_dir,
+        row_id=1,
+        filename="deck.pdf",
+        mailbox_name="Inbox",
+        message_id="AAMkADk1ZTRiexample",
+    )
+    brain.conn.commit()
+    monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
+    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+
+    def no_client():
+        raise AssertionError("built a client without a Vertex project")
+
+    monkeypatch.setattr(curate, "install_llm_deadline_for_this_process", lambda: None)
+    monkeypatch.setattr(curate, "_get_client_and_model", no_client)
+    monkeypatch.setattr(sys, "argv", ["curate_documents_daily.py"])
+
+    assert curate.main() == 1
+
+
+def test_a_run_short_of_time_stops_classifying_and_still_saves(curate, brain, monkeypatch):
+    """Under the retry policy one candidate can wait out a token push. With no
+    check between candidates the unit was SIGTERMed before save_state, losing the
+    run's placements; the rest now wait for the next run."""
+    for row_id in (1, 2):
+        _seed_candidate(
+            brain.conn,
+            brain.src_dir,
+            row_id=row_id,
+            filename=f"deck{row_id}.pdf",
+            mailbox_name="Inbox",
+            message_id=f"AAMkADk1ZTRiexample{row_id}",
+        )
+    brain.conn.commit()
+    deadline = 1000.0
+    clock = iter([800.0, 900.0, 900.0, 900.0])  # 800 + 120 fits; 900 + 120 does not
+    monkeypatch.setattr(curate, "time", types.SimpleNamespace(time=lambda: next(clock)))
+    monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+    seen = []
+
+    def fake_classify(c):
+        seen.append(c["id"])
+        return {"folder": "SKIP", "confidence": "low"}
+
+    monkeypatch.setattr(curate, "install_llm_deadline_for_this_process", lambda: deadline)
+    monkeypatch.setattr(curate, "_get_client_and_model", lambda: (object(), "model"))
+    monkeypatch.setattr(curate, "classify_one", fake_classify)
+    monkeypatch.setattr(sys, "argv", ["curate_documents_daily.py"])
+
+    assert curate.main() == 0
+    assert len(seen) == 1
+    assert _state(curate)["processed_ids"] == seen
 
 
 def _state(curate) -> dict:

@@ -113,8 +113,9 @@ export HC_PING_URL="${HC_PING_URL:-}"
   >> "$LOG_FILE" 2>&1 \
   || echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: backup step failed (non-fatal)" >> "$LOG_FILE"
 
-# Engine selection
-if [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${ANTHROPIC_VERTEX_PROJECT_ID:-}" ]; then
+# Engine selection: Claude whenever claude_extract has a credential, Vertex
+# under either project name or the direct API.
+if [ -n "${VERTEX_SDK_PROJECT:-}${ANTHROPIC_VERTEX_PROJECT_ID:-}${ANTHROPIC_API_KEY:-}" ]; then
   ENGINE="claude"
 else
   ENGINE="${BRAIN_EXTRACT_ENGINE:-gemini}"

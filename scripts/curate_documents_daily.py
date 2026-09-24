@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import os
 import re
 import shutil
 import sqlite3
@@ -30,13 +29,18 @@ from pathlib import Path
 
 # Make src.extract.* importable when run as a standalone script (scripts/ is sys.path[0]).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-# _response_text and MAX_OUTPUT_TOKENS are the repo's single implementations of
-# "first block that has text" and "how much output to allow". Imported rather
-# than copied so this script cannot drift away from them again the way it did
-# while it lived untracked on the VPS.
-from src.extract.claude_extract import MAX_OUTPUT_TOKENS, _response_text  # noqa: E402
+# _response_text, MAX_OUTPUT_TOKENS and complete are the repo's single
+# implementations of "first block that has text", "how much output to allow" and
+# "send one request". Imported rather than copied so this script cannot drift
+# away from them again the way it did while it lived untracked on the VPS: it
+# had its own client, and no retry policy.
+from src.extract.claude_extract import (  # noqa: E402
+    MAX_OUTPUT_TOKENS,
+    _get_client_and_model,
+    _response_text,
+    complete,
+)
 from src.extract.untrusted import fence_fields  # noqa: E402
-from src.extract.vertex_fallback import create_with_refusal_fallback  # noqa: E402
 from src.llm_deadline import install_llm_deadline_for_this_process  # noqa: E402
 
 # --- Paths ---------------------------------------------------------------
@@ -174,18 +178,7 @@ def save_state(state: dict):
     STATE.write_text(json.dumps(state, indent=2, ensure_ascii=False))
 
 
-def get_client():
-    from anthropic import AnthropicVertex
-
-    project_id = os.environ.get("VERTEX_SDK_PROJECT") or os.environ["ANTHROPIC_VERTEX_PROJECT_ID"]
-    region = os.environ.get("VERTEX_SDK_REGION") or os.environ.get(
-        "CLOUD_ML_REGION", "europe-west1"
-    )
-    model = os.environ.get("VERTEX_MODEL_EXTRACT", "claude-sonnet-4-6")
-    return AnthropicVertex(project_id=project_id, region=region, timeout=120.0), model
-
-
-def classify_one(client, model, c: dict) -> dict:
+def classify_one(c: dict) -> dict:
     # The sender wrote the filename, the subject and the document the summary
     # came from, and the answer names a folder this job writes to.
     intro, fenced = fence_fields(
@@ -204,9 +197,7 @@ def classify_one(client, model, c: dict) -> dict:
             **fenced,
         )
     )
-    response = create_with_refusal_fallback(
-        client,
-        model=model,
+    response = complete(
         # Extended thinking draws on the same budget as the answer, so the old
         # 300 was spent entirely on thinking and the response carried no text
         # block at all (stop_reason=max_tokens, thinking_tokens=300).
@@ -246,14 +237,12 @@ def _summary_fields(summary) -> dict:
     return kept
 
 
-def summarize_folder(client, model, folder: str, readme_text: str) -> dict:
+def summarize_folder(folder: str, readme_text: str) -> dict:
     truncated = readme_text[:18000]
     # The README lists senders' subjects and summaries, and the answer is written
     # into INDEX.md, which later sessions read as curated guidance.
     intro, fenced = fence_fields(readme=truncated)
-    response = create_with_refusal_fallback(
-        client,
-        model=model,
+    response = complete(
         max_tokens=MAX_OUTPUT_TOKENS,  # 600 left no room after thinking either
         messages=[
             {
@@ -552,13 +541,15 @@ def main():
         log("Nothing to do.")
         return 0
 
-    client, model = get_client()
+    # Built here, not at the first call, so missing credentials stop the run
+    # before any candidate is tried.
+    _, model = _get_client_and_model()
     log(f"Using model: {model}")
 
     new_placements = []
     for c in candidates:
         try:
-            result = classify_one(client, model, c)
+            result = classify_one(c)
         except Exception as e:
             log(f"  classify error for id={c['id']}: {e}")
             continue
@@ -651,9 +642,7 @@ def main():
             if not readme.exists():
                 continue
             try:
-                summary = summarize_folder(
-                    client, model, folder, readme.read_text(encoding="utf-8")
-                )
+                summary = summarize_folder(folder, readme.read_text(encoding="utf-8"))
                 if "error" not in summary:
                     summaries[folder] = summary
             except Exception as e:
@@ -661,7 +650,6 @@ def main():
 
     state["folder_summaries"] = summaries
     save_state(state)
-    client.close()
 
     # Always rebuild INDEX (cheap — uses cached summaries)
     for area in AREAS:

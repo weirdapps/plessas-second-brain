@@ -191,6 +191,17 @@ def test_only_a_head_left_open_is_dropped_to_the_body():
     assert html_to_text("<html><head><title>T</head>Plain text first<p>then this") == (
         "Plain text first\n\nthen this"
     )
+    # The way to the head's end skips its comments, whose markup no browser shows:
+    # a note, an Outlook-only block, a block for every client but Outlook.
+    for comment in (
+        "<!-- built with <b>Tool</b> v2 -->",
+        "<!--[if mso]><table><tr><td>Outlook-only banner</td></tr></table><![endif]-->",
+    ):
+        assert html_to_text(f"<html><head><title>T{comment}</head><body><p>Hi</p>") == "Hi"
+    outlook = "<!-- p.MsoNormal{margin:0} --><!--[if !mso]><p>Only not Outlook</p><![endif]-->"
+    assert html_to_text(f"<html><head><style>{outlook}</head><body>Hello") == "Hello"
+    island = "<xml><!-- settings --><w:View>Normal</w:View>"  # it goes on past its comment
+    assert html_to_text(f"<html><head>{island}</head><body><p>Hi</p>") == "Hi"
     for held in ("<noscript><link rel=x></noscript>", "<basefont size=3>", "<bgsound src=x>", "\f"):
         assert html_to_text(f"<html><head>{held}<title>Subj</head><body>Hello") == "Hello", held
     # A stylesheet left open in the head goes up to where the head ends, past
@@ -233,23 +244,28 @@ def test_an_inline_tag_looks_for_nothing_to_end(monkeypatch):
     assert searched == ["div"]
 
 
-def test_the_re_reads_read_two_megabytes_at_most(monkeypatch):
+def test_the_reads_stop_at_two_megabytes_after_the_first_re_read(monkeypatch):
     """Read four times, a crafted body cost 7 s a megabyte; no body in the corpus
-    needs a re-read at all (19,804 on 2026-09-24, the largest 1.7 MB)."""
+    needs a re-read at all (19,804 on 2026-09-24, the largest 1.7 MB). A larger
+    body still gets its first: refused one, it was stored as no text at all."""
     from src.extract import html_text
 
     reads = []
     read = html_text._read
     monkeypatch.setattr(html_text, "_read", lambda html: reads.append(len(html)) or read(html))
-    html = "<p>" + "x" * 900_000 + "</p><title>a<title>b<title>c<p>after"
-    html_text.html_to_text(html)
-    assert len(reads) == 3  # the first read and two re-reads: a third would pass 2 MB
-    reads.clear()
-    html_text.html_to_text("<p>a</p><title>a<p>b</p><title>b<p>c</p><title>c<p>d")
-    assert len(reads) == 4
-    reads.clear()
-    html_text.html_to_text("<p>" + "x" * 1_999_988 + "</p><title>after")  # 2 MB re-read, exactly
-    assert reads == [2_000_007, 2_000_000]
+
+    def reads_for(html):
+        text = html_text.html_to_text(html)
+        count = len(reads)
+        reads.clear()
+        return count, text
+
+    assert reads_for("<p>a</p><title>a<p>b</p><title>b<p>c</p><title>c<p>d")[0] == 4
+    assert reads_for("<p>" + "x" * 900_000 + "</p><title>a<title>b<title>c<p>d")[0] == 2
+    count, text = reads_for("<p>" + "x" * 2_100_000 + "</p><title>T<p>after")
+    assert count == 2
+    assert text.endswith("x\n\nT\n\nafter")
+    assert reads_for("<p>" + "x" * 666_648 + "</p><title>a<xml>b<p>c")[0] == 3  # 2 MB exactly
 
 
 def test_key_headers_hidden_by_markup_cost_no_time():

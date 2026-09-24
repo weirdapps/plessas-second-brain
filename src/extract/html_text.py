@@ -105,18 +105,18 @@ _NO_PLACEHOLDERS = str.maketrans("", "", "\ufdd0\ufdd1")
 # tag, at most this many times: not after a script, which is code even when it
 # writes markup, nor after a style that nothing but its own CSS followed...
 _REREADS = 3
-# ...and the re-reads read no more than this between them: read four times, a
-# crafted body cost 7 s a megabyte, and no body in the corpus needs a re-read at
-# all (19,804 on 2026-09-24, the largest 1.7 MB).
-_REREAD_BYTES = 2_000_000
+# ...and past the first re-read, they stop once the reads come to more than this:
+# read four times, a crafted body cost 7 s a megabyte, and no body in the corpus
+# needs a re-read at all (19,804 on 2026-09-24, the largest 1.7 MB).
+_READ_BYTES = 2_000_000
 # What the scan after a stylesheet stops at: a comment, a string, or markup.
 _CSS_TOKEN = re.compile(r"/\*|[\"']|<[a-zA-Z/!]")
 # A CSS string ends at its quote or, unterminated, at the line's end.
 _CSS_STRING = {q: re.compile(rf"{q}(?:[^{q}\\\n]|\\.)*{q}?") for q in ("'", '"')}
 # Where a head ends: at its end tag, at the body's start tag, or, as a browser
-# ends it, at the first element a head cannot hold.
+# ends it, at the first element a head cannot hold. Its comments are skipped.
 _HEAD_END = re.compile(
-    r"</head[\s>]|<(?:body|div|p|br|span|font|center|table|tbody|thead|tfoot|tr|td|th|img"
+    r"<!--|</head[\s>]|<(?:body|div|p|br|span|font|center|table|tbody|thead|tfoot|tr|td|th|img"
     r"|ul|ol|li|dl|dt|dd|h[1-6]|hr|pre|blockquote|section|article|header|footer|main|nav"
     r"|aside|form|a|b|i|u|em|strong|small|big|sub|sup)[\s/>]",
     re.IGNORECASE,
@@ -369,6 +369,20 @@ def _markup_after_css(html: str, pos: int) -> int:
     return -1
 
 
+def _head_end(html: str, pos: int) -> int | None:
+    """Where a head left open at `pos` ends (_HEAD_END), outside its comments,
+    whose markup no browser shows (Outlook's conditional blocks hold tables);
+    None if nothing ends it."""
+    while (found := _HEAD_END.search(html, pos)) is not None:
+        if found.group() != "<!--":
+            return found.start()
+        close = html.find("-->", found.end())
+        if close < 0:
+            return None  # a comment left open runs to the end
+        pos = close + 3
+    return None
+
+
 def _read(html: str) -> _Reader:
     reader = _Reader()
     reader.feed(html)
@@ -389,8 +403,8 @@ def html_to_text(html: str) -> str:
     words (the spacing of <pre> kept), a newline between lines, a blank line
     between paragraphs, and after a link's text the address it goes to."""
     reader = _read(html)
-    reread = 0
-    for _ in range(_REREADS):
+    read = len(html)
+    for rereads in range(_REREADS):
         if not reader.hidden or reader.opened is None:
             break
         # The body ended inside a hidden element: a <title> or <xml> never
@@ -414,10 +428,10 @@ def html_to_text(html: str) -> str:
             rest = _markup_after_css(html, rest)  # what follows the CSS
             if rest < 0:
                 break  # a stylesheet the body was cut off inside
-        head_end = None if in_body else _HEAD_END.search(html, rest)
-        html = html[:start] + html[head_end.start() if head_end else rest :]
-        reread += len(html)
-        if reread > _REREAD_BYTES:
+        head_end = None if in_body else _head_end(html, rest)
+        html = html[:start] + html[rest if head_end is None else head_end :]
+        read += len(html)
+        if rereads and read > _READ_BYTES:
             break
         reader = _read(html)
     text = "".join(reader.parts).replace("\xa0", " ").replace("\ufeff", "")

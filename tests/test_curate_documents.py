@@ -861,3 +861,11 @@ def test_outlook_reauth_sentinel_does_not_stop_curation(curate, monkeypatch, tmp
         "curation still refuses to run because of the Outlook sentinel, "
         "though it never touches Outlook."
     )
+
+
+def test_curation_reads_the_configured_database(curate):
+    """It read <home>/SourceCode/plessas-second-brain/data/brain.db whatever
+    BRAIN_DATA_DIR said, a different database from the one extraction loads."""
+    from src import config
+
+    assert curate.DB == config.DEFAULT_DB

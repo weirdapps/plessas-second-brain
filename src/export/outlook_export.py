@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 
+from src.config import ATTACHMENTS_DIR, DATA_ROOT
 from src.export.outlook_cli import (
     OutlookCliAuthRequired,
     OutlookCliError,
@@ -195,7 +196,9 @@ def commit_messages_to_db(messages: list[dict], folder: str = "Inbox") -> Path:
     Outlook fields are mapped to the Apple Mail exporter's staging shape so the
     downstream pipeline doesn't need to learn a new format.
     """
-    staging_dir = Path(__file__).parent.parent.parent / "data" / "staging"
+    # Under DATA_ROOT, where extraction reads: built from the repository, it
+    # missed a data home moved with BRAIN_DATA_DIR.
+    staging_dir = DATA_ROOT / "staging"
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     batch_number = _next_outlook_batch_number(staging_dir)
@@ -227,7 +230,7 @@ def download_attachments_for_messages(
     effort, not part of the cursor-advance contract.
     """
     if base_dir is None:
-        base_dir = Path(__file__).parent.parent.parent / "data" / "attachments"
+        base_dir = ATTACHMENTS_DIR
     base_dir.mkdir(parents=True, exist_ok=True)
 
     targets = [m for m in messages if m.get("HasAttachments")]
@@ -371,8 +374,7 @@ def run_hourly_sync(
 
 
 def _default_state_path() -> Path:
-    repo_root = Path(__file__).parent.parent.parent
-    return repo_root / "data" / "state" / "outlook_sync.json"
+    return DATA_ROOT / "state" / "outlook_sync.json"
 
 
 def main() -> int:

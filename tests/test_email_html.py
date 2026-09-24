@@ -20,7 +20,9 @@ HTML = (
     + "<p>notes</p>" * 20
     + '<p><img src="cid:chart.png"></p></body></html>'
 )
-TEXT = "Καλησπέρα,\n\nthe deck: deck\n\n" + "\n\n".join(["notes"] * 20)
+TEXT = f"Καλησπέρα,\n\nthe deck: deck ({LINK})\n\n" + "\n\n".join(["notes"] * 20)
+# A shape fixture, not a credential (as in tests/test_scrub_secrets.py).
+ANTHROPIC = "sk-ant-api03-" + "a1B2c3D4e5" * 9
 
 
 def test_the_body_is_split_into_text_and_the_html_kept_beside_it():
@@ -187,6 +189,83 @@ def test_split_html_converts_the_emails_loaded_before_it(tmp_path, capsys):
     assert "0 emails" in capsys.readouterr().out
 
 
+def test_split_html_converts_every_email_of_a_batch(tmp_path, capsys):
+    from src.cli import cmd_split_html
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    for i in range(1, 6):
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received, subject, content) "
+            "VALUES (?, ?, '2026-09-01', 's', ?)",
+            (i, f"m{i}", HTML if i != 3 else "plain"),
+        )
+    conn.commit()
+    conn.close()
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=2, dry_run=False)) == 0
+
+    conn = sqlite3.connect(db)
+    assert [r[0] for r in conn.execute("SELECT email_id FROM email_html ORDER BY 1")] == [
+        1,
+        2,
+        4,
+        5,
+    ]
+    assert {r[0] for r in conn.execute("SELECT content FROM emails WHERE id != 3")} == {TEXT}
+    assert "converted 4 emails:" in capsys.readouterr().out
+
+
+def test_split_html_leaves_a_body_that_changed_under_it(tmp_path, monkeypatch):
+    """A batch is read and converted before the write lock is taken, so the
+    timers sharing the database wait for the writes only. A body re-loaded in
+    between is left as the re-load wrote it."""
+    from src.cli import cmd_split_html
+    from src.store import email_html
+
+    db = _html_store(tmp_path)
+    convert = email_html.split_body
+
+    def racing(content):
+        other = sqlite3.connect(db)
+        other.execute("UPDATE emails SET content = 'reloaded' WHERE id = 1")
+        other.commit()
+        other.close()
+        return convert(content)
+
+    monkeypatch.setattr(email_html, "split_body", racing)
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=10, dry_run=False)) == 0
+
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT content FROM emails WHERE id = 1").fetchone()[0] == "reloaded"
+    assert conn.execute("SELECT count(*) FROM email_html").fetchone()[0] == 0
+
+
+def test_split_html_never_converts_an_email_twice(tmp_path):
+    """Text converted from HTML can itself open like markup (an escaped &lt;p&gt;).
+    A second run must leave it and its kept HTML alone."""
+    from src.cli import cmd_split_html
+
+    html = "<html><body>&lt;p&gt; marks a paragraph</body></html>"
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    conn.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, content) "
+        "VALUES (1, 'a', '2026-09-01', 's', ?)",
+        (html,),
+    )
+    conn.commit()
+    conn.close()
+
+    for _ in range(2):
+        assert cmd_split_html(argparse.Namespace(db=str(db), batch=10, dry_run=False)) == 0
+
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT content FROM emails").fetchone()[0] == "<p> marks a paragraph"
+    assert unpack(conn.execute("SELECT html FROM email_html").fetchone()[0]) == html
+
+
 def test_split_html_dry_run_changes_nothing(tmp_path, capsys):
     from src.cli import cmd_split_html
 
@@ -198,6 +277,74 @@ def test_split_html_dry_run_changes_nothing(tmp_path, capsys):
     assert conn.execute("SELECT content FROM emails WHERE id = 1").fetchone()[0] == HTML
     assert conn.execute("SELECT count(*) FROM email_html").fetchone()[0] == 0
     assert "would" in capsys.readouterr().out
+
+
+def test_split_html_dry_run_does_not_migrate_an_older_store(tmp_path, capsys):
+    """A rehearsal on a copy of a v22 store must leave it at v22."""
+    from src.cli import cmd_split_html
+
+    db = _html_store(tmp_path)
+    conn = get_connection(str(db))
+    conn.execute("DROP TABLE email_html")
+    conn.execute("UPDATE schema_version SET version = 22")
+    conn.commit()
+    conn.close()
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=100, dry_run=True)) == 0
+
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 22
+    assert not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'email_html'").fetchone()
+    assert "would convert 1 email:" in capsys.readouterr().out
+
+
+def test_split_html_redacts_what_it_keeps(tmp_path):
+    """A body loaded before the ingest path redacted (#55) can hold a key. Moved
+    into email_html it would be compressed, out of sight of the index, of a grep
+    of the file and of any scan of text columns."""
+    from src.cli import cmd_split_html
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    conn.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, content) "
+        "VALUES (1, 'a', '2026-09-01', 's', ?)",
+        (f"<html><body><p>the key is {ANTHROPIC}</p></body></html>",),
+    )
+    conn.commit()
+    conn.close()
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=10, dry_run=False)) == 0
+
+    conn = sqlite3.connect(db)
+    content = conn.execute("SELECT content FROM emails WHERE id = 1").fetchone()[0]
+    html = unpack(conn.execute("SELECT html FROM email_html WHERE email_id = 1").fetchone()[0])
+    assert content == "the key is [REDACTED:anthropic-key]"
+    assert html == "<html><body><p>the key is [REDACTED:anthropic-key]</p></body></html>"
+
+
+def test_split_html_finds_a_body_behind_a_byte_order_mark(tmp_path):
+    """Its SQL prefilter skips the same leading characters looks_like_html does."""
+    from src.cli import cmd_split_html
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    conn.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, content) "
+        "VALUES (1, 'a', '2026-09-01', 's', ?), (2, 'b', '2026-09-01', 's', ?)",
+        ("\ufeff\r\n\t " + HTML, "From: Petros <p.petrou@example.com>"),
+    )
+    conn.commit()
+    conn.close()
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=10, dry_run=False)) == 0
+
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT content FROM emails WHERE id = 1").fetchone()[0] == TEXT
+    assert conn.execute("SELECT content FROM emails WHERE id = 2").fetchone()[0] == (
+        "From: Petros <p.petrou@example.com>"
+    )
+    assert conn.execute("SELECT count(*) FROM email_html").fetchone()[0] == 1
 
 
 def test_an_older_store_gets_the_table(tmp_path):

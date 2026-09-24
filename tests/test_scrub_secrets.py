@@ -237,3 +237,30 @@ def test_vacuum_removes_bytes_freed_before_the_scrub(scrub, tmp_path, monkeypatc
     for secret in (GOOGLE, ANTHROPIC):
         assert secret.encode() not in data
         assert secret.lower().encode() not in data
+
+
+def test_a_key_in_kept_html_is_found_and_redacted(scrub, tmp_path, capsys, monkeypatch):
+    """email_html holds compressed HTML (schema v23), so neither a scan of text
+    columns nor a grep of the file can see a key in it: the scrub decompresses."""
+    from src.store.email_html import pack, unpack
+
+    other = "sk-ant-api03-" + "Z9y8X7w6V5" * 9  # a second shape, found nowhere else
+    path = _db(tmp_path, scrub, monkeypatch)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO email_html (email_id, html) VALUES (2, ?)",
+        (pack(f"<html><body><p>{other}</p></body></html>"),),
+    )
+    conn.commit()
+    conn.close()
+    assert other.encode() not in _file_bytes(path)
+
+    assert scrub.main([]) == 1
+    assert "email_html.html: 1 row" in capsys.readouterr().out
+
+    assert scrub.main(["--apply"]) == 0
+    conn = sqlite3.connect(path)
+    (blob,) = conn.execute("SELECT html FROM email_html WHERE email_id = 2").fetchone()
+    conn.close()
+    assert unpack(blob) == "<html><body><p>[REDACTED:anthropic-key]</p></body></html>"
+    assert scrub.main([]) == 0

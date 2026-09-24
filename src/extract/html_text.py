@@ -54,6 +54,12 @@ class _Reader(HTMLParser):
             self.newlines += 1
         elif tag in ("td", "th"):
             self.parts.append(" ")
+        elif tag == "img":
+            # What a reader with images off sees: Outlook's join buttons and
+            # many signatures are images.
+            alt = dict(attrs).get("alt") or ""
+            if alt.strip():
+                self.handle_data(f" {alt} ")
         elif tag in _PARAGRAPHS:
             self._break(2)
         elif tag in _BLOCKS:

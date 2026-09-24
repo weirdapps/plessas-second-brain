@@ -254,6 +254,17 @@ stopped. That is why the flag is off by default. `scripts/backup_db.py --hc-slug
 reason: "the sync ran" and "a backup was written" are different facts, and only
 the second one is worth a green check on the backup.
 
+**Upgrading to schema v23.** From v23 an HTML body is stored as the text a
+reader sees, with the HTML kept compressed in `email_html`. Emails loaded before
+it keep their HTML body until `python -m src.cli split-html` converts them, once,
+on the producer: it works a batch per transaction, so it can run beside the
+timers, and it ends by optimizing the full-text index. On a copy of a 3.5 GB
+store it converted 19,965 bodies (969 MB of HTML to 146 MB of text, the HTML kept
+in 124 MB) in 79 s, and halved the body index. The file shrinks only after a
+`VACUUM`, which needs the writers stopped and about twice the database free:
+3.5 GB became 2.6 GB. `scripts/scrub_secrets.py --apply --vacuum` does both
+jobs in one quiet window.
+
 ## 8. Backup and restore
 
 `scripts/backup_db.py` takes an MVCC-consistent snapshot of a live `brain.db`,

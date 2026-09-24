@@ -19,7 +19,7 @@ Multi-modal personal knowledge base: ingests emails, attachments, calendar event
 ## Hosts
 
 - The producer, a Linux VPS in this deployment, runs every ingest job on `systemd --user` timers and owns the only writable `brain.db`. Deploy code there by pulling; the wrappers the units run are archived in `scripts/wrappers/systemd/`.
-- A Mac is a replica: an hourly pull (`scripts/wrappers/launchd/sb-db-pull.sh`) copies `brain.db` and `embeddings.npz` down, and the local MCP server reads that copy. Every `python -m src.cli` subcommand that writes, and the action lifecycle, refuses to run on a replica (`BRAIN_ROLE=replica`, or the pull's stamp `~/.second-brain/db-pull.stamp`); `BRAIN_ROLE=producer` overrides the stamp. Other writers are not guarded, so do not run them on a Mac either: the MCP `sharepoint_index` refetch, `python -m src.store.dedup_people`, `python -m src.export.inbox_reconcile`.
+- A Mac is a replica: an hourly pull (`scripts/wrappers/launchd/sb-db-pull.sh`) copies `brain.db` and `embeddings.npz` down, and the local MCP server reads that copy. Every writer refuses to run on a replica: the `python -m src.cli` subcommands that write, the action lifecycle, the store maintenance modules, the scripts that write and the MCP `sharepoint_index` refetch (`BRAIN_ROLE=replica`, or the pull's stamp `~/.second-brain/db-pull.stamp`); `BRAIN_ROLE=producer` overrides the stamp.
 - Schema migrations run on the producer and reach replicas with the next pull.
 
 ## Tests

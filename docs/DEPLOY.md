@@ -102,6 +102,21 @@ the cron recipe below; systemd's `EnvironmentFile=` and launchd's
 the database lives, and the systemd one would create a directory literally
 named `~` in its working directory.
 
+**Upgrading a host that already set `BRAIN_DATA_DIR`.** The Outlook exporter
+used to keep its cursors, staged batches and attachments in `<repo>/data`
+whatever the variable said, and extraction never read those batches. The
+cursors are carried over on the next run, one per folder, when the data home
+holds none; with the timers stopped, move the rest yourself:
+`<repo>/data/staging/batch-*.json` and `<repo>/data/attachments/*` into the same
+places under `$BRAIN_DATA_DIR`. A run that exits 7 has no cursor: move it
+across, and do not answer with `--bootstrap`, which fetches only the newest 100
+messages. A replica's pull (`sb-db-pull.sh`) reads the producer's
+`<repo>/data`: edit its `REMOTE_DATA` to the new data home too. The wrappers in
+`scripts/wrappers/` are an archive, so copy the updated `sb-outlook-sync.sh`,
+`sb-daily-sync.sh` and `sb-reverse-ingest.sh` into `~/.local/bin` as well. To
+roll back, rename `<repo>/data/state/*.json.carried` back to `*.json`, after
+copying across any newer cursor from `$BRAIN_DATA_DIR/state`.
+
 ## 4. Bootstrap and verify
 
 ```bash

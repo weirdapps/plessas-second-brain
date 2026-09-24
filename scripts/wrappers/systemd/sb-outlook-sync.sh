@@ -12,6 +12,9 @@ set -uo pipefail
 
 PROJECT="$HOME/SourceCode/plessas-second-brain"
 PYTHON="$HOME/.venvs/second-brain/bin/python"
+# The data home as src/config.py resolves it: BRAIN_DATA_DIR, else the repo's.
+DATA_DIR="${BRAIN_DATA_DIR:-$PROJECT/data}"
+DB="$DATA_DIR/brain.db"
 SENTINEL="$HOME/.second-brain/needs_reauth"
 STATE="$HOME/.second-brain/outlook_sync_wrapper.json"
 LOG_DIR="$HOME/.second-brain/logs"
@@ -98,21 +101,21 @@ overall_rc=0
 echo "$(ts) — start folder=Inbox" >> "$LOG"
 "$PYTHON" -m src.export.outlook_export \
   --mode hourly --concurrency 2 \
-  --folder Inbox --state-path "$PROJECT/data/state/outlook_sync.json" >> "$LOG" 2>&1
+  --folder Inbox --state-path "$DATA_DIR/state/outlook_sync.json" >> "$LOG" 2>&1
 rc1=$?
 [ "$rc1" -ne 0 ] && overall_rc=$rc1
 
 echo "$(ts) — start folder=Archive" >> "$LOG"
 "$PYTHON" -m src.export.outlook_export \
   --mode hourly --concurrency 2 --bootstrap \
-  --folder Archive --state-path "$PROJECT/data/state/outlook_sync_archive.json" >> "$LOG" 2>&1
+  --folder Archive --state-path "$DATA_DIR/state/outlook_sync_archive.json" >> "$LOG" 2>&1
 rc2=$?
 [ "$rc2" -ne 0 ] && overall_rc=$rc2
 
 echo "$(ts) — start folder=Sent Items" >> "$LOG"
 "$PYTHON" -m src.export.outlook_export \
   --mode hourly --concurrency 2 --bootstrap \
-  --folder "Sent Items" --state-path "$PROJECT/data/state/outlook_sync_sent.json" >> "$LOG" 2>&1
+  --folder "Sent Items" --state-path "$DATA_DIR/state/outlook_sync_sent.json" >> "$LOG" 2>&1
 rc_sent=$?
 [ "$rc_sent" -ne 0 ] && overall_rc=$rc_sent
 
@@ -148,7 +151,7 @@ else
   if [ "$rc4" -ne 0 ] && tail -20 "$LOG" | grep -qi "database is locked"; then
     echo "$(ts) — load retry after database-lock" >> "$LOG"
     sleep 10
-    "$PYTHON" -c "import sqlite3,os; c=sqlite3.connect(os.path.expanduser('~/SourceCode/plessas-second-brain/data/brain.db')); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()" 2>/dev/null || true
+    "$PYTHON" -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()" "$DB" 2>/dev/null || true
     "$PYTHON" -m src.cli sync --engine claude --workers 8 --skip-export >> "$LOG" 2>&1
     rc4=$?
   fi

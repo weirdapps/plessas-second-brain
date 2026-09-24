@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from pathlib import Path
 
+from src.config import ATTACHMENTS_DIR, DATA_ROOT, REPO_ROOT
 from src.export.outlook_cli import (
     OutlookCliAuthRequired,
     OutlookCliError,
@@ -195,7 +196,9 @@ def commit_messages_to_db(messages: list[dict], folder: str = "Inbox") -> Path:
     Outlook fields are mapped to the Apple Mail exporter's staging shape so the
     downstream pipeline doesn't need to learn a new format.
     """
-    staging_dir = Path(__file__).parent.parent.parent / "data" / "staging"
+    # Under DATA_ROOT, where extraction reads: built from the repository, it
+    # missed a data home moved with BRAIN_DATA_DIR.
+    staging_dir = DATA_ROOT / "staging"
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     batch_number = _next_outlook_batch_number(staging_dir)
@@ -227,7 +230,7 @@ def download_attachments_for_messages(
     effort, not part of the cursor-advance contract.
     """
     if base_dir is None:
-        base_dir = Path(__file__).parent.parent.parent / "data" / "attachments"
+        base_dir = ATTACHMENTS_DIR
     base_dir.mkdir(parents=True, exist_ok=True)
 
     targets = [m for m in messages if m.get("HasAttachments")]
@@ -371,8 +374,42 @@ def run_hourly_sync(
 
 
 def _default_state_path() -> Path:
-    repo_root = Path(__file__).parent.parent.parent
-    return repo_root / "data" / "state" / "outlook_sync.json"
+    """The Inbox cursor, under DATA_ROOT with the rest of the data."""
+    return DATA_ROOT / "state" / "outlook_sync.json"
+
+
+def _cursor_in(path: Path) -> OutlookSyncState | None:
+    """The state saved at `path` if it holds a cursor: not a missing, unreadable
+    or cursorless file."""
+    try:
+        state = load_outlook_sync_state(path)
+    except (OSError, ValueError, AttributeError, TypeError):  # not JSON, or not an object
+        return None
+    return state if state.last_seen_received_at else None
+
+
+def _carry_over(path: Path) -> Path:
+    """`path`, with the cursor the repository still holds copied into it.
+
+    The cursors used to live in the repository's data/state whatever
+    BRAIN_DATA_DIR said. On a host that set it, a folder's cursor still there is
+    copied across when the one under DATA_ROOT has none: without it the Inbox
+    run exits 7 and the wrapper bootstraps the other folders, and a bootstrap
+    fetches only the newest 100 messages. A failed run's cursorless file counts
+    as none. Written atomically, once: the old file is renamed <name>.carried,
+    so a rollback still has it and a later reset of the folder cannot bring a
+    months-old cursor back.
+    """
+    legacy = REPO_ROOT / "data" / "state" / path.name
+    if path.parent != DATA_ROOT / "state" or legacy == path:
+        return path
+    cursor = _cursor_in(legacy)
+    if cursor is None or _cursor_in(path) is not None:
+        return path
+    save_outlook_sync_state(path, cursor)
+    legacy.rename(legacy.with_name(legacy.name + ".carried"))
+    logger.warning("Carried the sync cursor over from %s to %s", legacy, path)
+    return path
 
 
 def main() -> int:
@@ -395,12 +432,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    state_path = args.state_path or _default_state_path()
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # After the logging setup, so the carry-over's warning has a time and level.
+    state_path = _carry_over(args.state_path or _default_state_path())
 
     if args.mode == "hourly":
         try:

@@ -31,6 +31,8 @@ from pathlib import Path
 
 # Make src.extract.* importable when run as a standalone script (scripts/ is sys.path[0]).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.config import DEFAULT_DB  # noqa: E402
+
 # _response_text, MAX_OUTPUT_TOKENS and complete are the repo's single
 # implementations of "first block that has text", "how much output to allow" and
 # "send one request". Imported rather than copied so this script cannot drift
@@ -49,7 +51,7 @@ from src.llm_deadline import (  # noqa: E402
 )
 
 # --- Paths ---------------------------------------------------------------
-DB = Path.home() / "SourceCode/plessas-second-brain/data/brain.db"
+DB = DEFAULT_DB  # the data home, BRAIN_DATA_DIR included
 DOCS = Path.home() / "Documents"
 STATE = Path.home() / ".second-brain/curate-state.json"
 LOG_DIR = Path.home() / ".second-brain/logs"

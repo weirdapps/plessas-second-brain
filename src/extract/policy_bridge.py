@@ -22,19 +22,22 @@ from src.extract.claude_extract import reset_client_cache
 from src.extract.vertex_auth import is_vertex_auth_error
 from src.llm_policy import Outcome, register_post_reauth
 
-# Timeouts reaching the service rather than of the request (see is_item_timeout).
-# httpx2 is the Anthropic SDK's transport, a fork of httpx.
+# Timeouts of the network rather than of the request (see is_item_timeout):
+# connecting, waiting for a pooled connection, sending. httpx2 is the Anthropic
+# SDK's transport, a fork of httpx.
 try:
     import httpx2
 
-    _REACHING_TIMEOUTS: tuple[type[BaseException], ...] = (
+    _NETWORK_TIMEOUTS: tuple[type[BaseException], ...] = (
         httpx.ConnectTimeout,
         httpx.PoolTimeout,
+        httpx.WriteTimeout,
         httpx2.ConnectTimeout,
         httpx2.PoolTimeout,
+        httpx2.WriteTimeout,
     )
 except ImportError:  # an SDK back on plain httpx
-    _REACHING_TIMEOUTS = (httpx.ConnectTimeout, httpx.PoolTimeout)
+    _NETWORK_TIMEOUTS = (httpx.ConnectTimeout, httpx.PoolTimeout, httpx.WriteTimeout)
 
 _RATE_LIMIT_PATTERNS = ("429", "resource_exhausted")
 
@@ -63,6 +66,10 @@ def classify_exception(exc: BaseException | None, response: object | None) -> Ou
         if isinstance(exc, anthropic.AuthenticationError | anthropic.PermissionDeniedError):
             return Outcome.AUTH_REAUTH_REQUIRED
         if isinstance(exc, anthropic.RateLimitError | anthropic.OverloadedError):
+            return Outcome.RATE_LIMIT
+        # The Vertex client has no class for 529: an overload arrives as
+        # InternalServerError with that status.
+        if isinstance(exc, anthropic.APIStatusError) and getattr(exc, "status_code", 0) == 529:
             return Outcome.RATE_LIMIT
         if isinstance(exc, anthropic.APITimeoutError):
             return Outcome.TIMEOUT
@@ -126,21 +133,27 @@ def is_transient(exc: BaseException) -> bool:
 def is_item_timeout(exc: BaseException) -> bool:
     """The request ran out of time, as the same request is likely to again.
 
-    On either side: the client's own timeout, or the service giving up on it (a
-    408, or a 504 such as Gemini's DEADLINE_EXCEEDED). Not a timeout reaching the
-    service, while connecting or waiting for a pooled connection: that is the
-    network's, and says nothing about the request. The Anthropic SDK wraps every
-    timeout of its transport in APITimeoutError, so the cause tells them apart.
+    On either side: the client waiting for the reply, or the service giving up
+    on it with a 408 or a 504. The Vertex client reports every 504 as
+    DeadlineExceededError, whatever answered; Gemini names its own deadline
+    (DEADLINE_EXCEEDED), so a gateway's 504 on the way there is not counted.
+    Nor is a timeout of the network: connecting, waiting for a pooled
+    connection, or sending a request body, which is at most ~50K characters
+    here. The Anthropic SDK wraps every timeout of its transport in
+    APITimeoutError, so the cause tells them apart. The Vertex mTLS transport
+    (requests) is not used here, and its timeouts are not classified.
     """
-    if isinstance(exc, _REACHING_TIMEOUTS) or isinstance(exc.__cause__, _REACHING_TIMEOUTS):
+    if isinstance(exc, _NETWORK_TIMEOUTS) or isinstance(exc.__cause__, _NETWORK_TIMEOUTS):
         return False
     if classify_exception(exc, None) is Outcome.TIMEOUT:
         return True
     if isinstance(exc, TimeoutError | httpx.TimeoutException):
         return True
-    if isinstance(exc, anthropic.APIStatusError) and exc.status_code in (408, 504):
+    if isinstance(exc, anthropic.APIStatusError) and getattr(exc, "status_code", 0) in (408, 504):
         return True
-    return isinstance(exc, genai_errors.APIError) and exc.code in (408, 504)
+    if isinstance(exc, genai_errors.APIError):
+        return exc.code == 408 or (exc.code == 504 and exc.status == "DEADLINE_EXCEEDED")
+    return False
 
 
 register_post_reauth(reset_client_cache)

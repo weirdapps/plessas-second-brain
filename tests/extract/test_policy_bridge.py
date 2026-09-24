@@ -202,8 +202,10 @@ def test_a_timeout_of_the_request_is_told_apart_from_one_reaching_the_service():
     reaching_the_service = [
         _sdk_timeout(httpx2.ConnectTimeout("connect", request=request2)),
         _sdk_timeout(httpx2.PoolTimeout("pool", request=request2)),
+        _sdk_timeout(httpx2.WriteTimeout("write", request=request2)),
         httpx.ConnectTimeout("connect", request=request),
         httpx.PoolTimeout("pool", request=request),
+        httpx.WriteTimeout("write", request=request),
     ]
     not_timeouts = [
         _status_error(anthropic.InternalServerError, 500),
@@ -224,3 +226,56 @@ def is_transient_(exc):
     from src.extract.policy_bridge import is_transient
 
     return is_transient(exc)
+
+
+def _vertex_error(status):
+    """What the Vertex client itself makes of a status, not a hand-built class."""
+    import httpx2
+
+    client = anthropic.AnthropicVertex(region="eu", project_id="p", access_token="t")
+    response = httpx2.Response(status, request=httpx2.Request("POST", "https://example.invalid"))
+    return client._make_status_error("status", body=None, response=response)
+
+
+def test_a_vertex_overload_is_rate_limited_as_the_direct_apis_is():
+    """The Vertex client has no class for 529: an overload arrived as a plain
+    InternalServerError, and never slowed anything down."""
+    exc = _vertex_error(529)
+
+    assert type(exc) is anthropic.InternalServerError
+    assert classify_exception(exc, None) is Outcome.RATE_LIMIT
+
+
+def test_what_the_vertex_client_makes_of_a_504_is_the_requests_timeout():
+    from src.extract.policy_bridge import is_item_timeout
+
+    assert is_item_timeout(_vertex_error(504))
+    assert not is_item_timeout(_vertex_error(503))
+
+
+def test_a_gateways_504_on_the_way_to_gemini_is_not_the_requests_timeout():
+    """Gemini names its own deadline; an HTML 504 from a proxy is the network."""
+    import httpx
+    from google.genai import errors as genai_errors
+
+    from src.extract.policy_bridge import is_item_timeout
+
+    def raised(response):
+        try:
+            genai_errors.APIError.raise_for_response(response)
+        except genai_errors.APIError as e:
+            return e
+        raise AssertionError("no error raised")
+
+    request = httpx.Request("POST", "https://example.invalid")
+    gateway = raised(httpx.Response(504, text="<html>gateway</html>", request=request))
+    deadline = raised(
+        httpx.Response(
+            504,
+            json={"error": {"code": 504, "status": "DEADLINE_EXCEEDED", "message": "late"}},
+            request=request,
+        )
+    )
+
+    assert not is_item_timeout(gateway)
+    assert is_item_timeout(deadline)

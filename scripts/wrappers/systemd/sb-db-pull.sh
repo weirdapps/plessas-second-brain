@@ -16,7 +16,9 @@ mkdir -p "$LOG_DIR"
 
 VPS="vps"
 LOCAL_DATA="$HOME/SourceCode/plessas-second-brain/data"
-REMOTE_DATA="SourceCode/plessas-second-brain/data"
+# The producer's data home, relative to its $HOME; set it if BRAIN_DATA_DIR
+# moved it there.
+REMOTE_DATA="${SB_REMOTE_DATA:-SourceCode/plessas-second-brain/data}"
 REMOTE_PYTHON="~/.venvs/second-brain/bin/python"
 SSH_OPTS="-o ConnectTimeout=10 -o BatchMode=yes -o ServerAliveInterval=15"
 

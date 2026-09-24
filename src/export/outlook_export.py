@@ -6,7 +6,6 @@ path. Forward-only: historical data stays in the existing DB untouched.
 """
 
 import logging
-import shutil
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -375,19 +374,38 @@ def run_hourly_sync(
 
 
 def _default_state_path() -> Path:
-    """The Inbox cursor, under DATA_ROOT with the rest of the data.
+    """The Inbox cursor, under DATA_ROOT with the rest of the data."""
+    return DATA_ROOT / "state" / "outlook_sync.json"
 
-    It used to live in the repository's data/state whatever BRAIN_DATA_DIR said.
-    On a host that set it, a cursor still there is copied across once: without
-    it the run exits 7, and the bootstrap that answers that fetches only the
-    newest 100 messages. The old file stays where it was.
+
+def _cursor_in(path: Path) -> OutlookSyncState | None:
+    """The state saved at `path` if it holds a cursor: not a missing, unreadable
+    or cursorless file."""
+    try:
+        state = load_outlook_sync_state(path)
+    except (OSError, ValueError):
+        return None
+    return state if state.last_seen_received_at else None
+
+
+def _carry_over(path: Path) -> Path:
+    """`path`, with the cursor the repository still holds copied into it.
+
+    The cursors used to live in the repository's data/state whatever
+    BRAIN_DATA_DIR said. On a host that set it, a folder's cursor still there is
+    copied across when the one under DATA_ROOT has none: without it the Inbox
+    run exits 7 and the wrapper bootstraps the other folders, and a bootstrap
+    fetches only the newest 100 messages. A failed run's cursorless file counts
+    as none. Written atomically; the old file stays where it was.
     """
-    path = DATA_ROOT / "state" / "outlook_sync.json"
-    legacy = REPO_ROOT / "data" / "state" / "outlook_sync.json"
-    if legacy != path and legacy.exists() and not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(legacy, path)
-        logger.warning("Carried the sync cursor over from %s to %s", legacy, path)
+    legacy = REPO_ROOT / "data" / "state" / path.name
+    if path.parent != DATA_ROOT / "state" or legacy == path:
+        return path
+    cursor = _cursor_in(legacy)
+    if cursor is None or _cursor_in(path) is not None:
+        return path
+    save_outlook_sync_state(path, cursor)
+    logger.warning("Carried the sync cursor over from %s to %s", legacy, path)
     return path
 
 
@@ -411,7 +429,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    state_path = args.state_path or _default_state_path()
+    state_path = _carry_over(args.state_path or _default_state_path())
 
     logging.basicConfig(
         level=logging.INFO,

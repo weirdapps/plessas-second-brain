@@ -141,3 +141,16 @@ def test_reverse_ingest_defaults_to_config_document_roots(monkeypatch, tmp_path,
     capsys.readouterr()
 
     assert seen["roots"] == cfg.document_roots()
+
+
+def test_an_empty_data_dir_means_the_default(monkeypatch):
+    """An empty BRAIN_DATA_DIR= line made the data root the working directory,
+    where the wrappers (${BRAIN_DATA_DIR:-...}) saw the default."""
+    monkeypatch.setenv("BRAIN_DATA_DIR", "")
+    import src.config as cfg
+
+    importlib.reload(cfg)
+    try:
+        assert cfg.DATA_ROOT == cfg.REPO_ROOT / "data"
+    finally:
+        _restore_config(monkeypatch, cfg)

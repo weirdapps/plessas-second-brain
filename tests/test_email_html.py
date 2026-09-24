@@ -216,6 +216,36 @@ def test_split_html_converts_every_email_of_a_batch(tmp_path, capsys):
     assert "converted 4 emails:" in capsys.readouterr().out
 
 
+def test_split_html_takes_a_batch_bigger_than_sqlites_variable_limit(tmp_path, monkeypatch):
+    """A batch's ids go to SQLite as one JSON list, not one variable each."""
+    from src.cli import cmd_split_html
+    from src.store import schema
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    for i in range(1, 13):
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received, subject, content) "
+            "VALUES (?, ?, '2026-09-01', 's', ?)",
+            (i, f"m{i}", HTML),
+        )
+    conn.commit()
+    conn.close()
+    connect = schema.get_connection
+
+    def limited(path):
+        c = connect(path)
+        c.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 10)
+        return c
+
+    monkeypatch.setattr(schema, "get_connection", limited)
+
+    assert cmd_split_html(argparse.Namespace(db=str(db), batch=12, dry_run=False)) == 0
+
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT count(*) FROM email_html").fetchone()[0] == 12
+
+
 def test_split_html_leaves_a_body_that_changed_under_it(tmp_path, monkeypatch):
     """A batch is read and converted before the write lock is taken, so the
     timers sharing the database wait for the writes only. A body re-loaded in

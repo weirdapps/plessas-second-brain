@@ -426,6 +426,7 @@ def cmd_split_html(args) -> int:
     sight of the index and of a grep of the file. A dry run opens the database
     read-only, so it neither migrates nor converts.
     """
+    import json
     import sqlite3
 
     from src.extract.html_text import LEADING
@@ -466,7 +467,8 @@ def cmd_split_html(args) -> int:
         ids = candidates[start : start + size]
         ready = []
         for email_id, content in conn.execute(
-            f"SELECT id, content FROM emails WHERE id IN ({', '.join('?' * len(ids))})", ids
+            "SELECT id, content FROM emails WHERE id IN (SELECT value FROM json_each(?))",
+            (json.dumps(ids),),
         ).fetchall():
             if content is None:
                 continue

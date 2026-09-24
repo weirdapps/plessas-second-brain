@@ -50,6 +50,37 @@ class TestCatchesRealCredentials:
         assert "[REDACTED:private-key]" in out
         assert "before" in out and "after" in out
 
+    def test_an_encrypted_key_block_is_removed_whole(self):
+        head = "-----BEGIN RSA PRIVATE KEY-----"  # gitleaks:allow
+        tail = "-----END RSA PRIVATE KEY-----"  # gitleaks:allow
+        body = f"{head}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,00\n\n{'a' * 20}\n{tail}"
+        assert redact_secrets(f"before\n{body}\nafter") == "before\n[REDACTED:private-key]\nafter"
+
+    def test_key_headers_that_never_end_cost_no_time(self):
+        """Each header scanned the rest of the text for its END line, so the cost
+        grew with the square of the size: 400 KB of headers took 12 s, and anyone
+        can send them in a mail."""
+        import time
+
+        head = "-----BEGIN RSA PRIVATE KEY-----"  # gitleaks:allow
+        text = f"{head} x\n" * 10_000
+        started = time.perf_counter()
+        out = redact_secrets(text)
+        assert time.perf_counter() - started < 1.0
+        assert out == "[REDACTED:private-key]" * 9_999 + f"{head} x\n"  # each ends at the next
+
+    def test_a_key_cut_off_before_another_is_removed_too(self):
+        """A block ends at its END line or at the next key's header: a key pasted
+        half before a whole one left its first half in the text."""
+        rsa = "-----BEGIN RSA PRIVATE KEY-----"  # gitleaks:allow
+        ec = "-----BEGIN EC PRIVATE KEY-----"  # gitleaks:allow
+        ec_end = "-----END EC PRIVATE KEY-----"  # gitleaks:allow
+        text = f"{rsa}\n{'a' * 20}\n{ec}\n{'b' * 20}\n{ec_end}\nafter"
+        assert redact_secrets(text) == "[REDACTED:private-key][REDACTED:private-key]\nafter"
+        # Only a key's header ends one: a header named in prose stays prose.
+        prose = f"a key file starts {rsa} and stays secret.\n-----Original Message-----\nFrom: x"
+        assert redact_secrets(prose) == prose
+
     def test_several_secrets_in_one_string(self):
         text = f"{REAL['github-token']} and {REAL['google-key']}"
         out = redact_secrets(text)

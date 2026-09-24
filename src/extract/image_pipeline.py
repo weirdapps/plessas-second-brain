@@ -13,6 +13,7 @@ from src.extract.image_classifier import (
     refresh_signature_index,
     sha256_of_file,
 )
+from src.store.email_html import markup_or_text
 
 logger = logging.getLogger(__name__)
 
@@ -190,9 +191,11 @@ def run_backfill(
             a.message_id,
             e.sender_address,
             e.content,
-            e.date_received
+            e.date_received,
+            h.html
         FROM attachments a
         JOIN emails e ON a.email_id = e.id
+        LEFT JOIN email_html h ON h.email_id = e.id
         WHERE a.mime_type LIKE 'image/%'
           AND a.file_path IS NOT NULL
     """
@@ -247,8 +250,9 @@ def run_backfill(
         return deadline is not None and time.monotonic() >= deadline
 
     def _process(row, work_conn) -> bool:
-        attachment_id, file_path, filename, message_id, sender_address, content, _ = row
-        position = compute_position_in_body(content, filename)
+        attachment_id, file_path, filename, message_id, sender_address, content, _, html = row
+        # cid: references live in the markup, which an HTML body keeps in email_html.
+        position = compute_position_in_body(markup_or_text(content, html), filename)
         try:
             result = process_single_image(
                 conn=work_conn,

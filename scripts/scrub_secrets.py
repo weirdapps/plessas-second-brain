@@ -13,7 +13,8 @@ document in its old segments until they are merged. So --apply:
 
   1. scans every TEXT column of every content table with the src/redact.py
      patterns (generated columns and FTS shadow tables are derived, not stored
-     input, and are skipped),
+     input, and are skipped), and the HTML kept in email_html, decompressed
+     first: compressed, a key is invisible to a column scan and to a grep,
   2. rewrites each hit with redact_secrets under PRAGMA secure_delete=ON, in one
      transaction, re-reading the row inside it,
   3. runs FTS5 'optimize' on EVERY full-text index, hits or not, which merges its
@@ -32,7 +33,9 @@ that write the database first.
 
 Run it on the host that builds the database, with the writers stopped. Counts
 only are printed, never a value. Defaults to a dry run, which opens the database
-read-only and exits 1 when it finds anything. On a replica --apply is refused
+read-only and exits 1 when it finds anything. Either mode exits 2 when a kept
+HTML value cannot be decompressed: it scrubs everything else, but cannot say the
+database is clean. On a replica --apply is refused
 with exit 3, since the next pull replaces the file. Snapshots taken before the scrub
 still hold the old rows: the encrypted offsite ones, and the plaintext local
 ones in data/backups/, both of which age out under the retention policy.
@@ -42,16 +45,22 @@ import argparse
 import shutil
 import sqlite3
 import sys
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import DEFAULT_DB, is_replica, replica_refusal  # noqa: E402
 from src.redact import _PATTERNS, redact_secrets  # noqa: E402
+from src.store.email_html import pack, unpack  # noqa: E402
 
 _FTS_SHADOW_SUFFIXES = ("_data", "_idx", "_content", "_docsize", "_config")
 
 # How long the write connection waits on a lock. Tests shorten it.
 BUSY_TIMEOUT_MS = 60000
+
+# Columns holding zlib-compressed text (schema v23 keeps an HTML body's markup
+# in email_html), read and written through src.store.email_html.
+_PACKED = (("email_html", "html"),)
 
 
 def _virtual_tables(conn: sqlite3.Connection) -> dict[str, str]:
@@ -85,24 +94,48 @@ def _text_columns(conn: sqlite3.Connection) -> list[tuple[str, str]]:
     return targets
 
 
+def _packed_columns(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """(table, column) for every compressed column this database has."""
+    tables = {
+        name for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    return [(table, column) for table, column in _PACKED if table in tables]
+
+
 def _has_secret(value) -> bool:
     return isinstance(value, str) and any(p.search(value) for _n, p in _PATTERNS)
 
 
-def _scan(conn: sqlite3.Connection) -> dict[tuple[str, str], list[int]]:
-    """(table, column) -> rowids of rows whose value holds a credential."""
+def _unpacked(value) -> str | None:
+    """A compressed value's text, or None for one that is not zlib, not UTF-8
+    inside, or not bytes at all."""
+    try:
+        return unpack(value)
+    except (zlib.error, UnicodeDecodeError, TypeError):
+        return None
+
+
+def _scan(
+    conn: sqlite3.Connection,
+) -> tuple[dict[tuple[str, str], list[int]], dict[str, list[int]]]:
+    """(table, column) -> rowids of rows whose value holds a credential, and
+    table -> rowids of the compressed values that could not be read."""
     found: dict[tuple[str, str], list[int]] = {}
-    for table, column in _text_columns(conn):
-        rowids = [
-            rowid
-            for rowid, value in conn.execute(
-                f'SELECT rowid, "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL'
-            )
-            if _has_secret(value)
-        ]
+    unreadable: dict[str, list[int]] = {}
+    for table, column in _text_columns(conn) + _packed_columns(conn):
+        packed = (table, column) in _PACKED
+        rowids = []
+        for rowid, value in conn.execute(
+            f'SELECT rowid, "{column}" FROM "{table}" WHERE "{column}" IS NOT NULL'
+        ):
+            text = _unpacked(value) if packed else value
+            if packed and text is None:
+                unreadable.setdefault(table, []).append(rowid)
+            elif _has_secret(text):
+                rowids.append(rowid)
         if rowids:
             found[(table, column)] = rowids
-    return found
+    return found, unreadable
 
 
 def _fts5_indexes(conn: sqlite3.Connection) -> list[str]:
@@ -136,13 +169,26 @@ def _checkpoint(conn: sqlite3.Connection) -> bool:
     return busy == 0 and log_frames == checkpointed
 
 
-def _report(found: dict[tuple[str, str], list[int]]) -> None:
+def _report_unreadable(unreadable: dict[str, list[int]]) -> None:
+    """Counts and rowids, which are no secret, so the rows can be fixed or deleted."""
+    for table, rowids in sorted(unreadable.items()):
+        noun = "row" if len(rowids) == 1 else "rows"
+        shown = ", ".join(str(r) for r in rowids[:20]) + (" ..." if len(rowids) > 20 else "")
+        print(
+            f"  {len(rowids)} {table} {noun} could not be read, so were not checked "
+            f"(rowid {shown})",
+            file=sys.stderr,
+        )
+
+
+def _report(found: dict[tuple[str, str], list[int]], unread: bool = False, file=None) -> None:
     if not found:
-        print("No credential-shaped values found.")
+        if not unread:  # an unread row may hold one
+            print("No credential-shaped values found.", file=file)
         return
     for (table, column), rowids in sorted(found.items()):
         noun = "row" if len(rowids) == 1 else "rows"
-        print(f"  {table}.{column}: {len(rowids)} {noun}")
+        print(f"  {table}.{column}: {len(rowids)} {noun}", file=file)
 
 
 def _apply(conn: sqlite3.Connection, found: dict[tuple[str, str], list[int]]) -> int:
@@ -150,15 +196,18 @@ def _apply(conn: sqlite3.Connection, found: dict[tuple[str, str], list[int]]) ->
     conn.execute("BEGIN IMMEDIATE")
     try:
         for (table, column), rowids in found.items():
+            packed = (table, column) in _PACKED
             for rowid in rowids:
                 row = conn.execute(
                     f'SELECT "{column}" FROM "{table}" WHERE rowid = ?', (rowid,)
                 ).fetchone()
-                if row is None or not _has_secret(row[0]):
+                value = None if row is None else _unpacked(row[0]) if packed else row[0]
+                if value is None or not _has_secret(value):
                     continue  # changed since the scan
+                clean = redact_secrets(value)
                 conn.execute(
                     f'UPDATE "{table}" SET "{column}" = ? WHERE rowid = ?',
-                    (redact_secrets(row[0]), rowid),
+                    (pack(clean) if packed else clean, rowid),
                 )
                 changed += 1
         conn.execute("COMMIT")
@@ -197,10 +246,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.apply:
         conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
         try:
-            found = _scan(conn)
+            found, unreadable = _scan(conn)
         finally:
             conn.close()
-        _report(found)
+        _report(found, unread=bool(unreadable))
+        if unreadable:
+            _report_unreadable(unreadable)
+            return 2
         return 1 if found else 0
 
     if args.vacuum:
@@ -224,8 +276,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     try:
-        found = _scan(conn)
-        _report(found)
+        found, first_unread = _scan(conn)
+        _report(found, unread=bool(first_unread))
         changed = _apply(conn, found) if found else 0
         print(f"{changed} rows redacted")
         for fts in _fts5_indexes(conn):
@@ -235,21 +287,25 @@ def main(argv: list[str] | None = None) -> int:
             conn.execute("VACUUM")
             print("  vacuumed")
         checkpointed = _checkpoint(conn)
-        left = _scan(conn)
+        left, unreadable = _scan(conn)
     finally:
         conn.close()
+    # Every warning first, then one exit code: 2 for an unread row wins, since
+    # the run cannot vouch for what it could not read.
     if left:
         print("Credential-shaped values remain:", file=sys.stderr)
-        _report(left)
-        return 1
+        _report(left, file=sys.stderr)
+    if unreadable:
+        _report_unreadable(unreadable)
     if not checkpointed:
         print(
             "The WAL checkpoint was blocked by a reader, so the main file still holds "
             "pre-scrub pages. Stop the readers and re-run.",
             file=sys.stderr,
         )
-        return 1
-    return 0
+    if unreadable:
+        return 2
+    return 1 if left or not checkpointed else 0
 
 
 if __name__ == "__main__":

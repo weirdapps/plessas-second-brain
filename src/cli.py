@@ -413,6 +413,114 @@ def cmd_process_images(args):
     print(f"  Failed: {stats['failed']}")
 
 
+# split-html holds a batch in memory until it writes it, so a batch ends at about
+# this many characters of bodies, their text and their kept HTML (about twice as
+# many bytes for Greek) as well as at --batch emails.
+SPLIT_HTML_BATCH_CHARS = 64_000_000
+
+
+def cmd_split_html(args) -> int:
+    """Keep the HTML of emails loaded before schema v23 beside their text.
+
+    Converts each HTML body to the text a reader sees, keeps the HTML compressed
+    in email_html, and lets the index follow; a batch per transaction, so the
+    writers that share the database wait seconds, not minutes, and a stopped run
+    resumes where it was. Ends with an FTS optimize, which drops the deleted
+    terms. The file only shrinks after a VACUUM.
+
+    Credentials are redacted on the way, as the ingest path has done since #55:
+    an older body can hold one, and in email_html it would be compressed, out of
+    sight of the index and of a grep of the file. secure_delete zeroes the pages
+    the rewrite frees, which the replica pull and the snapshots would copy. A dry
+    run opens the database read-only, so it neither migrates nor converts.
+    """
+    import sqlite3
+
+    from src.extract.html_text import LEADING
+    from src.redact import redact_secrets
+    from src.store.email_html import pack, split_body
+    from src.store.schema import get_connection, run_migrations
+
+    db_path = str(args.db)
+    if not Path(db_path).exists():
+        print(f"Database not found: {db_path}", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        migrated = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'email_html'"
+        ).fetchone()
+    else:
+        conn = get_connection(db_path)
+        run_migrations(conn)
+        conn.execute("PRAGMA secure_delete = ON")
+        migrated = True
+    # A prefilter in SQL, on the same opening looks_like_html reads; it decides.
+    not_kept = (
+        "NOT EXISTS (SELECT 1 FROM email_html h WHERE h.email_id = e.id) AND " if migrated else ""
+    )
+    blanks = ", ".join(str(ord(c)) for c in LEADING)
+    candidates = [
+        row[0]
+        for row in conn.execute(
+            f"SELECT e.id FROM emails e WHERE {not_kept}"
+            f"ltrim(e.content, char({blanks})) LIKE '<%' ORDER BY e.id"
+        )
+    ]
+    converted = before = after = kept = 0
+    size = max(1, args.batch)
+    pos = 0
+    while pos < len(candidates):
+        # Read and convert with no lock held: the writers sharing the database
+        # wait for the writes only, not for the parsing.
+        ready: list[tuple[int, str, str | None, bytes, int]] = []
+        held = 0
+        while pos < len(candidates) and len(ready) < size and held < SPLIT_HTML_BATCH_CHARS:
+            email_id = candidates[pos]
+            pos += 1
+            row = conn.execute("SELECT content FROM emails WHERE id = ?", (email_id,)).fetchone()
+            if row is None or row[0] is None:
+                continue
+            content = row[0]
+            body, html = split_body(redact_secrets(content))
+            if html is not None:
+                blob = pack(html)
+                ready.append((email_id, content, body, blob, len(html.encode("utf-8"))))
+                held += len(content) + len(body or "") + len(blob)
+        for email_id, content, body, blob, html_bytes in ready:
+            if not args.dry_run:
+                # Unless the body changed since it was read: a re-load wins.
+                if not conn.execute(
+                    "UPDATE emails SET content = ? WHERE id = ? AND content = ?",
+                    (body, email_id, content),
+                ).rowcount:
+                    continue
+                conn.execute(
+                    "INSERT OR REPLACE INTO email_html (email_id, html) VALUES (?, ?)",
+                    (email_id, blob),
+                )
+            converted += 1
+            before += html_bytes
+            after += len((body or "").encode("utf-8"))
+            kept += len(blob)
+        if not args.dry_run:
+            conn.commit()
+    verb = "would convert" if args.dry_run else "converted"
+    print(
+        f"split-html: {verb} {converted} email{'s' if converted != 1 else ''}: "
+        f"bodies {before / 1e6:.1f} MB -> {after / 1e6:.1f} MB of text, "
+        f"HTML kept in {kept / 1e6:.1f} MB"
+    )
+    # Whenever HTML has been kept, not only when this run kept some: a run stopped
+    # before its optimize left the words of what it redacted in the index.
+    if not args.dry_run and (converted or conn.execute("SELECT 1 FROM email_html").fetchone()):
+        conn.execute("INSERT INTO emails_fts(emails_fts) VALUES('optimize')")
+        conn.commit()
+        print("  full-text index optimized; VACUUM returns the space to the disk")
+    conn.close()
+    return 0
+
+
 def cmd_process_sharepoint(args):
     """Scan emails for SharePoint URLs and fetch them."""
     from src.config import SHAREPOINT_DATA_DIR, SHAREPOINT_HOST
@@ -423,6 +531,7 @@ def cmd_process_sharepoint(args):
         retry_candidates,
     )
     from src.extract.sharepoint_url_scanner import extract_sharepoint_urls
+    from src.store.email_html import markup_or_text
     from src.store.schema import get_connection, run_migrations
 
     db_path = str(args.db)
@@ -450,15 +559,19 @@ def cmd_process_sharepoint(args):
     conn = get_connection(db_path)
     run_migrations(conn)
 
-    # Build query
-    query = "SELECT id, message_id, content, date_received FROM emails WHERE content IS NOT NULL"
+    # Build query. Links are read from the markup: an HTML body is kept in
+    # email_html, the text in content has no hrefs.
+    query = (
+        "SELECT e.id, e.message_id, e.content, e.date_received, h.html FROM emails e "
+        "LEFT JOIN email_html h ON h.email_id = e.id WHERE e.content IS NOT NULL"
+    )
     params = []
 
     if args.since:
-        query += " AND date_received >= ?"
+        query += " AND e.date_received >= ?"
         params.append(args.since)
 
-    query += " ORDER BY date_received DESC"
+    query += " ORDER BY e.date_received DESC"
 
     if args.limit and args.limit > 0:
         query += " LIMIT ?"
@@ -560,10 +673,10 @@ def cmd_process_sharepoint(args):
     if not stats["auth_required"]:
         cursor = conn.execute(query, params)
         for row in cursor:
-            email_id, message_id, content, date_received = row
+            email_id, message_id, content, date_received, html = row
             stats["emails_scanned"] += 1
 
-            urls = extract_sharepoint_urls(content)
+            urls = extract_sharepoint_urls(markup_or_text(content, html))
             if not urls:
                 continue
 
@@ -2403,6 +2516,21 @@ def main():
         "--dry-run", action="store_true", help="Scan and count only, no fetching"
     )
     parser_process_sp.set_defaults(func=cmd_process_sharepoint)
+
+    # split-html command
+    parser_split_html = subparsers.add_parser(
+        "split-html",
+        help="Keep the HTML of emails loaded before schema v23 beside their text",
+    )
+    parser_split_html.add_argument(
+        "--batch", type=int, default=500, help="Emails per transaction (default 500)"
+    )
+    parser_split_html.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Count and measure only, read-only: no migration, no conversion",
+    )
+    parser_split_html.set_defaults(func=cmd_split_html)
 
     # reverse-ingest command
     parser_reverse = subparsers.add_parser(

@@ -73,6 +73,8 @@ A staging batch is `{ "batch_number", "exported_at", "source", "folder", "emails
 }
 ```
 
+An HTML `content` is recognised by how it opens: a document or block-level tag (or `span`, `font`, `br`, `img`), a comment, a doctype, or an XML prolog followed by one of those; `looks_like_html` in `src/extract/html_text.py` has the list. It is stored as the text a reader sees, with the markup kept beside it; a body that opens with text is stored as it came.
+
 See [`examples/example_exporter.py`](examples/example_exporter.py) for a ~40-line reference exporter and [`examples/sample-batch.json`](examples/sample-batch.json) for a complete synthetic batch. Drop a batch into `staging/` under the data home (`<repo>/data` unless `BRAIN_DATA_DIR` moves it). On a fresh store, run `python -m src.extract.local && python -m src.cli load`: `load` creates the database but does not extract, and `sync` needs the database to exist. From then on `python -m src.cli sync` does both.
 
 ## MCP tools
@@ -263,6 +265,7 @@ python -m src.cli teams-sync --workers 4
 python -m src.cli process-attachments --phase 2 --workers 2
 python -m src.cli process-images --limit 500
 python -m src.cli process-sharepoint --since 2026-06-01
+python -m src.cli split-html                # after v23, on the producer: HTML bodies loaded before it (see DEPLOY)
 python -m src.cli reverse-ingest --root ~/Documents --workers 4
 python -m src.cli ingest ~/Downloads/report.pdf --source "Q2 report"
 python -m src.cli ingest --url https://example.com/article
@@ -383,7 +386,7 @@ skill/
 
 `data/brain.db` (SQLite). Migrations run automatically via `src/store/schema.py`; the current schema version is `CURRENT_SCHEMA_VERSION` in `src/config.py` and is tracked in the `schema_version` table.
 
-- **Core content**: `emails`, `topics`, `email_topics`, `decisions`, `action_items`, `commitments`, `people`, `email_people`, `key_facts`
+- **Core content**: `emails`, `topics`, `email_topics`, `decisions`, `action_items`, `commitments`, `people`, `email_people`, `key_facts`, and from v23 `email_html`: an HTML body is stored as the text a reader sees, and the HTML is kept here, zlib-compressed, for the SharePoint link scan and the inline-image positions
 - **Attachments and images**: `attachments`, `attachment_content`, `inline_images`, `inline_image_occurrences`, `sender_signature_index`
 - **Calendar**: `calendar_events`, `event_attendees`
 - **Teams**: `teams_chats`, `teams_threads`, `teams_messages`, `teams_mri_resolution`

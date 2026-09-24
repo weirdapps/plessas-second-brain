@@ -21,7 +21,8 @@ then it is documentation of the intended workflow.
 > `search_conversations`, `query_calendar_events`, `query_decisions`,
 > `query_actions`. Dossier tools: `person_context` (email and Teams),
 > `topic_context`, `sender_brief`, `meeting_prep`. The rest of a hit's thread:
-> `email_thread`. Corpus size, per-source coverage and freshness: `stats`.
+> `email_thread` (a keyword row's `thread_matches` says how many of its emails
+> matched). Corpus size, per-source coverage and freshness: `stats`.
 
 ## Usage
 

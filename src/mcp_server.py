@@ -742,6 +742,12 @@ def sharepoint_index(
         if operation == "refetch":
             if not url:
                 return {"error": "url is required for refetch"}
+            from src.config import is_replica, replica_refusal
+
+            # It records the result, and a replica's copy is replaced by the next
+            # pull (see src/config.py).
+            if is_replica():
+                return {"error": replica_refusal("a SharePoint refetch")}
             # Resolve the link BEFORE fetching, and refuse one we have never
             # recorded. `url` is model-supplied and reaches sharepoint-cli's
             # `--host` unfiltered (host_for_url is a bare urlparse().netloc), and

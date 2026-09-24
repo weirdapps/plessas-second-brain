@@ -169,6 +169,25 @@ def test_a_failure_below_the_cap_is_offered_again(staged, monkeypatch):
     assert ex.call_count == len(staged)
 
 
+def test_the_newest_conversations_go_first(staged, monkeypatch):
+    """Step 7 has 30 s. An old conversation the model will not take held the head
+    of the list and spent every hourly budget."""
+    convs = [
+        {"session_id": "old", "started_at": "2026-09-01T09:00:00Z"},
+        {"session_id": "new", "started_at": "2026-09-24T09:00:00Z"},
+        {"session_id": "mid", "started_at": "2026-09-10T09:00:00Z"},
+    ]
+
+    with (
+        patch.object(local, "collect_conversations", return_value=convs),
+        patch("src.extract.claude_extract._get_client_and_model", return_value=(object(), "m")),
+        patch.object(local, "extract_conversation_inline", side_effect=_extraction_for) as ex,
+    ):
+        local.run_conversation_extraction()
+
+    assert [c.args[0]["session_id"] for c in ex.call_args_list] == ["new", "mid", "old"]
+
+
 def test_work_done_before_the_deadline_is_saved(staged, tmp_path, monkeypatch):
     """A deferred item is only free if the ones already paid for are durable.
     Without the final state write, a budget-limited run would re-extract the
@@ -219,8 +238,10 @@ def test_a_quota_or_auth_failure_never_counts_toward_giving_up(staged, monkeypat
 
 def test_a_run_in_which_nothing_succeeded_counts_nothing(staged, monkeypatch):
     """An outage failed every conversation it touched, and three outage runs gave
-    them all up for good."""
+    them all up for good. The run's own successes decide, not earlier runs'."""
     monkeypatch.setattr(local, "CONVERSATION_MAX_ATTEMPTS", 1)
+    local.CONV_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    local.CONV_STATE_FILE.write_text(json.dumps({"processed_ids": ["earlier"]}))
 
     with (
         patch.object(local, "collect_conversations", return_value=staged),
@@ -235,17 +256,31 @@ def test_a_run_in_which_nothing_succeeded_counts_nothing(staged, monkeypatch):
     assert state["given_up_ids"] == []
 
 
+def _overloaded():
+    """The SDK's 529, through the module that already imports the SDK."""
+    from src.extract import policy_bridge
+
+    cls = policy_bridge.anthropic.OverloadedError
+    return cls.__new__(cls)
+
+
 @pytest.mark.parametrize(
-    ("error", "calls", "countable"),
+    ("error", "quota", "countable"),
     [
-        pytest.param(ValueError("no text block (stop_reason='refusal')"), 1, True, id="refusal"),
-        pytest.param(ConnectionError("connection reset"), 3, True, id="service"),
-        pytest.param(RuntimeError("429 RESOURCE_EXHAUSTED"), 3, False, id="quota"),
+        pytest.param(
+            ValueError("no text block (stop_reason='refusal')"), False, True, id="refusal"
+        ),
+        pytest.param(RuntimeError("400 prompt is too long"), False, True, id="rejected"),
+        pytest.param(ConnectionError("connection reset"), False, False, id="service"),
+        pytest.param(RuntimeError("429 RESOURCE_EXHAUSTED"), True, False, id="quota"),
+        pytest.param(_overloaded(), True, False, id="overloaded-529"),
     ],
 )
-def test_only_an_unusable_reply_goes_unretried_and_quota_never_counts(
-    staged, monkeypatch, error, calls, countable
+def test_one_attempt_and_only_the_conversations_own_failure_counts(
+    staged, monkeypatch, error, quota, countable
 ):
+    """The policy inside complete() is the only retry; a 529 overload is quota, as
+    it is for email."""
     seen = []
 
     def fail(conversation):
@@ -257,8 +292,8 @@ def test_only_an_unusable_reply_goes_unretried_and_quota_never_counts(
 
     result = local.extract_conversation_inline({"session_id": "s"})
 
-    assert result == ("s", None, not countable, countable)
-    assert len(seen) == calls
+    assert result == ("s", None, quota, countable)
+    assert len(seen) == 1
 
 
 def test_an_expired_credential_is_not_the_conversations_fault(staged, monkeypatch):

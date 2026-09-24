@@ -11,9 +11,11 @@ skips the model altogether.
 """
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 import google.auth.exceptions as gauth
 import pytest
+from google.genai import errors as genai_errors
 
 from src.extract import local
 
@@ -101,22 +103,36 @@ def test_news_is_no_evidence_that_the_model_works(run, workers):
     assert not (run.extracted / "bad.json").exists()
 
 
-def test_an_email_that_fails_then_extracts_in_one_run_is_not_counted(run):
-    """Counting it would leave a stale count, and at the cap write a stub over the
-    extraction the run had just saved."""
-    seen: list[str] = []
+@pytest.mark.parametrize("workers", [1, 3])
+@pytest.mark.parametrize("first", ["fails", "extracts"])
+def test_an_email_that_both_fails_and_extracts_in_one_run_is_not_counted(run, workers, first):
+    """Staged twice, one copy fails and one extracts, in either order. Counting it
+    would leave a stale count, and at the cap write a stub over the extraction
+    the run had just saved."""
+    import threading
 
-    def first_fails(email):
-        seen.append(email["message_id"])
-        if seen.count(email["message_id"]) == 1:
+    seen: list[str] = []
+    lock = threading.Lock()
+    first_done = threading.Event()
+
+    def one_of_each(email):
+        with lock:
+            seen.append(email["message_id"])
+            nth = seen.count(email["message_id"])
+        failing = (nth == 1) == (first == "fails")
+        if nth == 2:
+            first_done.wait(5)  # the second copy finishes second, whatever the pool does
+        else:
+            first_done.set()
+        if failing:
             return email["message_id"], None, False, True
         return email["message_id"], {"summary": "real"}, False, False
 
-    run.failure = first_fails
-    run([_mail("flaky"), _mail("flaky"), _mail("ok0")])
+    run.failure = one_of_each
+    run([_mail("dup"), _mail("dup"), _mail("ok0")], workers)
 
     assert run.state()["failed_attempts"] == {}
-    assert json.loads((run.extracted / "flaky.json").read_text())["summary"] == "real"
+    assert json.loads((run.extracted / "dup.json").read_text())["summary"] == "real"
 
 
 def test_quota_failures_never_count(run):
@@ -160,19 +176,23 @@ def test_news_never_reaches_the_model(run, workers):
     assert result["extracted"] == 2
 
 
-def test_news_does_not_hold_the_quota_breaker_open(run):
+@pytest.mark.parametrize("workers", [1, 3])
+def test_news_does_not_hold_the_quota_breaker_open(run, workers):
     """Interleaved with news, a quota outage kept the run calling the exhausted
-    model to its deadline, because every news item reset the count."""
+    model to its deadline, because every news item reset the count. The
+    concurrent path checks between chunks, so it stops at a chunk boundary."""
     run.failure = lambda e: (e["message_id"], None, True, False)
     emails = []
-    for n in range(10):
+    for n in range(100):
         emails.append(_mail(f"m{n}"))
         emails.append({"message_id": f"news:article:{n}", "mailbox_name": "News", "content": "x"})
 
-    result = run(emails)
+    result = run(emails, workers)
 
     assert result["quota_paused"] is True
-    assert len(run.calls) == local.CONSECUTIVE_FAIL_THRESHOLD
+    assert len(run.calls) < 100
+    if workers == 1:
+        assert len(run.calls) == local.CONSECUTIVE_FAIL_THRESHOLD
 
 
 # --- extract_inline: what is retried, and what counts
@@ -180,46 +200,55 @@ def test_news_does_not_hold_the_quota_breaker_open(run):
 
 @pytest.fixture
 def inline(monkeypatch, tmp_path):
-    """inline(error): extract_inline over one email whose extraction raises `error`."""
+    """inline(error, engine): extract_inline over one email whose extraction raises
+    `error`. Run in a worker thread, so the Gemini path sets no SIGALRM here."""
     monkeypatch.setattr(local, "LOG_FILE", tmp_path / "extract.log")
     monkeypatch.setattr(local.time, "sleep", lambda s: None)
     monkeypatch.setattr("src.extract.vertex_auth.touch_sentinel", lambda: None)
     monkeypatch.setattr(local, "_shutdown", False)
     calls: list[str] = []
 
-    def go(error):
+    def go(error, engine="claude"):
         def fail(email, api_key, engine="gemini"):
             calls.append(email["message_id"])
             raise error
 
         monkeypatch.setattr(local, "extract_one", fail)
-        return local.extract_inline({"message_id": "m"}, None, engine="claude")
+        with ThreadPoolExecutor(1) as pool:
+            return pool.submit(local.extract_inline, {"message_id": "m"}, None, 3, engine).result()
 
     go.calls = calls
     return go
 
 
+@pytest.mark.parametrize("engine", ["claude", "gemini"])
 @pytest.mark.parametrize(
-    ("error", "calls", "quota", "countable"),
+    ("error", "gemini_calls", "quota", "countable"),
     [
         pytest.param(ValueError("Failed to parse JSON"), 1, False, True, id="unusable-reply"),
-        pytest.param(ConnectionError("connection reset"), 3, False, True, id="service"),
-        pytest.param(RuntimeError("404 model not found"), 3, False, True, id="configuration"),
+        pytest.param(RuntimeError("400 prompt is too long"), 3, False, True, id="rejected"),
         pytest.param(
             gauth.MalformedError("half-written ADC"), 3, False, True, id="auth-valueerror"
         ),
+        pytest.param(ConnectionError("connection reset"), 3, False, False, id="service"),
+        pytest.param(
+            genai_errors.ServerError(503, {"error": {"status": "UNAVAILABLE"}}),
+            3,
+            False,
+            False,
+            id="gemini-503",
+        ),
+        pytest.param(TimeoutError(), 3, False, False, id="timeout"),
         pytest.param(RuntimeError("429 RESOURCE_EXHAUSTED"), 3, True, False, id="quota"),
-        pytest.param(TimeoutError(), 3, False, True, id="timeout"),
     ],
 )
-def test_only_an_unusable_reply_goes_unretried_and_quota_never_counts(
-    inline, error, calls, quota, countable
-):
-    """A reply that cannot be used comes back the same for the same input; every
-    other failure is retried as before. Counting is left to the run, which counts
-    nothing when the model worked for no email."""
-    assert inline(error) == ("m", None, quota, countable)
-    assert len(inline.calls) == calls
+def test_what_is_retried_and_what_counts(inline, engine, error, gemini_calls, quota, countable):
+    """Only the email's own failure is countable; a transient one is the service's.
+    Claude is tried once here, its retries being the policy's inside complete();
+    Gemini, which has no policy, is retried unless the reply was unusable. The run
+    still counts nothing when the model worked for no email."""
+    assert inline(error, engine) == ("m", None, quota, countable)
+    assert len(inline.calls) == (1 if engine == "claude" else gemini_calls)
 
 
 def test_an_expired_credential_never_counts_and_stops_the_run(inline):

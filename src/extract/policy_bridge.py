@@ -15,6 +15,8 @@ Two facts shape this file, both measured rather than assumed:
 
 import anthropic
 import google.auth.exceptions as gauth
+import httpx
+from google.genai import errors as genai_errors
 
 from src.extract.claude_extract import reset_client_cache
 from src.extract.vertex_auth import is_vertex_auth_error
@@ -88,6 +90,10 @@ def is_transient(exc: BaseException) -> bool:
     # AnthropicVertex refreshes its Google token outside the SDK's own error
     # wrapping, so a network drop there arrives as google-auth's own types.
     if isinstance(exc, gauth.TransportError | gauth.TimeoutError):
+        return True
+    # The Gemini engine raises its SDK's own 5xx, and httpx's transport errors
+    # unwrapped.
+    if isinstance(exc, genai_errors.ServerError | httpx.TransportError):
         return True
     return isinstance(exc, ConnectionError | TimeoutError)
 

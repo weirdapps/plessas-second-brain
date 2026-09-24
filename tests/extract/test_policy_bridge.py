@@ -112,6 +112,19 @@ def test_is_transient_knows_the_service_failures_the_sdk_raises():
     assert [is_transient(e) for e in cases] == [True] * len(cases)
 
 
+def test_is_transient_knows_the_gemini_engines_service_failures():
+    """The Gemini engine has no policy in front of it, and raises its SDK's own
+    5xx and httpx's transport errors unwrapped."""
+    import httpx
+    from google.genai import errors as genai_errors
+
+    from src.extract.policy_bridge import is_transient
+
+    assert is_transient(genai_errors.ServerError(503, {"error": {"status": "UNAVAILABLE"}}))
+    assert is_transient(httpx.ConnectError("connection refused"))
+    assert not is_transient(genai_errors.ClientError(400, {"error": {"status": "INVALID"}}))
+
+
 def test_is_transient_leaves_an_unusable_reply_permanent():
     from src.extract.policy_bridge import is_transient
 

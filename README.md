@@ -77,7 +77,7 @@ See [`examples/example_exporter.py`](examples/example_exporter.py) for a ~40-lin
 
 ## MCP tools
 
-The MCP server exposes 23 tools (all defined in `src/mcp_server.py`). Register the server once in `~/.claude/settings.json`, then every session picks them up.
+The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register the server once in `~/.claude/settings.json`, then every session picks them up.
 
 ### Unified recall
 
@@ -89,13 +89,14 @@ The MCP server exposes 23 tools (all defined in `src/mcp_server.py`). Register t
 
 ### Emails
 
-- `search_emails(query, search_type, limit)`. Keyword (FTS5) or semantic (embedding).
+- `search_emails(query, search_type, limit)`. Keyword (FTS5) or semantic (embedding). Keyword search tries the subject first, then the summary, the body, key facts and attachments, and returns one email per thread (for a subject match, the thread's newest).
+- `email_thread(email_id, limit)`. The emails of a hit's thread, oldest first, with `thread_total`; a thread longer than `limit` comes back as the `limit` emails centred on the hit, and a News item or an email with no conversation id as a thread of one.
 - `query_emails(person, topic, keyword, start_date, end_date, limit)`. Combined filters.
 - `outlook_live_search(folder, since_minutes, subject_contains)`. Bypasses the DB and queries the live Outlook mailbox directly, for mail newer than the store. `since_minutes` defaults to 60 and is capped at 1440 (24 hours); the answer's `since_minutes` and `clamped` say what was searched. This is the escape hatch when `stats` says the local copy is stale.
 
 ### People and topics
 
-- `person_context(name_or_email, days, limit)`. History, sentiment, decisions, open actions, communication pattern. Each list is capped at `limit` (default 20) and carries a `<name>_total` sibling with the real count, so a truncated answer is distinguishable from a complete one. A name is matched ignoring case and accents; when several people match, the most-emailed one is used and `match_count` / `other_candidates` say who else it could be (`sender_brief` and `meeting_prep` resolve names the same way).
+- `person_context(name_or_email, days, limit)`. History, sentiment, decisions, open actions, communication pattern, and `teams`: the messages they wrote in the window and the threads they wrote in (`recent_threads`, with `recent_threads_total`). Each list is capped at `limit` (default 20) and carries a `<name>_total` sibling with the real count, so a truncated answer is distinguishable from a complete one. A name is matched ignoring case and accents; when several people match, the most-emailed one is used and `match_count` / `other_candidates` say who else it could be (`sender_brief` and `meeting_prep` resolve names the same way).
 - `topic_context(topic, days, limit)`. Key people, decisions, actions, facts. Same `limit` and `<name>_total` contract.
 - `sender_brief(name_or_email, days)`. Compact briefing suitable for inline display.
 - `meeting_prep(people, topic, days)`. Per-attendee dossiers, optionally scoped to a topic.
@@ -297,7 +298,7 @@ Full subcommand list: `python -m src.cli --help`.
 src/
   cli.py                       Command-line entry (`brain` wrapper points here)
   config.py                    Paths, env-driven settings, schema version
-  mcp_server.py                MCP server (MCPServer, mcp SDK v2), 23 tools
+  mcp_server.py                MCP server (MCPServer, mcp SDK v2), 24 tools
   bridge.py                    Legacy JSON-over-CLI bridge (superseded by MCP)
   llm_policy.py                Shared Vertex retry and auth policy (vendored, SHA256 drift-checked)
   llm_deadline.py              Derives PTS_LLM_DEADLINE from the calling unit's own budget
@@ -393,7 +394,7 @@ skill/
 - **Teams**: `teams_chats`, `teams_threads`, `teams_messages`, `teams_mri_resolution`
 - **Conversations**: `conversations`, `conversation_turns`, `conversation_topics`
 - **External refs**: `sharepoint_links`
-- **FTS5**: `emails_fts`, `key_facts_fts`, `attachment_content_fts`, `conversation_turns_fts`, `conversations_fts`, `teams_messages_fts`, `teams_threads_fts`, `calendar_events_fts`
+- **FTS5**: `emails_fts` (summary, body and, from v22, subject, all accent-folded), `key_facts_fts`, `attachment_content_fts`, `conversation_turns_fts`, `conversations_fts`, `teams_messages_fts`, `teams_threads_fts`, `calendar_events_fts`
 - **Metadata**: `sync_metadata` (per-source cursors), `schema_version`
 
 `commitments` has no dedicated MCP tool and no CLI subcommand. The `commitments` bucket of `recall` is the only way to read it.
@@ -414,6 +415,8 @@ pytest tests/test_mcp_server.py     # single file
 pytest -k recall                    # filter by expression
 pytest --cov=src --cov-report=term  # with coverage
 ```
+
+Before and after changing how text is tokenised (stemming, prefix matching), run the regression guard. `scripts/retrieval_eval.py build` samples emails and keeps two words of each subject as a query; `run` reports how often keyword search returns the email, and its thread, first, in the top 5 and in the top 10. Compare the thread figures: replies share a subject, and a subject match returns one email per thread. It can show a loss, not a gain, because the queries are the subject's own words. The set holds subjects, so it is written to `~/.second-brain/retrieval-eval.json`, outside the repository, and both steps open the database read-only.
 
 ### Lint and format
 

@@ -71,7 +71,7 @@ def _get_conn():
 
 @mcp.tool()
 def person_context(name_or_email: str, days: int = 365, limit: int = 20) -> dict:
-    """Get rich context for a person: email history, topics, sentiment, decisions, open actions, communication pattern.
+    """Get rich context for a person: email history, topics, sentiment, decisions, open actions, communication pattern, Teams activity.
 
     Each list is capped at `limit` and carries a `<name>_total` sibling
     (topics_total, decisions_total, open_actions_total) with the real count, so
@@ -133,8 +133,38 @@ def sender_brief(name_or_email: str, days: int = 365) -> dict:
 
 
 @mcp.tool()
+def email_thread(email_id: int, limit: int = 50) -> dict:
+    """The emails of one email's thread, oldest first: date, sender, subject, summary.
+
+    For reading the exchange around a search hit. `thread_total` is the thread's
+    size; above `limit`, the `limit` emails centred on `email_id` come back. A
+    News item or an email with no conversation id is a thread of one; an unknown
+    id gives no emails and a total of 0.
+
+    Args:
+        email_id: emails.id of any email in the thread
+        limit: Maximum emails returned (default 50, at most 200)
+    """
+    from src.store.query import count_thread, query_thread
+
+    limit = max(1, min(int(limit), 200))
+    conn = _get_conn()
+    try:
+        return {
+            "email_id": email_id,
+            "emails": query_thread(conn, email_id, limit=limit),
+            "thread_total": count_thread(conn, email_id),
+        }
+    finally:
+        conn.close()
+
+
+@mcp.tool()
 def search_emails(query: str, search_type: str = "keyword", limit: int = 20) -> list[dict]:
     """Search emails by keyword (FTS5) or semantic similarity (embeddings).
+
+    Keyword mode returns one email per thread (a subject match shows the thread's
+    newest); email_thread reads the rest of it.
 
     Args:
         query: Search query text. Keyword mode wants every word, then falls back to
@@ -583,9 +613,8 @@ def search_conversations(
         if search_type == "semantic":
             from src.store.embeddings import query_semantic
 
-            results = query_semantic(conn, query, limit=limit * 2)
-            # Filter to conversation results only
-            conv_results = [r for r in results if r.get("type") == "conversation"]
+            # Room for the workspace filter below.
+            conv_results = query_semantic(conn, query, limit=limit * 2, kinds={"conversation"})
             if workspace:
                 conv_results = [
                     r

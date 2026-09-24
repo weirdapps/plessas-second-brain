@@ -326,3 +326,175 @@ def test_live_search_clamps_the_window_and_asks_for_the_fields_it_returns(mock_c
     assert out["since_minutes"] == 1440 and out["clamped"] is True
     assert out["messages"][0]["BodyPreview"] == "short"
     assert "@odata.etag" not in out["messages"][0]
+
+
+# ------------------------------------------------------------ email thread
+
+
+def test_email_thread_returns_the_exchange_around_a_hit(conn, monkeypatch):
+    """search_emails returns single emails; the thread around one had no tool."""
+    from src import mcp_server
+
+    _email(conn, 60, 3, "a@example.com", "convX")
+    _email(conn, 61, 2, "b@example.com", "convX")
+    _email(conn, 62, 1, "a@example.com", "convY")
+    conn.commit()
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    out = mcp_server.email_thread(email_id=61)
+
+    assert [e["email_id"] for e in out["emails"]] == [60, 61]
+    assert out["thread_total"] == 2
+
+
+def test_email_thread_says_when_it_was_cut(conn, monkeypatch):
+    from src import mcp_server
+
+    for i in range(70, 75):
+        _email(conn, i, 80 - i, "a@example.com", "convZ")
+    conn.commit()
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    out = mcp_server.email_thread(email_id=72, limit=2)
+
+    assert len(out["emails"]) == 2
+    assert 72 in [e["email_id"] for e in out["emails"]]
+    assert out["thread_total"] == 5
+
+
+def test_email_thread_centres_a_long_thread_on_the_email(conn, monkeypatch):
+    """The oldest 50 of a 60-email thread left out its newest email, the one a
+    search usually hits."""
+    from src import mcp_server
+
+    for i in range(100, 160):
+        _email(conn, i, 200 - i, "a@example.com", "convL")
+    conn.commit()
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    out = mcp_server.email_thread(email_id=159, limit=50)
+
+    assert [e["email_id"] for e in out["emails"]] == list(range(110, 160))
+    assert out["thread_total"] == 60
+
+
+def test_query_thread_centres_the_window_on_the_email(conn):
+    from src.store.query import query_thread
+
+    for i in range(100, 160):
+        _email(conn, i, 200 - i, "a@example.com", "convL")
+    conn.commit()
+
+    assert [e["email_id"] for e in query_thread(conn, 130, limit=10)] == list(range(125, 135))
+    assert [e["email_id"] for e in query_thread(conn, 100, limit=10)] == list(range(100, 110))
+    assert len(query_thread(conn, 130, limit=100)) == 60
+
+
+def test_email_thread_returns_at_least_the_email_itself(conn, monkeypatch):
+    from src import mcp_server
+
+    _email(conn, 60, 3, "a@example.com", "convX")
+    _email(conn, 61, 2, "b@example.com", "convX")
+    conn.commit()
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    out = mcp_server.email_thread(email_id=61, limit=0)
+
+    assert [e["email_id"] for e in out["emails"]] == [61]
+
+
+def test_email_thread_caps_the_limit(conn, monkeypatch):
+    import src.store.query as query
+    from src import mcp_server
+
+    asked = []
+    real = query.query_thread
+
+    def spy(c, email_id, limit):
+        asked.append(limit)
+        return real(c, email_id, limit=limit)
+
+    monkeypatch.setattr(query, "query_thread", spy)
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+
+    mcp_server.email_thread(email_id=1, limit=10**6)
+
+    assert asked == [200]
+
+
+def test_the_cli_says_when_it_shows_part_of_a_thread(tmp_path, capsys):
+    """query thread centres on the email too, and said 'Thread with 5 emails' of
+    a 30-email thread, numbering the slice from 1."""
+    import argparse
+
+    from src.cli import cmd_query_thread
+
+    path = tmp_path / "b.db"
+    c = create_database(str(path))
+    for i in range(1, 31):
+        _email(c, i, 40 - i, "a@example.com", "convC")
+    c.commit()
+    c.close()
+
+    cmd_query_thread(argparse.Namespace(db=path, email_id=30, limit=5, verbose=False))
+
+    out = capsys.readouterr().out
+    assert "Thread with 30 emails, showing 5 around #30" in out
+
+
+def test_a_news_article_or_a_blank_thread_id_is_a_thread_of_one(conn):
+    """Search treats both as unthreaded; the thread view showed a day's
+    unrelated articles, or strangers sharing a blank id, as one exchange. Alone
+    rather than empty: empty reads as an unknown id."""
+    from src.store.query import count_thread, query_thread
+
+    for i in range(200, 205):
+        _email(conn, i, 3, "news@example.com", "news:digest:2026-09-01", mailbox="News")
+    _email(conn, 210, 3, "a@example.com", "  ")
+    _email(conn, 211, 2, "b@example.com", "  ")
+    conn.commit()
+
+    for email_id in (202, 210):
+        assert [e["email_id"] for e in query_thread(conn, email_id)] == [email_id]
+        assert count_thread(conn, email_id) == 1
+    assert (query_thread(conn, 99999), count_thread(conn, 99999)) == ([], 0)
+
+
+def test_a_blank_subject_email_is_no_stale_thread(conn):
+    """Every email with neither a conversation id nor references and a blank
+    subject shares one id; a stranger's later one hid the owner's, and the id it
+    reported was one email_thread calls a thread of one."""
+    from src.store.query import find_stale_threads
+    from src.store.schema import subject_to_conversation_id
+
+    blank = subject_to_conversation_id("")
+    _email(conn, 90, 10, "owner@example.com", blank, subject="")
+    _email(conn, 91, 12, "someone@example.com", blank, subject="")
+    _email(conn, 92, 10, "owner@example.com", "  ", subject="x")
+    _email(conn, 93, 12, "someone@example.com", "  ", subject="y")
+    conn.commit()
+
+    reported = [r["conversation_id"] for r in find_stale_threads(conn, days=5)]
+    assert blank not in reported
+    assert "  " not in reported
+
+
+def test_the_cli_thread_view_survives_a_blank_subject_and_a_zero_limit(tmp_path, capsys):
+    import argparse
+
+    from src.cli import cmd_query_thread
+
+    path = tmp_path / "b.db"
+    c = create_database(str(path))
+    c.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, conversation_id) "
+        "VALUES (5, 5, '2026-09-01T00:00:00Z', NULL, NULL)"
+    )
+    c.commit()
+    c.close()
+
+    cmd_query_thread(argparse.Namespace(db=path, email_id=5, limit=0, verbose=False))
+
+    out = capsys.readouterr().out
+    assert "Thread with 1 emails" in out
+    assert "(no subject)" in out

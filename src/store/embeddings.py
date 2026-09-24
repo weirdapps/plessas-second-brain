@@ -429,10 +429,45 @@ def build_index(conn: sqlite3.Connection, force: bool = False) -> int:
     return len(to_embed)
 
 
+def _kind_mask(ids, kinds) -> np.ndarray:
+    """Which vectors are of the given kinds, read off their id namespaces.
+
+    The boundaries are query_semantic's routing below: positive ids are emails,
+    TEAMS_THREAD_ID_OFFSET and below Teams threads, CONVERSATION_ID_OFFSET and
+    below conversations, the rest of the negatives attachments.
+    """
+    mask = np.zeros(len(ids), dtype=bool)
+    if "email" in kinds:
+        mask |= ids > 0
+    if "attachment" in kinds:
+        mask |= (ids < 0) & (ids > CONVERSATION_ID_OFFSET)
+    if "conversation" in kinds:
+        mask |= (ids <= CONVERSATION_ID_OFFSET) & (ids > TEAMS_THREAD_ID_OFFSET)
+    if "teams_thread" in kinds:
+        mask |= ids <= TEAMS_THREAD_ID_OFFSET
+    return mask
+
+
+def _top_indices(similarities, ids, limit: int, kinds=None) -> np.ndarray:
+    """The `limit` most similar vectors, best first, among `kinds` (all when None).
+
+    The kind is chosen before the top is taken. Taking it over every vector and
+    filtering after left a kind with few vectors (conversations, about 1K of
+    120K) mostly empty, and cost emails their slots to other kinds.
+    """
+    if kinds is None:
+        return np.argsort(similarities)[::-1][:limit]
+    candidates = np.flatnonzero(_kind_mask(ids, kinds))
+    return candidates[np.argsort(similarities[candidates])[::-1][:limit]]
+
+
 def query_semantic(
     conn: sqlite3.Connection,
     query: str,
     limit: int = 20,
+    kinds=None,
+    embed_fn=None,
+    index_path=None,
 ) -> list[dict]:
     """Semantic search across email summaries using cosine similarity.
 
@@ -440,22 +475,25 @@ def query_semantic(
         conn: Database connection
         query: Natural language search query
         limit: Maximum number of results
+        kinds: Only these kinds ("email", "attachment", "conversation",
+            "teams_thread"); every kind when None
+        embed_fn, index_path: injection points for testing
 
     Returns:
         List of dicts with keys: email_id, date, subject, summary, similarity
     """
     # Index load + unit-normalization is cached across calls (see _load_index),
     # so a long-lived process pays the ~1 GB read once, not per query.
-    ids, normalized = _load_index()
+    ids, normalized = _load_index(index_path)
 
     # Generate query embedding
-    query_vec = np.asarray(generate_embeddings([query])[0], dtype=np.float32)
+    embed = embed_fn or generate_embeddings
+    query_vec = np.asarray(embed([query])[0], dtype=np.float32)
     query_norm = query_vec / (np.linalg.norm(query_vec) or 1)
 
     similarities = normalized @ query_norm
 
-    # Get top-k indices
-    top_indices = np.argsort(similarities)[::-1][:limit]
+    top_indices = _top_indices(similarities, ids, limit, kinds)
 
     # Fetch details (positive IDs = emails, negative IDs = attachments)
     results = []
@@ -583,9 +621,9 @@ def semantic_email_candidates(
     query_vec = np.asarray(embed([query])[0], dtype=np.float32)
     query_norm = query_vec / (np.linalg.norm(query_vec) or 1)
     similarities = normalized @ query_norm
-    # Over-fetch: many top vectors collapse onto the same email or onto non-email
-    # namespaces (conversations/teams), so we need headroom to fill `limit` emails.
-    order = np.argsort(similarities)[::-1][: max(limit * 4, limit)]
+    # Over-fetch: several attachment vectors can collapse onto one email, so we
+    # need headroom to fill `limit` emails. Other kinds are left out first.
+    order = _top_indices(similarities, ids, max(limit * 4, limit), {"email", "attachment"})
     out: list[int] = []
     seen: set[int] = set()
     for idx in order:

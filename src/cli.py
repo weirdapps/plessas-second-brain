@@ -1155,7 +1155,7 @@ def cmd_prep(args):
 
 
 def cmd_sync(args):
-    """Incremental sync: export new emails, extract, load."""
+    """Incremental sync over staged mail: extract, load, and the steps after."""
     from src.store.schema import get_connection, migrate_add_sync_metadata
 
     db_path = str(args.db)
@@ -1182,7 +1182,10 @@ def cmd_sync(args):
         if last_sync:
             print(f"No sync history. Using latest email date: {last_sync}")
         else:
-            print("Empty database. Run full export + load first.")
+            print(
+                "Empty database. Stage mail, then run `python -m src.extract.local` "
+                "and `python -m src.cli load` first."
+            )
             conn.close()
             return
 
@@ -1278,7 +1281,7 @@ def cmd_sync(args):
     conn_mig.close()
 
     print("\nStep 6: Processing new attachment content...")
-    # Scope to newly exported attachments only — avoids competing with background backfill
+    # Scope to newly registered attachments only — avoids competing with background backfill
     scope_ids = new_attachment_ids or None
     # Phase 1 runs UNSCOPED so the deadline can converge. Scoped to this run's
     # own registrations, anything deferred for time would never be offered
@@ -2522,7 +2525,9 @@ def main():
     parser_prep.set_defaults(func=cmd_prep)
 
     # Sync command (incremental)
-    parser_sync = subparsers.add_parser("sync", help="Incremental sync (export + extract + load)")
+    parser_sync = subparsers.add_parser(
+        "sync", help="Incremental sync over staged mail (extract + load + the steps after)"
+    )
     parser_sync.add_argument("--limit", type=int, help="Max emails to process")
     parser_sync.add_argument(
         "--engine",

@@ -437,10 +437,10 @@ Dependabot is configured for the `uv` ecosystem (see `.github/dependabot.yml`), 
 
 The pipeline is just CLI commands, so schedule them however you like. Examples:
 
-- **cron** (hourly incremental sync): `7 * * * * cd /path/to/repo && .venv/bin/python -m src.cli sync >> ~/second-brain.log 2>&1`
-- **macOS launchd** / **systemd timers**: wrap `python -m src.cli sync` (and `embed`) in a service unit pointing at your checkout and venv.
+- **cron** (hourly staging and sync): `5 * * * * cd /path/to/repo && .venv/bin/python -m src.export.outlook_export --folder Inbox >> ~/second-brain.log 2>&1`, then `7 * * * * cd /path/to/repo && .venv/bin/python -m src.cli sync >> ~/second-brain.log 2>&1`
+- **macOS launchd** / **systemd timers**: wrap the same two commands (and `embed`) in a service unit pointing at your checkout and venv.
 
-Typical cadence: `sync` hourly, `embed` daily. `sync` does not cover every source: `calendar-sync`, `teams-sync`, `news-sync`, `process-sharepoint` and `reverse-ingest` each want their own schedule.
+Typical cadence: staging and `sync` hourly, `embed` daily. `sync` stages no mail itself: it extracts and loads what `outlook_export` (or your own exporter) staged. Nor does it cover every source: `calendar-sync`, `teams-sync`, `news-sync`, `process-sharepoint` and `reverse-ingest` each want their own schedule.
 
 [`docs/DEPLOY.md`](docs/DEPLOY.md) has the full recipe, including the two-host shape (one producer that ingests, workstations that read an rsync'd replica) and the `loginctl enable-linger` without which `systemd --user` timers die at logout.
 

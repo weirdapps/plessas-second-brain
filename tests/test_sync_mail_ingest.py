@@ -68,3 +68,20 @@ def test_sync_registers_outlook_downloads_and_never_drives_mail_app(
         cli.cmd_sync(args)
 
     register.assert_called_once()
+
+
+def test_the_skip_export_flag_the_schedules_pass_still_reaches_sync(monkeypatch, tmp_path):
+    """sb-outlook-sync and sb-noon-catchup pass --skip-export. Removing the ignored
+    flag would make argparse exit 2 in both, every run."""
+    from src import cli
+
+    seen = []
+    monkeypatch.setattr(cli, "cmd_sync", lambda args: seen.append(args.skip_export))
+    monkeypatch.setattr(cli, "install_llm_deadline_for_this_process", lambda: None)
+    monkeypatch.setattr(
+        sys, "argv", ["brain", "--db", str(tmp_path / "brain.db"), "sync", "--skip-export"]
+    )
+
+    cli.main()
+
+    assert seen == [True]

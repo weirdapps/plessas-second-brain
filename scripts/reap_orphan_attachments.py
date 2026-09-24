@@ -32,7 +32,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from src.config import ATTACHMENTS_DIR, DEFAULT_DB  # noqa: E402
+from src.config import ATTACHMENTS_DIR, DEFAULT_DB, is_replica, replica_refusal  # noqa: E402
 from src.export.outlook_attachments import ORPHAN_GRACE_DAYS, is_abandoned_orphan  # noqa: E402
 from src.extract.attachment_pipeline import ingest_document  # noqa: E402
 from src.store.schema import get_connection  # noqa: E402
@@ -190,6 +190,11 @@ def main() -> int:
     ap.add_argument("--db", default=str(DEFAULT_DB))
     ap.add_argument("--root", default=str(ATTACHMENTS_DIR))
     args = ap.parse_args()
+    if args.apply and is_replica():
+        # The dry run reads only; applying adopts files into the database, and a
+        # replica's copy is replaced by the next pull (see src/config.py).
+        print(replica_refusal("the orphan attachment reap"), file=sys.stderr)
+        return 2
 
     stats = reap_orphan_attachments(
         args.db,

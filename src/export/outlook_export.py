@@ -383,7 +383,7 @@ def _cursor_in(path: Path) -> OutlookSyncState | None:
     or cursorless file."""
     try:
         state = load_outlook_sync_state(path)
-    except (OSError, ValueError):
+    except (OSError, ValueError, AttributeError, TypeError):  # not JSON, or not an object
         return None
     return state if state.last_seen_received_at else None
 
@@ -396,7 +396,9 @@ def _carry_over(path: Path) -> Path:
     copied across when the one under DATA_ROOT has none: without it the Inbox
     run exits 7 and the wrapper bootstraps the other folders, and a bootstrap
     fetches only the newest 100 messages. A failed run's cursorless file counts
-    as none. Written atomically; the old file stays where it was.
+    as none. Written atomically, once: the old file is renamed <name>.carried,
+    so a rollback still has it and a later reset of the folder cannot bring a
+    months-old cursor back.
     """
     legacy = REPO_ROOT / "data" / "state" / path.name
     if path.parent != DATA_ROOT / "state" or legacy == path:
@@ -405,6 +407,7 @@ def _carry_over(path: Path) -> Path:
     if cursor is None or _cursor_in(path) is not None:
         return path
     save_outlook_sync_state(path, cursor)
+    legacy.rename(legacy.with_name(legacy.name + ".carried"))
     logger.warning("Carried the sync cursor over from %s to %s", legacy, path)
     return path
 
@@ -429,12 +432,12 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    state_path = _carry_over(args.state_path or _default_state_path())
-
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # After the logging setup, so the carry-over's warning has a time and level.
+    state_path = _carry_over(args.state_path or _default_state_path())
 
     if args.mode == "hourly":
         try:

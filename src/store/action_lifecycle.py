@@ -17,6 +17,7 @@ database the replicas copy. By hand, `--dry-run` rolls back.
 
 import re
 import sqlite3
+import sys
 from datetime import date
 
 from src.config import DEFAULT_DB
@@ -206,4 +207,11 @@ if __name__ == "__main__":
     parser.add_argument("--expire-days", type=int, default=DEFAULT_EXPIRE_DAYS)
     parser.add_argument("--undated-expire-days", type=int, default=DEFAULT_UNDATED_EXPIRE_DAYS)
     args = parser.parse_args()
+    from src.config import is_replica, replica_refusal
+
+    if is_replica():
+        # Even a dry run opens a write transaction, and a replica's copy is
+        # replaced by the next pull (see src/config.py).
+        print(replica_refusal("the action lifecycle"), file=sys.stderr)
+        raise SystemExit(2)
     run_action_lifecycle(args.db, args.dry_run, args.expire_days, args.undated_expire_days)

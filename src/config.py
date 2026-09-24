@@ -71,6 +71,34 @@ load_config_file(
     Path(os.environ.get("BRAIN_CONFIG_FILE", str(Path.home() / ".config" / "second-brain" / "env")))
 )
 
+# A replica holds a copy of the database built on another host, and the next
+# pull replaces it. The pull job stamps this file. Writing to the copy is how a
+# local `embed` left a WAL that the next pull replayed over a fresh copy, on
+# 2026-08-29. BRAIN_ROLE=producer or =replica overrides the stamp.
+REPLICA_STAMP = Path.home() / ".second-brain" / "db-pull.stamp"
+
+
+def is_replica() -> bool:
+    """Whether this host holds a pulled copy of the database, not the original."""
+    role = os.environ.get("BRAIN_ROLE", "").strip().lower()
+    if role in ("producer", "replica"):
+        return role == "replica"
+    return REPLICA_STAMP.exists()
+
+
+def replica_refusal(what: str) -> str:
+    """The message that refuses `what` on a host where is_replica() holds."""
+    if os.environ.get("BRAIN_ROLE", "").strip().lower() == "replica":
+        why = "BRAIN_ROLE=replica"
+    else:
+        why = f"{REPLICA_STAMP} exists"
+    return (
+        f"Refusing {what}: this host holds a replica of the database ({why}), and "
+        "the next pull replaces what it writes. Run it on the producer, or set "
+        "BRAIN_ROLE=producer if this host builds the store."
+    )
+
+
 REPO_ROOT = Path(__file__).parent.parent
 # Data root — override with BRAIN_DATA_DIR to point at a stable, checkout-independent
 # location (e.g. ~/.second-brain/data). Everything under data/ derives from this.

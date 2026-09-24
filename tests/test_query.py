@@ -754,7 +754,7 @@ class TestQueryResultStructure:
             assert "summary" in result
             assert "snippet" in result
             assert "source" in result
-            assert result["source"] in ["summary", "content", "key_fact"]
+            assert result["source"] in ["subject", "summary", "content", "key_fact"]
 
     def test_query_decisions_result_keys(self, sample_db):
         """Test query_decisions returns expected keys."""

@@ -510,7 +510,9 @@ def cmd_split_html(args) -> int:
         f"bodies {before / 1e6:.1f} MB -> {after / 1e6:.1f} MB of text, "
         f"HTML kept in {kept / 1e6:.1f} MB"
     )
-    if converted and not args.dry_run:
+    # Whenever HTML has been kept, not only when this run kept some: a run stopped
+    # before its optimize left the words of what it redacted in the index.
+    if not args.dry_run and (converted or conn.execute("SELECT 1 FROM email_html").fetchone()):
         conn.execute("INSERT INTO emails_fts(emails_fts) VALUES('optimize')")
         conn.commit()
         print("  full-text index optimized; VACUUM returns the space to the disk")

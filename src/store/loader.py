@@ -43,10 +43,11 @@ def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
     if not staging_path.exists():
         raise FileNotFoundError(f"Staging directory not found: {staging_dir}")
 
-    # Open database connection
-    from .schema import get_connection
+    # Open database connection, at the schema this code writes (email_html, v23)
+    from .schema import get_connection, run_migrations
 
     conn = get_connection(db_path)
+    run_migrations(conn)
 
     # Build index of staged emails by message_id.
     # Also remember which message_ids each batch contains, so we can prune

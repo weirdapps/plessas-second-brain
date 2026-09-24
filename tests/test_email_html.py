@@ -8,6 +8,7 @@ inline-image positions read the markup, so it is kept (schema v23).
 
 import argparse
 import sqlite3
+from pathlib import Path
 from unittest.mock import patch
 
 from src.store.email_html import markup_or_text, pack, split_body, unpack
@@ -379,6 +380,131 @@ def test_split_html_leaves_no_copy_of_what_it_redacted(tmp_path):
     if wal.exists():
         data += wal.read_bytes()
     assert ANTHROPIC.encode() not in data
+
+
+def test_split_html_optimizes_after_a_run_that_was_stopped(tmp_path, monkeypatch):
+    """Killed between its last commit and the optimize, a run left old index
+    segments holding the words of the bodies it had redacted, and a re-run, with
+    nothing left to convert, skipped the optimize."""
+    from src import cli
+    from src.store import schema
+
+    db = tmp_path / "b.db"
+    conn = create_database(str(db))
+    conn.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, content) "
+        "VALUES (1, 'a', '2026-09-01', 's', ?)",
+        (f"<html><body><p>the key is {ANTHROPIC}</p></body></html>",),
+    )
+    conn.commit()
+    conn.close()
+    token = ANTHROPIC.rsplit("-", 1)[-1].lower().encode()  # as the index holds it
+    real = schema.get_connection
+
+    class Killed:
+        """The store's connection, until the optimize, where the process dies."""
+
+        def __init__(self, path):
+            self.conn = real(path)
+
+        def __getattr__(self, name):
+            return getattr(self.conn, name)
+
+        def execute(self, sql, *args):
+            if "optimize" in sql:
+                self.conn.close()
+                raise SystemExit("killed")
+            return self.conn.execute(sql, *args)
+
+    monkeypatch.setattr(schema, "get_connection", Killed)
+    try:
+        cli.cmd_split_html(argparse.Namespace(db=str(db), batch=100, dry_run=False))
+    except SystemExit:
+        pass
+    assert token in db.read_bytes()
+    monkeypatch.setattr(schema, "get_connection", real)
+
+    assert cli.cmd_split_html(argparse.Namespace(db=str(db), batch=100, dry_run=False)) == 0
+
+    data = db.read_bytes()
+    wal = db.with_name(db.name + "-wal")
+    if wal.exists():
+        data += wal.read_bytes()
+    assert token not in data
+
+
+def _older_store(path):
+    """A store at v22, before email_html."""
+    create_database(str(path)).close()
+    conn = get_connection(str(path))
+    conn.execute("DROP TABLE email_html")
+    conn.execute("UPDATE schema_version SET version = 22")
+    conn.commit()
+    conn.close()
+
+
+def _staged(tmp_path, message_id="m1"):
+    import json
+
+    staging, extracted = tmp_path / "staging", tmp_path / "extracted"
+    staging.mkdir()
+    extracted.mkdir()
+    email = {
+        "message_id": message_id,
+        "date_received": "2026-09-01T00:00:00Z",
+        "subject": "Deck",
+        "sender": {"name": "A", "address": "a@example.com"},
+        "content": HTML,
+    }
+    (staging / "batch-00001.json").write_text(json.dumps({"emails": [email]}))
+    (extracted / f"{message_id}.json").write_text(json.dumps({"summary": "s"}))
+    return staging, extracted
+
+
+def _kept(path):
+    conn = sqlite3.connect(path)
+    row = conn.execute(
+        "SELECT e.content, h.html FROM emails e LEFT JOIN email_html h ON h.email_id = e.id"
+    ).fetchone()
+    version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+    conn.close()
+    return row[0], row[1] is not None and unpack(row[1]) == HTML, version
+
+
+def test_loading_emails_migrates_an_older_store_first(tmp_path):
+    """Loaded into a v22 store, an HTML body was converted, and saving its HTML
+    failed: pulled before the migration ran, the code would lose it."""
+    from src.store.loader import load_extractions
+
+    db = tmp_path / "b.db"
+    _older_store(db)
+    staging, extracted = _staged(tmp_path)
+
+    assert load_extractions(str(db), str(extracted), str(staging)) == 1
+
+    assert _kept(db) == (TEXT, True, 23)
+
+
+def test_recovering_extractions_migrates_an_older_store_first(tmp_path, monkeypatch):
+    """The recovery script caught the failure to save the HTML and committed the
+    text: the markup was gone for good, and split-html cannot bring it back."""
+    import importlib.util
+
+    path = Path(__file__).parent.parent / "scripts" / "recover_missing_extractions.py"
+    spec = importlib.util.spec_from_file_location("recover_missing_extractions", path)
+    assert spec and spec.loader
+    recover = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(recover)
+    db = tmp_path / "b.db"
+    _older_store(db)
+    staging, extracted = _staged(tmp_path)
+    monkeypatch.setattr(recover, "DB", db)
+    monkeypatch.setattr(recover, "STAGING", staging)
+    monkeypatch.setattr(recover, "EXTRACTED", extracted)
+
+    assert recover.main() == 0
+
+    assert _kept(db) == (TEXT, True, 23)
 
 
 def test_split_html_skips_a_text_body_that_opens_with_a_bracket(tmp_path, capsys):

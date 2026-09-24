@@ -1,0 +1,128 @@
+"""scripts/retrieval_eval.py: a known-item baseline for keyword search."""
+
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+from src.store.schema import create_database
+
+SCRIPT = Path(__file__).parent.parent / "scripts" / "retrieval_eval.py"
+
+
+@pytest.fixture
+def ev():
+    spec = importlib.util.spec_from_file_location("retrieval_eval", SCRIPT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def db(tmp_path):
+    path = tmp_path / "brain.db"
+    conn = create_database(str(path))
+    rows = [
+        (1, "Quarterly zebrafinch budget review", "Inbox"),
+        (2, "Hello", "Inbox"),  # one search word: not usable
+        (3, "Zebrafinch market wrap", "News"),  # news: left out
+        (4, "", "Inbox"),
+    ]
+    conn.executemany(
+        "INSERT INTO emails (id, message_id, date_received, subject, mailbox_name, summary) "
+        "VALUES (?, ?, '2026-09-01T00:00:00Z', ?, ?, 'nothing about it')",
+        [(i, i, subject, mailbox) for i, subject, mailbox in rows],
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
+def test_the_set_takes_the_longest_subject_words_of_usable_mail_only(ev, db):
+    conn = ev._open(db)
+
+    items = ev.build_set(conn, size=5, seed=1)
+
+    assert items == [{"email_id": 1, "query": "zebrafinch quarterly"}]
+
+
+def test_the_score_counts_ranks(ev):
+    result = ev.score([1, 3, None, 11])
+
+    assert result["queries"] == 4
+    assert (result["hit@1"], result["hit@5"], result["hit@10"]) == (0.25, 0.5, 0.5)
+    assert result["mrr"] == pytest.approx((1 + 1 / 3 + 1 / 11) / 4)
+
+
+def test_build_then_run_finds_the_email_by_its_subject(ev, db, tmp_path, capsys):
+    """The subject is indexed from v22, so this is also the index's own check."""
+    eval_set = tmp_path / "set.json"
+
+    assert ev.main(["build", "--db", str(db), "--file", str(eval_set)]) == 0
+    assert ev.main(["run", "--db", str(db), "--file", str(eval_set)]) == 0
+
+    out = capsys.readouterr().out
+    result = json.loads(out[out.index("{") : out.rindex("}") + 1])
+    assert result["email"]["hit@1"] == 1.0
+    assert result["thread"]["hit@1"] == 1.0
+    assert json.loads(eval_set.read_text())[0]["email_id"] == 1
+
+
+def test_the_database_is_opened_read_only(ev, db):
+    import sqlite3
+
+    conn = ev._open(db)
+
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        conn.execute("DELETE FROM emails")
+
+
+def test_another_email_of_the_thread_counts_for_the_thread_only(ev, tmp_path):
+    """Replies share their subject, so a sibling often ranks first; counted as a
+    miss, that was noise about tie-breaking, not a retrieval failure."""
+    path = tmp_path / "t.db"
+    conn = create_database(str(path))
+    conn.executemany(
+        "INSERT INTO emails (id, message_id, date_received, subject, mailbox_name, summary, "
+        "conversation_id) VALUES (?, ?, '2026-09-01T00:00:00Z', ?, 'Inbox', 'nothing', 'T1')",
+        [(1, 1, "RE: Quarterly zebrafinch budget"), (2, 2, "Quarterly zebrafinch budget")],
+    )
+    conn.commit()
+    conn.close()
+
+    result, misses = ev.run_set(ev._open(path), [{"email_id": 1, "query": "zebrafinch quarterly"}])
+
+    assert result["email"]["hit@1"] == 0.0
+    assert result["thread"]["hit@1"] == 1.0
+    assert misses == []
+
+
+def test_a_thread_is_the_one_search_and_email_thread_know(ev, tmp_path):
+    """News keeps a day per pipeline as its conversation_id and blank subjects
+    share one hash: neither makes their emails one thread, so neither is a hit."""
+    from src.store.schema import subject_to_conversation_id
+
+    path = tmp_path / "t.db"
+    conn = create_database(str(path))
+    blank = subject_to_conversation_id("")
+    conn.executemany(
+        "INSERT INTO emails (id, message_id, date_received, subject, mailbox_name, summary, "
+        "conversation_id) VALUES (?, ?, '2026-09-01T00:00:00Z', ?, ?, 'nothing', ?)",
+        [
+            (1, 1, "", "Inbox", blank),
+            (2, 2, "", "Inbox", blank),
+            (3, 3, "ECB holds", "News", "news:digest:2026-09-01"),
+            (4, 4, "ECB warns", "News", "news:digest:2026-09-01"),
+            (5, 5, "Plan", "Inbox", "T"),
+            (6, 6, "RE: Plan", "Inbox", "T"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+    ro = ev._open(path)
+
+    assert ev.thread_of(ro, 1) == {1}
+    assert ev.thread_of(ro, 3) == {3}
+    assert ev.thread_of(ro, 5) == {5, 6}

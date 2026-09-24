@@ -19,9 +19,9 @@ then it is documentation of the intended workflow.
 >
 > Per-kind tools: `search_emails`, `search_attachments`, `search_teams`,
 > `search_conversations`, `query_calendar_events`, `query_decisions`,
-> `query_actions`. Dossier tools: `person_context`, `topic_context`,
-> `sender_brief`, `meeting_prep`. Corpus size, per-source coverage and freshness:
-> `stats`.
+> `query_actions`. Dossier tools: `person_context` (email and Teams),
+> `topic_context`, `sender_brief`, `meeting_prep`. The rest of a hit's thread:
+> `email_thread`. Corpus size, per-source coverage and freshness: `stats`.
 
 ## Usage
 
@@ -148,7 +148,8 @@ For deeper queries, `src.store.context` is what the dossier tools call:
 - **`get_topic_context(conn, topic, days=365, limit=20)`**: emails, key people,
   decisions, open actions, key facts
 - **`get_conversation_context(conn, email_id)`**: all emails in a thread, with
-  participants, decisions and action items
+  participants, decisions and action items. The thread is email_thread's: a News
+  item, or an email with no conversation id, stands alone
 
 The first two cap every list at `limit` and return a `<name>_total` sibling
 (`topics_total`, `decisions_total`, `open_actions_total`, and so on) with the

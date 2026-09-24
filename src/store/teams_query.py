@@ -188,7 +188,7 @@ def chat_summary(conn: sqlite3.Connection, chat_id: int, days: int = 30) -> dict
         """
         SELECT composed_at, sender_display_name, content_text
         FROM teams_messages
-        WHERE chat_id = ?
+        WHERE chat_id = ? AND is_system = 0
         ORDER BY composed_at DESC
         LIMIT 10
         """,
@@ -199,7 +199,7 @@ def chat_summary(conn: sqlite3.Connection, chat_id: int, days: int = 30) -> dict
         """
         SELECT sender_display_name AS name, COUNT(*) AS n
         FROM teams_messages
-        WHERE chat_id = ? AND composed_at >= ?
+        WHERE chat_id = ? AND composed_at >= ? AND is_system = 0
         GROUP BY sender_display_name
         ORDER BY n DESC
         LIMIT 10

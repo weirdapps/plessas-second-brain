@@ -163,6 +163,49 @@ def test_a_body_inside_a_template_or_xml_shows_nothing():
     assert html_to_text("<title>a<xml>b<xml>c<xml>d<body><p>Body text") == "Body text"
 
 
+def test_only_a_head_left_open_is_dropped_to_the_body():
+    """What the re-read drops follows where the element was left open. In the head,
+    up to where the head ends; in the body, the tag alone, since cutting to the
+    <body> of a quoted document lost the reply between them; a stylesheet, up to
+    the markup after its CSS, wherever it is. A '<body' in an attribute, a comment
+    or a textarea ends no head."""
+    quoted = "<p>Middle text</p><blockquote><html><body><p>Quoted</p>"
+    for before, then in (
+        ("<html><body><p>Reply</p>", "\n\n"),
+        ("<p>Reply</p>", "\n\n"),
+        ("Reply ", " "),
+    ):
+        assert html_to_text(f"{before}<style>p{{color:red}}{quoted}") == (
+            "Reply\n\nMiddle text\n\nQuoted"
+        )
+        for element in ("title", "xml", "iframe"):
+            assert html_to_text(f"{before}<{element}>x{quoted}") == (
+                f"Reply{then}x\n\nMiddle text\n\nQuoted"
+            ), element
+    assert html_to_text(f"<html><head></head><title>x{quoted}") == "x\n\nMiddle text\n\nQuoted"
+    attribute = '<html><head><title>T</head><p>kept</p><a title="<body >">link</a><p>after</p>'
+    assert html_to_text(attribute) == "kept\n\nlink\n\nafter"
+    comment = "<html><head><xml>settings</head><p>visible</p><!-- <body> --><p>two</p>"
+    assert html_to_text(comment) == "visible\n\ntwo"
+    area = "<html><head><title>T</head><p>keep me</p><textarea><body></textarea><p>after</p>"
+    assert html_to_text(area) == "keep me\n\n<body>\n\nafter"
+    assert html_to_text("\ufeff<html><head><title>T<body><p>text</p>") == "text"
+    head = '<html><head><meta charset="utf-8"><link rel="icon" href="i"><base href="b"><title>T'
+    assert html_to_text(f"{head}<body><p>text</p>") == "text"
+
+
+def test_key_headers_hidden_by_markup_cost_no_time():
+    """The decoded text is redacted, and a key header broken up by an entity and an
+    empty element only comes together there: 400 KB of them took 9 s."""
+    import time
+
+    unit = "&#45;----BEGIN RSA <b></b>PRIVATE KEY-----"  # gitleaks:allow
+    started = time.perf_counter()
+    text = html_to_text("<html><body>" + unit * 9_000)
+    assert time.perf_counter() - started < 1.0
+    assert text.count("PRIVATE KEY") == 9_000
+
+
 def test_a_position_that_misses_the_tag_is_not_trusted(monkeypatch):
     """The re-read cuts the tag out where the parser says it is. Cutting anywhere
     else would delete text, so a position that misses the tag stops it."""
@@ -401,9 +444,18 @@ def test_white_space_follows_the_element_tree():
     # A rule, a void element, ends an open paragraph like any block.
     assert html_to_text('<p style="white-space:pre">a  b<hr>c  d') == "a  b\nc d"
     assert html_to_text('<pre><span style="white-space:initial">a   b</span></pre>') == "a b"
-    # inherit, unset and revert are the parent's value, not an invalid one.
+    # inherit and unset are the parent's value, not an invalid one; revert is the
+    # browser's own, which keeps a pre element's spacing.
     assert html_to_text('<div style="white-space:pre; white-space:inherit">a   b</div>') == "a b"
     assert html_to_text('<pre style="white-space: unset">a   b</pre>') == "a b"
+    assert html_to_text('<div>x<pre style="white-space:revert">a    b\n c</pre></div>') == (
+        "x\na    b\n c"
+    )
+    assert html_to_text('<pre style="white-space:revert-layer">a   b</pre>') == "a   b"
+    last = '<pre style="white-space:normal; white-space:revert">a   b</pre>'
+    assert html_to_text(last) == "a   b"
+    reverted = '<div style="white-space:pre"><span style="white-space:revert">a    b</span></div>'
+    assert html_to_text(reverted) == "a    b"
     notimportant = '<div style="white-space:pre !importantx; white-space:normal">a   b</div>'
     assert html_to_text(notimportant) == "a b"
     rows = '<table><tr style="white-space:pre"><td>a  b<tr><td>c  d</table>'

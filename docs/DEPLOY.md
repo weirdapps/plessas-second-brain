@@ -288,6 +288,19 @@ writers stopped and about twice the database free: 3.5 GB became 2.6 GB.
 `scripts/scrub_secrets.py --apply --vacuum` does both jobs in one quiet window,
 and scrubs the kept HTML as well.
 
+**Upgrading to schema v24.** From v24 a Teams call record, and a notice that a
+call was recorded or transcribed, is a system message, as the service writes it;
+ingest took them for messages, counted them as their sender's, and put their XML
+into the threads the model reads. The migration marks the ones stored, counts
+again without them each thread that also holds other messages, and sends back to
+extraction those whose remaining messages clear extraction's floor, which the
+next teams-sync runs, one model call and one new vector each. On a copy of the
+replica on 2026-09-24: 1,261 rows marked, 123 threads counted again, 95 queued,
+in 0.2 s. A thread of calls alone, or with too little else, keeps its summary. Stop
+`sb-teams-sync.timer`, and let a running sync exit, before the pull: a sync still
+running the old code stores call records unmarked, and the migration runs once.
+Then run `python -m src.cli migrate` and start the timer again.
+
 ## 8. Backup and restore
 
 `scripts/backup_db.py` takes an MVCC-consistent snapshot of a live `brain.db`,

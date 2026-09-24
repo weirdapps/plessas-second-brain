@@ -87,7 +87,7 @@ def _teams_hits(conn: sqlite3.Connection, safe: str, kind: str, limit: int) -> l
             JOIN teams_messages m ON m.id = teams_messages_fts.rowid
             LEFT JOIN teams_threads t ON t.id = m.thread_id
             JOIN teams_chats c ON c.id = m.chat_id
-            WHERE teams_messages_fts MATCH ?
+            WHERE teams_messages_fts MATCH ? AND m.is_system = 0
             ORDER BY rank
             LIMIT ?
             """,
@@ -188,7 +188,7 @@ def chat_summary(conn: sqlite3.Connection, chat_id: int, days: int = 30) -> dict
         """
         SELECT composed_at, sender_display_name, content_text
         FROM teams_messages
-        WHERE chat_id = ?
+        WHERE chat_id = ? AND is_system = 0
         ORDER BY composed_at DESC
         LIMIT 10
         """,
@@ -199,7 +199,7 @@ def chat_summary(conn: sqlite3.Connection, chat_id: int, days: int = 30) -> dict
         """
         SELECT sender_display_name AS name, COUNT(*) AS n
         FROM teams_messages
-        WHERE chat_id = ? AND composed_at >= ?
+        WHERE chat_id = ? AND composed_at >= ? AND is_system = 0
         GROUP BY sender_display_name
         ORDER BY n DESC
         LIMIT 10

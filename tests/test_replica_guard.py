@@ -72,6 +72,24 @@ def test_a_write_command_is_refused_on_a_replica(stamp, monkeypatch, tmp_path, c
     assert "BRAIN_ROLE=producer" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("by_role", [False, True])
+def test_the_refusal_names_what_made_this_host_a_replica(
+    stamp, monkeypatch, tmp_path, capsys, by_role
+):
+    """BRAIN_ROLE=replica with no stamp must not be reported as the stamp."""
+    if by_role:
+        monkeypatch.setenv("BRAIN_ROLE", "replica")
+    else:
+        stamp.write_text("x")
+
+    code, _ = _run_cli(monkeypatch, tmp_path, "load")
+
+    err = capsys.readouterr().err
+    assert code == 2
+    assert ("BRAIN_ROLE=replica" in err) is by_role
+    assert (str(stamp) in err) is not by_role
+
+
 def test_a_read_command_still_runs_on_a_replica(stamp, monkeypatch, tmp_path):
     stamp.write_text("x")
 

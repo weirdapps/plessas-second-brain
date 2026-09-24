@@ -207,16 +207,11 @@ if __name__ == "__main__":
     parser.add_argument("--expire-days", type=int, default=DEFAULT_EXPIRE_DAYS)
     parser.add_argument("--undated-expire-days", type=int, default=DEFAULT_UNDATED_EXPIRE_DAYS)
     args = parser.parse_args()
-    from src.config import REPLICA_STAMP, is_replica
+    from src.config import is_replica, replica_refusal
 
     if is_replica():
         # Even a dry run opens a write transaction, and a replica's copy is
         # replaced by the next pull (see src/config.py).
-        print(
-            f"Refusing: this host holds a replica of the database ({REPLICA_STAMP} "
-            "exists), and the next pull replaces what it writes. Run it on the "
-            "producer, or set BRAIN_ROLE=producer if this host builds the store.",
-            file=sys.stderr,
-        )
+        print(replica_refusal("the action lifecycle"), file=sys.stderr)
         raise SystemExit(2)
     run_action_lifecycle(args.db, args.dry_run, args.expire_days, args.undated_expire_days)

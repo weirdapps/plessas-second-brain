@@ -2797,13 +2797,7 @@ def main():
     from src import config
 
     if args.command not in READ_ONLY_COMMANDS and config.is_replica():
-        print(
-            f"Refusing '{args.command}': this host holds a replica of the database "
-            f"({config.REPLICA_STAMP} exists), and the next pull replaces what it "
-            "writes. Run it on the producer, or set BRAIN_ROLE=producer if this "
-            "host builds the store.",
-            file=sys.stderr,
-        )
+        print(config.replica_refusal(f"'{args.command}'"), file=sys.stderr)
         sys.exit(2)
 
     # Execute command

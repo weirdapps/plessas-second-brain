@@ -443,7 +443,10 @@ def _conversation_vectors_gone(conn: sqlite3.Connection, ids) -> set[int]:
     of conversation vectors, so no vector whose row it has not seen can go."""
     try:
         held = {CONVERSATION_ID_OFFSET - r[0] for r in conn.execute("SELECT id FROM conversations")}
-    except sqlite3.OperationalError:  # a schema without conversations
+        # An attachment past the offset reads as a conversation; its vector stays.
+        past = "SELECT id FROM attachment_content WHERE id >= ?"
+        held |= {-r[0] for r in conn.execute(past, (-CONVERSATION_ID_OFFSET,))}
+    except sqlite3.OperationalError:  # a schema without these tables
         return set()
     return {
         vid

@@ -1311,6 +1311,19 @@ def cmd_sync(args):
         run_conversation_extraction(deadline_s=CONVERSATION_SYNC_DEADLINE_S)
         conv_loaded = load_convs(db_path)
         print(f"  Loaded {conv_loaded} conversations")
+        if conv_loaded:
+            # Their vectors now, not at the next sync with new mail (Step 5 ran
+            # before them): a session loaded again has a new id, which semantic
+            # search cannot find until it has one.
+            from src.store.embeddings import build_index
+
+            conn_embed = get_conn(db_path)
+            try:
+                build_index(conn_embed)
+            except Exception as e:  # the next sync embeds what this one could not
+                print(f"  Embedding the conversations failed: {e}", file=sys.stderr)
+            finally:
+                conn_embed.close()
     else:
         print("  No new conversations to sync")
 

@@ -497,26 +497,34 @@ def load_conversations(db_path: str) -> int:
     conn = get_connection(db_path)
     run_migrations(conn)
 
-    # Build index of staged conversations by session_id
-    staging_index = {}
+    extractions = {}
+    for extraction_file in sorted(extracted_dir.glob("*.json")):
+        with open(extraction_file, encoding="utf-8") as f:
+            extractions[extraction_file.stem] = json.load(f)
+
+    # Each extraction loads with the copy of its session it read, where that is
+    # still staged, not with the newest copy, which is ahead of it when the
+    # session went on between the two; else with the newest. Only those two
+    # copies of a session are kept: every batch ever written is still on disk.
+    newest: dict[str, dict] = {}
+    read: dict[str, dict] = {}
     for batch_file in sorted(staging_dir.glob("conversation-batch-*.json")):
         batch = load_json_or_quarantine(batch_file)
         if batch is None:
             continue
         for conv in batch.get("conversations", []):
-            staging_index[conv["session_id"]] = conv
+            session_id = conv["session_id"]
+            newest[session_id] = conv
+            extraction = extractions.get(session_id)
+            ended_at = str(conv.get("ended_at") or "")
+            if extraction is not None and extraction.get("transcript_ended_at") == ended_at:
+                read[session_id] = conv
 
     loaded_count = 0
-    for extraction_file in sorted(extracted_dir.glob("*.json")):
-        session_id = extraction_file.stem
-
-        if session_id not in staging_index:
+    for session_id, extraction in extractions.items():
+        metadata = read.get(session_id) or newest.get(session_id)
+        if metadata is None:
             continue
-
-        with open(extraction_file, encoding="utf-8") as f:
-            extraction = json.load(f)
-
-        metadata = staging_index[session_id]
 
         if load_single_conversation(conn, metadata, extraction):
             loaded_count += 1
@@ -591,11 +599,12 @@ def load_single_conversation(
     if existing:
         if not (replace or conversation_went_on(metadata, existing[1], existing[2])):
             return False
-        # Loaded again, whole, under an id above every one in use: SQLite would
-        # give the top id to the next row once it is deleted, and build_index
-        # embeds only an id it holds no vector for.
-        new_id = conn.execute("SELECT MAX(id) FROM conversations").fetchone()[0] + 1
         delete_conversation(conn, existing[0])
+        # Loaded again, whole, under an id above every one in use, read once the
+        # delete holds the write lock: SQLite would give the top id to the next
+        # row, and build_index embeds only an id it holds no vector for.
+        top = conn.execute("SELECT MAX(id) FROM conversations").fetchone()[0]
+        new_id = max(top or 0, existing[0]) + 1
 
     # Insert conversation record
     cursor = conn.execute(

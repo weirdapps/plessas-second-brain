@@ -800,14 +800,20 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
     # given-up conversation never reads as ingested to the loader.
     attempt_counts = dict(conv_state.get("failed_attempts", {}))
     timeout_counts = dict(conv_state.get("timeout_attempts", {}))
-    # session_id -> the end of the transcript it was last extracted from.
-    extracted_ended_at = dict(conv_state.get("extracted_ended_at", {}))
+    # session_id -> [ended_at, turn_count] of the copy it was last extracted from.
+    extracted_from = dict(conv_state.get("extracted_from", {}))
+
+    from src.store.loader import conversation_went_on
 
     def went_on(conv: dict) -> bool:
-        """Extracted before, and staged since with a later end: past the end it
-        was extracted at, or (no record, from before this was kept) the end it
-        was loaded at, which the export marks on a conversation that went on."""
-        since = extracted_ended_at.get(conv.get("session_id", "")) or conv.get("regrown_from")
+        """Extracted before, and staged since past the copy it was extracted from
+        (a later end and more turns), or, with no record of that copy (extracted
+        before one was kept), past the end it was loaded at, which the export
+        marks on a conversation that went on."""
+        record = extracted_from.get(conv.get("session_id", ""))
+        if record:
+            return conversation_went_on(conv, *record)
+        since = conv.get("regrown_from")
         return bool(since) and str(conv.get("ended_at") or "") > str(since)
 
     def given_up_ids() -> set[str]:
@@ -903,7 +909,10 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
             with open(result_file, "w") as f:
                 json.dump(extraction, f, indent=2, ensure_ascii=False)
             processed_ids.add(session_id)
-            extracted_ended_at[session_id] = extraction["transcript_ended_at"]
+            extracted_from[session_id] = [
+                extraction["transcript_ended_at"],
+                conv.get("turn_count") or len(conv.get("turns", [])),
+            ]
             # A success clears the record: the next failure starts from zero
             # rather than inheriting an earlier one.
             attempt_counts.pop(session_id, None)
@@ -923,7 +932,7 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
         # Save state periodically
         if (i + 1) % SAVE_INTERVAL == 0 or i == len(pending) - 1:
             conv_state["processed_ids"] = list(processed_ids)
-            conv_state["extracted_ended_at"] = extracted_ended_at
+            conv_state["extracted_from"] = extracted_from
             conv_state["failed_attempts"] = attempt_counts
             conv_state["timeout_attempts"] = timeout_counts
             conv_state["total_extracted"] = len(processed_ids)
@@ -956,7 +965,7 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
 
     # Final save
     conv_state["processed_ids"] = list(processed_ids)
-    conv_state["extracted_ended_at"] = extracted_ended_at
+    conv_state["extracted_from"] = extracted_from
     conv_state["failed_attempts"] = attempt_counts
     conv_state["timeout_attempts"] = timeout_counts
     conv_state["given_up_ids"] = sorted(given_up_ids())

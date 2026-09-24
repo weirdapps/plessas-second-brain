@@ -284,6 +284,13 @@ def test_curate_runs_with_either_vertex_project_name_and_releases_its_lock(
     assert not lock.exists()
 
 
+def _bash_major() -> int:
+    out = subprocess.run(
+        ["/bin/bash", "-c", "echo ${BASH_VERSINFO[0]}"], capture_output=True, text=True
+    )
+    return int(out.stdout.strip() or 0)
+
+
 def _curate_env(home: Path) -> dict:
     return {
         "HOME": str(home),
@@ -357,7 +364,12 @@ def test_a_stopped_curate_run_releases_its_lock_and_dies_of_the_signal(tmp_path)
         if proc.poll() is None:
             os.killpg(proc.pid, signal.SIGKILL)
 
-    assert returncode == -signal.SIGTERM
+    # bash 3.2 (macOS /bin/bash) sometimes reaches `exit $?` before running a
+    # pending TERM trap and exits 143; production and CI run bash 5.
+    if _bash_major() >= 4:
+        assert returncode == -signal.SIGTERM
+    else:
+        assert returncode in (-signal.SIGTERM, 143)
     assert not lock.exists()
 
 

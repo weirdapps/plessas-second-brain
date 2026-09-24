@@ -317,10 +317,11 @@ def complete(*, max_tokens: int, messages: list, model: str | None = None, **kwa
     own); `kwargs` go to the SDK as they are (`system`). Do not close the
     client: it is shared.
 
-    The policy does not retry a refusal here: the fallback tier has already had
-    it, and the policy's REFUSAL row would replay primary and fallback twice
-    more, when replaying a pair cannot change its answer (see vertex_fallback).
-    A refused attempt still takes two calls, primary then fallback. When the
+    The policy does not retry a refusal here: the fallback tier has usually had
+    it already (see vertex_fallback for when it has not), and the policy's
+    REFUSAL row would replay primary and fallback twice more, when replaying a
+    pair cannot change its answer. A refused attempt can take two calls,
+    primary then fallback. When the
     attempt was checked against the deadline first (a retry decide() allowed,
     or a caller that checks before starting, like the curate job) the reserve
     holds room for the second; an unchecked first call refused near the

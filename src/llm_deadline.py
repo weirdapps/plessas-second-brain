@@ -85,11 +85,10 @@ _UNIT_TIMEOUT_SECONDS: dict[str, int] = {
 # to finish its bookkeeping and flush its logs before systemd's SIGTERM.
 _SHUTDOWN_GRACE_SECONDS = 90
 
-# Every ``call_with_policy`` call site in this repo passes 120.0: claude_extract's
-# extract_one and extract_conversation, attachment_pipeline, image_vision,
-# calendar_extractor and teams_pipeline. news reads the equivalent per profile from config;
-# here it is uniform, and test_max_call_seconds_matches_every_call_site fails if a site
-# diverges — it is also what caught teams_pipeline arriving as the sixth.
+# call_with_policy has one caller, claude_extract.complete(), which every Claude call
+# site goes through (the curate job included) with 120.0. news reads the equivalent per
+# profile from config; here it is uniform, and test_max_call_seconds_matches_every_call_site
+# fails if the two diverge.
 MAX_CALL_SECONDS = 120.0
 
 # Largest single backoff decide() can actually emit: RATE_LIMIT at n=3, so 240s.

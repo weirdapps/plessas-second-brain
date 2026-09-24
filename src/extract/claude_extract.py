@@ -14,6 +14,7 @@ from typing import Any
 from src.llm_policy import (
     Action,
     Attempt,
+    Outcome,
     ReauthResult,
     decide,
     default_adc_probe,
@@ -109,9 +110,9 @@ def _build_client_and_model():
         return Anthropic(api_key=api_key, timeout=60.0), model
 
     raise RuntimeError(
-        "No Claude credentials found. Set VERTEX_SDK_PROJECT (or "
-        "ANTHROPIC_VERTEX_PROJECT_ID) and CLOUD_ML_REGION for Vertex AI, or "
-        "ANTHROPIC_API_KEY for the direct API."
+        "No Claude credentials found. For Vertex AI set VERTEX_SDK_PROJECT (or "
+        "ANTHROPIC_VERTEX_PROJECT_ID), with the region in VERTEX_SDK_REGION or "
+        "CLOUD_ML_REGION (default europe-west1); for the direct API set ANTHROPIC_API_KEY."
     )
 
 
@@ -139,9 +140,9 @@ def reset_client_cache():
 # Process-wide latch: once a re-auth has FAILED, no other worker repeats the wait.
 #
 # On Linux reauth() has no local remedy and polls for PUSH_WAIT_SECONDS (1020s) waiting
-# for the Mac's token push. call_with_policy runs per item, and three of its call sites
-# drive a ThreadPoolExecutor (local.py:397, attachment_pipeline.py:361,
-# image_pipeline.py:284). Without a latch each worker in turn pays its own full wait, so
+# for the Mac's token push. complete() runs per item, and three of its callers drive a
+# ThreadPoolExecutor (local.py, attachment_pipeline.py, image_pipeline.py). Without a
+# latch each worker in turn pays its own full wait, so
 # four workers spend 68 minutes discovering, four times over, the one fact the first
 # worker already established in 17: the push is not coming.
 #
@@ -227,14 +228,17 @@ def _reauth_unless_latched(*, is_linux: bool) -> ReauthResult | None:
         return result
 
 
-def call_with_policy(fn, *, max_call_seconds: float) -> object:
+def call_with_policy(fn, *, max_call_seconds: float, refusal_is_final: bool = False) -> object:
     """Run fn() under the shared retry/reauth policy.
 
     fn is a zero-argument callable that performs a single SDK request and returns
     the response or raises.  Returns the response when the policy says RETURN, or
-    raises the last exception when the policy gives up.  Both extract_one and
-    extract_conversation route through this so that auth failures trigger a re-auth
-    and a retry rather than propagating immediately.
+    raises the last exception when the policy gives up.  complete() routes every
+    Claude call site through this so that auth failures trigger a re-auth and a
+    retry rather than propagating immediately.
+
+    refusal_is_final returns a refusal at once instead of letting the policy's
+    REFUSAL row retry it, for an fn() that has already retried it elsewhere.
 
     now is always time.time() (wall clock), never time.monotonic().
     PTS_LLM_DEADLINE is wall-clock arithmetic; a monotonic now (~1e5) against an
@@ -261,6 +265,8 @@ def call_with_policy(fn, *, max_call_seconds: float) -> object:
             last_exc = exc
 
         outcome = classify_exception(last_exc, last_response)
+        if refusal_is_final and outcome is Outcome.REFUSAL:
+            return last_response
         attempt = attempt.bump(outcome)
         decision = decide(
             outcome,
@@ -302,7 +308,7 @@ def call_with_policy(fn, *, max_call_seconds: float) -> object:
 def complete(*, max_tokens: int, messages: list, model: str | None = None, **kwargs: Any) -> Any:
     """Send one Claude request, the way every extraction call site does.
 
-    Seven call sites used to build this themselves, and drifted: attachments,
+    The call sites used to build this themselves, and drifted: attachments,
     images and calendar had no refusal fallback, and the curate job had no
     retry policy. Here each gets all of it: the shared client, fetched again on
     every attempt so that a re-auth (which drops the cached client) reaches the
@@ -310,6 +316,12 @@ def complete(*, max_tokens: int, messages: list, model: str | None = None, **kwa
     the model refuses. `model` overrides the configured model (Teams has its
     own); `kwargs` go to the SDK as they are (`system`). Do not close the
     client: it is shared.
+
+    The fallback tier is the only retry a refusal gets. The policy would replay
+    it twice more, primary and fallback each time, and replaying a pair cannot
+    change its answer (see vertex_fallback). A refused attempt can still take
+    two calls, primary then fallback: the deadline reserve's one-call allowance
+    beyond max_call_seconds is what covers the second.
     """
     # Imported here, not at the top, so tests that patch it in vertex_fallback
     # reach this call.
@@ -321,7 +333,7 @@ def complete(*, max_tokens: int, messages: list, model: str | None = None, **kwa
             client, model=model or configured, max_tokens=max_tokens, messages=messages, **kwargs
         )
 
-    return call_with_policy(_do_call, max_call_seconds=120.0)
+    return call_with_policy(_do_call, max_call_seconds=120.0, refusal_is_final=True)
 
 
 def extract_one(email: dict) -> dict | None:

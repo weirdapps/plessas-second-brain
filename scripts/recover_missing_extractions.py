@@ -23,7 +23,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.config import DATA_ROOT, DEFAULT_DB  # noqa: E402
+from src.config import DATA_ROOT, DEFAULT_DB, is_replica, replica_refusal  # noqa: E402
 from src.store.loader import load_single_email  # noqa: E402
 from src.store.schema import get_connection  # noqa: E402
 
@@ -48,6 +48,11 @@ def build_staging_index() -> dict[str, dict]:
 
 
 def main() -> int:
+    if is_replica():
+        # It loads emails, and a replica's copy is replaced by the next pull
+        # (see src/config.py).
+        print(replica_refusal("recovering extractions"), file=sys.stderr)
+        return 2
     if not DB.exists():
         print(f"DB not found: {DB}")
         return 1

@@ -413,7 +413,8 @@ def cmd_process_images(args):
 
 
 # split-html holds a batch in memory until it writes it, so a batch ends at about
-# this many characters of bodies and their text as well as at --batch emails.
+# this many characters of bodies, their text and their kept HTML (about twice as
+# many bytes for Greek) as well as at --batch emails.
 SPLIT_HTML_BATCH_CHARS = 64_000_000
 
 
@@ -482,8 +483,9 @@ def cmd_split_html(args) -> int:
             content = row[0]
             body, html = split_body(redact_secrets(content))
             if html is not None:
-                ready.append((email_id, content, body, pack(html), len(html.encode("utf-8"))))
-                held += len(content) + len(body or "")
+                blob = pack(html)
+                ready.append((email_id, content, body, blob, len(html.encode("utf-8"))))
+                held += len(content) + len(body or "") + len(blob)
         for email_id, content, body, blob, html_bytes in ready:
             if not args.dry_run:
                 # Unless the body changed since it was read: a re-load wins.

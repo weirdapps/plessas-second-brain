@@ -56,7 +56,7 @@ _OPENING = re.compile(
 # line. A void element has no end tag, so a style on one would never end.
 _SPACING, _LINES, _NEITHER = 2, 1, 0
 _PRE_TAGS = {"pre", "textarea", "xmp", "listing", "plaintext"}
-_WHITE_SPACE = re.compile(r"white-space\s*:\s*([a-z-]+)", re.IGNORECASE)
+_WHITE_SPACE = re.compile(r"white-space\s*:\s*([a-z-]+)\s*(!\s*important)?", re.IGNORECASE)
 _KEEPS = {
     "pre": _SPACING, "pre-wrap": _SPACING, "break-spaces": _SPACING,
     "pre-line": _LINES, "normal": _NEITHER, "nowrap": _NEITHER, "initial": _NEITHER,
@@ -79,11 +79,13 @@ _ENDED_BY = {
 _CONTAINER = {
     "td": {"tr", "table"}, "th": {"tr", "table"}, "tr": {"table"} | _SECTIONS,
     "tbody": {"table"}, "thead": {"table"}, "tfoot": {"table"},
-    "li": {"ul", "ol", "menu"}, "dt": {"dl"}, "dd": {"dl"},
 }  # fmt: skip
 # A block's search for an open paragraph stops at the first element that may
 # hold paragraphs, and no search looks deeper than this many open elements.
 _HOLDS_P = (_BLOCKS | _PARAGRAPHS | {"td", "th", "body", "html"}) - {"p"}
+# An item's or a term's search stops at any of those but a div or an address,
+# as a browser's does: a table or a quote inside an item holds its own items.
+_CONTAINER.update(dict.fromkeys(("li", "dt", "dd"), _HOLDS_P - {"div", "address"}))
 _SEARCH_DEPTH = 32
 
 # The spacing is held as noncharacters, which the whitespace collapse leaves
@@ -98,6 +100,7 @@ _NO_PLACEHOLDERS = str.maketrans("", "", "\ufdd0\ufdd1")
 # writes markup, nor after a style that nothing but its own CSS followed.
 _REREADS = 3
 _MARKUP = re.compile(r"<[a-zA-Z/!]")
+_CSS_QUOTED = re.compile(r"/\*.*?\*/|\"[^\"]*\"|'[^']*'", re.DOTALL)
 
 # A longer address loses its query string (click tracking, mostly), and one
 # still longer is left out: newsletters grew twelvefold with every one in full.
@@ -160,7 +163,6 @@ class _Reader(HTMLParser):
         self.hidden = 0
         # The outermost hidden element open: its position and its opening tag.
         self.opened: tuple[tuple[int, int], str] | None = None
-        self.bodied = False
         # The open elements, each with what white-space keeps inside it: its
         # own setting, else its parent's, as CSS inherits it.
         self.stack: list[tuple[str, int]] = []
@@ -222,10 +224,15 @@ class _Reader(HTMLParser):
                     return
 
     def _open(self, tag: str, attrs) -> None:
-        if any(self.open_count.get(kind) for kind in _ENDED_BY):
-            self._end_left_open(tag)
-        declared = _WHITE_SPACE.findall(dict(attrs).get("style") or "")
-        keeps = _KEEPS.get(declared[-1].lower()) if declared else None  # the last one wins
+        # As CSS reads it: an invalid value is dropped, an important declaration
+        # beats a plain one, and of the rest the last one wins.
+        valid = [
+            (value.lower(), bool(important))
+            for value, important in _WHITE_SPACE.findall(dict(attrs).get("style") or "")
+            if value.lower() in _KEEPS
+        ]
+        ranked = [value for value, important in valid if important] or [v for v, _ in valid]
+        keeps = _KEEPS[ranked[-1]] if ranked else None
         if keeps is None:
             keeps = _SPACING if tag in _PRE_TAGS else self._keeps()
         self.stack.append((tag, keeps))
@@ -243,11 +250,10 @@ class _Reader(HTMLParser):
                 self.opened = (self.getpos(), self.get_starttag_text() or "")
             self.hidden += 1
             return
-        if tag == "body" and not self.bodied:
-            self.hidden = 0  # the head ends where the body starts, whatever it left open
-            self.bodied = True
         if self.hidden:
-            return  # what a template or an xml island holds is never rendered
+            return  # what a template or an xml island holds, a <body> included, is never rendered
+        if any(self.open_count.get(kind) for kind in _ENDED_BY):
+            self._end_left_open(tag)  # an <hr> too, though it is void
         if tag not in _VOID:
             self._open(tag, attrs)
         if tag == "a":
@@ -343,7 +349,9 @@ def html_to_text(html: str) -> str:
             break
         if html[start : start + len(tag)] != tag:
             break
-        if tag[1:6].lower() == "style" and not _MARKUP.search(html, start + len(tag)):
+        if tag[1:6].lower() == "style" and not _MARKUP.search(
+            _CSS_QUOTED.sub("", html[start + len(tag) :])
+        ):
             break  # a stylesheet the body was cut off inside
         html = html[:start] + html[start + len(tag) :]
         reader = _read(html)

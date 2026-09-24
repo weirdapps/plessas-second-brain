@@ -284,7 +284,7 @@ def test_an_unreadable_kept_html_is_counted_not_fatal(scrub, tmp_path, capsys, m
     out = capsys.readouterr()
     assert "emails.content: 1 row" in out.out
     assert "1 email_html row could not be read" in out.err
-    assert "rowid 2" in out.err  # which one, to fix or delete it (an id is no secret)
+    assert "(rowid 2)" in out.err  # which one, to fix or delete it (an id is no secret)
 
     assert scrub.main(["--apply"]) == 2
     conn = sqlite3.connect(path)
@@ -305,6 +305,8 @@ def test_unreadable_is_not_reported_as_clean(scrub, tmp_path, capsys, monkeypatc
 
     assert scrub.main([]) == 2
     assert "No credential-shaped values found." not in capsys.readouterr().out
+    assert scrub.main(["--apply"]) == 2
+    assert "No credential-shaped values found." not in capsys.readouterr().out
 
 
 def test_a_blocked_checkpoint_is_reported_beside_an_unreadable_row(
@@ -322,3 +324,33 @@ def test_a_blocked_checkpoint_is_reported_beside_an_unreadable_row(
     err = capsys.readouterr().err
     assert "could not be read" in err
     assert "checkpoint was blocked" in err
+
+
+def test_more_than_twenty_unreadable_rows_are_listed_twenty(scrub, tmp_path, capsys, monkeypatch):
+    path = _db(tmp_path, scrub, monkeypatch)
+    conn = sqlite3.connect(path)
+    for i in range(1, 22):
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received, content) VALUES (?, ?, ?, 'x')",
+            (100 + i, f"u{i}", "2026-03-03T10:00:00"),
+        )
+        conn.execute("INSERT INTO email_html (email_id, html) VALUES (?, ?)", (100 + i, b"bad"))
+    conn.commit()
+    conn.close()
+
+    assert scrub.main([]) == 2
+    err = capsys.readouterr().err
+    assert "21 email_html rows could not be read" in err
+    assert "120 ...)" in err and "121" not in err
+
+
+def test_what_remains_is_listed_where_its_header_is(scrub, tmp_path, capsys, monkeypatch):
+    """The header went to stderr and its counts to stdout: a log that keeps one
+    stream had half the message."""
+    _db(tmp_path, scrub, monkeypatch)
+    monkeypatch.setattr(scrub, "_apply", lambda conn, found: 0)  # redacts nothing
+
+    assert scrub.main(["--apply"]) == 1
+    err = capsys.readouterr().err
+    assert "Credential-shaped values remain:" in err
+    assert "emails.content: 1 row" in err

@@ -181,14 +181,14 @@ def _report_unreadable(unreadable: dict[str, list[int]]) -> None:
         )
 
 
-def _report(found: dict[tuple[str, str], list[int]], unread: bool = False) -> None:
+def _report(found: dict[tuple[str, str], list[int]], unread: bool = False, file=None) -> None:
     if not found:
         if not unread:  # an unread row may hold one
-            print("No credential-shaped values found.")
+            print("No credential-shaped values found.", file=file)
         return
     for (table, column), rowids in sorted(found.items()):
         noun = "row" if len(rowids) == 1 else "rows"
-        print(f"  {table}.{column}: {len(rowids)} {noun}")
+        print(f"  {table}.{column}: {len(rowids)} {noun}", file=file)
 
 
 def _apply(conn: sqlite3.Connection, found: dict[tuple[str, str], list[int]]) -> int:
@@ -276,8 +276,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
     try:
-        found, _unreadable = _scan(conn)
-        _report(found)
+        found, first_unread = _scan(conn)
+        _report(found, unread=bool(first_unread))
         changed = _apply(conn, found) if found else 0
         print(f"{changed} rows redacted")
         for fts in _fts5_indexes(conn):
@@ -294,7 +294,7 @@ def main(argv: list[str] | None = None) -> int:
     # the run cannot vouch for what it could not read.
     if left:
         print("Credential-shaped values remain:", file=sys.stderr)
-        _report(left)
+        _report(left, file=sys.stderr)
     if unreadable:
         _report_unreadable(unreadable)
     if not checkpointed:

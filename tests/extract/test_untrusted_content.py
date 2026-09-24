@@ -137,7 +137,7 @@ def test_the_calendar_prompt_fences_the_invite(monkeypatch):
             return Response()
 
     fake = type("Client", (), {"messages": FakeMessages()})()
-    monkeypatch.setattr("src.extract.calendar_extractor._get_client_and_model", lambda: (fake, "m"))
+    monkeypatch.setattr("src.extract.claude_extract._get_client_and_model", lambda: (fake, "m"))
 
     extract_event(
         {"subject": "Sync " + INJECTION, "organizer": "m@evil.example", "attendees": []},

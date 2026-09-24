@@ -268,6 +268,7 @@ python -m src.cli teams-sync --workers 4
 python -m src.cli process-attachments --phase 2 --workers 2
 python -m src.cli process-images --limit 500
 python -m src.cli process-sharepoint --since 2026-06-01
+python -m src.cli split-html --dry-run      # once after v23: HTML bodies loaded before it
 python -m src.cli reverse-ingest --root ~/Documents --workers 4
 python -m src.cli ingest ~/Downloads/report.pdf --source "Q2 report"
 python -m src.cli ingest --url https://example.com/article
@@ -388,7 +389,7 @@ skill/
 
 `data/brain.db` (SQLite). Migrations run automatically via `src/store/schema.py`; the current schema version is `CURRENT_SCHEMA_VERSION` in `src/config.py` and is tracked in the `schema_version` table.
 
-- **Core content**: `emails`, `topics`, `email_topics`, `decisions`, `action_items`, `commitments`, `people`, `email_people`, `key_facts`
+- **Core content**: `emails`, `topics`, `email_topics`, `decisions`, `action_items`, `commitments`, `people`, `email_people`, `key_facts`, and from v23 `email_html`: an HTML body is stored as the text a reader sees, and the HTML is kept here, zlib-compressed, for the SharePoint link scan and the inline-image positions
 - **Attachments and images**: `attachments`, `attachment_content`, `inline_images`, `inline_image_occurrences`, `sender_signature_index`
 - **Calendar**: `calendar_events`, `event_attendees`
 - **Teams**: `teams_chats`, `teams_threads`, `teams_messages`, `teams_mri_resolution`

@@ -54,3 +54,11 @@ def test_plain_text_is_not_mistaken_for_html():
     assert not looks_like_html("a < b and c > d")
     assert not looks_like_html(None)
     assert not looks_like_html("")
+
+
+def test_an_image_reads_as_its_alt_text():
+    """Outlook's join buttons and signatures are images; a reader with images off
+    sees their alt text, and so should the index."""
+    html = '<p>Click <img src="cid:b.png" alt="Join the meeting"> now<img src="x.png"></p>'
+
+    assert html_to_text(html) == "Click Join the meeting now"

@@ -59,3 +59,55 @@ def test_the_inbox_reconcile_refuses_a_replica(replica, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["inbox_reconcile"])
 
     assert inbox_reconcile.main() == inbox_reconcile.REFUSED_ON_REPLICA
+
+
+def _script(name):
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).parent.parent / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"guard_{name}", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_topic_dedup_refuses_a_replica(replica, monkeypatch):
+    from src.store import dedup_topics
+
+    monkeypatch.setattr(dedup_topics, "run_topic_dedup", lambda *a, **k: pytest.fail("ran"))
+    monkeypatch.setattr(sys, "argv", ["dedup_topics", "--dry-run"])
+
+    assert dedup_topics.main() == 2
+
+
+def test_fuzzy_people_applies_nothing_on_a_replica(replica, monkeypatch):
+    from src.store import fuzzy_people
+
+    monkeypatch.setattr(fuzzy_people, "get_connection", lambda *a, **k: pytest.fail("opened"))
+    monkeypatch.setattr(sys, "argv", ["fuzzy_people", "--apply", "/tmp/reviewed.jsonl"])
+
+    assert fuzzy_people._cli() == 2
+
+
+def test_recovering_extractions_refuses_a_replica(replica, monkeypatch):
+    module = _script("recover_missing_extractions")
+    monkeypatch.setattr(module, "get_connection", lambda *a, **k: pytest.fail("opened"))
+
+    assert module.main() == 2
+
+
+def test_the_secret_scrub_applies_nothing_on_a_replica(replica, monkeypatch):
+    module = _script("scrub_secrets")
+    monkeypatch.setattr(module.sqlite3, "connect", lambda *a, **k: pytest.fail("opened"))
+
+    assert module.main(["--apply"]) == 3
+
+
+def test_reaping_attachments_applies_nothing_on_a_replica(replica, monkeypatch):
+    module = _script("reap_orphan_attachments")
+    monkeypatch.setattr(module, "reap_orphan_attachments", lambda *a, **k: pytest.fail("ran"))
+    monkeypatch.setattr(sys, "argv", ["reap_orphan_attachments", "--apply"])
+
+    assert module.main() == 2

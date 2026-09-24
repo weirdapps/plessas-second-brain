@@ -306,7 +306,7 @@ src/
     news_export.py             News-reader digests and articles into staging batches
     teams_cli.py               teams-cli subprocess wrapper
     teams_export.py            Teams chats, threads, messages
-    inbox_reconcile.py         Cursor recovery
+    inbox_reconcile.py         Inbox to Archive move detection
     sharepoint_fetcher.py      SharePoint link fetch and host classification
     sharepoint_cli.py          sharepoint-cli subprocess wrapper (cookie session, not bearer)
     state.py                   Atomic staging writes and the Outlook sync cursor

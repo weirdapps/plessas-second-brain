@@ -89,7 +89,7 @@ The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register t
 
 ### Emails
 
-- `search_emails(query, search_type, limit)`. Keyword (FTS5) or semantic (embedding). Keyword search tries the subject first, then the summary, the body, key facts and attachments, and returns one email per thread (for a subject match, the thread's newest).
+- `search_emails(query, search_type, limit)`. Keyword (FTS5) or semantic (embedding). Keyword search tries the subject first, then the summary, the body, key facts and attachments, and returns one email per thread (for a subject match, the thread's newest); a row whose thread matched in more emails says how many in `thread_matches`.
 - `email_thread(email_id, limit)`. The emails of a hit's thread, oldest first, with `thread_total`; a thread longer than `limit` comes back as the `limit` emails centred on the hit, and a News item or an email with no conversation id as a thread of one.
 - `query_emails(person, topic, keyword, start_date, end_date, limit)`. Combined filters.
 - `outlook_live_search(folder, since_minutes, subject_contains)`. Bypasses the DB and queries the live Outlook mailbox directly, for mail newer than the store. `since_minutes` defaults to 60 and is capped at 1440 (24 hours); the answer's `since_minutes` and `clamped` say what was searched. This is the escape hatch when `stats` says the local copy is stale.

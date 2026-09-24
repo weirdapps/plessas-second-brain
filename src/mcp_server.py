@@ -164,7 +164,8 @@ def search_emails(query: str, search_type: str = "keyword", limit: int = 20) -> 
     """Search emails by keyword (FTS5) or semantic similarity (embeddings).
 
     Keyword mode returns one email per thread (a subject match shows the thread's
-    newest); email_thread reads the rest of it.
+    newest); a row whose thread matched in more emails says how many in
+    thread_matches, and email_thread reads the rest of it.
 
     Args:
         query: Search query text. Keyword mode wants every word, then falls back to

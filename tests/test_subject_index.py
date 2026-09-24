@@ -606,3 +606,34 @@ def test_a_padded_thread_id_is_its_own_thread_in_search_and_in_the_thread_view(t
     assert [e["email_id"] for e in query_thread(conn, 2)] == [2]
     assert [e["email_id"] for e in query_thread(conn, 4)] == [3, 4]
     assert count_thread(conn, 3) == 2
+
+
+@pytest.mark.parametrize("source", ["subject", "summary", "content"])
+def test_a_threads_row_says_how_many_of_its_emails_matched(tmp_path, source):
+    """One row per thread hides the rest of it. Half the corpus is threaded by
+    subject alone (43,399 emails, from before Outlook's conversation ids), and a
+    recurring report's matching emails read as one row. thread_matches says how
+    many matched, so a caller knows to open email_thread."""
+    conn = create_database(str(tmp_path / "b.db"))
+    conn.row_factory = sqlite3.Row
+
+    def mail(n, thread):
+        if source == "subject":
+            _mail(conn, n, "Okapi weekly report", thread=thread)
+        elif source == "summary":
+            _mail(conn, n, "Report", summary="the okapi weekly report", thread=thread)
+        else:
+            _mail(conn, n, "Report", content="the okapi weekly report", thread=thread)
+
+    for n in range(1, 5):
+        mail(n, "T")
+    mail(5, "C5")
+    mail(6, None)
+    conn.commit()
+
+    results = {r["email_id"]: r for r in query_by_keyword(conn, "okapi weekly", limit=10)}
+
+    assert sorted(results) == [4, 5, 6]
+    assert results[4]["thread_matches"] == 4
+    assert "thread_matches" not in results[5]  # alone in its thread
+    assert "thread_matches" not in results[6]  # no thread at all

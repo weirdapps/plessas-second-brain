@@ -86,10 +86,50 @@ trap 'rm -rf "$LOCK"' EXIT INT TERM
 
 # Bail out quietly when the VPS is unreachable (laptop off-network) so this does
 # not log an rsync failure every 6 hours.
+#
+# Quietly, but no longer silently for ever. Until 2026-09-23 this branch wrote no
+# marker and exited 0, the VPS-side check judges the success stamp against a
+# 14-day window, and daily-automation-health reads only this agent's exit code,
+# so the document feed could stop for two weeks with no alert from either side.
+# A laptop off the network is still this job's NORMAL state, so one skip, or an
+# overnight gap, stays exit 0. Once the last successful push is 24h old, or after
+# 4 consecutive unreachable runs (4 x 6h), unreachable_verdict writes the local
+# failure marker with reason "unreachable" and the job exits 1. Nothing needs
+# pushing when the link returns: that run resets the count, and its own success
+# clears the marker on both hosts, as any successful run does.
+# ---- UNREACHABLE-GATE-BEGIN ----
+UNREACHABLE_RUNS_FILE="$HOME/.second-brain/document-sync.unreachable-runs"
+UNREACHABLE_MAX_RUNS=4
+UNREACHABLE_MAX_AGE=86400
+
+# Returns 0 to skip quietly, or 1 once the gap outlives either threshold.
+unreachable_verdict() {
+  local runs last_ok since=-1 ago reason
+  mkdir -p "$HOME/.second-brain"
+  runs=$(cat "$UNREACHABLE_RUNS_FILE" 2>/dev/null)
+  case "$runs" in ''|*[!0-9]*) runs=0 ;; esac
+  runs=$((runs + 1))
+  printf '%s\n' "$runs" >"$UNREACHABLE_RUNS_FILE"
+  # The stamp is rewritten on every successful run, so its mtime is the last
+  # success. No stamp means no age to judge, and the run count alone decides.
+  last_ok=$(/usr/bin/stat -f %m "$HOME/.second-brain/document-sync.stamp" 2>/dev/null)
+  [ -n "$last_ok" ] && since=$(( $(date +%s) - last_ok ))
+  if [ "$runs" -lt "$UNREACHABLE_MAX_RUNS" ] && [ "$since" -lt "$UNREACHABLE_MAX_AGE" ]; then
+    log "VPS unreachable: skipping ($runs consecutive; pages at $UNREACHABLE_MAX_RUNS, or 24h after the last successful push)"
+    return 0
+  fi
+  if [ "$since" -ge 0 ]; then ago="$((since / 3600))h ago"; else ago="never recorded here"; fi
+  reason="unreachable: ssh to $VPS failed on $runs consecutive runs, last successful push $ago"
+  printf '%s\n%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%S+00:00')" "$reason" >"$HOME/.second-brain/document-sync.fail"
+  log "VPS unreachable: $reason; failure marker written"
+  return 1
+}
+# ---- UNREACHABLE-GATE-END ----
 if ! ssh -o ConnectTimeout=10 -o BatchMode=yes "$VPS" true 2>/dev/null; then
-  log "VPS unreachable — skipping"
-  exit 0
+  unreachable_verdict
+  exit $?
 fi
+rm -f "$UNREACHABLE_RUNS_FILE"
 
 rc=0
 # Reasons accumulate so the failure marker can name the cause, not just the

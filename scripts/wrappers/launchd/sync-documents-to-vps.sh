@@ -157,7 +157,7 @@ note_failure() {
 # the job goes straight back to exit 23 with nobody at the keyboard to click
 # Allow. Re-read this value after any rsync upgrade, with:
 #   codesign -dvvv "$(command -v rsync)" 2>&1 | sed -n 's/^CDHash=//p'
-EXPECTED_RSYNC_CDHASH="78d3b891ef9ec4827cb47f761d9d264ee6eb5df8"
+EXPECTED_RSYNC_CDHASH="d2628534f3070231b806a39fd55e9453a9d834f3"
 
 # Echoes a human-actionable reason when the rsync on PATH is not the binary the
 # grant was issued to, and stays silent otherwise. It fails OPEN on every case

@@ -171,7 +171,12 @@ def load_event(
     # Determine body_extracted_at
     body_extracted_at = now_utc if extraction.get("body_summary") else None
 
-    # UPSERT event
+    # UPSERT event. The summary and its stamp are replaced only by a new
+    # extraction, as the decisions and actions below are. Any other status comes
+    # with an empty extraction: a failure or a deferral knows nothing about the
+    # meeting, and 'skipped' only knows the body is now too short to summarise,
+    # while the decisions it keeps came from the body the summary did. Writing ''
+    # over it lost the summary for good on a 'failed', which is not re-offered.
     conn.execute(
         """
         INSERT INTO calendar_events (
@@ -196,8 +201,10 @@ def load_event(
             created_at = excluded.created_at,
             modified_at = excluded.modified_at,
             ingested_at = excluded.ingested_at,
-            body_extracted_at = excluded.body_extracted_at,
-            body_summary = excluded.body_summary,
+            body_extracted_at = CASE WHEN excluded.llm_status = 'extracted'
+                THEN excluded.body_extracted_at ELSE calendar_events.body_extracted_at END,
+            body_summary = CASE WHEN excluded.llm_status = 'extracted'
+                THEN excluded.body_summary ELSE calendar_events.body_summary END,
             llm_status = excluded.llm_status,
             change_key = excluded.change_key
         """,

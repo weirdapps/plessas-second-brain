@@ -129,9 +129,12 @@ Mail reaches the store in two steps, and `sync` is only the second:
 
 1. **Stage.** With Microsoft 365, `python -m src.export.outlook_export --folder Inbox --bootstrap`
    stages mail through `outlook-cli`: the first run takes the 100 most recent
-   messages, later runs continue from the cursor it saves (`--state-path`, one
-   file per folder). Any other source writes staging batches itself; see "Bring
-   your own source" in the README.
+   messages, later runs continue from the cursor it saves. Each folder gets its
+   own cursor file under `$BRAIN_DATA_DIR/state` without `--state-path`
+   (`outlook_sync.json` for Inbox, `outlook_sync_archive.json` for Archive,
+   `outlook_sync_sent.json` for Sent Items), and a run given a cursor saved for
+   another folder exits 9 without touching it. Any other source writes staging
+   batches itself; see "Bring your own source" in the README.
 2. **Extract and load.** On a fresh store, `python -m src.extract.local && python -m src.cli load`,
    because `sync` skips an empty store. From then on `python -m src.cli sync`
    does both.

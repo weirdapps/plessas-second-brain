@@ -133,9 +133,14 @@ def person_context(name_or_email: str, days: int = 365, limit: int = 20) -> dict
     you can tell a complete answer from the head of a long one.
 
     Args:
-        name_or_email: Person's name (partial match, case and accent blind) or email
-            address. An ambiguous name resolves to the most-emailed match;
-            match_count and other_candidates say how many matched and who else.
+        name_or_email: Person's name or email address, case and accent blind. A
+            name matches at the start of a word ('Papa' finds 'Papadopoulos', 'AI'
+            does not find 'Michail'), a last word of one or two letters counts as
+            an initial ('Papadopoulos N'), and one word of four letters or more also
+            matches the start of an address's local part, after an optional
+            one-letter initial. An ambiguous name resolves to the most-emailed
+            match; match_count and other_candidates say how many matched and who
+            else.
         days: Lookback period in days (default: 365)
         limit: Max rows per list (default: 20)
     """
@@ -524,7 +529,6 @@ def query_calendar_events(
         keyword: Full-text search in subject and body_summary
         limit: Maximum results (default: 20, at most 200)
     """
-    import re
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
 
@@ -570,7 +574,7 @@ def query_calendar_events(
                     f"got {value!r}"
                 }
             bounds[name] = bound
-    limit = max(1, min(int(limit), 200))
+    limit = _cap(limit)
 
     conn = _get_conn()
     try:

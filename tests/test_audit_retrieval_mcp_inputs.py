@@ -125,7 +125,8 @@ def test_the_limit_helper_covers_every_handler_that_takes_one():
         and {"limit", "limit_per_kind"} & set(inspect.signature(fn).parameters)
     }
 
-    # query_calendar_events is clamped by its own owner.
+    # query_calendar_events runs its SQL inline, so no store function can be spied on;
+    # its clamp (_cap) is tested in test_audit_calendar_utc.py.
     assert takes_limit - {"query_calendar_events"} == {c[0] for c in CASES}
 
 

@@ -89,13 +89,13 @@ sqlite3 brain.db 'PRAGMA foreign_key_check;'   # expect no output at all
 # 3. Assert it is the corpus you think it is, not an empty shell.
 sqlite3 brain.db "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table';"
 sqlite3 brain.db "SELECT COUNT(*) FROM emails;"
-sqlite3 brain.db "SELECT value FROM sync_metadata WHERE key = 'last_sync_date';"
+sqlite3 brain.db "SELECT key, value FROM sync_metadata WHERE key IN ('last_sync_date', 'mail_export_ok_at');"
 ```
 
-`last_sync_date` is the honest age of the archive, and it is what the MCP
-`stats` tool reports as `data_as_of`. Check it before serving from a restored
-copy: everything after that timestamp is missing, and nothing else in the file
-will tell you.
+`last_sync_date` is when a sync last ran, and `mail_export_ok_at` is when the
+Inbox export last succeeded; the MCP `stats` tool reports the older of the two as
+`data_as_of`. Check both before serving from a restored copy: everything after
+the older one is missing, and nothing else in the file will tell you.
 
 ```bash
 # 4. Put it in place with the WAL sidecars removed. They belong to the old

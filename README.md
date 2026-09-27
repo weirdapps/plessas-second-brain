@@ -116,7 +116,7 @@ The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register t
 
 ### Calendar
 
-- `query_calendar_events(person, since, until, keyword, limit)`.
+- `query_calendar_events(person, since, until, keyword, limit)`. Times come back as `start_at`/`end_at` in UTC (a trailing `Z`) and as `start_local`/`end_local` in Europe/Athens with the offset. A bare-date `since`/`until` is an Athens calendar day, and `limit` is capped at 200. A meeting Outlook no longer lists is kept as cancelled and left out.
 
 ### Teams
 
@@ -141,7 +141,7 @@ The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register t
 
 - `stats()`. Counts across emails, news articles, standalone documents, conversations, topics, people, decisions, actions, attachments, key facts and calendar events, plus `coverage`: the first and last date held per mailbox, Teams, calendar and conversations. Check it before reading an empty answer as 'nothing happened'.
 
-  It also returns `data_as_of`, `age_hours` and `stale`, read from the `last_sync_date` cursor. On a read replica that is the only way to tell a live corpus from one whose feed stopped, because both answer queries identically.
+  It also returns `data_as_of`, `age_hours` and `stale`. `data_as_of` is the older of two stamps, both returned as stored: `last_sync_date`, which every `sync` writes, and `mail_export_ok_at`, the Inbox export's last success, which `sync` copies in. `stale_warning` names the one that is behind. On a read replica that is the only way to tell a live corpus from one whose feed stopped, because both answer queries identically.
 
 ## Installation
 
@@ -266,7 +266,7 @@ python -m src.cli news-sync --relevance 60
 python -m src.cli teams-sync --workers 4
 python -m src.cli process-attachments --phase 2 --workers 2
 python -m src.cli process-images --limit 500
-python -m src.cli process-sharepoint --since 2026-06-01
+python -m src.cli process-sharepoint --since 2026-06-01   # a rescan by date; the nightly run continues past the last email id it scanned, fetching at most --max-fetches (100)
 python -m src.cli split-html                # after v23, on the producer: HTML bodies loaded before it (see DEPLOY)
 python -m src.cli reverse-ingest --root ~/Documents --workers 4
 python -m src.cli ingest ~/Downloads/report.pdf --source "Q2 report"
@@ -347,7 +347,7 @@ src/
     recall.py                  Unified `recall` fan-out
     fusion.py                  Reciprocal rank fusion over keyword and semantic result lists
     normalizer.py              Greek-aware topic and people normalization
-    dedup_people.py            Six-phase people deduplication
+    dedup_people.py            Seven-phase people deduplication
     dedup_topics.py            One-time merge of topics differing only by case, accents, separators
     transliterate.py           Greek to Latin transliteration and name canonicalization
     fuzzy_people.py            Review-gated fuzzy name candidates; never auto-merges
@@ -364,6 +364,7 @@ scripts/
   recover_missing_extractions.py  Backfill emails that staged but never extracted
   reap_orphan_attachments.py   Resolves attachment dirs the registrar can never claim
   scrub_secrets.py             Redacts credentials already in the DB (dry run by default)
+  repair_people.py             Mends garbled people names and unsaved sender addresses (dry run by default)
   curate_documents_daily.py    Classifies new attachments into ~/Documents sub-folders
   backfill-all.sh              One-shot backfill across all sources
   conversation-capture.sh      Helper to snapshot Claude Code sessions

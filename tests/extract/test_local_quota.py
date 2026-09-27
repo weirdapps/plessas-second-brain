@@ -14,8 +14,8 @@ def test_an_auth_error_does_not_trigger_an_hour_of_pointless_sleep():
 
 
 def test_an_auth_error_whose_message_matches_the_quota_pattern_still_does_not_pause():
-    # Discriminator: _parse_retry_delay would see "429" in the message and return
-    # non-None, so a bare string check alone would produce True here.  Only the
+    # Discriminator: a bare substring check finds "429" in the message, so a
+    # string test alone would produce True here.  Only the
     # type-first routing through classify_exception produces False.
     assert _should_quota_pause(gauth.RefreshError("429 RESOURCE_EXHAUSTED")) is False
 

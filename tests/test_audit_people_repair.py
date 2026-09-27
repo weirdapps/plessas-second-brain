@@ -175,3 +175,16 @@ def test_apply_waits_for_the_write_lock(store, monkeypatch):
         writer.close()
 
     assert _people(db) == before
+
+
+def test_a_dry_run_opens_a_database_whose_path_holds_uri_characters(tmp_path, capsys):
+    """The read-only dry run pasted the path into a SQLite URI, where a '#' or a
+    '?' in a directory name cuts the path short or rewrites the query, so the
+    connection opened the wrong file or refused mode=ro. The path is escaped."""
+    odd = tmp_path / "backups #2 ?mode=rwc"
+    odd.mkdir()
+    db = odd / "brain.db"
+    create_database(str(db)).close()
+
+    assert _script().main(["--db", str(db), "--canonical", str(tmp_path / "none.json")]) == 0
+    assert "DRY RUN" in capsys.readouterr().out

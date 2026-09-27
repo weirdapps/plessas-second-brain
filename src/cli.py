@@ -1534,13 +1534,18 @@ def cmd_sync(args):
         classified = img_stats.get("classified", 0)
         missing = img_stats.get("missing", 0)
         deferred = img_stats.get("deferred", 0)
+        failed = img_stats.get("failed", 0)
         # `missing` = file gone from disk; `deferred` = budget spent, work requeued.
         # The old line printed `missing` under the label "remaining", which read as
         # "backlog empty: 0" every day while the queue was 200 deep. Queue depth is
         # reported by health_check.check_images (WARN past IMAGE_QUEUE_WARN); this
-        # line just says what THIS run did.
-        if classified > 0 or missing > 0 or deferred > 0:
-            print(f"  Classified: {classified}, deferred: {deferred}, missing files: {missing}")
+        # line just says what THIS run did. `failed` too: without it a run in which
+        # every image failed read "No unclassified images".
+        if classified > 0 or missing > 0 or deferred > 0 or failed > 0:
+            print(
+                f"  Classified: {classified}, failed: {failed}, deferred: {deferred}, "
+                f"missing files: {missing}"
+            )
         else:
             print("  No unclassified images")
     except Exception as e:

@@ -1370,13 +1370,15 @@ def count_stale_threads(conn: sqlite3.Connection, days: int = 5, max_days: int =
     return conn.execute(sql, params).fetchone()[0]
 
 
-# Open, past a deadline SQLite can parse, and not from a news article. A NULL
-# julianday() means the deadline is free text; those rows sorted to the top with
-# days_overdue = NULL and pushed the real answers off the end.
-_OVERDUE_WHERE = """
-    ai.status = 'open' AND ai.deadline IS NOT NULL
-      AND julianday(ai.deadline) IS NOT NULL
-      AND ai.deadline < date('now')
+# Open, past an ISO date, and not from a news article. Free text sorted to the
+# top with days_overdue = NULL and pushed the real answers off the end. A
+# parseable julianday() was not enough either: it reads a bare year ('2026') as
+# Julian day 2026 and '10:00' as today, so those counted as overdue with
+# days_overdue near 2.46 million. The same ISO test query_action_items uses.
+_OVERDUE_WHERE = f"""
+    ai.status = 'open' AND ai.deadline {_ISO_DATE}
+      AND date(substr(ai.deadline, 1, 10)) IS NOT NULL
+      AND substr(ai.deadline, 1, 10) < date('now')
       AND (e.id IS NULL OR e.mailbox_name IS NULL OR e.mailbox_name <> 'News')
 """
 
@@ -1417,7 +1419,8 @@ def find_overdue_actions(conn: sqlite3.Connection, limit: int = 20) -> list[dict
                    WHEN c.id IS NOT NULL THEN 'conversation'
                    ELSE 'orphan'
                END as source,
-               CAST(julianday('now') - julianday(ai.deadline) AS INTEGER) as days_overdue
+               CAST(julianday('now') - julianday(substr(ai.deadline, 1, 10)) AS INTEGER)
+                   as days_overdue
         FROM action_items ai
         LEFT JOIN emails e ON ai.email_id = e.id
         LEFT JOIN teams_threads tt ON ai.teams_thread_id = tt.id

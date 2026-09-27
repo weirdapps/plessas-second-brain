@@ -266,7 +266,7 @@ def inline(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     ("error", "gemini_calls", "quota", "failure"),
     [
-        pytest.param(ValueError("Failed to parse JSON"), 1, False, "fault", id="unusable-reply"),
+        pytest.param(ValueError("Failed to parse JSON"), 1, False, "unusable", id="unusable-reply"),
         pytest.param(RuntimeError("400 prompt is too long"), 3, False, "fault", id="rejected"),
         pytest.param(
             gauth.MalformedError("half-written ADC"), 3, False, "fault", id="auth-valueerror"
@@ -310,11 +310,11 @@ def test_an_expired_credential_never_counts_and_stops_the_run(inline):
     assert local._shutdown is True
 
 
-def test_a_reply_whose_error_mentions_429_is_a_fault_not_quota(inline):
+def test_a_reply_whose_error_mentions_429_is_unusable_not_quota(inline):
     """The parser's message carries a column number, and one of them was 429."""
     error = ValueError("Failed to parse JSON: Expecting ',' delimiter: line 1 column 4291")
 
-    assert inline(error) == ("m", None, False, "fault")
+    assert inline(error) == ("m", None, False, "unusable")
 
 
 def test_an_email_that_keeps_timing_out_is_retired_on_the_longer_cap(run):

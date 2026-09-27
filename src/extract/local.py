@@ -76,6 +76,11 @@ EMAIL_MAX_TIMEOUTS = 10
 # What a final failure counts as (see _failure_kind); None counts as nothing.
 FAULT = "fault"
 TIMEOUT = "timeout"
+# A reply the model gave that could not be used: a refusal, or JSON that does not
+# parse. It counts against EMAIL_MAX_ATTEMPTS exactly as a FAULT does, but it
+# proves the model answered, so unlike a retired model id or a 400 it is no sign
+# that the model is down (see run_extraction's model counts).
+UNUSABLE = "unusable"
 
 
 def _is_unusable_reply(exc: BaseException) -> bool:
@@ -262,9 +267,9 @@ def extract_inline(
     """Extract inline with retries. Thread-safe for Claude engine.
 
     Returns (msg_id, extraction_or_None, is_quota_error, failure). The caller
-    uses is_quota_error to trigger a global pause, and failure (FAULT, TIMEOUT
-    or None, see _failure_kind) to count it against EMAIL_MAX_ATTEMPTS or
-    EMAIL_MAX_TIMEOUTS. An unusable reply is not retried here: it comes
+    uses is_quota_error to trigger a global pause, and failure (UNUSABLE for a
+    reply it could not use, else FAULT, TIMEOUT or None, see _failure_kind) to
+    count it against EMAIL_MAX_ATTEMPTS or EMAIL_MAX_TIMEOUTS. An unusable reply is not retried here: it comes
     back the same for the same input. Nor is anything on Claude, whose request
     has already been through the retry policy inside complete(); retrying it
     here multiplied that policy's attempts, and its waits, by max_retries.
@@ -307,7 +312,7 @@ def extract_inline(
             # number), and a reply that cannot be used is never quota.
             if _is_unusable_reply(e):
                 log(f"  ↳ msg {msg_id} error: {type(e).__name__}: {str(e)[:200]}")
-                return (msg_id, None, False, FAULT)
+                return (msg_id, None, False, UNUSABLE)
             if _should_quota_pause(e):
                 is_quota = True
                 if attempt < max_retries - 1:
@@ -377,10 +382,11 @@ def run_extraction(
     mail. Without one (a manual run) nothing changes.
 
     Returns {"extracted", "failed", "quota_paused", "model_successes",
-    "model_failures"}; quota_paused is True when a quota pause ended a run that
-    had a deadline. The last two count the emails that went to the model and
-    came back extracted or failed, less the failures of emails that had already
-    failed in an earlier run. News is extracted without it and counts in
+    "model_failures", "model_unusable"}; quota_paused is True when a quota pause
+    ended a run that had a deadline. The model counts are the emails that went to
+    the model and came back extracted, failed (less the failures of emails that
+    had already failed in an earlier run), or answered with a reply that could
+    not be used. News is extracted without it and counts in
     neither, so a run in which the model failed every email still reports
     "extracted" above zero on a day with news, and only these tell.
     """
@@ -419,8 +425,12 @@ def run_extraction(
     failed_this_run: dict[str, str] = {}
     model_successes = 0
     model_failures = 0
+    model_unusable = 0
 
     def note_failure(msg_id: str, failure: str | None) -> None:
+        # An unusable reply is the item's own fault, capped like any other.
+        if failure == UNUSABLE:
+            failure = FAULT
         # A fault outranks a timeout for an email met twice in one run.
         if failure and failed_this_run.get(msg_id) != FAULT:
             failed_this_run[msg_id] = failure
@@ -486,6 +496,7 @@ def run_extraction(
             "quota_paused": False,
             "model_successes": 0,
             "model_failures": 0,
+            "model_unusable": 0,
         }
 
     # Warm up: verify auth
@@ -536,8 +547,11 @@ def run_extraction(
                 i += 1
             else:
                 total_failed += 1
-                if not is_news(email) and msg_id not in carried:
-                    model_failures += 1
+                if not is_news(email):
+                    if failure == UNUSABLE:
+                        model_unusable += 1
+                    elif msg_id not in carried:
+                        model_failures += 1
                 if is_quota:
                     consecutive_failures += 1
                 log(f"FAILED msg {msg_id}")
@@ -653,8 +667,11 @@ def run_extraction(
                     else:
                         with _state_lock:
                             total_failed += 1
-                            if not is_news(email) and msg_id not in carried:
-                                model_failures += 1
+                            if not is_news(email):
+                                if failure == UNUSABLE:
+                                    model_unusable += 1
+                                elif msg_id not in carried:
+                                    model_failures += 1
                             if is_quota:
                                 consecutive_failures += 1
                             note_failure(msg_id, failure)
@@ -744,6 +761,7 @@ def run_extraction(
         "quota_paused": quota_paused,
         "model_successes": model_successes,
         "model_failures": model_failures,
+        "model_unusable": model_unusable,
     }
 
 

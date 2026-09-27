@@ -83,6 +83,7 @@ def test_the_deadline_stops_the_sequential_loop_between_items(staged, monkeypatc
         "quota_paused": False,
         "model_successes": 2,
         "model_failures": 0,
+        "model_unusable": 0,
     }
 
 

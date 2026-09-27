@@ -108,6 +108,13 @@ EXTRACT_DEADLINE_BY_UNIT_S = {
     "sb-noon-catchup": 900.0,
 }
 
+# Replies the model could not use (refusals, unparseable JSON), with none
+# extracted, from which a sync reads as the model being down. One or two are an
+# ordinary quiet run: about 14 emails a day were refused in September 2026, and a
+# run whose one fresh email was refused went red at 75. Three and none usable is
+# no longer ordinary.
+MODEL_UNUSABLE_ALARM = 3
+
 # Observed span for the stages that have no budget of their own: load,
 # registration (count-bounded), people dedup, and the incremental embeddings
 # update (about 10 s), made twice when Step 7 loads conversations, and each
@@ -1433,10 +1440,16 @@ def cmd_sync(args):
     # still runs, but the run must not read as fresh or green, as it did with
     # rc 0 and a new last_sync_date while no mail loaded. Not keyed on
     # `extracted`, which news (extracted without the model) keeps above zero.
+    # A reply the model could not use (a refusal, unparseable JSON) is an answer,
+    # not an outage: a quiet run whose one fresh email was refused read as a dead
+    # model. Several answers and none of them usable still reads as down.
     model_down = (
         isinstance(extraction_run, dict)
-        and extraction_run.get("model_failures", 0) > 0
         and not extraction_run.get("model_successes", 0)
+        and (
+            extraction_run.get("model_failures", 0) > 0
+            or extraction_run.get("model_unusable", 0) >= MODEL_UNUSABLE_ALARM
+        )
     )
 
     # Step 3: Load into DB
@@ -1676,8 +1689,10 @@ def cmd_sync(args):
     # (RestartPreventExitStatus=75 on both backlog units).
     if model_down:
         print(
-            f"The model failed all {extraction_run['model_failures']} new emails sent to it "
-            "and extracted none; last_sync_date was not advanced",
+            f"The model extracted none of the new emails sent to it "
+            f"({extraction_run.get('model_failures', 0)} failed, "
+            f"{extraction_run.get('model_unusable', 0)} unusable replies); "
+            "last_sync_date was not advanced",
             file=sys.stderr,
         )
         return 75

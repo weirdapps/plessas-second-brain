@@ -236,3 +236,36 @@ def test_the_nightly_pass_scans_by_the_mark_with_a_fetch_cap():
     line = next(ln for ln in WRAPPER.read_text().splitlines() if "src.cli process-sharepoint" in ln)
     assert "--limit" not in line
     assert "--max-fetches" in line
+
+
+def test_a_commit_from_another_process_mid_scan_does_not_lock_the_pass(tmp_path):
+    """The scan cursor stayed open on the connection every fetch commits on. In
+    WAL mode a commit from any other process in between left that connection on
+    a stale snapshot, and its next write failed at once with 'database is
+    locked', which busy_timeout does not retry: the pass exited 1, the mark was
+    not written, and the file already downloaded went unrecorded."""
+    db_path, ids = _db(
+        tmp_path,
+        [("Archive", f"a {_url(1)} b"), ("Archive", f"c {_url(2)} d"), ("Archive", f"e {_url(3)}")],
+    )
+    fetched = []
+
+    def fake_fetch(url, out_dir):
+        if not fetched:
+            other = get_connection(str(db_path))
+            other.execute(
+                "INSERT INTO emails (message_id, date_received, content, mailbox_name) "
+                "VALUES ('m-other', '2026-09-30T09:00:00', 'no link', 'Archive')"
+            )
+            other.commit()
+            other.close()
+        fetched.append(url)
+        return SharepointFetchResult(url=url, status="ok")
+
+    options = {"db": str(db_path), "since": None, "limit": 0, "dry_run": False}
+    with patch("src.export.sharepoint_fetcher.fetch_sharepoint_link", side_effect=fake_fetch):
+        rc = cli.cmd_process_sharepoint(argparse.Namespace(**options))
+
+    assert rc == 0
+    assert fetched == [_url(1), _url(2), _url(3)]
+    assert _mark(db_path) == ids[-1]

@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from src.config import DATA_ROOT, GEMINI_MODEL
+from src.config import DATA_ROOT, EXTRACT_ENGINE, GEMINI_MODEL
 from src.export.state import load_json_or_quarantine, write_json_atomic
 
 # Repo root
@@ -29,7 +29,9 @@ LOG_FILE = DATA_DIR / "extract.log"
 
 SAVE_INTERVAL = 50
 CALL_TIMEOUT = 60  # seconds per API call
-DEFAULT_ENGINE = os.environ.get("BRAIN_EXTRACT_ENGINE", "claude")  # "gemini" or "claude"
+# "claude" or "gemini", as config.py stripped, lowercased and checked it. Read
+# here again raw, a value such as 'Claude ' took the Gemini branch below.
+DEFAULT_ENGINE = EXTRACT_ENGINE
 CONSECUTIVE_FAIL_THRESHOLD = 5  # pause after this many consecutive failures
 QUOTA_PAUSE_SECONDS = 3600  # 1 hour default pause when quota exhausted
 

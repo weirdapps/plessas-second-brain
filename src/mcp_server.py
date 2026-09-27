@@ -4,6 +4,7 @@ Exposes the knowledge store as MCP tools for Claude Code plugins.
 Run: python -m src.mcp_server
 """
 
+import re
 from datetime import UTC
 
 from mcp.server import MCPServer
@@ -69,6 +70,49 @@ def _get_conn():
     return get_connection(str(DEFAULT_DB))
 
 
+def _cap(limit: int, hi: int = 200) -> int:
+    """`limit` held to 1..hi, for every handler that takes one.
+
+    SQLite reads a negative LIMIT as none, so limit=-1, which an agent passes to
+    mean 'all', dumped every row past the MCP result cap; and a search that
+    stops at `len(results) >= limit` returned nothing for limit <= 0, which read
+    as 'nothing found'.
+    """
+    return max(1, min(int(limit), hi))
+
+
+_SEARCH_TYPES = ("keyword", "semantic")
+
+
+def _unknown(name: str, value: str, allowed: tuple[str, ...]) -> dict:
+    """The error for an enum argument outside `allowed`. Anything but the exact
+    'semantic' used to run keyword search, and an unknown Teams kind searched
+    nothing, so a typo read as zero matches."""
+    return {"error": f"{name} must be one of {', '.join(allowed)}; got {value!r}"}
+
+
+def _date_error(name: str, value: str | None) -> dict | None:
+    """The error for a date argument SQLite cannot read, else None.
+
+    query_combined compares DATE(?), which is NULL for '01/09/2026' or
+    '2026-9-1' and so excluded every email, and reads '20260901' as a Julian day
+    number. A date, or a date and time, in ISO form passes; empty means unset.
+    """
+    from datetime import date, datetime
+
+    if not value:
+        return None
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value[:10]):
+            raise ValueError
+        date.fromisoformat(value[:10])
+        if len(value) > 10:
+            datetime.fromisoformat(value)
+    except ValueError:
+        return {"error": f"{name} must be YYYY-MM-DD (or an ISO date and time); got {value!r}"}
+    return None
+
+
 @mcp.tool()
 def person_context(name_or_email: str, days: int = 365, limit: int = 20) -> dict:
     """Get rich context for a person: email history, topics, sentiment, decisions, open actions, communication pattern, Teams activity.
@@ -88,7 +132,7 @@ def person_context(name_or_email: str, days: int = 365, limit: int = 20) -> dict
 
     conn = _get_conn()
     try:
-        return get_person_context(conn, name_or_email, days=days, limit=limit)
+        return get_person_context(conn, name_or_email, days=days, limit=_cap(limit))
     finally:
         conn.close()
 
@@ -110,7 +154,7 @@ def topic_context(topic: str, days: int = 365, limit: int = 20) -> dict:
 
     conn = _get_conn()
     try:
-        return get_topic_context(conn, topic, days=days, limit=limit)
+        return get_topic_context(conn, topic, days=days, limit=_cap(limit))
     finally:
         conn.close()
 
@@ -147,7 +191,7 @@ def email_thread(email_id: int, limit: int = 50) -> dict:
     """
     from src.store.query import count_thread, query_thread
 
-    limit = max(1, min(int(limit), 200))
+    limit = _cap(limit)
     conn = _get_conn()
     try:
         return {
@@ -160,7 +204,7 @@ def email_thread(email_id: int, limit: int = 50) -> dict:
 
 
 @mcp.tool()
-def search_emails(query: str, search_type: str = "keyword", limit: int = 20) -> list[dict]:
+def search_emails(query: str, search_type: str = "keyword", limit: int = 20) -> list[dict] | dict:
     """Search emails by keyword (FTS5) or semantic similarity (embeddings).
 
     Keyword mode returns one email per thread (a subject match shows the thread's
@@ -171,9 +215,13 @@ def search_emails(query: str, search_type: str = "keyword", limit: int = 20) -> 
     Args:
         query: Search query text. Keyword mode wants every word, then falls back to
             any meaningful word, flagging those rows partial_match.
-        search_type: "keyword" for full-text search, "semantic" for embedding similarity
-        limit: Maximum results (default: 20)
+        search_type: "keyword" for full-text search, "semantic" for embedding similarity;
+            anything else is an error
+        limit: Maximum results (default: 20, at most 200)
     """
+    if search_type not in _SEARCH_TYPES:
+        return _unknown("search_type", search_type, _SEARCH_TYPES)
+    limit = _cap(limit)
     conn = _get_conn()
     try:
         if search_type == "semantic":
@@ -224,7 +272,7 @@ def recall(query: str, limit_per_kind: int = 5, days: int = 365) -> dict:
         out = _recall(
             conn,
             query,
-            limit_per_kind=limit_per_kind,
+            limit_per_kind=_cap(limit_per_kind),
             days=days,
             semantic_candidates=semantic_email_candidates,
         )
@@ -248,19 +296,23 @@ def query_emails(
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 20,
-) -> list[dict]:
+) -> list[dict] | dict:
     """Query emails with combined filters: person, topic, keyword, date range.
 
     Args:
         person: Filter by person name
         topic: Filter by topic
         keyword: Full-text search keyword
-        start_date: Start date (YYYY-MM-DD)
-        end_date: End date (YYYY-MM-DD)
-        limit: Maximum results (default: 20)
+        start_date: Start date (YYYY-MM-DD); any other form is an error
+        end_date: End date (YYYY-MM-DD); any other form is an error
+        limit: Maximum results (default: 20, at most 200)
     """
     from src.store.query import query_combined
 
+    for name, value in (("start_date", start_date), ("end_date", end_date)):
+        error = _date_error(name, value)
+        if error:
+            return error
     conn = _get_conn()
     try:
         return query_combined(
@@ -270,7 +322,7 @@ def query_emails(
             keyword=keyword,
             start_date=start_date,
             end_date=end_date,
-            limit=limit,
+            limit=_cap(limit),
         )
     finally:
         conn.close()
@@ -306,7 +358,12 @@ def query_decisions(
         # emails (dropping every Teams, calendar and conversation decision) and
         # ignored include_news; with a filter it dropped `days`.
         return _qd(
-            conn, topic=topic, person=person, days=days, limit=limit, include_news=include_news
+            conn,
+            topic=topic,
+            person=person,
+            days=days,
+            limit=_cap(limit),
+            include_news=include_news,
         )
     finally:
         conn.close()
@@ -343,7 +400,7 @@ def query_actions(
     conn = _get_conn()
     try:
         return query_action_items(
-            conn, owner=owner, status=status, limit=limit, include_news=include_news
+            conn, owner=owner, status=status, limit=_cap(limit), include_news=include_news
         )
     finally:
         conn.close()
@@ -373,8 +430,7 @@ def stale_threads(days: int = 5, limit: int = 20, max_days: int = 30) -> dict:
         find_stale_threads,
     )
 
-    # SQLite reads a negative LIMIT as none, which would undo the bound.
-    limit = max(1, min(limit, 200))
+    limit = _cap(limit)
     conn = _get_conn()
     try:
         out: dict = {
@@ -428,7 +484,7 @@ def search_attachments(query: str, limit: int = 20) -> list[dict]:
 
     conn = _get_conn()
     try:
-        return _search(conn, query, limit=limit)
+        return _search(conn, query, limit=_cap(limit))
     finally:
         conn.close()
 
@@ -602,16 +658,20 @@ def search_conversations(
     search_type: str = "keyword",
     workspace: str | None = None,
     limit: int = 20,
-) -> list[dict]:
+) -> list[dict] | dict:
     """Search past Claude Code conversations by keyword (FTS5) or semantic similarity.
 
     Args:
         query: Search query text. Keyword mode wants every word, then falls back to
             any meaningful word, flagging those rows partial_match.
-        search_type: "keyword" for full-text search, "semantic" for embedding similarity
+        search_type: "keyword" for full-text search, "semantic" for embedding similarity;
+            anything else is an error
         workspace: Optional workspace/project path filter
-        limit: Maximum results (default: 20)
+        limit: Maximum results (default: 20, at most 200)
     """
+    if search_type not in _SEARCH_TYPES:
+        return _unknown("search_type", search_type, _SEARCH_TYPES)
+    limit = _cap(limit)
     conn = _get_conn()
     try:
         if search_type == "semantic":
@@ -672,7 +732,7 @@ def recall_preference(topic: str, limit: int = 20) -> list[dict]:
 
     conn = _get_conn()
     try:
-        return recall_preferences(conn, topic, limit=limit)
+        return recall_preferences(conn, topic, limit=_cap(limit))
     finally:
         conn.close()
 
@@ -694,7 +754,7 @@ def recent_conversations(
 
     conn = _get_conn()
     try:
-        return _recent(conn, workspace=workspace, days=days, limit=limit)
+        return _recent(conn, workspace=workspace, days=days, limit=_cap(limit))
     finally:
         conn.close()
 
@@ -836,7 +896,7 @@ def attachment_image_search(
             LIMIT ?
             """,
             query,
-            limit,
+            _cap(limit),
         )
 
         results = []
@@ -938,14 +998,18 @@ def search_teams(query: str, kind: str = "both", limit: int = 20) -> dict:
     Args:
         query: Free-text query: the exact phrase, then every word in any order, then any
             meaningful word, with those rows flagged partial_match.
-        kind: 'thread' (summaries+titles), 'message' (raw text), or 'both' (default).
-        limit: Max results (default 20).
+        kind: 'thread' (summaries+titles), 'message' (raw text), or 'both' (default);
+            anything else is an error.
+        limit: Max results (default 20, at most 200).
     """
     from src.store.teams_query import search_teams as q
 
+    kinds = ("thread", "message", "both")
+    if kind not in kinds:
+        return _unknown("kind", kind, kinds)
     conn = _get_conn()
     try:
-        return {"results": q(conn, query, kind=kind, limit=limit)}
+        return {"results": q(conn, query, kind=kind, limit=_cap(limit))}
     finally:
         conn.close()
 

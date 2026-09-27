@@ -311,6 +311,12 @@ def get_person_context(
     # anyone who never attended one. Each IN subquery runs once per statement.
     # The name must have two words or more: a blank name matched every
     # unresolved attendee, and one word ('ΝΙΚΟΣ', 'Info') fits strangers' invites.
+    # "Now" is rendered with a 'T' like start_at, not datetime('now')'s space: 'T'
+    # sorts above ' ', so every start on the current UTC day read as still to
+    # come, and a meeting this morning was next_meeting rather than last_met.
+    # The bare column is compared so idx_calendar_start still serves the query.
+    # A cancelled event, by Outlook or because Outlook no longer lists it, is
+    # not a meeting had or to come.
     calendar_data = {}
     email = person.get("email") or ""
     folded_name = search_fold(person["name"]).strip()
@@ -325,7 +331,8 @@ def get_person_context(
                    WHERE person_id = ?
                       OR (? <> '' AND LOWER(email) = LOWER(?))
                       OR (person_id IS NULL AND ? <> '' AND sb_fold(name) LIKE ?))
-                 AND ce.start_at < datetime('now')
+                 AND ce.is_cancelled = 0
+                 AND ce.start_at < strftime('%Y-%m-%dT%H:%M:%S', 'now')
                ORDER BY ce.start_at DESC LIMIT 1""",
             attendee_args,
         ).fetchone()
@@ -339,7 +346,8 @@ def get_person_context(
                    WHERE person_id = ?
                       OR (? <> '' AND LOWER(email) = LOWER(?))
                       OR (person_id IS NULL AND ? <> '' AND sb_fold(name) LIKE ?))
-                 AND ce.start_at > datetime('now')
+                 AND ce.is_cancelled = 0
+                 AND ce.start_at > strftime('%Y-%m-%dT%H:%M:%S', 'now')
                ORDER BY ce.start_at ASC LIMIT 1""",
             attendee_args,
         ).fetchone()
@@ -356,7 +364,8 @@ def get_person_context(
                    WHERE person_id = ?
                       OR (? <> '' AND LOWER(email) = LOWER(?))
                       OR (person_id IS NULL AND ? <> '' AND sb_fold(name) LIKE ?))
-                 AND ce.start_at >= datetime('now', '-30 days')""",
+                 AND ce.is_cancelled = 0
+                 AND ce.start_at >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-30 days')""",
             attendee_args,
         ).fetchone()[0]
         calendar_data["meeting_count_30d"] = meeting_count

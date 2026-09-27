@@ -1876,16 +1876,22 @@ def _read_json_dict(path: Path) -> dict:
 
 def cmd_calendar_sync(args):
     """Sync calendar events from Outlook into the knowledge store."""
-    from datetime import timedelta
+    from datetime import UTC, timedelta
 
     from src.config import USER_EMAIL_PATTERN
-    from src.export.calendar_export import get_event_body, list_events, parse_event
+    from src.export.calendar_export import (
+        BACKFILL_LIST_CALLS,
+        get_event_body,
+        list_events,
+        parse_event,
+    )
     from src.export.outlook_cli import OutlookCliAuthRequired
     from src.extract.calendar_extractor import extract_event
     from src.extract.policy_bridge import classify_exception, is_transient
     from src.extract.vertex_auth import touch_sentinel
     from src.llm_policy import Outcome
     from src.store.calendar_loader import (
+        cancel_unlisted,
         dedupe_event_children,
         load_event,
         load_proxy_emails,
@@ -1904,7 +1910,10 @@ def cmd_calendar_sync(args):
     proxy_emails = load_proxy_emails(str(DATA_ROOT / "canonical_people.json"))
 
     now = datetime.now()
-    if args.backfill and args.since:
+    # --since is honoured on its own, as --until is. It used to count only with
+    # --backfill, so the README's `calendar-sync --since 2026-01-01` listed the
+    # last seven days and exited 0 with the gap it was run to fill still open.
+    if args.since:
         since = datetime.fromisoformat(args.since)
     elif args.backfill:
         since = now - timedelta(days=365)
@@ -1916,7 +1925,14 @@ def cmd_calendar_sync(args):
     print(f"Calendar sync: {since.date()} to {until_dt.date()}")
     chunk_failures: list[str] = []
     try:
-        raw_events = list_events(since, until_dt, failures=chunk_failures)
+        if args.backfill:
+            # A year a month at a time, every busy stretch split further: the
+            # hourly run's call bound would stop it a few months in.
+            raw_events = list_events(
+                since, until_dt, failures=chunk_failures, max_calls=BACKFILL_LIST_CALLS
+            )
+        else:
+            raw_events = list_events(since, until_dt, failures=chunk_failures)
     except OutlookCliAuthRequired:
         conn.close()
         print("  Outlook needs re-authentication; nothing listed", file=sys.stderr)
@@ -2095,13 +2111,35 @@ def cmd_calendar_sync(args):
         )
         stats["loaded"] += 1
 
+    # A complete listing also says which stored events Outlook no longer holds;
+    # nothing ever removed them, so deleted and re-created meetings stayed live.
+    # Not after a span that failed or came back full, nor once the session
+    # expired mid-run: what is missing then says nothing about Outlook. The
+    # window was local time to outlook-cli, as it is to since.astimezone().
+    cancelled = 0
+    if not chunk_failures and not session_expired:
+        cancelled = cancel_unlisted(
+            conn,
+            set(listed_ids),
+            since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
+            until_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+
     # Both are idempotent and cheap, and both repair rows no upsert will touch
     # again: stacked duplicates from the old append-only loader, and self flags
     # written while BRAIN_USER_EMAIL_PATTERN was unset.
     dup_decisions, dup_actions = dedupe_event_children(conn)
     flags_changed = 0
-    if USER_EMAIL_PATTERN:
+    if USER_EMAIL_PATTERN and proxy_emails is not None:
         flags_changed = refresh_self_flags(conn, USER_EMAIL_PATTERN, proxy_emails)
+    elif proxy_emails is None:
+        # canonical_people.json exists but did not parse. Recomputed without it,
+        # every event the PA booked would be rewritten as not-self, so the flags
+        # wait for the file to be fixed.
+        print(
+            "  canonical_people.json is unreadable; leaving the stored self flags alone",
+            file=sys.stderr,
+        )
     else:
         # Without the pattern every stored flag would be rewritten to not-self.
         print(
@@ -2172,6 +2210,8 @@ def cmd_calendar_sync(args):
         print(f"  Removed duplicate decisions/actions: {dup_decisions}/{dup_actions}")
     if flags_changed:
         print(f"  Self flags corrected: {flags_changed}")
+    if cancelled:
+        print(f"  No longer in Outlook, marked cancelled: {cancelled}")
 
     # Every one of these is already recorded so the next run re-offers or
     # reports it; the exit code is what tells the scheduler this run did not do
@@ -2935,7 +2975,9 @@ def main():
         action="store_true",
         help="Backfill mode (default: 12 months back)",
     )
-    parser_cal.add_argument("--since", type=str, help="Start date ISO (e.g. 2025-05-14)")
+    parser_cal.add_argument(
+        "--since", type=str, help="Start date ISO (e.g. 2025-05-14; default: 7 days back)"
+    )
     parser_cal.add_argument("--until", type=str, help="End date ISO (default: now + 30d)")
     parser_cal.add_argument(
         "--skip-extraction", action="store_true", help="Skip LLM body extraction"

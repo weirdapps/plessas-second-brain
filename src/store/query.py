@@ -344,9 +344,10 @@ def query_by_keyword(
 
     Returns:
         List of dicts with keys: email_id, date, subject, summary, snippet, source
-        where source is 'subject', 'summary', 'content', 'key_fact' or
-        'attachment'; a row whose thread has more than one email matching in its
-        subject, summary or body adds thread_matches, that count. When no row carries
+        where source is 'subject', 'summary', 'content', 'mixed' (every word, but
+        across those three fields), 'key_fact' or 'attachment'; a row whose thread
+        has more than one email matching across its subject, summary and body adds
+        thread_matches, that count. When no row carries
         every token, rows matching any meaningful token come back instead, each
         flagged partial_match.
     """
@@ -384,22 +385,19 @@ _SEEKS_UP_TO = 200
 def _matching_emails_per_thread(
     conn: sqlite3.Connection, expression: str, keys: set, search_content_only: bool
 ) -> dict:
-    """Thread key -> how many of its emails match `expression` in the subject, the
-    summary or the body (the body alone for a content-only search), each column
-    on its own, as each stage of the waterfall matches it.
+    """Thread key -> how many of its emails match `expression` across the subject,
+    the summary and the body, as the waterfall's whole-row stage matches them (the
+    body alone for a content-only search). A whole-row match holds every
+    single-column one, so it counts each stage's matches too.
 
     The page's threads are read through the conversation_id index, then their
     emails are checked one seek each, or, past _SEEKS_UP_TO emails, against one
-    pass over each column's matches. On the replica a page's threads hold 2 to
-    122 emails: seeks take 0 to 5 ms, a pass 22 to 111 ms. A seek costs 0.03 to
-    1 ms by the query, so 20 threads of 700 emails took 1.6 to 14 s by seeks
-    and 20 to 87 ms in one pass; the counts are the same.
+    pass over the matches. On the replica a page's threads hold 2 to 122 emails:
+    seeks take 0 to 5 ms, a pass 22 to 111 ms. A seek costs 0.03 to 1 ms by the
+    query, so 20 threads of 700 emails took 1.6 to 14 s by seeks and 20 to 87 ms
+    in one pass; the counts are the same.
     """
-    columns = ["content_f"]
-    if not search_content_only:
-        columns.append("summary_f")
-        if _has_subject_index(conn):
-            columns.append("subject_f")
+    columns = ["emails_fts.content_f" if search_content_only else "emails_fts"]
     members = (
         "SELECT e.id AS id, j.value AS thread FROM json_each(?) j "
         f"JOIN emails e ON e.conversation_id = j.value AND {_THREAD} = j.value"
@@ -408,16 +406,14 @@ def _matching_emails_per_thread(
     (count,) = conn.execute(f"SELECT COUNT(*) FROM ({members})", (threads,)).fetchone()
     if count <= _SEEKS_UP_TO:
         matched = " OR ".join(
-            "EXISTS (SELECT 1 FROM emails_fts "
-            f"WHERE emails_fts.rowid = m.id AND emails_fts.{column} MATCH ?)"
+            f"EXISTS (SELECT 1 FROM emails_fts WHERE emails_fts.rowid = m.id AND {column} MATCH ?)"
             for column in columns
         )
     else:
         matched = (
             "m.id IN ("
             + " UNION ".join(
-                f"SELECT rowid FROM emails_fts WHERE emails_fts.{column} MATCH ?"
-                for column in columns
+                f"SELECT rowid FROM emails_fts WHERE {column} MATCH ?" for column in columns
             )
             + ")"
         )
@@ -514,8 +510,8 @@ def _keyword_waterfall(
         # Rank by FTS5 BM25 relevance (ORDER BY rank), not recency. rank is only
         # comparable within a single MATCH query, so each source is ranked on its
         # own; the source-priority waterfall (subject -> summary -> content ->
-        # key_fact -> attachment) plus seen_ids dedup preserves the cross-source
-        # order.
+        # mixed -> key_fact -> attachment) plus seen_ids dedup preserves the
+        # cross-source order.
         query_summaries = f"""
             SELECT email_id, date, subject, summary, snippet, source, thread FROM (
                 SELECT
@@ -576,6 +572,45 @@ def _keyword_waterfall(
         """
 
         take(conn.execute(query_content, (safe_keyword, taken(), limit, safe_keyword)))
+
+    # The whole row: every word somewhere in the email, but not all in one field.
+    # The commonest query names a person and a subject, and those split: the name
+    # in the summary or the subject line, the subject words in the body. Matched
+    # one column at a time, that email was missed and the search fell back to
+    # partial rows holding one word each.
+    if len(results) < limit and not search_content_only:
+        query_mixed = f"""
+            WITH picked AS (
+                SELECT email_id FROM (
+                    SELECT
+                        e.id as email_id,
+                        emails_fts.rank as score,
+                        e.date_received as date,
+                        {_best_of_each_thread("emails_fts.rank")} as nth
+                    FROM emails e
+                    JOIN emails_fts ON emails_fts.rowid = e.id
+                    WHERE emails_fts MATCH ? {_NOT_TAKEN}
+                )
+                WHERE nth = 1
+                ORDER BY score, date DESC, email_id DESC
+                LIMIT ?
+            )
+            SELECT
+                e.id as email_id,
+                e.date_received as date,
+                e.subject,
+                e.summary,
+                snippet(emails_fts, 1, '<b>', '</b>', '...', 30) as snippet,
+                'mixed' as source,
+                {_THREAD} as thread
+            FROM emails e
+            JOIN picked ON picked.email_id = e.id
+            JOIN emails_fts ON emails_fts.rowid = e.id
+            WHERE emails_fts MATCH ?
+            ORDER BY rank, e.date_received DESC, e.id DESC
+        """
+
+        take(conn.execute(query_mixed, (safe_keyword, taken(), limit, safe_keyword)))
 
     # Search in key facts (only if we haven't hit the limit and not content-only)
     if len(results) < limit and not search_content_only:
@@ -647,8 +682,8 @@ def _keyword_waterfall(
         take(conn.execute(query_attachments, (safe_keyword, taken(), limit, safe_keyword)))
 
     # Results are relevance-ranked within each source (ORDER BY rank) and appended
-    # in source-priority order (subject -> summary -> content -> key_fact ->
-    # attachment); keep that order rather than re-sorting by date, so BM25
+    # in source-priority order (subject -> summary -> content -> mixed ->
+    # key_fact -> attachment); keep that order rather than re-sorting by date, so BM25
     # relevance is not discarded. (True cross-source ranking via score fusion / RRF
     # is a later change.) take() stops at the requested number.
 

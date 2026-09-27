@@ -15,7 +15,6 @@ from src.store.conversation_query import search_conversations_keyword
 from src.store.fusion import reciprocal_rank_fusion
 from src.store.greek import (
     PHRASE_MATCH,
-    _match_score,
     register_sql_functions,
     search_phrase,
     search_tokens,
@@ -243,33 +242,15 @@ _CONTEXT_HINT_LIMIT = 5
 
 def _maybe_person_context(conn: sqlite3.Connection, query: str, days: int) -> dict | None:
     """Return person_context if the query plausibly matches a known person."""
-    # Cheap pre-check: is there any person whose name starts a word with the
-    # query, or whose address it is? A substring test found a name for most
-    # topics ('AI' inside Michail, 'EU' inside Piraeus) and attached that
-    # person's dossier. No match-count threshold: a real surname matches about
-    # 50 people.
-    if "@" in query:
-        hit = conn.execute(
-            "SELECT 1 FROM people WHERE LOWER(email) = LOWER(?)", (query.strip(),)
-        ).fetchone()
-    else:
-        hit = conn.execute(
-            "SELECT 1 FROM people WHERE sb_match(name, ?, '', '') >= ?",
-            (search_phrase(query), PHRASE_MATCH),
-        ).fetchone()
-    if not hit:
-        return None
+    # resolve_person is the test, so recall attaches exactly the person that
+    # person_context and meeting_prep find for the same words: a name with a word
+    # starting with the query, or an address whose local part starts with it. A
+    # substring test found a name for most topics ('AI' inside Michail, 'EU'
+    # inside Piraeus) and attached that dossier, and a separate pre-check here
+    # disagreed with resolve_person in both directions. No match-count threshold:
+    # a real surname matches about 50 people. An unmatched name returns early.
     ctx = get_person_context(conn, query, days=days, limit=_CONTEXT_HINT_LIMIT)
-    person = ctx.get("person")
-    if not person:
-        return None
-    # resolve_person still matches anywhere in a name and prefers the most-emailed
-    # match, so 'AI' passed the pre-check on 'AI Compliance' and then resolved to
-    # a busier Michail. Attach only a person the pre-check itself would accept.
-    if "@" in query:
-        return ctx
-    score = _match_score(person.get("name"), search_phrase(query), "", "")
-    return ctx if score >= PHRASE_MATCH else None
+    return ctx if ctx.get("person") else None
 
 
 def _maybe_topic_context(conn: sqlite3.Connection, query: str, days: int) -> dict | None:

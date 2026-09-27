@@ -83,6 +83,16 @@ def classify_exception(exc: BaseException | None, response: object | None) -> Ou
             return Outcome.RATE_LIMIT
         if isinstance(exc, anthropic.APITimeoutError):
             return Outcome.TIMEOUT
+        # Any other 4xx carries its real status, so no string may reclassify it:
+        # a deterministic 400 whose text held '429' (a token count, a request
+        # id) became a rate limit and was retried as quota every hour, forever.
+        # 401, 403 and 429 are typed above; an untyped 429 still falls through.
+        if (
+            isinstance(exc, anthropic.APIStatusError)
+            and 400 <= exc.status_code < 500
+            and exc.status_code != 429
+        ):
+            return Outcome.API_ERROR
         # Secondary wideners — type checks always run first; strings catch only
         # wrapped or re-raised exceptions that have lost their original type.
         # Ordering: auth widener before rate-limit widener so an auth exception

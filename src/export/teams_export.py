@@ -282,8 +282,8 @@ def pull_messages(
     Active = (last_message_at within 12 months) OR (any messages already in DB).
     teams-cli list-messages does NOT expose a sync-state cursor and reads one
     page only (CHAT_PAGE_SIZE for chats), so each run re-reads the newest page
-    and relies on UNIQUE(teams_message_id) for dedup. The teams_chats.sync_state column is
-    vestigial in Phase 1; kept for forward-compatibility.
+    and relies on UNIQUE(teams_message_id) for dedup. The teams_chats.sync_state
+    column is vestigial in Phase 1; kept for forward-compatibility.
 
     Args:
         conn: open SQLite connection.
@@ -300,6 +300,11 @@ def pull_messages(
     now = datetime.now(UTC)
     cutoff_iso = now.replace(year=now.year - 1).isoformat()
 
+    # Chats with a message since their last pull go first, then the rotation by
+    # oldest pull. The deadline reaches only part of the inventory per run, and
+    # a busy chat that waited its turn behind hundreds of quiet ones overflowed
+    # the one page teams-cli reads. julianday() because last_message_at is
+    # Teams' "...Z" and last_pulled_at is Python's "...+00:00".
     rows = conn.execute(
         """
         SELECT id, teams_chat_id, chat_kind, team_uuid, channel_id, sync_state
@@ -311,7 +316,11 @@ def pull_messages(
             OR last_message_at >= ?
             OR EXISTS (SELECT 1 FROM teams_messages tm WHERE tm.chat_id = teams_chats.id)
           )
-        ORDER BY last_pulled_at IS NOT NULL, last_pulled_at
+        ORDER BY
+          CASE WHEN last_pulled_at IS NULL
+                 OR julianday(last_message_at) > julianday(last_pulled_at)
+               THEN 0 ELSE 1 END,
+          last_pulled_at IS NOT NULL, last_pulled_at
         """,
         (cutoff_iso,),
     ).fetchall()

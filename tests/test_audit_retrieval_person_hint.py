@@ -50,11 +50,12 @@ def test_a_query_at_the_start_of_a_word_still_attaches_the_person(conn, query):
     assert result["person_context"] is not None
 
 
-def test_a_word_start_decoy_does_not_vouch_for_a_more_emailed_in_word_match():
-    """The pre-check finds 'AI Compliance', but resolution picks the busier Michail.
+def test_the_person_attached_is_the_one_resolve_person_finds():
+    """'AI' starts a word of 'AI Compliance' and sits inside the busier Michail.
 
-    resolve_person matches anywhere in a name and prefers the most-emailed match,
-    so recall must attach only a person its own pre-check would accept.
+    recall attaches the person resolve_person finds, which matches at the start
+    of a word, so it is the one person_context gives for the same words, and the
+    busier in-word match is never attached.
     """
     c = create_database(":memory:")
     c.executemany(
@@ -78,5 +79,5 @@ def test_a_word_start_decoy_does_not_vouch_for_a_more_emailed_in_word_match():
 
     result = recall(c, "AI")
 
-    assert result["person_context"] is None
-    assert result["summary"]["has_person_context"] is False
+    assert result["person_context"]["person"]["name"] == "AI Compliance"
+    assert result["summary"]["has_person_context"] is True

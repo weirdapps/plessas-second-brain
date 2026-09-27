@@ -73,7 +73,7 @@ run_stage "image classification" "$PYTHON" -m src.cli process-images --limit 500
 
 # SharePoint URL fetch backfill
 echo "$(date '+%Y-%m-%d %H:%M:%S') — starting SharePoint fetch" >> "$LOG_FILE"
-run_stage "SharePoint fetch" "$PYTHON" -m src.cli process-sharepoint --limit 200
+run_stage "SharePoint fetch" "$PYTHON" -m src.cli process-sharepoint --max-fetches 100
 
 # Every stage has run by here, so a restart would repeat the whole hour of LLM
 # and vision calls for a failure that a retry of the whole pass is unlikely to

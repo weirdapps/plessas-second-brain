@@ -1829,6 +1829,9 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
                 extra = f" (upstream {format_age(c.get('lag'))} ahead of last ingested)"
             elif c.get("note"):
                 extra = f" ({c['note']})"
+        elif c["name"] == "Calendar" and c.get("note"):
+            # The reason an empty week ahead is a WARN; the row alone said only WARN.
+            extra = f" ({c['note']})"
         elif c["name"] == "SP Session":
             count = "—"
             rem = c.get("remaining")

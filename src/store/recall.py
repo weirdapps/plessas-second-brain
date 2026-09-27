@@ -23,6 +23,7 @@ from src.store.greek import (
 )
 from src.store.normalizer import normalize_topic
 from src.store.query import (
+    _ISO_DATE,
     fts5_query_variants,
     query_by_keyword,
     search_attachments,
@@ -115,9 +116,14 @@ def _search_decisions(conn: sqlite3.Connection, keyword: str, limit: int) -> lis
 
 
 def _search_actions(conn: sqlite3.Connection, keyword: str, limit: int) -> list[dict]:
+    # Outstanding first, as query_action_items sorts: open before anything else,
+    # then upcoming dates soonest first, then undated or free text, then overdue,
+    # most recently missed first. Every whole match scores the same, so this
+    # decides the page, and ascending deadline put the oldest dates first: items
+    # long since expired, with a free-text '2026' ahead of every real date.
     return _folded_bucket(
         conn,
-        """
+        f"""
         WITH scored AS MATERIALIZED (
             SELECT id, sb_match(task, ?, ?, ?) AS score FROM action_items
         )
@@ -127,7 +133,17 @@ def _search_actions(conn: sqlite3.Connection, keyword: str, limit: int) -> list[
         JOIN action_items a ON a.id = s.id
         LEFT JOIN emails e ON e.id = a.email_id
         WHERE s.score > 0
-        ORDER BY s.score DESC, CASE WHEN a.deadline IS NULL THEN 1 ELSE 0 END, a.deadline ASC
+        ORDER BY s.score DESC,
+                 a.status IS NOT 'open',
+                 CASE
+                     WHEN a.deadline {_ISO_DATE} AND a.deadline >= date('now') THEN 0
+                     WHEN a.deadline {_ISO_DATE} THEN 2
+                     ELSE 1
+                 END,
+                 CASE WHEN a.deadline {_ISO_DATE} AND a.deadline >= date('now')
+                      THEN a.deadline END ASC,
+                 CASE WHEN a.deadline {_ISO_DATE} AND a.deadline < date('now')
+                      THEN a.deadline END DESC
         LIMIT ?
         """,
         keyword,

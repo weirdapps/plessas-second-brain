@@ -748,16 +748,36 @@ def check_calendar(db):
     if listed_age is not None and (age is None or listed_age < age):
         latest, age = listed[0], listed_age
     stale = age is not None and age > STALE_THRESHOLDS["calendar"]
-    return {
+    # A fresh heartbeat proves the sync ran, not that it stored the week ahead:
+    # listing the ten earliest events of each month, it never did, and this row
+    # stayed green. The owner has meetings every working week, so none in the
+    # next seven days means the lookahead is broken. start_at is UTC with a 'T',
+    # so 'now' is rendered the same way. A table without these columns cannot
+    # answer, and the age verdict stands alone.
+    try:
+        upcoming = db.execute(
+            "SELECT COUNT(*) FROM calendar_events WHERE is_cancelled = 0 "
+            "AND start_at >= strftime('%Y-%m-%dT%H:%M:%S', 'now') "
+            "AND start_at < strftime('%Y-%m-%dT%H:%M:%S', 'now', '+7 days')"
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        upcoming = None
+    result = {
         "name": "Calendar",
         "total": total,
         "latest": latest,
         "age": age,
         "stale": stale,
+        "upcoming_7d": upcoming,
         # No parseable ingested_at at all means the column is empty or the table
         # is — either way nothing here can be trusted as fresh.
         "status": "STALE" if stale else ("WARN" if age is None else "OK"),
     }
+    if upcoming == 0:
+        result["note"] = "no meeting in the next 7 days"
+        if result["status"] == "OK":
+            result["status"] = "WARN"
+    return result
 
 
 def check_conversations(db):

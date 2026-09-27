@@ -48,16 +48,47 @@ URGENCY_VALUES = {"low", "medium", "high", "critical"}
 LANGUAGE_VALUES = {"greek", "english", "mixed"}
 
 
-def _clean_json_string(raw: str) -> str:
-    """
-    Clean common JSON formatting issues.
+# Fields the loader stores as text, one row or tag per item. The conversation
+# prompt's two extra fields are among them: parse_extraction copies them through
+# with every other key the schema does not name.
+STRING_LIST_FIELDS = (
+    "topics",
+    "key_facts",
+    "references",
+    "preferences_expressed",
+    "technical_decisions",
+)
 
-    Args:
-        raw: Raw string that may contain JSON
 
-    Returns:
-        Cleaned JSON string
+def _as_string_list(value: Any) -> list[str]:
+    """`value` as the list of strings the loader expects.
+
+    The model does not always answer in that shape. 35 conversation extractions
+    gave technical_decisions as [{"decision": ...}], and the loader, which writes
+    each item as f"[TECHNICAL] {item}", stored the dict's Python repr as a key
+    fact. A null reached the loader as None to iterate, which raises and stops
+    every conversation load, and a bare string would be iterated one character
+    at a time. So: null is an empty list, a bare string or dict is one item, a
+    dict item is its 'decision', its 'text' or its first string value, and any
+    other item is dropped.
     """
+    if value is None:
+        return []
+    items = value if isinstance(value, list) else [value]
+    out: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            text = item.get("decision") or item.get("text")
+            if not isinstance(text, str):
+                text = next((v for v in item.values() if isinstance(v, str)), None)
+            item = text
+        if isinstance(item, str):
+            out.append(item)
+    return out
+
+
+def _strip_to_object(raw: str) -> str:
+    """The reply without markdown fences or any text around its JSON object."""
     # Remove markdown code blocks
     raw = re.sub(r"```json\s*", "", raw)
     raw = re.sub(r"```\s*$", "", raw)
@@ -68,6 +99,25 @@ def _clean_json_string(raw: str) -> str:
     end = raw.rfind("}")
     if start != -1 and end != -1 and end > start:
         raw = raw[start : end + 1]
+    return raw
+
+
+def _clean_json_string(raw: str) -> str:
+    """
+    Clean common JSON formatting issues.
+
+    Only for a reply that strict parsing rejected. The repairs edit the text
+    without regard to string literals, and in valid JSON a comma before a
+    closing bracket can only be inside a string, so run over a valid reply they
+    deleted that comma from its content.
+
+    Args:
+        raw: Raw string that may contain JSON
+
+    Returns:
+        Cleaned JSON string
+    """
+    raw = _strip_to_object(raw)
 
     # Fix trailing commas before closing braces/brackets
     raw = re.sub(r",\s*}", "}", raw)
@@ -148,30 +198,35 @@ def parse_extraction(
     Raises:
         ValueError: If JSON is completely unparseable
     """
-    # Clean the response
-    cleaned = _clean_json_string(raw_response)
-
-    # Try to parse
+    # Strictly first: the repairs in _clean_json_string can only damage a reply
+    # that is already valid.
     try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        # Truncated response (LLM hit max_tokens): salvage a valid prefix by closing
-        # the open string/containers. Only accepted if it parses, so a bad guess never
-        # yields garbage.
-        #
-        # We deliberately do NOT globally replace ' -> " as a fallback: that corrupts
-        # apostrophes inside string values (Greek possessives, English contractions)
-        # and can silently store mangled data. A rare single-quoted-JSON response now
-        # fails visibly (logged + retried) instead of being corrupted in place.
-        salvaged = _salvage_truncated_json(cleaned)
-        if salvaged is not None:
-            try:
-                data = json.loads(salvaged)
-                logger.warning("Recovered truncated JSON via salvage (%d chars)", len(cleaned))
-            except json.JSONDecodeError:
+        data = json.loads(_strip_to_object(raw_response))
+    except json.JSONDecodeError:
+        # Clean the response
+        cleaned = _clean_json_string(raw_response)
+
+        # Try to parse
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            # Truncated response (LLM hit max_tokens): salvage a valid prefix by closing
+            # the open string/containers. Only accepted if it parses, so a bad guess never
+            # yields garbage.
+            #
+            # We deliberately do NOT globally replace ' -> " as a fallback: that corrupts
+            # apostrophes inside string values (Greek possessives, English contractions)
+            # and can silently store mangled data. A rare single-quoted-JSON response now
+            # fails visibly (logged + retried) instead of being corrupted in place.
+            salvaged = _salvage_truncated_json(cleaned)
+            if salvaged is not None:
+                try:
+                    data = json.loads(salvaged)
+                    logger.warning("Recovered truncated JSON via salvage (%d chars)", len(cleaned))
+                except json.JSONDecodeError:
+                    raise ValueError(f"Failed to parse JSON: {e}") from e
+            else:
                 raise ValueError(f"Failed to parse JSON: {e}") from e
-        else:
-            raise ValueError(f"Failed to parse JSON: {e}") from e
 
     # Ensure it's a dict
     if not isinstance(data, dict):
@@ -204,6 +259,11 @@ def parse_extraction(
     for key, value in data.items():
         if key not in result:
             result[key] = value
+
+    # Only the fields present: an email extraction gains no conversation fields.
+    for key in STRING_LIST_FIELDS:
+        if key in result:
+            result[key] = _as_string_list(result[key])
 
     # Normalize enums to lowercase. str() so a model that answers with a number
     # or a bool gets validated below rather than raising here.

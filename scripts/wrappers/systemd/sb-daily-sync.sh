@@ -125,15 +125,21 @@ else
   echo "Warning: no Anthropic credentials, using $ENGINE" >> "$LOG_FILE"
 fi
 
+# One sync at a time: sync takes a lock, and --lock-wait is how long to wait for
+# the hourly load when it is still running. Then it skips with exit 0, because
+# the sync holding the lock drains the same staged mail. 300 s, not the noon
+# job's 600: under TimeoutStartSec=1800 this unit has taken up to 21 minutes,
+# 12 of them the backup above, and 600 s on top of that would not fit.
+SYNC_LOCK_WAIT=300
 cd "$REPO_DIR"
-"$PYTHON" -m src.cli sync --engine "$ENGINE" --workers 8 >> "$LOG_FILE" 2>&1
+"$PYTHON" -m src.cli sync --engine "$ENGINE" --workers 8 --lock-wait "$SYNC_LOCK_WAIT" >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
 # Retry once on database-lock failures (exit=1 + "locked" in recent log lines)
 if [ "$EXIT_CODE" -ne 0 ] && tail -20 "$LOG_FILE" | grep -qi "database is locked"; then
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] Retrying sync after database-lock failure..." >> "$LOG_FILE"
   sleep 10
   "$PYTHON" -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()" "$DB" 2>/dev/null || true
-  "$PYTHON" -m src.cli sync --engine "$ENGINE" --workers 8 >> "$LOG_FILE" 2>&1
+  "$PYTHON" -m src.cli sync --engine "$ENGINE" --workers 8 --lock-wait "$SYNC_LOCK_WAIT" >> "$LOG_FILE" 2>&1
   EXIT_CODE=$?
 fi
 echo "=== Daily sync finished (exit $EXIT_CODE): $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"

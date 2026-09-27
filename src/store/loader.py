@@ -451,7 +451,7 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
         if recipient.get("address"):
             recipient_id = find_or_create_person(
                 conn,
-                recipient.get("name", recipient["address"]),
+                recipient.get("name") or recipient["address"],
                 recipient["address"],
                 display_name=True,
             )
@@ -464,7 +464,7 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
         if cc_recipient.get("address"):
             cc_id = find_or_create_person(
                 conn,
-                cc_recipient.get("name", cc_recipient["address"]),
+                cc_recipient.get("name") or cc_recipient["address"],
                 cc_recipient["address"],
                 display_name=True,
             )
@@ -670,7 +670,7 @@ def load_single_conversation(
             metadata.get("project_name"),
             metadata.get("turn_count", len(metadata.get("turns", []))),
             extraction.get("summary"),
-            ", ".join(extraction.get("topics", [])),
+            ", ".join(extraction.get("topics") or []),
         ),
     )
     conversation_id = cursor.lastrowid
@@ -697,7 +697,7 @@ def load_single_conversation(
         )
 
     # Link topics (reuse existing topics table)
-    for topic_name in extraction.get("topics", []):
+    for topic_name in extraction.get("topics") or []:
         topic_id = find_or_create_topic(conn, topic_name)
         conn.execute(
             "INSERT OR IGNORE INTO conversation_topics (conversation_id, topic_id) VALUES (?, ?)",
@@ -705,7 +705,7 @@ def load_single_conversation(
         )
 
     # Load decisions (linked to conversation, not email)
-    for decision in extraction.get("decisions", []):
+    for decision in extraction.get("decisions") or []:
         if isinstance(decision, dict) and decision.get("decision"):
             decided_by = decision.get("decided_by")
             if isinstance(decided_by, list):
@@ -720,7 +720,7 @@ def load_single_conversation(
             )
 
     # Load action items
-    for action in extraction.get("action_items", []):
+    for action in extraction.get("action_items") or []:
         if isinstance(action, dict) and action.get("task"):
             owner = action.get("owner")
             if isinstance(owner, list):

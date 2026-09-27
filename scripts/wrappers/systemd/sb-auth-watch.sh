@@ -49,6 +49,9 @@ RENEW_ERR_LOG="$LOG_DIR/auth-renew-stderr.log"
 MIN_HOURS_BEFORE_NOTIFY=1   # notify + sentinel when <1h to expiry
 GCLOUD_AUTO_LOGIN="$HOME/scripts/gcloud-auto-login.sh"
 WRAPPER_DIR="$HOME/.local/bin"
+# Overridable for the test suite: a stub on PATH cannot intercept an absolute
+# path, so until 2026-09-27 every test run on a Mac posted real reauth alerts.
+OSASCRIPT="${OSASCRIPT:-/usr/bin/osascript}"
 
 mkdir -p "$LOG_DIR" "$(dirname "$SENTINEL")"
 
@@ -162,13 +165,13 @@ hc_report() {  # hc_report <slug> <ok|fail>
 
 notify_interactive_required() {
   local detail="$1"
-  /usr/bin/osascript -e "display notification \"$detail\" with title \"second-brain auth: run outlook-cli login\"" 2>/dev/null || true
+  "$OSASCRIPT" -e "display notification \"$detail\" with title \"second-brain auth: run outlook-cli login\"" 2>/dev/null || true
   command -v terminal-notifier > /dev/null && \
     terminal-notifier -title "second-brain auth" -message "Run: outlook-cli login (${detail})" -sound Glass 2>/dev/null || true
 }
 
 notify_teams_reauth() {
-  /usr/bin/osascript -e \
+  "$OSASCRIPT" -e \
     'display notification "Run: teams-cli login" with title "second-brain: teams reauth needed" sound name "Basso"' \
     2>/dev/null || true
   command -v terminal-notifier > /dev/null && \
@@ -176,7 +179,7 @@ notify_teams_reauth() {
 }
 
 notify_gcloud_reauth() {
-  /usr/bin/osascript -e \
+  "$OSASCRIPT" -e \
     'display notification "Vertex AI extraction will fail. Run: gcloud auth application-default login" with title "second-brain: gcloud ADC reauth needed" sound name "Basso"' \
     2>/dev/null || true
   command -v terminal-notifier > /dev/null && \

@@ -561,27 +561,54 @@ def cmd_process_sharepoint(args):
 
     # Build query. Links are read from the markup: an HTML body is kept in
     # email_html, the text in content has no hrefs.
+    #
+    # The scan starts past the highest emails.id it has already read. It used
+    # to read the newest N rows by date_received, and the nightly N of 200 was
+    # a few hours of a weekday's 400-500 rows, so links in the rest of the day
+    # were never recorded, and retry_candidates only retries recorded links.
+    # An id also catches Archive and Sent mail loaded late with an old date.
+    # News carries no links and only used up the window. --since is the manual
+    # backfill: it rescans by date from the start and leaves the mark alone.
     query = (
         "SELECT e.id, e.message_id, e.content, e.date_received, h.html FROM emails e "
-        "LEFT JOIN email_html h ON h.email_id = e.id WHERE e.content IS NOT NULL"
+        "LEFT JOIN email_html h ON h.email_id = e.id WHERE e.content IS NOT NULL "
+        "AND COALESCE(e.mailbox_name, '') <> 'News'"
     )
-    params = []
+    params: list = []
+
+    mark_row = conn.execute(
+        "SELECT value FROM sync_metadata WHERE key = 'sharepoint_scan_last_id'"
+    ).fetchone()
+    scan_mark = int(mark_row[0]) if mark_row else 0
 
     if args.since:
         query += " AND e.date_received >= ?"
         params.append(args.since)
+    else:
+        query += " AND e.id > ?"
+        params.append(scan_mark)
 
-    query += " ORDER BY e.date_received DESC"
+    query += " ORDER BY e.id"
 
     if args.limit and args.limit > 0:
         query += " LIMIT ?"
         params.append(args.limit)
 
+    # The regex scan is cheap; the fetches are not. With no mark yet the first
+    # run finds the whole backlog, and this keeps it inside the nightly unit's
+    # TimeoutStartSec: the mark stops before the first email it could not
+    # finish, and the next run starts there.
+    max_fetches = getattr(args, "max_fetches", 0) or 0
+
     print("Scanning emails for SharePoint URLs...")
     if args.since:
         print(f"  Filtering to emails after {args.since}")
+    else:
+        print(f"  Starting past email id {scan_mark}")
     if args.limit and args.limit > 0:
         print(f"  Limiting to {args.limit} emails")
+    if max_fetches > 0 and not args.dry_run:
+        print(f"  Fetching at most {max_fetches} new URLs")
     if args.dry_run:
         print("  DRY RUN — scan and count only, no fetching")
     print()
@@ -670,6 +697,10 @@ def cmd_process_sharepoint(args):
                 break
 
     # Scan emails for new URLs (skip anything already fetched or attempted).
+    # scanned_to is the last email every link of which was dealt with.
+    scanned_to = scan_mark
+    fetches = 0
+    capped = False
     if not stats["auth_required"]:
         cursor = conn.execute(query, params)
         for row in cursor:
@@ -677,26 +708,37 @@ def cmd_process_sharepoint(args):
             stats["emails_scanned"] += 1
 
             urls = extract_sharepoint_urls(markup_or_text(content, html))
-            if not urls:
-                continue
-
             stats["urls_found"] += len(urls)
 
             for url in urls:
                 if url in existing_urls or url in attempted:
                     continue
+                if not args.dry_run and max_fetches > 0 and fetches >= max_fetches:
+                    capped = True
+                    break
                 attempted.add(url)
                 stats["urls_new"] += 1
 
                 if args.dry_run:
                     continue
 
+                fetches += 1
                 if _fetch_one(url, message_id):
                     break
 
-            if stats["auth_required"]:
+            if stats["auth_required"] or capped:
                 break
+            scanned_to = email_id
 
+    # Only a real pass over the mark's own range moves it: a dry run fetched
+    # nothing, and a --since backfill did not read every id above the mark.
+    if not args.dry_run and not args.since and scanned_to > scan_mark:
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_metadata (key, value) "
+            "VALUES ('sharepoint_scan_last_id', ?)",
+            (str(scanned_to),),
+        )
+        conn.commit()
     conn.close()
 
     print("\nSharePoint processing complete:")
@@ -708,6 +750,8 @@ def cmd_process_sharepoint(args):
         print(f"  URLs failed: {stats['urls_failed']}")
         if stats["urls_skipped_external"]:
             print(f"  External hosts skipped (no session): {stats['urls_skipped_external']}")
+        if capped:
+            print(f"  Fetch cap of {max_fetches} reached; the next run continues from here")
     if stats["auth_required"]:
         print(f"\n⚠ Auth required — run 'sharepoint-cli login --host {SHAREPOINT_HOST}' and retry")
         # The warning alone left the nightly stage green while new links piled
@@ -2527,9 +2571,23 @@ def main():
     parser_process_sp = subparsers.add_parser(
         "process-sharepoint", help="Scan emails for SharePoint URLs and fetch them"
     )
-    parser_process_sp.add_argument("--since", type=str, help="Only scan emails after YYYY-MM-DD")
     parser_process_sp.add_argument(
-        "--limit", type=int, default=0, help="Max emails to scan (0 = all, default 0)"
+        "--since",
+        type=str,
+        help="Rescan emails received on or after YYYY-MM-DD, ignoring and keeping the scan mark",
+    )
+    parser_process_sp.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Max emails to scan past the scan mark (0 = all, default 0)",
+    )
+    parser_process_sp.add_argument(
+        "--max-fetches",
+        type=int,
+        default=0,
+        dest="max_fetches",
+        help="Max new URLs to fetch this run; the rest wait for the next (0 = no cap, default 0)",
     )
     parser_process_sp.add_argument(
         "--dry-run", action="store_true", help="Scan and count only, no fetching"

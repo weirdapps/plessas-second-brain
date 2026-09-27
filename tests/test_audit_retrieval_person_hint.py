@@ -48,3 +48,35 @@ def test_a_query_at_the_start_of_a_word_still_attaches_the_person(conn, query):
     result = recall(conn, query)
 
     assert result["person_context"] is not None
+
+
+def test_a_word_start_decoy_does_not_vouch_for_a_more_emailed_in_word_match():
+    """The pre-check finds 'AI Compliance', but resolution picks the busier Michail.
+
+    resolve_person matches anywhere in a name and prefers the most-emailed match,
+    so recall must attach only a person its own pre-check would accept.
+    """
+    c = create_database(":memory:")
+    c.executemany(
+        "INSERT INTO people (id, name, email) VALUES (?, ?, ?)",
+        [
+            (1, "Μιχαήλ (Michail)", "michail@example.com"),
+            (2, "AI Compliance", "ai-compliance@example.com"),
+        ],
+    )
+    c.executemany(
+        "INSERT INTO emails (id, message_id, date_received, subject, summary) "
+        "VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 day'), 'Hello', 'A note')",
+        [(i, i) for i in range(1, 5)],
+    )
+    c.executemany(
+        "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, 1, 'sender')",
+        [(i,) for i in range(1, 5)],
+    )
+    c.execute("INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (1, 2, 'cc')")
+    c.commit()
+
+    result = recall(c, "AI")
+
+    assert result["person_context"] is None
+    assert result["summary"]["has_person_context"] is False

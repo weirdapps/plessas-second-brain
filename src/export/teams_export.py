@@ -215,17 +215,32 @@ def _discover_chat_chats(conn: sqlite3.Connection) -> dict:
                 if isinstance(m, dict) and str(m.get("mri", "")).startswith("8:")
             ]
         )
-        last_msg = (chat.get("lastMessage") or {}).get("composetime")
+        # teams-access types the key as composeTime; the lowercase spelling is
+        # what the chatsvc message payloads use, so accept both.
+        last_message = chat.get("lastMessage") or {}
+        last_msg = last_message.get("composeTime") or last_message.get("composetime")
 
         existing = conn.execute(
             "SELECT id FROM teams_chats WHERE teams_chat_id = ?", (chat_id,)
         ).fetchone()
 
         if existing:
+            # Only ever move last_message_at forward. A listing with no last
+            # message, or one older than a message pull_messages has since
+            # stored, used to write NULL or the stale value over it.
             conn.execute(
-                "UPDATE teams_chats SET topic = ?, member_mris = ?, last_message_at = ? "
-                "WHERE id = ?",
-                (title, member_mris, last_msg, existing["id"]),
+                """
+                UPDATE teams_chats SET topic = ?, member_mris = ?,
+                    last_message_at = CASE
+                        WHEN ? IS NOT NULL AND (
+                            julianday(last_message_at) IS NULL
+                            OR julianday(?) > julianday(last_message_at)
+                        ) THEN ?
+                        ELSE last_message_at
+                    END
+                WHERE id = ?
+                """,
+                (title, member_mris, last_msg, last_msg, last_msg, existing["id"]),
             )
             updated += 1
         else:

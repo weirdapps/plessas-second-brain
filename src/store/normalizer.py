@@ -173,12 +173,25 @@ def find_or_create_person(
                 conn.execute("UPDATE people SET name = ? WHERE id = ?", (name, person_id))
             return person_id
 
-    # No email provided, or email not found - search by name
-    cursor = conn.execute("SELECT id FROM people WHERE name = ?", (name,))
-    row = cursor.fetchone()
+        # The address is not on record. A namesake without one is this person,
+        # named first in an email that gave no address (people_roles are loaded
+        # before the sender): it gets the address, just looked up and found
+        # free, so UNIQUE(email) holds. Linking to it without saving the address
+        # left about 195 active senders unknown by address. A namesake holding
+        # another address is someone else, and this one is created.
+        row = conn.execute(
+            "SELECT id FROM people WHERE name = ? AND email IS NULL ORDER BY id LIMIT 1", (name,)
+        ).fetchone()
+        if row:
+            conn.execute("UPDATE people SET email = ? WHERE id = ?", (email_normalized, row[0]))
+            return row[0]
+    else:
+        # No email provided - search by name
+        cursor = conn.execute("SELECT id FROM people WHERE name = ?", (name,))
+        row = cursor.fetchone()
 
-    if row:
-        return row[0]
+        if row:
+            return row[0]
 
     # Create new person
     cursor = conn.execute(

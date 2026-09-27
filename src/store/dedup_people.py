@@ -16,6 +16,7 @@ import sqlite3
 import unicodedata
 
 from src.config import DEFAULT_DB
+from src.store.normalizer import looks_garbled, recover_garbled_greek
 from src.store.transliterate import canonical_name
 
 DB_PATH = DEFAULT_DB
@@ -50,7 +51,14 @@ def pick_best_name(names: list[str]) -> str:
     Prefers: Title Case > mixed case > ALL CAPS > all lower.
     Prefers: accented Greek > unaccented Greek.
     Prefers: longer name > shorter (more complete).
+
+    Never a garbled name: its lower-case Latin letters scored as mixed case and
+    its doubled length as more complete, so it beat the real ALL-CAPS Greek. A
+    recoverable one stands in as its Greek, and an unrecoverable one wins only
+    when every variant is garbled.
     """
+    names = [recover_garbled_greek(n) or n for n in names]
+    names = [n for n in names if not looks_garbled(n)] or names
 
     def score(name: str) -> tuple:
         n = name.strip()

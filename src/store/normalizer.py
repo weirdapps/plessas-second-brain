@@ -75,7 +75,61 @@ def find_or_create_topic(conn: sqlite3.Connection, name: str, parent_id: int | N
     return cursor.lastrowid
 
 
-def find_or_create_person(conn: sqlite3.Connection, name: str, email: str | None = None) -> int:
+def _is_greek(ch: str) -> bool:
+    return "\u0370" <= ch <= "\u03ff"
+
+
+def recover_garbled_greek(name: str) -> str | None:
+    """The Greek a garbled name stands for, or None when it is not one.
+
+    Seven people rows, the owner's among them, carried names such as 'Ķ°ĶŦĶĨ...':
+    Greek written out as GBK, whose row A6 holds the Greek alphabet, and read
+    back as ISO-8859-10, so every Greek letter became 'Ķ' (byte A6) and a second
+    letter. Encoding it back and decoding it as GBK returns the Greek exactly, and
+    only Greek and ASCII come back: anything else means these bytes never were
+    Greek, as in a Latvian name that merely holds a 'Ķ'.
+    """
+    if not name or any(_is_greek(ch) for ch in name):
+        return None
+    try:
+        recovered = name.encode("iso8859_10").decode("gbk")
+    except UnicodeError:
+        return None
+    if not any(_is_greek(ch) for ch in recovered):
+        return None
+    if not all(ch.isascii() or _is_greek(ch) for ch in recovered):
+        return None
+    return recovered
+
+
+def looks_garbled(name: str) -> bool:
+    """Whether a name is mojibake rather than a name, recoverable or not.
+
+    Recoverable, by recover_garbled_greek; or written mostly in Latin Extended-A
+    (U+0100 to U+017F), which is what the garbled rows are made of even when cut
+    inside a letter's pair. Czech, Polish and Baltic names mix those letters with
+    plain ones: on the replica none reached 30%, and the garbled names are 100%.
+    """
+    if recover_garbled_greek(name) is not None:
+        return True
+    letters = [ch for ch in name if ch.isalpha()]
+    extended = sum(1 for ch in letters if "\u0100" <= ch <= "\u017f")
+    return bool(letters) and extended * 2 > len(letters)
+
+
+def _stands_in_for_a_name(name: str) -> bool:
+    """An empty name, or an address a recipient without a display name was given."""
+    name = name.strip()
+    return not name or ("@" in name and not any(ch.isspace() for ch in name))
+
+
+def find_or_create_person(
+    conn: sqlite3.Connection,
+    name: str,
+    email: str | None = None,
+    *,
+    display_name: bool = False,
+) -> int:
     """Find existing person by email or create new one.
 
     Email is the primary key for deduplication. If email is provided and matches
@@ -86,24 +140,36 @@ def find_or_create_person(conn: sqlite3.Connection, name: str, email: str | None
         conn: Database connection
         name: Person's name
         email: Person's email address (optional, but recommended for dedup)
+        display_name: True when `name` is the sender's or a recipient's display
+            name from the message headers. Only such a name may rename the person
+            found by `email`, and only when the name on record is an address,
+            empty or garbled: 'the longer name wins' let a garbled name, twice
+            the length of the real one, replace it for good, and let any longer
+            header overwrite a canonical name from import-people. A name the
+            model extracted (people_roles) never renames anyone.
 
     Returns:
         Person ID (existing or newly created)
     """
+    name = recover_garbled_greek(name) or name
+
     # If email provided, use it as primary deduplication key
     if email:
         email_normalized = email.strip().lower()
 
-        cursor = conn.execute("SELECT id FROM people WHERE LOWER(email) = ?", (email_normalized,))
+        cursor = conn.execute(
+            "SELECT id, name FROM people WHERE LOWER(email) = ?", (email_normalized,)
+        )
         row = cursor.fetchone()
 
         if row:
-            # Person exists, optionally update name if it's more complete
-            person_id = row[0]
-            # Update name if new name is longer (likely more complete)
-            cursor = conn.execute("SELECT name FROM people WHERE id = ?", (person_id,))
-            existing_name = cursor.fetchone()[0]
-            if len(name) > len(existing_name):
+            person_id, existing_name = row[0], row[1]
+            if (
+                display_name
+                and not _stands_in_for_a_name(name)
+                and not looks_garbled(name)
+                and (_stands_in_for_a_name(existing_name) or looks_garbled(existing_name))
+            ):
                 conn.execute("UPDATE people SET name = ? WHERE id = ?", (name, person_id))
             return person_id
 

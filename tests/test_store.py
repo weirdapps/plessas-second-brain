@@ -287,14 +287,17 @@ class TestNormalizer:
         conn.close()
 
     def test_find_or_create_person_updates_name(self):
-        """Test that longer name replaces shorter name."""
+        """Test that a header display name replaces an address standing in for one.
+
+        No longer 'the longer name wins': see tests/test_audit_people_names.py.
+        """
         conn = create_database(":memory:")
 
-        # Create with short name
-        person_id = find_or_create_person(conn, "J. Doe", "john.doe@example.com")
+        # Create with the address as the name, as a recipient without one gets
+        person_id = find_or_create_person(conn, "john.doe@example.com", "john.doe@example.com")
 
-        # Update with longer name
-        find_or_create_person(conn, "John Doe", "john.doe@example.com")
+        # Update with the sender's display name
+        find_or_create_person(conn, "John Doe", "john.doe@example.com", display_name=True)
 
         # Should have updated name
         cursor = conn.execute("SELECT name FROM people WHERE id = ?", (person_id,))

@@ -1527,6 +1527,7 @@ def cmd_teams_sync(args):
     conn = get_connection(db_path)
     run_migrations(conn)
 
+    pull_failed = False
     if not getattr(args, "skip_pull", False):
         print("Step 1/6: discovering chats + channels...")
         d = discover_chats(conn, scope="all")
@@ -1546,6 +1547,12 @@ def cmd_teams_sync(args):
                 else ""
             )
         )
+        # pull_messages re-raises only an expired session and counts every other
+        # failure per chat, so a service-wide 403, 429 or 5xx arrives here as
+        # errors with nothing pulled. That returned 0, and sb-teams-sync.sh wrote
+        # 'ok' over a dead pull for as long as it lasted. Some chats pulled is a
+        # partial run, not a failed one.
+        pull_failed = p["errors"] > 0 and p["chats_pulled"] == 0
     else:
         print("Steps 1+2 SKIPPED — --skip-pull set.")
 
@@ -1578,6 +1585,14 @@ def cmd_teams_sync(args):
 
     conn.close()
     print("teams-sync complete.")
+
+    # The later steps still ran on what was already stored. 5 is "upstream
+    # misbehaved", the same code as the M365 CLIs'. Extraction failures do not
+    # count: one poison thread would otherwise keep the unit red every hour.
+    if pull_failed:
+        print(f"Every chat pull failed ({p['errors']} errors, 0 chats pulled)", file=sys.stderr)
+        return 5
+    return 0
 
 
 def cmd_teams_search(args):

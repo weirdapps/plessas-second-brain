@@ -2511,8 +2511,8 @@ def test_check_curation_is_quiet_when_nothing_is_blocked(hc, tmp_path):
 
 
 def test_check_curation_tolerates_ordinary_back_pressure(hc, tmp_path):
-    """A deferred candidate with retries left clears itself once a folder has
-    room. That is the mechanism working, not a fault."""
+    """A candidate deferred recently, with retries left, is ordinary back-pressure
+    and stays OK. Only a deferral older than a week warns."""
     state = _curate_state(tmp_path, deferred={"7": {"folder": "retail", "attempts": 1}})
 
     r = hc.check_curation(state_path=state)

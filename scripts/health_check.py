@@ -700,19 +700,17 @@ def check_images(db):
     # The JOIN matters: run_backfill only sees attachments joinable to an email, so
     # counting orphans (email_id NULL) inflates this permanently — 91 reported vs 2
     # reachable on prod — and would trip the WARN for work that can never drain.
-    pending = db.execute(
-        "SELECT COUNT(*) FROM attachments a JOIN emails e ON a.email_id = e.id "
+    # The same query also ages the queue, so the count and the age can never be
+    # read off two predicates that drift apart. Depth alone has no time dimension:
+    # sync swallows any Step 8 exception, so a step that raises on every run writes
+    # no occurrences, `stuck` stays 0, and `pending` took 8-10 days to cross
+    # IMAGE_QUEUE_WARN.
+    pending, oldest_pending = db.execute(
+        "SELECT COUNT(*), MIN(e.date_received) FROM attachments a "
+        "JOIN emails e ON a.email_id = e.id "
         "WHERE a.mime_type LIKE 'image/%' AND a.file_path IS NOT NULL "
         "AND a.message_id NOT IN (SELECT message_id FROM inline_image_occurrences)"
-    ).fetchone()[0]
-    # The same queue, aged. Depth alone has no time dimension: sync swallows any
-    # Step 8 exception, so a step that raises on every run writes no occurrences,
-    # `stuck` stays 0, and `pending` took 8-10 days to cross IMAGE_QUEUE_WARN.
-    oldest_pending = db.execute(
-        "SELECT MIN(e.date_received) FROM attachments a JOIN emails e ON a.email_id = e.id "
-        "WHERE a.mime_type LIKE 'image/%' AND a.file_path IS NOT NULL "
-        "AND a.message_id NOT IN (SELECT message_id FROM inline_image_occurrences)"
-    ).fetchone()[0]
+    ).fetchone()
     pending_age = _age(oldest_pending)
     pending_stale = (
         pending_age is not None

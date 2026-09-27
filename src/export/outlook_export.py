@@ -6,6 +6,7 @@ path. Forward-only: historical data stays in the existing DB untouched.
 """
 
 import logging
+import re
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -76,6 +77,10 @@ class BootstrapRequired(RuntimeError):
 
 class TruncatedRunWarning(RuntimeError):
     """Raised when a run hits max_results — silent advance would lose data."""
+
+
+class CursorFolderMismatch(RuntimeError):
+    """Raised when the cursor file was saved by a run over another folder."""
 
 
 def get_one_message_body(message_id: str, body_mode: str = "html") -> dict | None:
@@ -242,7 +247,14 @@ def download_attachments_for_messages(
             continue
         msg_dir = base_dir / msg_id
         msg_dir.mkdir(parents=True, exist_ok=True)
-        args = ["download-attachments", msg_id, "--out", str(msg_dir)]
+        # --overwrite because list-mail's --since is inclusive: the cursor's
+        # own message is re-listed every run, and without it outlook-cli
+        # refused the first file it had already saved (IO_WRITE_EEXIST), which
+        # was 99.7% of the logged failures and kept a download that died
+        # part-way from ever finishing. outlook-cli writes each file to a temp
+        # name and renames it into place, and the registrar keys on
+        # (message_id, filename), so a rewrite neither tears nor re-registers.
+        args = ["download-attachments", msg_id, "--out", str(msg_dir), "--overwrite"]
         if include_inline:
             args.append("--include-inline")
         try:
@@ -274,6 +286,16 @@ def run_hourly_sync(
     Returns a summary dict for logging.
     """
     state = load_outlook_sync_state(state_path)
+    # Refused before anything is saved, so the other folder's cursor survives.
+    # Sharing one file let a Sent Items run list from the Inbox cursor and then
+    # move it to its own newest mail, and the next Inbox run skipped everything
+    # in between. A cursor from before the field existed adopts this folder.
+    if state.folder is not None and state.folder != folder:
+        raise CursorFolderMismatch(
+            f"{state_path} holds the cursor for folder={state.folder!r}, not {folder!r}. "
+            "Refusing to share one cursor between folders: pass a --state-path of its own."
+        )
+    state.folder = folder
     state.last_sync_started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     try:
@@ -373,9 +395,26 @@ def run_hourly_sync(
         raise
 
 
-def _default_state_path() -> Path:
-    """The Inbox cursor, under DATA_ROOT with the rest of the data."""
-    return DATA_ROOT / "state" / "outlook_sync.json"
+# The names the production wrapper has always passed, so a run that takes the
+# default lands on the cursor that wrapper already keeps.
+_STATE_FILES = {
+    "Inbox": "outlook_sync.json",
+    "Archive": "outlook_sync_archive.json",
+    "Sent Items": "outlook_sync_sent.json",
+}
+
+
+def _default_state_path(folder: str = "Inbox") -> Path:
+    """The folder's own cursor, under DATA_ROOT with the rest of the data.
+
+    One file per folder: a single default shared by every folder let one
+    folder's run move another's cursor past mail it had not listed yet.
+    """
+    name = _STATE_FILES.get(folder)
+    if name is None:
+        slug = re.sub(r"[^a-z0-9]+", "_", folder.lower()).strip("_") or "folder"
+        name = f"outlook_sync_{slug}.json"
+    return DATA_ROOT / "state" / name
 
 
 def _cursor_in(path: Path) -> OutlookSyncState | None:
@@ -437,7 +476,7 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     # After the logging setup, so the carry-over's warning has a time and level.
-    state_path = _carry_over(args.state_path or _default_state_path())
+    state_path = _carry_over(args.state_path or _default_state_path(args.folder))
 
     if args.mode == "hourly":
         try:
@@ -464,6 +503,11 @@ def main() -> int:
         except TruncatedRunWarning as e:
             logger.error("Truncated run, refusing to advance cursor: %s", e)
             return 8
+        except CursorFolderMismatch as e:
+            # Not 7: that says "no cursor", and the answer to it, --bootstrap,
+            # would fetch only the newest 100 messages.
+            logger.error("Cursor belongs to another folder: %s", e)
+            return 9
         except Exception:
             logger.exception("Sync failed with unexpected error")
             return 1

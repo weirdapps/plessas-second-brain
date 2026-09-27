@@ -1355,10 +1355,12 @@ def cmd_sync(args):
         print("Stop requested during extraction; the later steps did not run", file=sys.stderr)
         return 143
     # Every email that went to the model failed there: a retired model id, a 400
-    # on every request, a refusal of everything. The rest of the sync still runs,
-    # but the run must not read as fresh or green, as it did with rc 0 and a new
-    # last_sync_date while no mail loaded. Not keyed on `extracted`, which news
-    # (extracted without the model) keeps above zero.
+    # on every request, a refusal of everything. Emails that had already failed
+    # in an earlier run are left out of the count (see run_extraction), so a run
+    # that met only those is not taken for a dead model. The rest of the sync
+    # still runs, but the run must not read as fresh or green, as it did with
+    # rc 0 and a new last_sync_date while no mail loaded. Not keyed on
+    # `extracted`, which news (extracted without the model) keeps above zero.
     model_down = (
         isinstance(extraction_run, dict)
         and extraction_run.get("model_failures", 0) > 0
@@ -1602,7 +1604,7 @@ def cmd_sync(args):
     # (RestartPreventExitStatus=75 on both backlog units).
     if model_down:
         print(
-            f"The model failed all {extraction_run['model_failures']} emails sent to it "
+            f"The model failed all {extraction_run['model_failures']} new emails sent to it "
             "and extracted none; last_sync_date was not advanced",
             file=sys.stderr,
         )

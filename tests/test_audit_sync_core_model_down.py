@@ -7,6 +7,8 @@ mail entered the store. News is extracted without the model, so `extracted`
 stays above zero on such a day and cannot be the test.
 """
 
+import contextlib
+import json
 import sqlite3
 import types
 from unittest.mock import patch
@@ -69,7 +71,7 @@ def test_a_run_with_nothing_pending_reports_zero_of_each(staged, monkeypatch):
     assert result["model_failures"] == 0
 
 
-def _sync(tmp_path, monkeypatch, extraction_result):
+def _sync(tmp_path, monkeypatch, extraction_result=None):
     from src import cli
     from src.store.schema import create_database
 
@@ -84,8 +86,14 @@ def _sync(tmp_path, monkeypatch, extraction_result):
     args = types.SimpleNamespace(
         db=db_path, limit=None, engine="claude", workers=1, skip_export=True
     )
+    # None runs the real run_extraction, over whatever the `staged` fixture set up.
+    extraction = (
+        contextlib.nullcontext()
+        if extraction_result is None
+        else patch("src.extract.local.run_extraction", return_value=extraction_result)
+    )
     with (
-        patch("src.extract.local.run_extraction", return_value=extraction_result),
+        extraction,
         patch("src.store.loader.load_extractions", return_value=0) as load,
         patch("src.extract.attachment_pipeline.run_phase1", return_value={"processed": 0}),
         patch("src.export.conversation_export.export_conversations", return_value={"exported": 0}),
@@ -140,6 +148,61 @@ def test_a_sync_that_sent_nothing_to_the_model_is_fresh(tmp_path, monkeypatch):
     }
 
     rc, last, _, _ = _sync(tmp_path, monkeypatch, quiet)
+
+    assert rc == 0
+    assert last != "2026-01-01T00:00:00"
+
+
+def _carry(tmp_path, *, faults=(), timeouts=(), processed=()):
+    """A state file as an earlier run where the model worked leaves it."""
+    (tmp_path / "state.json").write_text(
+        json.dumps(
+            {
+                "processed_ids": list(processed),
+                "failed_attempts": dict.fromkeys(faults, 1),
+                "timeout_attempts": dict.fromkeys(timeouts, 1),
+            }
+        )
+    )
+
+
+@pytest.mark.parametrize("workers", [1, 3])
+def test_emails_that_failed_in_an_earlier_run_are_no_evidence_the_model_is_down(
+    staged, tmp_path, workers
+):
+    # They failed while the model was answering others, so failing again says
+    # nothing about the model. Counted, they made a healthy run exit 75.
+    _carry(tmp_path, faults=["bad1"], timeouts=["bad2"])
+    staged("bad1", "bad2")
+
+    result = local.run_extraction(workers=workers, deadline_s=600.0)
+
+    assert result["failed"] == 2
+    assert result["model_successes"] == 0
+    assert result["model_failures"] == 0
+
+
+@pytest.mark.parametrize("workers", [1, 3])
+def test_fresh_mail_still_says_the_model_is_down_beside_carried_failures(staged, tmp_path, workers):
+    # On a dead-model day no failure is counted into the state, so the fresh
+    # mail of every run stays fresh and keeps saying so.
+    _carry(tmp_path, faults=["bad1"])
+    staged("bad1", "bad2")
+
+    result = local.run_extraction(workers=workers, deadline_s=600.0)
+
+    assert result["model_successes"] == 0
+    assert result["model_failures"] == 1
+
+
+def test_a_catch_up_over_only_carried_failures_is_fresh_and_green(staged, tmp_path, monkeypatch):
+    # 2026-09-25: the 13:15 hourly run extracted 36 emails and two failed. The
+    # 13:20 noon catch-up had only those two pending, both failed again, and it
+    # must not read as a dead model (rc 75, OnFailure, a frozen last_sync_date).
+    _carry(tmp_path, faults=["bad1", "bad2"], processed=["news:1"])
+    staged("bad1", "bad2")
+
+    rc, last, _, _ = _sync(tmp_path, monkeypatch)
 
     assert rc == 0
     assert last != "2026-01-01T00:00:00"

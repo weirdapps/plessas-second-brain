@@ -396,7 +396,8 @@ def run_extraction(
     Returns {"extracted", "failed", "quota_paused", "model_successes",
     "model_failures"}; quota_paused is True when a quota pause ended a run that
     had a deadline. The last two count the emails that went to the model and
-    came back extracted or failed. News is extracted without it and counts in
+    came back extracted or failed, less the failures of emails that had already
+    failed in an earlier run. News is extracted without it and counts in
     neither, so a run in which the model failed every email still reports
     "extracted" above zero on a day with news, and only these tell.
     """
@@ -426,6 +427,12 @@ def run_extraction(
     # if the model worked for some email.
     attempt_counts: dict[str, int] = dict(state.get("failed_attempts", {}))
     timeout_counts: dict[str, int] = dict(state.get("timeout_attempts", {}))
+    # Emails that already failed in a run where the model answered others. One
+    # failing again is no evidence that the model is down, so model_failures
+    # leaves them out: on 2026-09-25 a catch-up that met only two of them would
+    # have exited 75 behind an hourly run that extracted 36. On a day the model
+    # is down nothing is counted into the state, so fresh mail still trips it.
+    carried = set(attempt_counts) | set(timeout_counts)
     failed_this_run: dict[str, str] = {}
     model_successes = 0
     model_failures = 0
@@ -546,7 +553,7 @@ def run_extraction(
                 i += 1
             else:
                 total_failed += 1
-                if not is_news(email):
+                if not is_news(email) and msg_id not in carried:
                     model_failures += 1
                 if is_quota:
                     consecutive_failures += 1
@@ -663,7 +670,7 @@ def run_extraction(
                     else:
                         with _state_lock:
                             total_failed += 1
-                            if not is_news(email):
+                            if not is_news(email) and msg_id not in carried:
                                 model_failures += 1
                             if is_quota:
                                 consecutive_failures += 1

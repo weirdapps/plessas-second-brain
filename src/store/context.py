@@ -449,17 +449,23 @@ def get_topic_context(
     # exact name wins, then the most-used topic, rather than whichever came first.
     topic_normalized = normalize_topic(topic)
 
-    # Find topic
-    topic_row = conn.execute(
-        """
-        SELECT t.id, t.name, t.display_name FROM topics t
-        WHERE t.name LIKE ?
-        ORDER BY (t.name = ?) DESC,
-                 (SELECT COUNT(*) FROM email_topics et WHERE et.topic_id = t.id) DESC, t.id
-        LIMIT 1
-        """,
-        (f"%{topic_normalized}%", topic_normalized),
-    ).fetchone()
+    # Find topic. With no letter or digit there is none: '   ', '-' and '.'
+    # normalize to '', and LIKE '%%' matched every topic, so the most-used one
+    # came back as if it were the answer.
+    topic_row = (
+        conn.execute(
+            """
+            SELECT t.id, t.name, t.display_name FROM topics t
+            WHERE t.name LIKE ?
+            ORDER BY (t.name = ?) DESC,
+                     (SELECT COUNT(*) FROM email_topics et WHERE et.topic_id = t.id) DESC, t.id
+            LIMIT 1
+            """,
+            (f"%{topic_normalized}%", topic_normalized),
+        ).fetchone()
+        if any(ch.isalnum() for ch in topic_normalized)
+        else None
+    )
 
     if not topic_row:
         return {

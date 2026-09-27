@@ -40,6 +40,12 @@ def conn(monkeypatch):
         _email(c, i, days, "owner@example.com", f"conv{i}")
     _email(c, 50, 7, "owner@example.com", "conv50")
     _email(c, 51, 1, "someone@example.com", "conv50")
+    # Addressed to someone: mail the owner sent only himself is never stale.
+    c.execute("INSERT INTO people (id, name, email) VALUES (900, 'Someone', 'someone@example.com')")
+    c.execute(
+        "INSERT INTO email_people (email_id, person_id, role_in_email) "
+        "SELECT id, 900, 'recipient' FROM emails"
+    )
     c.commit()
     return c
 

@@ -15,14 +15,15 @@ from src.store.conversation_query import search_conversations_keyword
 from src.store.fusion import reciprocal_rank_fusion
 from src.store.greek import (
     PHRASE_MATCH,
+    _match_score,
     register_sql_functions,
-    search_fold,
     search_phrase,
     search_tokens,
     search_words,
 )
 from src.store.normalizer import normalize_topic
 from src.store.query import (
+    _ISO_DATE,
     fts5_query_variants,
     query_by_keyword,
     search_attachments,
@@ -115,9 +116,14 @@ def _search_decisions(conn: sqlite3.Connection, keyword: str, limit: int) -> lis
 
 
 def _search_actions(conn: sqlite3.Connection, keyword: str, limit: int) -> list[dict]:
+    # Outstanding first, as query_action_items sorts: open before anything else,
+    # then upcoming dates soonest first, then undated or free text, then overdue,
+    # most recently missed first. Every whole match scores the same, so this
+    # decides the page, and ascending deadline put the oldest dates first: items
+    # long since expired, with a free-text '2026' ahead of every real date.
     return _folded_bucket(
         conn,
-        """
+        f"""
         WITH scored AS MATERIALIZED (
             SELECT id, sb_match(task, ?, ?, ?) AS score FROM action_items
         )
@@ -127,7 +133,17 @@ def _search_actions(conn: sqlite3.Connection, keyword: str, limit: int) -> list[
         JOIN action_items a ON a.id = s.id
         LEFT JOIN emails e ON e.id = a.email_id
         WHERE s.score > 0
-        ORDER BY s.score DESC, CASE WHEN a.deadline IS NULL THEN 1 ELSE 0 END, a.deadline ASC
+        ORDER BY s.score DESC,
+                 a.status IS NOT 'open',
+                 CASE
+                     WHEN a.deadline {_ISO_DATE} AND a.deadline >= date('now') THEN 0
+                     WHEN a.deadline {_ISO_DATE} THEN 2
+                     ELSE 1
+                 END,
+                 CASE WHEN a.deadline {_ISO_DATE} AND a.deadline >= date('now')
+                      THEN a.deadline END ASC,
+                 CASE WHEN a.deadline {_ISO_DATE} AND a.deadline < date('now')
+                      THEN a.deadline END DESC
         LIMIT ?
         """,
         keyword,
@@ -223,26 +239,41 @@ _CONTEXT_HINT_LIMIT = 5
 
 def _maybe_person_context(conn: sqlite3.Connection, query: str, days: int) -> dict | None:
     """Return person_context if the query plausibly matches a known person."""
-    # Cheap pre-check: is there any person whose name/email contains the query?
+    # Cheap pre-check: is there any person whose name starts a word with the
+    # query, or whose address it is? A substring test found a name for most
+    # topics ('AI' inside Michail, 'EU' inside Piraeus) and attached that
+    # person's dossier. No match-count threshold: a real surname matches about
+    # 50 people.
     if "@" in query:
         hit = conn.execute(
             "SELECT 1 FROM people WHERE LOWER(email) = LOWER(?)", (query.strip(),)
         ).fetchone()
     else:
         hit = conn.execute(
-            "SELECT 1 FROM people WHERE sb_fold(name) LIKE ?", (f"%{search_fold(query)}%",)
+            "SELECT 1 FROM people WHERE sb_match(name, ?, '', '') >= ?",
+            (search_phrase(query), PHRASE_MATCH),
         ).fetchone()
     if not hit:
         return None
     ctx = get_person_context(conn, query, days=days, limit=_CONTEXT_HINT_LIMIT)
-    return ctx if ctx.get("person") else None
+    person = ctx.get("person")
+    if not person:
+        return None
+    # resolve_person still matches anywhere in a name and prefers the most-emailed
+    # match, so 'AI' passed the pre-check on 'AI Compliance' and then resolved to
+    # a busier Michail. Attach only a person the pre-check itself would accept.
+    if "@" in query:
+        return ctx
+    score = _match_score(person.get("name"), search_phrase(query), "", "")
+    return ctx if score >= PHRASE_MATCH else None
 
 
 def _maybe_topic_context(conn: sqlite3.Connection, query: str, days: int) -> dict | None:
     """Return topic_context if the query plausibly matches a known topic."""
-    hit = conn.execute(
-        "SELECT 1 FROM topics WHERE name LIKE ?", (f"%{normalize_topic(query)}%",)
-    ).fetchone()
+    topic = normalize_topic(query)
+    if not any(ch.isalnum() for ch in topic):
+        return None  # LIKE '%%' fits every topic, and the most-used one came back
+    hit = conn.execute("SELECT 1 FROM topics WHERE name LIKE ?", (f"%{topic}%",)).fetchone()
     if not hit:
         return None
     ctx = get_topic_context(conn, query, days=days, limit=_CONTEXT_HINT_LIMIT)
@@ -254,7 +285,7 @@ def _hybrid_emails(
     query: str,
     limit: int,
     semantic_candidates,
-) -> list[dict]:
+) -> tuple[list[dict], str]:
     """RRF-fuse keyword email hits with semantic email candidates.
 
     Over-fetches keyword hits so fusion has a candidate pool, merges the keyword
@@ -262,16 +293,21 @@ def _hybrid_emails(
     Semantic-only emails are hydrated as email rows tagged source='semantic'. Any
     semantic failure (missing index, embed error, no ADC) degrades gracefully to
     keyword-only, so recall never breaks.
+
+    Returns the rows and the semantic half's status: 'ok', or 'unavailable:
+    <exception type>'. The fallback used to leave no trace, so a keyword-only
+    answer, when the Mac's ADC had expired, read exactly like a fused one.
     """
     pool = max(limit * 4, limit)
     keyword_hits = query_by_keyword(conn, query, limit=pool)
     try:
         # Read twice below: a provider that yields would be empty the second time.
         sem_ids = list(semantic_candidates(conn, query, pool))
-    except Exception:
-        return keyword_hits[:limit]
+    except Exception as e:
+        logger.warning("recall semantic fusion skipped: %s: %s", type(e).__name__, e)
+        return keyword_hits[:limit], f"unavailable: {type(e).__name__}"
     if not sem_ids:
-        return keyword_hits[:limit]
+        return keyword_hits[:limit], "ok"
 
     # Fused by thread, not by email: keyword search returns one email per thread,
     # and the email that embeds best is rarely that one, so a thread both
@@ -311,7 +347,7 @@ def _hybrid_emails(
             hit = dict(row)
             hit["source"] = "semantic"
             out.append(hit)
-    return out
+    return out, "ok"
 
 
 def recall(
@@ -331,7 +367,10 @@ def recall(
         semantic_candidates: Optional callable (conn, query, limit) -> ranked
             email ids. When provided, the emails bucket becomes a keyword+semantic
             RRF fusion; when None (default) it stays keyword-only. Injected by the
-            MCP layer so recall itself carries no embedding dependency.
+            MCP layer so recall itself carries no embedding dependency. With a
+            provider, summary.semantic says whether its half ran: 'ok', or
+            'unavailable: <exception type>' when it failed and the emails bucket
+            is keyword-only.
 
     Returns:
         Dict with categorized hits across emails (incl. standalone docs),
@@ -346,10 +385,11 @@ def recall(
     # emails_fts, key_facts_fts, and attachment_content_fts in one call). When a
     # semantic candidate provider is injected (the MCP runtime does this), fuse the
     # keyword and semantic rankings with RRF; otherwise stay keyword-only.
+    semantic = None
     if semantic_candidates is None:
         emails = query_by_keyword(conn, query, limit=limit_per_kind)
     else:
-        emails = _hybrid_emails(conn, query, limit_per_kind, semantic_candidates)
+        emails, semantic = _hybrid_emails(conn, query, limit_per_kind, semantic_candidates)
 
     # Conversations. search_conversations_keyword sanitizes the raw query itself
     # and falls back to any-token like every other bucket. It used to be handed
@@ -402,16 +442,19 @@ def recall(
         and all(r.get("partial_match") or r.get("source") == "semantic" for r in v)
     ]
 
+    summary = {
+        "total_hits": total_hits,
+        "kinds_with_results": kinds_with_results,
+        "partial_kinds": partial_kinds,
+        "has_person_context": person_context is not None,
+        "has_topic_context": topic_context is not None,
+    }
+    if semantic is not None:
+        summary["semantic"] = semantic
     return {
         "query": query,
         **text_kinds,
         "person_context": person_context,
         "topic_context": topic_context,
-        "summary": {
-            "total_hits": total_hits,
-            "kinds_with_results": kinds_with_results,
-            "partial_kinds": partial_kinds,
-            "has_person_context": person_context is not None,
-            "has_topic_context": topic_context is not None,
-        },
+        "summary": summary,
     }

@@ -79,3 +79,16 @@ def test_every_match_is_counted_and_the_runners_up_named():
     assert row["name"] == "Νίκος (Nikolaidis)"
     assert count == 3
     assert [o["name"] for o in others] == ["Theodoros Example", "Example Other"]
+
+
+def test_a_short_last_word_after_a_name_is_an_initial():
+    conn = _store()
+    # 'Surname I' resolved before the word-start rule and must again: a trailing
+    # word under three letters starts a word here, it need not be the whole word.
+    assert _resolved(conn, "Theodoros E") == "Theodoros Example"
+    assert _resolved(conn, "Theodoros Ex") == "Theodoros Example"
+    assert _resolved(conn, "Παπαδοπούλου Μ") == "ΠΑΠΑΔΟΠΟΥΛΟΥ ΜΑΡΙΝΑ"
+    # The phrase still starts a word, and a lone short word is still a whole one.
+    assert _resolved(conn, "odoros E") is None
+    assert _resolved(conn, "AI") is None
+    assert _resolved(conn, "EU") is None

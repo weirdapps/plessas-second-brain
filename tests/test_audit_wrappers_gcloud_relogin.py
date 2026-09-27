@@ -38,6 +38,13 @@ def test_the_relogin_token_on_stdout_never_reaches_the_log(tmp_path):
         bin_dir / "teams-cli",
         'case "$1" in health-check) echo \'{"overall":"ok","probes":[]}\';; esac\nexit 0\n',
     )
+    # Alerts go to stubs, never to the owner's screen: osascript is called by its
+    # absolute path unless $OSASCRIPT names another, and terminal-notifier is found
+    # on the script's PATH, where $HOME/.local/bin comes first.
+    _write_stub(home / "osascript", 'echo "osascript $*" >> "$HOME/alerts.txt"\n')
+    _write_stub(
+        bin_dir / "terminal-notifier", 'echo "terminal-notifier $*" >> "$HOME/alerts.txt"\n'
+    )
     done = home / "relogin-ran"
     _write_stub(
         home / "scripts" / "gcloud-auto-login.sh",
@@ -46,7 +53,13 @@ def test_the_relogin_token_on_stdout_never_reaches_the_log(tmp_path):
 
     subprocess.run(
         ["/bin/bash", str(_WATCHER)],
-        env={"HOME": str(home), "PATH": "/usr/bin:/bin", "SHELL": "/bin/bash", "UID": "501"},
+        env={
+            "HOME": str(home),
+            "PATH": "/usr/bin:/bin",
+            "SHELL": "/bin/bash",
+            "UID": "501",
+            "OSASCRIPT": str(home / "osascript"),
+        },
         capture_output=True,
         text=True,
         timeout=120,

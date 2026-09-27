@@ -80,6 +80,13 @@ def _restoration_home(home: Path, *, systemctl_ok: bool) -> Path:
     _write_stub(bin_dir / "systemctl", f'echo "$*" >> {calls}\nexit {0 if systemctl_ok else 1}\n')
     # Never the real launchctl: on a Mac it would kickstart a real job.
     _write_stub(bin_dir / "launchctl", "exit 1\n")
+    # Alerts go to stubs, never to the owner's screen: osascript is called by its
+    # absolute path unless $OSASCRIPT names another, and terminal-notifier is found
+    # on the script's PATH, where $HOME/.local/bin comes first.
+    _write_stub(home / "osascript", 'echo "osascript $*" >> "$HOME/alerts.txt"\n')
+    _write_stub(
+        bin_dir / "terminal-notifier", 'echo "terminal-notifier $*" >> "$HOME/alerts.txt"\n'
+    )
     # Each stub wrapper records whether it inherited fd 9, the auth-watch lock.
     for script in _triggered_scripts():
         marker = home / f"{script}.fd9"
@@ -93,7 +100,13 @@ def _restoration_home(home: Path, *, systemctl_ok: bool) -> Path:
 def _run_watcher(home: Path) -> str:
     subprocess.run(
         ["/bin/bash", str(_WATCHER)],
-        env={"HOME": str(home), "PATH": "/usr/bin:/bin", "SHELL": "/bin/bash", "UID": "501"},
+        env={
+            "HOME": str(home),
+            "PATH": "/usr/bin:/bin",
+            "SHELL": "/bin/bash",
+            "UID": "501",
+            "OSASCRIPT": str(home / "osascript"),
+        },
         capture_output=True,
         text=True,
         timeout=120,

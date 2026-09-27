@@ -114,8 +114,15 @@ USER_NAME = os.environ.get("BRAIN_USER_NAME", "")
 USER_ROLE = os.environ.get("BRAIN_USER_ROLE", "")
 USER_EMAIL_PATTERN = os.environ.get("BRAIN_USER_EMAIL_PATTERN", "")
 
-# Extraction engine: "claude" (default) or "gemini"
-EXTRACT_ENGINE = os.environ.get("BRAIN_EXTRACT_ENGINE", "claude")
+# Extraction engine: "claude" (default) or "gemini". Normalised, and anything
+# else stops here: systemd's EnvironmentFile= keeps an inline comment as part of
+# the value, and every `engine == "claude"` test then fell through to Gemini.
+EXTRACT_ENGINE = os.environ.get("BRAIN_EXTRACT_ENGINE", "").strip().lower() or "claude"
+if EXTRACT_ENGINE not in ("claude", "gemini"):
+    raise ValueError(
+        f"BRAIN_EXTRACT_ENGINE must be 'claude' or 'gemini', got {EXTRACT_ENGINE!r}. "
+        "An inline comment after the value counts as part of it under systemd."
+    )
 CLAUDE_MODEL = os.environ.get("CLAUDE_EXTRACT_MODEL") or os.environ.get(
     "VERTEX_MODEL_EXTRACT", "claude-sonnet-4-6"
 )

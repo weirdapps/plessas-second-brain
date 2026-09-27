@@ -1,0 +1,55 @@
+{
+  "chats": [
+    {
+      "id": "19:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa_bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb@unq.gbl.spaces",
+      "chatType": "chat",
+      "threadType": "chat",
+      "isOneOnOne": true,
+      "title": null,
+      "members": [
+        {
+          "mri": "8:orgid:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+          "role": "Admin",
+          "isIdentityMasked": false
+        },
+        {
+          "mri": "8:orgid:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+          "role": "Admin",
+          "isIdentityMasked": false
+        }
+      ],
+      "createdAt": "2026-08-01T08:00:00Z",
+      "lastMessage": {
+        "composeTime": "2026-09-25T12:34:07.123Z"
+      }
+    },
+    {
+      "id": "19:cccccccccccccccccccccccccccccccc@thread.v2",
+      "chatType": "chat",
+      "threadType": "chat",
+      "isOneOnOne": false,
+      "title": "Example project group",
+      "members": [
+        {
+          "mri": "8:orgid:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+          "role": "Admin",
+          "isIdentityMasked": false
+        },
+        {
+          "mri": "8:orgid:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+          "role": "Admin",
+          "isIdentityMasked": false
+        },
+        {
+          "mri": "8:orgid:cccccccc-cccc-cccc-cccc-cccccccccccc",
+          "role": "Admin",
+          "isIdentityMasked": false
+        }
+      ],
+      "createdAt": "2026-08-01T08:00:00Z",
+      "lastMessage": {
+        "composeTime": "2026-09-24T09:00:00.000Z"
+      }
+    }
+  ]
+}

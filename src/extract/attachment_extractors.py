@@ -268,6 +268,33 @@ def _extract_doc(path: str) -> dict:
     }
 
 
+def _collect_shape_text(shapes, out: list[str]) -> None:
+    """Append the text of every shape, descending into groups.
+
+    A GroupShape has neither a text frame nor a table, so a flat walk dropped
+    the labels, callouts and diagram boxes a consulting-style deck builds as
+    groups, while the row still said 'extracted'. Groups nest, and a group can
+    hold a table, so the walk recurses rather than unwrapping one level. The
+    test is isinstance, not shape_type, because shape_type raises
+    NotImplementedError on an autoshape python-pptx does not recognise.
+    """
+    from pptx.shapes.group import GroupShape
+
+    for shape in shapes:
+        if isinstance(shape, GroupShape):
+            _collect_shape_text(shape.shapes, out)
+            continue
+        if shape.has_text_frame:
+            for para in shape.text_frame.paragraphs:
+                if para.text.strip():
+                    out.append(para.text)
+        if getattr(shape, "has_table", False):
+            for row in shape.table.rows:
+                cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if cells:
+                    out.append(" | ".join(cells))
+
+
 def _extract_pptx(path: str) -> dict:
     """Extract text from PowerPoint using python-pptx."""
     from pptx import Presentation
@@ -276,17 +303,8 @@ def _extract_pptx(path: str) -> dict:
     parts = []
 
     for i, slide in enumerate(prs.slides, 1):
-        slide_text = []
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                for para in shape.text_frame.paragraphs:
-                    if para.text.strip():
-                        slide_text.append(para.text)
-            if getattr(shape, "has_table", False):
-                for row in shape.table.rows:
-                    cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-                    if cells:
-                        slide_text.append(" | ".join(cells))
+        slide_text: list[str] = []
+        _collect_shape_text(slide.shapes, slide_text)
         if slide_text:
             parts.append(f"--- Slide {i} ---\n" + "\n".join(slide_text))
 

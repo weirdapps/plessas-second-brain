@@ -27,6 +27,7 @@ Defaults to a dry run. Pass --apply to actually touch the disk.
 """
 
 import argparse
+import filecmp
 import os
 import sys
 from pathlib import Path
@@ -79,8 +80,15 @@ def _is_duplicate(f: Path, size: int, known: dict[tuple[str, int], list[str]]) -
 
     A row is not bytes. If every registered copy has vanished from disk, this
     orphan is the last one and the row is no licence to delete it.
+
+    Nor is a matching name and size. Recurring reports keep one name and often
+    one size across days: 402 registered (filename, size) groups on the VPS hold
+    more than one distinct content. So the bytes are compared, and anything that
+    differs falls through to adoption.
     """
-    return any(Path(p).exists() for p in known.get((f.name, size), []))
+    return any(
+        Path(p).exists() and filecmp.cmp(f, p, shallow=False) for p in known.get((f.name, size), [])
+    )
 
 
 def _reap_one_dir(

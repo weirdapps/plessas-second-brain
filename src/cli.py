@@ -1317,6 +1317,48 @@ def cmd_prep(args):
                 print(f"  - {a['task'][:80]}{deadline}")
 
 
+def _holding_the_sync_lock(sync):
+    """Run `sync` holding DATA_ROOT/state/sync.lock, or skip if another sync has it.
+
+    Three units run `src.cli sync` (sb-outlook-sync hourly, sb-noon-catchup and
+    sb-daily-sync), and only the hourly wrapper looked for another, with a pgrep,
+    once, one way and not atomically. On 2026-09-24 the noon catch-up started
+    during the hourly load, and both extracted the same conversations and
+    rewrote the state file each from its own snapshot, where the last writer
+    drops the other's processed_ids and give-up counters.
+
+    `--lock-wait` seconds (0 by default) is how long to wait for the holder.
+    Then the run skips with exit 0: the sync holding the lock is draining the
+    same staged mail. The lock is an flock, so it goes with the process holding
+    it, and a killed sync leaves nothing to clear.
+    """
+    import fcntl
+    import functools
+    import time
+
+    @functools.wraps(sync)
+    def locked(args):
+        wait_s = float(getattr(args, "lock_wait", 0) or 0)
+        path = DATA_ROOT / "state" / "sync.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as lock:
+            give_up_at = time.monotonic() + wait_s
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    left = give_up_at - time.monotonic()
+                    if left <= 0:
+                        print(f"skip: another sync is running (waited {wait_s:.0f} s for {path})")
+                        return 0
+                    time.sleep(min(1.0, left))
+            return sync(args)
+
+    return locked
+
+
+@_holding_the_sync_lock
 def cmd_sync(args):
     """Incremental sync over staged mail: extract, load, and the steps after."""
     from src.store.schema import get_connection, migrate_add_sync_metadata
@@ -1362,13 +1404,31 @@ def cmd_sync(args):
     # Step 2: Extract (local mode)
     engine = getattr(args, "engine", None) or EXTRACT_ENGINE
     print(f"\nStep 2: Extracting new emails (engine: {engine})...")
-    from src.extract.local import run_extraction
+    from src.extract.local import run_extraction, stop_requested
 
     extraction_run = run_extraction(
         limit=args.limit or 0,
         engine=engine,
         workers=args.workers or 1,
         deadline_s=_extract_deadline_s(),
+    )
+    # A stop signal ends extraction at a checkpoint. The steps after it used to
+    # carry on regardless, until systemd's SIGKILL 90 s later; now they do not
+    # start. 143 is 128 + SIGTERM, which is what systemd sends.
+    if stop_requested():
+        print("Stop requested during extraction; the later steps did not run", file=sys.stderr)
+        return 143
+    # Every email that went to the model failed there: a retired model id, a 400
+    # on every request, a refusal of everything. Emails that had already failed
+    # in an earlier run are left out of the count (see run_extraction), so a run
+    # that met only those is not taken for a dead model. The rest of the sync
+    # still runs, but the run must not read as fresh or green, as it did with
+    # rc 0 and a new last_sync_date while no mail loaded. Not keyed on
+    # `extracted`, which news (extracted without the model) keeps above zero.
+    model_down = (
+        isinstance(extraction_run, dict)
+        and extraction_run.get("model_failures", 0) > 0
+        and not extraction_run.get("model_successes", 0)
     )
 
     # Step 3: Load into DB
@@ -1487,6 +1547,12 @@ def cmd_sync(args):
         from src.extract.local import run_conversation_extraction
 
         run_conversation_extraction(deadline_s=CONVERSATION_SYNC_DEADLINE_S)
+        if stop_requested():  # as after Step 2
+            print(
+                "Stop requested during conversation extraction; the later steps did not run",
+                file=sys.stderr,
+            )
+            return 143
         conv_loaded = load_convs(db_path)
         print(f"  Loaded {conv_loaded} conversations")
         if conv_loaded:
@@ -1534,13 +1600,18 @@ def cmd_sync(args):
         classified = img_stats.get("classified", 0)
         missing = img_stats.get("missing", 0)
         deferred = img_stats.get("deferred", 0)
+        failed = img_stats.get("failed", 0)
         # `missing` = file gone from disk; `deferred` = budget spent, work requeued.
         # The old line printed `missing` under the label "remaining", which read as
         # "backlog empty: 0" every day while the queue was 200 deep. Queue depth is
         # reported by health_check.check_images (WARN past IMAGE_QUEUE_WARN); this
-        # line just says what THIS run did.
-        if classified > 0 or missing > 0 or deferred > 0:
-            print(f"  Classified: {classified}, deferred: {deferred}, missing files: {missing}")
+        # line just says what THIS run did. `failed` too: without it a run in which
+        # every image failed read "No unclassified images".
+        if classified > 0 or missing > 0 or deferred > 0 or failed > 0:
+            print(
+                f"  Classified: {classified}, failed: {failed}, deferred: {deferred}, "
+                f"missing files: {missing}"
+            )
         else:
             print("  No unclassified images")
     except Exception as e:
@@ -1550,18 +1621,40 @@ def cmd_sync(args):
     conn = get_conn(db_path)
     migrate_add_sync_metadata(conn)
     now = datetime.now().isoformat()
-    conn.execute(
-        "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('last_sync_date', ?)",
-        (now,),
-    )
+    if not model_down:
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('last_sync_date', ?)",
+            (now,),
+        )
     conn.execute(
         "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('last_sync_count', ?)",
         (str(count),),
     )
+    # When mail last arrived, beside when this command last ran. last_sync_date
+    # moves on every run, fetched mail or not, so alone it read fresh through an
+    # Outlook outage. The Inbox export stamps last_sync_completed_at only when it
+    # succeeds, empty runs included. Copied here because brain.db is the only
+    # file a replica receives; get_freshness reports the older of the two.
+    from src.export.state import load_outlook_sync_state
+
+    try:
+        export_ok_at = load_outlook_sync_state(
+            DATA_ROOT / "state" / "outlook_sync.json"
+        ).last_sync_completed_at
+    except (OSError, ValueError, AttributeError, TypeError):  # unreadable: no stamp
+        export_ok_at = None
+    if export_ok_at:
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('mail_export_ok_at', ?)",
+            (export_ok_at,),
+        )
     conn.commit()
     conn.close()
 
-    print(f"\nSync complete. {count} emails added. Sync timestamp: {now}")
+    if model_down:
+        print(f"\nSync complete. {count} emails added. Sync timestamp left at {last_sync}.")
+    else:
+        print(f"\nSync complete. {count} emails added. Sync timestamp: {now}")
 
     # Everything else ran and the rest of the mail stays pending, but extraction
     # did not finish. Before the deadline existed the same pause slept past the
@@ -1570,6 +1663,15 @@ def cmd_sync(args):
     # keeps it out of its own status by design, with those two units behind it.
     if isinstance(extraction_run, dict) and extraction_run.get("quota_paused"):
         print("Extraction ended on a quota pause; the rest stays pending", file=sys.stderr)
+        return 75
+    # The same code: the run finished and failed, and a restart would repeat it
+    # (RestartPreventExitStatus=75 on both backlog units).
+    if model_down:
+        print(
+            f"The model failed all {extraction_run['model_failures']} new emails sent to it "
+            "and extracted none; last_sync_date was not advanced",
+            file=sys.stderr,
+        )
         return 75
     return 0
 
@@ -2771,6 +2873,14 @@ def main():
         action="store_true",
         help="Accepted for the existing schedules and ignored: sync never exports "
         "mail, it loads what outlook_export staged.",
+    )
+    parser_sync.add_argument(
+        "--lock-wait",
+        type=float,
+        default=0,
+        metavar="SECONDS",
+        help="If another sync is running, wait up to this long for it, then skip "
+        "with exit 0 (default: 0, skip at once)",
     )
     parser_sync.set_defaults(func=cmd_sync)
 

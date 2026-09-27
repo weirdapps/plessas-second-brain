@@ -788,16 +788,17 @@ def _find_person_email(person_name: str, metadata: dict) -> str | None:
     """
     name_lower = person_name.lower()
 
-    # Check sender
+    # Check sender. A name staged as null is a key that holds None, which
+    # .get()'s default does not replace.
     sender = metadata.get("sender", {})
-    if sender.get("name", "").lower() == name_lower:
+    if (sender.get("name") or "").lower() == name_lower:
         return sender.get("address")
 
     # Check recipients
     for recipient in metadata.get("to_recipients", metadata.get("to", [])) + metadata.get(
         "cc_recipients", metadata.get("cc", [])
     ):
-        if recipient.get("name", "").lower() == name_lower:
+        if (recipient.get("name") or "").lower() == name_lower:
             return recipient.get("address")
 
     return None

@@ -506,7 +506,9 @@ def query_calendar_events(
     conn = _get_conn()
     try:
         query = "SELECT ce.* FROM calendar_events ce"
-        conditions = []
+        # A cancelled event, by Outlook or by calendar-sync because Outlook no
+        # longer lists it, is not a meeting.
+        conditions = ["ce.is_cancelled = 0"]
         params: list[str | int] = []
 
         if person:

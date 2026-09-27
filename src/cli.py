@@ -1695,7 +1695,7 @@ def _read_json_dict(path: Path) -> dict:
 
 def cmd_calendar_sync(args):
     """Sync calendar events from Outlook into the knowledge store."""
-    from datetime import timedelta
+    from datetime import UTC, timedelta
 
     from src.config import USER_EMAIL_PATTERN
     from src.export.calendar_export import (
@@ -1710,6 +1710,7 @@ def cmd_calendar_sync(args):
     from src.extract.vertex_auth import touch_sentinel
     from src.llm_policy import Outcome
     from src.store.calendar_loader import (
+        cancel_unlisted,
         dedupe_event_children,
         load_event,
         load_proxy_emails,
@@ -1929,6 +1930,20 @@ def cmd_calendar_sync(args):
         )
         stats["loaded"] += 1
 
+    # A complete listing also says which stored events Outlook no longer holds;
+    # nothing ever removed them, so deleted and re-created meetings stayed live.
+    # Not after a span that failed or came back full, nor once the session
+    # expired mid-run: what is missing then says nothing about Outlook. The
+    # window was local time to outlook-cli, as it is to since.astimezone().
+    cancelled = 0
+    if not chunk_failures and not session_expired:
+        cancelled = cancel_unlisted(
+            conn,
+            set(listed_ids),
+            since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
+            until_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+
     # Both are idempotent and cheap, and both repair rows no upsert will touch
     # again: stacked duplicates from the old append-only loader, and self flags
     # written while BRAIN_USER_EMAIL_PATTERN was unset.
@@ -2014,6 +2029,8 @@ def cmd_calendar_sync(args):
         print(f"  Removed duplicate decisions/actions: {dup_decisions}/{dup_actions}")
     if flags_changed:
         print(f"  Self flags corrected: {flags_changed}")
+    if cancelled:
+        print(f"  No longer in Outlook, marked cancelled: {cancelled}")
 
     # Every one of these is already recorded so the next run re-offers or
     # reports it; the exit code is what tells the scheduler this run did not do

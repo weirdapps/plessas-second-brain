@@ -201,7 +201,9 @@ def recall(query: str, limit_per_kind: int = 5, days: int = 365) -> dict:
     2026-09-09, which made three whole kinds invisible to a caller.
 
     Only the emails bucket fuses keyword and semantic ranking; every other
-    bucket is keyword-only. A bucket where nothing held the whole query falls
+    bucket is keyword-only. `summary.semantic` is 'ok' when the semantic half
+    ran, or 'unavailable: <error type>' when it failed and the emails bucket is
+    keyword-only. A bucket where nothing held the whole query falls
     back to rows holding some of its words, each flagged partial_match, and
     `summary.partial_kinds` names those buckets. When the local replica is
     behind, the result carries `_stale_warning` and `data_as_of`.

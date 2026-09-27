@@ -274,7 +274,7 @@ def _hybrid_emails(
     query: str,
     limit: int,
     semantic_candidates,
-) -> list[dict]:
+) -> tuple[list[dict], str]:
     """RRF-fuse keyword email hits with semantic email candidates.
 
     Over-fetches keyword hits so fusion has a candidate pool, merges the keyword
@@ -282,16 +282,21 @@ def _hybrid_emails(
     Semantic-only emails are hydrated as email rows tagged source='semantic'. Any
     semantic failure (missing index, embed error, no ADC) degrades gracefully to
     keyword-only, so recall never breaks.
+
+    Returns the rows and the semantic half's status: 'ok', or 'unavailable:
+    <exception type>'. The fallback used to leave no trace, so a keyword-only
+    answer, when the Mac's ADC had expired, read exactly like a fused one.
     """
     pool = max(limit * 4, limit)
     keyword_hits = query_by_keyword(conn, query, limit=pool)
     try:
         # Read twice below: a provider that yields would be empty the second time.
         sem_ids = list(semantic_candidates(conn, query, pool))
-    except Exception:
-        return keyword_hits[:limit]
+    except Exception as e:
+        logger.warning("recall semantic fusion skipped: %s: %s", type(e).__name__, e)
+        return keyword_hits[:limit], f"unavailable: {type(e).__name__}"
     if not sem_ids:
-        return keyword_hits[:limit]
+        return keyword_hits[:limit], "ok"
 
     # Fused by thread, not by email: keyword search returns one email per thread,
     # and the email that embeds best is rarely that one, so a thread both
@@ -331,7 +336,7 @@ def _hybrid_emails(
             hit = dict(row)
             hit["source"] = "semantic"
             out.append(hit)
-    return out
+    return out, "ok"
 
 
 def recall(
@@ -351,7 +356,10 @@ def recall(
         semantic_candidates: Optional callable (conn, query, limit) -> ranked
             email ids. When provided, the emails bucket becomes a keyword+semantic
             RRF fusion; when None (default) it stays keyword-only. Injected by the
-            MCP layer so recall itself carries no embedding dependency.
+            MCP layer so recall itself carries no embedding dependency. With a
+            provider, summary.semantic says whether its half ran: 'ok', or
+            'unavailable: <exception type>' when it failed and the emails bucket
+            is keyword-only.
 
     Returns:
         Dict with categorized hits across emails (incl. standalone docs),
@@ -366,10 +374,11 @@ def recall(
     # emails_fts, key_facts_fts, and attachment_content_fts in one call). When a
     # semantic candidate provider is injected (the MCP runtime does this), fuse the
     # keyword and semantic rankings with RRF; otherwise stay keyword-only.
+    semantic = None
     if semantic_candidates is None:
         emails = query_by_keyword(conn, query, limit=limit_per_kind)
     else:
-        emails = _hybrid_emails(conn, query, limit_per_kind, semantic_candidates)
+        emails, semantic = _hybrid_emails(conn, query, limit_per_kind, semantic_candidates)
 
     # Conversations. search_conversations_keyword sanitizes the raw query itself
     # and falls back to any-token like every other bucket. It used to be handed
@@ -422,16 +431,19 @@ def recall(
         and all(r.get("partial_match") or r.get("source") == "semantic" for r in v)
     ]
 
+    summary = {
+        "total_hits": total_hits,
+        "kinds_with_results": kinds_with_results,
+        "partial_kinds": partial_kinds,
+        "has_person_context": person_context is not None,
+        "has_topic_context": topic_context is not None,
+    }
+    if semantic is not None:
+        summary["semantic"] = semantic
     return {
         "query": query,
         **text_kinds,
         "person_context": person_context,
         "topic_context": topic_context,
-        "summary": {
-            "total_hits": total_hits,
-            "kinds_with_results": kinds_with_results,
-            "partial_kinds": partial_kinds,
-            "has_person_context": person_context is not None,
-            "has_topic_context": topic_context is not None,
-        },
+        "summary": summary,
     }

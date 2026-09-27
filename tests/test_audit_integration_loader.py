@@ -111,3 +111,20 @@ def test_an_old_file_with_null_fields_still_loads(tmp_path):
     )
 
     assert facts == []
+
+
+def test_a_recipient_whose_name_is_null_loads():
+    conn = create_database(":memory:")
+    to = [{"name": "Jane Roe", "address": "jane.roe@example.com"}]
+    load_single_email(conn, _meta(1, OWNER, to), _extraction())
+    meta = _meta(2, OWNER, [{"name": None, "address": "jane.roe@example.com"}])
+    meta["cc"] = [{"name": None, "address": "jane.roe@example.com"}]
+
+    assert load_single_email(conn, meta, _extraction())
+    assert _name(conn, "jane.roe@example.com") == "Jane Roe"
+
+
+def test_an_old_file_with_null_topics_decisions_and_actions_still_loads(tmp_path):
+    facts = _conversation(tmp_path, {"topics": None, "decisions": None, "action_items": None})
+
+    assert facts == []

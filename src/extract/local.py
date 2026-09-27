@@ -426,6 +426,11 @@ def run_extraction(
     log(f"Total staged emails: {len(all_emails)}")
 
     pending = [e for e in all_emails if str(e.get("message_id", "")) not in processed_ids]
+    # One copy of each message, the last staged, as collect_conversations keeps.
+    # The export's cursor is inclusive, so a folder's newest message is staged
+    # again every hour until it loads: one that kept failing went to the model
+    # once per copy, in parallel, three and four times in a run.
+    pending = list({str(e.get("message_id", "")): e for e in pending}.values())
     log(f"Pending extraction: {len(pending)} emails")
     if deadline is not None:
         # By the mail's own date, not staging order: Archive and Sent bootstraps

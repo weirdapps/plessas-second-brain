@@ -11,8 +11,13 @@ labelled `mailbox_name='Inbox'` whose `message_id` is no longer there has
 been moved out. We assume → Archive (matches the dominant /triage-inbox
 flow). Subfolder routing would mislabel — accept that until it bites.
 
-Runs after every hourly Inbox sync (~1s — current Inbox is tiny). Exits 5,
+Runs after every hourly Inbox sync (~1s — current Inbox is tiny). Exits 2,
 touching nothing, on a replica (see src.config.is_replica).
+
+Exit codes follow the estate's M365 convention, which the wrapper and its
+operators read: 4 means re-authenticate, 5 means outlook-cli or the service
+behind it misbehaved, and 75 (EX_TEMPFAIL) means a local, transient failure
+such as a locked database.
 """
 
 from __future__ import annotations
@@ -26,10 +31,12 @@ import sys
 from pathlib import Path
 
 from src.config import DEFAULT_DB, is_replica, replica_refusal
+from src.export.outlook_cli import OutlookCliAuthRequired, OutlookCliError, run_outlook_cli
 from src.store.schema import get_connection
 
-# Exit code for a run refused on a replica; 1-4 already name other failures.
-REFUSED_ON_REPLICA = 5
+# Exit code for a run refused on a replica, the same as src.cli's. It was 5,
+# which every M365 wrapper here reads as "upstream misbehaved".
+REFUSED_ON_REPLICA = 2
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +49,11 @@ def list_current_inbox_ids(max_results: int = 5000) -> tuple[set[str], set[str]]
     which the loader populates in `emails.internet_message_id` regardless
     of source — so we can cross-match AppleScript-sourced rows too.
     """
-    result = subprocess.run(
+    # Through the shared adapter, like every other outlook-cli caller: it adds
+    # --no-auto-reauth, so a timer never opens an interactive login, honours
+    # OUTLOOK_CLI_PATH, and raises OutlookCliAuthRequired on exit 4.
+    items = run_outlook_cli(
         [
-            "outlook-cli",
             "list-mail",
             "--folder",
             "Inbox",
@@ -54,12 +63,8 @@ def list_current_inbox_ids(max_results: int = 5000) -> tuple[set[str], set[str]]
             "--max",
             str(max_results),
         ],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=120,
+        timeout_sec=120,
     )
-    items = json.loads(result.stdout or "[]")
     outlook_ids = {m["Id"] for m in items if m.get("Id")}
     internet_ids = {m["InternetMessageId"] for m in items if m.get("InternetMessageId")}
     return outlook_ids, internet_ids
@@ -188,15 +193,21 @@ def main() -> int:
 
     try:
         result = reconcile_moves(args.db, target_mailbox=args.target_mailbox)
-    except subprocess.CalledProcessError as e:
-        logger.error("outlook-cli failed: rc=%d stderr=%s", e.returncode, e.stderr)
-        return 2
+    # An auth loss used to exit 2 and a locked database 4, so the wrapper
+    # reported lock contention as "re-authenticate" and a real auth loss as
+    # something else.
+    except OutlookCliAuthRequired as e:
+        logger.error("outlook-cli needs re-authentication: %s", e.stderr)
+        return 4
+    except OutlookCliError as e:
+        logger.error("outlook-cli failed: rc=%d stderr=%s", e.exit_code, e.stderr)
+        return 5
     except subprocess.TimeoutExpired:
         logger.error("outlook-cli timed out listing Inbox")
-        return 3
+        return 5
     except (json.JSONDecodeError, sqlite3.Error) as e:
         logger.error("reconcile failed: %s", e)
-        return 4
+        return 75
 
     logger.info(
         "Reconciled: live_inbox=%d moved=%d (by_outlook_id=%d by_internet_id=%d) → %s",

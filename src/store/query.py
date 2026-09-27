@@ -1529,7 +1529,11 @@ def get_coverage(conn: sqlite3.Connection) -> dict:
     return {
         "mailboxes": mailboxes,
         "teams": span("SELECT MIN(started_at), MAX(ended_at), COUNT(*) FROM teams_threads"),
-        "calendar": span("SELECT MIN(start_at), MAX(start_at), COUNT(*) FROM calendar_events"),
+        # Meetings Outlook no longer lists are kept as cancelled, not deleted.
+        "calendar": span(
+            "SELECT MIN(start_at), MAX(start_at), COUNT(*) FROM calendar_events "
+            "WHERE is_cancelled = 0"
+        ),
         "conversations": span(
             "SELECT MIN(started_at), MAX(COALESCE(ended_at, started_at)), COUNT(*) "
             "FROM conversations"

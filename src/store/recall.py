@@ -16,7 +16,6 @@ from src.store.fusion import reciprocal_rank_fusion
 from src.store.greek import (
     PHRASE_MATCH,
     register_sql_functions,
-    search_fold,
     search_phrase,
     search_tokens,
     search_words,
@@ -239,14 +238,19 @@ _CONTEXT_HINT_LIMIT = 5
 
 def _maybe_person_context(conn: sqlite3.Connection, query: str, days: int) -> dict | None:
     """Return person_context if the query plausibly matches a known person."""
-    # Cheap pre-check: is there any person whose name/email contains the query?
+    # Cheap pre-check: is there any person whose name starts a word with the
+    # query, or whose address it is? A substring test found a name for most
+    # topics ('AI' inside Michail, 'EU' inside Piraeus) and attached that
+    # person's dossier. No match-count threshold: a real surname matches about
+    # 50 people.
     if "@" in query:
         hit = conn.execute(
             "SELECT 1 FROM people WHERE LOWER(email) = LOWER(?)", (query.strip(),)
         ).fetchone()
     else:
         hit = conn.execute(
-            "SELECT 1 FROM people WHERE sb_fold(name) LIKE ?", (f"%{search_fold(query)}%",)
+            "SELECT 1 FROM people WHERE sb_match(name, ?, '', '') >= ?",
+            (search_phrase(query), PHRASE_MATCH),
         ).fetchone()
     if not hit:
         return None

@@ -710,6 +710,10 @@ def cmd_process_sharepoint(args):
             print(f"  External hosts skipped (no session): {stats['urls_skipped_external']}")
     if stats["auth_required"]:
         print(f"\n⚠ Auth required — run 'sharepoint-cli login --host {SHAREPOINT_HOST}' and retry")
+        # The warning alone left the nightly stage green while new links piled
+        # up unfetched. run_stage in sb-attachment-pass.sh judges the exit code.
+        return EXIT_REAUTH
+    return 0
 
 
 def cmd_reverse_ingest(args):

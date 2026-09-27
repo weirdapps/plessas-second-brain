@@ -300,7 +300,13 @@ def systemctl_bin() -> str:
 
 def kick_job(label: str):
     """(Re)start a scheduled job by its platform-native identifier:
-    `launchctl kickstart` on macOS, `systemctl --user start` on Linux (VPS)."""
+    `launchctl kickstart` on macOS, `systemctl --user start` on Linux (VPS).
+
+    --no-block because every sb-* unit is Type=oneshot, and a blocking start
+    waits for the whole job. The 30 s timeout then killed the client while
+    systemd went on running the job, so the report said "Failed to kick" for a
+    sync that finished seven minutes later.
+    """
     if IS_MACOS:
         uid = os.getuid()
         return subprocess.run(
@@ -309,10 +315,27 @@ def kick_job(label: str):
             timeout=30,
         )
     return subprocess.run(
-        [systemctl_bin(), "--user", "start", label],
+        [systemctl_bin(), "--user", "start", "--no-block", label],
         capture_output=True,
         timeout=30,
     )
+
+
+def _kick_outcome(label: str, queued: str) -> str:
+    """Kick a job and say what actually happened: `queued` when the service
+    manager accepted it, otherwise the return code and the tail of its stderr.
+    Reading the return code is the point; a refused restart used to be
+    reported as done."""
+    try:
+        proc = kick_job(label)
+    except Exception as e:
+        return f"Failed to kick {label}: {e}"
+    if proc.returncode == 0:
+        return queued
+    stderr = proc.stderr or b""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
+    return f"Failed to kick {label} (rc={proc.returncode}): {stderr.strip()[-200:]}"
 
 
 def get_db():
@@ -1581,27 +1604,19 @@ def auto_fix(issues):
 
     for issue in issues:
         if issue["type"] == "sentinel" and issue["name"] == "needs_reauth":
-            try:
-                kick_job(AUTH_WATCH_JOB)
-                actions.append("Kicked auth-watch to attempt silent renewal")
-            except Exception as e:
-                actions.append(f"Failed to kick auth-watch: {e}")
+            actions.append(
+                _kick_outcome(AUTH_WATCH_JOB, f"Queued {AUTH_WATCH_JOB} to attempt silent renewal")
+            )
 
         elif issue["type"] == "job_failed":
             label = issue["label"]
-            try:
-                kick_job(label)
-                actions.append(f"Re-kicked {label}")
-            except Exception as e:
-                actions.append(f"Failed to kick {label}: {e}")
+            actions.append(_kick_outcome(label, f"Queued {label}"))
 
         elif issue["type"] == "stale_data":
             label = issue["label"]
-            try:
-                kick_job(label)
-                actions.append(f"Kicked {label} to drain staging ({issue['name']} stale)")
-            except Exception as e:
-                actions.append(f"Failed to kick {label}: {e}")
+            actions.append(
+                _kick_outcome(label, f"Queued {label} to drain staging ({issue['name']} stale)")
+            )
 
     return actions
 

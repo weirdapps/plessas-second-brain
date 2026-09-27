@@ -152,10 +152,10 @@ note_failure() {
 # interpreter is still what lets this job ENUMERATE ~/Documents, so the tripwire
 # stays; it simply does not cover hydration and must not be blamed for it.
 #
-# The grant that fixed it is pinned to a cdhash at a VERSIONED Cellar path. A
-# `brew upgrade rsync` changes both, the grant stops matching in silence, and
-# the job goes straight back to exit 23 with nobody at the keyboard to click
-# Allow. Re-read this value after any rsync upgrade, with:
+# The grant is pinned to a cdhash at a VERSIONED Cellar path, and a
+# `brew upgrade rsync` changes both. The check below says so in the log; it no
+# longer stops the run (see the call site). Re-read this value after any rsync
+# upgrade, with:
 #   codesign -dvvv "$(command -v rsync)" 2>&1 | sed -n 's/^CDHash=//p'
 EXPECTED_RSYNC_CDHASH="d2628534f3070231b806a39fd55e9453a9d834f3"
 
@@ -193,17 +193,23 @@ rsync_cdhash_mismatch() {
   if [ "$actual" != "$EXPECTED_RSYNC_CDHASH" ]; then
     # No single quotes in this reason: it is interpolated into the ssh command
     # that writes the failure marker.
-    printf '%s' "rsync at $bin now has cdhash $actual, not the $EXPECTED_RSYNC_CDHASH that was granted OneDrive FileProvider access. A human must re-grant it: System Settings > Privacy & Security > Files and Folders, allow the new rsync, then update EXPECTED_RSYNC_CDHASH in this script."
+    printf '%s' "rsync at $bin now has cdhash $actual, not the pinned $EXPECTED_RSYNC_CDHASH. If the transfers below fail with a permission error, re-grant it in System Settings > Privacy & Security > Files and Folders; either way update EXPECTED_RSYNC_CDHASH in this script."
     return 1
   fi
   return 0
 }
 
-cdhash_problem=$(rsync_cdhash_mismatch)
-if [ -n "$cdhash_problem" ]; then
-  log "ABORT: $cdhash_problem"
-  note_failure "$cdhash_problem"
+# A warning, not an abort. On 2026-09-27 brew upgraded rsync to 3.5.1 and this
+# check aborted every run from 11:28 until the pin was updated at 17:32, although
+# the new binary, granted nothing, read OneDrive from this job (zsh spawning
+# rsync) with no dialog and synced green. The grant it pins is not what this
+# process tree needs, so a changed cdhash is logged; a real denial still fails
+# the run, because rsync exits non-zero and the transfer loop records it.
+cdhash_warning=$(rsync_cdhash_mismatch)
+if [ -n "$cdhash_warning" ]; then
+  log "WARNING: $cdhash_warning"
 fi
+blocked=""
 
 # Resolve the document root instead of assuming ~/Documents reaches OneDrive.
 #
@@ -229,15 +235,14 @@ done
 if [ -z "${DOCROOT:-}" ]; then
   log "ABORT: no document root found; tried CloudStorage/OneDrive-Personal/Documents and ~/Documents"
   note_failure "no document root found"
-  cdhash_problem="${cdhash_problem:-no document root}"
+  blocked="no document root"
 else
   log "document root: $DOCROOT"
 fi
 
 for tree in National Personal; do
-  # A cdhash mismatch is fatal for the whole run rather than for one tree:
-  # every transfer below would hit the same missing grant.
-  if [ -n "$cdhash_problem" ]; then
+  # With no document root every transfer below would fail the same way.
+  if [ -n "$blocked" ]; then
     break
   fi
 

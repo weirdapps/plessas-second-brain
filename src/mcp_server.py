@@ -136,9 +136,11 @@ def person_context(name_or_email: str, days: int = 365, limit: int = 20) -> dict
         name_or_email: Person's name or email address, case and accent blind. A
             name matches at the start of a word ('Papa' finds 'Papadopoulos', 'AI'
             does not find 'Michail'), a last word of one or two letters counts as
-            an initial ('Papadopoulos N'), and one word of four letters or more also
-            matches the start of an address's local part, after an optional
-            one-letter initial. An ambiguous name resolves to the most-emailed
+            an initial ('Papadopoulos N'), and one Latin word of four letters or
+            more (digits allowed) also matches an address's local part: at its
+            start, after its first character ('jexample'), or at the start of any
+            part after '.', '-' or '_' ('john.example'). An ambiguous name
+            resolves to the most-emailed
             match; match_count and other_candidates say how many matched and who
             else.
         days: Lookback period in days (default: 365)

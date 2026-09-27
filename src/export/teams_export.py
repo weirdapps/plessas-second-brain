@@ -333,8 +333,13 @@ def pull_messages(
     deadline = None if deadline_s is None else time.monotonic() + deadline_s
     # Disabling is decided after the run, not inside the loop: a Graph-wide auth
     # lapse 403s every chat, and applying the flag per-chat turned one transient
-    # failure into 1,179 permanently dropped chats on prod.
-    permanent_candidates: list[int] = []
+    # failure into 1,179 permanently dropped chats on prod. Channels and chats
+    # are judged apart: channels read through chatsvcagg and chats through
+    # chatsvc, on different token audiences, so a lapse can hit one kind alone.
+    # Channels are about 3% of a run, so against the whole run a channel-wide
+    # 403 stayed under the ceiling and disabled every channel.
+    permanent_candidates: dict[str, list[int]] = {"channel": [], "chat": []}
+    attempted: dict[str, int] = {"channel": 0, "chat": 0}
 
     # Concurrency wired in but defaulted to sequential for Phase 1 simplicity;
     # parallelism is a Phase 2 follow-up if throughput becomes an issue.
@@ -344,6 +349,8 @@ def pull_messages(
         if deadline is not None and time.monotonic() >= deadline:
             deferred += 1
             continue
+        audience = "channel" if chat["chat_kind"] == "channel" else "chat"
+        attempted[audience] += 1
         try:
             # teams-cli list-messages has no --sync-state flag (channel reads via
             # chatsvcagg /posts don't expose a cursor). We always pull and rely on
@@ -380,7 +387,7 @@ def pull_messages(
             import sys
 
             if _is_permanent_error(e):
-                permanent_candidates.append(chat["id"])
+                permanent_candidates[audience].append(chat["id"])
                 print(
                     f"pull_messages: candidate for disable {chat['teams_chat_id']} "
                     f"(permanent: {str(e)[:140]})",
@@ -392,23 +399,25 @@ def pull_messages(
                     file=sys.stderr,
                 )
 
-    attempted = pulled + errors
-    if permanent_candidates and _is_systemic_failure(len(permanent_candidates), attempted):
-        import sys as _sys
+    # Stamp the moment, not just the flag. Without a date, a sweep that took
+    # 1,179 of 1,219 chats in one pass looks exactly like archived rooms
+    # accumulating a few at a time over months — and the clustering is the
+    # only thing that tells those two apart after the fact.
+    disabled_at = datetime.now(UTC).isoformat()
+    for audience, candidates in permanent_candidates.items():
+        if not candidates:
+            continue
+        if _is_systemic_failure(len(candidates), attempted[audience]):
+            import sys as _sys
 
-        print(
-            f"pull_messages: {len(permanent_candidates)}/{attempted} chats returned a "
-            "permanent-looking error — treating as systemic (auth/service) and "
-            "disabling none",
-            file=_sys.stderr,
-        )
-    else:
-        # Stamp the moment, not just the flag. Without a date, a sweep that took
-        # 1,179 of 1,219 chats in one pass looks exactly like archived rooms
-        # accumulating a few at a time over months — and the clustering is the
-        # only thing that tells those two apart after the fact.
-        disabled_at = datetime.now(UTC).isoformat()
-        for chat_id in permanent_candidates:
+            print(
+                f"pull_messages: {len(candidates)}/{attempted[audience]} {audience} reads "
+                "returned a permanent-looking error — treating as systemic "
+                "(auth/service) and disabling none",
+                file=_sys.stderr,
+            )
+            continue
+        for chat_id in candidates:
             conn.execute(
                 "UPDATE teams_chats SET ingest_disabled = 1, ingest_disabled_at = ? WHERE id = ?",
                 (disabled_at, chat_id),

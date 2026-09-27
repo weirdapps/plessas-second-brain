@@ -201,23 +201,6 @@ def extract_one(email: dict, api_key: str | None, engine: str = "gemini") -> dic
     return extraction
 
 
-def _parse_retry_delay(exc: Exception) -> int | None:
-    """Extract retry delay seconds from a 429 quota error, or None."""
-    msg = str(exc)
-    if "429" not in msg and "RESOURCE_EXHAUSTED" not in msg:
-        return None
-    # Look for "retry in XhYmZs" pattern
-    import re
-
-    m = re.search(r"retry\s+in\s+(\d+)h(\d+)m", msg, re.IGNORECASE)
-    if m:
-        return int(m.group(1)) * 3600 + int(m.group(2)) * 60
-    m = re.search(r"retryDelay.*?(\d+)s", msg)
-    if m:
-        return int(m.group(1))
-    return 3600  # default 1h if we can't parse
-
-
 def _should_quota_pause(exc: Exception) -> bool:
     """Return True for genuine quota exhaustion or an overload, False for auth and
     other errors.
@@ -750,8 +733,12 @@ def extract_conversation_inline(
                 log(f"FAILED conv {session_id[:12]}: {e}")
                 return (session_id, None, False, FAULT)
             # The same test as emails (a 529 overload is quota, from either
-            # client), plus the retry-delay text this path has always recognised.
-            if _parse_retry_delay(e) is not None or _should_quota_pause(e):
+            # client). A retry-delay parser used to be consulted here too, and it
+            # matched a bare '429' anywhere in the text, so a 400 holding a token
+            # count such as 214290 came back as quota and never reached its
+            # attempt cap. _should_quota_pause already knows a 429 and
+            # RESOURCE_EXHAUSTED, by type first.
+            if _should_quota_pause(e):
                 is_quota = True
                 if attempt < max_retries - 1:
                     log(

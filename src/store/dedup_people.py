@@ -128,6 +128,20 @@ def merge_person(conn: sqlite3.Connection, keep_id: int, remove_id: int):
         (keep_id, remove_id),
     )
     conn.execute("DELETE FROM email_people WHERE person_id = ?", (remove_id,))
+    # Every other table that names a person. Left behind, a merged-away person's
+    # Teams messages, meetings and resolved MRI pointed at a deleted row, so
+    # person_context never showed them, and with foreign keys on the delete
+    # below failed outright.
+    conn.execute(
+        "UPDATE teams_messages SET sender_person_id = ? WHERE sender_person_id = ?",
+        (keep_id, remove_id),
+    )
+    conn.execute(
+        "UPDATE teams_mri_resolution SET person_id = ? WHERE person_id = ?", (keep_id, remove_id)
+    )
+    conn.execute(
+        "UPDATE event_attendees SET person_id = ? WHERE person_id = ?", (keep_id, remove_id)
+    )
     conn.execute("DELETE FROM people WHERE id = ?", (remove_id,))
 
 

@@ -1,12 +1,19 @@
 #!/bin/bash
-# Wrapper script for the brain CLI — uses the project venv automatically.
+# Wrapper script for the brain CLI. Finds the interpreter the way run_mcp.sh
+# does, so the same script works on every host (the producer keeps its venv
+# out of the repo, in ~/.venvs):
+#   1. $SECOND_BRAIN_VENV_PYTHON  (explicit override)
+#   2. ./.venv or ./venv          (in-repo; .venv may symlink to ~/.venvs)
+#   3. ~/.venvs/second-brain      (shared venv dir)
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
-VENV_PYTHON="$REPO_DIR/.venv/bin/python3"
+for _py in \
+  "${SECOND_BRAIN_VENV_PYTHON:-}" \
+  "$REPO_DIR/.venv/bin/python" \
+  "$REPO_DIR/venv/bin/python" \
+  "$HOME/.venvs/second-brain/bin/python"; do
+  [ -n "$_py" ] && [ -x "$_py" ] && exec "$_py" -m src.cli "$@"
+done
 
-if [ ! -f "$VENV_PYTHON" ]; then
-    echo "Error: Virtual environment not found at $REPO_DIR/.venv" >&2
-    echo "Run: python -m venv .venv && source .venv/bin/activate && pip install -e ." >&2
-    exit 1
-fi
-
-exec "$VENV_PYTHON" -m src.cli "$@"
+echo "Error: no second-brain virtual environment found (.venv, venv, ~/.venvs/second-brain)" >&2
+echo "Run: cd $REPO_DIR && uv sync --frozen   (or set SECOND_BRAIN_VENV_PYTHON)" >&2
+exit 1

@@ -12,6 +12,10 @@ on a single host or split across two (see "Topology" below).
   out to it.
 - `tesseract`, plus the language data for the languages your attachments are
   written in.
+- `antiword` (or `catdoc`) on Linux, for legacy Word `.doc` attachments. macOS
+  uses its built-in `textutil`. Without any of the three every `.doc` is
+  recorded as skipped ("No legacy .doc converter available"), which no failure
+  count reports.
 - `zstd` and `openssl`, if you want encrypted offsite backups.
 
 **Tesseract is not optional if you ingest attachments.** Attachment OCR calls
@@ -25,6 +29,7 @@ method of all.
 ```bash
 brew install tesseract tesseract-lang                  # macOS
 sudo apt-get install tesseract-ocr tesseract-ocr-ell   # Debian/Ubuntu
+sudo apt-get install antiword                          # Debian/Ubuntu, legacy .doc
 tesseract --list-langs | grep -x ell                   # verify the Greek pack
 ```
 
@@ -129,9 +134,12 @@ Mail reaches the store in two steps, and `sync` is only the second:
 
 1. **Stage.** With Microsoft 365, `python -m src.export.outlook_export --folder Inbox --bootstrap`
    stages mail through `outlook-cli`: the first run takes the 100 most recent
-   messages, later runs continue from the cursor it saves (`--state-path`, one
-   file per folder). Any other source writes staging batches itself; see "Bring
-   your own source" in the README.
+   messages, later runs continue from the cursor it saves. Each folder gets its
+   own cursor file under `$BRAIN_DATA_DIR/state` without `--state-path`
+   (`outlook_sync.json` for Inbox, `outlook_sync_archive.json` for Archive,
+   `outlook_sync_sent.json` for Sent Items), and a run given a cursor saved for
+   another folder exits 9 without touching it. Any other source writes staging
+   batches itself; see "Bring your own source" in the README.
 2. **Extract and load.** On a fresh store, `python -m src.extract.local && python -m src.cli load`,
    because `sync` skips an empty store. From then on `python -m src.cli sync`
    does both.

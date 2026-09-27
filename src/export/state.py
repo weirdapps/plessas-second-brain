@@ -93,6 +93,9 @@ class OutlookSyncState:
     messages_in_last_run: int = 0
     consecutive_failures: int = 0
     schema_version: int = OUTLOOK_STATE_SCHEMA_VERSION
+    # The folder this cursor walks. None in every file written before the field
+    # existed; such a cursor adopts the folder of its next run.
+    folder: str | None = None
 
 
 def load_outlook_sync_state(path: Path) -> OutlookSyncState:

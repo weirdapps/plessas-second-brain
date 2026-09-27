@@ -175,7 +175,13 @@ def test_a_dry_run_leaves_the_mark_alone(tmp_path):
     assert _mark(db_path) is None
 
 
-def test_limit_counts_emails_past_the_mark(tmp_path):
+# repo-autoupdate pulls new code onto the producer every hour but never copies
+# the wrappers, which run from ~/.local/bin. Until one is copied by hand the
+# nightly pass keeps calling "process-sharepoint --limit 200", so that line must
+# behave like the new one: read every email past the mark, fetch a bounded
+# number. 200 emails a night against 400-500 a weekday would have left the mark
+# further behind every night.
+def test_limit_does_not_bound_the_scan_past_the_mark(tmp_path):
     db_path, ids = _db(
         tmp_path,
         [("Archive", f"a {_url(1)} b"), ("Archive", f"c {_url(2)} d"), ("Archive", f"{_url(3)}")],
@@ -183,8 +189,37 @@ def test_limit_counts_emails_past_the_mark(tmp_path):
 
     _, fetched = _run(db_path, limit=2)
 
+    assert fetched == [_url(1), _url(2), _url(3)]
+    assert _mark(db_path) == ids[2]
+
+
+def test_limit_still_bounds_a_since_rescan(tmp_path):
+    db_path, _ = _db(
+        tmp_path,
+        [("Archive", f"a {_url(1)} b"), ("Archive", f"c {_url(2)} d"), ("Archive", f"{_url(3)}")],
+    )
+
+    _, fetched = _run(db_path, since="2026-09-01", limit=2)
+
     assert fetched == [_url(1), _url(2)]
-    assert _mark(db_path) == ids[1]
+
+
+def test_the_fetch_cap_is_on_unless_turned_off(tmp_path, monkeypatch):
+    seen: dict = {}
+    monkeypatch.setattr(cli, "cmd_process_sharepoint", lambda args: seen.update(vars(args)))
+    monkeypatch.setattr(cli, "install_llm_deadline_for_this_process", lambda: None)
+    monkeypatch.setenv("BRAIN_ROLE", "producer")
+    db = str(tmp_path / "x.db")
+
+    monkeypatch.setattr("sys.argv", ["brain", "--db", db, "process-sharepoint", "--limit", "200"])
+    cli.main()
+    assert seen["max_fetches"] == 100
+
+    monkeypatch.setattr(
+        "sys.argv", ["brain", "--db", db, "process-sharepoint", "--max-fetches", "0"]
+    )
+    cli.main()
+    assert seen["max_fetches"] == 0
 
 
 def test_since_rescans_by_date_and_leaves_the_mark_alone(tmp_path):

@@ -8,7 +8,7 @@ import json
 import re
 import sqlite3
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from src.export.teams_cli import TeamsCliAuthRequired, run_teams_cli
@@ -298,7 +298,8 @@ def pull_messages(
         {"chats_pulled", "messages_inserted", "errors", "deferred"}
     """
     now = datetime.now(UTC)
-    cutoff_iso = now.replace(year=now.year - 1).isoformat()
+    # timedelta, not replace(year=...), which raises on 29 February.
+    cutoff_iso = (now - timedelta(days=365)).isoformat()
 
     # Chats with a message since their last pull go first, then the rotation by
     # oldest pull. The deadline reaches only part of the inventory per run, and

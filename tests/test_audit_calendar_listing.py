@@ -5,7 +5,10 @@ earliest events of the window, however many it holds (mcp-1, teams-calendar-1,
 vps-runtime-1). The fake below behaves the same way over a synthetic calendar.
 """
 
-from datetime import datetime, timedelta
+import time
+from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from src.export import calendar_export
 from src.export.calendar_export import OUTLOOK_PAGE_SIZE
@@ -45,14 +48,21 @@ def _calendar() -> list[dict]:
     return events
 
 
+def _utc(value: str) -> datetime:
+    """A --from or --to as outlook-cli reads it: naive means this host's local
+    time (Date.parse), and Outlook compares it in UTC. Naive UTC out, to match
+    the events' DateTime."""
+    return datetime.fromisoformat(value).astimezone(UTC).replace(tzinfo=None)
+
+
 def _fake_cli(calendar: list[dict], calls: list[tuple[datetime, datetime]]):
     """list-calendar as outlook-cli answers it today: the events overlapping the
     window, earliest first, cut at one page."""
 
     def run(args):
         assert args[0] == "list-calendar"
-        start = datetime.fromisoformat(args[args.index("--from") + 1])
-        end = datetime.fromisoformat(args[args.index("--to") + 1])
+        start = _utc(args[args.index("--from") + 1])
+        end = _utc(args[args.index("--to") + 1])
         calls.append((start, end))
         overlapping = [
             e
@@ -161,8 +171,111 @@ def test_every_subdivision_is_logged(monkeypatch, caplog):
     full_pages = sum(
         1 for r in caplog.records if r.levelno == logging.WARNING and "full page" in r.message
     )
-    # Every call past one per chunk is half of a split.
-    assert full_pages and len(calls) - 2 == 2 * full_pages
+    # Every call past one per chunk lists part of a full page again, and each
+    # full page is listed again in one part or two.
+    assert full_pages and full_pages <= len(calls) - 2 <= 2 * full_pages
+
+
+@pytest.fixture(params=["UTC", "Europe/Athens", "America/New_York"])
+def host_zone(request, monkeypatch):
+    """The host's zone, in which outlook-cli reads a naive --from and --to. East
+    and west of UTC both, because reading a UTC start as local time errs late
+    on one side, and late loses events."""
+    monkeypatch.setenv("TZ", request.param)
+    time.tzset()
+    yield request.param
+    monkeypatch.undo()
+    time.tzset()
+
+
+def test_a_full_page_is_complete_up_to_its_last_start(monkeypatch, host_zone):
+    """list-calendar orders by start, so a full page holds every event that
+    starts before the last one on it, and only the rest is listed again. The
+    whole first half used to be, and split again and again around a busy
+    morning it already held."""
+    morning = datetime(2026, 10, 2, 6)
+    calendar = [_event(f"early-{n}", morning + timedelta(minutes=30 * n), 30) for n in range(11)]
+    calendar += [_event(f"late-{n}", datetime(2026, 10, 20, 9 + n), 60) for n in range(4)]
+    calls: list = []
+    monkeypatch.setattr(calendar_export, "run_outlook_cli", _fake_cli(calendar, calls))
+    failures: list[str] = []
+
+    events = calendar_export.list_events(
+        datetime(2026, 10, 1), datetime(2026, 10, 31), failures=failures
+    )
+
+    ids = [e["Id"] for e in events]
+    assert failures == []
+    assert sorted(ids) == sorted(e["Id"] for e in calendar)
+    assert len(ids) == len(set(ids))
+    # The month, the rest of its first half from the tenth start on, its second half.
+    assert len(calls) == 3
+
+
+def test_a_half_the_page_already_holds_is_not_listed_again(monkeypatch, host_zone):
+    day = datetime(2026, 10, 8, 6)
+    calendar = [_event(f"day-{n}", day + timedelta(minutes=30 * n), 30) for n in range(12)]
+    calls: list = []
+    monkeypatch.setattr(calendar_export, "run_outlook_cli", _fake_cli(calendar, calls))
+    failures: list[str] = []
+
+    events = calendar_export.list_events(
+        datetime(2026, 10, 1), datetime(2026, 10, 11), failures=failures
+    )
+
+    assert (failures, sorted(e["Id"] for e in events)) == ([], sorted(e["Id"] for e in calendar))
+    tenth = day + timedelta(minutes=30 * 9)
+    assert all(end >= tenth for _, end in calls), "a window the first page holds was listed"
+
+
+def test_an_event_of_no_length_at_the_cut_is_still_listed(monkeypatch, host_zone):
+    """The rest is listed from a second before the tenth start: an event of no
+    length that starts with the tenth and was cut off with the page need not
+    overlap a window that opens exactly at its start."""
+    day = datetime(2026, 10, 8, 6)
+    calendar = [_event(f"day-{n}", day + timedelta(minutes=30 * n), 30) for n in range(10)]
+    calendar.append(_event("reminder", day + timedelta(minutes=30 * 9), 0))
+    calls: list = []
+    monkeypatch.setattr(calendar_export, "run_outlook_cli", _fake_cli(calendar, calls))
+
+    events = calendar_export.list_events(datetime(2026, 10, 1), datetime(2026, 10, 11), failures=[])
+
+    assert "reminder" in {e["Id"] for e in events}
+
+
+def _busy_month() -> list[dict]:
+    """Twelve meetings every working day, as in the busiest real weeks: 325
+    events over the thirty-seven days an hourly run lists."""
+    first = datetime(2026, 6, 8)
+    events = []
+    for day in range(37):
+        date = first + timedelta(days=day)
+        if date.weekday() >= 5:
+            continue
+        events += [
+            _event(f"d{day}-{n}", date + timedelta(hours=6, minutes=40 * n), 60 if n % 3 else 30)
+            for n in range(12)
+        ]
+    events.append(_event("offsite", first + timedelta(days=9, hours=6), 3 * 24 * 60))
+    return events
+
+
+def test_a_busy_month_is_listed_inside_the_hourly_call_bound(monkeypatch, host_zone):
+    """Splitting every full page into two whole halves took 146 to 168 calls
+    here, over the bound of 120, so every busy week's hourly run exited 1,
+    held its heartbeat and never marked a cancelled event."""
+    calendar = _busy_month()
+    calls: list = []
+    monkeypatch.setattr(calendar_export, "run_outlook_cli", _fake_cli(calendar, calls))
+    failures: list[str] = []
+
+    events = calendar_export.list_events(
+        datetime(2026, 6, 8), datetime(2026, 7, 15), failures=failures
+    )
+
+    assert failures == []
+    assert sorted(e["Id"] for e in events) == sorted(e["Id"] for e in calendar)
+    assert len(calls) <= calendar_export.DEFAULT_LIST_CALLS
 
 
 # ------------------------------------------------------------ what the run makes of it

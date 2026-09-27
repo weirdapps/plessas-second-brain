@@ -2,7 +2,7 @@
 
 import logging
 from collections.abc import Iterator
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from src.export.outlook_cli import OutlookCliAuthRequired, run_outlook_cli
 
@@ -80,6 +80,37 @@ def _merged(*pages: list[dict]) -> list[dict]:
     return sorted(merged, key=lambda raw: (raw.get("Start") or {}).get("DateTime") or "")
 
 
+def _complete_until(page: list[dict], start: datetime) -> datetime:
+    """How far a full page is known to be complete, in the time ``start`` keeps.
+
+    list-calendar asks for the window in order of start, so a page holds every
+    event that starts before the latest start on it. The answer is a second
+    before that start: an event of no length that starts there, cut off with the
+    rest of the page, need not overlap a window that opens exactly at its start.
+    A start that cannot be read only makes the answer earlier, which costs a
+    call and loses nothing.
+    """
+    complete_until = start
+    for raw in page:
+        when = raw.get("Start") or {}
+        value = when.get("DateTime")
+        if not value or when.get("TimeZone") != "UTC":
+            continue
+        try:
+            began = datetime.fromisoformat(value)
+        except ValueError:
+            continue
+        if began.tzinfo is None:
+            began = began.replace(tzinfo=UTC)
+        # outlook-cli reads a naive --from and --to as this host's local time.
+        if start.tzinfo is None:
+            began = began.astimezone().replace(tzinfo=None)
+        else:
+            began = began.astimezone(start.tzinfo)
+        complete_until = max(complete_until, began - timedelta(seconds=1))
+    return complete_until
+
+
 def list_events(
     since: datetime,
     until: datetime,
@@ -91,7 +122,9 @@ def list_events(
 
     A span that comes back as a full page (OUTLOOK_PAGE_SIZE events) is listed
     again as two halves split at its midpoint, recursively, and the answers are
-    merged by event Id. A full page over MIN_SPLIT_SPAN or less, and reaching
+    merged by event Id. The page is complete up to its latest start, so the
+    first half is listed again only from there, and not at all once that lies
+    past the midpoint. A full page over MIN_SPLIT_SPAN or less, and reaching
     ``max_calls``, are failures: the events listed are still returned, but the
     window is not complete.
 
@@ -154,12 +187,24 @@ def list_events(
         # A warning, because calendar-sync.log is stderr and cli.py configures no
         # logging: an info line would never reach it.
         middle = (start + (end - start) / 2).replace(microsecond=0)
+        # Listed again whole, the first half was split again and again around a
+        # busy morning the page already held: a busy month took up to 152 calls
+        # against the bound of 120, so the hourly run failed every busy week.
+        resume = _complete_until(result, start)
+        if resume >= middle:
+            logger.warning(
+                f"{window}: a full page of {len(result)} events, which may be cut short; "
+                f"it holds everything before {middle:%Y-%m-%d %H:%M}, so only the "
+                f"second half is listed again"
+            )
+            return _merged(list_span(middle, end), result)
         logger.warning(
             f"{window}: a full page of {len(result)} events, which may be cut short; "
-            f"listing it again in two halves split at {middle:%Y-%m-%d %H:%M}"
+            f"listing it again in two halves split at {middle:%Y-%m-%d %H:%M}, "
+            f"the first from {resume:%Y-%m-%d %H:%M:%S}, where the page stops"
         )
         # The page itself too, so a half that fails loses nothing it had listed.
-        return _merged(list_span(start, middle), list_span(middle, end), result)
+        return _merged(list_span(resume, middle), list_span(middle, end), result)
 
     all_events: list[dict] = []
     for chunk_start, chunk_end in chunk_date_range(since, until):

@@ -26,7 +26,7 @@ DEFAULT_CONTEXT_LIMIT = 20
 
 
 def resolve_person(
-    conn: sqlite3.Connection, name_or_email: str
+    conn: sqlite3.Connection, name_or_email: str, *, local_part: bool = True
 ) -> tuple[sqlite3.Row | None, int, list[dict]]:
     """The person a name or email means, how many people matched, and the next three.
 
@@ -62,7 +62,9 @@ def resolve_person(
     # And the local part of an address, where one word of four letters or more
     # starts a token or follows a one-letter initial ('jexample'), so a name
     # stored only in Greek is found by the Latin surname its address spells.
-    local = phrase if re.fullmatch(r"[a-z0-9]{4,}", phrase) else ""
+    # recall turns that off for the dossier it attaches on its own: there a topic
+    # word ('data', 'info') started some mailbox's local part and brought it in.
+    local = phrase if local_part and re.fullmatch(r"[a-z0-9]{4,}", phrase) else ""
     where = r"""
         (sb_fold(p.name) LIKE '%' || :phrase || '%' AND sb_match(p.name, :anchor, '', '') > 0)
         OR (:local <> '' AND (LOWER(p.email) LIKE :local || '%@%'
@@ -94,6 +96,8 @@ def get_person_context(
     name_or_email: str,
     days: int = 365,
     limit: int = DEFAULT_CONTEXT_LIMIT,
+    *,
+    local_part: bool = True,
 ) -> dict:
     """Return rich context for a person.
 
@@ -104,6 +108,8 @@ def get_person_context(
         limit: Max rows per list (topics, decisions, open_actions). Each list is
             accompanied by a `<name>_total` giving the unbounded count.
             recent_emails holds at most min(limit, 10), with no total.
+        local_part: Also match a name against the start of an address's local
+            part (see resolve_person).
 
     Returns:
         Dict with person info, email_count, recent_emails, topics,
@@ -113,7 +119,9 @@ def get_person_context(
 
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
 
-    person_row, match_count, other_candidates = resolve_person(conn, name_or_email)
+    person_row, match_count, other_candidates = resolve_person(
+        conn, name_or_email, local_part=local_part
+    )
 
     if not person_row:
         return {

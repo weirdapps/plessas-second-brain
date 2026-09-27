@@ -1298,7 +1298,7 @@ def cmd_sync(args):
     # Step 2: Extract (local mode)
     engine = getattr(args, "engine", None) or EXTRACT_ENGINE
     print(f"\nStep 2: Extracting new emails (engine: {engine})...")
-    from src.extract.local import run_extraction
+    from src.extract.local import run_extraction, stop_requested
 
     extraction_run = run_extraction(
         limit=args.limit or 0,
@@ -1306,6 +1306,12 @@ def cmd_sync(args):
         workers=args.workers or 1,
         deadline_s=_extract_deadline_s(),
     )
+    # A stop signal ends extraction at a checkpoint. The steps after it used to
+    # carry on regardless, until systemd's SIGKILL 90 s later; now they do not
+    # start. 143 is 128 + SIGTERM, which is what systemd sends.
+    if stop_requested():
+        print("Stop requested during extraction; the later steps did not run", file=sys.stderr)
+        return 143
 
     # Step 3: Load into DB
     print("\nStep 3: Loading into database...")
@@ -1423,6 +1429,12 @@ def cmd_sync(args):
         from src.extract.local import run_conversation_extraction
 
         run_conversation_extraction(deadline_s=CONVERSATION_SYNC_DEADLINE_S)
+        if stop_requested():  # as after Step 2
+            print(
+                "Stop requested during conversation extraction; the later steps did not run",
+                file=sys.stderr,
+            )
+            return 143
         conv_loaded = load_convs(db_path)
         print(f"  Loaded {conv_loaded} conversations")
         if conv_loaded:

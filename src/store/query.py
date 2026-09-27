@@ -1102,17 +1102,23 @@ def meeting_prep(
         dossier["resolved_email"] = person_row["email"]
         person_id = person_row["id"]
 
-        # Recent emails
+        # One row per email, as in person_context: email_people is keyed by
+        # role too, so joined through it an email where the person held two
+        # roles came back twice (the DISTINCT took in the role), and so did its
+        # decisions and actions. The role shown is one of theirs, sender first.
         cursor = conn.execute(
             """
-            SELECT DISTINCT e.id as email_id, e.date_received as date,
-                e.subject, e.summary, ep.role_in_email as role, e.sentiment
+            SELECT e.id as email_id, e.date_received as date, e.subject, e.summary,
+                (SELECT ep.role_in_email FROM email_people ep
+                  WHERE ep.email_id = e.id AND ep.person_id = ?
+                  ORDER BY ep.role_in_email <> 'sender', ep.role_in_email LIMIT 1) as role,
+                e.sentiment
             FROM emails e
-            JOIN email_people ep ON e.id = ep.email_id
-            WHERE ep.person_id = ? AND e.date_received >= ?
+            WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+              AND e.date_received >= ?
             ORDER BY e.date_received DESC LIMIT ?
         """,
-            (person_id, cutoff, limit_per_person),
+            (person_id, person_id, cutoff, limit_per_person),
         )
         dossier["emails"] = [dict(r) for r in cursor.fetchall()]
 
@@ -1129,8 +1135,8 @@ def meeting_prep(
                 e.subject as email_subject
             FROM decisions d
             JOIN emails e ON d.email_id = e.id
-            JOIN email_people ep ON e.id = ep.email_id
-            WHERE ep.person_id = ? AND e.date_received >= ?
+            WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+              AND e.date_received >= ?
             ORDER BY date DESC LIMIT 10
         """,
             (person_id, cutoff),
@@ -1144,8 +1150,8 @@ def meeting_prep(
                 e.subject as email_subject
             FROM action_items a
             JOIN emails e ON a.email_id = e.id
-            JOIN email_people ep ON e.id = ep.email_id
-            WHERE ep.person_id = ? AND a.status = 'open'
+            WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+              AND a.status = 'open'
             ORDER BY a.deadline IS NULL, a.deadline ASC LIMIT 10
         """,
             (person_id,),
@@ -1159,8 +1165,8 @@ def meeting_prep(
             FROM email_topics et
             JOIN topics t ON et.topic_id = t.id
             JOIN emails e ON et.email_id = e.id
-            JOIN email_people ep ON e.id = ep.email_id
-            WHERE ep.person_id = ? AND e.date_received >= ?
+            WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+              AND e.date_received >= ?
             GROUP BY t.id ORDER BY count DESC LIMIT 5
         """,
             (person_id, cutoff),
@@ -1179,6 +1185,9 @@ def meeting_prep(
             "action_items": [],
         }
 
+        # t.name LIKE matches every topic whose name holds the words, and joined
+        # to them an email tagged with two of those repeated each of its items.
+        # Filtered by email instead, each item is listed once.
         cursor = conn.execute(
             """
             SELECT d.decision, d.decided_by,
@@ -1186,9 +1195,9 @@ def meeting_prep(
                    e.subject as email_subject
             FROM decisions d
             JOIN emails e ON d.email_id = e.id
-            JOIN email_topics et ON e.id = et.email_id
-            JOIN topics t ON et.topic_id = t.id
-            WHERE t.name LIKE ? AND e.date_received >= ?
+            WHERE e.id IN (SELECT et.email_id FROM email_topics et
+                           JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
+              AND e.date_received >= ?
             ORDER BY date DESC LIMIT 20
         """,
             (f"%{topic_normalized}%", cutoff),
@@ -1200,9 +1209,9 @@ def meeting_prep(
             SELECT kf.fact, e.date_received as date, e.subject
             FROM key_facts kf
             JOIN emails e ON kf.email_id = e.id
-            JOIN email_topics et ON e.id = et.email_id
-            JOIN topics t ON et.topic_id = t.id
-            WHERE t.name LIKE ? AND e.date_received >= ?
+            WHERE e.id IN (SELECT et.email_id FROM email_topics et
+                           JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
+              AND e.date_received >= ?
             ORDER BY e.date_received DESC LIMIT 20
         """,
             (f"%{topic_normalized}%", cutoff),
@@ -1214,9 +1223,9 @@ def meeting_prep(
             SELECT a.task, a.owner, a.deadline, a.status
             FROM action_items a
             JOIN emails e ON a.email_id = e.id
-            JOIN email_topics et ON e.id = et.email_id
-            JOIN topics t ON et.topic_id = t.id
-            WHERE t.name LIKE ? AND a.status = 'open'
+            WHERE e.id IN (SELECT et.email_id FROM email_topics et
+                           JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
+              AND a.status = 'open'
             ORDER BY a.deadline IS NULL, a.deadline ASC LIMIT 20
         """,
             (f"%{topic_normalized}%",),

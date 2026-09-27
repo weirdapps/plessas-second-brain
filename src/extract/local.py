@@ -81,7 +81,8 @@ TIMEOUT = "timeout"
 # A reply the model gave that could not be used: a refusal, or JSON that does not
 # parse. It counts against EMAIL_MAX_ATTEMPTS exactly as a FAULT does, but it
 # proves the model answered, so unlike a retired model id or a 400 it is no sign
-# that the model is down (see run_extraction's model counts).
+# that the model is down (see run_extraction's model counts, which leave out
+# emails that already failed in an earlier run, as for any failure).
 UNUSABLE = "unusable"
 
 
@@ -386,9 +387,9 @@ def run_extraction(
     Returns {"extracted", "failed", "quota_paused", "model_successes",
     "model_failures", "model_unusable"}; quota_paused is True when a quota pause
     ended a run that had a deadline. The model counts are the emails that went to
-    the model and came back extracted, failed (less the failures of emails that
-    had already failed in an earlier run), or answered with a reply that could
-    not be used. News is extracted without it and counts in
+    the model and came back extracted, failed, or answered with a reply that
+    could not be used; the last two leave out emails that had already failed in
+    an earlier run. News is extracted without it and counts in
     neither, so a run in which the model failed every email still reports
     "extracted" above zero on a day with news, and only these tell.
     """
@@ -549,10 +550,10 @@ def run_extraction(
                 i += 1
             else:
                 total_failed += 1
-                if not is_news(email):
+                if not is_news(email) and msg_id not in carried:
                     if failure == UNUSABLE:
                         model_unusable += 1
-                    elif msg_id not in carried:
+                    else:
                         model_failures += 1
                 if is_quota:
                     consecutive_failures += 1
@@ -669,10 +670,10 @@ def run_extraction(
                     else:
                         with _state_lock:
                             total_failed += 1
-                            if not is_news(email):
+                            if not is_news(email) and msg_id not in carried:
                                 if failure == UNUSABLE:
                                     model_unusable += 1
-                                elif msg_id not in carried:
+                                else:
                                     model_failures += 1
                             if is_quota:
                                 consecutive_failures += 1

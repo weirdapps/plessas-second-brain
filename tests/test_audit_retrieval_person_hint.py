@@ -53,8 +53,8 @@ def test_a_query_at_the_start_of_a_word_still_attaches_the_person(conn, query):
 def test_the_person_attached_is_the_one_resolve_person_finds():
     """'AI' starts a word of 'AI Compliance' and sits inside the busier Michail.
 
-    recall attaches the person resolve_person finds, which matches at the start
-    of a word, so it is the one person_context gives for the same words, and the
+    recall attaches the person resolve_person finds by name, which matches at the
+    start of a word, so for a name it is the one person_context gives, and the
     busier in-word match is never attached.
     """
     c = create_database(":memory:")

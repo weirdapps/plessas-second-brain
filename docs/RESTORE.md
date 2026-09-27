@@ -58,6 +58,19 @@ rotation date in its filename.
 Prerequisites: `zstd`, `openssl` and `sqlite3` on `PATH`, plus the key file.
 
 ```bash
+# 0. Stop every writer before touching the database, and keep them stopped
+#    until the last step. On the producer:
+systemctl --user stop 'sb-*.timer' 'sb-*.service'
+# On each replica, unload the hourly pull so it cannot copy a half-swapped
+# state (launchctl disable alone does not stop a loaded job):
+launchctl bootout "gui/$(id -u)/<db-pull label>"
+```
+
+A writer still running when the file is swapped keeps the old file open. Its
+next commits go into the unlinked old inode and are lost, and deleting a live
+`-wal` under it (step 4) throws away what it had not checkpointed yet.
+
+```bash
 # 1. Decrypt, then decompress. Note the -d on both.
 openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/path/to/backup.key \
   -in brain-20260101.db.zst.enc | zstd -q -d > brain.db
@@ -87,15 +100,48 @@ will tell you.
 ```bash
 # 4. Put it in place with the WAL sidecars removed. They belong to the old
 #    file, and a stale -wal replayed over a fresh database is a corruption,
-#    not a recovery.
-rm -f "$BRAIN_DATA_DIR/brain.db-wal" "$BRAIN_DATA_DIR/brain.db-shm"
-mv brain.db "$BRAIN_DATA_DIR/brain.db"
+#    not a recovery. With BRAIN_DATA_DIR unset the data home is the repo's
+#    data/ directory, which may be a symlink: resolve it, and check the path
+#    before deleting anything under it.
+DATA="${BRAIN_DATA_DIR:-$(cd /path/to/plessas-second-brain/data && pwd -P)}"
+ls -la "$DATA/brain.db"
+rm -f "$DATA/brain.db-wal" "$DATA/brain.db-shm"
+mv brain.db "$DATA/brain.db"
 ```
 
-The embedding index is not in the database. `data/embeddings.npz` is a separate
-file, is not covered by these snapshots, and semantic search degrades to
-keyword-only without it. Rebuild it with `python -m src.cli embed --force`, or
-restore it from wherever you keep it.
+The embedding index is not in the database. `embeddings.npz` is a separate file
+in the same data home, is not covered by these snapshots, and semantic search
+degrades to keyword-only without it.
+
+**Discard an `embeddings.npz` newer than the restored snapshot; never keep it.**
+Row ids are `INTEGER PRIMARY KEY` without `AUTOINCREMENT`, so after the restore
+new rows reuse the ids of the rows the snapshot lost. The newer index already
+maps those ids to the lost rows' vectors, an incremental `embed` skips any id it
+already holds, and semantic search then answers with the wrong rows for good.
+Keep an index only if it was taken at the same moment as the snapshot.
+Otherwise rebuild it, from the repo directory:
+
+```bash
+# 5. Rebuild the embedding index against the restored rows.
+mv "$DATA/embeddings.npz" "$DATA/embeddings.npz.pre-restore"
+python -m src.cli embed --force   # emails, attachments, conversations
+python -c 'from src.config import DEFAULT_DB; from src.store.schema import get_connection; from src.store.embeddings import build_teams_index; print(build_teams_index(get_connection(str(DEFAULT_DB))))'   # Teams threads
+```
+
+The export cursors are not in the snapshot either, and they are now ahead of
+it. Each `outlook_sync*.json` under `$DATA/state` still holds the newest mail
+the lost database had seen, so the next run lists only mail after that and the
+gap between `last_sync_date` and the cursor is never fetched again. Before
+restarting, set `last_seen_received_at` in each of them to a time at or before
+`last_sync_date`; the loader skips mail it already holds by message id. Check
+any other source you stage from for a cursor of its own.
+
+```bash
+# 6. Start the writers again. On the producer:
+systemctl --user start 'sb-*.timer'
+# On each replica, load the pull again:
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/<db-pull plist>
+```
 
 `scripts/backup_db.py` also exposes `decrypt_decompress()` if you would rather
 do step 1 in Python than in a shell pipeline. It is the exact inverse of the

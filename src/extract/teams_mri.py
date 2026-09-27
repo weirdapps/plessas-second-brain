@@ -137,6 +137,27 @@ def resolve_mris(conn: sqlite3.Connection, max_per_run: int = 50) -> dict:
     # people(id), and a teams_mri_resolution.person_id can outlive the people row
     # that dedup merged away, so without it this statement plants a dangling
     # foreign key. It guards both halves: the value written and the rows chosen.
+    #
+    # First, the cache itself. person_id is looked up once, when the MRI is
+    # resolved, so a colleague seen in Teams before any email created their
+    # people row stayed unlinked for good (21 senders, 305 messages). A resolved
+    # row with no person is matched against people again on every run.
+    conn.execute(
+        """
+        UPDATE teams_mri_resolution
+           SET person_id = (
+                 SELECT p.id FROM people p
+                  WHERE LOWER(p.email) = LOWER(teams_mri_resolution.email)
+                  ORDER BY p.id LIMIT 1
+               )
+         WHERE status = 'resolved'
+           AND person_id IS NULL
+           AND email IS NOT NULL
+           AND EXISTS (
+                 SELECT 1 FROM people p WHERE LOWER(p.email) = LOWER(teams_mri_resolution.email)
+               )
+        """
+    )
     conn.execute(
         """
         UPDATE teams_messages

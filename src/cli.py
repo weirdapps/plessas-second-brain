@@ -1312,6 +1312,16 @@ def cmd_sync(args):
     if stop_requested():
         print("Stop requested during extraction; the later steps did not run", file=sys.stderr)
         return 143
+    # Every email that went to the model failed there: a retired model id, a 400
+    # on every request, a refusal of everything. The rest of the sync still runs,
+    # but the run must not read as fresh or green, as it did with rc 0 and a new
+    # last_sync_date while no mail loaded. Not keyed on `extracted`, which news
+    # (extracted without the model) keeps above zero.
+    model_down = (
+        isinstance(extraction_run, dict)
+        and extraction_run.get("model_failures", 0) > 0
+        and not extraction_run.get("model_successes", 0)
+    )
 
     # Step 3: Load into DB
     print("\nStep 3: Loading into database...")
@@ -1498,10 +1508,11 @@ def cmd_sync(args):
     conn = get_conn(db_path)
     migrate_add_sync_metadata(conn)
     now = datetime.now().isoformat()
-    conn.execute(
-        "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('last_sync_date', ?)",
-        (now,),
-    )
+    if not model_down:
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('last_sync_date', ?)",
+            (now,),
+        )
     conn.execute(
         "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('last_sync_count', ?)",
         (str(count),),
@@ -1509,7 +1520,10 @@ def cmd_sync(args):
     conn.commit()
     conn.close()
 
-    print(f"\nSync complete. {count} emails added. Sync timestamp: {now}")
+    if model_down:
+        print(f"\nSync complete. {count} emails added. Sync timestamp left at {last_sync}.")
+    else:
+        print(f"\nSync complete. {count} emails added. Sync timestamp: {now}")
 
     # Everything else ran and the rest of the mail stays pending, but extraction
     # did not finish. Before the deadline existed the same pause slept past the
@@ -1518,6 +1532,15 @@ def cmd_sync(args):
     # keeps it out of its own status by design, with those two units behind it.
     if isinstance(extraction_run, dict) and extraction_run.get("quota_paused"):
         print("Extraction ended on a quota pause; the rest stays pending", file=sys.stderr)
+        return 75
+    # The same code: the run finished and failed, and a restart would repeat it
+    # (RestartPreventExitStatus=75 on both backlog units).
+    if model_down:
+        print(
+            f"The model failed all {extraction_run['model_failures']} emails sent to it "
+            "and extracted none; last_sync_date was not advanced",
+            file=sys.stderr,
+        )
         return 75
     return 0
 

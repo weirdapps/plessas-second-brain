@@ -315,6 +315,12 @@ def cmd_process_attachments(args):
     # limit is no safer than it was in the hourly sync.
     deadline_s = getattr(args, "deadline_s", None)
 
+    # A phase that failed everything it tried. The exit code was 0 whatever the
+    # counts, and run_stage in sb-attachment-pass.sh judges only the exit code,
+    # so a night where every attachment failed was logged as a passing stage.
+    # Failures beside successes are per-item, and the other phase still runs.
+    phase_failed = False
+
     if phase is None or phase == 1:
         print("Phase 1: Local text extraction...")
         stats = run_phase1(db_path, limit=limit, file_type=file_type, deadline_s=deadline_s)
@@ -324,6 +330,7 @@ def cmd_process_attachments(args):
         print(f"  Skipped: {stats['skipped']}")
         if stats.get("deferred"):
             print(f"  Deferred (out of time): {stats['deferred']}")
+        phase_failed |= stats["failed"] > 0 and stats["extracted"] == 0
 
     if phase is None or phase == 2:
         workers = getattr(args, "workers", 1) or 1
@@ -336,8 +343,13 @@ def cmd_process_attachments(args):
         print(f"  Failed: {stats['failed']}")
         if stats.get("deferred"):
             print(f"  Deferred (out of time): {stats['deferred']}")
+        phase_failed |= stats["failed"] > 0 and stats["extracted"] == 0
 
     print("\nAttachment processing complete.")
+    if phase_failed:
+        print("A phase failed every attachment it tried", file=sys.stderr)
+        return 1
+    return 0
 
 
 def cmd_register_attachments(args):
@@ -561,27 +573,58 @@ def cmd_process_sharepoint(args):
 
     # Build query. Links are read from the markup: an HTML body is kept in
     # email_html, the text in content has no hrefs.
+    #
+    # The scan starts past the highest emails.id it has already read. It used
+    # to read the newest N rows by date_received, and the nightly N of 200 was
+    # a few hours of a weekday's 400-500 rows, so links in the rest of the day
+    # were never recorded, and retry_candidates only retries recorded links.
+    # An id also catches Archive and Sent mail loaded late with an old date.
+    # News carries no links and only used up the window. --since is the manual
+    # backfill: it rescans by date from the start and leaves the mark alone.
     query = (
         "SELECT e.id, e.message_id, e.content, e.date_received, h.html FROM emails e "
-        "LEFT JOIN email_html h ON h.email_id = e.id WHERE e.content IS NOT NULL"
+        "LEFT JOIN email_html h ON h.email_id = e.id WHERE e.content IS NOT NULL "
+        "AND COALESCE(e.mailbox_name, '') <> 'News'"
     )
-    params = []
+    params: list = []
+
+    mark_row = conn.execute(
+        "SELECT value FROM sync_metadata WHERE key = 'sharepoint_scan_last_id'"
+    ).fetchone()
+    scan_mark = int(mark_row[0]) if mark_row else 0
 
     if args.since:
         query += " AND e.date_received >= ?"
         params.append(args.since)
+    else:
+        query += " AND e.id > ?"
+        params.append(scan_mark)
 
-    query += " ORDER BY e.date_received DESC"
+    query += " ORDER BY e.id"
 
-    if args.limit and args.limit > 0:
+    # --limit bounds a --since rescan only. repo-autoupdate pulls this code onto
+    # the producer without copying the wrappers, and the old nightly line passes
+    # --limit 200: bounding the mark scan with it would read 200 emails a night
+    # against 400-500 a weekday, and the mark would never catch up.
+    if args.since and args.limit and args.limit > 0:
         query += " LIMIT ?"
         params.append(args.limit)
+
+    # The regex scan is cheap; the fetches are not. With no mark yet the first
+    # run finds the whole backlog, and this keeps it inside the nightly unit's
+    # TimeoutStartSec: the mark stops before the first email it could not
+    # finish, and the next run starts there.
+    max_fetches = getattr(args, "max_fetches", 0) or 0
 
     print("Scanning emails for SharePoint URLs...")
     if args.since:
         print(f"  Filtering to emails after {args.since}")
-    if args.limit and args.limit > 0:
+    else:
+        print(f"  Starting past email id {scan_mark}")
+    if args.since and args.limit and args.limit > 0:
         print(f"  Limiting to {args.limit} emails")
+    if max_fetches > 0 and not args.dry_run:
+        print(f"  Fetching at most {max_fetches} new URLs")
     if args.dry_run:
         print("  DRY RUN — scan and count only, no fetching")
     print()
@@ -670,6 +713,10 @@ def cmd_process_sharepoint(args):
                 break
 
     # Scan emails for new URLs (skip anything already fetched or attempted).
+    # scanned_to is the last email every link of which was dealt with.
+    scanned_to = scan_mark
+    fetches = 0
+    capped = False
     if not stats["auth_required"]:
         cursor = conn.execute(query, params)
         for row in cursor:
@@ -677,26 +724,37 @@ def cmd_process_sharepoint(args):
             stats["emails_scanned"] += 1
 
             urls = extract_sharepoint_urls(markup_or_text(content, html))
-            if not urls:
-                continue
-
             stats["urls_found"] += len(urls)
 
             for url in urls:
                 if url in existing_urls or url in attempted:
                     continue
+                if not args.dry_run and max_fetches > 0 and fetches >= max_fetches:
+                    capped = True
+                    break
                 attempted.add(url)
                 stats["urls_new"] += 1
 
                 if args.dry_run:
                     continue
 
+                fetches += 1
                 if _fetch_one(url, message_id):
                     break
 
-            if stats["auth_required"]:
+            if stats["auth_required"] or capped:
                 break
+            scanned_to = email_id
 
+    # Only a real pass over the mark's own range moves it: a dry run fetched
+    # nothing, and a --since backfill did not read every id above the mark.
+    if not args.dry_run and not args.since and scanned_to > scan_mark:
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_metadata (key, value) "
+            "VALUES ('sharepoint_scan_last_id', ?)",
+            (str(scanned_to),),
+        )
+        conn.commit()
     conn.close()
 
     print("\nSharePoint processing complete:")
@@ -708,8 +766,14 @@ def cmd_process_sharepoint(args):
         print(f"  URLs failed: {stats['urls_failed']}")
         if stats["urls_skipped_external"]:
             print(f"  External hosts skipped (no session): {stats['urls_skipped_external']}")
+        if capped:
+            print(f"  Fetch cap of {max_fetches} reached; the next run continues from here")
     if stats["auth_required"]:
         print(f"\n⚠ Auth required — run 'sharepoint-cli login --host {SHAREPOINT_HOST}' and retry")
+        # The warning alone left the nightly stage green while new links piled
+        # up unfetched. run_stage in sb-attachment-pass.sh judges the exit code.
+        return EXIT_REAUTH
+    return 0
 
 
 def cmd_reverse_ingest(args):
@@ -1527,6 +1591,7 @@ def cmd_teams_sync(args):
     conn = get_connection(db_path)
     run_migrations(conn)
 
+    pull_failed = False
     if not getattr(args, "skip_pull", False):
         print("Step 1/6: discovering chats + channels...")
         d = discover_chats(conn, scope="all")
@@ -1546,6 +1611,12 @@ def cmd_teams_sync(args):
                 else ""
             )
         )
+        # pull_messages re-raises only an expired session and counts every other
+        # failure per chat, so a service-wide 403, 429 or 5xx arrives here as
+        # errors with nothing pulled. That returned 0, and sb-teams-sync.sh wrote
+        # 'ok' over a dead pull for as long as it lasted. Some chats pulled is a
+        # partial run, not a failed one.
+        pull_failed = p["errors"] > 0 and p["chats_pulled"] == 0
     else:
         print("Steps 1+2 SKIPPED — --skip-pull set.")
 
@@ -1578,6 +1649,14 @@ def cmd_teams_sync(args):
 
     conn.close()
     print("teams-sync complete.")
+
+    # The later steps still ran on what was already stored. 5 is "upstream
+    # misbehaved", the same code as the M365 CLIs'. Extraction failures do not
+    # count: one poison thread would otherwise keep the unit red every hour.
+    if pull_failed:
+        print(f"Every chat pull failed ({p['errors']} errors, 0 chats pulled)", file=sys.stderr)
+        return 5
+    return 0
 
 
 def cmd_teams_search(args):
@@ -2508,9 +2587,26 @@ def main():
     parser_process_sp = subparsers.add_parser(
         "process-sharepoint", help="Scan emails for SharePoint URLs and fetch them"
     )
-    parser_process_sp.add_argument("--since", type=str, help="Only scan emails after YYYY-MM-DD")
     parser_process_sp.add_argument(
-        "--limit", type=int, default=0, help="Max emails to scan (0 = all, default 0)"
+        "--since",
+        type=str,
+        help="Rescan emails received on or after YYYY-MM-DD, ignoring and keeping the scan mark",
+    )
+    parser_process_sp.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Max emails to rescan with --since (0 = all, default 0); the scan past the "
+        "mark always reads every email",
+    )
+    # On by default, so any invocation stays inside the nightly unit's timeout,
+    # the stale wrapper line included (see the --limit comment in the command).
+    parser_process_sp.add_argument(
+        "--max-fetches",
+        type=int,
+        default=100,
+        dest="max_fetches",
+        help="Max new URLs to fetch this run; the rest wait for the next (0 = no cap, default 100)",
     )
     parser_process_sp.add_argument(
         "--dry-run", action="store_true", help="Scan and count only, no fetching"

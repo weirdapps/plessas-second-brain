@@ -11,6 +11,32 @@ from src.store.query import _sanitize_fts5_query, fts5_query_variants
 
 logger = logging.getLogger(__name__)
 
+# A conversation is in a workspace when the filter is in its path or its project
+# name. Callers pass either: the path is the documented form and what
+# recent_conversations filters on, and the project name is its basename. The
+# summary branch matched only the path and the turn branch only the name, so a
+# path filter dropped every turn-level hit. Three parameters: _workspace_args.
+_IN_WORKSPACE = (
+    "(? = '' OR LOWER(c.workspace) LIKE LOWER(?) OR LOWER(c.project_name) LIKE LOWER(?))"
+)
+
+
+def _workspace_args(workspace: str | None) -> tuple[str, str, str]:
+    ws = workspace or ""
+    return ws, f"%{ws}%", f"%{ws}%"
+
+
+def conversation_ids_in_workspace(conn: sqlite3.Connection, workspace: str) -> set[int]:
+    """The ids of the conversations in `workspace`, by the keyword search's rule.
+
+    Semantic search ranks among these, so its limit counts matches in the
+    workspace, as the keyword search's does.
+    """
+    rows = conn.execute(
+        f"SELECT c.id FROM conversations c WHERE {_IN_WORKSPACE}", _workspace_args(workspace)
+    )
+    return {row[0] for row in rows}
+
 
 def search_conversations_keyword(
     conn: sqlite3.Connection,
@@ -59,22 +85,22 @@ def _conversation_hits(
     left this empty and sent the caller to the any-token fallback.
     """
     results: list[dict] = []
-    ws = workspace or ""
+    in_workspace = _workspace_args(workspace)
 
     # Search conversation-level summaries
     rows = conn.execute(
-        """
+        f"""
         SELECT c.id, c.session_id, c.started_at, c.project_name,
                c.workspace, c.summary, c.turn_count,
                snippet(conversations_fts, 0, '>>>', '<<<', '...', 40) as snippet
         FROM conversations_fts
         JOIN conversations c ON c.id = conversations_fts.rowid
         WHERE conversations_fts MATCH ?
-          AND (? = '' OR LOWER(c.workspace) LIKE LOWER(?))
+          AND {_IN_WORKSPACE}
         ORDER BY rank
         LIMIT ?
     """,
-        (safe_query, ws, f"%{ws}%", limit),
+        (safe_query, *in_workspace, limit),
     ).fetchall()
 
     seen_ids = set()
@@ -97,7 +123,7 @@ def _conversation_hits(
     remaining = limit - len(results)
     if remaining > 0:
         rows = conn.execute(
-            """
+            f"""
             SELECT ct.id, ct.conversation_id, ct.speaker, ct.turn_index,
                    c.session_id, c.started_at, c.project_name, c.summary,
                    snippet(conversation_turns_fts, 1, '>>>', '<<<', '...', 40) as snippet
@@ -105,11 +131,11 @@ def _conversation_hits(
             JOIN conversation_turns ct ON ct.id = conversation_turns_fts.rowid
             JOIN conversations c ON c.id = ct.conversation_id
             WHERE conversation_turns_fts MATCH ?
-              AND (? = '' OR LOWER(c.project_name) LIKE LOWER(?))
+              AND {_IN_WORKSPACE}
             ORDER BY rank
             LIMIT ?
         """,
-            (safe_query, ws, f"%{ws}%", remaining * 2),
+            (safe_query, *in_workspace, remaining * 2),
         ).fetchall()
 
         for r in rows:

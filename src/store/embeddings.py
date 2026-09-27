@@ -476,16 +476,22 @@ def _kind_mask(ids, kinds) -> np.ndarray:
     return mask
 
 
-def _top_indices(similarities, ids, limit: int, kinds=None) -> np.ndarray:
-    """The `limit` most similar vectors, best first, among `kinds` (all when None).
+def _top_indices(similarities, ids, limit: int, kinds=None, allowed_ids=None) -> np.ndarray:
+    """The `limit` most similar vectors, best first, among `kinds` (all when None)
+    and, when given, among `allowed_ids` (index ids, as stored in the npz).
 
     The kind is chosen before the top is taken. Taking it over every vector and
     filtering after left a kind with few vectors (conversations, about 1K of
-    120K) mostly empty, and cost emails their slots to other kinds.
+    120K) mostly empty, and cost emails their slots to other kinds. The allowed
+    ids are applied first for the same reason: a workspace filter applied after
+    the top came back empty whenever the best matches sat in other projects.
     """
-    if kinds is None:
+    if kinds is None and allowed_ids is None:
         return np.argsort(similarities)[::-1][:limit]
-    candidates = np.flatnonzero(_kind_mask(ids, kinds))
+    mask = np.ones(len(ids), dtype=bool) if kinds is None else _kind_mask(ids, kinds)
+    if allowed_ids is not None:
+        mask &= np.isin(ids, np.fromiter(allowed_ids, dtype=np.int64))
+    candidates = np.flatnonzero(mask)
     return candidates[np.argsort(similarities[candidates])[::-1][:limit]]
 
 
@@ -496,6 +502,7 @@ def query_semantic(
     kinds=None,
     embed_fn=None,
     index_path=None,
+    allowed_ids=None,
 ) -> list[dict]:
     """Semantic search across email summaries using cosine similarity.
 
@@ -506,6 +513,9 @@ def query_semantic(
         kinds: Only these kinds ("email", "attachment", "conversation",
             "teams_thread"); every kind when None
         embed_fn, index_path: injection points for testing
+        allowed_ids: Only these index ids (for a conversation,
+            CONVERSATION_ID_OFFSET - conversations.id), ranked among
+            themselves; every id when None
 
     Returns:
         List of dicts with keys: email_id, date, subject, summary, similarity
@@ -521,7 +531,7 @@ def query_semantic(
 
     similarities = normalized @ query_norm
 
-    top_indices = _top_indices(similarities, ids, limit, kinds)
+    top_indices = _top_indices(similarities, ids, limit, kinds, allowed_ids)
 
     # Fetch details (positive IDs = emails, negative IDs = attachments)
     results = []

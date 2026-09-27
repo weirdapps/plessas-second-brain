@@ -566,6 +566,11 @@ def main():
     log(f"Using model: {model}")
 
     new_placements = []
+    # Counted so a run in which every classification raised can fail the unit.
+    # Logging and skipping each one left expired auth and a response-parse bug
+    # exiting 0 for eleven days in August, green everywhere.
+    classified = 0
+    errors = 0
     for i, c in enumerate(candidates):
         if out_of_time():
             log(f"Out of time: {len(candidates) - i} candidates left for the next run.")
@@ -573,8 +578,10 @@ def main():
         try:
             result = classify_one(c)
         except Exception as e:
+            errors += 1
             log(f"  classify error for id={c['id']}: {e}")
             continue
+        classified += 1
         processed.add(c["id"])
         # Only a managed folder, exactly. The folder is the model's answer, and
         # the model reads what the sender wrote: a prefix check let
@@ -683,8 +690,10 @@ def main():
     # Always rebuild INDEX (cheap — uses cached summaries)
     for area in AREAS:
         write_index(area, summaries)
-    log(f"Done. New placements: {len(new_placements)}. State saved.")
-    return 0
+    log(f"Done. New placements: {len(new_placements)}. Classify errors: {errors}. State saved.")
+    # Only when nothing succeeded: a few bad documents in an otherwise working
+    # run are that document's problem, not the job's.
+    return 1 if errors and not classified else 0
 
 
 if __name__ == "__main__":

@@ -335,9 +335,9 @@ class TestCdhashTripwire:
                 _extract(self._FN_RE, "cdhash tripwire function"),
                 # Called exactly the way the wrapper calls it, so the harness
                 # cannot pass under a calling convention production never uses.
-                "cdhash_problem=$(rsync_cdhash_mismatch)",
+                "cdhash_warning=$(rsync_cdhash_mismatch)",
                 'print -r -- "exit=$?"',
-                'print -r -- "reason=$cdhash_problem"',
+                'print -r -- "reason=$cdhash_warning"',
             ]
         )
         proc = _run_zsh(tmp_path, body, stub_dir, {})
@@ -379,3 +379,38 @@ class TestCdhashTripwire:
         # The reason is interpolated into a single-quoted remote ssh command by
         # the failure-marker block, so an apostrophe in it would break the write.
         assert "'" not in reason
+
+    _CALL_RE = re.compile(r"^cdhash_warning=\$\(rsync_cdhash_mismatch\)$.*?^fi$", re.M | re.S)
+
+    def test_a_rebuilt_binary_is_a_warning_not_a_failed_run(self, tmp_path):
+        """On 2026-09-27 brew upgraded rsync and this check aborted every run for
+        six hours, although the new binary synced with no new grant. A changed
+        cdhash is logged; a real denial still fails the run, through rsync's own
+        exit code in the transfer loop."""
+        captured = tmp_path / "log.txt"
+        failures = tmp_path / "failures.txt"
+        stub_dir = _stub_bin(tmp_path, "rsync", "exit 0\n")
+        _stub_bin(
+            tmp_path, "codesign", f"cat <<'EOF'\n{_CODESIGN_ADHOC.format(cdhash='0' * 40)}EOF\n"
+        )
+        body = "\n".join(
+            [
+                "#!/bin/zsh",
+                "set -uo pipefail",
+                f'log() {{ print -r -- "$*" >> "{captured}" }}',
+                f'note_failure() {{ print -r -- "$*" >> "{failures}" }}',
+                f'EXPECTED_RSYNC_CDHASH="{_shell_const("EXPECTED_RSYNC_CDHASH")}"',
+                _extract(self._FN_RE, "cdhash tripwire function"),
+                _extract(self._CALL_RE, "cdhash tripwire call site"),
+                'print -r -- "done"',
+            ]
+        )
+        proc = _run_zsh(tmp_path, body, stub_dir, {})
+
+        assert "done" in proc.stdout, f"harness did not finish: {proc.stdout}\n{proc.stderr}"
+        assert "WARNING:" in (captured.read_text() if captured.exists() else "")
+        assert not failures.exists(), "a changed cdhash marked the run failed"
+
+    def test_the_transfer_loop_is_not_gated_on_the_cdhash(self):
+        loop = _WRAPPER.read_text().split("for tree in National Personal; do", 1)[1]
+        assert "cdhash" not in loop.split("done", 1)[0]

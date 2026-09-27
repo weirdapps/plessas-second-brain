@@ -101,9 +101,24 @@ def _run_watcher(home: Path):
     (home / ".second-brain").mkdir(parents=True, exist_ok=True)
     # Neutralise the gcloud probe: it is a separate surface with its own sentinel.
     _write_stub(_bin(home) / "gcloud", "exit 0\n")
+    # Record alerts instead of posting them. Unstubbed, every run of this file put
+    # real "second-brain ... reauth needed" banners on the Mac running the suite:
+    # 23 were still in Notification Center from 18:14 to 18:49 on 2026-09-27.
+    # osascript is called by absolute path, hence $OSASCRIPT; terminal-notifier is
+    # found on the script's PATH, where $HOME/.local/bin precedes /opt/homebrew/bin.
+    _write_stub(home / "osascript", 'echo "osascript $*" >> "$HOME/alerts.txt"\n')
+    _write_stub(
+        _bin(home) / "terminal-notifier", 'echo "terminal-notifier $*" >> "$HOME/alerts.txt"\n'
+    )
     return subprocess.run(
         ["/bin/bash", str(_WATCHER)],
-        env={"HOME": str(home), "PATH": "/usr/bin:/bin", "SHELL": "/bin/bash", "UID": "501"},
+        env={
+            "HOME": str(home),
+            "PATH": "/usr/bin:/bin",
+            "SHELL": "/bin/bash",
+            "UID": "501",
+            "OSASCRIPT": str(home / "osascript"),
+        },
         capture_output=True,
         text=True,
         timeout=180,
@@ -112,6 +127,11 @@ def _run_watcher(home: Path):
 
 def _log(home: Path) -> str:
     p = home / ".second-brain" / "logs" / "auth-watch.log"
+    return p.read_text() if p.is_file() else ""
+
+
+def _alerts(home: Path) -> str:
+    p = home / "alerts.txt"
     return p.read_text() if p.is_file() else ""
 
 
@@ -143,6 +163,24 @@ def test_expired_bearer_still_latches(tmp_path):
     assert sentinel.exists(), (
         "auth-watch failed to latch on an expired bearer with no working renewal. "
         "That is the condition the sentinel exists for.\n\n" + _log(tmp_path)
+    )
+
+
+@pytest.mark.skipif(not Path("/usr/bin/python3").exists(), reason="probe needs /usr/bin/python3")
+def test_the_reauth_alert_goes_through_the_osascript_override(tmp_path):
+    """The alert must honour $OSASCRIPT, or no test can run this path silently.
+
+    A stub on PATH cannot intercept `/usr/bin/osascript`, so a hardcoded path
+    turns every run of this suite on a Mac into real reauth banners.
+    """
+    _outlook_stub(tmp_path, seconds_remaining=-600, renew_ok=False)
+    _teams_stub(tmp_path, healthy_after_renew_attempt=True)
+
+    _run_watcher(tmp_path)
+
+    alerts = _alerts(tmp_path)
+    assert alerts.count('with title "second-brain auth: run outlook-cli login"') == 1, (
+        alerts + "\n\n" + _log(tmp_path)
     )
 
 

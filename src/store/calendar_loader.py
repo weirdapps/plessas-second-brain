@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 LLM_STATUSES = ("extracted", "pending", "failed", "skipped")
 
 
-def load_proxy_emails(canonical_path: str) -> set[str]:
+def load_proxy_emails(canonical_path: str) -> set[str] | None:
     """
     Load proxy-organizer emails from canonical_people.json.
 
@@ -25,7 +25,9 @@ def load_proxy_emails(canonical_path: str) -> set[str]:
         canonical_path: Path to canonical_people.json
 
     Returns:
-        Set of lowercase proxy emails, or empty set if file doesn't exist
+        Set of lowercase proxy emails, or empty set if file doesn't exist, or None
+        if it exists but cannot be parsed, so a caller can tell a broken file from
+        an absent one.
     """
     try:
         path = Path(canonical_path)
@@ -42,8 +44,16 @@ def load_proxy_emails(canonical_path: str) -> set[str]:
             if person.get("is_proxy_for_self") is True and person.get("email")
         }
         return proxy_emails
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return set()
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        # This branch said nothing, so a merge conflict or a stray comma in the
+        # hand-edited file read exactly like a file with no proxies, and
+        # calendar-sync then rewrote every event the PA books as not the owner's.
+        logger.warning(
+            "%s unreadable (%s); proxy-organised events will not count as self",
+            canonical_path,
+            exc,
+        )
+        return None
 
 
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")

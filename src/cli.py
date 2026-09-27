@@ -1922,8 +1922,16 @@ def cmd_calendar_sync(args):
     # written while BRAIN_USER_EMAIL_PATTERN was unset.
     dup_decisions, dup_actions = dedupe_event_children(conn)
     flags_changed = 0
-    if USER_EMAIL_PATTERN:
+    if USER_EMAIL_PATTERN and proxy_emails is not None:
         flags_changed = refresh_self_flags(conn, USER_EMAIL_PATTERN, proxy_emails)
+    elif proxy_emails is None:
+        # canonical_people.json exists but did not parse. Recomputed without it,
+        # every event the PA booked would be rewritten as not-self, so the flags
+        # wait for the file to be fixed.
+        print(
+            "  canonical_people.json is unreadable; leaving the stored self flags alone",
+            file=sys.stderr,
+        )
     else:
         # Without the pattern every stored flag would be rewritten to not-self.
         print(

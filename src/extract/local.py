@@ -5,6 +5,7 @@ Concurrent processing with ThreadPoolExecutor.
 Resumable state tracking.
 """
 
+import functools
 import json
 import os
 import signal
@@ -16,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from src.config import DATA_ROOT, GEMINI_MODEL
+from src.export.state import load_json_or_quarantine, write_json_atomic
 
 # Repo root
 REPO_ROOT = Path(__file__).parent.parent.parent
@@ -113,17 +115,51 @@ def _failure_kind(exc: BaseException, is_quota: bool) -> str | None:
 
 
 _shutdown = False
+# Set by a stop signal only. _shutdown also ends a run on an expired credential,
+# and that must not end the rest of a sync; a stop must (see stop_requested).
+_stop_requested = False
 _state_lock = threading.Lock()
 _log_lock = threading.Lock()
 
 
 def _handle_signal(signum, frame):
-    global _shutdown
+    global _shutdown, _stop_requested
     _shutdown = True
+    _stop_requested = True
 
 
-signal.signal(signal.SIGTERM, _handle_signal)
-signal.signal(signal.SIGINT, _handle_signal)
+def stop_requested() -> bool:
+    """Whether a stop signal reached an extraction run in this process."""
+    return _stop_requested
+
+
+def _stops_on_signals(run):
+    """Run `run` with SIGTERM and SIGINT asking it to stop, then restore the
+    handlers that were there before.
+
+    They used to be installed when this module was imported, and never removed.
+    Only the extraction loops read the flag they set, so every later step of a
+    sync ignored a stop, and so did Ctrl-C: systemd waited out TimeoutStopSec
+    and SIGKILLed the job, five times in September, marking a unit failed that
+    had finished. signal.signal works in the main thread only, and a run on any
+    other thread keeps the process's handlers.
+    """
+
+    @functools.wraps(run)
+    def wrapper(*args, **kwargs):
+        if threading.current_thread() is not threading.main_thread():
+            return run(*args, **kwargs)
+        previous = {
+            sig: signal.signal(sig, _handle_signal) for sig in (signal.SIGTERM, signal.SIGINT)
+        }
+        try:
+            return run(*args, **kwargs)
+        finally:
+            for sig, handler in previous.items():
+                # None: installed outside Python, and it cannot be put back.
+                signal.signal(sig, signal.SIG_DFL if handler is None else handler)
+
+    return wrapper
 
 
 def log(msg: str):
@@ -135,20 +171,23 @@ def log(msg: str):
 
 
 def load_state() -> dict:
+    # A file cut short used to raise here on every later run until someone
+    # repaired it by hand. Quarantined, the run starts from an empty record, and
+    # what it offers again is only what is still staged: load prunes the rest.
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
+        state = load_json_or_quarantine(STATE_FILE)
+        if state is not None:
+            return state
     return {"processed_ids": [], "total_extracted": 0, "failures": 0}
 
 
 def save_state(state: dict):
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     state["last_updated"] = datetime.now().isoformat()
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    # Atomic, so a kill mid-write leaves the previous record, not half of one.
+    write_json_atomic(STATE_FILE, state)
 
 
 def collect_emails() -> list[dict]:
-    from src.export.state import load_json_or_quarantine
-
     batch_files = sorted(STAGING_DIR.glob("batch-*.json"))
     all_emails = []
     for bf in batch_files:
@@ -338,6 +377,7 @@ def _stub_extraction(msg_id: str) -> dict:
     return stub
 
 
+@_stops_on_signals
 def run_extraction(
     workers: int = 1,
     limit: int = 0,
@@ -414,8 +454,7 @@ def run_extraction(
                 continue
             attempt_counts.pop(msg_id, None)
             timeout_counts.pop(msg_id, None)
-            with open(EXTRACTED_DIR / f"{msg_id}.json", "w") as f:
-                json.dump(_stub_extraction(msg_id), f, indent=2, ensure_ascii=False)
+            write_json_atomic(EXTRACTED_DIR / f"{msg_id}.json", _stub_extraction(msg_id))
             processed_ids.add(msg_id)
             log(
                 f"GAVE UP on msg {msg_id} after {runs} runs ({kind}); it loads without an extraction"
@@ -484,9 +523,7 @@ def run_extraction(
             msg_id, extraction, is_quota, failure = _worker_fn(email, api_key, engine)
 
             if extraction is not None:
-                result_file = EXTRACTED_DIR / f"{msg_id}.json"
-                with open(result_file, "w") as f:
-                    json.dump(extraction, f, indent=2, ensure_ascii=False)
+                write_json_atomic(EXTRACTED_DIR / f"{msg_id}.json", extraction)
                 processed_ids.add(msg_id)
                 attempt_counts.pop(msg_id, None)
                 timeout_counts.pop(msg_id, None)
@@ -580,7 +617,14 @@ def run_extraction(
 
                 for future in as_completed(futures):
                     if _shutdown:
-                        break
+                        # As at the deadline below. Only breaking out left the
+                        # queued calls to run, since leaving the executor waits
+                        # for them: all 40 of 40 in a probe, their results thrown
+                        # away. The running ones finish and are kept.
+                        for queued in futures:
+                            queued.cancel()
+                        if future.cancelled():
+                            continue
                     if past_deadline():
                         # Calls already running finish (each is bounded by the
                         # policy); the ones not yet started are dropped.
@@ -594,9 +638,7 @@ def run_extraction(
                     email = futures[future]
 
                     if extraction is not None:
-                        result_file = EXTRACTED_DIR / f"{msg_id}.json"
-                        with open(result_file, "w") as f:
-                            json.dump(extraction, f, indent=2, ensure_ascii=False)
+                        write_json_atomic(EXTRACTED_DIR / f"{msg_id}.json", extraction)
                         with _state_lock:
                             processed_ids.add(msg_id)
                             attempt_counts.pop(msg_id, None)
@@ -775,6 +817,7 @@ def extract_conversation_inline(
     return (session_id, None, is_quota, None)
 
 
+@_stops_on_signals
 def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: float | None = None):
     """Extract structured data from staged conversations.
 
@@ -797,9 +840,10 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
     log(f"Workers: {workers}")
 
     # Load state
-    conv_state = {}
+    conv_state: dict = {}
     if CONV_STATE_FILE.exists():
-        conv_state = json.loads(CONV_STATE_FILE.read_text())
+        # Quarantined rather than fatal, as load_state does.
+        conv_state = load_json_or_quarantine(CONV_STATE_FILE) or {}
     processed_ids = set(conv_state.get("processed_ids", []))
     # session_id -> runs that ended in a failure. Separate from processed_ids so a
     # given-up conversation never reads as ingested to the loader.
@@ -913,9 +957,7 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
             extraction["transcript_turn_count"] = conv.get("turn_count") or len(
                 conv.get("turns", [])
             )
-            result_file = CONV_EXTRACTED_DIR / f"{session_id}.json"
-            with open(result_file, "w") as f:
-                json.dump(extraction, f, indent=2, ensure_ascii=False)
+            write_json_atomic(CONV_EXTRACTED_DIR / f"{session_id}.json", extraction)
             processed_ids.add(session_id)
             extracted_from[session_id] = [
                 extraction["transcript_ended_at"],
@@ -946,8 +988,7 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
             conv_state["total_extracted"] = len(processed_ids)
             conv_state["failures"] = total_failed
             conv_state["last_updated"] = datetime.now().isoformat()
-            CONV_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CONV_STATE_FILE.write_text(json.dumps(conv_state, indent=2))
+            write_json_atomic(CONV_STATE_FILE, conv_state)
 
             elapsed = (time.time() - start_time) / 60
             rate = total_done / elapsed if elapsed > 0 else 0
@@ -980,8 +1021,7 @@ def run_conversation_extraction(workers: int = 1, limit: int = 0, deadline_s: fl
     conv_state["total_extracted"] = len(processed_ids)
     conv_state["failures"] = total_failed
     conv_state["last_updated"] = datetime.now().isoformat()
-    CONV_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CONV_STATE_FILE.write_text(json.dumps(conv_state, indent=2))
+    write_json_atomic(CONV_STATE_FILE, conv_state)
 
     elapsed = (time.time() - start_time) / 60
     ending = "STOPPED" if _shutdown else "CUT SHORT" if cut_short else "COMPLETE"

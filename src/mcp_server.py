@@ -615,17 +615,23 @@ def search_conversations(
     conn = _get_conn()
     try:
         if search_type == "semantic":
-            from src.store.embeddings import query_semantic
+            from src.store.conversation_query import conversation_ids_in_workspace
+            from src.store.embeddings import CONVERSATION_ID_OFFSET, query_semantic
 
-            # Room for the workspace filter below.
-            conv_results = query_semantic(conn, query, limit=limit * 2, kinds={"conversation"})
+            # The workspace filter goes in before the ranking, as the keyword
+            # search's goes in the SQL. Applied to the global top 2 x limit, it
+            # returned nothing whenever the best matches sat in other projects.
+            allowed = None
             if workspace:
-                conv_results = [
-                    r
-                    for r in conv_results
-                    if workspace.lower() in (r.get("project_name") or "").lower()
-                ]
-            return conv_results[:limit]
+                allowed = {
+                    CONVERSATION_ID_OFFSET - cid
+                    for cid in conversation_ids_in_workspace(conn, workspace)
+                }
+                if not allowed:
+                    return []
+            return query_semantic(
+                conn, query, limit=limit, kinds={"conversation"}, allowed_ids=allowed
+            )
         else:
             from src.store.conversation_query import search_conversations_keyword
 

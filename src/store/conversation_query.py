@@ -389,11 +389,14 @@ def recent_conversations(
     Returns:
         List of recent conversations with summaries
     """
+    # datetime() on both sides: started_at is stored as '2026-09-27T00:27:13Z'
+    # and datetime('now', ...) renders a space, so compared as strings every
+    # session from earlier on the cutoff day counted as newer than the cutoff.
     query = """
         SELECT id, session_id, started_at, ended_at, workspace,
                project_name, turn_count, summary, topics_summary
         FROM conversations
-        WHERE started_at >= datetime('now', ?)
+        WHERE datetime(started_at) >= datetime('now', ?)
     """
     params: list = [f"-{days} days"]
 

@@ -8,7 +8,7 @@ import json
 import re
 import sqlite3
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from src.export.teams_cli import TeamsCliAuthRequired, run_teams_cli
@@ -130,11 +130,17 @@ def _extract_mri(from_url: str | None) -> str | None:
 #
 # 1. "no channel named 'General'": chatsvcagg requires a literal "General"
 #    channel to derive the teamId; teams that renamed/archived theirs are
-#    permanently unreadable via this code path.
+#    permanently unreadable via this code path. It is disabled unconditionally:
+#    teams-access raises it only after Graph has listed the team's channels, so
+#    a token lapse cannot produce it, and it hits every channel of the team at
+#    once, so a team with five or more channels tripped the breaker below on
+#    every run and was retried for ever.
 # 2. "HTTP_403" / "Graph 403": no Graph permission on this channel (archived
-#    teams, guest-only channels, deleted resources).
+#    teams, guest-only channels, deleted resources). A lapse 403s the same way,
+#    so these go through the breaker below.
+_NO_GENERAL_CHANNEL_PATTERN = "has no channel named"
 _PERMANENT_ERROR_PATTERNS = (
-    "has no channel named",
+    _NO_GENERAL_CHANNEL_PATTERN,
     "HTTP_403",
     "Graph 403",
 )
@@ -215,17 +221,32 @@ def _discover_chat_chats(conn: sqlite3.Connection) -> dict:
                 if isinstance(m, dict) and str(m.get("mri", "")).startswith("8:")
             ]
         )
-        last_msg = (chat.get("lastMessage") or {}).get("composetime")
+        # teams-access types the key as composeTime; the lowercase spelling is
+        # what the chatsvc message payloads use, so accept both.
+        last_message = chat.get("lastMessage") or {}
+        last_msg = last_message.get("composeTime") or last_message.get("composetime")
 
         existing = conn.execute(
             "SELECT id FROM teams_chats WHERE teams_chat_id = ?", (chat_id,)
         ).fetchone()
 
         if existing:
+            # Only ever move last_message_at forward. A listing with no last
+            # message, or one older than a message pull_messages has since
+            # stored, used to write NULL or the stale value over it.
             conn.execute(
-                "UPDATE teams_chats SET topic = ?, member_mris = ?, last_message_at = ? "
-                "WHERE id = ?",
-                (title, member_mris, last_msg, existing["id"]),
+                """
+                UPDATE teams_chats SET topic = ?, member_mris = ?,
+                    last_message_at = CASE
+                        WHEN ? IS NOT NULL AND (
+                            julianday(last_message_at) IS NULL
+                            OR julianday(?) > julianday(last_message_at)
+                        ) THEN ?
+                        ELSE last_message_at
+                    END
+                WHERE id = ?
+                """,
+                (title, member_mris, last_msg, last_msg, last_msg, existing["id"]),
             )
             updated += 1
         else:
@@ -251,16 +272,24 @@ def _discover_chat_chats(conn: sqlite3.Connection) -> dict:
     return {"chats_inserted": inserted, "chats_updated": updated}
 
 
+# teams-cli list-messages reads a single page, 50 messages by default, and does
+# not page backwards. A chat that got more than one page between two polls kept
+# only the newest page and lost the rest for good, so chat-scope reads ask for
+# 200, the page Teams' own client requests. It is a stopgap: the real fix is for
+# the CLI to follow backwardLink until it reaches a message already stored.
+CHAT_PAGE_SIZE = 200
+
+
 def pull_messages(
     conn: sqlite3.Connection, concurrency: int = 2, deadline_s: float | None = None
 ) -> dict:
     """Step 2: full pull of messages for every active chat.
 
     Active = (last_message_at within 12 months) OR (any messages already in DB).
-    teams-cli list-messages does NOT expose a sync-state cursor (chatsvcagg
-    /posts only paginates by --page-size), so we always full-pull and rely on
-    UNIQUE(teams_message_id) for dedup. The teams_chats.sync_state column is
-    vestigial in Phase 1; kept for forward-compatibility.
+    teams-cli list-messages does NOT expose a sync-state cursor and reads one
+    page only (CHAT_PAGE_SIZE for chats), so each run re-reads the newest page
+    and relies on UNIQUE(teams_message_id) for dedup. The teams_chats.sync_state
+    column is vestigial in Phase 1; kept for forward-compatibility.
 
     Args:
         conn: open SQLite connection.
@@ -275,8 +304,14 @@ def pull_messages(
         {"chats_pulled", "messages_inserted", "errors", "deferred"}
     """
     now = datetime.now(UTC)
-    cutoff_iso = now.replace(year=now.year - 1).isoformat()
+    # timedelta, not replace(year=...), which raises on 29 February.
+    cutoff_iso = (now - timedelta(days=365)).isoformat()
 
+    # Chats with a message since their last pull go first, then the rotation by
+    # oldest pull. The deadline reaches only part of the inventory per run, and
+    # a busy chat that waited its turn behind hundreds of quiet ones overflowed
+    # the one page teams-cli reads. julianday() because last_message_at is
+    # Teams' "...Z" and last_pulled_at is Python's "...+00:00".
     rows = conn.execute(
         """
         SELECT id, teams_chat_id, chat_kind, team_uuid, channel_id, sync_state
@@ -288,7 +323,11 @@ def pull_messages(
             OR last_message_at >= ?
             OR EXISTS (SELECT 1 FROM teams_messages tm WHERE tm.chat_id = teams_chats.id)
           )
-        ORDER BY last_pulled_at IS NOT NULL, last_pulled_at
+        ORDER BY
+          CASE WHEN last_pulled_at IS NULL
+                 OR julianday(last_message_at) > julianday(last_pulled_at)
+               THEN 0 ELSE 1 END,
+          last_pulled_at IS NOT NULL, last_pulled_at
         """,
         (cutoff_iso,),
     ).fetchall()
@@ -300,8 +339,16 @@ def pull_messages(
     deadline = None if deadline_s is None else time.monotonic() + deadline_s
     # Disabling is decided after the run, not inside the loop: a Graph-wide auth
     # lapse 403s every chat, and applying the flag per-chat turned one transient
-    # failure into 1,179 permanently dropped chats on prod.
-    permanent_candidates: list[int] = []
+    # failure into 1,179 permanently dropped chats on prod. Channels and chats
+    # are judged apart: channels read through chatsvcagg and chats through
+    # chatsvc, on different token audiences, so a lapse can hit one kind alone.
+    # Channels are about 3% of a run, so against the whole run a channel-wide
+    # 403 stayed under the ceiling and disabled every channel.
+    permanent_candidates: dict[str, list[int]] = {"channel": [], "chat": []}
+    attempted: dict[str, int] = {"channel": 0, "chat": 0}
+    # A team with no "General" channel follows a successful Graph call, so it
+    # says nothing about the service and skips the breaker.
+    no_general_channel: list[int] = []
 
     # Concurrency wired in but defaulted to sequential for Phase 1 simplicity;
     # parallelism is a Phase 2 follow-up if throughput becomes an issue.
@@ -311,6 +358,8 @@ def pull_messages(
         if deadline is not None and time.monotonic() >= deadline:
             deferred += 1
             continue
+        audience = "channel" if chat["chat_kind"] == "channel" else "chat"
+        attempted[audience] += 1
         try:
             # teams-cli list-messages has no --sync-state flag (channel reads via
             # chatsvcagg /posts don't expose a cursor). We always pull and rely on
@@ -328,6 +377,8 @@ def pull_messages(
                 # oneOnOne / group — chat-scope read via chatsvc
                 args = [
                     "list-messages",
+                    "--page-size",
+                    str(CHAT_PAGE_SIZE),
                     "--chat",
                     chat["teams_chat_id"],
                 ]
@@ -345,7 +396,10 @@ def pull_messages(
             import sys
 
             if _is_permanent_error(e):
-                permanent_candidates.append(chat["id"])
+                if _NO_GENERAL_CHANNEL_PATTERN in str(e):
+                    no_general_channel.append(chat["id"])
+                else:
+                    permanent_candidates[audience].append(chat["id"])
                 print(
                     f"pull_messages: candidate for disable {chat['teams_chat_id']} "
                     f"(permanent: {str(e)[:140]})",
@@ -357,23 +411,30 @@ def pull_messages(
                     file=sys.stderr,
                 )
 
-    attempted = pulled + errors
-    if permanent_candidates and _is_systemic_failure(len(permanent_candidates), attempted):
-        import sys as _sys
-
-        print(
-            f"pull_messages: {len(permanent_candidates)}/{attempted} chats returned a "
-            "permanent-looking error — treating as systemic (auth/service) and "
-            "disabling none",
-            file=_sys.stderr,
+    # Stamp the moment, not just the flag. Without a date, a sweep that took
+    # 1,179 of 1,219 chats in one pass looks exactly like archived rooms
+    # accumulating a few at a time over months — and the clustering is the
+    # only thing that tells those two apart after the fact.
+    disabled_at = datetime.now(UTC).isoformat()
+    for chat_id in no_general_channel:
+        conn.execute(
+            "UPDATE teams_chats SET ingest_disabled = 1, ingest_disabled_at = ? WHERE id = ?",
+            (disabled_at, chat_id),
         )
-    else:
-        # Stamp the moment, not just the flag. Without a date, a sweep that took
-        # 1,179 of 1,219 chats in one pass looks exactly like archived rooms
-        # accumulating a few at a time over months — and the clustering is the
-        # only thing that tells those two apart after the fact.
-        disabled_at = datetime.now(UTC).isoformat()
-        for chat_id in permanent_candidates:
+    for audience, candidates in permanent_candidates.items():
+        if not candidates:
+            continue
+        if _is_systemic_failure(len(candidates), attempted[audience]):
+            import sys as _sys
+
+            print(
+                f"pull_messages: {len(candidates)}/{attempted[audience]} {audience} reads "
+                "returned a permanent-looking error — treating as systemic "
+                "(auth/service) and disabling none",
+                file=_sys.stderr,
+            )
+            continue
+        for chat_id in candidates:
             conn.execute(
                 "UPDATE teams_chats SET ingest_disabled = 1, ingest_disabled_at = ? WHERE id = ?",
                 (disabled_at, chat_id),

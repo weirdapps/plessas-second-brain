@@ -41,8 +41,19 @@ def extract_text_from_file(file_path: str, mime_type: str) -> dict:
     ext = Path(file_path).suffix.lower()
 
     # Skip unsupported types
-    if mime_type in SKIP_MIME_TYPES or ext in SKIP_EXTENSIONS:
+    if ext in SKIP_EXTENSIONS:
         return {"text": None, "method": None, "status": "skipped", "error": None}
+
+    # A declared archive or media type is a claim, and senders make it wrongly:
+    # 60 .docx and 15 .pptx on the replica arrived labelled application/zip and
+    # were skipped here unread, although every one of them opens. So the bytes
+    # get the last word. A genuine archive still sniffs as application/zip (or
+    # as nothing) and is skipped exactly as before.
+    if mime_type in SKIP_MIME_TYPES:
+        sniffed = sniff_mime_type(file_path)
+        if sniffed is None or sniffed in SKIP_MIME_TYPES:
+            return {"text": None, "method": None, "status": "skipped", "error": None}
+        mime_type = sniffed
 
     # Check file exists
     if not os.path.isfile(file_path):
@@ -126,6 +137,13 @@ def extract_text_from_file(file_path: str, mime_type: str) -> dict:
         elif mime_type == "text/html" or ext in (".html", ".htm"):
             return _extract_html(file_path)
         else:
+            # Neither the declared type nor the name said what this is, which
+            # is what an extensionless Outlook part or a name that lost its dot
+            # ("Status Updatepptx") looks like. Ask the bytes once. The
+            # recursion ends because a second pass sniffs the same type.
+            sniffed = sniff_mime_type(file_path)
+            if sniffed and sniffed != mime_type and sniffed not in SKIP_MIME_TYPES:
+                return extract_text_from_file(file_path, sniffed)
             return {
                 "text": None,
                 "method": None,
@@ -250,6 +268,33 @@ def _extract_doc(path: str) -> dict:
     }
 
 
+def _collect_shape_text(shapes, out: list[str]) -> None:
+    """Append the text of every shape, descending into groups.
+
+    A GroupShape has neither a text frame nor a table, so a flat walk dropped
+    the labels, callouts and diagram boxes a consulting-style deck builds as
+    groups, while the row still said 'extracted'. Groups nest, and a group can
+    hold a table, so the walk recurses rather than unwrapping one level. The
+    test is isinstance, not shape_type, because shape_type raises
+    NotImplementedError on an autoshape python-pptx does not recognise.
+    """
+    from pptx.shapes.group import GroupShape
+
+    for shape in shapes:
+        if isinstance(shape, GroupShape):
+            _collect_shape_text(shape.shapes, out)
+            continue
+        if shape.has_text_frame:
+            for para in shape.text_frame.paragraphs:
+                if para.text.strip():
+                    out.append(para.text)
+        if getattr(shape, "has_table", False):
+            for row in shape.table.rows:
+                cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if cells:
+                    out.append(" | ".join(cells))
+
+
 def _extract_pptx(path: str) -> dict:
     """Extract text from PowerPoint using python-pptx."""
     from pptx import Presentation
@@ -258,17 +303,8 @@ def _extract_pptx(path: str) -> dict:
     parts = []
 
     for i, slide in enumerate(prs.slides, 1):
-        slide_text = []
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                for para in shape.text_frame.paragraphs:
-                    if para.text.strip():
-                        slide_text.append(para.text)
-            if getattr(shape, "has_table", False):
-                for row in shape.table.rows:
-                    cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-                    if cells:
-                        slide_text.append(" | ".join(cells))
+        slide_text: list[str] = []
+        _collect_shape_text(slide.shapes, slide_text)
         if slide_text:
             parts.append(f"--- Slide {i} ---\n" + "\n".join(slide_text))
 
@@ -303,6 +339,98 @@ def _magic(path: str, n: int = 4) -> bytes:
         return b""
 
 
+# Office zips announce their kind by the top-level folder their parts sit in.
+_OOXML_BY_FOLDER = (
+    ("word/", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    ("ppt/", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+    ("xl/", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+)
+
+# OLE2 stream names that identify the application that wrote the file.
+_OLE_BY_STREAM = (
+    ("WordDocument", "application/msword"),
+    ("Workbook", "application/vnd.ms-excel"),
+    ("Book", "application/vnd.ms-excel"),
+    ("PowerPoint Document", "application/vnd.ms-powerpoint"),
+    ("__properties_version1.0", "application/vnd.ms-outlook"),
+)
+
+
+def sniff_mime_type(path: str) -> str | None:
+    """The MIME type a file's own bytes declare, or None when they do not say.
+
+    For names that carry no usable extension. Outlook saves some parts as
+    "Outlook-xxxx" and users lose the dot in "...Updatepptx", so
+    mimetypes.guess_type returns None for both and the row used to be recorded
+    as application/octet-stream: 57 attachments, among them PDFs, decks and
+    screenshots, that neither text extraction nor the image pipeline ever read.
+    """
+    magic = _magic(path, 8)
+    if magic.startswith(b"%PDF"):
+        return "application/pdf"
+    if magic.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if magic.startswith(b"\x89PNG"):
+        return "image/png"
+    if magic.startswith(b"PK\x03\x04"):
+        import zipfile
+
+        # Any failure to read the directory means the bytes do not say, so the
+        # sniff answers None. zipfile raises more than BadZipFile on a crafted
+        # zip: a name flagged UTF-8 that holds invalid bytes raises
+        # UnicodeDecodeError, and letting that out aborts the whole sync from
+        # the registrar and makes the file a poison row for the extractor.
+        try:
+            with zipfile.ZipFile(path) as zf:
+                names = zf.namelist()
+        except Exception:
+            return None
+        for folder, mime in _OOXML_BY_FOLDER:
+            if any(n.startswith(folder) for n in names):
+                return mime
+        return "application/zip"
+    if magic.startswith(b"\xd0\xcf\x11\xe0"):
+        streams = _ole_stream_names(path)
+        if any(n.startswith("__substg1.0_") for n in streams):
+            return "application/vnd.ms-outlook"
+        for stream, mime in _OLE_BY_STREAM:
+            if stream in streams:
+                return mime
+    return None
+
+
+def _ole_stream_names(path: str) -> set[str]:
+    """Names in the first directory sector of an OLE2 file, or an empty set.
+
+    The header fixes the sector size (a power of two at offset 30) and the
+    first directory sector (offset 48), and each 128-byte directory entry holds
+    a UTF-16LE name whose byte length sits at offset 64. The streams that say
+    which application wrote the file are children of the root entry, so they
+    sit in that first sector; reading one sector avoids a parser dependency.
+    """
+    import struct
+
+    try:
+        with open(path, "rb") as f:
+            header = f.read(512)
+            if len(header) < 512:
+                return set()
+            (shift,) = struct.unpack_from("<H", header, 30)
+            (first_dir,) = struct.unpack_from("<I", header, 48)
+            if shift not in (9, 12):
+                return set()
+            f.seek((first_dir + 1) << shift)
+            sector = f.read(1 << shift)
+    except OSError:
+        return set()
+    names = set()
+    for offset in range(0, len(sector) - 127, 128):
+        (length,) = struct.unpack_from("<H", sector, offset + 64)
+        if 2 <= length <= 64:
+            names.add(sector[offset : offset + length - 2].decode("utf-16-le", "replace"))
+    return names
+
+
 def _extract_excel(path: str) -> dict:
     """Extract headers + first 50 rows per sheet from .xlsx files via openpyxl.
 
@@ -312,25 +440,28 @@ def _extract_excel(path: str) -> dict:
     import openpyxl
 
     parts = []
-    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    # A handle, not the path: openpyxl refuses a path whose extension it does
+    # not know, and a workbook identified by its bytes may have none.
+    with open(path, "rb") as fh:
+        wb = openpyxl.load_workbook(fh, read_only=True, data_only=True)
 
-    max_sheets = 20
-    for _sheet_idx, sheet_name in enumerate(wb.sheetnames[:max_sheets]):
-        ws = wb[sheet_name]
-        rows_text = []
-        row_count = 0
-        for row in ws.iter_rows(max_row=51, values_only=True):
-            cells = [str(c) if c is not None else "" for c in row]
-            if any(c.strip() for c in cells):
-                rows_text.append(" | ".join(c for c in cells if c.strip()))
-            row_count += 1
-            if row_count >= 51:
-                break
+        max_sheets = 20
+        for _sheet_idx, sheet_name in enumerate(wb.sheetnames[:max_sheets]):
+            ws = wb[sheet_name]
+            rows_text = []
+            row_count = 0
+            for row in ws.iter_rows(max_row=51, values_only=True):
+                cells = [str(c) if c is not None else "" for c in row]
+                if any(c.strip() for c in cells):
+                    rows_text.append(" | ".join(c for c in cells if c.strip()))
+                row_count += 1
+                if row_count >= 51:
+                    break
 
-        if rows_text:
-            parts.append(f"--- Sheet: {sheet_name} ---\n" + "\n".join(rows_text))
+            if rows_text:
+                parts.append(f"--- Sheet: {sheet_name} ---\n" + "\n".join(rows_text))
 
-    wb.close()
+        wb.close()
 
     text = _truncate("\n\n".join(parts))
     if _apply_noise_filter(text):

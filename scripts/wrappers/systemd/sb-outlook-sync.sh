@@ -97,32 +97,41 @@ cd "$PROJECT"
 #      matches /triage-inbox flow). Without this, mailbox_name goes stale
 #      forever the moment the user triages.
 overall_rc=0
+# The first auth failure (4, re-authenticate) sticks. Any other non-zero code
+# replaces the one before it. The reconcile runs last, so its code used to
+# become the unit's exit status even after an export pass had reported a dead
+# session, and the unit then exited 2 for an auth loss.
+note_rc() {
+  [ "$1" -eq 0 ] && return 0
+  [ "$overall_rc" -eq 4 ] && return 0
+  overall_rc=$1
+}
 
 echo "$(ts) — start folder=Inbox" >> "$LOG"
 "$PYTHON" -m src.export.outlook_export \
   --mode hourly --concurrency 2 \
   --folder Inbox --state-path "$DATA_DIR/state/outlook_sync.json" >> "$LOG" 2>&1
 rc1=$?
-[ "$rc1" -ne 0 ] && overall_rc=$rc1
+note_rc "$rc1"
 
 echo "$(ts) — start folder=Archive" >> "$LOG"
 "$PYTHON" -m src.export.outlook_export \
   --mode hourly --concurrency 2 --bootstrap \
   --folder Archive --state-path "$DATA_DIR/state/outlook_sync_archive.json" >> "$LOG" 2>&1
 rc2=$?
-[ "$rc2" -ne 0 ] && overall_rc=$rc2
+note_rc "$rc2"
 
 echo "$(ts) — start folder=Sent Items" >> "$LOG"
 "$PYTHON" -m src.export.outlook_export \
   --mode hourly --concurrency 2 --bootstrap \
   --folder "Sent Items" --state-path "$DATA_DIR/state/outlook_sync_sent.json" >> "$LOG" 2>&1
 rc_sent=$?
-[ "$rc_sent" -ne 0 ] && overall_rc=$rc_sent
+note_rc "$rc_sent"
 
 echo "$(ts) — start reconcile (Inbox→Archive moves)" >> "$LOG"
 "$PYTHON" -m src.export.inbox_reconcile >> "$LOG" 2>&1
 rc3=$?
-[ "$rc3" -ne 0 ] && overall_rc=$rc3
+note_rc "$rc3"
 
 # 4. Drain staged batches into the DB (extract + load) every hour.
 #    The three passes above only *stage* bodies to data/staging; loading used to
@@ -167,7 +176,7 @@ if [ "$rc" -eq 0 ]; then
 else
   failures=$((failures + 1))
   write_state "$failures" "fail rc=$rc"
-  echo "$(ts) — fail rc=$rc (inbox=$rc1 archive=$rc2 reconcile=$rc3) consecutive=$failures" >> "$LOG"
+  echo "$(ts) — fail rc=$rc (inbox=$rc1 archive=$rc2 sent=$rc_sent reconcile=$rc3) consecutive=$failures" >> "$LOG"
   if [ "$failures" -ge "$NOTIFY_THRESHOLD" ]; then
     notify "second-brain: $failures sync failures (rc=$rc)"
   fi

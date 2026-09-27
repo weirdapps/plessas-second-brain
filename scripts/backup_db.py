@@ -49,6 +49,22 @@ LOCAL_PATTERN = "brain-*.db"
 OFFSITE_SUFFIX = ".db.zst.enc"
 OFFSITE_PATTERN = "brain-*.db.zst.enc"
 
+# Every file this script writes is the whole corpus, plaintext or encrypted.
+# sqlite and open() take the process umask, which left the local plaintext
+# snapshots at 0644 on 2026-09-25, so the mode is set explicitly instead.
+BACKUP_MODE = 0o600
+
+
+def _private_file(path: str) -> None:
+    """Create ``path`` owner-only before any content lands in it.
+
+    Created first, not chmod-ed afterwards, so the bytes are never readable by
+    others even while being written. The chmod covers a file an earlier run
+    left under the same name, whose mode O_CREAT does not touch.
+    """
+    os.close(os.open(path, os.O_CREAT | os.O_WRONLY, BACKUP_MODE))
+    os.chmod(path, BACKUP_MODE)
+
 
 def _log(msg: str) -> None:
     print(f"[backup_db] {msg}", flush=True)
@@ -89,6 +105,7 @@ def snapshot(db_path: str, dest_path: str) -> str:
     check fails, so a corrupt snapshot never masquerades as a good backup.
     """
     Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+    _private_file(dest_path)
     src = sqlite3.connect(db_path)
     try:
         dst = sqlite3.connect(dest_path)
@@ -118,6 +135,7 @@ def tools_available() -> bool:
 def compress_encrypt(src_path: str, dest_path: str, key_file: str) -> str:
     """zstd-compress then AES-256-encrypt ``src_path`` -> ``dest_path`` (streamed)."""
     Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+    _private_file(dest_path)
     with open(dest_path, "wb") as out:
         zst = subprocess.Popen(["zstd", "-q", "-c", src_path], stdout=subprocess.PIPE)
         enc = subprocess.Popen(
@@ -139,6 +157,7 @@ def compress_encrypt(src_path: str, dest_path: str, key_file: str) -> str:
 def decrypt_decompress(enc_path: str, dest_path: str, key_file: str) -> str:
     """Reverse of :func:`compress_encrypt` — for verification and restore."""
     Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+    _private_file(dest_path)
     with open(dest_path, "wb") as out:
         dec = subprocess.Popen(
             [

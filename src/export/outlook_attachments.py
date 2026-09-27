@@ -19,6 +19,7 @@ from src.export.sharepoint_fetcher import (
     fetch_sharepoint_link,
     record_link_in_db,
 )
+from src.extract.attachment_extractors import sniff_mime_type
 
 logger = logging.getLogger(__name__)
 
@@ -243,7 +244,12 @@ def register_downloaded_attachments(
                     email_id,
                     stored_message_id,
                     f.name,
-                    mimetypes.guess_type(f.name)[0] or "application/octet-stream",
+                    # The name first, then the bytes: an extensionless
+                    # Outlook part recorded as octet-stream is skipped by the
+                    # text extractor and never selected by the image backfill.
+                    mimetypes.guess_type(f.name)[0]
+                    or sniff_mime_type(str(f))
+                    or "application/octet-stream",
                     f.stat().st_size,
                     str(f),
                     stamp,

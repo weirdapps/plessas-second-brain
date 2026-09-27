@@ -242,14 +242,15 @@ _CONTEXT_HINT_LIMIT = 5
 
 def _maybe_person_context(conn: sqlite3.Connection, query: str, days: int) -> dict | None:
     """Return person_context if the query plausibly matches a known person."""
-    # resolve_person is the test, so recall attaches exactly the person that
-    # person_context and meeting_prep find for the same words: a name with a word
-    # starting with the query, or an address whose local part starts with it. A
-    # substring test found a name for most topics ('AI' inside Michail, 'EU'
-    # inside Piraeus) and attached that dossier, and a separate pre-check here
-    # disagreed with resolve_person in both directions. No match-count threshold:
-    # a real surname matches about 50 people. An unmatched name returns early.
-    ctx = get_person_context(conn, query, days=days, limit=_CONTEXT_HINT_LIMIT)
+    # resolve_person is the test, so recall attaches the person person_context
+    # and meeting_prep find for the same words: a name with a word starting with
+    # the query. A substring test found a name for most topics ('AI' inside
+    # Michail, 'EU' inside Piraeus) and attached that dossier, and a separate
+    # pre-check here disagreed with resolve_person in both directions. Not by an
+    # address's local part, which a topic word such as 'data' or 'info' starts
+    # often enough. No match-count threshold: a real surname matches about 50
+    # people. An unmatched name returns early.
+    ctx = get_person_context(conn, query, days=days, limit=_CONTEXT_HINT_LIMIT, local_part=False)
     return ctx if ctx.get("person") else None
 
 

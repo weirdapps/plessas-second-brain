@@ -137,3 +137,19 @@ def test_a_failure_beside_a_refusal_still_says_the_model_is_down(tmp_path, monke
     rc, _ = _sync(tmp_path, monkeypatch, _run(unusable=1, failures=1))
 
     assert rc == 75
+
+
+@pytest.mark.parametrize("workers", [1, 3])
+def test_refusals_carried_from_an_earlier_run_are_no_sign_of_an_outage(staged, tmp_path, workers):
+    # Refused while the model answered others, so refused again they say nothing
+    # about the model. Counted, a quiet run that met three of them went red at 75
+    # every hour, and without a success they were never counted towards retiring.
+    (tmp_path / "state.json").write_text(
+        json.dumps({"failed_attempts": {"refused1": 1, "refused2": 1, "refused3": 1}})
+    )
+    staged("refused1", "refused2", "refused3")
+
+    result = local.run_extraction(workers=workers, deadline_s=600.0)
+
+    assert result["model_unusable"] == 0
+    assert result["model_failures"] == 0

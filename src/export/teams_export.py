@@ -410,6 +410,10 @@ def pull_messages(
                     f"pull_messages error chat={chat['teams_chat_id']}: {e}",
                     file=sys.stderr,
                 )
+        # One chat, one transaction. Committed only after the loop, the pull held
+        # the write lock across the whole deadline of teams-cli calls, and every
+        # other writer waiting past its busy_timeout failed "database is locked".
+        conn.commit()
 
     # Stamp the moment, not just the flag. Without a date, a sweep that took
     # 1,179 of 1,219 chats in one pass looks exactly like archived rooms

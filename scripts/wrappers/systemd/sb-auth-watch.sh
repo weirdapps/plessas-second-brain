@@ -446,7 +446,10 @@ auth_check_gcloud_adc() {
 
   if [ -x "$GCLOUD_AUTO_LOGIN" ]; then
     log "launching gcloud-auto-login.sh in background (timeout=180s, may drive Chrome)"
-    nohup "$GCLOUD_AUTO_LOGIN" >> "$LOG_DIR/gcloud-auto-login.log" 2>&1 &
+    # stdout goes nowhere: the helper ends by echoing the ADC access token, and
+    # appending it here left live bearer tokens in a plaintext log. Nothing in
+    # this script reads that output; stderr carries the diagnostics.
+    nohup "$GCLOUD_AUTO_LOGIN" >/dev/null 2>>"$LOG_DIR/gcloud-auto-login.log" &
     return 1
   fi
 

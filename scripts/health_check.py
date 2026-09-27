@@ -68,6 +68,11 @@ CURATE_STATE = STATE_DIR / "curate-state.json"
 # source of truth; duplicated because this script is loaded standalone, and
 # pinned by a test that reads the real one.
 CURATE_MAX_DEFER_ATTEMPTS = 5
+# How long candidates may sit deferred, or placements stop, before check_curation
+# calls the stall. A deferral cannot age out through retries: a parked candidate
+# is only offered again once its folder has room, so while every folder stays at
+# its cap `attempts` never passes 1 and only time can show the queue is stuck.
+CURATE_STALL_AGE = timedelta(days=7)
 
 # Counterpart to the heartbeat: written by the push job when a run FAILS (line 1
 # ISO-8601 UTC, line 2 the reason), removed when one succeeds. The stamp alone
@@ -196,6 +201,13 @@ TEAMS_DISABLED_WARN_SHARE = 0.25
 # manual `brain process-images` pass or more budget.
 IMAGE_QUEUE_WARN = 500
 
+# Slack on top of STALE_THRESHOLDS["images_vision"] before the OLDEST pending
+# image counts as abandoned. Step 8 drains newest first (ORDER BY date_received
+# DESC) in short hourly slices plus the nightly process-images pass, so after a
+# heavy day the oldest arrivals legitimately wait longest; a day of grace keeps a
+# queue that is merely behind from reading as one that stopped.
+IMAGE_PENDING_GRACE = timedelta(days=1)
+
 # Downloaded attachment directories with no matching email row. A handful is
 # ordinary: a sync can download an attachment minutes before the loader writes
 # its email, and the registrar picks it up on the next pass. Hundreds is not
@@ -295,7 +307,13 @@ def systemctl_bin() -> str:
 
 def kick_job(label: str):
     """(Re)start a scheduled job by its platform-native identifier:
-    `launchctl kickstart` on macOS, `systemctl --user start` on Linux (VPS)."""
+    `launchctl kickstart` on macOS, `systemctl --user start` on Linux (VPS).
+
+    --no-block because every sb-* unit is Type=oneshot, and a blocking start
+    waits for the whole job. The 30 s timeout then killed the client while
+    systemd went on running the job, so the report said "Failed to kick" for a
+    sync that finished seven minutes later.
+    """
     if IS_MACOS:
         uid = os.getuid()
         return subprocess.run(
@@ -304,10 +322,27 @@ def kick_job(label: str):
             timeout=30,
         )
     return subprocess.run(
-        [systemctl_bin(), "--user", "start", label],
+        [systemctl_bin(), "--user", "start", "--no-block", label],
         capture_output=True,
         timeout=30,
     )
+
+
+def _kick_outcome(label: str, queued: str) -> str:
+    """Kick a job and say what actually happened: `queued` when the service
+    manager accepted it, otherwise the return code and the tail of its stderr.
+    Reading the return code is the point; a refused restart used to be
+    reported as done."""
+    try:
+        proc = kick_job(label)
+    except Exception as e:
+        return f"Failed to kick {label}: {e}"
+    if proc.returncode == 0:
+        return queued
+    stderr = proc.stderr or b""
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
+    return f"Failed to kick {label} (rc={proc.returncode}): {stderr.strip()[-200:]}"
 
 
 def get_db():
@@ -665,11 +700,22 @@ def check_images(db):
     # The JOIN matters: run_backfill only sees attachments joinable to an email, so
     # counting orphans (email_id NULL) inflates this permanently — 91 reported vs 2
     # reachable on prod — and would trip the WARN for work that can never drain.
-    pending = db.execute(
-        "SELECT COUNT(*) FROM attachments a JOIN emails e ON a.email_id = e.id "
+    # The same query also ages the queue, so the count and the age can never be
+    # read off two predicates that drift apart. Depth alone has no time dimension:
+    # sync swallows any Step 8 exception, so a step that raises on every run writes
+    # no occurrences, `stuck` stays 0, and `pending` took 8-10 days to cross
+    # IMAGE_QUEUE_WARN.
+    pending, oldest_pending = db.execute(
+        "SELECT COUNT(*), MIN(e.date_received) FROM attachments a "
+        "JOIN emails e ON a.email_id = e.id "
         "WHERE a.mime_type LIKE 'image/%' AND a.file_path IS NOT NULL "
         "AND a.message_id NOT IN (SELECT message_id FROM inline_image_occurrences)"
-    ).fetchone()[0]
+    ).fetchone()
+    pending_age = _age(oldest_pending)
+    pending_stale = (
+        pending_age is not None
+        and pending_age > STALE_THRESHOLDS["images_vision"] + IMAGE_PENDING_GRACE
+    )
     # Vision-stage liveness. Neither signal above has a time dimension: coverage %
     # freezes numerator and denominator together, and `pending` only sees images
     # that never reached inline_images at all. So a vision stage that stopped
@@ -714,15 +760,17 @@ def check_images(db):
         "skipped": skipped,
         "owed": owed,
         "pending": pending,
+        "pending_age": pending_age,
+        "pending_stale": pending_stale,
         "stuck": stuck,
         "latest_vision": latest_vision,
         # Keyed "age" because that is what build_report reads. Under its old name
         # the report printed "?" here, so the one source with a known outage was
         # also the one whose age was invisible.
         "age": _age(latest_vision),
-        # Only the two gauges with a real drain semantics and a time dimension.
+        # Only the gauges with a real drain semantics and a time dimension.
         # `pct` is deliberately absent: see the note above.
-        "status": "WARN" if pending > IMAGE_QUEUE_WARN or stuck else "OK",
+        "status": "WARN" if pending > IMAGE_QUEUE_WARN or stuck or pending_stale else "OK",
     }
 
 
@@ -1051,6 +1099,13 @@ def check_curation(state_path: Path | None = None):
     destination is full. Entries at MAX_DEFER_ATTEMPTS have exhausted their
     retries and will not be offered again, so those are the ones that mean work
     is being dropped rather than delayed.
+
+    Exhausted retries alone never fired in production, though. A parked
+    candidate is only re-offered once its folder has headroom, so while every
+    folder stays full no entry passes attempts=1, and the check read OK with 376
+    candidates parked and nothing placed for a week. So the queue is also aged:
+    the oldest deferral, and the latest placement while anything is deferred,
+    each past CURATE_STALL_AGE means the folders are not freeing up by themselves.
     """
     path = CURATE_STATE if state_path is None else Path(state_path)
     try:
@@ -1064,17 +1119,31 @@ def check_curation(state_path: Path | None = None):
     copied = state.get("copied") or []
     blocked = sum(1 for v in deferred.values() if v.get("attempts", 0) >= CURATE_MAX_DEFER_ATTEMPTS)
     latest = max((c.get("classified_at") for c in copied if c.get("classified_at")), default=None)
+    # last_attempt is rewritten only when a candidate is deferred again, which
+    # needs headroom first, so on a full folder it stays frozen at the first
+    # deferral and its age is how long the destination has been full.
+    oldest = min(
+        (v.get("last_attempt") for v in deferred.values() if v.get("last_attempt")), default=None
+    )
+    age = _age(latest)
+    deferral_age = _age(oldest)
+    stalled = bool(deferred) and any(
+        a is not None and a > CURATE_STALL_AGE for a in (deferral_age, age)
+    )
     return {
         "name": "Curation",
         "total": len(copied),
         "deferred": len(deferred),
         "blocked": blocked,
+        "stalled": stalled,
         "latest": latest,
-        "age": _age(latest),
-        # Deferred alone is ordinary back-pressure and clears itself once a
-        # folder has room. Exhausted retries are not: that is the document being
-        # dropped, which is the condition that went unnoticed for a month.
-        "status": "WARN" if blocked else "OK",
+        "age": age,
+        "deferral_age": deferral_age,
+        # Fresh deferrals are ordinary back-pressure: an operator pruning a
+        # folder lets them through. Nothing frees a folder automatically, so a
+        # week of it, or exhausted retries, is the document not arriving, which
+        # is the condition that went unnoticed for a month.
+        "status": "WARN" if blocked or stalled else "OK",
     }
 
 
@@ -1555,27 +1624,19 @@ def auto_fix(issues):
 
     for issue in issues:
         if issue["type"] == "sentinel" and issue["name"] == "needs_reauth":
-            try:
-                kick_job(AUTH_WATCH_JOB)
-                actions.append("Kicked auth-watch to attempt silent renewal")
-            except Exception as e:
-                actions.append(f"Failed to kick auth-watch: {e}")
+            actions.append(
+                _kick_outcome(AUTH_WATCH_JOB, f"Queued {AUTH_WATCH_JOB} to attempt silent renewal")
+            )
 
         elif issue["type"] == "job_failed":
             label = issue["label"]
-            try:
-                kick_job(label)
-                actions.append(f"Re-kicked {label}")
-            except Exception as e:
-                actions.append(f"Failed to kick {label}: {e}")
+            actions.append(_kick_outcome(label, f"Queued {label}"))
 
         elif issue["type"] == "stale_data":
             label = issue["label"]
-            try:
-                kick_job(label)
-                actions.append(f"Kicked {label} to drain staging ({issue['name']} stale)")
-            except Exception as e:
-                actions.append(f"Failed to kick {label}: {e}")
+            actions.append(
+                _kick_outcome(label, f"Queued {label} to drain staging ({issue['name']} stale)")
+            )
 
     return actions
 
@@ -1666,6 +1727,8 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
                 extra += (
                     f" — {c['stuck']:,} awaiting vision, last output {format_age(c.get('age'))} ago"
                 )
+            if c.get("pending_stale"):
+                extra += f" — oldest queued {format_age(c.get('pending_age'))} ago, not draining"
         elif c["name"] == "Emails":
             extra = f" ({c.get('recent_24h', 0)} today)"
         elif c["name"] == "Embeddings" and c.get("gaps"):
@@ -1687,13 +1750,22 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
                 if c.get("disabled_at"):
                     extra += f" (latest {str(c['disabled_at'])[:19]})"
         elif c["name"] == "Curation":
+            # Both ages, because either one alone is ambiguous: an old deferral
+            # with a fresh placement is one full folder among several with room,
+            # and an old placement with fresh deferrals is every folder full.
+            ages = (
+                f"oldest deferral {format_age(c.get('deferral_age'))} ago,"
+                f" last placement {format_age(c.get('age'))} ago"
+            )
             if c.get("blocked"):
                 extra = (
-                    f" ({c.get('deferred', 0)} deferred, {c['blocked']} out of retries:"
+                    f" ({c.get('deferred', 0)} deferred, {c['blocked']} out of retries, {ages}:"
                     " destination folders are full)"
                 )
+            elif c.get("stalled"):
+                extra = f" ({c['deferred']} deferred, {ages}: destination folders are full)"
             elif c.get("deferred"):
-                extra = f" ({c['deferred']} deferred, awaiting folder headroom)"
+                extra = f" ({c['deferred']} deferred, {ages}; awaiting folder headroom)"
             else:
                 extra = " (nothing blocked)"
         elif c["name"] == "SharePoint":

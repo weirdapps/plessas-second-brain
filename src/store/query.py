@@ -1478,34 +1478,67 @@ def get_freshness(conn: sqlite3.Connection) -> dict:
 
     Returns data_as_of / age_hours / stale, plus a `stale_warning` sentence when
     the replica is behind, so it can be surfaced verbatim.
+
+    Two clocks, because either can stop on its own. Every `sync` stamps
+    last_sync_date whether or not any mail was exported: while the Outlook
+    session was dead the daily sync still stamped it, and the replica read fresh
+    for hours over an inbox a day old. mail_export_ok_at is the Inbox export's
+    last success, which sync copies in. data_as_of is the older of the two, the
+    warning names the one behind, and both are returned as they are stored.
     """
-    from datetime import datetime
+    from datetime import UTC, datetime
+
+    def moment(stamp) -> datetime:
+        # last_sync_date is naive local time on the producer; the export's
+        # stamp is UTC with a Z. Aware, the two can be compared.
+        parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.astimezone()
 
     out: dict = {"data_as_of": None, "age_hours": None, "stale": False}
     try:
         row = conn.execute(
             "SELECT value FROM sync_metadata WHERE key = 'last_sync_date'"
         ).fetchone()
+        export_row = conn.execute(
+            "SELECT value FROM sync_metadata WHERE key = 'mail_export_ok_at'"
+        ).fetchone()
     except sqlite3.OperationalError:
         return out
     if not row or not row[0]:
         return out
 
-    out["data_as_of"] = row[0]
+    out["data_as_of"] = out["last_sync_date"] = row[0]
     try:
-        as_of = datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+        as_of = moment(row[0])
     except ValueError:
         return out
-    now = datetime.now(as_of.tzinfo) if as_of.tzinfo else datetime.now()
-    age_hours = round((now - as_of).total_seconds() / 3600.0, 1)
+    export_behind = False
+    if export_row and export_row[0]:
+        out["mail_export_ok_at"] = export_row[0]
+        try:
+            export_ok = moment(export_row[0])
+        except ValueError:  # reported above, not guessed at
+            export_ok = None
+        if export_ok is not None and export_ok < as_of:
+            as_of, export_behind = export_ok, True
+            out["data_as_of"] = export_row[0]
+    age_hours = round((datetime.now(UTC) - as_of).total_seconds() / 3600.0, 1)
     out["age_hours"] = age_hours
     if age_hours > STALE_AFTER_HOURS:
         out["stale"] = True
-        out["stale_warning"] = (
-            f"This corpus was last updated {age_hours}h ago ({row[0]}). Anything "
-            "more recent than that is missing. Use outlook_live_search for very "
-            "recent mail, and say so if the answer depends on recent items."
-        )
+        if export_behind:
+            out["stale_warning"] = (
+                f"The Outlook mail export last succeeded {age_hours}h ago "
+                f"({export_row[0]}), although the corpus was last updated at {row[0]}. "
+                "Mail more recent than the export is missing. Use outlook_live_search "
+                "for very recent mail, and say so if the answer depends on recent items."
+            )
+        else:
+            out["stale_warning"] = (
+                f"This corpus was last updated {age_hours}h ago ({row[0]}). Anything "
+                "more recent than that is missing. Use outlook_live_search for very "
+                "recent mail, and say so if the answer depends on recent items."
+            )
     return out
 
 

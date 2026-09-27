@@ -1517,6 +1517,24 @@ def cmd_sync(args):
         "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('last_sync_count', ?)",
         (str(count),),
     )
+    # When mail last arrived, beside when this command last ran. last_sync_date
+    # moves on every run, fetched mail or not, so alone it read fresh through an
+    # Outlook outage. The Inbox export stamps last_sync_completed_at only when it
+    # succeeds, empty runs included. Copied here because brain.db is the only
+    # file a replica receives; get_freshness reports the older of the two.
+    from src.export.state import load_outlook_sync_state
+
+    try:
+        export_ok_at = load_outlook_sync_state(
+            DATA_ROOT / "state" / "outlook_sync.json"
+        ).last_sync_completed_at
+    except (OSError, ValueError, AttributeError, TypeError):  # unreadable: no stamp
+        export_ok_at = None
+    if export_ok_at:
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('mail_export_ok_at', ?)",
+            (export_ok_at,),
+        )
     conn.commit()
     conn.close()
 

@@ -192,6 +192,20 @@ def get_event_body(event_id: str) -> dict | None:
         return None
 
 
+def _marked_time(when: dict) -> str | None:
+    """Graph's DateTime, ending in 'Z' when its TimeZone says UTC.
+
+    outlook-cli sends no Prefer: outlook.timezone, so Outlook returns every time
+    in UTC. Kept without its zone, '2026-10-01T13:00:00.0000000' read as 13:00
+    for a meeting at 16:00 in Athens. The 'Z' comes after the fraction, so the
+    text still sorts, and compares with a 19-character bound, as before.
+    """
+    value = when.get("DateTime")
+    if value and when.get("TimeZone") == "UTC" and not value.endswith("Z"):
+        return value + "Z"
+    return value
+
+
 def parse_event(raw: dict) -> dict:
     """
     Normalize an Outlook calendar event into internal shape.
@@ -233,8 +247,8 @@ def parse_event(raw: dict) -> dict:
         "subject": raw.get("Subject", ""),
         "organizer_email": organizer.get("Address", ""),
         "organizer_name": organizer.get("Name", ""),
-        "start_at": start.get("DateTime"),
-        "end_at": end.get("DateTime"),
+        "start_at": _marked_time(start),
+        "end_at": _marked_time(end),
         "location": location.get("DisplayName", ""),
         "is_recurring": raw.get("IsRecurring", False),
         "recurrence_master_id": raw.get("SeriesMasterId"),

@@ -480,6 +480,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_email_html(conn)
     if current < 24:
         migrate_teams_call_records_are_system(conn)
+    if current < 25:
+        migrate_mark_calendar_times_utc(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -705,6 +707,30 @@ def migrate_teams_call_records_are_system(conn: sqlite3.Connection) -> None:
                 substantive >= 1 and chars >= 100,
                 thread_id,
             ),
+        )
+    conn.commit()
+
+
+def migrate_mark_calendar_times_utc(conn: sqlite3.Connection) -> None:
+    """v25: stored calendar times end in 'Z', which says they are UTC.
+
+    parse_event kept Graph's DateTime and dropped its TimeZone, which is 'UTC'
+    for every event outlook-cli lists, so '2026-10-01T13:00:00.0000000' read as
+    13:00 for a meeting at 16:00 in Athens. parse_event now keeps the 'Z'. An
+    unchanged event is never fetched again, so the rows already stored get it
+    here: values in Graph's shape without a 'Z' or an offset, which also makes a
+    second run change nothing.
+    """
+    has_table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='calendar_events'"
+    ).fetchone()
+    if not has_table:
+        return
+    for column in ("start_at", "end_at"):
+        conn.execute(
+            f"UPDATE calendar_events SET {column} = {column} || 'Z' "
+            f"WHERE {column} LIKE '____-__-__T%' AND {column} NOT LIKE '%Z' "
+            f"AND {column} NOT GLOB '*[+-][0-9][0-9]:[0-9][0-9]'"
         )
     conn.commit()
 

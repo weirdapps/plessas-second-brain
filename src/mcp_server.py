@@ -441,16 +441,67 @@ def query_calendar_events(
 ) -> dict:
     """Query calendar events by person, date range, or keyword.
 
+    start_at and end_at are UTC (ISO 8601, ending in Z). start_local and end_local
+    are the same times in Europe/Athens with their offset, e.g.
+    2026-10-01T16:00:00+03:00: quote those to the user. A bare date in since or
+    until is an Athens calendar day, so a meeting at 00:30 Athens time falls on its
+    own day, not the one before.
+
     Args:
         person: Filter by attendee name or email (partial match, case and accent blind)
-        since: Start date (YYYY-MM-DD)
-        until: End date (YYYY-MM-DD, inclusive)
+        since: Start date (YYYY-MM-DD, an Athens day), or an ISO 8601 date-time,
+            Athens time unless it carries an offset
+        until: End date (YYYY-MM-DD, inclusive), or an ISO 8601 date-time
         keyword: Full-text search in subject and body_summary
-        limit: Maximum results (default: 20)
+        limit: Maximum results (default: 20, at most 200)
     """
     import re
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
 
     from src.store.greek import search_fold
+
+    athens = ZoneInfo("Europe/Athens")
+
+    def utc_bound(value: str, *, upper: bool) -> str | None:
+        """since/until as the UTC second start_at is compared with, None if malformed.
+
+        start_at is UTC, and a bare date used to be compared with it as it stood,
+        so the Athens day began at 03:00 (02:00 in winter). An upper bound is
+        exclusive: the next day for a date, the next second for a date-time.
+        """
+        try:
+            moment = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            moment += timedelta(days=1 if upper else 0)
+        else:
+            moment = moment.replace(microsecond=0) + timedelta(seconds=1 if upper else 0)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=athens)
+        return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+
+    def local(value: str | None) -> str | None:
+        """A stored time in Athens, with its offset; None if it does not parse."""
+        try:
+            moment = datetime.fromisoformat(value or "")
+        except ValueError:
+            return None
+        # Every stored time is UTC, the few written without the 'Z' included.
+        return moment.replace(tzinfo=moment.tzinfo or UTC).astimezone(athens).isoformat()
+
+    bounds: dict[str, str] = {}
+    for name, value in (("since", since), ("until", until)):
+        if value:
+            bound = utc_bound(value, upper=name == "until")
+            if bound is None:
+                return {
+                    "error": f"{name} must be a date (YYYY-MM-DD) or an ISO 8601 date-time, "
+                    f"got {value!r}"
+                }
+            bounds[name] = bound
+    limit = max(1, min(int(limit), 200))
 
     conn = _get_conn()
     try:
@@ -468,17 +519,14 @@ def query_calendar_events(
             )
             params.extend([f"%{search_fold(person)}%", f"%{person.strip().lower()}%"])
 
-        if since:
+        # start_at carries a time, so a bare date compared with <= dropped every
+        # event on that day: the upper bound is exclusive and past the whole day.
+        if "since" in bounds:
             conditions.append("ce.start_at >= ?")
-            params.append(since)
-        if until:
-            # start_at carries a time, so a bare date compared with <= dropped
-            # every event on that day. A bare date now means the whole day.
-            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", until):
-                conditions.append("ce.start_at < date(?, '+1 day')")
-            else:
-                conditions.append("ce.start_at <= ?")
-            params.append(until)
+            params.append(bounds["since"])
+        if "until" in bounds:
+            conditions.append("ce.start_at < ?")
+            params.append(bounds["until"])
 
         # The keyword runs through the same sanitized variants as every other
         # MATCH: every word, then any meaningful word, whose rows are flagged
@@ -523,6 +571,8 @@ def query_calendar_events(
                     "subject": row["subject"],
                     "start_at": row["start_at"],
                     "end_at": row["end_at"],
+                    "start_local": local(row["start_at"]),
+                    "end_local": local(row["end_at"]),
                     "location": row["location"],
                     "organizer": row["organizer_name"] or row["organizer_email"],
                     "body_summary": row["body_summary"],

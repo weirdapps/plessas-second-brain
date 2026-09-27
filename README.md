@@ -145,14 +145,16 @@ The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register t
 
 ## Installation
 
-Requires Python 3.12+ and, if you ingest attachments, two system packages that `pip` cannot install:
+Requires Python 3.12+ and, if you ingest attachments, system packages that `pip` cannot install:
 
 - **`tesseract` plus its language data.** Attachment OCR calls `pytesseract.image_to_string(img, lang="eng+ell")`, so the English *and* Greek traineddata must both be present or every image and scanned PDF fails. `pytesseract` is a wrapper around the binary, not the binary. In a corpus with scanned documents in it, OCR ends up the most common extraction method of all.
+- **`antiword` (or `catdoc`) on Linux**, for legacy Word `.doc` attachments. macOS converts them with its built-in `textutil`; a Linux host with neither records every `.doc` as skipped, which no failure count reports.
 - **`zstd` and `openssl`**, only if you want the encrypted offsite backups from `scripts/backup_db.py`. Missing either one silently downgrades to local-snapshot-only.
 
 ```bash
 brew install tesseract tesseract-lang                  # macOS
 sudo apt-get install tesseract-ocr tesseract-ocr-ell   # Debian/Ubuntu
+sudo apt-get install antiword                          # Debian/Ubuntu, legacy .doc
 tesseract --list-langs | grep -x ell                   # verify the Greek pack
 ```
 

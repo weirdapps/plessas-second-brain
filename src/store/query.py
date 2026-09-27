@@ -344,9 +344,10 @@ def query_by_keyword(
 
     Returns:
         List of dicts with keys: email_id, date, subject, summary, snippet, source
-        where source is 'subject', 'summary', 'content', 'key_fact' or
-        'attachment'; a row whose thread has more than one email matching in its
-        subject, summary or body adds thread_matches, that count. When no row carries
+        where source is 'subject', 'summary', 'content', 'mixed' (every word, but
+        across those three fields), 'key_fact' or 'attachment'; a row whose thread
+        has more than one email matching across its subject, summary and body adds
+        thread_matches, that count. When no row carries
         every token, rows matching any meaningful token come back instead, each
         flagged partial_match.
     """
@@ -384,22 +385,19 @@ _SEEKS_UP_TO = 200
 def _matching_emails_per_thread(
     conn: sqlite3.Connection, expression: str, keys: set, search_content_only: bool
 ) -> dict:
-    """Thread key -> how many of its emails match `expression` in the subject, the
-    summary or the body (the body alone for a content-only search), each column
-    on its own, as each stage of the waterfall matches it.
+    """Thread key -> how many of its emails match `expression` across the subject,
+    the summary and the body, as the waterfall's whole-row stage matches them (the
+    body alone for a content-only search). A whole-row match holds every
+    single-column one, so it counts each stage's matches too.
 
     The page's threads are read through the conversation_id index, then their
     emails are checked one seek each, or, past _SEEKS_UP_TO emails, against one
-    pass over each column's matches. On the replica a page's threads hold 2 to
-    122 emails: seeks take 0 to 5 ms, a pass 22 to 111 ms. A seek costs 0.03 to
-    1 ms by the query, so 20 threads of 700 emails took 1.6 to 14 s by seeks
-    and 20 to 87 ms in one pass; the counts are the same.
+    pass over the matches. On the replica a page's threads hold 2 to 122 emails:
+    seeks take 0 to 5 ms, a pass 22 to 111 ms. A seek costs 0.03 to 1 ms by the
+    query, so 20 threads of 700 emails took 1.6 to 14 s by seeks and 20 to 87 ms
+    in one pass; the counts are the same.
     """
-    columns = ["content_f"]
-    if not search_content_only:
-        columns.append("summary_f")
-        if _has_subject_index(conn):
-            columns.append("subject_f")
+    columns = ["emails_fts.content_f" if search_content_only else "emails_fts"]
     members = (
         "SELECT e.id AS id, j.value AS thread FROM json_each(?) j "
         f"JOIN emails e ON e.conversation_id = j.value AND {_THREAD} = j.value"
@@ -408,16 +406,14 @@ def _matching_emails_per_thread(
     (count,) = conn.execute(f"SELECT COUNT(*) FROM ({members})", (threads,)).fetchone()
     if count <= _SEEKS_UP_TO:
         matched = " OR ".join(
-            "EXISTS (SELECT 1 FROM emails_fts "
-            f"WHERE emails_fts.rowid = m.id AND emails_fts.{column} MATCH ?)"
+            f"EXISTS (SELECT 1 FROM emails_fts WHERE emails_fts.rowid = m.id AND {column} MATCH ?)"
             for column in columns
         )
     else:
         matched = (
             "m.id IN ("
             + " UNION ".join(
-                f"SELECT rowid FROM emails_fts WHERE emails_fts.{column} MATCH ?"
-                for column in columns
+                f"SELECT rowid FROM emails_fts WHERE {column} MATCH ?" for column in columns
             )
             + ")"
         )
@@ -514,8 +510,8 @@ def _keyword_waterfall(
         # Rank by FTS5 BM25 relevance (ORDER BY rank), not recency. rank is only
         # comparable within a single MATCH query, so each source is ranked on its
         # own; the source-priority waterfall (subject -> summary -> content ->
-        # key_fact -> attachment) plus seen_ids dedup preserves the cross-source
-        # order.
+        # mixed -> key_fact -> attachment) plus seen_ids dedup preserves the
+        # cross-source order.
         query_summaries = f"""
             SELECT email_id, date, subject, summary, snippet, source, thread FROM (
                 SELECT
@@ -576,6 +572,45 @@ def _keyword_waterfall(
         """
 
         take(conn.execute(query_content, (safe_keyword, taken(), limit, safe_keyword)))
+
+    # The whole row: every word somewhere in the email, but not all in one field.
+    # The commonest query names a person and a subject, and those split: the name
+    # in the summary or the subject line, the subject words in the body. Matched
+    # one column at a time, that email was missed and the search fell back to
+    # partial rows holding one word each.
+    if len(results) < limit and not search_content_only:
+        query_mixed = f"""
+            WITH picked AS (
+                SELECT email_id FROM (
+                    SELECT
+                        e.id as email_id,
+                        emails_fts.rank as score,
+                        e.date_received as date,
+                        {_best_of_each_thread("emails_fts.rank")} as nth
+                    FROM emails e
+                    JOIN emails_fts ON emails_fts.rowid = e.id
+                    WHERE emails_fts MATCH ? {_NOT_TAKEN}
+                )
+                WHERE nth = 1
+                ORDER BY score, date DESC, email_id DESC
+                LIMIT ?
+            )
+            SELECT
+                e.id as email_id,
+                e.date_received as date,
+                e.subject,
+                e.summary,
+                snippet(emails_fts, 1, '<b>', '</b>', '...', 30) as snippet,
+                'mixed' as source,
+                {_THREAD} as thread
+            FROM emails e
+            JOIN picked ON picked.email_id = e.id
+            JOIN emails_fts ON emails_fts.rowid = e.id
+            WHERE emails_fts MATCH ?
+            ORDER BY rank, e.date_received DESC, e.id DESC
+        """
+
+        take(conn.execute(query_mixed, (safe_keyword, taken(), limit, safe_keyword)))
 
     # Search in key facts (only if we haven't hit the limit and not content-only)
     if len(results) < limit and not search_content_only:
@@ -647,8 +682,8 @@ def _keyword_waterfall(
         take(conn.execute(query_attachments, (safe_keyword, taken(), limit, safe_keyword)))
 
     # Results are relevance-ranked within each source (ORDER BY rank) and appended
-    # in source-priority order (subject -> summary -> content -> key_fact ->
-    # attachment); keep that order rather than re-sorting by date, so BM25
+    # in source-priority order (subject -> summary -> content -> mixed ->
+    # key_fact -> attachment); keep that order rather than re-sorting by date, so BM25
     # relevance is not discarded. (True cross-source ranking via score fusion / RRF
     # is a later change.) take() stops at the requested number.
 
@@ -1102,17 +1137,23 @@ def meeting_prep(
         dossier["resolved_email"] = person_row["email"]
         person_id = person_row["id"]
 
-        # Recent emails
+        # One row per email, as in person_context: email_people is keyed by
+        # role too, so joined through it an email where the person held two
+        # roles came back twice (the DISTINCT took in the role), and so did its
+        # decisions and actions. The role shown is one of theirs, sender first.
         cursor = conn.execute(
             """
-            SELECT DISTINCT e.id as email_id, e.date_received as date,
-                e.subject, e.summary, ep.role_in_email as role, e.sentiment
+            SELECT e.id as email_id, e.date_received as date, e.subject, e.summary,
+                (SELECT ep.role_in_email FROM email_people ep
+                  WHERE ep.email_id = e.id AND ep.person_id = ?
+                  ORDER BY ep.role_in_email <> 'sender', ep.role_in_email LIMIT 1) as role,
+                e.sentiment
             FROM emails e
-            JOIN email_people ep ON e.id = ep.email_id
-            WHERE ep.person_id = ? AND e.date_received >= ?
+            WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+              AND e.date_received >= ?
             ORDER BY e.date_received DESC LIMIT ?
         """,
-            (person_id, cutoff, limit_per_person),
+            (person_id, person_id, cutoff, limit_per_person),
         )
         dossier["emails"] = [dict(r) for r in cursor.fetchall()]
 
@@ -1129,8 +1170,8 @@ def meeting_prep(
                 e.subject as email_subject
             FROM decisions d
             JOIN emails e ON d.email_id = e.id
-            JOIN email_people ep ON e.id = ep.email_id
-            WHERE ep.person_id = ? AND e.date_received >= ?
+            WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+              AND e.date_received >= ?
             ORDER BY date DESC LIMIT 10
         """,
             (person_id, cutoff),
@@ -1144,8 +1185,8 @@ def meeting_prep(
                 e.subject as email_subject
             FROM action_items a
             JOIN emails e ON a.email_id = e.id
-            JOIN email_people ep ON e.id = ep.email_id
-            WHERE ep.person_id = ? AND a.status = 'open'
+            WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+              AND a.status = 'open'
             ORDER BY a.deadline IS NULL, a.deadline ASC LIMIT 10
         """,
             (person_id,),
@@ -1159,8 +1200,8 @@ def meeting_prep(
             FROM email_topics et
             JOIN topics t ON et.topic_id = t.id
             JOIN emails e ON et.email_id = e.id
-            JOIN email_people ep ON e.id = ep.email_id
-            WHERE ep.person_id = ? AND e.date_received >= ?
+            WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+              AND e.date_received >= ?
             GROUP BY t.id ORDER BY count DESC LIMIT 5
         """,
             (person_id, cutoff),
@@ -1179,6 +1220,9 @@ def meeting_prep(
             "action_items": [],
         }
 
+        # t.name LIKE matches every topic whose name holds the words, and joined
+        # to them an email tagged with two of those repeated each of its items.
+        # Filtered by email instead, each item is listed once.
         cursor = conn.execute(
             """
             SELECT d.decision, d.decided_by,
@@ -1186,9 +1230,9 @@ def meeting_prep(
                    e.subject as email_subject
             FROM decisions d
             JOIN emails e ON d.email_id = e.id
-            JOIN email_topics et ON e.id = et.email_id
-            JOIN topics t ON et.topic_id = t.id
-            WHERE t.name LIKE ? AND e.date_received >= ?
+            WHERE e.id IN (SELECT et.email_id FROM email_topics et
+                           JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
+              AND e.date_received >= ?
             ORDER BY date DESC LIMIT 20
         """,
             (f"%{topic_normalized}%", cutoff),
@@ -1200,9 +1244,9 @@ def meeting_prep(
             SELECT kf.fact, e.date_received as date, e.subject
             FROM key_facts kf
             JOIN emails e ON kf.email_id = e.id
-            JOIN email_topics et ON e.id = et.email_id
-            JOIN topics t ON et.topic_id = t.id
-            WHERE t.name LIKE ? AND e.date_received >= ?
+            WHERE e.id IN (SELECT et.email_id FROM email_topics et
+                           JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
+              AND e.date_received >= ?
             ORDER BY e.date_received DESC LIMIT 20
         """,
             (f"%{topic_normalized}%", cutoff),
@@ -1214,9 +1258,9 @@ def meeting_prep(
             SELECT a.task, a.owner, a.deadline, a.status
             FROM action_items a
             JOIN emails e ON a.email_id = e.id
-            JOIN email_topics et ON e.id = et.email_id
-            JOIN topics t ON et.topic_id = t.id
-            WHERE t.name LIKE ? AND a.status = 'open'
+            WHERE e.id IN (SELECT et.email_id FROM email_topics et
+                           JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
+              AND a.status = 'open'
             ORDER BY a.deadline IS NULL, a.deadline ASC LIMIT 20
         """,
             (f"%{topic_normalized}%",),
@@ -1228,20 +1272,36 @@ def meeting_prep(
     return result
 
 
+# Replies Outlook sends for the owner when he answers a meeting invitation: the
+# organiser owes nothing back. The Greek forms are the ones found on the replica.
+_MEETING_RESPONSE_PREFIXES = ("Accepted:", "Tentative:", "Declined:", "Αποδεκτή:", "Αποδοχή:")
+
+
 def _stale_threads_sql(select: str, days: int, max_days: int) -> tuple[str, tuple]:
-    """Threads whose last message the user sent between `days` and `max_days` ago.
+    """Threads whose last message the user sent between `days` and `max_days` ago,
+    to someone else, and not as a meeting response.
 
     A threshold at or past the window widens it by 30 days: days=45 against
     the 30-day default was an empty answer with a total of 0, read as 'nobody
     owes you a reply'.
+
+    Mail with no recipient or cc but the owner (health checks and digests he
+    sends himself) and meeting responses were about 80% of the list on the
+    replica, and nobody will ever answer either. The window is cut in UTC, the
+    time the store holds: naive local time put a thread 4.9 days old under
+    days=5.
     """
-    from datetime import datetime, timedelta
+    from datetime import UTC, datetime, timedelta
 
     if max_days <= days:
         max_days = days + 30
-    now = datetime.now()
+    now = datetime.now(UTC)
     cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
     oldest = (now - timedelta(days=max_days)).strftime("%Y-%m-%dT%H:%M:%S")
+    owner = f"%{USER_EMAIL_PATTERN}%"
+    not_a_response = " ".join(
+        "AND COALESCE(e.subject, '') NOT LIKE ?" for _ in _MEETING_RESPONSE_PREFIXES
+    )
     sql = f"""
         WITH latest_per_thread AS (
             SELECT conversation_id,
@@ -1259,10 +1319,23 @@ def _stale_threads_sql(select: str, days: int, max_days: int) -> tuple[str, tupl
         JOIN emails e ON e.conversation_id = lpt.conversation_id
                      AND e.date_received = lpt.last_date
         WHERE LOWER(e.sender_address) LIKE LOWER(?)
+          AND EXISTS (
+              SELECT 1 FROM email_people ep JOIN people p ON p.id = ep.person_id
+              WHERE ep.email_id = e.id AND ep.role_in_email IN ('recipient', 'cc')
+                AND LOWER(COALESCE(p.email, '')) NOT LIKE LOWER(?)
+          )
+          {not_a_response}
           AND lpt.last_date < ?
           AND lpt.last_date >= ?
     """
-    return sql, (_BLANK_SUBJECT_THREAD, f"%{USER_EMAIL_PATTERN}%", cutoff, oldest)
+    return sql, (
+        _BLANK_SUBJECT_THREAD,
+        owner,
+        owner,
+        *(f"{prefix}%" for prefix in _MEETING_RESPONSE_PREFIXES),
+        cutoff,
+        oldest,
+    )
 
 
 def find_stale_threads(
@@ -1306,13 +1379,15 @@ def count_stale_threads(conn: sqlite3.Connection, days: int = 5, max_days: int =
     return conn.execute(sql, params).fetchone()[0]
 
 
-# Open, past a deadline SQLite can parse, and not from a news article. A NULL
-# julianday() means the deadline is free text; those rows sorted to the top with
-# days_overdue = NULL and pushed the real answers off the end.
-_OVERDUE_WHERE = """
-    ai.status = 'open' AND ai.deadline IS NOT NULL
-      AND julianday(ai.deadline) IS NOT NULL
-      AND ai.deadline < date('now')
+# Open, past an ISO date, and not from a news article. Free text sorted to the
+# top with days_overdue = NULL and pushed the real answers off the end. A
+# parseable julianday() was not enough either: it reads a bare year ('2026') as
+# Julian day 2026 and '10:00' as today, so those counted as overdue with
+# days_overdue near 2.46 million. The same ISO test query_action_items uses.
+_OVERDUE_WHERE = f"""
+    ai.status = 'open' AND ai.deadline {_ISO_DATE}
+      AND date(substr(ai.deadline, 1, 10)) IS NOT NULL
+      AND substr(ai.deadline, 1, 10) < date('now')
       AND (e.id IS NULL OR e.mailbox_name IS NULL OR e.mailbox_name <> 'News')
 """
 
@@ -1353,7 +1428,8 @@ def find_overdue_actions(conn: sqlite3.Connection, limit: int = 20) -> list[dict
                    WHEN c.id IS NOT NULL THEN 'conversation'
                    ELSE 'orphan'
                END as source,
-               CAST(julianday('now') - julianday(ai.deadline) AS INTEGER) as days_overdue
+               CAST(julianday('now') - julianday(substr(ai.deadline, 1, 10)) AS INTEGER)
+                   as days_overdue
         FROM action_items ai
         LEFT JOIN emails e ON ai.email_id = e.id
         LEFT JOIN teams_threads tt ON ai.teams_thread_id = tt.id
@@ -1453,7 +1529,11 @@ def get_coverage(conn: sqlite3.Connection) -> dict:
     return {
         "mailboxes": mailboxes,
         "teams": span("SELECT MIN(started_at), MAX(ended_at), COUNT(*) FROM teams_threads"),
-        "calendar": span("SELECT MIN(start_at), MAX(start_at), COUNT(*) FROM calendar_events"),
+        # Meetings Outlook no longer lists are kept as cancelled, not deleted.
+        "calendar": span(
+            "SELECT MIN(start_at), MAX(start_at), COUNT(*) FROM calendar_events "
+            "WHERE is_cancelled = 0"
+        ),
         "conversations": span(
             "SELECT MIN(started_at), MAX(COALESCE(ended_at, started_at)), COUNT(*) "
             "FROM conversations"
@@ -1478,34 +1558,67 @@ def get_freshness(conn: sqlite3.Connection) -> dict:
 
     Returns data_as_of / age_hours / stale, plus a `stale_warning` sentence when
     the replica is behind, so it can be surfaced verbatim.
+
+    Two clocks, because either can stop on its own. Every `sync` stamps
+    last_sync_date whether or not any mail was exported: while the Outlook
+    session was dead the daily sync still stamped it, and the replica read fresh
+    for hours over an inbox a day old. mail_export_ok_at is the Inbox export's
+    last success, which sync copies in. data_as_of is the older of the two, the
+    warning names the one behind, and both are returned as they are stored.
     """
-    from datetime import datetime
+    from datetime import UTC, datetime
+
+    def moment(stamp) -> datetime:
+        # last_sync_date is naive local time on the producer; the export's
+        # stamp is UTC with a Z. Aware, the two can be compared.
+        parsed = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.astimezone()
 
     out: dict = {"data_as_of": None, "age_hours": None, "stale": False}
     try:
         row = conn.execute(
             "SELECT value FROM sync_metadata WHERE key = 'last_sync_date'"
         ).fetchone()
+        export_row = conn.execute(
+            "SELECT value FROM sync_metadata WHERE key = 'mail_export_ok_at'"
+        ).fetchone()
     except sqlite3.OperationalError:
         return out
     if not row or not row[0]:
         return out
 
-    out["data_as_of"] = row[0]
+    out["data_as_of"] = out["last_sync_date"] = row[0]
     try:
-        as_of = datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+        as_of = moment(row[0])
     except ValueError:
         return out
-    now = datetime.now(as_of.tzinfo) if as_of.tzinfo else datetime.now()
-    age_hours = round((now - as_of).total_seconds() / 3600.0, 1)
+    export_behind = False
+    if export_row and export_row[0]:
+        out["mail_export_ok_at"] = export_row[0]
+        try:
+            export_ok = moment(export_row[0])
+        except ValueError:  # reported above, not guessed at
+            export_ok = None
+        if export_ok is not None and export_ok < as_of:
+            as_of, export_behind = export_ok, True
+            out["data_as_of"] = export_row[0]
+    age_hours = round((datetime.now(UTC) - as_of).total_seconds() / 3600.0, 1)
     out["age_hours"] = age_hours
     if age_hours > STALE_AFTER_HOURS:
         out["stale"] = True
-        out["stale_warning"] = (
-            f"This corpus was last updated {age_hours}h ago ({row[0]}). Anything "
-            "more recent than that is missing. Use outlook_live_search for very "
-            "recent mail, and say so if the answer depends on recent items."
-        )
+        if export_behind:
+            out["stale_warning"] = (
+                f"The Outlook mail export last succeeded {age_hours}h ago "
+                f"({export_row[0]}), although the corpus was last updated at {row[0]}. "
+                "Mail more recent than the export is missing. Use outlook_live_search "
+                "for very recent mail, and say so if the answer depends on recent items."
+            )
+        else:
+            out["stale_warning"] = (
+                f"This corpus was last updated {age_hours}h ago ({row[0]}). Anything "
+                "more recent than that is missing. Use outlook_live_search for very "
+                "recent mail, and say so if the answer depends on recent items."
+            )
     return out
 
 

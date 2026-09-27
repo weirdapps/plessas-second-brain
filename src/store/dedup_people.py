@@ -16,6 +16,7 @@ import sqlite3
 import unicodedata
 
 from src.config import DEFAULT_DB
+from src.store.normalizer import looks_garbled, recover_garbled_greek
 from src.store.transliterate import canonical_name
 
 DB_PATH = DEFAULT_DB
@@ -50,7 +51,14 @@ def pick_best_name(names: list[str]) -> str:
     Prefers: Title Case > mixed case > ALL CAPS > all lower.
     Prefers: accented Greek > unaccented Greek.
     Prefers: longer name > shorter (more complete).
+
+    Never a garbled name: its lower-case Latin letters scored as mixed case and
+    its doubled length as more complete, so it beat the real ALL-CAPS Greek. A
+    recoverable one stands in as its Greek, and an unrecoverable one wins only
+    when every variant is garbled.
     """
+    names = [recover_garbled_greek(n) or n for n in names]
+    names = [n for n in names if not looks_garbled(n)] or names
 
     def score(name: str) -> tuple:
         n = name.strip()
@@ -120,6 +128,20 @@ def merge_person(conn: sqlite3.Connection, keep_id: int, remove_id: int):
         (keep_id, remove_id),
     )
     conn.execute("DELETE FROM email_people WHERE person_id = ?", (remove_id,))
+    # Every other table that names a person. Left behind, a merged-away person's
+    # Teams messages, meetings and resolved MRI pointed at a deleted row, so
+    # person_context never showed them, and with foreign keys on the delete
+    # below failed outright.
+    conn.execute(
+        "UPDATE teams_messages SET sender_person_id = ? WHERE sender_person_id = ?",
+        (keep_id, remove_id),
+    )
+    conn.execute(
+        "UPDATE teams_mri_resolution SET person_id = ? WHERE person_id = ?", (keep_id, remove_id)
+    )
+    conn.execute(
+        "UPDATE event_attendees SET person_id = ? WHERE person_id = ?", (keep_id, remove_id)
+    )
     conn.execute("DELETE FROM people WHERE id = ?", (remove_id,))
 
 

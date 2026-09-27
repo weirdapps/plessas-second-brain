@@ -370,7 +370,7 @@ def _images_db():
         "CREATE TABLE inline_images (id INTEGER PRIMARY KEY, vision_description TEXT, "
         "classification TEXT, classified_at TEXT, visioned_at TEXT)"
     )
-    db.execute("CREATE TABLE emails (id INTEGER PRIMARY KEY)")
+    db.execute("CREATE TABLE emails (id INTEGER PRIMARY KEY, date_received TEXT)")
     db.execute(
         "CREATE TABLE attachments (id INTEGER PRIMARY KEY, email_id INTEGER, message_id TEXT, "
         "mime_type TEXT, file_path TEXT)"
@@ -2511,8 +2511,8 @@ def test_check_curation_is_quiet_when_nothing_is_blocked(hc, tmp_path):
 
 
 def test_check_curation_tolerates_ordinary_back_pressure(hc, tmp_path):
-    """A deferred candidate with retries left clears itself once a folder has
-    room. That is the mechanism working, not a fault."""
+    """A candidate deferred recently, with retries left, is ordinary back-pressure
+    and stays OK. Only a deferral older than a week warns."""
     state = _curate_state(tmp_path, deferred={"7": {"folder": "retail", "attempts": 1}})
 
     r = hc.check_curation(state_path=state)
@@ -2521,20 +2521,24 @@ def test_check_curation_tolerates_ordinary_back_pressure(hc, tmp_path):
     assert r["status"] == "OK"
 
 
-def test_check_curation_warns_once_candidates_run_out_of_retries(hc, tmp_path):
-    """Exhausted retries mean the document is being DROPPED, which is the
-    condition that went unnoticed for a month."""
+def test_check_curation_warns_once_candidates_sit_deferred_for_a_week(hc, tmp_path):
+    """A full folder never re-offers its parked candidates, so attempts stays at
+    1 in production and exhausted retries cannot fire. The age of the oldest
+    deferral is what shows the document is not arriving."""
+    from datetime import datetime
+
+    old = (datetime.now() - timedelta(days=10)).isoformat()
     state = _curate_state(
         tmp_path,
         deferred={
-            "7": {"folder": "retail", "attempts": hc.CURATE_MAX_DEFER_ATTEMPTS},
-            "8": {"folder": "retail", "attempts": 1},
+            "7": {"folder": "retail", "attempts": 1, "last_attempt": old},
+            "8": {"folder": "retail", "attempts": 1, "last_attempt": old},
         },
     )
 
     r = hc.check_curation(state_path=state)
 
-    assert r["blocked"] == 1
+    assert r["blocked"] == 0
     assert r["status"] == "WARN"
 
 

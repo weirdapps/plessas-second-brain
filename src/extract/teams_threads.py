@@ -143,10 +143,41 @@ def _bound_chat_session_threads(conn: sqlite3.Connection) -> tuple[int, set[int]
 
         prev_dt: datetime | None = None
         cur_thread_id: int = 0  # Will be assigned on first iteration
+        # Messages older than this cannot join the current session. Only the
+        # seeded session sets one: within a run the messages come in order.
+        floor_dt: datetime | None = None
+
+        # A session goes on across runs. Starting every run from nothing made the
+        # first new message open a thread even when the chat's latest session
+        # ended minutes before, so a conversation that spanned an hourly sync
+        # was extracted in pieces. Continue the newest session instead; its
+        # bounds come from its messages, which the aggregates are recomputed from.
+        newest = conn.execute(
+            """
+            SELECT m.thread_id, MIN(m.composed_at) AS started, MAX(m.composed_at) AS ended
+            FROM teams_messages m
+            JOIN teams_threads t ON t.id = m.thread_id
+            WHERE m.chat_id = ?
+              AND m.is_system = 0
+              AND t.thread_kind = 'chat_session'
+            GROUP BY m.thread_id
+            ORDER BY ended DESC
+            LIMIT 1
+            """,
+            (chat_id,),
+        ).fetchone()
+        if newest is not None:
+            cur_thread_id = newest["thread_id"]
+            prev_dt = _parse_iso(newest["ended"])
+            floor_dt = _parse_iso(newest["started"]) - gap
 
         for msg in msgs:
             this_dt = _parse_iso(msg["composed_at"])
-            new_session = prev_dt is None or (this_dt - prev_dt) > gap
+            new_session = (
+                prev_dt is None
+                or (this_dt - prev_dt) > gap
+                or (floor_dt is not None and this_dt < floor_dt)
+            )
 
             if new_session:
                 title = _chat_session_title(chat_kind, chat_topic, msg["composed_at"])
@@ -158,13 +189,15 @@ def _bound_chat_session_threads(conn: sqlite3.Connection) -> tuple[int, set[int]
                     title=title,
                 )
                 created += 1
+                floor_dt = None
 
             conn.execute(
                 "UPDATE teams_messages SET thread_id = ? WHERE id = ?",
                 (cur_thread_id, msg["id"]),
             )
             touched.add(cur_thread_id)
-            prev_dt = this_dt
+            # A late message inside the seeded session must not pull its end back.
+            prev_dt = this_dt if new_session or prev_dt is None else max(prev_dt, this_dt)
 
     return created, touched
 

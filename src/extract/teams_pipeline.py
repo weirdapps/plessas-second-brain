@@ -282,11 +282,10 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
 
     from src.extract.claude_extract import _response_text, complete
 
-    model = (
-        os.environ.get("BRAIN_TEAMS_MODEL")
-        or os.environ.get("VERTEX_MODEL_EXTRACT")
-        or "claude-sonnet-4-6"
-    )
+    # None lets complete() use the configured model, as every other call site
+    # does. The old fallback skipped CLAUDE_EXTRACT_MODEL for a hardcoded 4.6
+    # model, which on an eu client configured for 4.7+ returns 429.
+    model = os.environ.get("BRAIN_TEAMS_MODEL") or None
     resp = complete(
         model=model,
         max_tokens=2048,

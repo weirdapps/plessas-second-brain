@@ -103,38 +103,47 @@ def test_news_is_no_evidence_that_the_model_works(run, workers):
     assert not (run.extracted / "bad.json").exists()
 
 
-@pytest.mark.parametrize("workers", [1, 3])
-@pytest.mark.parametrize("first", ["fails", "extracts"])
-def test_an_email_that_both_fails_and_extracts_in_one_run_is_not_counted(run, workers, first):
-    """Staged twice, one copy fails and one extracts, in either order. Counting it
-    would leave a stale count, and at the cap write a stub over the extraction
-    the run had just saved."""
-    import threading
+def _met_twice(run, monkeypatch, outcomes):
+    """One manual run that meets the email "twice" twice, with `outcomes` in order.
 
-    seen: list[str] = []
-    lock = threading.Lock()
-    first_done = threading.Event()
+    A message staged twice no longer does it: pending keeps one copy of each. A
+    manual run's quota pause still does, because it resumes
+    CONSECUTIVE_FAIL_THRESHOLD - 1 emails back, over an email that failed among
+    the quota errors. Each "q" email meets quota once and then extracts.
+    """
+    monkeypatch.setattr(local, "QUOTA_PAUSE_SECONDS", 0)
+    outcomes = iter(outcomes)
+    quota_met: set[str] = set()
 
-    def one_of_each(email):
-        with lock:
-            seen.append(email["message_id"])
-            nth = seen.count(email["message_id"])
-        failing = (nth == 1) == (first == "fails")
-        if nth == 2:
-            # Usually lands after the first call's result, so `first` picks the
-            # order; the assertions hold either way.
-            first_done.wait(5)
-        else:
-            first_done.set()
-        if failing:
-            return email["message_id"], None, False, "fault"
-        return email["message_id"], {"summary": "real"}, False, None
+    def failure(email):
+        msg_id = email["message_id"]
+        if msg_id == "twice":
+            kind = next(outcomes)
+            if kind == "extracts":
+                return msg_id, {"summary": "real"}, False, None
+            return msg_id, None, False, kind
+        if msg_id not in quota_met:
+            quota_met.add(msg_id)
+            return msg_id, None, True, None
+        return msg_id, {"summary": "s"}, False, None
 
-    run.failure = one_of_each
-    run([_mail("dup"), _mail("dup"), _mail("ok0")], workers)
+    run.failure = failure
+    quota = [_mail(f"q{n}") for n in range(local.CONSECUTIVE_FAIL_THRESHOLD)]
+    emails = [quota[0], _mail("twice"), *quota[1:], _mail("ok0")]
+    monkeypatch.setattr(local, "collect_emails", lambda: emails)
+    local.run_extraction(workers=1)
+    assert run.calls.count("twice") == 2
+
+
+def test_an_email_that_both_fails_and_extracts_in_one_run_is_not_counted(run, monkeypatch):
+    """Met twice in one run, it fails and then extracts. Counting it would leave a
+    stale count, and at the cap write a stub over the extraction the run had just
+    saved. It cannot extract first and then fail any more: a success ends the run
+    of quota errors whose pause would bring it round again."""
+    _met_twice(run, monkeypatch, ["fault", "extracts"])
 
     assert run.state()["failed_attempts"] == {}
-    assert json.loads((run.extracted / "dup.json").read_text())["summary"] == "real"
+    assert json.loads((run.extracted / "twice.json").read_text())["summary"] == "real"
 
 
 def test_quota_failures_never_count(run):
@@ -257,7 +266,7 @@ def inline(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     ("error", "gemini_calls", "quota", "failure"),
     [
-        pytest.param(ValueError("Failed to parse JSON"), 1, False, "fault", id="unusable-reply"),
+        pytest.param(ValueError("Failed to parse JSON"), 1, False, "unusable", id="unusable-reply"),
         pytest.param(RuntimeError("400 prompt is too long"), 3, False, "fault", id="rejected"),
         pytest.param(
             gauth.MalformedError("half-written ADC"), 3, False, "fault", id="auth-valueerror"
@@ -301,11 +310,11 @@ def test_an_expired_credential_never_counts_and_stops_the_run(inline):
     assert local._shutdown is True
 
 
-def test_a_reply_whose_error_mentions_429_is_a_fault_not_quota(inline):
+def test_a_reply_whose_error_mentions_429_is_unusable_not_quota(inline):
     """The parser's message carries a column number, and one of them was 429."""
     error = ValueError("Failed to parse JSON: Expecting ',' delimiter: line 1 column 4291")
 
-    assert inline(error) == ("m", None, False, "fault")
+    assert inline(error) == ("m", None, False, "unusable")
 
 
 def test_an_email_that_keeps_timing_out_is_retired_on_the_longer_cap(run):
@@ -324,13 +333,10 @@ def test_an_email_that_keeps_timing_out_is_retired_on_the_longer_cap(run):
 
 
 @pytest.mark.parametrize("order", [["timeout", "fault"], ["fault", "timeout"]])
-def test_a_fault_outranks_a_timeout_in_the_same_run(run, order):
-    kinds = iter(order)
-    run.failure = lambda e: (e["message_id"], None, False, next(kinds))
+def test_a_fault_outranks_a_timeout_in_the_same_run(run, monkeypatch, order):
+    _met_twice(run, monkeypatch, order)
 
-    run([_mail("both"), _mail("both"), _mail("ok0")])
-
-    assert run.state()["failed_attempts"] == {"both": 1}
+    assert run.state()["failed_attempts"] == {"twice": 1}
     assert run.state()["timeout_attempts"] == {}
 
 

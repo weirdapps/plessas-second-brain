@@ -108,6 +108,13 @@ EXTRACT_DEADLINE_BY_UNIT_S = {
     "sb-noon-catchup": 900.0,
 }
 
+# Replies the model could not use (refusals, unparseable JSON), with none
+# extracted, from which a sync reads as the model being down. One or two are an
+# ordinary quiet run: about 14 emails a day were refused in September 2026, and a
+# run whose one fresh email was refused went red at 75. Three and none usable is
+# no longer ordinary.
+MODEL_UNUSABLE_ALARM = 3
+
 # Observed span for the stages that have no budget of their own: load,
 # registration (count-bounded), people dedup, and the incremental embeddings
 # update (about 10 s), made twice when Step 7 loads conversations, and each
@@ -315,6 +322,12 @@ def cmd_process_attachments(args):
     # limit is no safer than it was in the hourly sync.
     deadline_s = getattr(args, "deadline_s", None)
 
+    # A phase that failed everything it tried. The exit code was 0 whatever the
+    # counts, and run_stage in sb-attachment-pass.sh judges only the exit code,
+    # so a night where every attachment failed was logged as a passing stage.
+    # Failures beside successes are per-item, and the other phase still runs.
+    phase_failed = False
+
     if phase is None or phase == 1:
         print("Phase 1: Local text extraction...")
         stats = run_phase1(db_path, limit=limit, file_type=file_type, deadline_s=deadline_s)
@@ -324,6 +337,7 @@ def cmd_process_attachments(args):
         print(f"  Skipped: {stats['skipped']}")
         if stats.get("deferred"):
             print(f"  Deferred (out of time): {stats['deferred']}")
+        phase_failed |= stats["failed"] > 0 and stats["extracted"] == 0
 
     if phase is None or phase == 2:
         workers = getattr(args, "workers", 1) or 1
@@ -336,8 +350,13 @@ def cmd_process_attachments(args):
         print(f"  Failed: {stats['failed']}")
         if stats.get("deferred"):
             print(f"  Deferred (out of time): {stats['deferred']}")
+        phase_failed |= stats["failed"] > 0 and stats["extracted"] == 0
 
     print("\nAttachment processing complete.")
+    if phase_failed:
+        print("A phase failed every attachment it tried", file=sys.stderr)
+        return 1
+    return 0
 
 
 def cmd_register_attachments(args):
@@ -561,27 +580,58 @@ def cmd_process_sharepoint(args):
 
     # Build query. Links are read from the markup: an HTML body is kept in
     # email_html, the text in content has no hrefs.
+    #
+    # The scan starts past the highest emails.id it has already read. It used
+    # to read the newest N rows by date_received, and the nightly N of 200 was
+    # a few hours of a weekday's 400-500 rows, so links in the rest of the day
+    # were never recorded, and retry_candidates only retries recorded links.
+    # An id also catches Archive and Sent mail loaded late with an old date.
+    # News carries no links and only used up the window. --since is the manual
+    # backfill: it rescans by date from the start and leaves the mark alone.
     query = (
         "SELECT e.id, e.message_id, e.content, e.date_received, h.html FROM emails e "
-        "LEFT JOIN email_html h ON h.email_id = e.id WHERE e.content IS NOT NULL"
+        "LEFT JOIN email_html h ON h.email_id = e.id WHERE e.content IS NOT NULL "
+        "AND COALESCE(e.mailbox_name, '') <> 'News'"
     )
-    params = []
+    params: list = []
+
+    mark_row = conn.execute(
+        "SELECT value FROM sync_metadata WHERE key = 'sharepoint_scan_last_id'"
+    ).fetchone()
+    scan_mark = int(mark_row[0]) if mark_row else 0
 
     if args.since:
         query += " AND e.date_received >= ?"
         params.append(args.since)
+    else:
+        query += " AND e.id > ?"
+        params.append(scan_mark)
 
-    query += " ORDER BY e.date_received DESC"
+    query += " ORDER BY e.id"
 
-    if args.limit and args.limit > 0:
+    # --limit bounds a --since rescan only. repo-autoupdate pulls this code onto
+    # the producer without copying the wrappers, and the old nightly line passes
+    # --limit 200: bounding the mark scan with it would read 200 emails a night
+    # against 400-500 a weekday, and the mark would never catch up.
+    if args.since and args.limit and args.limit > 0:
         query += " LIMIT ?"
         params.append(args.limit)
+
+    # The regex scan is cheap; the fetches are not. With no mark yet the first
+    # run finds the whole backlog, and this keeps it inside the nightly unit's
+    # TimeoutStartSec: the mark stops before the first email it could not
+    # finish, and the next run starts there.
+    max_fetches = getattr(args, "max_fetches", 0) or 0
 
     print("Scanning emails for SharePoint URLs...")
     if args.since:
         print(f"  Filtering to emails after {args.since}")
-    if args.limit and args.limit > 0:
+    else:
+        print(f"  Starting past email id {scan_mark}")
+    if args.since and args.limit and args.limit > 0:
         print(f"  Limiting to {args.limit} emails")
+    if max_fetches > 0 and not args.dry_run:
+        print(f"  Fetching at most {max_fetches} new URLs")
     if args.dry_run:
         print("  DRY RUN — scan and count only, no fetching")
     print()
@@ -670,33 +720,56 @@ def cmd_process_sharepoint(args):
                 break
 
     # Scan emails for new URLs (skip anything already fetched or attempted).
+    # scanned_to is the last email every link of which was dealt with.
+    scanned_to = scan_mark
+    fetches = 0
+    capped = False
     if not stats["auth_required"]:
-        cursor = conn.execute(query, params)
-        for row in cursor:
-            email_id, message_id, content, date_received, html = row
-            stats["emails_scanned"] += 1
+        # The scan reads on a connection of its own. Its open cursor holds a read
+        # snapshot, and on the connection every fetch commits on, a commit from
+        # any other process in between left the next write on a stale snapshot:
+        # SQLite refuses that at once with 'database is locked', busy_timeout
+        # does not retry it, and the pass died with the mark unwritten.
+        scan_conn = get_connection(db_path)
+        try:
+            for row in scan_conn.execute(query, params):
+                email_id, message_id, content, date_received, html = row
+                stats["emails_scanned"] += 1
 
-            urls = extract_sharepoint_urls(markup_or_text(content, html))
-            if not urls:
-                continue
+                urls = extract_sharepoint_urls(markup_or_text(content, html))
+                stats["urls_found"] += len(urls)
 
-            stats["urls_found"] += len(urls)
+                for url in urls:
+                    if url in existing_urls or url in attempted:
+                        continue
+                    if not args.dry_run and max_fetches > 0 and fetches >= max_fetches:
+                        capped = True
+                        break
+                    attempted.add(url)
+                    stats["urls_new"] += 1
 
-            for url in urls:
-                if url in existing_urls or url in attempted:
-                    continue
-                attempted.add(url)
-                stats["urls_new"] += 1
+                    if args.dry_run:
+                        continue
 
-                if args.dry_run:
-                    continue
+                    fetches += 1
+                    if _fetch_one(url, message_id):
+                        break
 
-                if _fetch_one(url, message_id):
+                if stats["auth_required"] or capped:
                     break
+                scanned_to = email_id
+        finally:
+            scan_conn.close()
 
-            if stats["auth_required"]:
-                break
-
+    # Only a real pass over the mark's own range moves it: a dry run fetched
+    # nothing, and a --since backfill did not read every id above the mark.
+    if not args.dry_run and not args.since and scanned_to > scan_mark:
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_metadata (key, value) "
+            "VALUES ('sharepoint_scan_last_id', ?)",
+            (str(scanned_to),),
+        )
+        conn.commit()
     conn.close()
 
     print("\nSharePoint processing complete:")
@@ -708,8 +781,14 @@ def cmd_process_sharepoint(args):
         print(f"  URLs failed: {stats['urls_failed']}")
         if stats["urls_skipped_external"]:
             print(f"  External hosts skipped (no session): {stats['urls_skipped_external']}")
+        if capped:
+            print(f"  Fetch cap of {max_fetches} reached; the next run continues from here")
     if stats["auth_required"]:
         print(f"\n⚠ Auth required — run 'sharepoint-cli login --host {SHAREPOINT_HOST}' and retry")
+        # The warning alone left the nightly stage green while new links piled
+        # up unfetched. run_stage in sb-attachment-pass.sh judges the exit code.
+        return EXIT_REAUTH
+    return 0
 
 
 def cmd_reverse_ingest(args):
@@ -1253,6 +1332,48 @@ def cmd_prep(args):
                 print(f"  - {a['task'][:80]}{deadline}")
 
 
+def _holding_the_sync_lock(sync):
+    """Run `sync` holding DATA_ROOT/state/sync.lock, or skip if another sync has it.
+
+    Three units run `src.cli sync` (sb-outlook-sync hourly, sb-noon-catchup and
+    sb-daily-sync), and only the hourly wrapper looked for another, with a pgrep,
+    once, one way and not atomically. On 2026-09-24 the noon catch-up started
+    during the hourly load, and both extracted the same conversations and
+    rewrote the state file each from its own snapshot, where the last writer
+    drops the other's processed_ids and give-up counters.
+
+    `--lock-wait` seconds (0 by default) is how long to wait for the holder.
+    Then the run skips with exit 0: the sync holding the lock is draining the
+    same staged mail. The lock is an flock, so it goes with the process holding
+    it, and a killed sync leaves nothing to clear.
+    """
+    import fcntl
+    import functools
+    import time
+
+    @functools.wraps(sync)
+    def locked(args):
+        wait_s = float(getattr(args, "lock_wait", 0) or 0)
+        path = DATA_ROOT / "state" / "sync.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as lock:
+            give_up_at = time.monotonic() + wait_s
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    left = give_up_at - time.monotonic()
+                    if left <= 0:
+                        print(f"skip: another sync is running (waited {wait_s:.0f} s for {path})")
+                        return 0
+                    time.sleep(min(1.0, left))
+            return sync(args)
+
+    return locked
+
+
+@_holding_the_sync_lock
 def cmd_sync(args):
     """Incremental sync over staged mail: extract, load, and the steps after."""
     from src.store.schema import get_connection, migrate_add_sync_metadata
@@ -1298,13 +1419,37 @@ def cmd_sync(args):
     # Step 2: Extract (local mode)
     engine = getattr(args, "engine", None) or EXTRACT_ENGINE
     print(f"\nStep 2: Extracting new emails (engine: {engine})...")
-    from src.extract.local import run_extraction
+    from src.extract.local import run_extraction, stop_requested
 
     extraction_run = run_extraction(
         limit=args.limit or 0,
         engine=engine,
         workers=args.workers or 1,
         deadline_s=_extract_deadline_s(),
+    )
+    # A stop signal ends extraction at a checkpoint. The steps after it used to
+    # carry on regardless, until systemd's SIGKILL 90 s later; now they do not
+    # start. 143 is 128 + SIGTERM, which is what systemd sends.
+    if stop_requested():
+        print("Stop requested during extraction; the later steps did not run", file=sys.stderr)
+        return 143
+    # Every email that went to the model failed there: a retired model id, a 400
+    # on every request, a refusal of everything. Emails that had already failed
+    # in an earlier run are left out of the count (see run_extraction), so a run
+    # that met only those is not taken for a dead model. The rest of the sync
+    # still runs, but the run must not read as fresh or green, as it did with
+    # rc 0 and a new last_sync_date while no mail loaded. Not keyed on
+    # `extracted`, which news (extracted without the model) keeps above zero.
+    # A reply the model could not use (a refusal, unparseable JSON) is an answer,
+    # not an outage: a quiet run whose one fresh email was refused read as a dead
+    # model. Several answers and none of them usable still reads as down.
+    model_down = (
+        isinstance(extraction_run, dict)
+        and not extraction_run.get("model_successes", 0)
+        and (
+            extraction_run.get("model_failures", 0) > 0
+            or extraction_run.get("model_unusable", 0) >= MODEL_UNUSABLE_ALARM
+        )
     )
 
     # Step 3: Load into DB
@@ -1423,6 +1568,12 @@ def cmd_sync(args):
         from src.extract.local import run_conversation_extraction
 
         run_conversation_extraction(deadline_s=CONVERSATION_SYNC_DEADLINE_S)
+        if stop_requested():  # as after Step 2
+            print(
+                "Stop requested during conversation extraction; the later steps did not run",
+                file=sys.stderr,
+            )
+            return 143
         conv_loaded = load_convs(db_path)
         print(f"  Loaded {conv_loaded} conversations")
         if conv_loaded:
@@ -1470,13 +1621,18 @@ def cmd_sync(args):
         classified = img_stats.get("classified", 0)
         missing = img_stats.get("missing", 0)
         deferred = img_stats.get("deferred", 0)
+        failed = img_stats.get("failed", 0)
         # `missing` = file gone from disk; `deferred` = budget spent, work requeued.
         # The old line printed `missing` under the label "remaining", which read as
         # "backlog empty: 0" every day while the queue was 200 deep. Queue depth is
         # reported by health_check.check_images (WARN past IMAGE_QUEUE_WARN); this
-        # line just says what THIS run did.
-        if classified > 0 or missing > 0 or deferred > 0:
-            print(f"  Classified: {classified}, deferred: {deferred}, missing files: {missing}")
+        # line just says what THIS run did. `failed` too: without it a run in which
+        # every image failed read "No unclassified images".
+        if classified > 0 or missing > 0 or deferred > 0 or failed > 0:
+            print(
+                f"  Classified: {classified}, failed: {failed}, deferred: {deferred}, "
+                f"missing files: {missing}"
+            )
         else:
             print("  No unclassified images")
     except Exception as e:
@@ -1486,18 +1642,40 @@ def cmd_sync(args):
     conn = get_conn(db_path)
     migrate_add_sync_metadata(conn)
     now = datetime.now().isoformat()
-    conn.execute(
-        "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('last_sync_date', ?)",
-        (now,),
-    )
+    if not model_down:
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('last_sync_date', ?)",
+            (now,),
+        )
     conn.execute(
         "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('last_sync_count', ?)",
         (str(count),),
     )
+    # When mail last arrived, beside when this command last ran. last_sync_date
+    # moves on every run, fetched mail or not, so alone it read fresh through an
+    # Outlook outage. The Inbox export stamps last_sync_completed_at only when it
+    # succeeds, empty runs included. Copied here because brain.db is the only
+    # file a replica receives; get_freshness reports the older of the two.
+    from src.export.state import load_outlook_sync_state
+
+    try:
+        export_ok_at = load_outlook_sync_state(
+            DATA_ROOT / "state" / "outlook_sync.json"
+        ).last_sync_completed_at
+    except (OSError, ValueError, AttributeError, TypeError):  # unreadable: no stamp
+        export_ok_at = None
+    if export_ok_at:
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('mail_export_ok_at', ?)",
+            (export_ok_at,),
+        )
     conn.commit()
     conn.close()
 
-    print(f"\nSync complete. {count} emails added. Sync timestamp: {now}")
+    if model_down:
+        print(f"\nSync complete. {count} emails added. Sync timestamp left at {last_sync}.")
+    else:
+        print(f"\nSync complete. {count} emails added. Sync timestamp: {now}")
 
     # Everything else ran and the rest of the mail stays pending, but extraction
     # did not finish. Before the deadline existed the same pause slept past the
@@ -1506,6 +1684,17 @@ def cmd_sync(args):
     # keeps it out of its own status by design, with those two units behind it.
     if isinstance(extraction_run, dict) and extraction_run.get("quota_paused"):
         print("Extraction ended on a quota pause; the rest stays pending", file=sys.stderr)
+        return 75
+    # The same code: the run finished and failed, and a restart would repeat it
+    # (RestartPreventExitStatus=75 on both backlog units).
+    if model_down:
+        print(
+            f"The model extracted none of the new emails sent to it "
+            f"({extraction_run.get('model_failures', 0)} failed, "
+            f"{extraction_run.get('model_unusable', 0)} unusable replies); "
+            "last_sync_date was not advanced",
+            file=sys.stderr,
+        )
         return 75
     return 0
 
@@ -1527,6 +1716,7 @@ def cmd_teams_sync(args):
     conn = get_connection(db_path)
     run_migrations(conn)
 
+    pull_failed = False
     if not getattr(args, "skip_pull", False):
         print("Step 1/6: discovering chats + channels...")
         d = discover_chats(conn, scope="all")
@@ -1546,6 +1736,12 @@ def cmd_teams_sync(args):
                 else ""
             )
         )
+        # pull_messages re-raises only an expired session and counts every other
+        # failure per chat, so a service-wide 403, 429 or 5xx arrives here as
+        # errors with nothing pulled. That returned 0, and sb-teams-sync.sh wrote
+        # 'ok' over a dead pull for as long as it lasted. Some chats pulled is a
+        # partial run, not a failed one.
+        pull_failed = p["errors"] > 0 and p["chats_pulled"] == 0
     else:
         print("Steps 1+2 SKIPPED — --skip-pull set.")
 
@@ -1578,6 +1774,14 @@ def cmd_teams_sync(args):
 
     conn.close()
     print("teams-sync complete.")
+
+    # The later steps still ran on what was already stored. 5 is "upstream
+    # misbehaved", the same code as the M365 CLIs'. Extraction failures do not
+    # count: one poison thread would otherwise keep the unit red every hour.
+    if pull_failed:
+        print(f"Every chat pull failed ({p['errors']} errors, 0 chats pulled)", file=sys.stderr)
+        return 5
+    return 0
 
 
 def cmd_teams_search(args):
@@ -1695,16 +1899,22 @@ def _read_json_dict(path: Path) -> dict:
 
 def cmd_calendar_sync(args):
     """Sync calendar events from Outlook into the knowledge store."""
-    from datetime import timedelta
+    from datetime import UTC, timedelta
 
     from src.config import USER_EMAIL_PATTERN
-    from src.export.calendar_export import get_event_body, list_events, parse_event
+    from src.export.calendar_export import (
+        BACKFILL_LIST_CALLS,
+        get_event_body,
+        list_events,
+        parse_event,
+    )
     from src.export.outlook_cli import OutlookCliAuthRequired
     from src.extract.calendar_extractor import extract_event
     from src.extract.policy_bridge import classify_exception, is_transient
     from src.extract.vertex_auth import touch_sentinel
     from src.llm_policy import Outcome
     from src.store.calendar_loader import (
+        cancel_unlisted,
         dedupe_event_children,
         load_event,
         load_proxy_emails,
@@ -1723,7 +1933,10 @@ def cmd_calendar_sync(args):
     proxy_emails = load_proxy_emails(str(DATA_ROOT / "canonical_people.json"))
 
     now = datetime.now()
-    if args.backfill and args.since:
+    # --since is honoured on its own, as --until is. It used to count only with
+    # --backfill, so the README's `calendar-sync --since 2026-01-01` listed the
+    # last seven days and exited 0 with the gap it was run to fill still open.
+    if args.since:
         since = datetime.fromisoformat(args.since)
     elif args.backfill:
         since = now - timedelta(days=365)
@@ -1735,7 +1948,14 @@ def cmd_calendar_sync(args):
     print(f"Calendar sync: {since.date()} to {until_dt.date()}")
     chunk_failures: list[str] = []
     try:
-        raw_events = list_events(since, until_dt, failures=chunk_failures)
+        if args.backfill:
+            # A year a month at a time, every busy stretch split further: the
+            # hourly run's call bound would stop it a few months in.
+            raw_events = list_events(
+                since, until_dt, failures=chunk_failures, max_calls=BACKFILL_LIST_CALLS
+            )
+        else:
+            raw_events = list_events(since, until_dt, failures=chunk_failures)
     except OutlookCliAuthRequired:
         conn.close()
         print("  Outlook needs re-authentication; nothing listed", file=sys.stderr)
@@ -1914,13 +2134,35 @@ def cmd_calendar_sync(args):
         )
         stats["loaded"] += 1
 
+    # A complete listing also says which stored events Outlook no longer holds;
+    # nothing ever removed them, so deleted and re-created meetings stayed live.
+    # Not after a span that failed or came back full, nor once the session
+    # expired mid-run: what is missing then says nothing about Outlook. The
+    # window was local time to outlook-cli, as it is to since.astimezone().
+    cancelled = 0
+    if not chunk_failures and not session_expired:
+        cancelled = cancel_unlisted(
+            conn,
+            set(listed_ids),
+            since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
+            until_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
+        )
+
     # Both are idempotent and cheap, and both repair rows no upsert will touch
     # again: stacked duplicates from the old append-only loader, and self flags
     # written while BRAIN_USER_EMAIL_PATTERN was unset.
     dup_decisions, dup_actions = dedupe_event_children(conn)
     flags_changed = 0
-    if USER_EMAIL_PATTERN:
+    if USER_EMAIL_PATTERN and proxy_emails is not None:
         flags_changed = refresh_self_flags(conn, USER_EMAIL_PATTERN, proxy_emails)
+    elif proxy_emails is None:
+        # canonical_people.json exists but did not parse. Recomputed without it,
+        # every event the PA booked would be rewritten as not-self, so the flags
+        # wait for the file to be fixed.
+        print(
+            "  canonical_people.json is unreadable; leaving the stored self flags alone",
+            file=sys.stderr,
+        )
     else:
         # Without the pattern every stored flag would be rewritten to not-self.
         print(
@@ -1991,6 +2233,8 @@ def cmd_calendar_sync(args):
         print(f"  Removed duplicate decisions/actions: {dup_decisions}/{dup_actions}")
     if flags_changed:
         print(f"  Self flags corrected: {flags_changed}")
+    if cancelled:
+        print(f"  No longer in Outlook, marked cancelled: {cancelled}")
 
     # Every one of these is already recorded so the next run re-offers or
     # reports it; the exit code is what tells the scheduler this run did not do
@@ -2508,9 +2752,26 @@ def main():
     parser_process_sp = subparsers.add_parser(
         "process-sharepoint", help="Scan emails for SharePoint URLs and fetch them"
     )
-    parser_process_sp.add_argument("--since", type=str, help="Only scan emails after YYYY-MM-DD")
     parser_process_sp.add_argument(
-        "--limit", type=int, default=0, help="Max emails to scan (0 = all, default 0)"
+        "--since",
+        type=str,
+        help="Rescan emails received on or after YYYY-MM-DD, ignoring and keeping the scan mark",
+    )
+    parser_process_sp.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Max emails to rescan with --since (0 = all, default 0); the scan past the "
+        "mark always reads every email",
+    )
+    # On by default, so any invocation stays inside the nightly unit's timeout,
+    # the stale wrapper line included (see the --limit comment in the command).
+    parser_process_sp.add_argument(
+        "--max-fetches",
+        type=int,
+        default=100,
+        dest="max_fetches",
+        help="Max new URLs to fetch this run; the rest wait for the next (0 = no cap, default 100)",
     )
     parser_process_sp.add_argument(
         "--dry-run", action="store_true", help="Scan and count only, no fetching"
@@ -2676,6 +2937,14 @@ def main():
         help="Accepted for the existing schedules and ignored: sync never exports "
         "mail, it loads what outlook_export staged.",
     )
+    parser_sync.add_argument(
+        "--lock-wait",
+        type=float,
+        default=0,
+        metavar="SECONDS",
+        help="If another sync is running, wait up to this long for it, then skip "
+        "with exit 0 (default: 0, skip at once)",
+    )
     parser_sync.set_defaults(func=cmd_sync)
 
     # teams-sync command
@@ -2729,7 +2998,9 @@ def main():
         action="store_true",
         help="Backfill mode (default: 12 months back)",
     )
-    parser_cal.add_argument("--since", type=str, help="Start date ISO (e.g. 2025-05-14)")
+    parser_cal.add_argument(
+        "--since", type=str, help="Start date ISO (e.g. 2025-05-14; default: 7 days back)"
+    )
     parser_cal.add_argument("--until", type=str, help="End date ISO (default: now + 30d)")
     parser_cal.add_argument(
         "--skip-extraction", action="store_true", help="Skip LLM body extraction"

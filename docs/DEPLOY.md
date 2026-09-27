@@ -12,6 +12,10 @@ on a single host or split across two (see "Topology" below).
   out to it.
 - `tesseract`, plus the language data for the languages your attachments are
   written in.
+- `antiword` (or `catdoc`) on Linux, for legacy Word `.doc` attachments. macOS
+  uses its built-in `textutil`. Without any of the three every `.doc` is
+  recorded as skipped ("No legacy .doc converter available"), which no failure
+  count reports.
 - `zstd` and `openssl`, if you want encrypted offsite backups.
 
 **Tesseract is not optional if you ingest attachments.** Attachment OCR calls
@@ -25,6 +29,7 @@ method of all.
 ```bash
 brew install tesseract tesseract-lang                  # macOS
 sudo apt-get install tesseract-ocr tesseract-ocr-ell   # Debian/Ubuntu
+sudo apt-get install antiword                          # Debian/Ubuntu, legacy .doc
 tesseract --list-langs | grep -x ell                   # verify the Greek pack
 ```
 
@@ -129,9 +134,12 @@ Mail reaches the store in two steps, and `sync` is only the second:
 
 1. **Stage.** With Microsoft 365, `python -m src.export.outlook_export --folder Inbox --bootstrap`
    stages mail through `outlook-cli`: the first run takes the 100 most recent
-   messages, later runs continue from the cursor it saves (`--state-path`, one
-   file per folder). Any other source writes staging batches itself; see "Bring
-   your own source" in the README.
+   messages, later runs continue from the cursor it saves. Each folder gets its
+   own cursor file under `$BRAIN_DATA_DIR/state` without `--state-path`
+   (`outlook_sync.json` for Inbox, `outlook_sync_archive.json` for Archive,
+   `outlook_sync_sent.json` for Sent Items), and a run given a cursor saved for
+   another folder exits 9 without touching it. Any other source writes staging
+   batches itself; see "Bring your own source" in the README.
 2. **Extract and load.** On a fresh store, `python -m src.extract.local && python -m src.cli load`,
    because `sync` skips an empty store. From then on `python -m src.cli sync`
    does both.
@@ -300,6 +308,17 @@ in 0.2 s. A thread of calls alone, or with too little else, keeps its summary. S
 `sb-teams-sync.timer`, and let a running sync exit, before the pull: a sync still
 running the old code stores call records unmarked, and the migration runs once.
 Then run `python -m src.cli migrate` and start the timer again.
+
+**Upgrading to schema v25.** From v25 calendar `start_at` and `end_at` carry a
+trailing `Z`. Graph returns them in UTC, and without the zone a 16:00 Athens
+meeting read as 13:00. The migration appends it to the stored rows, about 1,100,
+in milliseconds, and changes nothing else. Stop `sb-calendar-sync.timer`, and let
+a running sync exit, before the pull: a sync still running the old code writes
+bare times after the migration has run. Then run `python -m src.cli migrate` and
+start the timer again. The same release lists every event of the window, where
+the old listing kept the ten earliest of each month, so run
+`python -m src.cli calendar-sync --backfill` once to fill the months it capped,
+best after outlook-access pages list-calendar itself.
 
 ## 8. Backup and restore
 

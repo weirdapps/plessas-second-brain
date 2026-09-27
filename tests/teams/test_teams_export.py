@@ -429,8 +429,9 @@ def test_pull_messages_uses_chat_arg_for_oneOnOne(db, fixture_loader):
 
     assert result["messages_inserted"] == 3
     assert len(captured_args) == 1
-    assert captured_args[0][:2] == ["list-messages", "--chat"]
-    assert captured_args[0][2] == "19:test-1on1@unq.gbl.spaces"
+    assert captured_args[0][0] == "list-messages"
+    chat_flag = captured_args[0].index("--chat")
+    assert captured_args[0][chat_flag + 1] == "19:test-1on1@unq.gbl.spaces"
 
 
 def test_pull_messages_still_uses_team_channel_for_channel(db, fixture_loader):

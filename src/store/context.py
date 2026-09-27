@@ -4,6 +4,7 @@ Provides rich context functions for the email-handler plugin and /recall skill
 to retrieve person, topic, conversation, and decision context from the knowledge store.
 """
 
+import re
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -25,7 +26,7 @@ DEFAULT_CONTEXT_LIMIT = 20
 
 
 def resolve_person(
-    conn: sqlite3.Connection, name_or_email: str
+    conn: sqlite3.Connection, name_or_email: str, *, local_part: bool = True
 ) -> tuple[sqlite3.Row | None, int, list[dict]]:
     """The person a name or email means, how many people matched, and the next three.
 
@@ -48,22 +49,44 @@ def resolve_person(
             (name_or_email.strip(),),
         ).fetchone()
         return row, (1 if row else 0), []
-    pattern = f"%{search_fold(name_or_email)}%"
+    # At the start of a word, as a search matches (greek._phrase_pattern, which
+    # sb_match applies to a phrase when given no words or tokens): anywhere inside
+    # a name, 'AI' resolved to a forename holding it and 'EU' to a bank, and recall
+    # attached that dossier to topic queries. The LIKE only rules rows out first.
+    phrase = " ".join(search_fold(name_or_email).split())
+    # Only the head of the phrase is anchored when its last word is under three
+    # letters, because that word is an initial ('Surname T') and _phrase_pattern
+    # would make it a whole word; a query of one short word stays whole ('AI').
+    head, _, tail = phrase.rpartition(" ")
+    anchor = head if head and len(tail) < 3 and tail.isalpha() else phrase
+    # And the local part of an address, where one word of four letters or more
+    # starts a token or follows a one-letter initial ('jexample'), so a name
+    # stored only in Greek is found by the Latin surname its address spells.
+    # recall turns that off for the dossier it attaches on its own: there a topic
+    # word ('data', 'info') started some mailbox's local part and brought it in.
+    local = phrase if local_part and re.fullmatch(r"[a-z0-9]{4,}", phrase) else ""
+    where = r"""
+        (sb_fold(p.name) LIKE '%' || :phrase || '%' AND sb_match(p.name, :anchor, '', '') > 0)
+        OR (:local <> '' AND (LOWER(p.email) LIKE :local || '%@%'
+                              OR LOWER(p.email) LIKE '_' || :local || '%@%'
+                              OR LOWER(p.email) LIKE '%.' || :local || '%@%'
+                              OR LOWER(p.email) LIKE '%-' || :local || '%@%'
+                              OR LOWER(p.email) LIKE '%\_' || :local || '%@%' ESCAPE '\'))
+    """
+    args = {"phrase": phrase, "anchor": anchor, "local": local}
     candidates = conn.execute(
-        """
+        f"""
         SELECT p.id, p.name, p.email, p.role, p.department
         FROM people p
-        WHERE sb_fold(p.name) LIKE ?
+        WHERE {where}
         ORDER BY (SELECT COUNT(*) FROM email_people ep WHERE ep.person_id = p.id) DESC, p.id
         LIMIT 4
         """,
-        (pattern,),
+        args,
     ).fetchall()
     if not candidates:
         return None, 0, []
-    match_count = conn.execute(
-        "SELECT COUNT(*) FROM people WHERE sb_fold(name) LIKE ?", (pattern,)
-    ).fetchone()[0]
+    match_count = conn.execute(f"SELECT COUNT(*) FROM people p WHERE {where}", args).fetchone()[0]
     others = [{"name": c["name"], "email": c["email"]} for c in candidates[1:]]
     return candidates[0], match_count, others
 
@@ -73,6 +96,8 @@ def get_person_context(
     name_or_email: str,
     days: int = 365,
     limit: int = DEFAULT_CONTEXT_LIMIT,
+    *,
+    local_part: bool = True,
 ) -> dict:
     """Return rich context for a person.
 
@@ -82,6 +107,9 @@ def get_person_context(
         days: Number of days to look back
         limit: Max rows per list (topics, decisions, open_actions). Each list is
             accompanied by a `<name>_total` giving the unbounded count.
+            recent_emails holds at most min(limit, 10), with no total.
+        local_part: Also match a name against the start of an address's local
+            part (see resolve_person).
 
     Returns:
         Dict with person info, email_count, recent_emails, topics,
@@ -91,7 +119,9 @@ def get_person_context(
 
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
 
-    person_row, match_count, other_candidates = resolve_person(conn, name_or_email)
+    person_row, match_count, other_candidates = resolve_person(
+        conn, name_or_email, local_part=local_part
+    )
 
     if not person_row:
         return {
@@ -128,19 +158,30 @@ def get_person_context(
         (person_id, cutoff),
     ).fetchone()["cnt"]
 
-    # Recent emails
+    # One row per email below, however many roles the person holds on it:
+    # email_people is keyed by role too, and the model writes free-text roles
+    # ('recipient', 'FYI', 'recipient, FYI'), so about 30% of (email, person)
+    # pairs have several rows. Joined through it, the top correspondent's
+    # decisions_total read 132K against 59K real, the sentiment counts summed to
+    # twice email_count, and the capped lists were about half repeats.
+
+    # Recent emails. The role shown is one of theirs, sender first, as in
+    # query_by_person.
     recent_emails = [
         dict(r)
         for r in conn.execute(
             """
-        SELECT e.date_received as date, e.subject, e.summary, ep.role_in_email
+        SELECT e.date_received as date, e.subject, e.summary,
+            (SELECT ep.role_in_email FROM email_people ep
+              WHERE ep.email_id = e.id AND ep.person_id = ?
+              ORDER BY ep.role_in_email <> 'sender', ep.role_in_email LIMIT 1) as role_in_email
         FROM emails e
-        JOIN email_people ep ON e.id = ep.email_id
-        WHERE ep.person_id = ? AND e.date_received >= ?
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND e.date_received >= ?
         ORDER BY e.date_received DESC
-        LIMIT 10
+        LIMIT ?
     """,
-            (person_id, cutoff),
+            (person_id, person_id, cutoff, min(limit, 10)),
         ).fetchall()
     ]
 
@@ -152,9 +193,9 @@ def get_person_context(
         SELECT t.display_name as topic, COUNT(*) as count
         FROM topics t
         JOIN email_topics et ON t.id = et.topic_id
-        JOIN email_people ep ON et.email_id = ep.email_id
         JOIN emails e ON et.email_id = e.id
-        WHERE ep.person_id = ? AND e.date_received >= ?
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND e.date_received >= ?
         GROUP BY t.id
         ORDER BY count DESC
         LIMIT ?
@@ -167,9 +208,9 @@ def get_person_context(
         SELECT COUNT(DISTINCT t.id) as cnt
         FROM topics t
         JOIN email_topics et ON t.id = et.topic_id
-        JOIN email_people ep ON et.email_id = ep.email_id
         JOIN emails e ON et.email_id = e.id
-        WHERE ep.person_id = ? AND e.date_received >= ?
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND e.date_received >= ?
     """,
         (person_id, cutoff),
     ).fetchone()["cnt"]
@@ -179,8 +220,8 @@ def get_person_context(
         """
         SELECT e.sentiment, COUNT(*) as count
         FROM emails e
-        JOIN email_people ep ON e.id = ep.email_id
-        WHERE ep.person_id = ? AND e.date_received >= ? AND e.sentiment IS NOT NULL
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND e.date_received >= ? AND e.sentiment IS NOT NULL
         GROUP BY e.sentiment
     """,
         (person_id, cutoff),
@@ -195,8 +236,8 @@ def get_person_context(
         SELECT d.decision, d.decided_by, d.decision_date as date
         FROM decisions d
         JOIN emails e ON d.email_id = e.id
-        JOIN email_people ep ON e.id = ep.email_id
-        WHERE ep.person_id = ? AND e.date_received >= ?
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND e.date_received >= ?
         ORDER BY d.decision_date DESC
         LIMIT ?
     """,
@@ -208,8 +249,8 @@ def get_person_context(
         SELECT COUNT(*) as cnt
         FROM decisions d
         JOIN emails e ON d.email_id = e.id
-        JOIN email_people ep ON e.id = ep.email_id
-        WHERE ep.person_id = ? AND e.date_received >= ?
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND e.date_received >= ?
     """,
         (person_id, cutoff),
     ).fetchone()["cnt"]
@@ -222,8 +263,8 @@ def get_person_context(
         SELECT a.task, a.owner, a.deadline, a.status
         FROM action_items a
         JOIN emails e ON a.email_id = e.id
-        JOIN email_people ep ON e.id = ep.email_id
-        WHERE ep.person_id = ? AND a.status = 'open' AND e.date_received >= ?
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND a.status = 'open' AND e.date_received >= ?
         ORDER BY a.deadline IS NULL, a.deadline ASC
         LIMIT ?
     """,
@@ -235,8 +276,8 @@ def get_person_context(
         SELECT COUNT(*) as cnt
         FROM action_items a
         JOIN emails e ON a.email_id = e.id
-        JOIN email_people ep ON e.id = ep.email_id
-        WHERE ep.person_id = ? AND a.status = 'open' AND e.date_received >= ?
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND a.status = 'open' AND e.date_received >= ?
     """,
         (person_id, cutoff),
     ).fetchone()["cnt"]
@@ -278,6 +319,12 @@ def get_person_context(
     # anyone who never attended one. Each IN subquery runs once per statement.
     # The name must have two words or more: a blank name matched every
     # unresolved attendee, and one word ('ΝΙΚΟΣ', 'Info') fits strangers' invites.
+    # "Now" is rendered with a 'T' like start_at, not datetime('now')'s space: 'T'
+    # sorts above ' ', so every start on the current UTC day read as still to
+    # come, and a meeting this morning was next_meeting rather than last_met.
+    # The bare column is compared so idx_calendar_start still serves the query.
+    # A cancelled event, by Outlook or because Outlook no longer lists it, is
+    # not a meeting had or to come.
     calendar_data = {}
     email = person.get("email") or ""
     folded_name = search_fold(person["name"]).strip()
@@ -292,7 +339,8 @@ def get_person_context(
                    WHERE person_id = ?
                       OR (? <> '' AND LOWER(email) = LOWER(?))
                       OR (person_id IS NULL AND ? <> '' AND sb_fold(name) LIKE ?))
-                 AND ce.start_at < datetime('now')
+                 AND ce.is_cancelled = 0
+                 AND ce.start_at < strftime('%Y-%m-%dT%H:%M:%S', 'now')
                ORDER BY ce.start_at DESC LIMIT 1""",
             attendee_args,
         ).fetchone()
@@ -306,7 +354,8 @@ def get_person_context(
                    WHERE person_id = ?
                       OR (? <> '' AND LOWER(email) = LOWER(?))
                       OR (person_id IS NULL AND ? <> '' AND sb_fold(name) LIKE ?))
-                 AND ce.start_at > datetime('now')
+                 AND ce.is_cancelled = 0
+                 AND ce.start_at > strftime('%Y-%m-%dT%H:%M:%S', 'now')
                ORDER BY ce.start_at ASC LIMIT 1""",
             attendee_args,
         ).fetchone()
@@ -323,7 +372,8 @@ def get_person_context(
                    WHERE person_id = ?
                       OR (? <> '' AND LOWER(email) = LOWER(?))
                       OR (person_id IS NULL AND ? <> '' AND sb_fold(name) LIKE ?))
-                 AND ce.start_at >= datetime('now', '-30 days')""",
+                 AND ce.is_cancelled = 0
+                 AND ce.start_at >= strftime('%Y-%m-%dT%H:%M:%S', 'now', '-30 days')""",
             attendee_args,
         ).fetchone()[0]
         calendar_data["meeting_count_30d"] = meeting_count
@@ -449,17 +499,23 @@ def get_topic_context(
     # exact name wins, then the most-used topic, rather than whichever came first.
     topic_normalized = normalize_topic(topic)
 
-    # Find topic
-    topic_row = conn.execute(
-        """
-        SELECT t.id, t.name, t.display_name FROM topics t
-        WHERE t.name LIKE ?
-        ORDER BY (t.name = ?) DESC,
-                 (SELECT COUNT(*) FROM email_topics et WHERE et.topic_id = t.id) DESC, t.id
-        LIMIT 1
-        """,
-        (f"%{topic_normalized}%", topic_normalized),
-    ).fetchone()
+    # Find topic. With no letter or digit there is none: '   ', '-' and '.'
+    # normalize to '', and LIKE '%%' matched every topic, so the most-used one
+    # came back as if it were the answer.
+    topic_row = (
+        conn.execute(
+            """
+            SELECT t.id, t.name, t.display_name FROM topics t
+            WHERE t.name LIKE ?
+            ORDER BY (t.name = ?) DESC,
+                     (SELECT COUNT(*) FROM email_topics et WHERE et.topic_id = t.id) DESC, t.id
+            LIMIT 1
+            """,
+            (f"%{topic_normalized}%", topic_normalized),
+        ).fetchone()
+        if any(ch.isalnum() for ch in topic_normalized)
+        else None
+    )
 
     if not topic_row:
         return {

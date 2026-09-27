@@ -169,15 +169,18 @@ def chat_summary(conn: sqlite3.Connection, chat_id: int, days: int = 30) -> dict
     if not chat:
         return {"error": "chat not found"}
 
+    # A julianday number, compared against julianday() of the column. As a
+    # datetime('now', ...) string it had a space where the stored values have a
+    # 'T', and 'T' sorts after ' ', so all of the cutoff day passed the filter.
     cutoff = conn.execute(
-        "SELECT datetime('now', ?) AS cutoff", (f"-{int(days)} days",)
+        "SELECT julianday('now', ?) AS cutoff", (f"-{int(days)} days",)
     ).fetchone()["cutoff"]
 
     threads = conn.execute(
         """
         SELECT id, title, summary, started_at, ended_at, message_count
         FROM teams_threads
-        WHERE chat_id = ? AND ended_at >= ?
+        WHERE chat_id = ? AND julianday(ended_at) >= ?
         ORDER BY ended_at DESC
         LIMIT 20
         """,
@@ -199,7 +202,7 @@ def chat_summary(conn: sqlite3.Connection, chat_id: int, days: int = 30) -> dict
         """
         SELECT sender_display_name AS name, COUNT(*) AS n
         FROM teams_messages
-        WHERE chat_id = ? AND composed_at >= ? AND is_system = 0
+        WHERE chat_id = ? AND julianday(composed_at) >= ? AND is_system = 0
         GROUP BY sender_display_name
         ORDER BY n DESC
         LIMIT 10

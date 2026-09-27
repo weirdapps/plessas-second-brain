@@ -130,11 +130,17 @@ def _extract_mri(from_url: str | None) -> str | None:
 #
 # 1. "no channel named 'General'": chatsvcagg requires a literal "General"
 #    channel to derive the teamId; teams that renamed/archived theirs are
-#    permanently unreadable via this code path.
+#    permanently unreadable via this code path. It is disabled unconditionally:
+#    teams-access raises it only after Graph has listed the team's channels, so
+#    a token lapse cannot produce it, and it hits every channel of the team at
+#    once, so a team with five or more channels tripped the breaker below on
+#    every run and was retried for ever.
 # 2. "HTTP_403" / "Graph 403": no Graph permission on this channel (archived
-#    teams, guest-only channels, deleted resources).
+#    teams, guest-only channels, deleted resources). A lapse 403s the same way,
+#    so these go through the breaker below.
+_NO_GENERAL_CHANNEL_PATTERN = "has no channel named"
 _PERMANENT_ERROR_PATTERNS = (
-    "has no channel named",
+    _NO_GENERAL_CHANNEL_PATTERN,
     "HTTP_403",
     "Graph 403",
 )
@@ -340,6 +346,9 @@ def pull_messages(
     # 403 stayed under the ceiling and disabled every channel.
     permanent_candidates: dict[str, list[int]] = {"channel": [], "chat": []}
     attempted: dict[str, int] = {"channel": 0, "chat": 0}
+    # A team with no "General" channel follows a successful Graph call, so it
+    # says nothing about the service and skips the breaker.
+    no_general_channel: list[int] = []
 
     # Concurrency wired in but defaulted to sequential for Phase 1 simplicity;
     # parallelism is a Phase 2 follow-up if throughput becomes an issue.
@@ -387,7 +396,10 @@ def pull_messages(
             import sys
 
             if _is_permanent_error(e):
-                permanent_candidates[audience].append(chat["id"])
+                if _NO_GENERAL_CHANNEL_PATTERN in str(e):
+                    no_general_channel.append(chat["id"])
+                else:
+                    permanent_candidates[audience].append(chat["id"])
                 print(
                     f"pull_messages: candidate for disable {chat['teams_chat_id']} "
                     f"(permanent: {str(e)[:140]})",
@@ -404,6 +416,11 @@ def pull_messages(
     # accumulating a few at a time over months — and the clustering is the
     # only thing that tells those two apart after the fact.
     disabled_at = datetime.now(UTC).isoformat()
+    for chat_id in no_general_channel:
+        conn.execute(
+            "UPDATE teams_chats SET ingest_disabled = 1, ingest_disabled_at = ? WHERE id = ?",
+            (disabled_at, chat_id),
+        )
     for audience, candidates in permanent_candidates.items():
         if not candidates:
             continue

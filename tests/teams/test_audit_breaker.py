@@ -86,3 +86,33 @@ def test_an_isolated_channel_403_is_still_disabled(db):
         pull_messages(db, concurrency=1)
 
     assert _disabled(db) == [bad]
+
+
+def test_a_team_without_a_general_channel_is_disabled_in_one_run(db):
+    # teams-access raises this once per channel, for every channel of the team,
+    # and only after Graph listed the team's channels, so it cannot come from a
+    # token lapse. Judged against a small channel pool it tripped the breaker on
+    # every run and the team was retried for ever.
+    for i in range(9):
+        db.execute(
+            "INSERT INTO teams_chats (teams_chat_id, chat_kind, topic, team_uuid, channel_id, "
+            "first_seen_at) VALUES (?, 'channel', 'x', 'renamed-team', ?, "
+            "'2026-08-01T00:00:00')",
+            (f"19:renamed-{i}@thread.v2", f"19:renamed-{i}@thread.v2"),
+        )
+    db.commit()
+    _seed(db, 3, "channel")
+    _seed(db, 300, "group")
+
+    def side_effect(args, **kw):
+        if "renamed-team" in args:
+            raise RuntimeError(
+                'Team renamed-team has no channel named "General", cannot derive chatsvcagg teamId.'
+            )
+        return {"messages": []}
+
+    with patch("src.export.teams_export.run_teams_cli", side_effect=side_effect):
+        result = pull_messages(db, concurrency=1)
+
+    assert result["errors"] == 9
+    assert _disabled(db) == [f"19:renamed-{i}@thread.v2" for i in range(9)]

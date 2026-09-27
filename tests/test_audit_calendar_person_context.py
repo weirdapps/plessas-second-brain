@@ -13,6 +13,13 @@ def _graph(moment: datetime) -> str:
     return moment.strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
 
 
+@pytest.fixture(autouse=True)
+def _not_in_the_first_second_of_the_day():
+    """The tests put a meeting at midnight UTC and need it strictly in the past."""
+    if datetime.now(UTC).strftime("%H:%M:%S") < "00:00:02":
+        pytest.skip("run within the first seconds of the UTC day")
+
+
 @pytest.fixture
 def conn():
     c = create_database(":memory:")

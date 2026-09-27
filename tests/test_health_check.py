@@ -370,7 +370,7 @@ def _images_db():
         "CREATE TABLE inline_images (id INTEGER PRIMARY KEY, vision_description TEXT, "
         "classification TEXT, classified_at TEXT, visioned_at TEXT)"
     )
-    db.execute("CREATE TABLE emails (id INTEGER PRIMARY KEY)")
+    db.execute("CREATE TABLE emails (id INTEGER PRIMARY KEY, date_received TEXT)")
     db.execute(
         "CREATE TABLE attachments (id INTEGER PRIMARY KEY, email_id INTEGER, message_id TEXT, "
         "mime_type TEXT, file_path TEXT)"

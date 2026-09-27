@@ -201,6 +201,13 @@ TEAMS_DISABLED_WARN_SHARE = 0.25
 # manual `brain process-images` pass or more budget.
 IMAGE_QUEUE_WARN = 500
 
+# Slack on top of STALE_THRESHOLDS["images_vision"] before the OLDEST pending
+# image counts as abandoned. Step 8 drains newest first (ORDER BY date_received
+# DESC) in short hourly slices plus the nightly process-images pass, so after a
+# heavy day the oldest arrivals legitimately wait longest; a day of grace keeps a
+# queue that is merely behind from reading as one that stopped.
+IMAGE_PENDING_GRACE = timedelta(days=1)
+
 # Downloaded attachment directories with no matching email row. A handful is
 # ordinary: a sync can download an attachment minutes before the loader writes
 # its email, and the registrar picks it up on the next pass. Hundreds is not
@@ -698,6 +705,19 @@ def check_images(db):
         "WHERE a.mime_type LIKE 'image/%' AND a.file_path IS NOT NULL "
         "AND a.message_id NOT IN (SELECT message_id FROM inline_image_occurrences)"
     ).fetchone()[0]
+    # The same queue, aged. Depth alone has no time dimension: sync swallows any
+    # Step 8 exception, so a step that raises on every run writes no occurrences,
+    # `stuck` stays 0, and `pending` took 8-10 days to cross IMAGE_QUEUE_WARN.
+    oldest_pending = db.execute(
+        "SELECT MIN(e.date_received) FROM attachments a JOIN emails e ON a.email_id = e.id "
+        "WHERE a.mime_type LIKE 'image/%' AND a.file_path IS NOT NULL "
+        "AND a.message_id NOT IN (SELECT message_id FROM inline_image_occurrences)"
+    ).fetchone()[0]
+    pending_age = _age(oldest_pending)
+    pending_stale = (
+        pending_age is not None
+        and pending_age > STALE_THRESHOLDS["images_vision"] + IMAGE_PENDING_GRACE
+    )
     # Vision-stage liveness. Neither signal above has a time dimension: coverage %
     # freezes numerator and denominator together, and `pending` only sees images
     # that never reached inline_images at all. So a vision stage that stopped
@@ -742,15 +762,17 @@ def check_images(db):
         "skipped": skipped,
         "owed": owed,
         "pending": pending,
+        "pending_age": pending_age,
+        "pending_stale": pending_stale,
         "stuck": stuck,
         "latest_vision": latest_vision,
         # Keyed "age" because that is what build_report reads. Under its old name
         # the report printed "?" here, so the one source with a known outage was
         # also the one whose age was invisible.
         "age": _age(latest_vision),
-        # Only the two gauges with a real drain semantics and a time dimension.
+        # Only the gauges with a real drain semantics and a time dimension.
         # `pct` is deliberately absent: see the note above.
-        "status": "WARN" if pending > IMAGE_QUEUE_WARN or stuck else "OK",
+        "status": "WARN" if pending > IMAGE_QUEUE_WARN or stuck or pending_stale else "OK",
     }
 
 
@@ -1707,6 +1729,8 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
                 extra += (
                     f" — {c['stuck']:,} awaiting vision, last output {format_age(c.get('age'))} ago"
                 )
+            if c.get("pending_stale"):
+                extra += f" — oldest queued {format_age(c.get('pending_age'))} ago, not draining"
         elif c["name"] == "Emails":
             extra = f" ({c.get('recent_24h', 0)} today)"
         elif c["name"] == "Embeddings" and c.get("gaps"):

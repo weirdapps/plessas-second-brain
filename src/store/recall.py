@@ -242,9 +242,9 @@ _CONTEXT_HINT_LIMIT = 5
 
 def _maybe_person_context(conn: sqlite3.Connection, query: str, days: int) -> dict | None:
     """Return person_context if the query plausibly matches a known person."""
-    # resolve_person is the test, so recall attaches the person person_context
-    # and meeting_prep find for the same words: a name with a word starting with
-    # the query. A substring test found a name for most topics ('AI' inside
+    # resolve_person is the test, so for a name recall attaches the person
+    # person_context and meeting_prep find: one with a word starting with the
+    # query. A substring test found a name for most topics ('AI' inside
     # Michail, 'EU' inside Piraeus) and attached that dossier, and a separate
     # pre-check here disagreed with resolve_person in both directions. Not by an
     # address's local part, which a topic word such as 'data' or 'info' starts

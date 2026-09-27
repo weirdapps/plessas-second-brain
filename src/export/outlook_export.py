@@ -242,7 +242,14 @@ def download_attachments_for_messages(
             continue
         msg_dir = base_dir / msg_id
         msg_dir.mkdir(parents=True, exist_ok=True)
-        args = ["download-attachments", msg_id, "--out", str(msg_dir)]
+        # --overwrite because list-mail's --since is inclusive: the cursor's
+        # own message is re-listed every run, and without it outlook-cli
+        # refused the first file it had already saved (IO_WRITE_EEXIST), which
+        # was 99.7% of the logged failures and kept a download that died
+        # part-way from ever finishing. outlook-cli writes each file to a temp
+        # name and renames it into place, and the registrar keys on
+        # (message_id, filename), so a rewrite neither tears nor re-registers.
+        args = ["download-attachments", msg_id, "--out", str(msg_dir), "--overwrite"]
         if include_inline:
             args.append("--include-inline")
         try:

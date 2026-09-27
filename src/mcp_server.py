@@ -97,7 +97,11 @@ def _date_error(name: str, value: str | None) -> dict | None:
     query_combined compares DATE(?), which is NULL for '01/09/2026' or
     '2026-9-1' and so excluded every email, and reads '20260901' as a Julian day
     number. A date, or a date and time, in ISO form passes; empty means unset.
+    Python reads some ISO shapes SQLite does not ('2026-09-01T10', an offset
+    without a colon), and those gave the same silent empty result, so SQLite
+    itself has the last word.
     """
+    import sqlite3
     from datetime import date, datetime
 
     if not value:
@@ -108,6 +112,13 @@ def _date_error(name: str, value: str | None) -> dict | None:
         date.fromisoformat(value[:10])
         if len(value) > 10:
             datetime.fromisoformat(value)
+        probe = sqlite3.connect(":memory:")
+        try:
+            readable = probe.execute("SELECT DATE(?)", (value,)).fetchone()[0]
+        finally:
+            probe.close()
+        if readable is None:
+            raise ValueError
     except ValueError:
         return {"error": f"{name} must be YYYY-MM-DD (or an ISO date and time); got {value!r}"}
     return None

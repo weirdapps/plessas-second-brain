@@ -162,6 +162,9 @@ def test_an_unknown_teams_kind_is_an_error_naming_the_allowed_values(db):
         {"start_date": "20260901"},
         {"end_date": "2026-13-01"},
         {"start_date": "yesterday"},
+        {"start_date": "2026-09-01T10"},
+        {"end_date": "2026-09-01T10:00:00+0300"},
+        {"start_date": "2026-09-01T1000"},
     ],
 )
 def test_query_emails_rejects_a_date_that_is_not_iso(db, dates):

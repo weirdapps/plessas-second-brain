@@ -1698,7 +1698,12 @@ def cmd_calendar_sync(args):
     from datetime import timedelta
 
     from src.config import USER_EMAIL_PATTERN
-    from src.export.calendar_export import get_event_body, list_events, parse_event
+    from src.export.calendar_export import (
+        BACKFILL_LIST_CALLS,
+        get_event_body,
+        list_events,
+        parse_event,
+    )
     from src.export.outlook_cli import OutlookCliAuthRequired
     from src.extract.calendar_extractor import extract_event
     from src.extract.policy_bridge import classify_exception, is_transient
@@ -1738,7 +1743,14 @@ def cmd_calendar_sync(args):
     print(f"Calendar sync: {since.date()} to {until_dt.date()}")
     chunk_failures: list[str] = []
     try:
-        raw_events = list_events(since, until_dt, failures=chunk_failures)
+        if args.backfill:
+            # A year a month at a time, every busy stretch split further: the
+            # hourly run's call bound would stop it a few months in.
+            raw_events = list_events(
+                since, until_dt, failures=chunk_failures, max_calls=BACKFILL_LIST_CALLS
+            )
+        else:
+            raw_events = list_events(since, until_dt, failures=chunk_failures)
     except OutlookCliAuthRequired:
         conn.close()
         print("  Outlook needs re-authentication; nothing listed", file=sys.stderr)

@@ -82,6 +82,7 @@ def get_person_context(
         days: Number of days to look back
         limit: Max rows per list (topics, decisions, open_actions). Each list is
             accompanied by a `<name>_total` giving the unbounded count.
+            recent_emails holds at most min(limit, 10), with no total.
 
     Returns:
         Dict with person info, email_count, recent_emails, topics,
@@ -128,19 +129,30 @@ def get_person_context(
         (person_id, cutoff),
     ).fetchone()["cnt"]
 
-    # Recent emails
+    # One row per email below, however many roles the person holds on it:
+    # email_people is keyed by role too, and the model writes free-text roles
+    # ('recipient', 'FYI', 'recipient, FYI'), so about 30% of (email, person)
+    # pairs have several rows. Joined through it, the top correspondent's
+    # decisions_total read 132K against 59K real, the sentiment counts summed to
+    # twice email_count, and the capped lists were about half repeats.
+
+    # Recent emails. The role shown is one of theirs, sender first, as in
+    # query_by_person.
     recent_emails = [
         dict(r)
         for r in conn.execute(
             """
-        SELECT e.date_received as date, e.subject, e.summary, ep.role_in_email
+        SELECT e.date_received as date, e.subject, e.summary,
+            (SELECT ep.role_in_email FROM email_people ep
+              WHERE ep.email_id = e.id AND ep.person_id = ?
+              ORDER BY ep.role_in_email <> 'sender', ep.role_in_email LIMIT 1) as role_in_email
         FROM emails e
-        JOIN email_people ep ON e.id = ep.email_id
-        WHERE ep.person_id = ? AND e.date_received >= ?
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND e.date_received >= ?
         ORDER BY e.date_received DESC
-        LIMIT 10
+        LIMIT ?
     """,
-            (person_id, cutoff),
+            (person_id, person_id, cutoff, min(limit, 10)),
         ).fetchall()
     ]
 
@@ -152,9 +164,9 @@ def get_person_context(
         SELECT t.display_name as topic, COUNT(*) as count
         FROM topics t
         JOIN email_topics et ON t.id = et.topic_id
-        JOIN email_people ep ON et.email_id = ep.email_id
         JOIN emails e ON et.email_id = e.id
-        WHERE ep.person_id = ? AND e.date_received >= ?
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND e.date_received >= ?
         GROUP BY t.id
         ORDER BY count DESC
         LIMIT ?
@@ -167,9 +179,9 @@ def get_person_context(
         SELECT COUNT(DISTINCT t.id) as cnt
         FROM topics t
         JOIN email_topics et ON t.id = et.topic_id
-        JOIN email_people ep ON et.email_id = ep.email_id
         JOIN emails e ON et.email_id = e.id
-        WHERE ep.person_id = ? AND e.date_received >= ?
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND e.date_received >= ?
     """,
         (person_id, cutoff),
     ).fetchone()["cnt"]
@@ -179,8 +191,8 @@ def get_person_context(
         """
         SELECT e.sentiment, COUNT(*) as count
         FROM emails e
-        JOIN email_people ep ON e.id = ep.email_id
-        WHERE ep.person_id = ? AND e.date_received >= ? AND e.sentiment IS NOT NULL
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND e.date_received >= ? AND e.sentiment IS NOT NULL
         GROUP BY e.sentiment
     """,
         (person_id, cutoff),
@@ -195,8 +207,8 @@ def get_person_context(
         SELECT d.decision, d.decided_by, d.decision_date as date
         FROM decisions d
         JOIN emails e ON d.email_id = e.id
-        JOIN email_people ep ON e.id = ep.email_id
-        WHERE ep.person_id = ? AND e.date_received >= ?
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND e.date_received >= ?
         ORDER BY d.decision_date DESC
         LIMIT ?
     """,
@@ -208,8 +220,8 @@ def get_person_context(
         SELECT COUNT(*) as cnt
         FROM decisions d
         JOIN emails e ON d.email_id = e.id
-        JOIN email_people ep ON e.id = ep.email_id
-        WHERE ep.person_id = ? AND e.date_received >= ?
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND e.date_received >= ?
     """,
         (person_id, cutoff),
     ).fetchone()["cnt"]
@@ -222,8 +234,8 @@ def get_person_context(
         SELECT a.task, a.owner, a.deadline, a.status
         FROM action_items a
         JOIN emails e ON a.email_id = e.id
-        JOIN email_people ep ON e.id = ep.email_id
-        WHERE ep.person_id = ? AND a.status = 'open' AND e.date_received >= ?
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND a.status = 'open' AND e.date_received >= ?
         ORDER BY a.deadline IS NULL, a.deadline ASC
         LIMIT ?
     """,
@@ -235,8 +247,8 @@ def get_person_context(
         SELECT COUNT(*) as cnt
         FROM action_items a
         JOIN emails e ON a.email_id = e.id
-        JOIN email_people ep ON e.id = ep.email_id
-        WHERE ep.person_id = ? AND a.status = 'open' AND e.date_received >= ?
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+          AND a.status = 'open' AND e.date_received >= ?
     """,
         (person_id, cutoff),
     ).fetchone()["cnt"]

@@ -1098,6 +1098,14 @@ class TestFindStaleThreads:
                    conversation_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 e,
             )
+        # Addressed to someone: mail the owner sent only himself is never stale.
+        conn.execute(
+            "INSERT INTO people (id, name, email) VALUES (900, 'Other', 'other@example.com')"
+        )
+        conn.execute(
+            "INSERT INTO email_people (email_id, person_id, role_in_email) "
+            "SELECT id, 900, 'recipient' FROM emails"
+        )
         conn.commit()
         return conn
 

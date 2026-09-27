@@ -68,6 +68,11 @@ CURATE_STATE = STATE_DIR / "curate-state.json"
 # source of truth; duplicated because this script is loaded standalone, and
 # pinned by a test that reads the real one.
 CURATE_MAX_DEFER_ATTEMPTS = 5
+# How long candidates may sit deferred, or placements stop, before check_curation
+# calls the stall. A deferral cannot age out through retries: a parked candidate
+# is only offered again once its folder has room, so while every folder stays at
+# its cap `attempts` never passes 1 and only time can show the queue is stuck.
+CURATE_STALL_AGE = timedelta(days=7)
 
 # Counterpart to the heartbeat: written by the push job when a run FAILS (line 1
 # ISO-8601 UTC, line 2 the reason), removed when one succeeds. The stamp alone
@@ -1051,6 +1056,13 @@ def check_curation(state_path: Path | None = None):
     destination is full. Entries at MAX_DEFER_ATTEMPTS have exhausted their
     retries and will not be offered again, so those are the ones that mean work
     is being dropped rather than delayed.
+
+    Exhausted retries alone never fired in production, though. A parked
+    candidate is only re-offered once its folder has headroom, so while every
+    folder stays full no entry passes attempts=1, and the check read OK with 376
+    candidates parked and nothing placed for a week. So the queue is also aged:
+    the oldest deferral, and the latest placement while anything is deferred,
+    each past CURATE_STALL_AGE means the folders are not freeing up by themselves.
     """
     path = CURATE_STATE if state_path is None else Path(state_path)
     try:
@@ -1064,17 +1076,31 @@ def check_curation(state_path: Path | None = None):
     copied = state.get("copied") or []
     blocked = sum(1 for v in deferred.values() if v.get("attempts", 0) >= CURATE_MAX_DEFER_ATTEMPTS)
     latest = max((c.get("classified_at") for c in copied if c.get("classified_at")), default=None)
+    # last_attempt is rewritten only when a candidate is deferred again, which
+    # needs headroom first, so on a full folder it stays frozen at the first
+    # deferral and its age is how long the destination has been full.
+    oldest = min(
+        (v.get("last_attempt") for v in deferred.values() if v.get("last_attempt")), default=None
+    )
+    age = _age(latest)
+    deferral_age = _age(oldest)
+    stalled = bool(deferred) and any(
+        a is not None and a > CURATE_STALL_AGE for a in (deferral_age, age)
+    )
     return {
         "name": "Curation",
         "total": len(copied),
         "deferred": len(deferred),
         "blocked": blocked,
+        "stalled": stalled,
         "latest": latest,
-        "age": _age(latest),
-        # Deferred alone is ordinary back-pressure and clears itself once a
-        # folder has room. Exhausted retries are not: that is the document being
-        # dropped, which is the condition that went unnoticed for a month.
-        "status": "WARN" if blocked else "OK",
+        "age": age,
+        "deferral_age": deferral_age,
+        # Fresh deferrals are ordinary back-pressure: an operator pruning a
+        # folder lets them through. Nothing frees a folder automatically, so a
+        # week of it, or exhausted retries, is the document not arriving, which
+        # is the condition that went unnoticed for a month.
+        "status": "WARN" if blocked or stalled else "OK",
     }
 
 
@@ -1687,13 +1713,22 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
                 if c.get("disabled_at"):
                     extra += f" (latest {str(c['disabled_at'])[:19]})"
         elif c["name"] == "Curation":
+            # Both ages, because either one alone is ambiguous: an old deferral
+            # with a fresh placement is one full folder among several with room,
+            # and an old placement with fresh deferrals is every folder full.
+            ages = (
+                f"oldest deferral {format_age(c.get('deferral_age'))} ago,"
+                f" last placement {format_age(c.get('age'))} ago"
+            )
             if c.get("blocked"):
                 extra = (
-                    f" ({c.get('deferred', 0)} deferred, {c['blocked']} out of retries:"
+                    f" ({c.get('deferred', 0)} deferred, {c['blocked']} out of retries, {ages}:"
                     " destination folders are full)"
                 )
+            elif c.get("stalled"):
+                extra = f" ({c['deferred']} deferred, {ages}: destination folders are full)"
             elif c.get("deferred"):
-                extra = f" ({c['deferred']} deferred, awaiting folder headroom)"
+                extra = f" ({c['deferred']} deferred, {ages}; awaiting folder headroom)"
             else:
                 extra = " (nothing blocked)"
         elif c["name"] == "SharePoint":

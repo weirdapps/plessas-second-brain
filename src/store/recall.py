@@ -260,9 +260,10 @@ def _maybe_person_context(conn: sqlite3.Connection, query: str, days: int) -> di
 
 def _maybe_topic_context(conn: sqlite3.Connection, query: str, days: int) -> dict | None:
     """Return topic_context if the query plausibly matches a known topic."""
-    hit = conn.execute(
-        "SELECT 1 FROM topics WHERE name LIKE ?", (f"%{normalize_topic(query)}%",)
-    ).fetchone()
+    topic = normalize_topic(query)
+    if not any(ch.isalnum() for ch in topic):
+        return None  # LIKE '%%' fits every topic, and the most-used one came back
+    hit = conn.execute("SELECT 1 FROM topics WHERE name LIKE ?", (f"%{topic}%",)).fetchone()
     if not hit:
         return None
     ctx = get_topic_context(conn, query, days=days, limit=_CONTEXT_HINT_LIMIT)

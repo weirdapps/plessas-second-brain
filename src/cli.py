@@ -718,33 +718,41 @@ def cmd_process_sharepoint(args):
     fetches = 0
     capped = False
     if not stats["auth_required"]:
-        cursor = conn.execute(query, params)
-        for row in cursor:
-            email_id, message_id, content, date_received, html = row
-            stats["emails_scanned"] += 1
+        # The scan reads on a connection of its own. Its open cursor holds a read
+        # snapshot, and on the connection every fetch commits on, a commit from
+        # any other process in between left the next write on a stale snapshot:
+        # SQLite refuses that at once with 'database is locked', busy_timeout
+        # does not retry it, and the pass died with the mark unwritten.
+        scan_conn = get_connection(db_path)
+        try:
+            for row in scan_conn.execute(query, params):
+                email_id, message_id, content, date_received, html = row
+                stats["emails_scanned"] += 1
 
-            urls = extract_sharepoint_urls(markup_or_text(content, html))
-            stats["urls_found"] += len(urls)
+                urls = extract_sharepoint_urls(markup_or_text(content, html))
+                stats["urls_found"] += len(urls)
 
-            for url in urls:
-                if url in existing_urls or url in attempted:
-                    continue
-                if not args.dry_run and max_fetches > 0 and fetches >= max_fetches:
-                    capped = True
+                for url in urls:
+                    if url in existing_urls or url in attempted:
+                        continue
+                    if not args.dry_run and max_fetches > 0 and fetches >= max_fetches:
+                        capped = True
+                        break
+                    attempted.add(url)
+                    stats["urls_new"] += 1
+
+                    if args.dry_run:
+                        continue
+
+                    fetches += 1
+                    if _fetch_one(url, message_id):
+                        break
+
+                if stats["auth_required"] or capped:
                     break
-                attempted.add(url)
-                stats["urls_new"] += 1
-
-                if args.dry_run:
-                    continue
-
-                fetches += 1
-                if _fetch_one(url, message_id):
-                    break
-
-            if stats["auth_required"] or capped:
-                break
-            scanned_to = email_id
+                scanned_to = email_id
+        finally:
+            scan_conn.close()
 
     # Only a real pass over the mark's own range moves it: a dry run fetched
     # nothing, and a --since backfill did not read every id above the mark.

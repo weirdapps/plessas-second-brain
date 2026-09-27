@@ -375,10 +375,15 @@ def sniff_mime_type(path: str) -> str | None:
     if magic.startswith(b"PK\x03\x04"):
         import zipfile
 
+        # Any failure to read the directory means the bytes do not say, so the
+        # sniff answers None. zipfile raises more than BadZipFile on a crafted
+        # zip: a name flagged UTF-8 that holds invalid bytes raises
+        # UnicodeDecodeError, and letting that out aborts the whole sync from
+        # the registrar and makes the file a poison row for the extractor.
         try:
             with zipfile.ZipFile(path) as zf:
                 names = zf.namelist()
-        except (OSError, zipfile.BadZipFile):
+        except Exception:
             return None
         for folder, mime in _OOXML_BY_FOLDER:
             if any(n.startswith(folder) for n in names):

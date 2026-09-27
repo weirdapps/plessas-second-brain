@@ -24,6 +24,10 @@ PHASE2_BATCH_SIZE = 10
 PHASE2_COOLDOWN = 3  # seconds between LLM batches
 LLM_MAX_TEXT = 50_000  # max chars sent to LLM
 
+# The last element of a phase-2 worker's result when the service failed rather
+# than the item (policy_bridge.is_transient): offered again, but no re-auth.
+TRANSIENT = "transient"
+
 
 def _connect(db_path: str) -> sqlite3.Connection:
     """Open brain.db with the same concurrency settings as schema.get_connection.
@@ -198,7 +202,8 @@ def _extract_one_attachment(row):
 
     Returns ``(ac_id, email_id, extraction, error, auth_error)``. On success ``error`` is
     None and ``extraction`` is the parsed dict; on failure the reverse, with ``error``
-    serialised for the DB column.
+    serialised for the DB column. ``auth_error`` is True for a re-authable failure,
+    ``TRANSIENT`` for a failure of the service, and False otherwise.
 
     ``auth_error`` EXISTS BECAUSE THE VERDICT CANNOT BE RECOVERED FROM THE STRING. The
     caller writes ``pending`` for a re-authable failure and ``failed`` for a permanent
@@ -213,7 +218,7 @@ def _extract_one_attachment(row):
     from src.extract.attachment_prompt import build_attachment_prompt
     from src.extract.claude_extract import _response_text, complete
     from src.extract.parser import parse_extraction
-    from src.extract.policy_bridge import classify_exception
+    from src.extract.policy_bridge import classify_exception, is_transient
     from src.llm_policy import Outcome
 
     ac_id, att_id, text, filename, mime_type, email_id, email_subject, email_date = row
@@ -254,8 +259,14 @@ def _extract_one_attachment(row):
         return (ac_id, email_id, extraction, None, False)
 
     except Exception as e:
-        auth_error = classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED
-        return (ac_id, email_id, None, f"{type(e).__name__}: {str(e)[:500]}", auth_error)
+        verdict: bool | str = classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED
+        # The service failed, not the item, the same split as the calendar path in
+        # cli.py. Written 'failed', an outage during the nightly pass would drop
+        # the summaries of the whole queue for good. Still False for an item's
+        # own fault, so the tuple keeps its shape for every other caller.
+        if not verdict and is_transient(e):
+            verdict = TRANSIENT
+        return (ac_id, email_id, None, f"{type(e).__name__}: {str(e)[:500]}", verdict)
 
 
 def run_phase2(
@@ -342,7 +353,17 @@ def run_phase2(
         """
         now = datetime.now().isoformat()
         if error:
-            if auth_error:
+            if auth_error == TRANSIENT:
+                # Offered again next run, and still counted, so a run during an
+                # outage that lasts reads as failed rather than as a quiet night.
+                conn.execute(
+                    """UPDATE attachment_content
+                       SET llm_status = 'pending', llm_error = ?, llm_extracted_at = ?
+                       WHERE id = ?""",
+                    (error, now, ac_id),
+                )
+                stats["failed"] += 1
+            elif auth_error:
                 # Vertex ADC expired. Mark pending so the next cron retries
                 # automatically once the user re-auths (auth-watch clears
                 # the sentinel on its next probe). See vertex_auth.py.

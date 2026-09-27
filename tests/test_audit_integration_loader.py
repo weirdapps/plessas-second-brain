@@ -128,3 +128,14 @@ def test_an_old_file_with_null_topics_decisions_and_actions_still_loads(tmp_path
     facts = _conversation(tmp_path, {"topics": None, "decisions": None, "action_items": None})
 
     assert facts == []
+
+
+def test_a_null_name_loads_beside_names_the_model_extracted():
+    """people_roles looks each name up among the sender and recipients first, and
+    that lookup called .lower() on a name staged as null, which is nearly every
+    real extraction's path."""
+    conn = create_database(":memory:")
+    meta = _meta(1, {"name": None, "address": "sam.poe@example.com"}, [])
+    meta["to"] = [{"name": None, "address": "jane.roe@example.com"}]
+
+    assert load_single_email(conn, meta, _extraction({"Someone Else": "FYI"}))

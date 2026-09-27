@@ -10,6 +10,7 @@ import sqlite3
 from pathlib import Path
 
 from src.export.state import load_json_or_quarantine
+from src.extract.parser import _as_string_list
 
 from .email_html import save_html, split_body
 from .normalizer import find_or_create_person, find_or_create_topic
@@ -435,9 +436,11 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
                     (email_id, person_id, role),
                 )
 
-    # Also add sender as a person
+    # Also add sender as a person. The header names below are the only ones that
+    # may rename a person found by address (display_name=True): the model's
+    # people_roles names above never do.
     if sender_name and sender_address:
-        sender_id = find_or_create_person(conn, sender_name, sender_address)
+        sender_id = find_or_create_person(conn, sender_name, sender_address, display_name=True)
         conn.execute(
             "INSERT OR IGNORE INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, ?)",
             (email_id, sender_id, "sender"),
@@ -447,7 +450,10 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
     for recipient in metadata.get("to_recipients", metadata.get("to", [])):
         if recipient.get("address"):
             recipient_id = find_or_create_person(
-                conn, recipient.get("name", recipient["address"]), recipient["address"]
+                conn,
+                recipient.get("name", recipient["address"]),
+                recipient["address"],
+                display_name=True,
             )
             conn.execute(
                 "INSERT OR IGNORE INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, ?)",
@@ -460,6 +466,7 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
                 conn,
                 cc_recipient.get("name", cc_recipient["address"]),
                 cc_recipient["address"],
+                display_name=True,
             )
             conn.execute(
                 "INSERT OR IGNORE INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, ?)",
@@ -729,7 +736,7 @@ def load_single_conversation(
             )
 
     # Load key facts
-    for fact in extraction.get("key_facts", []):
+    for fact in _as_string_list(extraction.get("key_facts")):
         if fact:
             conn.execute(
                 """
@@ -741,7 +748,10 @@ def load_single_conversation(
             )
 
     # Store preferences and technical decisions as key_facts with prefix
-    for pref in extraction.get("preferences_expressed", []):
+    # Conversation extractions are read from disk without parse_extraction, and
+    # files written before it normalised these lists hold dict items (stored as
+    # a repr) or nulls (which stopped every conversation load).
+    for pref in _as_string_list(extraction.get("preferences_expressed")):
         if pref:
             conn.execute(
                 """
@@ -752,7 +762,7 @@ def load_single_conversation(
                 (f"[PREFERENCE] {pref}", conversation_id),
             )
 
-    for tech in extraction.get("technical_decisions", []):
+    for tech in _as_string_list(extraction.get("technical_decisions")):
         if tech:
             conn.execute(
                 """

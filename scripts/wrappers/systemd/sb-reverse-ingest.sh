@@ -18,14 +18,13 @@ PYTHON="$HOME/.venvs/second-brain/bin/python"
 DB="${BRAIN_DATA_DIR:-$PROJECT/data}/brain.db"
 LOG_DIR="$HOME/.second-brain/logs"
 LOG_FILE="$LOG_DIR/reverse-ingest.log"
-SENTINEL="$HOME/.second-brain/needs_reauth"
 mkdir -p "$LOG_DIR"
 
-if [ -f "$SENTINEL" ]; then
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: needs_reauth sentinel present" >> "$LOG_FILE"
-  exit 0
-fi
-
+# No needs_reauth gate here on purpose. Reverse-ingest walks local folders and
+# calls Vertex; it never calls outlook-cli, so a dead M365 session cannot affect
+# it. The check used to be here, copied from the mail wrappers, and stopped this
+# job whenever Outlook was down. sb-curate-docs.sh removed the same gate for the
+# same reason. The real dependency is guarded immediately below.
 if [ -f "$HOME/.second-brain/needs_gcloud_reauth" ]; then
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: needs_gcloud_reauth sentinel present" >> "$LOG_FILE"
   exit 0

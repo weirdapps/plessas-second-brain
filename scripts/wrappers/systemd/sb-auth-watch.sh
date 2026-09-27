@@ -446,7 +446,10 @@ auth_check_gcloud_adc() {
 
   if [ -x "$GCLOUD_AUTO_LOGIN" ]; then
     log "launching gcloud-auto-login.sh in background (timeout=180s, may drive Chrome)"
-    nohup "$GCLOUD_AUTO_LOGIN" >> "$LOG_DIR/gcloud-auto-login.log" 2>&1 &
+    # stdout goes nowhere: the helper ends by echoing the ADC access token, and
+    # appending it here left live bearer tokens in a plaintext log. Nothing in
+    # this script reads that output; stderr carries the diagnostics.
+    nohup "$GCLOUD_AUTO_LOGIN" >/dev/null 2>>"$LOG_DIR/gcloud-auto-login.log" &
     return 1
   fi
 
@@ -496,6 +499,12 @@ trigger_job() {
     sb-teams-sync.sh)       label="com.plessas.second-brain.teams-sync"    unit="sb-teams-sync.service" ;;
     sb-reverse-ingest.sh)   label="com.plessas.second-brain.reverse-ingest" unit="sb-reverse-ingest.service" ;;
     sb-attachment-pass.sh)  label="com.plessas.second-brain.attachments"   unit="sb-attachments.service" ;;
+    # Fired below but missing here until 2026-09-27, so every restoration took
+    # the nohup fallback: killed with this unit's cgroup when auth-watch ran on
+    # its own timer, and a second full mail sync beside the first when it ran as
+    # sb-outlook-sync's pre-flight. From the pre-flight the unit is already
+    # activating, and systemd merges this start into that job.
+    sb-outlook-sync.sh)     label="com.plessas.second-brain.sync"          unit="sb-outlook-sync.service" ;;
   esac
 
   # systemd first on Linux, launchd first on macOS. Both hand the job to the
@@ -538,7 +547,10 @@ trigger_job() {
      && launchctl kickstart "gui/$UID/$label" >/dev/null 2>&1; then
     log "auth-trigger: kickstarted $label (reason=$reason)"
   else
-    nohup "$WRAPPER_DIR/$script" >> "$TRIGGERED_LOG" 2>&1 &
+    # 9>&- closes the lock fd for the child. It would otherwise hold
+    # auth-watch's flock for as long as it ran, and every auth-watch run in
+    # that time would find the lock taken and skip its probes.
+    nohup "$WRAPPER_DIR/$script" >> "$TRIGGERED_LOG" 2>&1 9>&- &
     log "auth-trigger: nohup-fallback $script (pid=$!, reason=$reason, label=${label:-none} unit=${unit:-none})"
   fi
 }

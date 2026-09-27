@@ -342,6 +342,52 @@ def refresh_self_flags(
     return changed
 
 
+def cancel_unlisted(
+    conn: sqlite3.Connection, listed_ids: set[str], window_start: str, window_end: str
+) -> int:
+    """Mark cancelled the stored events in a window that Outlook no longer lists.
+
+    Returns how many were marked. Only for a window listed completely: an event
+    deleted or re-created in Outlook was never removed, so the readers kept
+    reporting meetings that no longer exist. The rows are kept, marked, which is
+    how the readers already treat Outlook's own cancellations.
+
+    ``window_start`` and ``window_end`` are UTC in start_at's shape, a
+    half-open range. When more than half of the window's live events would go
+    at once, nothing is marked: that is far likelier a bad answer from Outlook
+    than a cleared calendar, and marking would hide real meetings.
+
+    The etag is cleared with the flag, so an event that is listed again is not
+    taken as unchanged but fetched, and the upsert sets is_cancelled from
+    Outlook's own answer.
+    """
+    live = conn.execute(
+        "SELECT id, outlook_event_id FROM calendar_events "
+        "WHERE is_cancelled = 0 AND start_at >= ? AND start_at < ?",
+        (window_start, window_end),
+    ).fetchall()
+    gone = [row_id for row_id, event_id in live if event_id not in listed_ids]
+    if not gone:
+        return 0
+    if 2 * len(gone) > len(live):
+        logger.warning(
+            "%d of %d stored events in %s..%s are no longer listed; not marking them "
+            "cancelled, since more than half of a window going at once is likelier a "
+            "bad listing",
+            len(gone),
+            len(live),
+            window_start,
+            window_end,
+        )
+        return 0
+    conn.executemany(
+        "UPDATE calendar_events SET is_cancelled = 1, change_key = NULL WHERE id = ?",
+        [(row_id,) for row_id in gone],
+    )
+    conn.commit()
+    return len(gone)
+
+
 def dedupe_event_children(conn: sqlite3.Connection) -> tuple[int, int]:
     """Delete exact duplicate calendar decisions and action items, keeping the first.
 

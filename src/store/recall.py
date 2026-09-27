@@ -190,7 +190,11 @@ def _search_teams(conn: sqlite3.Connection, keyword: str, limit: int) -> list[di
 
 
 def _search_calendar_events(conn: sqlite3.Connection, query: str, limit: int) -> list[dict]:
-    """FTS search over calendar events."""
+    """FTS search over calendar events, leaving out cancelled ones.
+
+    Cancelled by Outlook, or by calendar-sync because Outlook no longer lists the
+    event: either way it is not a meeting, and a deleted one kept coming back.
+    """
     if not _table_exists(conn, "calendar_events_fts"):
         return []
     try:
@@ -199,7 +203,7 @@ def _search_calendar_events(conn: sqlite3.Connection, query: str, limit: int) ->
                 """SELECT ce.id, ce.subject, ce.start_at, ce.body_summary, ce.organizer_name
                    FROM calendar_events_fts f
                    JOIN calendar_events ce ON ce.id = f.rowid
-                   WHERE calendar_events_fts MATCH ?
+                   WHERE calendar_events_fts MATCH ? AND ce.is_cancelled = 0
                    ORDER BY rank LIMIT ?""",
                 (expression, limit),
             ).fetchall()

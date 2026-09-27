@@ -12,6 +12,10 @@ on a single host or split across two (see "Topology" below).
   out to it.
 - `tesseract`, plus the language data for the languages your attachments are
   written in.
+- `antiword` (or `catdoc`) on Linux, for legacy Word `.doc` attachments. macOS
+  uses its built-in `textutil`. Without any of the three every `.doc` is
+  recorded as skipped ("No legacy .doc converter available"), which no failure
+  count reports.
 - `zstd` and `openssl`, if you want encrypted offsite backups.
 
 **Tesseract is not optional if you ingest attachments.** Attachment OCR calls
@@ -25,6 +29,7 @@ method of all.
 ```bash
 brew install tesseract tesseract-lang                  # macOS
 sudo apt-get install tesseract-ocr tesseract-ocr-ell   # Debian/Ubuntu
+sudo apt-get install antiword                          # Debian/Ubuntu, legacy .doc
 tesseract --list-langs | grep -x ell                   # verify the Greek pack
 ```
 

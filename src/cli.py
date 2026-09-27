@@ -315,6 +315,12 @@ def cmd_process_attachments(args):
     # limit is no safer than it was in the hourly sync.
     deadline_s = getattr(args, "deadline_s", None)
 
+    # A phase that failed everything it tried. The exit code was 0 whatever the
+    # counts, and run_stage in sb-attachment-pass.sh judges only the exit code,
+    # so a night where every attachment failed was logged as a passing stage.
+    # Failures beside successes are per-item, and the other phase still runs.
+    phase_failed = False
+
     if phase is None or phase == 1:
         print("Phase 1: Local text extraction...")
         stats = run_phase1(db_path, limit=limit, file_type=file_type, deadline_s=deadline_s)
@@ -324,6 +330,7 @@ def cmd_process_attachments(args):
         print(f"  Skipped: {stats['skipped']}")
         if stats.get("deferred"):
             print(f"  Deferred (out of time): {stats['deferred']}")
+        phase_failed |= stats["failed"] > 0 and stats["extracted"] == 0
 
     if phase is None or phase == 2:
         workers = getattr(args, "workers", 1) or 1
@@ -336,8 +343,13 @@ def cmd_process_attachments(args):
         print(f"  Failed: {stats['failed']}")
         if stats.get("deferred"):
             print(f"  Deferred (out of time): {stats['deferred']}")
+        phase_failed |= stats["failed"] > 0 and stats["extracted"] == 0
 
     print("\nAttachment processing complete.")
+    if phase_failed:
+        print("A phase failed every attachment it tried", file=sys.stderr)
+        return 1
+    return 0
 
 
 def cmd_register_attachments(args):

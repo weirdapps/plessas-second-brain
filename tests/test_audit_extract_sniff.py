@@ -243,3 +243,57 @@ def test_unknown_bytes_are_still_unsupported(tmp_path):
     )
     assert result["status"] == "skipped"
     assert result["error"].startswith("Unsupported type")
+
+
+def _zip_with_undecodable_name() -> bytes:
+    """A zip whose central directory flags its name UTF-8 but holds invalid bytes.
+
+    zipfile decodes a name with bit 0x800 set as UTF-8 while it reads the
+    directory, so opening this raises UnicodeDecodeError rather than
+    BadZipFile. Any sender can attach one.
+    """
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("ab", b"payload")
+    data = bytearray(buf.getvalue())
+    for signature, flag_at, name_at in ((b"PK\x03\x04", 6, 30), (b"PK\x01\x02", 8, 46)):
+        start = data.index(signature)
+        (flags,) = struct.unpack_from("<H", data, start + flag_at)
+        struct.pack_into("<H", data, start + flag_at, flags | 0x800)
+        data[start + name_at : start + name_at + 2] = b"\xff\xfe"
+    return bytes(data)
+
+
+def test_a_zip_with_an_undecodable_name_sniffs_to_none(tmp_path):
+    path = _write(tmp_path, "Outlook-crafted", _zip_with_undecodable_name())
+    with pytest.raises(UnicodeDecodeError):
+        zipfile.ZipFile(path)
+    assert sniff_mime_type(path) is None
+
+
+def test_registrar_survives_a_zip_with_an_undecodable_name(tmp_path):
+    from src.export.outlook_attachments import register_downloaded_attachments
+    from src.store.schema import create_database
+
+    conn = create_database(":memory:")
+    try:
+        conn.execute(
+            "INSERT INTO emails (message_id, date_received, subject) VALUES (?, ?, ?)",
+            ("AAMk-crafted", "2026-09-01T10:00:00Z", "synthetic"),
+        )
+        conn.commit()
+        msg_dir = tmp_path / "AAMk-crafted"
+        msg_dir.mkdir()
+        (msg_dir / "Outlook-crafted").write_bytes(_zip_with_undecodable_name())
+
+        register_downloaded_attachments(conn, tmp_path)
+
+        types = dict(conn.execute("SELECT filename, mime_type FROM attachments").fetchall())
+    finally:
+        conn.close()
+    assert types == {"Outlook-crafted": "application/octet-stream"}
+
+
+def test_extractor_skips_a_declared_zip_with_an_undecodable_name(tmp_path):
+    path = _write(tmp_path, "Outlook-crafted", _zip_with_undecodable_name())
+    assert extract_text_from_file(path, "application/zip")["status"] == "skipped"

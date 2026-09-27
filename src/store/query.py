@@ -1263,20 +1263,36 @@ def meeting_prep(
     return result
 
 
+# Replies Outlook sends for the owner when he answers a meeting invitation: the
+# organiser owes nothing back. The Greek forms are the ones found on the replica.
+_MEETING_RESPONSE_PREFIXES = ("Accepted:", "Tentative:", "Declined:", "Αποδεκτή:", "Αποδοχή:")
+
+
 def _stale_threads_sql(select: str, days: int, max_days: int) -> tuple[str, tuple]:
-    """Threads whose last message the user sent between `days` and `max_days` ago.
+    """Threads whose last message the user sent between `days` and `max_days` ago,
+    to someone else, and not as a meeting response.
 
     A threshold at or past the window widens it by 30 days: days=45 against
     the 30-day default was an empty answer with a total of 0, read as 'nobody
     owes you a reply'.
+
+    Mail with no recipient or cc but the owner (health checks and digests he
+    sends himself) and meeting responses were about 80% of the list on the
+    replica, and nobody will ever answer either. The window is cut in UTC, the
+    time the store holds: naive local time put a thread 4.9 days old under
+    days=5.
     """
-    from datetime import datetime, timedelta
+    from datetime import UTC, datetime, timedelta
 
     if max_days <= days:
         max_days = days + 30
-    now = datetime.now()
+    now = datetime.now(UTC)
     cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
     oldest = (now - timedelta(days=max_days)).strftime("%Y-%m-%dT%H:%M:%S")
+    owner = f"%{USER_EMAIL_PATTERN}%"
+    not_a_response = " ".join(
+        "AND COALESCE(e.subject, '') NOT LIKE ?" for _ in _MEETING_RESPONSE_PREFIXES
+    )
     sql = f"""
         WITH latest_per_thread AS (
             SELECT conversation_id,
@@ -1294,10 +1310,23 @@ def _stale_threads_sql(select: str, days: int, max_days: int) -> tuple[str, tupl
         JOIN emails e ON e.conversation_id = lpt.conversation_id
                      AND e.date_received = lpt.last_date
         WHERE LOWER(e.sender_address) LIKE LOWER(?)
+          AND EXISTS (
+              SELECT 1 FROM email_people ep JOIN people p ON p.id = ep.person_id
+              WHERE ep.email_id = e.id AND ep.role_in_email IN ('recipient', 'cc')
+                AND LOWER(COALESCE(p.email, '')) NOT LIKE LOWER(?)
+          )
+          {not_a_response}
           AND lpt.last_date < ?
           AND lpt.last_date >= ?
     """
-    return sql, (_BLANK_SUBJECT_THREAD, f"%{USER_EMAIL_PATTERN}%", cutoff, oldest)
+    return sql, (
+        _BLANK_SUBJECT_THREAD,
+        owner,
+        owner,
+        *(f"{prefix}%" for prefix in _MEETING_RESPONSE_PREFIXES),
+        cutoff,
+        oldest,
+    )
 
 
 def find_stale_threads(

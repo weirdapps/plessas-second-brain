@@ -1723,7 +1723,10 @@ def cmd_calendar_sync(args):
     proxy_emails = load_proxy_emails(str(DATA_ROOT / "canonical_people.json"))
 
     now = datetime.now()
-    if args.backfill and args.since:
+    # --since is honoured on its own, as --until is. It used to count only with
+    # --backfill, so the README's `calendar-sync --since 2026-01-01` listed the
+    # last seven days and exited 0 with the gap it was run to fill still open.
+    if args.since:
         since = datetime.fromisoformat(args.since)
     elif args.backfill:
         since = now - timedelta(days=365)
@@ -2729,7 +2732,9 @@ def main():
         action="store_true",
         help="Backfill mode (default: 12 months back)",
     )
-    parser_cal.add_argument("--since", type=str, help="Start date ISO (e.g. 2025-05-14)")
+    parser_cal.add_argument(
+        "--since", type=str, help="Start date ISO (e.g. 2025-05-14; default: 7 days back)"
+    )
     parser_cal.add_argument("--until", type=str, help="End date ISO (default: now + 30d)")
     parser_cal.add_argument(
         "--skip-extraction", action="store_true", help="Skip LLM body extraction"

@@ -54,19 +54,24 @@ def resolve_person(
     # a name, 'AI' resolved to a forename holding it and 'EU' to a bank, and recall
     # attached that dossier to topic queries. The LIKE only rules rows out first.
     phrase = " ".join(search_fold(name_or_email).split())
+    # Only the head of the phrase is anchored when its last word is under three
+    # letters, because that word is an initial ('Surname T') and _phrase_pattern
+    # would make it a whole word; a query of one short word stays whole ('AI').
+    head, _, tail = phrase.rpartition(" ")
+    anchor = head if head and len(tail) < 3 and tail.isalpha() else phrase
     # And the local part of an address, where one word of four letters or more
     # starts a token or follows a one-letter initial ('jexample'), so a name
     # stored only in Greek is found by the Latin surname its address spells.
     local = phrase if re.fullmatch(r"[a-z0-9]{4,}", phrase) else ""
     where = r"""
-        (sb_fold(p.name) LIKE '%' || :phrase || '%' AND sb_match(p.name, :phrase, '', '') > 0)
+        (sb_fold(p.name) LIKE '%' || :phrase || '%' AND sb_match(p.name, :anchor, '', '') > 0)
         OR (:local <> '' AND (LOWER(p.email) LIKE :local || '%@%'
                               OR LOWER(p.email) LIKE '_' || :local || '%@%'
                               OR LOWER(p.email) LIKE '%.' || :local || '%@%'
                               OR LOWER(p.email) LIKE '%-' || :local || '%@%'
                               OR LOWER(p.email) LIKE '%\_' || :local || '%@%' ESCAPE '\'))
     """
-    args = {"phrase": phrase, "local": local}
+    args = {"phrase": phrase, "anchor": anchor, "local": local}
     candidates = conn.execute(
         f"""
         SELECT p.id, p.name, p.email, p.role, p.department

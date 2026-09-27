@@ -251,15 +251,23 @@ def _discover_chat_chats(conn: sqlite3.Connection) -> dict:
     return {"chats_inserted": inserted, "chats_updated": updated}
 
 
+# teams-cli list-messages reads a single page, 50 messages by default, and does
+# not page backwards. A chat that got more than one page between two polls kept
+# only the newest page and lost the rest for good, so chat-scope reads ask for
+# 200, the page Teams' own client requests. It is a stopgap: the real fix is for
+# the CLI to follow backwardLink until it reaches a message already stored.
+CHAT_PAGE_SIZE = 200
+
+
 def pull_messages(
     conn: sqlite3.Connection, concurrency: int = 2, deadline_s: float | None = None
 ) -> dict:
     """Step 2: full pull of messages for every active chat.
 
     Active = (last_message_at within 12 months) OR (any messages already in DB).
-    teams-cli list-messages does NOT expose a sync-state cursor (chatsvcagg
-    /posts only paginates by --page-size), so we always full-pull and rely on
-    UNIQUE(teams_message_id) for dedup. The teams_chats.sync_state column is
+    teams-cli list-messages does NOT expose a sync-state cursor and reads one
+    page only (CHAT_PAGE_SIZE for chats), so each run re-reads the newest page
+    and relies on UNIQUE(teams_message_id) for dedup. The teams_chats.sync_state column is
     vestigial in Phase 1; kept for forward-compatibility.
 
     Args:
@@ -328,6 +336,8 @@ def pull_messages(
                 # oneOnOne / group — chat-scope read via chatsvc
                 args = [
                     "list-messages",
+                    "--page-size",
+                    str(CHAT_PAGE_SIZE),
                     "--chat",
                     chat["teams_chat_id"],
                 ]

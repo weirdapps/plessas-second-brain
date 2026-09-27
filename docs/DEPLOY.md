@@ -309,6 +309,17 @@ in 0.2 s. A thread of calls alone, or with too little else, keeps its summary. S
 running the old code stores call records unmarked, and the migration runs once.
 Then run `python -m src.cli migrate` and start the timer again.
 
+**Upgrading to schema v25.** From v25 calendar `start_at` and `end_at` carry a
+trailing `Z`. Graph returns them in UTC, and without the zone a 16:00 Athens
+meeting read as 13:00. The migration appends it to the stored rows, about 1,100,
+in milliseconds, and changes nothing else. Stop `sb-calendar-sync.timer`, and let
+a running sync exit, before the pull: a sync still running the old code writes
+bare times after the migration has run. Then run `python -m src.cli migrate` and
+start the timer again. The same release lists every event of the window, where
+the old listing kept the ten earliest of each month, so run
+`python -m src.cli calendar-sync --backfill` once to fill the months it capped,
+best after outlook-access pages list-calendar itself.
+
 ## 8. Backup and restore
 
 `scripts/backup_db.py` takes an MVCC-consistent snapshot of a live `brain.db`,

@@ -12,18 +12,29 @@ set -uo pipefail
 [ -f "$HOME/.zprofile" ] && source "$HOME/.zprofile" 2>/dev/null || true
 
 PROJECT="$HOME/SourceCode/plessas-second-brain"
-SENTINEL="$HOME/.second-brain/needs_reauth"
 GCLOUD_SENTINEL="$HOME/.second-brain/needs_gcloud_reauth"
-[ -f "$SENTINEL" ] && exit 0
-# gcloud ADC expired → Vertex AI extraction would fail. Skip until auth-watch
-# clears the sentinel (its hourly probe restores it on first successful refresh).
-[ -f "$GCLOUD_SENTINEL" ] && exit 0
-
-cd "$PROJECT" || exit 1
 PYTHON="$HOME/.venvs/second-brain/bin/python"
 LOG_DIR="$HOME/.second-brain/logs"
 LOG_FILE="$LOG_DIR/attachments.log"
 mkdir -p "$LOG_DIR"
+
+# No needs_reauth gate here on purpose. None of the stages below calls
+# outlook-cli: registration and Phase 1 read files already on disk, Phase 2 and
+# the image pass call Vertex, and the SharePoint pass uses sharepoint-cli with
+# its own session. The check used to be here, copied from the mail wrappers, so
+# an Outlook outage stopped the nightly pass while its healthcheck read green.
+# sb-curate-docs.sh removed the same gate for the same reason.
+
+# gcloud ADC expired → Vertex AI extraction would fail. Skip until auth-watch
+# clears the sentinel (its hourly probe restores it on first successful refresh).
+# Logged, because this check used to run before LOG_FILE was named, and a skip
+# that leaves no line cannot be told from a pass that never started.
+if [ -f "$GCLOUD_SENTINEL" ]; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') — SKIP: needs_gcloud_reauth sentinel present" >> "$LOG_FILE"
+  exit 0
+fi
+
+cd "$PROJECT" || exit 1
 
 overall_rc=0
 run_stage() {

@@ -45,7 +45,12 @@ fi
 echo $$ > "$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 
-[ -f "$HOME/.second-brain/needs_gcloud_reauth" ] && exit 0
+# Extraction needs Vertex. Logged, because this skip used to be silent, and a
+# skip that leaves no line cannot be told from a run that never started.
+if [ -f "$HOME/.second-brain/needs_gcloud_reauth" ]; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: needs_gcloud_reauth sentinel present" >> "$LOG_FILE"
+  exit 0
+fi
 
 echo "=== Conversation sync started: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
 

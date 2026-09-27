@@ -88,10 +88,15 @@ def _complete_until(page: list[dict], start: datetime) -> datetime:
     before that start: an event of no length that starts there, cut off with the
     rest of the page, need not overlap a window that opens exactly at its start.
     A start that cannot be read only makes the answer earlier, which costs a
-    call and loses nothing.
+    call and loses nothing. An all-day event does not bound the page: it comes
+    back as a floating midnight labelled UTC, while Exchange places it at local
+    midnight, so east of UTC its start reads hours later than its place in the
+    page and would skip the timed events cut off after it.
     """
     complete_until = start
     for raw in page:
+        if raw.get("IsAllDay"):
+            continue
         when = raw.get("Start") or {}
         value = when.get("DateTime")
         if not value or when.get("TimeZone") != "UTC":

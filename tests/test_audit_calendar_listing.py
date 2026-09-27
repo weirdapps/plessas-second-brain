@@ -48,11 +48,34 @@ def _calendar() -> list[dict]:
     return events
 
 
+def _all_day(event_id: str, date: datetime) -> dict:
+    """An all-day event as list-calendar returns it: a floating midnight labelled
+    UTC, whatever the zone it was created in."""
+    return {
+        "Id": event_id,
+        "Subject": event_id,
+        "IsAllDay": True,
+        "Start": {"DateTime": date.strftime(_FMT), "TimeZone": "UTC"},
+        "End": {"DateTime": (date + timedelta(days=1)).strftime(_FMT), "TimeZone": "UTC"},
+    }
+
+
 def _utc(value: str) -> datetime:
     """A --from or --to as outlook-cli reads it: naive means this host's local
     time (Date.parse), and Outlook compares it in UTC. Naive UTC out, to match
     the events' DateTime."""
     return datetime.fromisoformat(value).astimezone(UTC).replace(tzinfo=None)
+
+
+def _span(event: dict) -> tuple[datetime, datetime]:
+    """Where Exchange places an event, in naive UTC. An all-day event sits at
+    the host's local midnight, not at the midnight its DateTime shows (verified
+    live: an all-day event overlapped a 21:30Z-23:00Z window the day before)."""
+    start = datetime.fromisoformat(event["Start"]["DateTime"])
+    end = datetime.fromisoformat(event["End"]["DateTime"])
+    if event.get("IsAllDay"):
+        return _utc(start.isoformat()), _utc(end.isoformat())
+    return start, end
 
 
 def _fake_cli(calendar: list[dict], calls: list[tuple[datetime, datetime]]):
@@ -64,13 +87,8 @@ def _fake_cli(calendar: list[dict], calls: list[tuple[datetime, datetime]]):
         start = _utc(args[args.index("--from") + 1])
         end = _utc(args[args.index("--to") + 1])
         calls.append((start, end))
-        overlapping = [
-            e
-            for e in calendar
-            if datetime.fromisoformat(e["Start"]["DateTime"]) < end
-            and datetime.fromisoformat(e["End"]["DateTime"]) > start
-        ]
-        overlapping.sort(key=lambda e: e["Start"]["DateTime"])
+        overlapping = [e for e in calendar if _span(e)[0] < end and _span(e)[1] > start]
+        overlapping.sort(key=lambda e: _span(e)[0])
         return overlapping[:OUTLOOK_PAGE_SIZE]
 
     return run
@@ -241,6 +259,31 @@ def test_an_event_of_no_length_at_the_cut_is_still_listed(monkeypatch, host_zone
     events = calendar_export.list_events(datetime(2026, 10, 1), datetime(2026, 10, 11), failures=[])
 
     assert "reminder" in {e["Id"] for e in events}
+
+
+def test_an_all_day_event_does_not_stretch_the_page(monkeypatch, host_zone):
+    """East of UTC an all-day event's floating midnight is later than where it
+    sits in the page. Taken as the page's last start, it moved the resume point
+    past a timed event cut from the page just after local midnight, which was
+    then never listed, and the run still counted as complete."""
+    day = datetime(2026, 6, 10)
+    calendar = [
+        _event(f"t{n}", day - timedelta(days=1) + timedelta(hours=6, minutes=30 * n), 30)
+        for n in range(9)
+    ]
+    calendar.append(_all_day("all-day", day))
+    # 00:30 local time on the all-day event's date.
+    calendar.append(_event("late-call", _utc((day + timedelta(minutes=30)).isoformat()), 30))
+    calls: list = []
+    monkeypatch.setattr(calendar_export, "run_outlook_cli", _fake_cli(calendar, calls))
+    failures: list[str] = []
+
+    events = calendar_export.list_events(
+        datetime(2026, 6, 9), datetime(2026, 6, 20), failures=failures
+    )
+
+    assert failures == []
+    assert sorted(e["Id"] for e in events) == sorted(e["Id"] for e in calendar)
 
 
 def _busy_month() -> list[dict]:

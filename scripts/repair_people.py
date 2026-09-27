@@ -156,7 +156,9 @@ def main(argv: list[str] | None = None) -> int:
     canonical = load_canonical(Path(args.canonical))
 
     if not args.apply:
-        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        # as_uri escapes the path: pasted in raw, a '#' or '?' in a directory
+        # name cut it short or rewrote the query, and the wrong file opened.
+        conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
         try:
             renames, unmended = plan_renames(conn, canonical)
             backfills, held, shared = plan_backfills(conn)

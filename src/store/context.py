@@ -4,6 +4,7 @@ Provides rich context functions for the email-handler plugin and /recall skill
 to retrieve person, topic, conversation, and decision context from the knowledge store.
 """
 
+import re
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -48,22 +49,37 @@ def resolve_person(
             (name_or_email.strip(),),
         ).fetchone()
         return row, (1 if row else 0), []
-    pattern = f"%{search_fold(name_or_email)}%"
+    # At the start of a word, as a search matches (greek._phrase_pattern, which
+    # sb_match applies to a phrase when given no words or tokens): anywhere inside
+    # a name, 'AI' resolved to a forename holding it and 'EU' to a bank, and recall
+    # attached that dossier to topic queries. The LIKE only rules rows out first.
+    phrase = " ".join(search_fold(name_or_email).split())
+    # And the local part of an address, where one word of four letters or more
+    # starts a token or follows a one-letter initial ('jexample'), so a name
+    # stored only in Greek is found by the Latin surname its address spells.
+    local = phrase if re.fullmatch(r"[a-z0-9]{4,}", phrase) else ""
+    where = r"""
+        (sb_fold(p.name) LIKE '%' || :phrase || '%' AND sb_match(p.name, :phrase, '', '') > 0)
+        OR (:local <> '' AND (LOWER(p.email) LIKE :local || '%@%'
+                              OR LOWER(p.email) LIKE '_' || :local || '%@%'
+                              OR LOWER(p.email) LIKE '%.' || :local || '%@%'
+                              OR LOWER(p.email) LIKE '%-' || :local || '%@%'
+                              OR LOWER(p.email) LIKE '%\_' || :local || '%@%' ESCAPE '\'))
+    """
+    args = {"phrase": phrase, "local": local}
     candidates = conn.execute(
-        """
+        f"""
         SELECT p.id, p.name, p.email, p.role, p.department
         FROM people p
-        WHERE sb_fold(p.name) LIKE ?
+        WHERE {where}
         ORDER BY (SELECT COUNT(*) FROM email_people ep WHERE ep.person_id = p.id) DESC, p.id
         LIMIT 4
         """,
-        (pattern,),
+        args,
     ).fetchall()
     if not candidates:
         return None, 0, []
-    match_count = conn.execute(
-        "SELECT COUNT(*) FROM people WHERE sb_fold(name) LIKE ?", (pattern,)
-    ).fetchone()[0]
+    match_count = conn.execute(f"SELECT COUNT(*) FROM people p WHERE {where}", args).fetchone()[0]
     others = [{"name": c["name"], "email": c["email"]} for c in candidates[1:]]
     return candidates[0], match_count, others
 

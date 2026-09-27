@@ -602,7 +602,11 @@ def cmd_process_sharepoint(args):
 
     query += " ORDER BY e.id"
 
-    if args.limit and args.limit > 0:
+    # --limit bounds a --since rescan only. repo-autoupdate pulls this code onto
+    # the producer without copying the wrappers, and the old nightly line passes
+    # --limit 200: bounding the mark scan with it would read 200 emails a night
+    # against 400-500 a weekday, and the mark would never catch up.
+    if args.since and args.limit and args.limit > 0:
         query += " LIMIT ?"
         params.append(args.limit)
 
@@ -617,7 +621,7 @@ def cmd_process_sharepoint(args):
         print(f"  Filtering to emails after {args.since}")
     else:
         print(f"  Starting past email id {scan_mark}")
-    if args.limit and args.limit > 0:
+    if args.since and args.limit and args.limit > 0:
         print(f"  Limiting to {args.limit} emails")
     if max_fetches > 0 and not args.dry_run:
         print(f"  Fetching at most {max_fetches} new URLs")
@@ -2592,14 +2596,17 @@ def main():
         "--limit",
         type=int,
         default=0,
-        help="Max emails to scan past the scan mark (0 = all, default 0)",
+        help="Max emails to rescan with --since (0 = all, default 0); the scan past the "
+        "mark always reads every email",
     )
+    # On by default, so any invocation stays inside the nightly unit's timeout,
+    # the stale wrapper line included (see the --limit comment in the command).
     parser_process_sp.add_argument(
         "--max-fetches",
         type=int,
-        default=0,
+        default=100,
         dest="max_fetches",
-        help="Max new URLs to fetch this run; the rest wait for the next (0 = no cap, default 0)",
+        help="Max new URLs to fetch this run; the rest wait for the next (0 = no cap, default 100)",
     )
     parser_process_sp.add_argument(
         "--dry-run", action="store_true", help="Scan and count only, no fetching"

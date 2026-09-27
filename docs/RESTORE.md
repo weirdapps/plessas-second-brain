@@ -132,9 +132,25 @@ The export cursors are not in the snapshot either, and they are now ahead of
 it. Each `outlook_sync*.json` under `$DATA/state` still holds the newest mail
 the lost database had seen, so the next run lists only mail after that and the
 gap between `last_sync_date` and the cursor is never fetched again. Before
-restarting, set `last_seen_received_at` in each of them to a time at or before
-`last_sync_date`; the loader skips mail it already holds by message id. Check
-any other source you stage from for a cursor of its own.
+restarting, rewind `last_seen_received_at` in each of them; the loader skips
+mail it already holds by message id.
+
+The two timestamps are in different zones, so do not copy one into the other.
+`last_sync_date` is the producer's local wall-clock time with no zone
+(`src/cli.py` writes `datetime.now()`), while `last_seen_received_at` is UTC
+with a trailing `Z`. Appending a `Z` to the local time moves the cursor hours
+forward, and the mail in those hours is skipped for good. Subtract at least one
+export interval as well, because mail received after the last export before
+that load is missing from the snapshot too. Convert on the producer, whose
+local zone is the one `last_sync_date` was written in, and raise the hour if
+the export runs less often:
+
+```bash
+python3 -c 'import sys, datetime as d; t = d.datetime.fromisoformat(sys.argv[1]).astimezone(d.timezone.utc) - d.timedelta(hours=1); print(t.strftime("%Y-%m-%dT%H:%M:%SZ"))' "<last_sync_date>"
+```
+
+Write the result into each file. Check any other source you stage from for a
+cursor of its own.
 
 ```bash
 # 6. Start the writers again. On the producer:

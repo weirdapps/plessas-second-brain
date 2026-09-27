@@ -1253,6 +1253,48 @@ def cmd_prep(args):
                 print(f"  - {a['task'][:80]}{deadline}")
 
 
+def _holding_the_sync_lock(sync):
+    """Run `sync` holding DATA_ROOT/state/sync.lock, or skip if another sync has it.
+
+    Three units run `src.cli sync` (sb-outlook-sync hourly, sb-noon-catchup and
+    sb-daily-sync), and only the hourly wrapper looked for another, with a pgrep,
+    once, one way and not atomically. On 2026-09-24 the noon catch-up started
+    during the hourly load, and both extracted the same conversations and
+    rewrote the state file each from its own snapshot, where the last writer
+    drops the other's processed_ids and give-up counters.
+
+    `--lock-wait` seconds (0 by default) is how long to wait for the holder.
+    Then the run skips with exit 0: the sync holding the lock is draining the
+    same staged mail. The lock is an flock, so it goes with the process holding
+    it, and a killed sync leaves nothing to clear.
+    """
+    import fcntl
+    import functools
+    import time
+
+    @functools.wraps(sync)
+    def locked(args):
+        wait_s = float(getattr(args, "lock_wait", 0) or 0)
+        path = DATA_ROOT / "state" / "sync.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as lock:
+            give_up_at = time.monotonic() + wait_s
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    left = give_up_at - time.monotonic()
+                    if left <= 0:
+                        print(f"skip: another sync is running (waited {wait_s:.0f} s for {path})")
+                        return 0
+                    time.sleep(min(1.0, left))
+            return sync(args)
+
+    return locked
+
+
+@_holding_the_sync_lock
 def cmd_sync(args):
     """Incremental sync over staged mail: extract, load, and the steps after."""
     from src.store.schema import get_connection, migrate_add_sync_metadata
@@ -2728,6 +2770,14 @@ def main():
         action="store_true",
         help="Accepted for the existing schedules and ignored: sync never exports "
         "mail, it loads what outlook_export staged.",
+    )
+    parser_sync.add_argument(
+        "--lock-wait",
+        type=float,
+        default=0,
+        metavar="SECONDS",
+        help="If another sync is running, wait up to this long for it, then skip "
+        "with exit 0 (default: 0, skip at once)",
     )
     parser_sync.set_defaults(func=cmd_sync)
 

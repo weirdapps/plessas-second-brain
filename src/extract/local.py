@@ -393,8 +393,12 @@ def run_extraction(
     emails that fail on every run cannot spend each run's budget ahead of fresh
     mail. Without one (a manual run) nothing changes.
 
-    Returns {"extracted", "failed", "quota_paused"}; quota_paused is True when a
-    quota pause ended a run that had a deadline.
+    Returns {"extracted", "failed", "quota_paused", "model_successes",
+    "model_failures"}; quota_paused is True when a quota pause ended a run that
+    had a deadline. The last two count the emails that went to the model and
+    came back extracted or failed. News is extracted without it and counts in
+    neither, so a run in which the model failed every email still reports
+    "extracted" above zero on a day with news, and only these tell.
     """
     global _shutdown
 
@@ -424,6 +428,7 @@ def run_extraction(
     timeout_counts: dict[str, int] = dict(state.get("timeout_attempts", {}))
     failed_this_run: dict[str, str] = {}
     model_successes = 0
+    model_failures = 0
 
     def note_failure(msg_id: str, failure: str | None) -> None:
         # A fault outranks a timeout for an email met twice in one run.
@@ -485,7 +490,13 @@ def run_extraction(
 
     if not pending:
         log("Nothing to extract. Done.")
-        return {"extracted": 0, "failed": 0, "quota_paused": False}
+        return {
+            "extracted": 0,
+            "failed": 0,
+            "quota_paused": False,
+            "model_successes": 0,
+            "model_failures": 0,
+        }
 
     # Warm up: verify auth
     if engine == "claude":
@@ -535,6 +546,8 @@ def run_extraction(
                 i += 1
             else:
                 total_failed += 1
+                if not is_news(email):
+                    model_failures += 1
                 if is_quota:
                     consecutive_failures += 1
                 log(f"FAILED msg {msg_id}")
@@ -650,6 +663,8 @@ def run_extraction(
                     else:
                         with _state_lock:
                             total_failed += 1
+                            if not is_news(email):
+                                model_failures += 1
                             if is_quota:
                                 consecutive_failures += 1
                             note_failure(msg_id, failure)
@@ -733,7 +748,13 @@ def run_extraction(
     outcome = "STOPPED" if _shutdown else "CUT SHORT" if cut_short else "COMPLETE"
     log(f"=== EXTRACTION {outcome} ===")
     log(f"Extracted: {total_done}, Failed: {total_failed}, Time: {elapsed:.1f}min")
-    return {"extracted": total_done, "failed": total_failed, "quota_paused": quota_paused}
+    return {
+        "extracted": total_done,
+        "failed": total_failed,
+        "quota_paused": quota_paused,
+        "model_successes": model_successes,
+        "model_failures": model_failures,
+    }
 
 
 # --- Conversation Extraction ---

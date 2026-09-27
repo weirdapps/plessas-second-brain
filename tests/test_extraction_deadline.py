@@ -77,7 +77,13 @@ def test_the_deadline_stops_the_sequential_loop_between_items(staged, monkeypatc
     result = local.run_extraction(workers=1, deadline_s=50.0)
 
     assert len(calls) == 2
-    assert result == {"extracted": 2, "failed": 0, "quota_paused": False}
+    assert result == {
+        "extracted": 2,
+        "failed": 0,
+        "quota_paused": False,
+        "model_successes": 2,
+        "model_failures": 0,
+    }
 
 
 def test_the_deadline_stops_the_concurrent_path_at_a_chunk_boundary(staged, monkeypatch):

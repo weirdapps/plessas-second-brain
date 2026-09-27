@@ -69,6 +69,12 @@ def is_dropped_connection(exc: BaseException) -> bool:
 def classify_exception(exc: BaseException | None, response: object | None) -> Outcome:
     """Map one SDK outcome to a policy Outcome. Types first, strings second."""
     if exc is not None:
+        # google-auth retries a token-endpoint 5xx, 408 or 429 itself, then says
+        # so with retryable=True. That is an outage of the endpoint: called auth,
+        # a short-budget job wrote the reauth sentinel and stopped every gated
+        # job over it. An HTML error body still arrives as retryable=False.
+        if isinstance(exc, gauth.RefreshError) and exc.retryable:
+            return Outcome.API_ERROR
         if isinstance(exc, gauth.RefreshError):
             return Outcome.AUTH_REAUTH_REQUIRED
         if isinstance(exc, anthropic.AuthenticationError | anthropic.PermissionDeniedError):
@@ -119,6 +125,10 @@ def is_transient(exc: BaseException) -> bool:
     # AnthropicVertex refreshes its Google token outside the SDK's own error
     # wrapping, so a network drop there arrives as google-auth's own types.
     if isinstance(exc, gauth.TransportError | gauth.TimeoutError):
+        return True
+    # The token endpoint failing after google-auth's own retries (see
+    # classify_exception): the item is fine, so it stays pending.
+    if isinstance(exc, gauth.RefreshError) and exc.retryable:
         return True
     # The Gemini engine raises its SDK's own 5xx, and httpx's transport errors
     # unwrapped.

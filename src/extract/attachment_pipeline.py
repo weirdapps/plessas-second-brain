@@ -218,7 +218,7 @@ def _extract_one_attachment(row):
     from src.extract.attachment_prompt import build_attachment_prompt
     from src.extract.claude_extract import _response_text, complete
     from src.extract.parser import parse_extraction
-    from src.extract.policy_bridge import classify_exception, is_transient
+    from src.extract.policy_bridge import classify_exception, is_item_timeout, is_transient
     from src.llm_policy import Outcome
 
     ac_id, att_id, text, filename, mime_type, email_id, email_subject, email_date = row
@@ -263,8 +263,11 @@ def _extract_one_attachment(row):
         # The service failed, not the item, the same split as the calendar path in
         # cli.py. Written 'failed', an outage during the nightly pass would drop
         # the summaries of the whole queue for good. Still False for an item's
-        # own fault, so the tuple keeps its shape for every other caller.
-        if not verdict and is_transient(e):
+        # own fault, so the tuple keeps its shape for every other caller. An item
+        # that ran out of time will again, and attachment_content keeps no attempt
+        # count to cap it with: pending, it would be sent every night and fail the
+        # nightly stage every night, so it stays terminal as before.
+        if not verdict and is_transient(e) and not is_item_timeout(e):
             verdict = TRANSIENT
         return (ac_id, email_id, None, f"{type(e).__name__}: {str(e)[:500]}", verdict)
 

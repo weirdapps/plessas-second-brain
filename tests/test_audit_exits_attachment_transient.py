@@ -113,3 +113,18 @@ def test_an_item_fault_is_still_terminal(phase2, monkeypatch):
 
     assert _row(phase2)[0] == "failed"
     assert stats["failed"] == 1
+
+
+def test_an_item_that_runs_out_of_time_is_still_terminal(phase2, monkeypatch):
+    """The same request is likely to time out again (policy_bridge.is_item_timeout).
+    attachment_content keeps no attempt count to cap it with, so left pending it
+    would be sent again every night, and with nothing else extracted it would turn
+    the nightly stage red every night for good."""
+    from src.extract.attachment_pipeline import run_phase2
+
+    monkeypatch.setattr(claude_extract, "complete", _raise(TimeoutError("the model took too long")))
+
+    stats = run_phase2(phase2)
+
+    assert _row(phase2)[0] == "failed"
+    assert stats["failed"] == 1

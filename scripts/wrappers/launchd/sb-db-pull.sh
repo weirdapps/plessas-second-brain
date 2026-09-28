@@ -87,11 +87,12 @@ if [ $CP_RC -ne 0 ]; then
 fi
 
 # --- Rsync brain.db (delta transfer; default temp-file + rename = atomic) ---
-# --chmod=F600: -a carries the producer's modes across (brain.db 0644 from the
-# snapshot, embeddings.npz 0664), which left every mail, Teams and WhatsApp row on
-# this Mac readable by any account on it. Owner-only on arrival; the modes block
-# after the transfers also fixes files a run did not transfer.
-RSYNC_OPTS="-az --timeout=180 --chmod=F600"
+# No --chmod: /usr/bin/rsync on macOS is openrsync, which rejects it, and the first
+# pull that carried it failed every transfer. -a carries the producer's modes
+# across, the producer's pull snapshot and offsite copies are 0600, the data
+# directory is 0700 so nothing inside it is reachable by another account in the
+# meantime, and the modes block after the transfers makes the result owner-only.
+RSYNC_OPTS="-az --timeout=180"
 
 # Snapshot on the VPS FIRST, then copy the snapshot. rsync'ing brain.db directly
 # copied a live WAL-mode database that the VPS kept writing during the ~60s
@@ -126,8 +127,9 @@ SNAP_NAME="brain.snapshot.$(hostname -s).db"
 REMOTE_SNAP="\$HOME/.second-brain/$SNAP_NAME"
 # umask and chmod: the pull snapshot is a whole copy of brain.db, and .backup into
 # an existing file keeps that file's mode, so an old 0644 copy stays 0644 unless
-# it is set here.
-ssh $SSH_OPTS "$VPS" "umask 077; mkdir -p \$HOME/.second-brain && sqlite3 \$HOME/$REMOTE_DATA/brain.db \".backup '$REMOTE_SNAP'\" && chmod 600 '$REMOTE_SNAP'" 2>> "$LOG_FILE"
+# it is set here. Double quotes around the path, so the producer's shell expands the
+# escaped $HOME in it; single quotes left chmod a literal path and failed the step.
+ssh $SSH_OPTS "$VPS" "umask 077; mkdir -p \$HOME/.second-brain && sqlite3 \$HOME/$REMOTE_DATA/brain.db \".backup '$REMOTE_SNAP'\" && chmod 600 \"$REMOTE_SNAP\"" 2>> "$LOG_FILE"
 SNAP_RC=$?
 if [ $SNAP_RC -ne 0 ]; then
   log "ERROR: VPS snapshot FAILED (rc=$SNAP_RC), NOT copying a live database; keeping the existing local file"

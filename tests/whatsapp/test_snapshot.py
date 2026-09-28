@@ -39,7 +39,7 @@ def _run(source: Path, dest: Path, python: str = sys.executable):
 
 def test_the_snapshot_has_no_media_key_url_or_file_hash_column(tmp_path):
     source = make_bridge_store(tmp_path / "messages.db", _messages())
-    dest = tmp_path / "snapshot.db"
+    dest = tmp_path / "whatsapp-snapshot.db"
     assert _run(source, dest).returncode == 0
 
     conn = sqlite3.connect(dest)
@@ -60,7 +60,7 @@ def test_the_snapshot_has_no_media_key_url_or_file_hash_column(tmp_path):
 
 def test_every_chat_and_message_is_kept(tmp_path):
     source = make_bridge_store(tmp_path / "messages.db", _messages())
-    dest = tmp_path / "snapshot.db"
+    dest = tmp_path / "whatsapp-snapshot.db"
     out = _run(source, dest)
     assert json.loads(out.stdout) == {"chats": 2, "messages": 3, "bytes": dest.stat().st_size}
 
@@ -70,7 +70,7 @@ def test_the_source_is_read_only_and_left_untouched(tmp_path):
     before = hashlib.sha256(source.read_bytes()).hexdigest()
     source.chmod(0o400)
     try:
-        assert _run(source, tmp_path / "snapshot.db").returncode == 0
+        assert _run(source, tmp_path / "whatsapp-snapshot.db").returncode == 0
     finally:
         source.chmod(0o600)
     assert hashlib.sha256(source.read_bytes()).hexdigest() == before
@@ -79,22 +79,22 @@ def test_the_source_is_read_only_and_left_untouched(tmp_path):
 
 def test_the_snapshot_file_is_owner_only(tmp_path):
     source = make_bridge_store(tmp_path / "messages.db", _messages())
-    dest = tmp_path / "snapshot.db"
+    dest = tmp_path / "whatsapp-snapshot.db"
     _run(source, dest)
     assert stat.S_IMODE(dest.stat().st_mode) == 0o600
 
 
 def test_nothing_it_prints_carries_message_content(tmp_path):
     source = make_bridge_store(tmp_path / "messages.db", _messages())
-    out = _run(source, tmp_path / "snapshot.db")
+    out = _run(source, tmp_path / "whatsapp-snapshot.db")
     assert MARKER not in out.stdout + out.stderr
     assert "hello" not in out.stdout + out.stderr
 
 
 def test_a_missing_source_exits_66(tmp_path):
-    out = _run(tmp_path / "absent.db", tmp_path / "snapshot.db")
+    out = _run(tmp_path / "absent.db", tmp_path / "whatsapp-snapshot.db")
     assert out.returncode == 66
-    assert not (tmp_path / "snapshot.db").exists()
+    assert not (tmp_path / "whatsapp-snapshot.db").exists()
 
 
 def test_a_store_without_the_expected_columns_exits_65(tmp_path):
@@ -104,12 +104,12 @@ def test_a_store_without_the_expected_columns_exits_65(tmp_path):
     conn.execute("CREATE TABLE chats (jid TEXT)")
     conn.commit()
     conn.close()
-    assert _run(source, tmp_path / "snapshot.db").returncode == 65
+    assert _run(source, tmp_path / "whatsapp-snapshot.db").returncode == 65
 
 
 def test_an_existing_destination_is_replaced_whole(tmp_path):
     source = make_bridge_store(tmp_path / "messages.db", _messages())
-    dest = tmp_path / "snapshot.db"
+    dest = tmp_path / "whatsapp-snapshot.db"
     dest.write_bytes(b"stale")
     assert _run(source, dest).returncode == 0
     assert json.loads(_run(source, dest).stdout)["messages"] == 3
@@ -119,5 +119,5 @@ def test_an_existing_destination_is_replaced_whole(tmp_path):
 def test_it_runs_under_the_system_python_the_mac_job_uses(tmp_path):
     """The LaunchAgent calls /usr/bin/python3, which is 3.9 on macOS."""
     source = make_bridge_store(tmp_path / "messages.db", _messages())
-    out = _run(source, tmp_path / "snapshot.db", python="/usr/bin/python3")
+    out = _run(source, tmp_path / "whatsapp-snapshot.db", python="/usr/bin/python3")
     assert out.returncode == 0, out.stderr

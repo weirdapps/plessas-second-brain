@@ -72,7 +72,12 @@ def build_snapshot(tmp_path: Path, messages: list[tuple], chats: list[tuple] | N
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    source = make_bridge_store(tmp_path / "bridge.db", messages, chats)
+    # The wrapper builds in a mktemp -d directory, 0700; the builder refuses any other.
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    tmp_path.chmod(0o700)
+    bridge = tmp_path / "bridge"
+    bridge.mkdir(mode=0o700, exist_ok=True)
+    source = make_bridge_store(bridge / "messages.db", messages, chats)
     dest = tmp_path / "whatsapp-snapshot.db"
     module.build_snapshot(str(source), str(dest))
     source.unlink()

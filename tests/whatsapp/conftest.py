@@ -61,3 +61,19 @@ def make_bridge_store(path: Path, messages: list[tuple], chats: list[tuple] | No
     conn.commit()
     conn.close()
     return path
+
+
+def build_snapshot(tmp_path: Path, messages: list[tuple], chats: list[tuple] | None = None) -> Path:
+    """The snapshot the Mac would push: the real builder over a fake bridge store."""
+    import importlib.util
+
+    script = Path(__file__).parents[2] / "scripts" / "whatsapp_snapshot.py"
+    spec = importlib.util.spec_from_file_location("whatsapp_snapshot", script)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    source = make_bridge_store(tmp_path / "bridge.db", messages, chats)
+    dest = tmp_path / "whatsapp-snapshot.db"
+    module.build_snapshot(str(source), str(dest))
+    source.unlink()
+    return dest

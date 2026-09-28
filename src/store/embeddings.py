@@ -32,6 +32,10 @@ CONVERSATION_ID_OFFSET = -2_000_000
 # Conversations occupy the -2_000_000 .. -1 range so we put teams below it.
 TEAMS_THREAD_ID_OFFSET = -10_000_000
 
+# WhatsApp session embeddings live below Teams. Teams owns
+# (WHATSAPP_THREAD_ID_OFFSET, TEAMS_THREAD_ID_OFFSET], room for 990M threads.
+WHATSAPP_THREAD_ID_OFFSET = -1_000_000_000
+
 # In-process cache of the embedding index, keyed by file mtime. query_semantic and
 # the hybrid-recall candidate helper both hit this, so a long-lived process (the MCP
 # server) loads and unit-normalizes the ~1 GB index ONCE instead of on every query.
@@ -461,8 +465,9 @@ def _kind_mask(ids, kinds) -> np.ndarray:
     """Which vectors are of the given kinds, read off their id namespaces.
 
     The boundaries are query_semantic's routing below: positive ids are emails,
-    TEAMS_THREAD_ID_OFFSET and below Teams threads, CONVERSATION_ID_OFFSET and
-    below conversations, the rest of the negatives attachments.
+    WHATSAPP_THREAD_ID_OFFSET and below WhatsApp sessions, TEAMS_THREAD_ID_OFFSET
+    and below Teams threads, CONVERSATION_ID_OFFSET and below conversations, the
+    rest of the negatives attachments.
     """
     mask = np.zeros(len(ids), dtype=bool)
     if "email" in kinds:
@@ -472,7 +477,9 @@ def _kind_mask(ids, kinds) -> np.ndarray:
     if "conversation" in kinds:
         mask |= (ids <= CONVERSATION_ID_OFFSET) & (ids > TEAMS_THREAD_ID_OFFSET)
     if "teams_thread" in kinds:
-        mask |= ids <= TEAMS_THREAD_ID_OFFSET
+        mask |= (ids <= TEAMS_THREAD_ID_OFFSET) & (ids > WHATSAPP_THREAD_ID_OFFSET)
+    if "whatsapp_thread" in kinds:
+        mask |= ids <= WHATSAPP_THREAD_ID_OFFSET
     return mask
 
 
@@ -511,7 +518,7 @@ def query_semantic(
         query: Natural language search query
         limit: Maximum number of results
         kinds: Only these kinds ("email", "attachment", "conversation",
-            "teams_thread"); every kind when None
+            "teams_thread", "whatsapp_thread"); every kind when None
         embed_fn, index_path: injection points for testing
         allowed_ids: Only these index ids (for a conversation,
             CONVERSATION_ID_OFFSET - conversations.id), ranked among
@@ -554,6 +561,25 @@ def query_semantic(
                 result["type"] = "email"
                 result["similarity"] = round(similarity, 4)
                 results.append(result)
+        elif item_id <= WHATSAPP_THREAD_ID_OFFSET:
+            # WhatsApp session (npz id encoding: WHATSAPP_THREAD_ID_OFFSET - thread.id)
+            try:
+                row = conn.execute(
+                    """
+                    SELECT t.id, t.title, t.summary, t.started_at as date,
+                           t.message_count, c.name AS chat_name
+                    FROM whatsapp_threads t JOIN whatsapp_chats c ON c.id = t.chat_id
+                    WHERE t.id = ?
+                    """,
+                    (WHATSAPP_THREAD_ID_OFFSET - item_id,),
+                ).fetchone()
+                if row:
+                    result = dict(row)
+                    result["type"] = "whatsapp_thread"
+                    result["similarity"] = round(similarity, 4)
+                    results.append(result)
+            except sqlite3.OperationalError:
+                pass  # a store without the WhatsApp tables
         elif item_id <= TEAMS_THREAD_ID_OFFSET:
             # Teams thread (npz id encoding: TEAMS_THREAD_ID_OFFSET - thread.id)
             thread_id = TEAMS_THREAD_ID_OFFSET - item_id
@@ -777,3 +803,57 @@ def build_teams_index(conn, force: bool = False, limit: int = 0) -> int:
         )
     conn.commit()
     return len(ids)
+
+
+def _whatsapp_threads_to_embed(conn, indexed: set[int] | None = None) -> list[tuple[int, str]]:
+    """[(whatsapp_threads.id, text)] for sessions needing a (fresh) vector.
+
+    The Teams rule (see _teams_threads_to_embed): extracted, and either
+    re-extracted since it was embedded or missing from the index. Membership is
+    what brings a session back after a force rebuild dropped it.
+    """
+    if indexed is None:
+        indexed = _indexed_ids()
+    try:
+        rows = conn.execute(
+            """
+            SELECT t.id, t.summary, t.embedding_at, t.extracted_at, c.name
+            FROM whatsapp_threads t JOIN whatsapp_chats c ON c.id = t.chat_id
+            WHERE t.extraction_status = 'extracted' AND COALESCE(t.summary, '') != ''
+            ORDER BY t.id
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:  # a store without the WhatsApp tables
+        return []
+    stale, repair = [], []
+    for rid, summary, embedding_at, extracted_at, chat_name in rows:
+        text = f"[WhatsApp: {chat_name or 'chat'}] {summary}"
+        if embedding_at is None or (extracted_at is not None and embedding_at < extracted_at):
+            stale.append((int(rid), text))
+        elif (WHATSAPP_THREAD_ID_OFFSET - int(rid)) not in indexed:
+            repair.append((int(rid), text))
+    return sorted(stale, key=lambda p: -p[0]) + sorted(repair, key=lambda p: -p[0])
+
+
+def build_whatsapp_index(conn, force: bool = False, limit: int = 0) -> int:
+    """Embed the WhatsApp sessions that need it, at most ``limit`` (0 = all).
+
+    Stored in EMBEDDINGS_FILE at WHATSAPP_THREAD_ID_OFFSET - id, so every
+    WhatsApp key is at or below -1,000,000,001 and query_semantic routes it by
+    threshold alone. Returns the number embedded.
+    """
+    if force:
+        conn.execute("UPDATE whatsapp_threads SET embedding_at = NULL")
+        conn.commit()
+    pairs = _whatsapp_threads_to_embed(conn)
+    if limit and limit > 0:
+        pairs = pairs[:limit]
+    if not pairs:
+        return 0
+    vecs = generate_embeddings([p[1] for p in pairs])
+    _append_to_index(ids=[WHATSAPP_THREAD_ID_OFFSET - p[0] for p in pairs], vectors=vecs)
+    now = datetime.now(UTC).isoformat()
+    for tid, _text in pairs:
+        conn.execute("UPDATE whatsapp_threads SET embedding_at = ? WHERE id = ?", (now, tid))
+    conn.commit()
+    return len(pairs)

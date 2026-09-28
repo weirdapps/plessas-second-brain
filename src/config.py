@@ -138,6 +138,13 @@ RAW_BATCH_DIR = DATA_ROOT / "raw"
 CLAUDE_CODE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CONVERSATION_STAGING_DIR = DATA_ROOT / "staging" / "conversations"
 
+# WhatsApp: the minimized snapshot the bridge's Mac pushes here (see
+# scripts/wrappers/launchd/sync-whatsapp-to-vps.sh), read by `brain whatsapp-sync`.
+WHATSAPP_SNAPSHOT = Path(
+    os.environ.get("BRAIN_WHATSAPP_SNAPSHOT")
+    or Path.home() / ".second-brain" / "whatsapp" / "whatsapp-snapshot.db"
+)
+
 # SharePoint reference attachments
 SHAREPOINT_DATA_DIR = DATA_ROOT / "sharepoint"
 

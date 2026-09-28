@@ -18,8 +18,9 @@ then it is documentation of the intended workflow.
 > expose.
 >
 > Per-kind tools: `search_emails`, `search_attachments`, `search_teams`,
-> `search_conversations`, `query_calendar_events`, `query_decisions`,
-> `query_actions`. Dossier tools: `person_context` (email and Teams),
+> `search_whatsapp`, `search_conversations`, `query_calendar_events`,
+> `query_decisions`, `query_actions`. Dossier tools: `person_context` (email,
+> Teams and WhatsApp),
 > `topic_context`, `sender_brief`, `meeting_prep`. The rest of a hit's thread:
 > `email_thread` (a keyword row's `thread_matches` says how many of its emails
 > match in subject, summary or body). Corpus size, per-source coverage and freshness: `stats`.
@@ -62,10 +63,10 @@ Default path, one call:
 mcp__second-brain__recall(query="cards migration", limit_per_kind=5)
 ```
 
-It returns nine buckets, keyed exactly as listed: `emails` (which also covers
+It returns ten buckets, keyed exactly as listed: `emails` (which also covers
 standalone documents and news, since they share the `emails` table),
 `attachments`, `conversations`, `decisions`, `actions`, `commitments`,
-`inline_images`, `teams`, `calendar_events`. `summary.kinds_with_results` names
+`inline_images`, `teams`, `whatsapp`, `calendar_events`. `summary.kinds_with_results` names
 the ones that matched. Only the `emails` bucket fuses keyword and semantic
 ranking; the rest are keyword-only.
 
@@ -158,13 +159,13 @@ real count, so a truncated answer is distinguishable from a complete one. Say
 which one you have.
 
 Recent decisions come from `src.store.query.query_decisions(conn, days=365,
-limit=20)`, which covers email, Teams, calendar and conversation decisions and
+limit=20)`, which covers email, Teams, WhatsApp, calendar and conversation decisions and
 skips news. `days` defaults to None, all time.
 
 ## Notes
 
 - The store holds email summaries, original content, and LLM summaries of
-  attachments (PDF, Word, Excel, PowerPoint), plus Teams messages, calendar
+  attachments (PDF, Word, Excel, PowerPoint), plus Teams and WhatsApp messages, calendar
   events, news digests and past Claude Code conversations. Call `stats` for
   current counts and `coverage`, where each source starts; do not quote a
   number from memory.

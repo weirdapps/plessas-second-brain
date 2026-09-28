@@ -46,6 +46,7 @@ graph TD
 | Inline email images | `src/extract/image_classifier.py`, `image_pipeline.py`, `image_vision.py` | Dimensions plus bytes plus sender-scoped SHA256 dedup cascade; vision LLM stage for content images, cached by SHA256. |
 | Calendar events | `src/export/calendar_export.py`, `src/extract/calendar_extractor.py` | Outlook events with attendees, body summary, decisions. |
 | MS Teams | `src/export/teams_cli.py`, `teams_export.py`, `src/extract/teams_pipeline.py` | Chats, threads, messages, MRI resolution. |
+| WhatsApp | `scripts/whatsapp_snapshot.py`, `src/export/whatsapp_export.py`, `src/extract/whatsapp_pipeline.py` | A minimized snapshot pushed hourly from the Mac that runs a WhatsApp bridge; sessions extracted and embedded like Teams threads. See [WhatsApp](#whatsapp). |
 | SharePoint links | `src/extract/sharepoint_url_scanner.py`, `src/export/sharepoint_fetcher.py` | Managed host defaults to `contoso.sharepoint.com` (override via `SHAREPOINT_HOST`). |
 | Standalone documents | `src/cli.py ingest`, `reverse-ingest`, `src/ingest/reverse_scan.py` | Latest-version-per-logical-name dedup. |
 | Web and YouTube | `src/extract/web_ingest.py` | URL fetch plus transcript pull via `youtube-transcript-api`. |
@@ -85,7 +86,7 @@ The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register t
 
 - `recall(query, limit_per_kind, days)`. Fan-out across every text-bearing index, plus auto-pulled person and topic context. This is the default "tell me everything you know about X" entry point.
 
-  Nine result buckets, keyed exactly as returned: `emails` (which also covers standalone documents and news, since they share the `emails` table), `attachments`, `conversations`, `decisions`, `actions`, `commitments`, `inline_images`, `teams`, `calendar_events`. `summary.kinds_with_results` names the ones that matched.
+  Ten result buckets, keyed exactly as returned: `emails` (which also covers standalone documents and news, since they share the `emails` table), `attachments`, `conversations`, `decisions`, `actions`, `commitments`, `inline_images`, `teams`, `whatsapp`, `calendar_events`. `summary.kinds_with_results` names the ones that matched.
 
   Only the `emails` bucket is a keyword plus semantic fusion (reciprocal rank fusion over FTS5 and embedding hits, degrading to keyword-only if the index or credentials are absent). Every other bucket is keyword-only. When the local database is behind, the response carries `_stale_warning` and `data_as_of`.
 
@@ -98,7 +99,7 @@ The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register t
 
 ### People and topics
 
-- `person_context(name_or_email, days, limit)`. History, sentiment, decisions, open actions, communication pattern, and `teams`: the messages they wrote in the window and the threads they wrote in (`recent_threads`, with `recent_threads_total`). Each list is capped at `limit` (default 20) and carries a `<name>_total` sibling with the real count, so a truncated answer is distinguishable from a complete one. A name is matched ignoring case and accents; when several people match, the most-emailed one is used and `match_count` / `other_candidates` say who else it could be (`sender_brief` and `meeting_prep` resolve names the same way).
+- `person_context(name_or_email, days, limit)`. History, sentiment, decisions, open actions, communication pattern, `teams`: the messages they wrote in the window and the threads they wrote in (`recent_threads`, with `recent_threads_total`), and `whatsapp`, the same for WhatsApp, matched on a name of two words or more against sender names, since WhatsApp has no address to join on. Each list is capped at `limit` (default 20) and carries a `<name>_total` sibling with the real count, so a truncated answer is distinguishable from a complete one. A name is matched ignoring case and accents; when several people match, the most-emailed one is used and `match_count` / `other_candidates` say who else it could be (`sender_brief` and `meeting_prep` resolve names the same way).
 - `topic_context(topic, days, limit)`. Key people, decisions, actions, facts. Same `limit` and `<name>_total` contract.
 - `sender_brief(name_or_email, days)`. Compact briefing suitable for inline display.
 - `meeting_prep(people, topic, days)`. Per-attendee dossiers, optionally scoped to a topic.
@@ -124,6 +125,10 @@ The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register t
 - `teams_thread_context(thread_id)`. Full thread with decisions, actions, facts.
 - `teams_chat_summary(chat_id, days)`. Recent activity per chat or channel.
 
+### WhatsApp
+
+- `search_whatsapp(query, chat, days, limit)`. Session summaries and raw message text, newest first, one row per session. `chat` narrows to chats whose name contains it (or one exact JID); `days` to sessions active in the window.
+
 ### SharePoint
 
 - `sharepoint_index(operation, url)`. `list_stale` (any link whose `last_status` is not `ok`), `list_unfetched`, or `refetch` a specific URL.
@@ -139,9 +144,78 @@ The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register t
 
 ### Stats
 
-- `stats()`. Counts across emails, news articles, standalone documents, conversations, topics, people, decisions, actions, attachments, key facts and calendar events, plus `coverage`: the first and last date held per mailbox, Teams, calendar and conversations. Check it before reading an empty answer as 'nothing happened'.
+- `stats()`. Counts across emails, news articles, standalone documents, conversations, topics, people, decisions, actions, attachments, key facts and calendar events, plus `coverage`: the first and last date held per mailbox, Teams, WhatsApp, calendar and conversations. Check it before reading an empty answer as 'nothing happened'.
 
   It also returns `data_as_of`, `age_hours` and `stale`. `data_as_of` is the older of two stamps, both returned as stored: `last_sync_date`, which every `sync` writes, and `mail_export_ok_at`, the Inbox export's last success, which `sync` copies in. `stale_warning` names the one that is behind. On a read replica that is the only way to tell a live corpus from one whose feed stopped, because both answer queries identically.
+
+## WhatsApp
+
+A WhatsApp bridge (a whatsmeow client) runs on one Mac and keeps the phone's chats in a local SQLite store. That store never leaves the Mac. What does is a minimized snapshot, and only this path touches it:
+
+1. **On the Mac, hourly at :50**, LaunchAgent `com.plessas.whatsapp-sync-vps` runs `scripts/wrappers/launchd/sync-whatsapp-to-vps.sh`. It calls `scripts/whatsapp_snapshot.py` (stdlib, Python 3.9, for `/usr/bin/python3`), which opens the bridge store read-only and writes a new file holding `chats(jid, name)` and `messages(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename)`, and nothing else.
+2. The wrapper makes `~/.second-brain/whatsapp` 0700 on the producer, copies the snapshot there as `.part`, checks its size, sets it 0600 and renames it into place, then writes `whatsapp-sync.stamp` on both hosts (or `whatsapp-sync.fail` with the reason when a run fails).
+3. **On the producer, at :55** (`sb-whatsapp-sync.timer`), `python -m src.cli whatsapp-sync` upserts chats and messages on `(chat_jid, message_id)`, gap-bounds sessions per chat (8 h, continued across runs), extracts each new or changed session through the same Vertex route as Teams threads, and embeds the session summaries into `embeddings.npz` at `WHATSAPP_THREAD_ID_OFFSET - id`.
+
+From then on WhatsApp is a source like Teams: `search_whatsapp`, the `whatsapp` bucket of `recall`, decisions and actions with `source = 'whatsapp'`, `person_context`, `stats` and `coverage`.
+
+### Privacy properties
+
+- **What leaves the Mac** is the snapshot and nothing else. The bridge also stores, per media message, the CDN URL, the media key and the file hashes, which together download and decrypt that photo or voice note; the snapshot is built from an allowlist of columns, and a test reads its raw bytes to prove none of them survived. The bridge's own store is opened read-only and never written.
+- **Owner-only at every hop.** The snapshot is built under umask 077 in a private temporary directory that is removed on exit; it lands 0600 in a 0700 directory on the producer; `brain.db` is 0600 there, and the Mac's replica is now pulled 0600 in a 0700 directory as well (`sb-db-pull.sh`).
+- **No message in any log.** The snapshot builder and both wrappers log counts only, and the bridge's own stdout, which prints every message, is not involved.
+- **Where the content goes** is where every other source's goes: `brain.db`, the vectors of its summaries, the model provider configured for extraction and embeddings (Vertex AI), and the encrypted offsite snapshots and host backups of `brain.db`. Credentials inside messages are redacted before any of that (`src/redact.py`).
+- **This repository** holds code and synthetic fixtures only. Where the bridge keeps its store is host configuration (`SB_WHATSAPP_SOURCE` in the installed plist), not a path in this public tree.
+
+### Deploy
+
+On the **producer**, after pulling this repository and reinstalling (schema v26 applies on the next connection):
+
+```bash
+cp scripts/wrappers/systemd/sb-whatsapp-sync.sh ~/.local/bin/
+# ~/scripts/run-sb-whatsapp-sync.sh: a copy of run-sb-teams-sync.sh that execs sb-whatsapp-sync.sh
+```
+
+```ini
+# ~/.config/systemd/user/sb-whatsapp-sync.service
+[Unit]
+Description=second-brain WhatsApp sync
+
+[Service]
+Type=oneshot
+ExecStart=%h/scripts/run-sb-whatsapp-sync.sh
+TimeoutStartSec=600
+
+# ~/.config/systemd/user/sb-whatsapp-sync.timer
+[Unit]
+Description=second-brain WhatsApp sync, after the Mac's :50 push
+
+[Timer]
+OnCalendar=*-*-* 01,07,08,09,10,11,12,13,14,15,16,17,18,19,20,21,22:55:00 Europe/Athens
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
+
+# ~/.config/systemd/user/sb-whatsapp-sync.service.d/healthcheck.conf
+[Unit]
+OnSuccess=hc-success@sb-whatsapp-sync.service
+OnFailure=hc-fail@sb-whatsapp-sync.service
+```
+
+The Healthchecks check `sb-whatsapp-sync` must exist before the first run. Install the Mac side first, so the first run finds a snapshot rather than exiting 66, then `systemctl --user daemon-reload && systemctl --user enable --now sb-whatsapp-sync.timer`.
+
+On the **Mac that runs the bridge**, after pulling this repository:
+
+```bash
+cp scripts/wrappers/launchd/sync-whatsapp-to-vps.sh scripts/wrappers/launchd/sb-db-pull.sh ~/.local/bin/
+sed -e "s|__HOME__|$HOME|g" -e "s|__WHATSAPP_STORE__|/path/to/the/bridge/store/messages.db|g" \
+  scripts/wrappers/launchd/com.plessas.whatsapp-sync-vps.plist \
+  > ~/Library/LaunchAgents/com.plessas.whatsapp-sync-vps.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.plessas.whatsapp-sync-vps.plist
+launchctl kickstart gui/$(id -u)/com.plessas.whatsapp-sync-vps   # the first push
+```
+
+**First backfill**: `systemctl --user start sb-whatsapp-sync.service` on the producer once the first push has landed. Extraction is deadline-bounded (300 s a run), so a large first backlog drains over a few hourly runs; starting the service again drains it faster. Check with `python -m src.cli stats` (`whatsapp_messages`, `coverage.whatsapp`) and the nightly health report's WhatsApp line.
 
 ## Installation
 
@@ -264,6 +338,7 @@ python -m src.cli sync --engine claude --workers 4
 python -m src.cli calendar-sync --since 2026-01-01
 python -m src.cli news-sync --relevance 60
 python -m src.cli teams-sync --workers 4
+python -m src.cli whatsapp-sync             # the snapshot at BRAIN_WHATSAPP_SNAPSHOT (see WhatsApp below)
 python -m src.cli process-attachments --phase 2 --workers 2
 python -m src.cli process-images --limit 500
 python -m src.cli process-sharepoint --since 2026-06-01   # a rescan by date; the nightly run continues past the last email id it scanned, fetching at most --max-fetches (100)
@@ -393,9 +468,10 @@ skill/
 - **Attachments and images**: `attachments`, `attachment_content`, `inline_images`, `inline_image_occurrences`, `sender_signature_index`
 - **Calendar**: `calendar_events`, `event_attendees`
 - **Teams**: `teams_chats`, `teams_threads`, `teams_messages`, `teams_mri_resolution`
+- **WhatsApp** (v26): `whatsapp_chats`, `whatsapp_threads`, `whatsapp_messages`; decisions, action items and key facts point back through `whatsapp_thread_id`
 - **Conversations**: `conversations`, `conversation_turns`, `conversation_topics`
 - **External refs**: `sharepoint_links`
-- **FTS5**: `emails_fts` (summary, body and, from v22, subject, all accent-folded), `key_facts_fts`, `attachment_content_fts`, `conversation_turns_fts`, `conversations_fts`, `teams_messages_fts`, `teams_threads_fts`, `calendar_events_fts`
+- **FTS5**: `emails_fts` (summary, body and, from v22, subject, all accent-folded), `key_facts_fts`, `attachment_content_fts`, `conversation_turns_fts`, `conversations_fts`, `teams_messages_fts`, `teams_threads_fts`, `whatsapp_messages_fts`, `whatsapp_threads_fts`, `calendar_events_fts`
 - **Metadata**: `sync_metadata` (per-source cursors), `schema_version`
 
 `commitments` has no dedicated MCP tool and no CLI subcommand. The `commitments` bucket of `recall` is the only way to read it.
@@ -445,7 +521,7 @@ The pipeline is just CLI commands, so schedule them however you like. Examples:
 - **cron** (hourly staging and sync): `5 * * * * cd /path/to/repo && .venv/bin/python -m src.export.outlook_export --folder Inbox >> ~/second-brain.log 2>&1`, then `7 * * * * cd /path/to/repo && .venv/bin/python -m src.cli sync >> ~/second-brain.log 2>&1`
 - **macOS launchd** / **systemd timers**: wrap the same two commands (and `embed`) in a service unit pointing at your checkout and venv.
 
-Typical cadence: staging and `sync` hourly, `embed` daily. `sync` stages no mail itself: it extracts and loads what `outlook_export` (or your own exporter) staged. Nor does it cover every source: `calendar-sync`, `teams-sync`, `news-sync`, `process-sharepoint` and `reverse-ingest` each want their own schedule.
+Typical cadence: staging and `sync` hourly, `embed` daily. `sync` stages no mail itself: it extracts and loads what `outlook_export` (or your own exporter) staged. Nor does it cover every source: `calendar-sync`, `teams-sync`, `whatsapp-sync`, `news-sync`, `process-sharepoint` and `reverse-ingest` each want their own schedule.
 
 [`docs/DEPLOY.md`](docs/DEPLOY.md) has the full recipe, including the two-host shape (one producer that ingests, workstations that read an rsync'd replica) and the `loginctl enable-linger` without which `systemd --user` timers die at logout.
 
@@ -453,7 +529,7 @@ Typical cadence: staging and `sync` hourly, `embed` daily. `sync` stages no mail
 
 Report vulnerabilities via GitHub's private vulnerability reporting. See `SECURITY.md`.
 
-Credentials are redacted on the way in (`src/redact.py`): every staging batch, extracted attachment text, Teams messages, and calendar bodies before they reach the model. Rows stored before that existed are cleaned with `python scripts/scrub_secrets.py --apply` on the host that builds the database, with the jobs that write it stopped. It rewrites them under `secure_delete` and optimizes every full-text index, which removes what the run itself frees; `--vacuum` also drops copies freed by earlier churn, and needs free space of about twice the database. Snapshots taken before the scrub keep the old rows until retention ages them out. `scripts/pii-gauntlet.sh --mode=history` scans every line and filename ever committed, on every ref and on the pull-request heads fetched from `origin`, against the same checks as CI plus the private denylist.
+Credentials are redacted on the way in (`src/redact.py`): every staging batch, extracted attachment text, Teams and WhatsApp messages, and calendar bodies before they reach the model. Rows stored before that existed are cleaned with `python scripts/scrub_secrets.py --apply` on the host that builds the database, with the jobs that write it stopped. It rewrites them under `secure_delete` and optimizes every full-text index, which removes what the run itself frees; `--vacuum` also drops copies freed by earlier churn, and needs free space of about twice the database. Snapshots taken before the scrub keep the old rows until retention ages them out. `scripts/pii-gauntlet.sh --mode=history` scans every line and filename ever committed, on every ref and on the pull-request heads fetched from `origin`, against the same checks as CI plus the private denylist.
 
 ## License
 

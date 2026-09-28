@@ -15,15 +15,24 @@ message, a name or a number, because its output lands in a launchd log.
 Stdlib only and Python 3.9 compatible: scripts/wrappers/launchd/
 sync-whatsapp-to-vps.sh runs it with /usr/bin/python3, which is 3.9 on macOS.
 
-Exit codes: 0 done, 65 the source lacks a column this needs, 66 the source is
-missing or unreadable.
+Both paths are checked before either is touched, because building a snapshot
+replaces whatever is at DEST and writes message text there: DEST must be
+whatsapp-snapshot.db inside a private directory of this user's under the temp
+directory (the wrapper's mktemp -d), and SOURCE an existing messages.db, opened
+read-only through a URI that pathlib builds, so no character in either path can
+act as a URI parameter.
+
+Exit codes: 0 done, 64 DEST is not a private temp path for the snapshot, 65 the
+source lacks a column this needs, 66 the source is missing or unreadable.
 """
 
 import json
 import os
 import sqlite3
+import stat
 import sys
-from urllib.parse import quote
+import tempfile
+from pathlib import Path
 
 # The allowlist. Anything the bridge adds later stays behind unless it is named here.
 CHAT_COLUMNS = ("jid", "name")
@@ -38,6 +47,10 @@ MESSAGE_COLUMNS = (
     "filename",
 )
 
+SNAPSHOT_NAME = "whatsapp-snapshot.db"
+SOURCE_NAME = "messages.db"
+
+EX_USAGE = 64
 EX_DATAERR = 65
 EX_NOINPUT = 66
 
@@ -68,23 +81,56 @@ def _missing_columns(conn, table, wanted):
     return [c for c in wanted if c not in have]
 
 
+def _checked_source(source):
+    """The bridge store, resolved: an existing regular file named messages.db."""
+    path = os.path.realpath(source)
+    if os.path.basename(path) != SOURCE_NAME or not os.path.isfile(path):
+        raise SnapshotError(EX_NOINPUT, "source store not found")
+    return path
+
+
+def _checked_dest(dest):
+    """Where a snapshot may be written: whatsapp-snapshot.db in a private directory
+    of this user's strictly under the temp directory.
+
+    Anywhere else is refused. In a shared directory the snapshot would expose the
+    messages it holds, and at any other file name building it would delete that file.
+    """
+    path = os.path.realpath(dest)
+    parent = os.path.dirname(path)
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    if (
+        os.path.basename(path) != SNAPSHOT_NAME
+        or parent == temp_root
+        or os.path.commonpath([parent, temp_root]) != temp_root
+    ):
+        raise SnapshotError(EX_USAGE, f"DEST must be {SNAPSHOT_NAME} in a private temp directory")
+    try:
+        st = os.stat(parent)
+    except OSError:
+        raise SnapshotError(EX_USAGE, "DEST's directory does not exist") from None
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise SnapshotError(EX_USAGE, "DEST's directory must be private to this user")
+    return path
+
+
 def build_snapshot(source, dest):
     """Write the minimized copy of `source` to `dest`; return its counts.
 
     One read transaction covers both tables, so a message written by the bridge
     between the two copies cannot arrive without its chat.
     """
-    if not os.path.isfile(source):
-        raise SnapshotError(EX_NOINPUT, "source store not found")
+    source = _checked_source(source)
+    dest = _checked_dest(dest)
     if os.path.exists(dest):
         os.remove(dest)
     # uri=True on the MAIN connection: ATTACH honours a file: URI, and so the
     # read-only mode below, only on a connection opened with URIs enabled. Some
     # builds enable them by default and some do not.
-    dest_uri = "file:" + quote(os.path.abspath(dest))
+    dest_uri = Path(dest).as_uri()
     conn = sqlite3.connect(dest_uri, uri=True, isolation_level=None)
     try:
-        uri = "file:" + quote(os.path.abspath(source)) + "?mode=ro"
+        uri = Path(source).as_uri() + "?mode=ro"
         try:
             conn.execute("ATTACH DATABASE ? AS src", (uri,))
             conn.execute("SELECT count(*) FROM src.sqlite_master").fetchone()

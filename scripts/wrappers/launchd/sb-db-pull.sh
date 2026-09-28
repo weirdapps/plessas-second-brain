@@ -66,7 +66,7 @@ if ! "$WAIT_GATE" "$VPS" 2>> "$LOG_FILE"; then
 fi
 
 # --- Skip if a VPS sync job is actively writing (avoid mid-write copy) ---
-ACTIVE=$(ssh $SSH_OPTS "$VPS" 'pgrep -f "[s]rc\.cli (sync|teams-sync|calendar-sync|load)" 2>/dev/null' || true)
+ACTIVE=$(ssh $SSH_OPTS "$VPS" 'pgrep -f "[s]rc\.cli (sync|teams-sync|calendar-sync|whatsapp-sync|load)" 2>/dev/null' || true)
 if [ -n "$ACTIVE" ]; then
   log "DEFER: VPS sync job running (PIDs: $(echo $ACTIVE | tr '\n' ' ')), will retry next cycle"
   exit 0
@@ -87,7 +87,11 @@ if [ $CP_RC -ne 0 ]; then
 fi
 
 # --- Rsync brain.db (delta transfer; default temp-file + rename = atomic) ---
-RSYNC_OPTS="-az --timeout=180"
+# --chmod=F600: -a carries the producer's modes across (brain.db 0644 from the
+# snapshot, embeddings.npz 0664), which left every mail, Teams and WhatsApp row on
+# this Mac readable by any account on it. Owner-only on arrival; the modes block
+# after the transfers also fixes files a run did not transfer.
+RSYNC_OPTS="-az --timeout=180 --chmod=F600"
 
 # Snapshot on the VPS FIRST, then copy the snapshot. rsync'ing brain.db directly
 # copied a live WAL-mode database that the VPS kept writing during the ~60s
@@ -120,7 +124,10 @@ RSYNC_OPTS="-az --timeout=180"
 # more. Derive both from one variable so they cannot diverge again.
 SNAP_NAME="brain.snapshot.$(hostname -s).db"
 REMOTE_SNAP="\$HOME/.second-brain/$SNAP_NAME"
-ssh $SSH_OPTS "$VPS" "mkdir -p \$HOME/.second-brain && sqlite3 \$HOME/$REMOTE_DATA/brain.db \".backup '$REMOTE_SNAP'\"" 2>> "$LOG_FILE"
+# umask and chmod: the pull snapshot is a whole copy of brain.db, and .backup into
+# an existing file keeps that file's mode, so an old 0644 copy stays 0644 unless
+# it is set here.
+ssh $SSH_OPTS "$VPS" "umask 077; mkdir -p \$HOME/.second-brain && sqlite3 \$HOME/$REMOTE_DATA/brain.db \".backup '$REMOTE_SNAP'\" && chmod 600 '$REMOTE_SNAP'" 2>> "$LOG_FILE"
 SNAP_RC=$?
 if [ $SNAP_RC -ne 0 ]; then
   log "ERROR: VPS snapshot FAILED (rc=$SNAP_RC), NOT copying a live database; keeping the existing local file"
@@ -184,6 +191,11 @@ fi
 # against the third by asserting on a healthy file, not by reasoning about flags.
 # A read-write open recreates the `-shm`, and is how the MCP server opens this
 # file anyway, so the check now reads the copy the way its only consumer does.
+# ---- REPLICA-MODES-BEGIN ----
+chmod 700 "$LOCAL_DATA" 2>/dev/null
+chmod 600 "$LOCAL_DATA/brain.db" "$LOCAL_DATA/embeddings.npz" 2>/dev/null
+# ---- REPLICA-MODES-END ----
+
 INTEGRITY=$(sqlite3 "$LOCAL_DATA/brain.db" 'PRAGMA quick_check;' 2>&1 | head -3 | tr '\n' ' ')
 if [ "${INTEGRITY% }" != "ok" ]; then
   log "ERROR: local brain.db FAILED integrity check: ${INTEGRITY}"
@@ -202,7 +214,7 @@ fi
 # the pull silently never ran and the directory below never existed. Hence mkdir -p
 # rather than assuming: rsync will not create a two-level destination on its own.
 OFFSITE_LOCAL="$HOME/second-brain-backups/offsite"
-mkdir -p "$OFFSITE_LOCAL"
+mkdir -p "$OFFSITE_LOCAL" && chmod 700 "$OFFSITE_LOCAL"
 rsync $RSYNC_OPTS "$VPS:~/$REMOTE_DATA/backups/offsite/brain-*.db.zst.enc" \
   "$OFFSITE_LOCAL/" 2>> "$LOG_FILE"
 OFF_RC=$?

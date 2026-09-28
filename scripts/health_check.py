@@ -30,6 +30,7 @@ from src.config import (  # noqa: E402
     DEFAULT_DB,
     NEWS_DB_PATH,
     SHAREPOINT_HOST,
+    WHATSAPP_SNAPSHOT,
     document_roots,
 )
 from src.export.outlook_attachments import (  # noqa: E402
@@ -79,6 +80,13 @@ CURATE_STALL_AGE = timedelta(days=7)
 # records only successes and is judged against a 14-day window, so a job failing
 # on every run emits no signal until that window expires.
 DOCUMENT_SYNC_FAIL = STATE_DIR / "document-sync.fail"
+
+# The WhatsApp push from the bridge's Mac (sync-whatsapp-to-vps.sh): a stamp per
+# successful push and a failure marker per failed one, on both hosts, and the
+# snapshot it delivers. Same shape as the document push above.
+WHATSAPP_SYNC_STAMP = STATE_DIR / "whatsapp-sync.stamp"
+WHATSAPP_SYNC_FAIL = STATE_DIR / "whatsapp-sync.fail"
+WHATSAPP_SNAPSHOT_PATH = WHATSAPP_SNAPSHOT
 
 # Upstream news database — same path `brain news-sync` reads (honours BRAIN_NEWS_DB).
 NEWS_DB = NEWS_DB_PATH
@@ -155,6 +163,11 @@ STALE_THRESHOLDS = {
     # hours covers the real gap and still catches a genuinely dead sync inside
     # one working morning.
     "outlook_sync": timedelta(hours=7),
+    # The WhatsApp push runs on a laptop, so a night asleep or a weekend away is
+    # its normal state. A day without a push is a WARN in the report; a week is
+    # STALE and fails the freshness ping.
+    "whatsapp_push_warn": timedelta(hours=24),
+    "whatsapp_push": timedelta(days=7),
     "attachments_llm": timedelta(days=3),
     "document_roots": timedelta(days=14),
     # The Mac's own pull. The plist fires 16x/day from 07:45 to 22:45, so the
@@ -854,7 +867,11 @@ def _embedding_coverage(db, ids) -> dict[str, tuple[int, int]]:
     2026-09-23 the index held 133 of 5,469 extracted Teams threads while this
     check, which looked at the mtime and the total only, said OK.
     """
-    from src.store.embeddings import CONVERSATION_ID_OFFSET, TEAMS_THREAD_ID_OFFSET
+    from src.store.embeddings import (
+        CONVERSATION_ID_OFFSET,
+        TEAMS_THREAD_ID_OFFSET,
+        WHATSAPP_THREAD_ID_OFFSET,
+    )
 
     indexed = {int(i) for i in ids}
     sources = {
@@ -876,6 +893,11 @@ def _embedding_coverage(db, ids) -> dict[str, tuple[int, int]]:
             "SELECT id FROM teams_threads WHERE extraction_status = 'extracted' "
             "AND COALESCE(summary, '') != ''",
             lambda i: TEAMS_THREAD_ID_OFFSET - i,
+        ),
+        "whatsapp": (
+            "SELECT id FROM whatsapp_threads WHERE extraction_status = 'extracted' "
+            "AND COALESCE(summary, '') != ''",
+            lambda i: WHATSAPP_THREAD_ID_OFFSET - i,
         ),
     }
     coverage = {}
@@ -1317,6 +1339,69 @@ def check_document_roots(
         "stale": stale,
         "push_failing": push_failing,
         "status": "STALE" if stale else ("WARN" if missing or age is None else "OK"),
+    }
+
+
+def check_whatsapp(
+    db,
+    snapshot: Path | None = None,
+    stamp: Path | None = None,
+    fail_marker: Path | None = None,
+    now=None,
+):
+    """Is the WhatsApp push from the bridge's Mac alive, and what does the store hold.
+
+    Judged by the push's own stamp, as check_document_roots judges the document
+    push, falling back to the delivered snapshot's mtime: message recency only
+    says whether anyone wrote, which on a quiet week is nobody. A failure marker
+    newer than the last success outranks both.
+    """
+    snapshot = WHATSAPP_SNAPSHOT_PATH if snapshot is None else Path(snapshot)
+    stamp = WHATSAPP_SYNC_STAMP if stamp is None else Path(stamp)
+    fail_marker = WHATSAPP_SYNC_FAIL if fail_marker is None else Path(fail_marker)
+    now = now or datetime.now(UTC)
+
+    try:
+        total = db.execute("SELECT COUNT(*) FROM whatsapp_messages").fetchone()[0]
+        latest = db.execute("SELECT MAX(sent_at) FROM whatsapp_messages").fetchone()[0]
+        pending = db.execute(
+            "SELECT COUNT(*) FROM whatsapp_threads WHERE extraction_status = 'pending'"
+        ).fetchone()[0]
+    except sqlite3.OperationalError:  # a store from before v26
+        total, latest, pending = 0, None, 0
+
+    try:
+        pushed_at = _utc(Path(stamp).read_text(errors="replace").strip())
+    except OSError:
+        pushed_at = None
+    if pushed_at is None:
+        try:
+            pushed_at = datetime.fromtimestamp(snapshot.stat().st_mtime, UTC)
+        except OSError:
+            pushed_at = None
+    age = None if pushed_at is None else max(timedelta(0), now - pushed_at)
+
+    failing, reason = _read_push_failure(fail_marker, pushed_at)
+    if failing:
+        status, note = "STALE", (f"push FAILING: {reason}" if reason else "push FAILING")
+    elif age is None:
+        status, note = "WARN", "never pushed here: no stamp and no snapshot"
+    elif age > STALE_THRESHOLDS["whatsapp_push"]:
+        status, note = "STALE", "no push for over a week"
+    elif age > STALE_THRESHOLDS["whatsapp_push_warn"]:
+        status, note = "WARN", "no push for over a day: the bridge's Mac may be asleep or away"
+    else:
+        status, note = "OK", None
+    return {
+        "name": "WhatsApp",
+        "total": total,
+        "latest": latest,
+        "age": age,
+        "pending": pending,
+        "note": note,
+        "stale": status == "STALE",
+        "push_failing": failing,
+        "status": status,
     }
 
 
@@ -2142,6 +2227,7 @@ def main():
         check_documents(db),
         check_curation(),
         check_document_roots(),
+        check_whatsapp(db),
         check_news(db),
         check_sharepoint(db),
         check_sharepoint_token(),

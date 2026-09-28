@@ -482,9 +482,111 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_teams_call_records_are_system(conn)
     if current < 25:
         migrate_mark_calendar_times_utc(conn)
+    if current < 26:
+        migrate_add_whatsapp(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
+
+
+def migrate_add_whatsapp(conn: sqlite3.Connection) -> None:
+    """v26: WhatsApp chats, messages and threads, the Teams shape for a phone's chats.
+
+    Filled by `brain whatsapp-sync` from a minimized snapshot the Mac that runs
+    the WhatsApp bridge pushes to the producer (scripts/whatsapp_snapshot.py).
+    The snapshot carries no media URL, media key or file hash, so nothing here
+    can download or decrypt a photo, and neither can anyone holding a copy.
+
+    Threads are gap-bounded sessions per chat, as Teams chat sessions are, and
+    are extracted and embedded through the same route. Decisions, action items
+    and key facts point back at their thread through whatsapp_thread_id.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS whatsapp_chats (
+            id INTEGER PRIMARY KEY,
+            chat_jid TEXT UNIQUE NOT NULL,
+            name TEXT,
+            chat_kind TEXT NOT NULL CHECK (chat_kind IN ('direct','group','other')),
+            first_seen_at TEXT NOT NULL,
+            last_message_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS whatsapp_threads (
+            id INTEGER PRIMARY KEY,
+            chat_id INTEGER NOT NULL REFERENCES whatsapp_chats(id),
+            anchor_message_id TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            message_count INTEGER NOT NULL DEFAULT 0,
+            participant_names TEXT,
+            title TEXT,
+            summary TEXT,
+            sentiment TEXT,
+            language TEXT,
+            extraction_status TEXT NOT NULL DEFAULT 'pending',
+            extraction_error TEXT,
+            extracted_at TEXT,
+            embedding_at TEXT,
+            UNIQUE(chat_id, anchor_message_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS whatsapp_messages (
+            id INTEGER PRIMARY KEY,
+            chat_jid TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            chat_id INTEGER NOT NULL REFERENCES whatsapp_chats(id),
+            thread_id INTEGER REFERENCES whatsapp_threads(id),
+            sender_jid TEXT,
+            sender_name TEXT,
+            is_from_me INTEGER NOT NULL DEFAULT 0,
+            sent_at TEXT NOT NULL,
+            content TEXT,
+            media_type TEXT,
+            filename TEXT,
+            UNIQUE(chat_jid, message_id)
+        )
+    """)
+
+    existing_tables = {
+        row[0]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    }
+    for table in ("decisions", "action_items", "key_facts"):
+        if table not in existing_tables:
+            continue
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if "whatsapp_thread_id" not in cols:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN whatsapp_thread_id "
+                f"INTEGER REFERENCES whatsapp_threads(id)"
+            )
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{table}_whatsapp_thread_id "
+            f"ON {table}(whatsapp_thread_id)"
+        )
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_chat ON whatsapp_messages(chat_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_thread ON whatsapp_messages(thread_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_sent ON whatsapp_messages(sent_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_whatsapp_threads_chat ON whatsapp_threads(chat_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_whatsapp_threads_status "
+        "ON whatsapp_threads(extraction_status)"
+    )
+
+    _fold_fts(conn, "whatsapp_messages_fts", "whatsapp_messages", ("content", "sender_name"))
+    _fold_fts(conn, "whatsapp_threads_fts", "whatsapp_threads", ("title", "summary"))
+    conn.commit()
 
 
 def migrate_add_commitments(conn: sqlite3.Connection) -> None:
@@ -1715,6 +1817,8 @@ _FOLDED_FTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("teams_threads_fts", "teams_threads", ("title", "summary")),
     ("conversations_fts", "conversations", ("summary", "topics_summary")),
     ("conversation_turns_fts", "conversation_turns", ("summary", "content")),
+    ("whatsapp_messages_fts", "whatsapp_messages", ("content", "sender_name")),
+    ("whatsapp_threads_fts", "whatsapp_threads", ("title", "summary")),
 )
 
 
@@ -1750,55 +1854,64 @@ def migrate_fold_greek_accents(conn: sqlite3.Connection) -> None:
     Both sides fold: src/store/greek.fold() is applied to the query string, and
     fold_sql_expr() generates the identical replace() chain used here.
     """
-    from src.store.greek import fold_sql_expr
-
     for fts, table, columns in _FOLDED_FTS:
         if not _table_exists(conn, table) or not _table_exists(conn, fts):
             continue
-        # table_xinfo, NOT table_info: table_info omits hidden columns, and a
-        # VIRTUAL generated column is hidden. With table_info the guard below
-        # could never see the columns it had just added, so a second run of this
-        # migration raised "duplicate column name" instead of being a no-op.
-        existing = {r[1] for r in conn.execute(f"PRAGMA table_xinfo({table})")}
-        folded = [f"{c}_f" for c in columns]
-        if all(f in existing for f in folded):
-            continue  # already migrated
-
-        for col, fcol in zip(columns, folded, strict=True):
-            if fcol not in existing:
-                conn.execute(
-                    f"ALTER TABLE {table} ADD COLUMN {fcol} TEXT "
-                    f"GENERATED ALWAYS AS ({fold_sql_expr(col)}) VIRTUAL"
-                )
-
-        # Recreate the index over the folded columns, and its triggers with it.
-        # The trigger bodies must name the SAME columns the FTS declares, or the
-        # 'delete' rows will not match what was inserted.
-        for suffix in ("ai", "ad", "au"):
-            conn.execute(f"DROP TRIGGER IF EXISTS {table}_{suffix}")
-        conn.execute(f"DROP TABLE IF EXISTS {fts}")
-        cols_sql = ", ".join(folded)
-        conn.execute(
-            f"CREATE VIRTUAL TABLE {fts} USING fts5({cols_sql}, "
-            f"content='{table}', content_rowid='id')"
-        )
-        new_list = ", ".join(folded)
-        new_vals = ", ".join(f"new.{f}" for f in folded)
-        old_vals = ", ".join(f"old.{f}" for f in folded)
-        conn.execute(
-            f"CREATE TRIGGER {table}_ai AFTER INSERT ON {table} BEGIN "
-            f"INSERT INTO {fts}(rowid, {new_list}) VALUES (new.id, {new_vals}); END"
-        )
-        conn.execute(
-            f"CREATE TRIGGER {table}_ad AFTER DELETE ON {table} BEGIN "
-            f"INSERT INTO {fts}({fts}, rowid, {new_list}) "
-            f"VALUES('delete', old.id, {old_vals}); END"
-        )
-        conn.execute(
-            f"CREATE TRIGGER {table}_au AFTER UPDATE ON {table} BEGIN "
-            f"INSERT INTO {fts}({fts}, rowid, {new_list}) "
-            f"VALUES('delete', old.id, {old_vals}); "
-            f"INSERT INTO {fts}(rowid, {new_list}) VALUES (new.id, {new_vals}); END"
-        )
-        conn.execute(f"INSERT INTO {fts}({fts}) VALUES('rebuild')")
+        _fold_fts(conn, fts, table, columns)
     conn.commit()
+
+
+def _fold_fts(conn: sqlite3.Connection, fts: str, table: str, columns: tuple[str, ...]) -> None:
+    """Index `table` in `fts` over accent-folded generated columns (see v20 above).
+
+    Shared by v20, which converted the FTS tables that existed then, and by any
+    later migration that creates a new one, so every index in the store folds the
+    same way. A no-op when the folded columns are already there.
+    """
+    from src.store.greek import fold_sql_expr
+
+    # table_xinfo, NOT table_info: table_info omits hidden columns, and a
+    # VIRTUAL generated column is hidden. With table_info the guard below
+    # could never see the columns it had just added, so a second run of this
+    # migration raised "duplicate column name" instead of being a no-op.
+    existing = {r[1] for r in conn.execute(f"PRAGMA table_xinfo({table})")}
+    folded = [f"{c}_f" for c in columns]
+    if all(f in existing for f in folded) and _table_exists(conn, fts):
+        return  # already migrated
+
+    for col, fcol in zip(columns, folded, strict=True):
+        if fcol not in existing:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN {fcol} TEXT "
+                f"GENERATED ALWAYS AS ({fold_sql_expr(col)}) VIRTUAL"
+            )
+
+    # Recreate the index over the folded columns, and its triggers with it.
+    # The trigger bodies must name the SAME columns the FTS declares, or the
+    # 'delete' rows will not match what was inserted.
+    for suffix in ("ai", "ad", "au"):
+        conn.execute(f"DROP TRIGGER IF EXISTS {table}_{suffix}")
+    conn.execute(f"DROP TABLE IF EXISTS {fts}")
+    cols_sql = ", ".join(folded)
+    conn.execute(
+        f"CREATE VIRTUAL TABLE {fts} USING fts5({cols_sql}, content='{table}', content_rowid='id')"
+    )
+    new_list = ", ".join(folded)
+    new_vals = ", ".join(f"new.{f}" for f in folded)
+    old_vals = ", ".join(f"old.{f}" for f in folded)
+    conn.execute(
+        f"CREATE TRIGGER {table}_ai AFTER INSERT ON {table} BEGIN "
+        f"INSERT INTO {fts}(rowid, {new_list}) VALUES (new.id, {new_vals}); END"
+    )
+    conn.execute(
+        f"CREATE TRIGGER {table}_ad AFTER DELETE ON {table} BEGIN "
+        f"INSERT INTO {fts}({fts}, rowid, {new_list}) "
+        f"VALUES('delete', old.id, {old_vals}); END"
+    )
+    conn.execute(
+        f"CREATE TRIGGER {table}_au AFTER UPDATE ON {table} BEGIN "
+        f"INSERT INTO {fts}({fts}, rowid, {new_list}) "
+        f"VALUES('delete', old.id, {old_vals}); "
+        f"INSERT INTO {fts}(rowid, {new_list}) VALUES (new.id, {new_vals}); END"
+    )
+    conn.execute(f"INSERT INTO {fts}({fts}) VALUES('rebuild')")

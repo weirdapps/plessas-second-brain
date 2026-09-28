@@ -738,7 +738,8 @@ def query_by_date_range(
 # fell to the bound that keeps meetings still to come from deciding anything.
 _DECISION_DATE = (
     "COALESCE(CASE WHEN d.decision_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'"
-    " THEN d.decision_date END, e.date_received, tt.started_at, ce.start_at, c.started_at)"
+    " THEN d.decision_date END, e.date_received, tt.started_at, wt.started_at, ce.start_at,"
+    " c.started_at)"
 )
 
 
@@ -781,10 +782,11 @@ def query_decisions(
             d.decision,
             d.decided_by,
             {_DECISION_DATE} as date,
-            COALESCE(e.subject, tt.title, ce.subject, c.summary) as email_subject,
+            COALESCE(e.subject, tt.title, wt.title, ce.subject, c.summary) as email_subject,
             CASE
                 WHEN e.id IS NOT NULL THEN 'email'
                 WHEN tt.id IS NOT NULL THEN 'teams'
+                WHEN wt.id IS NOT NULL THEN 'whatsapp'
                 WHEN ce.id IS NOT NULL THEN 'calendar'
                 WHEN c.id IS NOT NULL THEN 'conversation'
                 ELSE 'orphan'
@@ -793,6 +795,7 @@ def query_decisions(
         FROM decisions d
         LEFT JOIN emails e ON d.email_id = e.id
         LEFT JOIN teams_threads tt ON d.teams_thread_id = tt.id
+        LEFT JOIN whatsapp_threads wt ON d.whatsapp_thread_id = wt.id
         LEFT JOIN calendar_events ce ON d.event_id = ce.id
         LEFT JOIN conversation_turns ct ON d.conversation_turn_id = ct.id
         LEFT JOIN conversations c ON ct.conversation_id = c.id
@@ -857,7 +860,7 @@ def query_action_items(
     status: str = "open",
     limit: int = 20,
     include_news: bool = False,
-    sources: tuple[str, ...] = ("email", "teams", "calendar", "conversation"),
+    sources: tuple[str, ...] = ("email", "teams", "whatsapp", "calendar", "conversation"),
 ) -> list[dict]:
     """Find action items, filtered by owner and/or status.
 
@@ -890,11 +893,13 @@ def query_action_items(
             a.owner,
             a.deadline,
             a.status,
-            COALESCE(e.subject, tt.title, ce.subject, c.summary) as email_subject,
-            COALESCE(e.date_received, tt.started_at, ce.start_at, c.started_at) as date,
+            COALESCE(e.subject, tt.title, wt.title, ce.subject, c.summary) as email_subject,
+            COALESCE(e.date_received, tt.started_at, wt.started_at, ce.start_at, c.started_at)
+                as date,
             CASE
                 WHEN e.id IS NOT NULL THEN 'email'
                 WHEN tt.id IS NOT NULL THEN 'teams'
+                WHEN wt.id IS NOT NULL THEN 'whatsapp'
                 WHEN ce.id IS NOT NULL THEN 'calendar'
                 WHEN c.id IS NOT NULL THEN 'conversation'
                 ELSE 'orphan'
@@ -906,6 +911,7 @@ def query_action_items(
         FROM action_items a
         LEFT JOIN emails e ON a.email_id = e.id
         LEFT JOIN teams_threads tt ON a.teams_thread_id = tt.id
+        LEFT JOIN whatsapp_threads wt ON a.whatsapp_thread_id = wt.id
         LEFT JOIN calendar_events ce ON a.event_id = ce.id
         LEFT JOIN conversation_turns ct ON a.conversation_turn_id = ct.id
         LEFT JOIN conversations c ON ct.conversation_id = c.id
@@ -926,12 +932,14 @@ def query_action_items(
         where_clauses.append("(e.id IS NULL OR e.mailbox_name IS NULL OR e.mailbox_name <> 'News')")
 
     wanted = set(sources)
-    if wanted != {"email", "teams", "calendar", "conversation"}:
+    if wanted != {"email", "teams", "whatsapp", "calendar", "conversation"}:
         parts = []
         if "email" in wanted:
             parts.append("e.id IS NOT NULL")
         if "teams" in wanted:
             parts.append("tt.id IS NOT NULL")
+        if "whatsapp" in wanted:
+            parts.append("wt.id IS NOT NULL")
         if "calendar" in wanted:
             parts.append("ce.id IS NOT NULL")
         if "conversation" in wanted:
@@ -1419,11 +1427,13 @@ def find_overdue_actions(conn: sqlite3.Connection, limit: int = 20) -> list[dict
     results = conn.execute(
         """
         SELECT ai.id as action_id, ai.task, ai.owner, ai.deadline,
-               COALESCE(e.subject, tt.title, ce.subject, c.summary) as email_subject,
-               COALESCE(e.date_received, tt.started_at, ce.start_at, c.started_at) as date,
+               COALESCE(e.subject, tt.title, wt.title, ce.subject, c.summary) as email_subject,
+               COALESCE(e.date_received, tt.started_at, wt.started_at, ce.start_at,
+                        c.started_at) as date,
                CASE
                    WHEN e.id IS NOT NULL THEN 'email'
                    WHEN tt.id IS NOT NULL THEN 'teams'
+                   WHEN wt.id IS NOT NULL THEN 'whatsapp'
                    WHEN ce.id IS NOT NULL THEN 'calendar'
                    WHEN c.id IS NOT NULL THEN 'conversation'
                    ELSE 'orphan'
@@ -1433,6 +1443,7 @@ def find_overdue_actions(conn: sqlite3.Connection, limit: int = 20) -> list[dict
         FROM action_items ai
         LEFT JOIN emails e ON ai.email_id = e.id
         LEFT JOIN teams_threads tt ON ai.teams_thread_id = tt.id
+        LEFT JOIN whatsapp_threads wt ON ai.whatsapp_thread_id = wt.id
         LEFT JOIN calendar_events ce ON ai.event_id = ce.id
         LEFT JOIN conversation_turns ct ON ai.conversation_turn_id = ct.id
         LEFT JOIN conversations c ON ct.conversation_id = c.id
@@ -1529,6 +1540,7 @@ def get_coverage(conn: sqlite3.Connection) -> dict:
     return {
         "mailboxes": mailboxes,
         "teams": span("SELECT MIN(started_at), MAX(ended_at), COUNT(*) FROM teams_threads"),
+        "whatsapp": span("SELECT MIN(sent_at), MAX(sent_at), COUNT(*) FROM whatsapp_messages"),
         # Meetings Outlook no longer lists are kept as cancelled, not deleted.
         "calendar": span(
             "SELECT MIN(start_at), MAX(start_at), COUNT(*) FROM calendar_events "

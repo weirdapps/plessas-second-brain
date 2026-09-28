@@ -8,7 +8,13 @@ import re
 import sqlite3
 from datetime import datetime, timedelta
 
-from src.store.greek import register_sql_functions, search_fold
+from src.store.greek import (
+    PHRASE_MATCH,
+    register_sql_functions,
+    search_fold,
+    search_phrase,
+    search_words,
+)
 from src.store.normalizer import normalize_topic
 
 # Every list in a context dossier is capped at this many rows unless the caller
@@ -142,6 +148,7 @@ def get_person_context(
             "next_meeting": None,
             "meeting_count_30d": None,
             "teams": _no_teams(),
+            "whatsapp": _no_whatsapp(),
         }
 
     person = dict(person_row)
@@ -381,6 +388,7 @@ def get_person_context(
         pass
 
     teams = _person_teams(conn, person_id, cutoff, limit)
+    whatsapp = _person_whatsapp(conn, person["name"], cutoff, limit)
 
     del person["id"]
 
@@ -402,6 +410,77 @@ def get_person_context(
         "next_meeting": calendar_data.get("next_meeting"),
         "meeting_count_30d": calendar_data.get("meeting_count_30d"),
         "teams": teams,
+        "whatsapp": whatsapp,
+    }
+
+
+def _no_whatsapp() -> dict:
+    """_person_whatsapp's answer for someone with no WhatsApp activity, a fresh dict each time."""
+    return {
+        "message_count": 0,
+        "last_message_at": None,
+        "recent_threads": [],
+        "recent_threads_total": 0,
+    }
+
+
+def _person_whatsapp(conn: sqlite3.Connection, name: str | None, cutoff: str, limit: int) -> dict:
+    """What the person wrote on WhatsApp since `cutoff`, matched by name.
+
+    WhatsApp knows a sender by phone number and by the name the phone's contacts
+    give them, never by email, so there is no person id to join on as Teams has.
+    A message counts when its sender's name holds every word of the person's name,
+    in any order, folded; and only for a name of two words or more, because a
+    first name alone would claim every namesake's messages. sent_at carries a UTC
+    'Z' and the cutoff is local, which moves the window's edge by hours, not days.
+    """
+    words = search_words(name)
+    if len(words) < 2:
+        return _no_whatsapp()
+    args = (cutoff, search_phrase(name), "\x1f".join(words), PHRASE_MATCH)
+
+    def match(p: str = "") -> str:
+        return f"{p}is_from_me = 0 AND {p}sent_at >= ? AND sb_match({p}sender_name, ?, ?, '') >= ?"
+
+    try:
+        count, last = conn.execute(
+            f"SELECT COUNT(*), MAX(sent_at) FROM whatsapp_messages WHERE {match()}", args
+        ).fetchone()
+        threads = conn.execute(
+            f"""
+            SELECT t.id AS thread_id, t.title, c.name AS chat, COUNT(*) AS messages,
+                   MAX(m.sent_at) AS last_message_at
+            FROM whatsapp_messages m
+            JOIN whatsapp_threads t ON t.id = m.thread_id
+            JOIN whatsapp_chats c ON c.id = t.chat_id
+            WHERE {match("m.")}
+            GROUP BY t.id
+            ORDER BY last_message_at DESC
+            LIMIT ?
+            """,
+            (*args, limit),
+        ).fetchall()
+        total = conn.execute(
+            f"SELECT COUNT(DISTINCT thread_id) FROM whatsapp_messages WHERE {match()} "
+            "AND thread_id IS NOT NULL",
+            args,
+        ).fetchone()[0]
+    except sqlite3.OperationalError:  # a store from before v26
+        return _no_whatsapp()
+    return {
+        "message_count": count,
+        "last_message_at": last,
+        "recent_threads": [
+            {
+                "thread_id": r["thread_id"],
+                "title": r["title"],
+                "chat": r["chat"],
+                "messages": r["messages"],
+                "last_message_at": r["last_message_at"],
+            }
+            for r in threads
+        ],
+        "recent_threads_total": total,
     }
 
 

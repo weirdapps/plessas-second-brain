@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for the Mac that runs the WhatsApp bridge. launchd expands neither ~
+  nor $HOME, so install it with the placeholder replaced:
+
+    cp scripts/wrappers/launchd/sync-whatsapp-to-vps.sh ~/.local/bin/
+    sed -e "s|__HOME__|$HOME|g" -e "s|__WHATSAPP_STORE__|<path to the bridge's messages.db>|g" \
+      scripts/wrappers/launchd/com.plessas.whatsapp-sync-vps.plist \
+      > ~/Library/LaunchAgents/com.plessas.whatsapp-sync-vps.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.plessas.whatsapp-sync-vps.plist
+
+  Hourly at :50, so a fresh snapshot is on the producer before sb-whatsapp-sync
+  runs at :55. The wrapper writes its own log; stdout and stderr stay near empty.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.plessas.whatsapp-sync-vps</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>__HOME__/.local/bin/sync-whatsapp-to-vps.sh</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>SB_WHATSAPP_SOURCE</key>
+		<string>__WHATSAPP_STORE__</string>
+	</dict>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Minute</key>
+		<integer>50</integer>
+	</dict>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>Umask</key>
+	<integer>63</integer>
+	<key>StandardOutPath</key>
+	<string>__HOME__/Library/Logs/whatsapp-sync-vps.out</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/Library/Logs/whatsapp-sync-vps.err</string>
+</dict>
+</plist>

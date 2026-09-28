@@ -29,6 +29,7 @@ from src.store.query import (
     thread_keys,
 )
 from src.store.teams_query import search_teams as _search_teams_q
+from src.store.whatsapp_query import search_whatsapp as _search_whatsapp_q
 
 logger = logging.getLogger(__name__)
 
@@ -85,14 +86,15 @@ def _search_decisions(conn: sqlite3.Connection, keyword: str, limit: int) -> lis
         WITH scored AS MATERIALIZED (
             SELECT id, sb_match(decision, ?, ?, ?) AS score FROM decisions
         )
-        SELECT d.id, d.email_id, d.event_id, d.teams_thread_id, d.decision, d.decided_by,
-               d.decision_date,
-               COALESCE(d.decision_date, e.date_received, tt.started_at, ce.start_at,
-                        c.started_at) AS date,
-               COALESCE(e.subject, tt.title, ce.subject, c.summary) AS email_subject,
+        SELECT d.id, d.email_id, d.event_id, d.teams_thread_id, d.whatsapp_thread_id,
+               d.decision, d.decided_by, d.decision_date,
+               COALESCE(d.decision_date, e.date_received, tt.started_at, wt.started_at,
+                        ce.start_at, c.started_at) AS date,
+               COALESCE(e.subject, tt.title, wt.title, ce.subject, c.summary) AS email_subject,
                CASE
                    WHEN e.id IS NOT NULL THEN 'email'
                    WHEN tt.id IS NOT NULL THEN 'teams'
+                   WHEN wt.id IS NOT NULL THEN 'whatsapp'
                    WHEN ce.id IS NOT NULL THEN 'calendar'
                    WHEN c.id IS NOT NULL THEN 'conversation'
                    ELSE 'orphan'
@@ -102,6 +104,7 @@ def _search_decisions(conn: sqlite3.Connection, keyword: str, limit: int) -> lis
         JOIN decisions d ON d.id = s.id
         LEFT JOIN emails e ON e.id = d.email_id
         LEFT JOIN teams_threads tt ON tt.id = d.teams_thread_id
+        LEFT JOIN whatsapp_threads wt ON wt.id = d.whatsapp_thread_id
         LEFT JOIN calendar_events ce ON ce.id = d.event_id
         LEFT JOIN conversation_turns ct ON ct.id = d.conversation_turn_id
         LEFT JOIN conversations c ON c.id = ct.conversation_id
@@ -202,6 +205,13 @@ def _search_teams(conn: sqlite3.Connection, keyword: str, limit: int) -> list[di
     if not _table_exists(conn, "teams_threads_fts"):
         return []
     return _search_teams_q(conn, keyword, kind="both", limit=limit)
+
+
+def _search_whatsapp(conn: sqlite3.Connection, keyword: str, limit: int) -> list[dict]:
+    """WhatsApp session summaries and message text; empty on a store from before v26."""
+    if not _table_exists(conn, "whatsapp_threads"):
+        return []
+    return _search_whatsapp_q(conn, keyword, limit=limit)
 
 
 def _search_calendar_events(conn: sqlite3.Connection, query: str, limit: int) -> list[dict]:
@@ -360,8 +370,9 @@ def recall(
 
     Returns:
         Dict with categorized hits across emails (incl. standalone docs),
-        attachments, conversations, decisions, actions, inline_images, and teams
-        threads, plus optional person_context and topic_context populated when
+        attachments, conversations, decisions, actions, inline_images, teams
+        threads and WhatsApp sessions, plus optional person_context and
+        topic_context populated when
         the query matches a known person or topic. Always includes every kind
         key (empty list if no matches) so callers don't have to handle missing
         keys.
@@ -398,6 +409,7 @@ def recall(
     commitments = _search_commitments(conn, query, limit_per_kind)
     inline_images = _search_inline_images(conn, query, limit_per_kind)
     teams = _search_teams(conn, query, limit_per_kind)
+    whatsapp = _search_whatsapp(conn, query, limit_per_kind)
     calendar_events = _search_calendar_events(conn, query, limit_per_kind)
 
     person_context = _maybe_person_context(conn, query, days=days)
@@ -412,6 +424,7 @@ def recall(
         "commitments": commitments,
         "inline_images": inline_images,
         "teams": teams,
+        "whatsapp": whatsapp,
         "calendar_events": calendar_events,
     }
     total_hits = sum(len(v) for v in text_kinds.values())

@@ -27,12 +27,14 @@ cp ~/.local/bin/sb-db-pull.sh ~/.local/bin/sync-documents-to-vps.sh \
 
 | Directory | Host | Scheduler | Count |
 | --- | --- | --- | --- |
-| `systemd/` | VPS | `systemctl --user` timers | 13 |
-| `launchd/` | Mac | LaunchAgents | 3 |
+| `systemd/` | VPS | `systemctl --user` timers | 14 |
+| `launchd/` | Mac | LaunchAgents | 4, plus one plist template |
 
 The VPS runs all ingestion. A Mac is a read replica: `sb-db-pull.sh` pulls the
 database and embeddings hourly, `wait-for-vps.sh` is the readiness gate it calls
-first, and `sync-documents-to-vps.sh` pushes the document roots the other way.
+first, `sync-documents-to-vps.sh` pushes the document roots the other way, and
+`sync-whatsapp-to-vps.sh` pushes the minimized WhatsApp snapshot (its LaunchAgent
+template, `com.plessas.whatsapp-sync-vps.plist`, sits beside it).
 The Mac's other `sb-*` wrappers correspond to jobs retired to the VPS and are
 deliberately not archived, because committing retired duplicates would only make
 it harder to tell which copy matters.

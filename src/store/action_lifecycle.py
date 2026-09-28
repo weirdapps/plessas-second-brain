@@ -37,6 +37,7 @@ _ISO_DATE = "'[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'"
 _PARENT_LAST_ACTIVE = """COALESCE(
     (SELECT e.date_received FROM emails e WHERE e.id = action_items.email_id),
     (SELECT t.ended_at FROM teams_threads t WHERE t.id = action_items.teams_thread_id),
+    (SELECT w.ended_at FROM whatsapp_threads w WHERE w.id = action_items.whatsapp_thread_id),
     (SELECT ce.start_at FROM calendar_events ce WHERE ce.id = action_items.event_id),
     (SELECT ct.timestamp FROM conversation_turns ct
       WHERE ct.id = action_items.conversation_turn_id))"""
@@ -45,7 +46,7 @@ _PARENT_LAST_ACTIVE = """COALESCE(
 def dedup_exact_open_actions(conn: sqlite3.Connection) -> int:
     """Delete duplicate OPEN actions sharing their parent, task, owner and deadline.
 
-    The parent is all four parent columns. Grouped on email_id alone, every action
+    The parent is all five parent columns. Grouped on email_id alone, every action
     from a Teams thread, a meeting or a conversation (email_id NULL) fell into one
     group, since GROUP BY puts NULLs together, and the same task under two parents
     was deleted as a duplicate.
@@ -61,8 +62,8 @@ def dedup_exact_open_actions(conn: sqlite3.Connection) -> int:
           AND id NOT IN (
               SELECT MIN(id) FROM action_items
               WHERE status = 'open'
-              GROUP BY email_id, event_id, teams_thread_id, conversation_turn_id,
-                       task, owner, COALESCE(deadline, '')
+              GROUP BY email_id, event_id, teams_thread_id, whatsapp_thread_id,
+                       conversation_turn_id, task, owner, COALESCE(deadline, '')
           )
         """
     )

@@ -129,7 +129,7 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_EXTRACT_MODEL") or os.environ.get(
 GEMINI_MODEL = os.environ.get("BRAIN_GEMINI_MODEL", "gemini-2.5-flash")
 
 # Schema version — bump when adding migrations (must match number of migrations in schema.py)
-CURRENT_SCHEMA_VERSION = 25
+CURRENT_SCHEMA_VERSION = 26
 
 ATTACHMENTS_DIR = DATA_ROOT / "attachments"
 RAW_BATCH_DIR = DATA_ROOT / "raw"
@@ -137,6 +137,13 @@ RAW_BATCH_DIR = DATA_ROOT / "raw"
 # Conversation memory
 CLAUDE_CODE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CONVERSATION_STAGING_DIR = DATA_ROOT / "staging" / "conversations"
+
+# WhatsApp: the minimized snapshot the bridge's Mac pushes here (see
+# scripts/wrappers/launchd/sync-whatsapp-to-vps.sh), read by `brain whatsapp-sync`.
+WHATSAPP_SNAPSHOT = Path(
+    os.environ.get("BRAIN_WHATSAPP_SNAPSHOT")
+    or Path.home() / ".second-brain" / "whatsapp" / "whatsapp-snapshot.db"
+)
 
 # SharePoint reference attachments
 SHAREPOINT_DATA_DIR = DATA_ROOT / "sharepoint"

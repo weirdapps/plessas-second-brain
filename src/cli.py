@@ -1721,7 +1721,7 @@ def cmd_sync(args):
 
 
 def cmd_teams_sync(args):
-    """Run the Teams ingestion pipeline (Phase 1: channels only)."""
+    """Run the Teams ingestion pipeline: channels plus 1:1, group and meeting chats."""
     from src.export.teams_export import discover_chats, pull_messages
     from src.extract.teams_mri import resolve_mris
     from src.extract.teams_pipeline import extract_threads
@@ -3038,7 +3038,9 @@ def main():
     parser_whatsapp_sync.set_defaults(func=cmd_whatsapp_sync)
 
     # teams-sync command
-    parser_teams_sync = subparsers.add_parser("teams-sync", help="Ingest Teams channels (Phase 1)")
+    parser_teams_sync = subparsers.add_parser(
+        "teams-sync", help="Ingest Teams channels plus 1:1, group and meeting chats"
+    )
     parser_teams_sync.add_argument(
         "--concurrency",
         type=int,

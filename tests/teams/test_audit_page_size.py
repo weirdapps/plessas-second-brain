@@ -56,3 +56,13 @@ def test_a_channel_read_is_left_as_it_was(db):
     captured, _ = _captured_args(db)
 
     assert "--page-size" not in captured[0]
+
+
+def test_a_meeting_chat_read_asks_for_a_page_of_200(db):
+    _seed(db, "meeting")
+
+    captured, _ = _captured_args(db)
+
+    args = captured[0]
+    assert args[args.index("--page-size") + 1] == "200"
+    assert args[args.index("--chat") + 1] == "19:meeting@thread.v2"

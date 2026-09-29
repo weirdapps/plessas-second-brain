@@ -298,3 +298,36 @@ def test_bound_threads_group_chat_title_uses_topic(db):
     bound_threads(db)
     title = db.execute("SELECT title FROM teams_threads").fetchone()["title"]
     assert "Cards strategy" in title
+
+
+def test_bound_threads_meeting_chat_becomes_a_session_titled_by_its_subject(db):
+    _seed_chat_with_messages(
+        db,
+        "meeting",
+        "Q2 review",
+        [("2026-05-01T08:00:00Z", "agenda for the review")],
+    )
+    bound_threads(db)
+    thread = db.execute("SELECT thread_kind, title FROM teams_threads").fetchone()
+    assert thread["thread_kind"] == "chat_session"
+    assert thread["title"] == "Meeting [Q2 review]: session 2026-05-01"
+
+
+def test_bound_threads_meeting_chat_without_a_subject(db):
+    _seed_chat_with_messages(db, "meeting", None, [("2026-05-01T08:00:00Z", "hello")])
+    bound_threads(db)
+    title = db.execute("SELECT title FROM teams_threads").fetchone()["title"]
+    assert title == "Meeting session 2026-05-01"
+
+
+def test_a_meeting_chat_holding_only_system_events_makes_no_thread(db):
+    chat_id = _insert_chat(db, kind="meeting")
+    db.execute(
+        """INSERT INTO teams_messages(
+             teams_message_id, chat_id, composed_at, content_text, is_system
+           ) VALUES ('sys-1', ?, '2026-05-01T08:00:00Z', 'Meeting started', 1)""",
+        (chat_id,),
+    )
+    db.commit()
+    bound_threads(db)
+    assert db.execute("SELECT COUNT(*) FROM teams_threads").fetchone()[0] == 0

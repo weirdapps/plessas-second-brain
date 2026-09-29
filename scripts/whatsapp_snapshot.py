@@ -4,13 +4,20 @@
     whatsapp_snapshot.py SOURCE DEST
 
 SOURCE is the WhatsApp bridge's messages.db, opened read-only. DEST is written
-from scratch with two tables and exactly the columns listed below, and nothing
+from scratch with three tables and exactly the columns listed below, and nothing
 else: the bridge also keeps, for every media message, the CDN URL, the media key
 and the file hashes, which together download and decrypt that photo or voice
 note. The producer needs none of it, so none of it leaves this machine.
 
-Prints one JSON line of counts ({"chats", "messages", "bytes"}) and never a
-message, a name or a number, because its output lands in a launchd log.
+The third table names people. WhatsApp shows most of them as an anonymous id,
+so the chat names the bridge keeps are numbers; the bridge's own store,
+whatsapp.db beside messages.db, knows their names. It is opened read-only too,
+and only a user id and a display name per person who appears in the snapshot
+leave this machine: the store also holds the account's encryption keys. When it
+is missing or unreadable the snapshot is built without names.
+
+Prints one JSON line of counts ({"chats", "messages", "contacts", "bytes"}) and
+never a message, a name or a number, because its output lands in a launchd log.
 
 Stdlib only and Python 3.9 compatible: scripts/wrappers/launchd/
 sync-whatsapp-to-vps.sh runs it with /usr/bin/python3, which is 3.9 on macOS.
@@ -49,6 +56,7 @@ MESSAGE_COLUMNS = (
 
 SNAPSHOT_NAME = "whatsapp-snapshot.db"
 SOURCE_NAME = "messages.db"
+CONTACT_STORE_NAME = "whatsapp.db"
 
 EX_USAGE = 64
 EX_DATAERR = 65
@@ -67,6 +75,7 @@ CREATE TABLE messages (
     filename TEXT,
     PRIMARY KEY (id, chat_jid)
 );
+CREATE TABLE contacts (user TEXT PRIMARY KEY, name TEXT NOT NULL);
 """
 
 
@@ -114,6 +123,78 @@ def _checked_dest(dest):
     return path
 
 
+def _user(jid):
+    """The user part of a JID ('30000000001@s.whatsapp.net' -> '30000000001')."""
+    return (jid or "").split("@", 1)[0].split(":", 1)[0]
+
+
+def _is_name(value):
+    """A real name, not an empty string or a bare number standing in for one."""
+    stripped = (value or "").strip().lstrip("+").replace(" ", "")
+    return bool(stripped) and not stripped.isdigit()
+
+
+def _copy_contacts(conn, source):
+    """Name the people in the snapshot from the bridge's contact store; return how many.
+
+    The name the owner saved in the address book comes first, then the name the
+    person set in WhatsApp, then a business name. An anonymous id and the phone
+    number it maps to are one person, so each is tried with the other's entry
+    too. Returns 0, and names nobody, when the store is missing or unreadable.
+    """
+    store = os.path.join(os.path.dirname(source), CONTACT_STORE_NAME)
+    if not os.path.isfile(store):
+        return 0
+    try:
+        conn.execute("ATTACH DATABASE ? AS wa", (Path(store).as_uri() + "?mode=ro",))
+    except sqlite3.Error:
+        return 0
+    try:
+        rows = conn.execute(
+            "SELECT their_jid, full_name, push_name, business_name FROM wa.whatsmeow_contacts"
+        ).fetchall()
+        try:
+            pairs = conn.execute("SELECT lid, pn FROM wa.whatsmeow_lid_map").fetchall()
+        except sqlite3.Error:
+            pairs = []
+    except sqlite3.Error:
+        return 0
+    finally:
+        try:
+            conn.execute("DETACH DATABASE wa")
+        except sqlite3.Error:
+            pass
+
+    entries = {_user(jid): (full, push, business) for jid, full, push, business in rows}
+    same_person = {}
+    for lid, pn in pairs:
+        same_person[_user(lid)] = _user(pn)
+        same_person[_user(pn)] = _user(lid)
+    wanted = {
+        _user(jid)
+        for (jid,) in conn.execute(
+            "SELECT jid FROM chats WHERE jid LIKE '%@s.whatsapp.net' OR jid LIKE '%@lid'"
+        )
+    }
+    wanted |= {
+        _user(sender)
+        for (sender,) in conn.execute(
+            "SELECT DISTINCT sender FROM messages WHERE COALESCE(sender, '') <> ''"
+        )
+    }
+    none = (None, None, None)
+    named = []
+    for user in sorted(wanted):
+        own = entries.get(user, none)
+        other = entries.get(same_person.get(user, ""), none)
+        for candidate in (own[0], other[0], own[1], other[1], own[2], other[2]):
+            if _is_name(candidate):
+                named.append((user, candidate.strip()))
+                break
+    conn.executemany("INSERT INTO contacts (user, name) VALUES (?, ?)", named)
+    return len(named)
+
+
 def build_snapshot(source, dest):
     """Write the minimized copy of `source` to `dest`; return its counts.
 
@@ -152,6 +233,7 @@ def build_snapshot(source, dest):
         )
         conn.execute("COMMIT")
         conn.execute("DETACH DATABASE src")
+        contacts = _copy_contacts(conn, source)
         chats = conn.execute("SELECT count(*) FROM chats").fetchone()[0]
         messages = conn.execute("SELECT count(*) FROM messages").fetchone()[0]
     except BaseException:
@@ -160,7 +242,12 @@ def build_snapshot(source, dest):
             os.remove(dest)
         raise
     conn.close()
-    return {"chats": chats, "messages": messages, "bytes": os.path.getsize(dest)}
+    return {
+        "chats": chats,
+        "messages": messages,
+        "contacts": contacts,
+        "bytes": os.path.getsize(dest),
+    }
 
 
 def main(argv=None):

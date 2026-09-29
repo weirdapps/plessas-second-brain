@@ -22,7 +22,7 @@ def discover_chats(conn: sqlite3.Connection, scope: Scope = "channel") -> dict:
 
     Args:
         conn: open SQLite connection (with row_factory = sqlite3.Row).
-        scope: 'channel' (channels only) or 'all' (channels + DM + group).
+        scope: 'channel' (channels only) or 'all' (channels + DM + group + meeting).
 
     Returns:
         {"chats_discovered": <int>, "chats_inserted": <int>, "chats_updated": <int>}
@@ -174,7 +174,7 @@ def _classify_chat_kind(chat: dict) -> str | None:
     """Map a list-chats payload entry to teams_chats.chat_kind.
 
     Order of precedence (matches spec § 3.1):
-    1. chatType == 'meeting' → 'meeting' (caller skips per 2026-05-04 spec).
+    1. chatType == 'meeting' → 'meeting' (stored once it has a message, 2026-09-29 spec E1).
     2. isOneOnOne flag (when present, definitive).
     3. Human-member count: 2 → 'oneOnOne', ≥3 → 'group', ≤1 → None (skip).
 
@@ -197,11 +197,12 @@ def _classify_chat_kind(chat: dict) -> str | None:
 
 
 def _discover_chat_chats(conn: sqlite3.Connection) -> dict:
-    """Discover non-channel chats (oneOnOne + group) via teams-cli list-chats.
+    """Discover non-channel chats (oneOnOne, group, meeting) via teams-cli list-chats.
 
-    Skips chat_kind='meeting' entirely (spec 2026-05-04). Idempotent:
-    UNIQUE(teams_chat_id) drops re-inserts. Updates `topic` on existing
-    rows so renamed groups stay in sync; never touches `ingest_disabled`.
+    Meeting chats are stored once they have a message (2026-09-29 spec E1, which
+    reverses the 2026-05-04 skip). Idempotent: UNIQUE(teams_chat_id) drops
+    re-inserts. Updates `topic` on existing rows so renamed groups stay in sync;
+    never touches `ingest_disabled`.
     """
     chats = run_teams_cli(["list-chats"]).get("chats", [])
     inserted = 0
@@ -209,11 +210,20 @@ def _discover_chat_chats(conn: sqlite3.Connection) -> dict:
 
     for chat in chats:
         kind = _classify_chat_kind(chat)
-        if kind is None or kind == "meeting":
+        if kind is None:
+            continue
+
+        # teams-access types the key as composeTime; the lowercase spelling is
+        # what the chatsvc message payloads use, so accept both.
+        last_message = chat.get("lastMessage") or {}
+        last_msg = last_message.get("composeTime") or last_message.get("composetime")
+        # Teams creates a meeting chat for every meeting and most stay empty.
+        # One is stored once it has a message, which the listing then carries.
+        if kind == "meeting" and not last_msg:
             continue
 
         chat_id = chat["id"]
-        title = chat.get("title")  # NULL for 1-on-1, set for group
+        title = chat.get("title")  # NULL for 1-on-1, set for group and meeting
         member_mris = json.dumps(
             [
                 m.get("mri")
@@ -221,10 +231,6 @@ def _discover_chat_chats(conn: sqlite3.Connection) -> dict:
                 if isinstance(m, dict) and str(m.get("mri", "")).startswith("8:")
             ]
         )
-        # teams-access types the key as composeTime; the lowercase spelling is
-        # what the chatsvc message payloads use, so accept both.
-        last_message = chat.get("lastMessage") or {}
-        last_msg = last_message.get("composeTime") or last_message.get("composetime")
 
         existing = conn.execute(
             "SELECT id FROM teams_chats WHERE teams_chat_id = ?", (chat_id,)
@@ -285,7 +291,10 @@ def pull_messages(
 ) -> dict:
     """Step 2: full pull of messages for every active chat.
 
-    Active = (last_message_at within 12 months) OR (any messages already in DB).
+    Eligible = never pulled, OR last_message_at within 12 months or unknown, OR
+    messages already stored. So every chat is pulled at least once whatever its
+    age (2026-09-29 spec E3), and after that a quiet chat older than a year
+    leaves the rotation unless it has stored messages.
     teams-cli list-messages does NOT expose a sync-state cursor and reads one
     page only (CHAT_PAGE_SIZE for chats), so each run re-reads the newest page
     and relies on UNIQUE(teams_message_id) for dedup. The teams_chats.sync_state
@@ -307,27 +316,39 @@ def pull_messages(
     # timedelta, not replace(year=...), which raises on 29 February.
     cutoff_iso = (now - timedelta(days=365)).isoformat()
 
-    # Chats with a message since their last pull go first, then the rotation by
+    # Order (2026-09-29 spec E4): channels and chats with a message since their
+    # last pull first, then chats never pulled (newest activity first, so a new
+    # conversation does not queue behind a backfill), then the rotation by
     # oldest pull. The deadline reaches only part of the inventory per run, and
     # a busy chat that waited its turn behind hundreds of quiet ones overflowed
-    # the one page teams-cli reads. julianday() because last_message_at is
-    # Teams' "...Z" and last_pulled_at is Python's "...+00:00".
+    # the one page teams-cli reads. Channels go first because discovery never
+    # learns their activity. Never-pulled chats used to sort first of all, which
+    # would have put a backfill of a thousand meeting chats ahead of live
+    # conversations. julianday() because last_message_at is Teams' "...Z" and
+    # last_pulled_at is Python's "...+00:00"; a NULL julianday sorts last under
+    # DESC.
     rows = conn.execute(
         """
         SELECT id, teams_chat_id, chat_kind, team_uuid, channel_id, sync_state
         FROM teams_chats
         WHERE ingest_disabled = 0
-          AND chat_kind IN ('channel', 'oneOnOne', 'group')
+          AND chat_kind IN ('channel', 'oneOnOne', 'group', 'meeting')
           AND (
-            last_message_at IS NULL
+            last_pulled_at IS NULL
+            OR last_message_at IS NULL
             OR last_message_at >= ?
             OR EXISTS (SELECT 1 FROM teams_messages tm WHERE tm.chat_id = teams_chats.id)
           )
         ORDER BY
-          CASE WHEN last_pulled_at IS NULL
-                 OR julianday(last_message_at) > julianday(last_pulled_at)
-               THEN 0 ELSE 1 END,
-          last_pulled_at IS NOT NULL, last_pulled_at
+          CASE
+            WHEN chat_kind = 'channel' THEN 0
+            WHEN last_pulled_at IS NOT NULL
+                 AND julianday(last_message_at) > julianday(last_pulled_at) THEN 0
+            WHEN last_pulled_at IS NULL THEN 1
+            ELSE 2
+          END,
+          last_pulled_at IS NOT NULL, last_pulled_at,
+          julianday(last_message_at) DESC, id
         """,
         (cutoff_iso,),
     ).fetchall()
@@ -374,7 +395,7 @@ def pull_messages(
                     chat["channel_id"],
                 ]
             else:
-                # oneOnOne / group — chat-scope read via chatsvc
+                # oneOnOne / group / meeting: chat-scope read via chatsvc
                 args = [
                     "list-messages",
                     "--page-size",

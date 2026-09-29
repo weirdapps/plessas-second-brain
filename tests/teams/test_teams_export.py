@@ -869,3 +869,54 @@ def test_a_teams_search_matches_no_system_message(tmp_path):
     assert [r["snippet"] for r in search_teams(conn, "okapi", kind="message")] == [
         "the [okapi] report is ready"
     ]
+
+
+# --- Every chat is pulled at least once (2026-09-29 spec E3) -----------------
+# The 12-month activity filter kept old chats out, which also kept a backfill of
+# old meeting chats out. It now applies only to chats pulled before.
+
+
+def test_an_unpulled_chat_is_pulled_whatever_its_age(db):
+    db.execute(
+        "INSERT INTO teams_chats (teams_chat_id, chat_kind, topic, first_seen_at, "
+        "last_message_at) VALUES ('19:old-unpulled@thread.v2', 'group', 'Old group', "
+        "'2026-09-29T00:00:00', '2020-05-01T09:00:00Z')"
+    )
+    db.commit()
+
+    with patch("src.export.teams_export.run_teams_cli") as mock:
+        mock.return_value = {"messages": []}
+        pull_messages(db, concurrency=1)
+
+    assert [c.args[0][-1] for c in mock.call_args_list] == ["19:old-unpulled@thread.v2"]
+
+
+def test_a_pulled_quiet_chat_older_than_a_year_leaves_the_rotation(db):
+    db.execute(
+        "INSERT INTO teams_chats (teams_chat_id, chat_kind, topic, first_seen_at, "
+        "last_message_at, last_pulled_at) VALUES ('19:old-pulled@thread.v2', 'group', "
+        "'Old group', '2020-01-01T00:00:00', '2020-05-01T09:00:00Z', "
+        "'2020-06-01T00:00:00+00:00')"
+    )
+    db.commit()
+
+    with patch("src.export.teams_export.run_teams_cli") as mock:
+        mock.return_value = {"messages": []}
+        pull_messages(db, concurrency=1)
+
+    assert mock.call_count == 0
+
+
+def test_a_disabled_chat_is_not_pulled_even_if_never_pulled(db):
+    db.execute(
+        "INSERT INTO teams_chats (teams_chat_id, chat_kind, topic, first_seen_at, "
+        "ingest_disabled) VALUES ('19:meeting_off@thread.v2', 'meeting', 'Off', "
+        "'2026-09-29T00:00:00', 1)"
+    )
+    db.commit()
+
+    with patch("src.export.teams_export.run_teams_cli") as mock:
+        mock.return_value = {"messages": []}
+        pull_messages(db, concurrency=1)
+
+    assert mock.call_count == 0

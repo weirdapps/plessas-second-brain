@@ -291,7 +291,10 @@ def pull_messages(
 ) -> dict:
     """Step 2: full pull of messages for every active chat.
 
-    Active = (last_message_at within 12 months) OR (any messages already in DB).
+    Eligible = never pulled, OR last_message_at within 12 months or unknown, OR
+    messages already stored. So every chat is pulled at least once whatever its
+    age (2026-09-29 spec E3), and after that a quiet chat older than a year
+    leaves the rotation unless it has stored messages.
     teams-cli list-messages does NOT expose a sync-state cursor and reads one
     page only (CHAT_PAGE_SIZE for chats), so each run re-reads the newest page
     and relies on UNIQUE(teams_message_id) for dedup. The teams_chats.sync_state
@@ -313,27 +316,39 @@ def pull_messages(
     # timedelta, not replace(year=...), which raises on 29 February.
     cutoff_iso = (now - timedelta(days=365)).isoformat()
 
-    # Chats with a message since their last pull go first, then the rotation by
+    # Order (2026-09-29 spec E4): channels and chats with a message since their
+    # last pull first, then chats never pulled (newest activity first, so a new
+    # conversation does not queue behind a backfill), then the rotation by
     # oldest pull. The deadline reaches only part of the inventory per run, and
     # a busy chat that waited its turn behind hundreds of quiet ones overflowed
-    # the one page teams-cli reads. julianday() because last_message_at is
-    # Teams' "...Z" and last_pulled_at is Python's "...+00:00".
+    # the one page teams-cli reads. Channels go first because discovery never
+    # learns their activity. Never-pulled chats used to sort first of all, which
+    # would have put a backfill of a thousand meeting chats ahead of live
+    # conversations. julianday() because last_message_at is Teams' "...Z" and
+    # last_pulled_at is Python's "...+00:00"; a NULL julianday sorts last under
+    # DESC.
     rows = conn.execute(
         """
         SELECT id, teams_chat_id, chat_kind, team_uuid, channel_id, sync_state
         FROM teams_chats
         WHERE ingest_disabled = 0
-          AND chat_kind IN ('channel', 'oneOnOne', 'group')
+          AND chat_kind IN ('channel', 'oneOnOne', 'group', 'meeting')
           AND (
-            last_message_at IS NULL
+            last_pulled_at IS NULL
+            OR last_message_at IS NULL
             OR last_message_at >= ?
             OR EXISTS (SELECT 1 FROM teams_messages tm WHERE tm.chat_id = teams_chats.id)
           )
         ORDER BY
-          CASE WHEN last_pulled_at IS NULL
-                 OR julianday(last_message_at) > julianday(last_pulled_at)
-               THEN 0 ELSE 1 END,
-          last_pulled_at IS NOT NULL, last_pulled_at
+          CASE
+            WHEN chat_kind = 'channel' THEN 0
+            WHEN last_pulled_at IS NOT NULL
+                 AND julianday(last_message_at) > julianday(last_pulled_at) THEN 0
+            WHEN last_pulled_at IS NULL THEN 1
+            ELSE 2
+          END,
+          last_pulled_at IS NOT NULL, last_pulled_at,
+          julianday(last_message_at) DESC, id
         """,
         (cutoff_iso,),
     ).fetchall()

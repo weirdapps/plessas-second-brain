@@ -731,3 +731,51 @@ def test_extract_threads_takes_the_newest_thread_first(db, monkeypatch):
         "SELECT anchor_message_id FROM teams_threads WHERE extraction_status = 'extracted'"
     ).fetchall()
     assert [r["anchor_message_id"] for r in extracted] == ["P-2026"]
+
+
+def test_a_recent_failed_thread_waits_behind_pending_ones(db, monkeypatch):
+    """Newest-first must not put a thread that keeps failing at the head of every
+    run: one LLM call can use most of the budget, which starved sb-outlook-sync
+    for three days on 2026-09-05. Pending threads go first, failed ones after."""
+    monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "test-project")
+    db.execute(
+        """INSERT INTO teams_chats(teams_chat_id, chat_kind, topic, team_name, first_seen_at)
+           VALUES ('19:t', 'channel', 'Channel A', 'Team T', '2026-04-01T00:00:00')"""
+    )
+    chat_id = db.execute("SELECT id FROM teams_chats").fetchone()["id"]
+    for anchor, started, status in (
+        ("P-failed-recent", "2026-09-28T08:00:00", "failed"),
+        ("P-pending-old", "2025-01-15T08:00:00", "pending"),
+    ):
+        db.execute(
+            """INSERT INTO teams_threads(
+                 chat_id, thread_kind, anchor_message_id, started_at, ended_at,
+                 message_count, extraction_status, participant_display_names
+               ) VALUES (?, 'channel_post', ?, ?, ?, 2, ?, '[\"Alice\",\"Bob\"]')""",
+            (chat_id, anchor, started, started, status),
+        )
+    for tid in [r["id"] for r in db.execute("SELECT id FROM teams_threads").fetchall()]:
+        for i in range(2):
+            db.execute(
+                """INSERT INTO teams_messages(
+                     teams_message_id, chat_id, thread_id, composed_at, content_text,
+                     sender_display_name, is_system
+                   ) VALUES (?, ?, ?, '2026-04-29T08:00:00', ?, ?, 0)""",
+                (
+                    f"{chat_id}::T{tid}M{i}",
+                    chat_id,
+                    tid,
+                    "this is a substantive message about quarterly cards strategy",
+                    "Alice" if i == 0 else "Bob",
+                ),
+            )
+    db.commit()
+
+    with patch("src.extract.teams_pipeline._call_llm") as mock:
+        mock.return_value = _fake_llm_response()
+        extract_threads(db, workers=1, limit=1)
+
+    statuses = dict(
+        db.execute("SELECT anchor_message_id, extraction_status FROM teams_threads").fetchall()
+    )
+    assert statuses == {"P-pending-old": "extracted", "P-failed-recent": "failed"}

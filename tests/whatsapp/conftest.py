@@ -63,8 +63,56 @@ def make_bridge_store(path: Path, messages: list[tuple], chats: list[tuple] | No
     return path
 
 
-def build_snapshot(tmp_path: Path, messages: list[tuple], chats: list[tuple] | None = None) -> Path:
-    """The snapshot the Mac would push: the real builder over a fake bridge store."""
+IDENTITY_KEY = bytes.fromhex("5ec2e7a9d1f00b1e5ec2e7a9d1f00b1e")
+
+
+def make_contact_store(
+    path: Path, contacts: list[tuple], lid_map: list[tuple] | None = None
+) -> Path:
+    """A whatsapp.db shaped like the bridge's whatsmeow store.
+
+    contacts: (their_jid, full_name, push_name, business_name) tuples. lid_map:
+    (lid, pn) pairs of bare user ids. The store also gets an identity key, which
+    a snapshot must never carry.
+    """
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE whatsmeow_contacts (
+            our_jid TEXT, their_jid TEXT, first_name TEXT, full_name TEXT,
+            push_name TEXT, business_name TEXT, redacted_phone TEXT,
+            PRIMARY KEY (our_jid, their_jid)
+        );
+        CREATE TABLE whatsmeow_lid_map (lid TEXT PRIMARY KEY, pn TEXT UNIQUE NOT NULL);
+        CREATE TABLE whatsmeow_identity_keys (our_jid TEXT, their_id TEXT, identity BLOB);
+        """
+    )
+    for their_jid, full, push, business in contacts:
+        conn.execute(
+            "INSERT INTO whatsmeow_contacts (our_jid, their_jid, full_name, push_name, "
+            "business_name) VALUES (?, ?, ?, ?, ?)",
+            (f"{OWNER}@s.whatsapp.net", their_jid, full, push, business),
+        )
+    conn.executemany("INSERT INTO whatsmeow_lid_map (lid, pn) VALUES (?, ?)", lid_map or [])
+    conn.execute(
+        "INSERT INTO whatsmeow_identity_keys VALUES (?, ?, ?)", (OWNER, ALICE, IDENTITY_KEY)
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
+def build_snapshot(
+    tmp_path: Path,
+    messages: list[tuple],
+    chats: list[tuple] | None = None,
+    contacts: list[tuple] | None = None,
+    lid_map: list[tuple] | None = None,
+) -> Path:
+    """The snapshot the Mac would push: the real builder over a fake bridge store.
+
+    With `contacts`, a contact store sits beside messages.db as it does on the Mac.
+    """
     import importlib.util
 
     script = Path(__file__).parents[2] / "scripts" / "whatsapp_snapshot.py"
@@ -78,7 +126,10 @@ def build_snapshot(tmp_path: Path, messages: list[tuple], chats: list[tuple] | N
     bridge = tmp_path / "bridge"
     bridge.mkdir(mode=0o700, exist_ok=True)
     source = make_bridge_store(bridge / "messages.db", messages, chats)
+    store = make_contact_store(bridge / "whatsapp.db", contacts, lid_map) if contacts else None
     dest = tmp_path / "whatsapp-snapshot.db"
     module.build_snapshot(str(source), str(dest))
     source.unlink()
+    if store:
+        store.unlink()
     return dest

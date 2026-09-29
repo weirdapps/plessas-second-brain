@@ -3038,7 +3038,9 @@ def main():
     parser_whatsapp_sync.set_defaults(func=cmd_whatsapp_sync)
 
     # teams-sync command
-    parser_teams_sync = subparsers.add_parser("teams-sync", help="Ingest Teams channels (Phase 1)")
+    parser_teams_sync = subparsers.add_parser(
+        "teams-sync", help="Ingest Teams channels plus 1:1, group and meeting chats"
+    )
     parser_teams_sync.add_argument(
         "--concurrency",
         type=int,

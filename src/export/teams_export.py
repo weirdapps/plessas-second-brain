@@ -22,7 +22,7 @@ def discover_chats(conn: sqlite3.Connection, scope: Scope = "channel") -> dict:
 
     Args:
         conn: open SQLite connection (with row_factory = sqlite3.Row).
-        scope: 'channel' (channels only) or 'all' (channels + DM + group).
+        scope: 'channel' (channels only) or 'all' (channels + DM + group + meeting).
 
     Returns:
         {"chats_discovered": <int>, "chats_inserted": <int>, "chats_updated": <int>}
@@ -395,7 +395,7 @@ def pull_messages(
                     chat["channel_id"],
                 ]
             else:
-                # oneOnOne / group — chat-scope read via chatsvc
+                # oneOnOne / group / meeting: chat-scope read via chatsvc
                 args = [
                     "list-messages",
                     "--page-size",

@@ -123,3 +123,69 @@ def test_the_last_message_time_is_kept_per_chat(db, tmp_path):
         "SELECT last_message_at FROM whatsapp_chats WHERE chat_jid = ?", (GROUP_JID,)
     ).fetchone()[0]
     assert last == "2026-09-02T16:01:00Z"
+
+
+# --- People named from the snapshot's contacts table --------------------------
+# The Mac names each person in the snapshot from the bridge's contact store,
+# address book first; without it every sender and direct chat was a number.
+
+CONTACTS = [
+    (f"{ALICE}@s.whatsapp.net", "Alice Address", "Alice Self", None),
+    (f"{BOB}@s.whatsapp.net", None, "Bob Self", None),
+]
+NUMBERED_CHATS = [(DIRECT_JID, ALICE), (GROUP_JID, "Chat A")]
+
+
+def test_people_are_named_from_the_snapshot_contacts(db, tmp_path):
+    ingest_snapshot(db, build_snapshot(tmp_path, _basic(), NUMBERED_CHATS, CONTACTS))
+    chat = db.execute("SELECT name FROM whatsapp_chats WHERE chat_jid = ?", (DIRECT_JID,))
+    assert chat.fetchone()[0] == "Alice Address"
+    names = dict(db.execute("SELECT message_id, sender_name FROM whatsapp_messages").fetchall())
+    assert names["m1"] == "Alice Address"
+    assert names["m3"] == "Bob Self"
+    assert names["m4"] == "Alice Address"
+
+
+def test_the_address_book_name_beats_the_bridge_chat_name(db, tmp_path):
+    chats = [(DIRECT_JID, "Alice Self"), (GROUP_JID, "Chat A")]
+    ingest_snapshot(db, build_snapshot(tmp_path, _basic(), chats, CONTACTS))
+    chat = db.execute("SELECT name FROM whatsapp_chats WHERE chat_jid = ?", (DIRECT_JID,))
+    assert chat.fetchone()[0] == "Alice Address"
+
+
+def test_a_snapshot_from_before_the_contacts_table_still_ingests(db, tmp_path):
+    import sqlite3
+
+    snapshot = build_snapshot(tmp_path, _basic(), NUMBERED_CHATS, CONTACTS)
+    conn = sqlite3.connect(snapshot)
+    conn.execute("DROP TABLE contacts")
+    conn.commit()
+    conn.close()
+    out = ingest_snapshot(db, snapshot)
+    assert out["messages_inserted"] == 4
+    names = dict(db.execute("SELECT message_id, sender_name FROM whatsapp_messages").fetchall())
+    assert names["m3"] == BOB
+
+
+def test_naming_a_sender_later_renames_them_and_re_extracts_their_threads(db, tmp_path):
+    import json
+
+    from src.extract.whatsapp_threads import bound_threads
+
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    ingest_snapshot(db, build_snapshot(tmp_path / "a", _basic(), NUMBERED_CHATS))
+    bound_threads(db)
+    db.execute("UPDATE whatsapp_threads SET extraction_status = 'extracted'")
+    db.commit()
+
+    out = ingest_snapshot(db, build_snapshot(tmp_path / "b", _basic(), NUMBERED_CHATS, CONTACTS))
+
+    assert out["messages_updated"] == 3  # m1, m3, m4; m2 is the owner's own
+    status, participants = db.execute(
+        "SELECT t.extraction_status, t.participant_names FROM whatsapp_threads t "
+        "JOIN whatsapp_messages m ON m.thread_id = t.id WHERE m.message_id = 'm3'"
+    ).fetchone()
+    assert status == "pending"
+    assert "Bob Self" in json.loads(participants)
+    assert BOB not in json.loads(participants)

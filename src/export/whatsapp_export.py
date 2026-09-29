@@ -12,6 +12,7 @@ come later and commit per thread (see whatsapp_pipeline).
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sqlite3
@@ -85,6 +86,25 @@ def _open_snapshot(snapshot: Path) -> sqlite3.Connection:
     return src
 
 
+def _read_contacts(src: sqlite3.Connection) -> dict[str, str]:
+    """user -> name from the snapshot's contacts table.
+
+    The Mac names each person in the snapshot from the bridge's contact store,
+    address book first. A snapshot built before that table existed has none, and
+    then nobody is named this way.
+    """
+    has_table = src.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'contacts'"
+    ).fetchone()
+    if not has_table:
+        return {}
+    return {
+        user: name
+        for user, name in src.execute("SELECT user, name FROM contacts")
+        if user and _has_name(name)
+    }
+
+
 def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SNAPSHOT) -> dict:
     """Upsert every chat and message in `snapshot`; return the counts.
 
@@ -99,11 +119,17 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
             "SELECT id, chat_jid, sender, content, timestamp, is_from_me, media_type, "
             "filename FROM messages"
         ).fetchall()
+        contacts = _read_contacts(src)
     finally:
         src.close()
 
     owner = os.environ.get("BRAIN_USER_NAME") or "me"
-    names = dict(chats)
+    # A direct chat takes the contact's name over the one the bridge kept: the
+    # bridge's is often a number, and the contact's puts the address book first.
+    names = {
+        jid: (contacts.get(_user(jid)) if chat_kind(jid) == "direct" else None) or name
+        for jid, name in chats
+    }
     # Who a number is, from the chats we hold with them one to one.
     direct_names = {
         _user(jid): name for jid, name in chats if chat_kind(jid) == "direct" and _has_name(name)
@@ -142,6 +168,8 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
         sender_name: str | None
         if from_me:
             sender_name = owner
+        elif contacts.get(_user(sender)):
+            sender_name = contacts[_user(sender)]
         elif (
             chat_kind(jid) == "direct" and _user(jid) == _user(sender) and _has_name(names.get(jid))
         ):
@@ -188,9 +216,21 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
         if existing[4] is not None:
             touched_threads.add(existing[4])
 
+    # A renamed sender is re-extracted, and the session's participant list is
+    # rebuilt the way bound_threads builds it, or the prompt keeps the old numbers.
     for tid in touched_threads:
+        participants = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT sender_name FROM whatsapp_messages "
+                "WHERE thread_id = ? AND sender_name IS NOT NULL ORDER BY sender_name",
+                (tid,),
+            )
+        ]
         conn.execute(
-            "UPDATE whatsapp_threads SET extraction_status = 'pending' WHERE id = ?", (tid,)
+            "UPDATE whatsapp_threads SET extraction_status = 'pending', participant_names = ? "
+            "WHERE id = ?",
+            (json.dumps(participants, ensure_ascii=False), tid),
         )
     conn.execute(
         """

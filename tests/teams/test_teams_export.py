@@ -289,12 +289,13 @@ def test_discover_chat_chats_inserts_oneOnOne_and_group(db, fixture_loader):
 
         result = _discover_chat_chats(db)
 
-    assert result["chats_inserted"] == 2  # 1on1 + group; meeting + self-chat skipped
+    # 1on1 + group + meeting; the empty meeting and the self-chat are skipped.
+    assert result["chats_inserted"] == 3
     rows = db.execute(
         "SELECT chat_kind, topic, teams_chat_id FROM teams_chats ORDER BY chat_kind"
     ).fetchall()
     kinds = sorted(r["chat_kind"] for r in rows)
-    assert kinds == ["group", "oneOnOne"]
+    assert kinds == ["group", "meeting", "oneOnOne"]
 
     group_row = next(r for r in rows if r["chat_kind"] == "group")
     assert group_row["topic"] == "Cards strategy huddle"
@@ -303,17 +304,73 @@ def test_discover_chat_chats_inserts_oneOnOne_and_group(db, fixture_loader):
     assert oneOnOne_row["topic"] is None  # 1-on-1 has no title; resolved later
 
 
-def test_discover_chat_chats_skips_meeting(db, fixture_loader):
+EMPTY_MEETING_ID = "19:meeting_NjY2NjY2NjYtNjY2Ni02NjY2LTY2NjYtNjY2NjY2NjY2NjY2@thread.v2"
+
+
+def test_discover_chat_chats_inserts_a_meeting_chat_that_has_messages(db, fixture_loader):
     chats_payload = fixture_loader("list-chats.json")
     with patch("src.export.teams_export.run_teams_cli") as mock:
         mock.return_value = chats_payload
         from src.export.teams_export import _discover_chat_chats
 
         _discover_chat_chats(db)
-    meeting_count = db.execute(
-        "SELECT COUNT(*) FROM teams_chats WHERE chat_kind = 'meeting'"
+    rows = db.execute(
+        "SELECT topic, last_message_at FROM teams_chats WHERE chat_kind = 'meeting'"
+    ).fetchall()
+    assert [(r["topic"], r["last_message_at"]) for r in rows] == [
+        ("Q2 review meeting", "2026-04-20T09:00:00Z")
+    ]
+
+
+def test_discover_chat_chats_skips_an_empty_meeting_chat(db, fixture_loader):
+    chats_payload = fixture_loader("list-chats.json")
+    with patch("src.export.teams_export.run_teams_cli") as mock:
+        mock.return_value = chats_payload
+        from src.export.teams_export import _discover_chat_chats
+
+        _discover_chat_chats(db)
+    count = db.execute(
+        "SELECT COUNT(*) FROM teams_chats WHERE teams_chat_id = ?", (EMPTY_MEETING_ID,)
     ).fetchone()[0]
-    assert meeting_count == 0
+    assert count == 0
+
+
+def _discover_one_meeting(db, last_message):
+    chat = {
+        "id": "19:meeting_example@thread.v2",
+        "chatType": "meeting",
+        "isOneOnOne": False,
+        "title": "Example sync",
+        "members": [
+            {"mri": "8:orgid:11111111-1111-1111-1111-111111111111"},
+            {"mri": "8:orgid:44444444-4444-4444-4444-444444444444"},
+        ],
+        "lastMessage": last_message,
+    }
+    with patch("src.export.teams_export.run_teams_cli", return_value={"chats": [chat]}):
+        from src.export.teams_export import _discover_chat_chats
+
+        _discover_chat_chats(db)
+    return db.execute(
+        "SELECT chat_kind, last_message_at FROM teams_chats WHERE teams_chat_id = ?",
+        ("19:meeting_example@thread.v2",),
+    ).fetchone()
+
+
+def test_a_meeting_chat_with_a_camel_case_compose_time_is_stored(db):
+    row = _discover_one_meeting(db, {"composeTime": "2026-09-25T12:34:07.123Z"})
+    assert (row["chat_kind"], row["last_message_at"]) == ("meeting", "2026-09-25T12:34:07.123Z")
+
+
+def test_a_meeting_chat_with_an_empty_or_null_last_message_is_not_stored(db):
+    assert _discover_one_meeting(db, {}) is None
+    assert _discover_one_meeting(db, None) is None
+
+
+def test_a_stored_meeting_chat_listed_without_a_last_message_is_kept(db):
+    _discover_one_meeting(db, {"composeTime": "2026-09-25T12:34:07.123Z"})
+    row = _discover_one_meeting(db, None)
+    assert (row["chat_kind"], row["last_message_at"]) == ("meeting", "2026-09-25T12:34:07.123Z")
 
 
 def test_discover_chat_chats_is_idempotent(db, fixture_loader):
@@ -325,7 +382,7 @@ def test_discover_chat_chats_is_idempotent(db, fixture_loader):
         _discover_chat_chats(db)
         _discover_chat_chats(db)  # second run
     count = db.execute("SELECT COUNT(*) FROM teams_chats").fetchone()[0]
-    assert count == 2  # unchanged
+    assert count == 3  # unchanged
 
 
 def test_discover_chat_chats_updates_renamed_group(db, fixture_loader):
@@ -359,9 +416,9 @@ def test_discover_chat_chats_updates_renamed_group(db, fixture_loader):
         mock.return_value = modified
         result = _discover_chat_chats(db)
 
-    # Both rows already existed → both go through UPDATE path; no new inserts.
+    # All three rows already existed, so all go through UPDATE; no new inserts.
     assert result["chats_inserted"] == 0
-    assert result["chats_updated"] == 2
+    assert result["chats_updated"] == 3
 
     refreshed_topic = db.execute(
         "SELECT topic FROM teams_chats WHERE chat_kind = 'group'"
@@ -387,10 +444,10 @@ def test_discover_chats_scope_all_calls_both_paths(db, fixture_loader):
         mock.side_effect = side_effect
         result = discover_chats(db, scope="all")
 
-    # 2 channels (from existing fixture) + 2 chats (1on1 + group, meeting/self-chat skipped)
-    assert result["chats_inserted"] == 4
+    # 2 channels (from existing fixture) + 3 chats (1on1, group, meeting; empty meeting and self-chat skipped)
+    assert result["chats_inserted"] == 5
     kinds = sorted(r[0] for r in db.execute("SELECT chat_kind FROM teams_chats").fetchall())
-    assert kinds == ["channel", "channel", "group", "oneOnOne"]
+    assert kinds == ["channel", "channel", "group", "meeting", "oneOnOne"]
 
 
 def _seed_oneOnOne_chat(db) -> int:

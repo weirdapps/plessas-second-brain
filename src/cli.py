@@ -1721,7 +1721,7 @@ def cmd_sync(args):
 
 
 def cmd_teams_sync(args):
-    """Run the Teams ingestion pipeline (Phase 1: channels only)."""
+    """Run the Teams ingestion pipeline: channels plus 1:1, group and meeting chats."""
     from src.export.teams_export import discover_chats, pull_messages
     from src.extract.teams_mri import resolve_mris
     from src.extract.teams_pipeline import extract_threads

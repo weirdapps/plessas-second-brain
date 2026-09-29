@@ -174,7 +174,7 @@ def _classify_chat_kind(chat: dict) -> str | None:
     """Map a list-chats payload entry to teams_chats.chat_kind.
 
     Order of precedence (matches spec § 3.1):
-    1. chatType == 'meeting' → 'meeting' (caller skips per 2026-05-04 spec).
+    1. chatType == 'meeting' → 'meeting' (stored once it has a message, 2026-09-29 spec E1).
     2. isOneOnOne flag (when present, definitive).
     3. Human-member count: 2 → 'oneOnOne', ≥3 → 'group', ≤1 → None (skip).
 
@@ -197,11 +197,12 @@ def _classify_chat_kind(chat: dict) -> str | None:
 
 
 def _discover_chat_chats(conn: sqlite3.Connection) -> dict:
-    """Discover non-channel chats (oneOnOne + group) via teams-cli list-chats.
+    """Discover non-channel chats (oneOnOne, group, meeting) via teams-cli list-chats.
 
-    Skips chat_kind='meeting' entirely (spec 2026-05-04). Idempotent:
-    UNIQUE(teams_chat_id) drops re-inserts. Updates `topic` on existing
-    rows so renamed groups stay in sync; never touches `ingest_disabled`.
+    Meeting chats are stored once they have a message (2026-09-29 spec E1, which
+    reverses the 2026-05-04 skip). Idempotent: UNIQUE(teams_chat_id) drops
+    re-inserts. Updates `topic` on existing rows so renamed groups stay in sync;
+    never touches `ingest_disabled`.
     """
     chats = run_teams_cli(["list-chats"]).get("chats", [])
     inserted = 0
@@ -209,11 +210,20 @@ def _discover_chat_chats(conn: sqlite3.Connection) -> dict:
 
     for chat in chats:
         kind = _classify_chat_kind(chat)
-        if kind is None or kind == "meeting":
+        if kind is None:
+            continue
+
+        # teams-access types the key as composeTime; the lowercase spelling is
+        # what the chatsvc message payloads use, so accept both.
+        last_message = chat.get("lastMessage") or {}
+        last_msg = last_message.get("composeTime") or last_message.get("composetime")
+        # Teams creates a meeting chat for every meeting and most stay empty.
+        # One is stored once it has a message, which the listing then carries.
+        if kind == "meeting" and not last_msg:
             continue
 
         chat_id = chat["id"]
-        title = chat.get("title")  # NULL for 1-on-1, set for group
+        title = chat.get("title")  # NULL for 1-on-1, set for group and meeting
         member_mris = json.dumps(
             [
                 m.get("mri")
@@ -221,10 +231,6 @@ def _discover_chat_chats(conn: sqlite3.Connection) -> dict:
                 if isinstance(m, dict) and str(m.get("mri", "")).startswith("8:")
             ]
         )
-        # teams-access types the key as composeTime; the lowercase spelling is
-        # what the chatsvc message payloads use, so accept both.
-        last_message = chat.get("lastMessage") or {}
-        last_msg = last_message.get("composeTime") or last_message.get("composetime")
 
         existing = conn.execute(
             "SELECT id FROM teams_chats WHERE teams_chat_id = ?", (chat_id,)

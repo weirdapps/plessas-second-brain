@@ -15,7 +15,7 @@ _CHAT_THREAD_GAP_HOURS = 8
 
 def bound_threads(conn: sqlite3.Connection) -> dict:
     """Assign thread_id to messages that don't have one. Channel messages use
-    parent-id reply chains; oneOnOne/group use gap-bounded sessions
+    parent-id reply chains; oneOnOne/group/meeting use gap-bounded sessions
     (default _CHAT_THREAD_GAP_HOURS = 8).
 
     Returns:
@@ -106,7 +106,7 @@ def bound_threads(conn: sqlite3.Connection) -> dict:
 
 
 def _bound_chat_session_threads(conn: sqlite3.Connection) -> tuple[int, set[int]]:
-    """Gap-bound oneOnOne + group chat messages into chat_session threads.
+    """Gap-bound oneOnOne, group and meeting chat messages into chat_session threads.
     Returns (created_count, touched_thread_ids).
     """
     created = 0
@@ -118,7 +118,7 @@ def _bound_chat_session_threads(conn: sqlite3.Connection) -> tuple[int, set[int]
         SELECT DISTINCT c.id, c.chat_kind, c.topic
         FROM teams_chats c
         JOIN teams_messages m ON m.chat_id = c.id
-        WHERE c.chat_kind IN ('oneOnOne', 'group')
+        WHERE c.chat_kind IN ('oneOnOne', 'group', 'meeting')
           AND m.thread_id IS NULL
           AND m.is_system = 0
         """
@@ -215,13 +215,16 @@ def _chat_session_title(chat_kind: str, chat_topic: str | None, started_at: str)
     oneOnOne: 'DM session YYYY-MM-DD' (participant name resolved later).
     group:    'Group [<topic>]: session YYYY-MM-DD' if topic, else
               'Group session YYYY-MM-DD'.
+    meeting:  'Meeting [<subject>]: session YYYY-MM-DD' if subject, else
+              'Meeting session YYYY-MM-DD'.
     """
     date = started_at[:10]
     if chat_kind == "oneOnOne":
         return f"DM session {date}"
+    label = "Meeting" if chat_kind == "meeting" else "Group"
     if chat_topic:
-        return f"Group [{chat_topic}]: session {date}"
-    return f"Group session {date}"
+        return f"{label} [{chat_topic}]: session {date}"
+    return f"{label} session {date}"
 
 
 def _create_chat_session_thread(

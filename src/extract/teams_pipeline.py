@@ -65,10 +65,12 @@ def extract_threads(
         )
 
     _ = workers  # parallelism is a Phase 1.5 follow-up if cost/throughput demands it
+    # Newest conversations first (2026-09-29 spec E5): a backlog of old threads,
+    # such as a history backfill, drains behind new ones instead of ahead of them.
     sql = """
         SELECT id FROM teams_threads
         WHERE extraction_status IN ('pending','failed')
-        ORDER BY id
+        ORDER BY started_at DESC, id DESC
     """
     if limit:
         sql += f" LIMIT {int(limit)}"

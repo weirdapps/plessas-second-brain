@@ -431,6 +431,28 @@ def cmd_hash_attachments(args):
     return 0
 
 
+def cmd_reextract(args):
+    """Read again and summarise again rows earlier code capped, skipped or could not read."""
+    from src.extract.reextract import SELECTORS, reextract
+
+    which = {name for name in SELECTORS if getattr(args, name)}
+    if not which:
+        print("Error: choose at least one of --capped, --long, --zip, --unread", file=sys.stderr)
+        return 2
+    stats = reextract(
+        args.db,
+        which,
+        limit=args.limit or None,
+        dry_run=args.dry_run,
+        workers=args.workers,
+        root=args.root,
+    )
+    print(f"reextract ({', '.join(sorted(which))}){' DRY RUN' if args.dry_run else ''}:")
+    for key in ("selected", "reread", "resummarise", "missing", "summarised", "failed"):
+        print(f"  {key:<12}: {stats[key]:,}")
+    return 0
+
+
 def cmd_sweep_files(args):
     """Delete attachment files whose content is already stored (src/store/file_sweep.py).
 
@@ -2892,6 +2914,25 @@ def main():
         "--root", default=str(ATTACHMENTS_DIR), help="Attachments root to sweep"
     )
     parser_sweep.set_defaults(func=cmd_sweep_files)
+
+    parser_reextract = subparsers.add_parser(
+        "reextract", help="Read and summarise again rows earlier code capped, skipped or missed"
+    )
+    parser_reextract.add_argument("--capped", action="store_true", help="text at the old 100k cap")
+    parser_reextract.add_argument(
+        "--long", action="store_true", help="summarised from the first 50k characters only"
+    )
+    parser_reextract.add_argument("--zip", action="store_true", help="zip archives once skipped")
+    parser_reextract.add_argument(
+        "--unread", action="store_true", help="rows Phase 1 recorded without reading the file"
+    )
+    parser_reextract.add_argument("--limit", type=int, default=0, help="Max rows (0 = all)")
+    parser_reextract.add_argument("--dry-run", action="store_true", help="Count only")
+    parser_reextract.add_argument("--workers", type=int, default=4, help="Phase 2 workers")
+    parser_reextract.add_argument(
+        "--root", default=str(ATTACHMENTS_DIR), help="Attachments root, for rows recorded elsewhere"
+    )
+    parser_reextract.set_defaults(func=cmd_reextract)
 
     # Process images command
     parser_process_img = subparsers.add_parser(

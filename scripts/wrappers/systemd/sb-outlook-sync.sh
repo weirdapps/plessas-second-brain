@@ -173,7 +173,8 @@ fi
 # "Files on disk" row catches a sweep that stops working.
 echo "$(ts) - start file sweep" >> "$LOG"
 "$PYTHON" -m src.cli sweep-files --policy >> "$LOG" 2>&1
-echo "$(ts) - file sweep done (rc=$?)" >> "$LOG"
+rc_sweep=$?
+echo "$(ts) - file sweep done (rc=$rc_sweep)" >> "$LOG"
 
 rc=$overall_rc
 

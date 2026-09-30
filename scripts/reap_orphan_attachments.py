@@ -39,7 +39,7 @@ from src.config import ATTACHMENTS_DIR, DEFAULT_DB, is_replica, replica_refusal 
 from src.export.outlook_attachments import ORPHAN_GRACE_DAYS, is_abandoned_orphan  # noqa: E402
 from src.extract.attachment_pipeline import ingest_document  # noqa: E402
 from src.store.file_hashes import sha256_of_file  # noqa: E402
-from src.store.file_sweep import UNREAD_SQL, load_policy  # noqa: E402
+from src.store.file_sweep import NOT_FULLY_READ_SQL, load_policy  # noqa: E402
 from src.store.schema import get_connection  # noqa: E402
 
 # outlook_attachments skips it on the way in and sharepoint_links tracks it with
@@ -73,9 +73,10 @@ def _survey(
     """Read the table once: claimed directories, what is held where, stored hashes, newest mail,
     and the (directory, filename) of every registered file.
 
-    A hash counts only when its row's content was read by Phase 1 (src/store/file_sweep.py's
-    UNREAD_SQL): a row whose file vanished before Phase 1, or that this host could not read,
-    proves nothing about the bytes, and the orphan may be the last copy.
+    A hash counts only when its row's content was read in full (src/store/file_sweep.py's
+    NOT_FULLY_READ_SQL): a row whose file vanished before Phase 1, that this host could not read,
+    or that a cap read in part proves nothing about the rest of the bytes, and the orphan may be
+    the last copy.
 
     Closes before anything writes. Adoption goes through `ingest_document`, which opens its
     own connection, and holding a second one across those writes is how six concurrent sb-*
@@ -96,7 +97,7 @@ def _survey(
             for (sha,) in conn.execute(
                 "SELECT a.sha256 FROM attachments a"
                 " JOIN attachment_content ac ON ac.attachment_id = a.id"
-                f" WHERE a.sha256 IS NOT NULL AND NOT COALESCE({UNREAD_SQL}, 0)"
+                f" WHERE a.sha256 IS NOT NULL AND NOT COALESCE({NOT_FULLY_READ_SQL}, 0)"
             )
         }
         newest = conn.execute(

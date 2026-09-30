@@ -9,10 +9,16 @@
             cut short: read it again, with no budget
     unread  Phase 1 recorded the row without reading the bytes (the file was not found, or
             this host lacked the tool): read it again
+    partial the old readers read it in part (a spreadsheet to 20 sheets of 51 rows, a scan to
+            30 pages, an archive with both, a text to 2,000,000 characters): read it again in
+            full. The first run records when it began (sync_metadata reextract_partial_since);
+            a row it has read carries a later extracted_at, so a repeated run takes only what
+            is left. Until then the sweep keeps the file (src/store/file_sweep.py PARTIAL_SQL)
 
 A row is updated in place, so its id, and the vector keyed on it, stay its own. A re-read that
 comes back with no text leaves a row that already had text untouched (counted as kept): a
-timeout or a parser error must not replace what was stored. The vector is dropped once Phase 2
+timeout or a parser error must not replace what was stored. A re-read that comes back with the
+same text only records when it was read (counted as unchanged): nothing new to summarise. The vector is dropped once Phase 2
 has run, for every row it did not fail, so the next index build embeds the new summary; a row
 whose new summary failed keeps its old summary and vector. Phase 2 replaces the attachment's own
 key facts, decisions and action items, and does not repeat one an older summary already put on
@@ -28,7 +34,7 @@ from src.extract.attachment_extractors import extract_text_from_file
 from src.extract.attachment_pipeline import LONG_TEXT_CHARS, _connect, run_phase2
 from src.redact import redact_secrets
 from src.store.file_hashes import locate_file
-from src.store.file_sweep import UNREAD_SQL
+from src.store.file_sweep import PARTIAL_SINCE_KEY, PARTIAL_SQL, UNREAD_SQL
 
 OLD_TEXT_CAP = 100_000
 
@@ -47,7 +53,14 @@ SELECTORS: dict[str, tuple[str, bool]] = {
         " OR ac.extraction_error LIKE '%members left unread%')",
         True,
     ),
-    "unread": (f"COALESCE({UNREAD_SQL}, 0)", True),
+    # A row whose file is kept for good (the text ceiling, an archive's limits) cannot be
+    # finished by reading it again.
+    "unread": (
+        f"COALESCE({UNREAD_SQL}, 0) AND COALESCE(ac.extraction_error NOT LIKE '%file kept%', 1)",
+        True,
+    ),
+    # A text-only document kept no file to read again.
+    "partial": (f"COALESCE({PARTIAL_SQL}, 0) AND a.file_path NOT LIKE 'text:%'", True),
 }
 
 
@@ -87,14 +100,30 @@ def reextract(
     db_path = str(db_path or DEFAULT_DB)
     root = Path(root) if root else ATTACHMENTS_DIR
     stats = dict.fromkeys(
-        ("selected", "reread", "resummarise", "missing", "kept", "summarised", "failed"), 0
+        (
+            "selected",
+            "reread",
+            "resummarise",
+            "missing",
+            "kept",
+            "unchanged",
+            "summarised",
+            "failed",
+        ),
+        0,
     )
     touched: list[tuple[int, int]] = []
     conn = _connect(db_path)
     try:
+        now = datetime.now().isoformat()
+        if "partial" in (which or set()) and not dry_run:
+            conn.execute(
+                "INSERT OR IGNORE INTO sync_metadata (key, value) VALUES (?, ?)",
+                (PARTIAL_SINCE_KEY, now),
+            )
+            conn.commit()
         rows = select_rows(conn, which or set(), limit)
         stats["selected"] = len(rows)
-        now = datetime.now().isoformat()
         for ac_id, att_id, file_path, mime, reread, has_text in rows:
             if not reread:
                 stats["resummarise"] += 1
@@ -116,9 +145,29 @@ def reextract(
             stats["reread"] += 1
             if dry_run:
                 continue
-            result = extract_text_from_file(str(path), mime or "", zip_seconds=math.inf)
-            if has_text and not result["text"]:
+            result = extract_text_from_file(
+                str(path), mime or "", zip_seconds=math.inf, ocr_seconds=math.inf
+            )
+            # A re-read with no text, or with less than was stored (a reader that suddenly reads
+            # less), replaces nothing and does not mark the row read.
+            if not result["text"]:
                 stats["kept"] += 1
+                continue
+            text = redact_secrets(result["text"])
+            (stored,) = conn.execute(
+                "SELECT extracted_text FROM attachment_content WHERE id = ?", (ac_id,)
+            ).fetchone()
+            if stored and len(text) < len(stored):
+                stats["kept"] += 1
+                continue
+            if has_text and text == stored:
+                conn.execute(
+                    "UPDATE attachment_content SET extraction_method = ?, extraction_status = ?,"
+                    " extraction_error = ?, extracted_at = ? WHERE id = ?",
+                    (result["method"], result["status"], result["error"], now, ac_id),
+                )
+                conn.commit()
+                stats["unchanged"] += 1
                 continue
             conn.execute(
                 """UPDATE attachment_content
@@ -127,7 +176,7 @@ def reextract(
                        llm_error = NULL
                    WHERE id = ?""",
                 (
-                    redact_secrets(result["text"]),
+                    text,
                     result["method"],
                     result["status"],
                     result["error"],

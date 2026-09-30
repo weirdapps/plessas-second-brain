@@ -47,15 +47,47 @@ STATES = (DELETABLE, PENDING_TEXT, UNREAD, PENDING_IMAGE, UNREGISTERED)
 # Shared with the orphan reaper, whose stored-hash rule must not count these rows either.
 # "No such file or directory" is how a missing converter used to surface (the older
 # "[Errno 2] ... 'textutil'" rows); a data file that vanished mid-read lands here too, which
-# errs on the side of keeping it. "members left unread" is an archive its time budget cut
-# short: read in part, not to the end.
+# errs on the side of keeping it. "left unread" is a read a time budget cut short (an archive's
+# members, a scan's pages), which reextract with no budget can finish. "file kept" is one no
+# re-read can finish (the text ceiling, an archive's safety limits): the file stays for good.
 UNREAD_SQL = (
     "(ac.extraction_error LIKE 'File not found%'"
     " OR ac.extraction_error LIKE 'No legacy .doc converter%'"
     " OR ac.extraction_error LIKE '%not installed%'"
     " OR ac.extraction_error LIKE '%No such file or directory%'"
-    " OR ac.extraction_error LIKE '%members left unread%')"
+    " OR ac.extraction_error LIKE '%left unread%'"
+    " OR ac.extraction_error LIKE '%file kept%')"
 )
+
+# Rows the old readers read in part: spreadsheets stopped at 20 sheets of 51 rows, scans at 30
+# pages, a multi-page TIFF at its first page, archives read their members with all of these,
+# stored text stopped at 100,000 characters until PR B, and every read at 2,000,000 without
+# saying so.
+# They count as read in part until reextract --partial reads them again: it sets this
+# sync_metadata row when it begins, and every row it reads gets a later extracted_at. Until the
+# row exists every such row counts, since the new readers leave no mark of their own.
+PARTIAL_SINCE_KEY = "reextract_partial_since"
+PARTIAL_READERS = (
+    "openpyxl",
+    "xlrd",
+    "xlrd (fallback from .xlsb)",
+    "pyxlsb",
+    "pymupdf+tesseract",
+    "zip",
+)
+CUT_LENGTHS = (100_000, 2_000_000)
+PARTIAL_SQL = (
+    "((ac.extraction_method IN (" + ", ".join(f"'{m}'" for m in PARTIAL_READERS) + ")"
+    " OR (ac.extraction_method = 'ocr'"
+    " AND (lower(a.filename) LIKE '%.tif' OR lower(a.filename) LIKE '%.tiff'))"
+    " OR length(ac.extracted_text) IN (" + ", ".join(str(n) for n in CUT_LENGTHS) + "))"
+    " AND COALESCE(ac.extracted_at, '') < COALESCE("
+    f"(SELECT value FROM sync_metadata WHERE key = '{PARTIAL_SINCE_KEY}'), '9999'))"
+)
+
+# Not stored in full: the sweep keeps the file, the reaper does not count the hash as stored,
+# and Phase 1 does not copy the row to another attachment with the same bytes.
+NOT_FULLY_READ_SQL = f"({UNREAD_SQL} OR {PARTIAL_SQL})"
 
 # The extractor OCRs these by extension whatever the mime says, and ingest_document used to
 # record them as application/octet-stream, so an image is known by either.
@@ -148,7 +180,7 @@ def _registered(conn: sqlite3.Connection) -> dict[tuple[str, str], tuple[tuple[i
         f"""
         SELECT a.id, a.file_path, a.mime_type, a.filename,
                ac.id IS NOT NULL,
-               COALESCE({UNREAD_SQL}, 0),
+               COALESCE({NOT_FULLY_READ_SQL}, 0),
                ii.sha256 IS NOT NULL,
                ii.vision_description IS NOT NULL,
                COALESCE(ii.classification IN ('signature', 'noise'), 0),
@@ -228,7 +260,7 @@ def classify_sharepoint_files(conn: sqlite3.Connection, root: Path) -> list[File
         for (sha,) in conn.execute(
             "SELECT a.sha256 FROM attachments a JOIN attachment_content ac"
             " ON ac.attachment_id = a.id"
-            f" WHERE a.sha256 IS NOT NULL AND NOT COALESCE({UNREAD_SQL}, 0)"
+            f" WHERE a.sha256 IS NOT NULL AND NOT COALESCE({NOT_FULLY_READ_SQL}, 0)"
         )
     }
     found: list[FileState] = []

@@ -21,3 +21,10 @@ def test_the_nightly_pass_reaps_then_sweeps():
     sweep = text.index("src.cli sweep-files --policy")
     assert reap < sweep
     assert "--apply" not in text[reap : text.index("\n", reap)]
+
+
+def test_the_hourly_sweep_logs_its_own_exit_code():
+    """$(ts) resets $? before the echo reads it, so the rc must be captured on its own line."""
+    text = (WRAPPERS / "sb-outlook-sync.sh").read_text()
+    assert "rc_sweep=$?" in text
+    assert "(rc=$rc_sweep)" in text

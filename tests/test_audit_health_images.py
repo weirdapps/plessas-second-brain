@@ -27,24 +27,34 @@ def hc():
 def _db(pending_received, processed_received=()):
     db = sqlite3.connect(":memory:")
     db.execute(
-        "CREATE TABLE inline_images (id INTEGER PRIMARY KEY, vision_description TEXT, "
-        "classification TEXT, classified_at TEXT, visioned_at TEXT)"
+        "CREATE TABLE inline_images (sha256 TEXT PRIMARY KEY, vision_description TEXT, "
+        "classification TEXT, classified_at TEXT, visioned_at TEXT, "
+        "vision_attempts INTEGER NOT NULL DEFAULT 0)"
     )
     db.execute("CREATE TABLE emails (id INTEGER PRIMARY KEY, date_received TEXT)")
     db.execute(
         "CREATE TABLE attachments (id INTEGER PRIMARY KEY, email_id INTEGER, message_id TEXT, "
-        "mime_type TEXT, file_path TEXT)"
+        "mime_type TEXT, file_path TEXT, sha256 TEXT)"
     )
-    db.execute("CREATE TABLE inline_image_occurrences (message_id TEXT)")
+    db.execute("CREATE TABLE inline_image_occurrences (sha256 TEXT, message_id TEXT)")
     rows = [(r, False) for r in pending_received] + [(r, True) for r in processed_received]
     for i, (received, done) in enumerate(rows, start=1):
         db.execute("INSERT INTO emails (id, date_received) VALUES (?, ?)", (i, received))
         db.execute(
-            "INSERT INTO attachments (email_id, message_id, mime_type, file_path) VALUES (?,?,?,?)",
-            (i, f"m{i}", "image/png", f"/tmp/i{i}.png"),
+            "INSERT INTO attachments (email_id, message_id, mime_type, file_path, sha256)"
+            " VALUES (?,?,?,?,?)",
+            (i, f"m{i}", "image/png", f"/tmp/i{i}.png", f"s{i}"),
         )
         if done:
-            db.execute("INSERT INTO inline_image_occurrences (message_id) VALUES (?)", (f"m{i}",))
+            db.execute(
+                "INSERT INTO inline_images (sha256, vision_description, classification,"
+                " classified_at) VALUES (?, 'described', 'content', ?)",
+                (f"s{i}", received),
+            )
+            db.execute(
+                "INSERT INTO inline_image_occurrences (sha256, message_id) VALUES (?, ?)",
+                (f"s{i}", f"m{i}"),
+            )
     db.commit()
     return db
 
@@ -89,3 +99,25 @@ def test_report_names_the_oldest_queued_image(hc):
     line = next(ln for ln in report.splitlines() if "Inline Images" in ln)
     assert "oldest queued 9d" in line
     assert any("Inline Images" in str(i) for i in issues)
+
+
+def test_an_image_whose_email_is_gone_counts_as_queued(hc):
+    db = _db([])
+    db.execute(
+        "INSERT INTO attachments (email_id, message_id, mime_type, file_path, sha256)"
+        " VALUES (999, 'm-gone', 'image/png', '/tmp/gone.png', 's-gone')"
+    )
+
+    assert hc.check_images(db)["pending"] == 1
+
+
+def test_an_image_given_up_on_is_neither_owed_nor_stuck(hc):
+    db = _db([])
+    db.execute(
+        "INSERT INTO inline_images (sha256, classification, classified_at, vision_attempts)"
+        " VALUES ('s-x', 'unclassified', '2026-01-01T00:00:00Z', 3)"
+    )
+
+    r = hc.check_images(db)
+
+    assert (r["given_up"], r["owed"], r["stuck"]) == (1, 0, 0)

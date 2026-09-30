@@ -86,6 +86,16 @@ run_stage "image classification" "$PYTHON" -m src.cli process-images --limit 500
 echo "$(date '+%Y-%m-%d %H:%M:%S') — starting SharePoint fetch" >> "$LOG_FILE"
 run_stage "SharePoint fetch" "$PYTHON" -m src.cli process-sharepoint --max-fetches 100
 
+# Orphans: files whose bytes are already stored go once their directory is a day old; unique
+# files are adopted after the 7-day grace (scripts/reap_orphan_attachments.py). --policy:
+# nothing is deleted or adopted until the sweep policy says apply.
+echo "$(date '+%Y-%m-%d %H:%M:%S') - starting orphan reap" >> "$LOG_FILE"
+run_stage "orphan reap" "$PYTHON" scripts/reap_orphan_attachments.py --policy
+
+# Files are inputs, never stored: delete what Phase 1 and the image pass have finished with.
+echo "$(date '+%Y-%m-%d %H:%M:%S') - starting file sweep" >> "$LOG_FILE"
+run_stage "file sweep" "$PYTHON" -m src.cli sweep-files --policy
+
 # Every stage has run by here, so a restart would repeat the whole hour of LLM
 # and vision calls for a failure that a retry of the whole pass is unlikely to
 # fix; the failed stage is retried by tomorrow's pass. 65 means "ran to the end,

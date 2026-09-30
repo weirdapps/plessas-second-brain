@@ -223,5 +223,6 @@ _STATS = {
     "bytes_freed": 0,
     "adopted": 0,
     "already_ingested": 0,
+    "waiting": 0,
     "dirs_removed": 0,
 }

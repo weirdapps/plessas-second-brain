@@ -18,8 +18,8 @@ def _columns(conn, table):
     return {r[1] for r in conn.execute(f"PRAGMA table_xinfo({table})")}
 
 
-def test_schema_version_is_26():
-    assert CURRENT_SCHEMA_VERSION == 26
+def test_schema_version_covers_the_whatsapp_migration():
+    assert CURRENT_SCHEMA_VERSION >= 26
 
 
 def test_a_fresh_store_has_the_whatsapp_tables(db):
@@ -88,7 +88,7 @@ def test_a_v25_store_migrates_to_v26(tmp_path):
         conn.execute(f"DROP TABLE {table}")
     set_schema_version(conn, 25)
     run_migrations(conn)
-    assert get_schema_version(conn) == 26
+    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION
     assert _columns(conn, "whatsapp_messages")
     conn.close()
 
@@ -97,4 +97,4 @@ def test_running_the_migrations_twice_is_a_no_op(db):
     run_migrations(db)
     set_schema_version(db, 25)
     run_migrations(db)
-    assert get_schema_version(db) == 26
+    assert get_schema_version(db) == CURRENT_SCHEMA_VERSION

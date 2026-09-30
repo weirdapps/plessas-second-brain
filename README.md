@@ -365,6 +365,9 @@ python -m src.cli embed --force
 python -m src.cli prune-staged
 python -m src.cli hash-attachments          # record a content hash for every attachment file still on disk
 python -m src.cli sweep-files --policy      # delete attachment files whose content is stored (report-only by default)
+python -m src.cli reextract --capped --zip --unread    # read and summarise again rows earlier code capped, skipped or never read
+python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents
+python -m src.cli process-sharepoint --ingest-fetched  # store the files earlier SharePoint fetches left on disk
 ```
 
 Full subcommand list: `python -m src.cli --help`.

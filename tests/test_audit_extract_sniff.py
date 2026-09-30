@@ -226,15 +226,15 @@ def test_extensionless_office_file_declared_application_zip_is_extracted(tmp_pat
     assert (result["status"], result["method"]) == ("extracted", "python-docx")
 
 
-def test_a_real_archive_is_still_skipped(tmp_path):
+def test_a_real_archive_is_unpacked(tmp_path):
     zipped = extract_text_from_file(
         _write(tmp_path, "bundle.zip", _plain_zip_bytes()), "application/zip"
     )
-    assert zipped["status"] == "skipped"
+    assert (zipped["status"], zipped["method"]) == ("extracted", "zip")
     bare = extract_text_from_file(
         _write(tmp_path, "Outlook-zip", _plain_zip_bytes()), "application/zip"
     )
-    assert bare["status"] == "skipped"
+    assert bare["status"] == "extracted"
 
 
 def test_unknown_bytes_are_still_unsupported(tmp_path):

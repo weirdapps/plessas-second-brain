@@ -224,5 +224,7 @@ _STATS = {
     "adopted": 0,
     "already_ingested": 0,
     "waiting": 0,
+    "strays_deleted": 0,
+    "strays_kept": 0,
     "dirs_removed": 0,
 }

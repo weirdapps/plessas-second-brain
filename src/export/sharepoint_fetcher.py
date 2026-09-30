@@ -246,13 +246,16 @@ def record_link_in_db(
     fetched_path: str | None = None,
     file_name: str | None = None,
     file_size: int | None = None,
+    document_message_id: int | None = None,
 ) -> None:
+    """Record one fetch attempt. `document_message_id` names the text-only document the fetched
+    file became (src/extract/sharepoint_ingest.py); a later attempt that stores none keeps it."""
     now = datetime.now(UTC).isoformat()
     conn.execute(
         """INSERT INTO sharepoint_links
            (url, message_id, fetched_at, fetched_path, last_status, last_attempt_at,
-            file_name, file_size, attempts)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            file_name, file_size, attempts, document_message_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(url) DO UPDATE SET
              fetched_at = excluded.fetched_at,
              fetched_path = excluded.fetched_path,
@@ -261,7 +264,9 @@ def record_link_in_db(
              file_name = excluded.file_name,
              file_size = excluded.file_size,
              attempts = CASE WHEN excluded.last_status = 'ok'
-                             THEN 0 ELSE sharepoint_links.attempts + 1 END""",
+                             THEN 0 ELSE sharepoint_links.attempts + 1 END,
+             document_message_id = COALESCE(excluded.document_message_id,
+                                            sharepoint_links.document_message_id)""",
         (
             url,
             message_id,
@@ -272,6 +277,7 @@ def record_link_in_db(
             file_name,
             file_size,
             0 if status == "ok" else 1,
+            document_message_id,
         ),
     )
     conn.commit()

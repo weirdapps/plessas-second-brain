@@ -859,7 +859,7 @@ def sharepoint_index(
         operation: One of "list_stale", "list_unfetched", "refetch"
         url: Required only for refetch
     """
-    from src.config import ATTACHMENTS_DIR, SHAREPOINT_HOST
+    from src.config import SHAREPOINT_HOST
     from src.export import sharepoint_fetcher
 
     conn = _get_conn()
@@ -887,7 +887,7 @@ def sharepoint_index(
                 """
                 SELECT url, message_id, last_status
                 FROM sharepoint_links
-                WHERE fetched_path IS NULL
+                WHERE fetched_at IS NULL
                 ORDER BY last_attempt_at DESC
                 """
             ).fetchall()
@@ -920,22 +920,22 @@ def sharepoint_index(
                 return {"error": "refetch: url is not present in sharepoint_links"}
             if not sharepoint_fetcher.is_managed_sharepoint_host(url, SHAREPOINT_HOST):
                 return {"error": "refetch: url is not on the managed SharePoint host"}
-            out_dir = ATTACHMENTS_DIR / "sharepoint-refetch"
-            result = sharepoint_fetcher.fetch_sharepoint_link(url, out_dir)
+            from src.extract import sharepoint_ingest
+
+            # Fetched into a temporary directory and stored as text; no file is kept.
             msg_id = msg_id_row["message_id"]
+            result, document = sharepoint_ingest.fetch_and_ingest(conn, url, msg_id)
             sharepoint_fetcher.record_link_in_db(
                 conn,
                 url=url,
                 message_id=msg_id,
                 status=result.status,
-                fetched_path=str(result.local_path) if result.local_path else None,
+                fetched_path=None,
                 file_name=result.file_name,
                 file_size=result.file_size,
+                document_message_id=document,
             )
-            return {
-                "status": result.status,
-                "local_path": str(result.local_path) if result.local_path else None,
-            }
+            return {"status": result.status, "document_message_id": document}
 
         return {"error": f"unknown operation: {operation}"}
     finally:

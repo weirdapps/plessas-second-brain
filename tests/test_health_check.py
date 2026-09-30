@@ -367,15 +367,16 @@ def _images_db():
 
     db = sqlite3.connect(":memory:")
     db.execute(
-        "CREATE TABLE inline_images (id INTEGER PRIMARY KEY, vision_description TEXT, "
-        "classification TEXT, classified_at TEXT, visioned_at TEXT)"
+        "CREATE TABLE inline_images (sha256 TEXT PRIMARY KEY, vision_description TEXT, "
+        "classification TEXT, classified_at TEXT, visioned_at TEXT, "
+        "vision_attempts INTEGER NOT NULL DEFAULT 0)"
     )
     db.execute("CREATE TABLE emails (id INTEGER PRIMARY KEY, date_received TEXT)")
     db.execute(
         "CREATE TABLE attachments (id INTEGER PRIMARY KEY, email_id INTEGER, message_id TEXT, "
-        "mime_type TEXT, file_path TEXT)"
+        "mime_type TEXT, file_path TEXT, sha256 TEXT)"
     )
-    db.execute("CREATE TABLE inline_image_occurrences (message_id TEXT)")
+    db.execute("CREATE TABLE inline_image_occurrences (sha256 TEXT, message_id TEXT)")
     return db
 
 
@@ -394,18 +395,26 @@ def _queue(db, pending, done):
         email_id += 1
         db.execute("INSERT INTO emails (id) VALUES (?)", (email_id,))
         db.execute(
-            "INSERT INTO attachments (email_id, message_id, mime_type, file_path) VALUES (?,?,?,?)",
-            (email_id, f"done-{i}", "image/png", f"/tmp/d{i}.png"),
+            "INSERT INTO attachments (email_id, message_id, mime_type, file_path, sha256)"
+            " VALUES (?,?,?,?,?)",
+            (email_id, f"done-{i}", "image/png", f"/tmp/d{i}.png", f"d{i}"),
         )
-        db.execute("INSERT INTO inline_image_occurrences (message_id) VALUES (?)", (f"done-{i}",))
+        db.execute(
+            "INSERT INTO inline_images (sha256, vision_description, classification)"
+            " VALUES (?, 'described', 'content')",
+            (f"d{i}",),
+        )
+        db.execute(
+            "INSERT INTO inline_image_occurrences (sha256, message_id) VALUES (?, ?)",
+            (f"d{i}", f"done-{i}"),
+        )
     db.commit()
 
 
-def test_check_images_excludes_orphaned_attachments(hc):
-    """run_backfill JOINs attachments to emails, so an attachment with no email row
-    can never be picked up. Counting it inflates the queue permanently and would
-    eventually trip the WARN for work that cannot drain — on prod this was 91
-    reported vs 2 actually reachable."""
+def test_check_images_counts_images_whose_email_is_gone(hc):
+    """run_backfill takes an image whose email row is gone (with a blank sender), so it is
+    work the pipeline will do and the queue counts it. It used to JOIN emails, and then the
+    queue left such images out because nothing could drain them."""
     db = _images_db()
     _queue(db, pending=2, done=0)
     # Orphan: valid message_id and file, but no joinable email row.
@@ -415,7 +424,7 @@ def test_check_images_excludes_orphaned_attachments(hc):
     )
     db.commit()
 
-    assert hc.check_images(db)["pending"] == 2
+    assert hc.check_images(db)["pending"] == 3
 
 
 def test_check_images_reports_pending_queue_depth(hc):

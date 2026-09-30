@@ -149,3 +149,25 @@ def test_only_a_fully_finished_row_is_reused(db, tmp_path, monkeypatch, status, 
 
     assert len(reads) == 1
     assert stats["reused"] == 0
+
+
+def test_a_copy_the_old_caps_read_in_part_is_not_reused(db, tmp_path, monkeypatch):
+    """A workbook the old readers stopped at 51 rows: copying its row would carry the cut text
+    forward under a fresh date, where the sweep no longer knows it was cut."""
+    path, conn = db
+    first = _attachment(conn, tmp_path, 1)
+    conn.execute(
+        "INSERT INTO attachment_content (attachment_id, extracted_text, extraction_method,"
+        " extraction_status, extracted_at, summary, language, llm_status)"
+        " VALUES (?, 'rows 1 to 50', 'openpyxl', 'extracted', '2026-09-01', 'a book', 'en',"
+        " 'extracted')",
+        (first,),
+    )
+    _attachment(conn, tmp_path, 2)
+    conn.commit()
+    reads = _record_reads(monkeypatch)
+
+    stats = run_phase1(str(path))
+
+    assert stats.get("reused", 0) == 0
+    assert len(reads) == 1

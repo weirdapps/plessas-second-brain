@@ -17,7 +17,7 @@ from src.extract.attachment_extractors import extract_text_from_file
 from src.extract.vertex_auth import touch_sentinel
 from src.redact import redact_secrets
 from src.store.file_hashes import sha256_of_file
-from src.store.file_sweep import UNREAD_SQL
+from src.store.file_sweep import NOT_FULLY_READ_SQL
 
 # Processing constants
 PHASE2_BATCH_SIZE = 10
@@ -35,6 +35,12 @@ LONG_TEXT_CHARS = 50_000
 # The last element of a phase-2 worker's result when the budget ran out between the parts of a
 # long document: left pending for the next run, neither a failure nor a re-auth.
 DEFERRED = "deferred"
+
+# A longer text is summarised from this many parts, spread evenly across it (2,000,000
+# characters at 40,000 a part). Every part of a 40M-character log would be 1,000 calls in a
+# row, more than a night's budget, and a deferred text starts over the next night. The whole
+# text is still stored and searchable.
+MAX_SUMMARY_PARTS = 50
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -107,7 +113,7 @@ _REUSABLE_SQL = f"""
     FROM attachments a
     JOIN attachment_content ac ON ac.attachment_id = a.id
     WHERE a.sha256 = ? AND a.id != ?
-      AND NOT COALESCE({UNREAD_SQL}, 0)
+      AND NOT COALESCE({NOT_FULLY_READ_SQL}, 0)
       AND ac.extraction_status = 'extracted' AND ac.llm_status = 'extracted'
     ORDER BY ac.id
     LIMIT 1
@@ -300,19 +306,20 @@ def _extract_in_parts(text, filename, mime_type, email_subject, email_date, out_
     )
 
     parts = split_text(text)
+    chosen = _spread(len(parts), MAX_SUMMARY_PARTS)
     extractions = []
-    for i, part in enumerate(parts, 1):
+    for i in chosen:
         if out_of_time is not None and out_of_time():
             return None
         extractions.append(
             _complete_and_parse(
                 build_attachment_prompt(
-                    extracted_text=part,
+                    extracted_text=parts[i],
                     filename=filename,
                     mime_type=mime_type,
                     email_subject=email_subject,
                     email_date=email_date,
-                    part=(i, len(parts)),
+                    part=(i + 1, len(parts)),
                 )
             )
         )
@@ -325,8 +332,16 @@ def _extract_in_parts(text, filename, mime_type, email_subject, email_date, out_
             mime_type=mime_type,
             email_subject=email_subject,
             email_date=email_date,
+            covered=(len(chosen), len(parts)),
         )
     )
+
+
+def _spread(n: int, k: int) -> list[int]:
+    """At most k of the indices 0..n-1, spread evenly, the first and the last included."""
+    if n <= k:
+        return list(range(n))
+    return [round(j * (n - 1) / (k - 1)) for j in range(k)]
 
 
 def _extract_one_attachment(row, out_of_time=None):

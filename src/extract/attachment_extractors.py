@@ -7,14 +7,17 @@ Extracts text from PDF, Word, PowerPoint, Excel, images (OCR),
 import html
 import os
 import re
+import time
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
 from pathlib import Path
 
 # A ceiling against runaway input, not a cap real documents reach: text is stored in full and
-# Phase 2 summarises a long one in parts (src/extract/attachment_pipeline.py).
-MAX_TEXT_CHARS = 2_000_000
+# Phase 2 summarises a long one in parts (src/extract/attachment_pipeline.py). At 2,000,000 it
+# cut a 39.8M-character call log to 5%. A text cut here says the rest was left unread, which the
+# sweep treats as not stored (src/store/file_sweep.py UNREAD_SQL).
+MAX_TEXT_CHARS = 50_000_000
 # Minimum characters to consider a successful extraction
 MIN_TEXT_CHARS = 50
 
@@ -43,11 +46,20 @@ ZIP_MAX_DEPTH = 1
 # Its error then says "members left unread", which the sweep treats as not stored
 # (src/store/file_sweep.py UNREAD_SQL) and reextract --zip reads again with no budget.
 ZIP_MAX_SECONDS = 120
+# Every page of a scan is OCR'd, a few seconds each. A scan stops once this is spent and keeps
+# the pages it read; its error then says "pages left unread", like an archive's, and reextract
+# reads it again with no budget.
+OCR_MAX_SECONDS = 120
 ZIP_MIME_TYPES = frozenset({"application/zip", "application/x-zip-compressed"})
 
 
 def extract_text_from_file(
-    file_path: str, mime_type: str, _depth: int = 0, *, zip_seconds: float | None = None
+    file_path: str,
+    mime_type: str,
+    _depth: int = 0,
+    *,
+    zip_seconds: float | None = None,
+    ocr_seconds: float | None = None,
 ) -> dict:
     """Extract text from a file based on its MIME type.
 
@@ -55,8 +67,29 @@ def extract_text_from_file(
     status is one of: 'extracted', 'partial', 'failed', 'skipped'.
     _depth is how deep inside archives this file sits; only _extract_zip passes it.
     zip_seconds is how long an archive may spend reading members, ZIP_MAX_SECONDS when None;
-    reextract passes math.inf, since a one-time recovery run has the time.
+    ocr_seconds how long a scan may spend on its pages, OCR_MAX_SECONDS when None. reextract
+    passes math.inf for both, since a one-time recovery run has the time. A text cut at
+    MAX_TEXT_CHARS says so in the error.
     """
+    result = _extract_by_type(
+        file_path, mime_type, _depth, zip_seconds=zip_seconds, ocr_seconds=ocr_seconds
+    )
+    text = result.get("text")
+    error = result.get("error") or ""
+    if text and len(text) >= MAX_TEXT_CHARS and "left unread" not in error:
+        note = f"text cut at {MAX_TEXT_CHARS:,} characters, the rest left unread"
+        result = {**result, "error": f"{error}; {note}" if error else note}
+    return result
+
+
+def _extract_by_type(
+    file_path: str,
+    mime_type: str,
+    _depth: int,
+    *,
+    zip_seconds: float | None,
+    ocr_seconds: float | None,
+) -> dict:
     ext = Path(file_path).suffix.lower()
 
     # Skip unsupported types
@@ -128,12 +161,12 @@ def extract_text_from_file(
             sniffed = sniff_mime_type(file_path)
             if sniffed == "application/zip":
                 seconds = ZIP_MAX_SECONDS if zip_seconds is None else zip_seconds
-                return _extract_zip(file_path, _depth, seconds)
+                return _extract_zip(file_path, _depth, seconds, ocr_seconds)
             if sniffed is None:
                 return {"text": None, "method": None, "status": "skipped", "error": None}
             mime_type = sniffed  # an Office document sent as a zip
         if mime_type == "application/pdf" or ext == ".pdf":
-            return _extract_pdf(file_path)
+            return _extract_pdf(file_path, ocr_seconds)
         elif (
             mime_type
             in ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",)
@@ -195,7 +228,9 @@ def extract_text_from_file(
             # recursion ends because a second pass sniffs the same type.
             sniffed = sniff_mime_type(file_path)
             if sniffed and sniffed != mime_type and sniffed not in SKIP_MIME_TYPES:
-                return extract_text_from_file(file_path, sniffed, _depth, zip_seconds=zip_seconds)
+                return extract_text_from_file(
+                    file_path, sniffed, _depth, zip_seconds=zip_seconds, ocr_seconds=ocr_seconds
+                )
             return {
                 "text": None,
                 "method": None,
@@ -211,7 +246,7 @@ def extract_text_from_file(
         }
 
 
-def _extract_pdf(path: str) -> dict:
+def _extract_pdf(path: str, ocr_seconds: float | None = None) -> dict:
     """Extract text from PDF using PyMuPDF, with OCR fallback."""
     import fitz
 
@@ -228,7 +263,8 @@ def _extract_pdf(path: str) -> dict:
     # _extract_image_ocr cannot read PDFs (Image.open fails); _ocr_pdf_pages
     # renders each page via fitz.get_pixmap before OCR-ing. See B3 spec.
     if len(text.strip()) < MIN_TEXT_CHARS:
-        ocr_result = _ocr_pdf_pages(path)
+        budget = OCR_MAX_SECONDS if ocr_seconds is None else ocr_seconds
+        ocr_result = _ocr_pdf_pages(path, seconds=budget)
         if ocr_result["status"] == "extracted" and len(ocr_result["text"] or "") > len(
             text.strip()
         ):
@@ -484,7 +520,7 @@ def _ole_stream_names(path: str) -> set[str]:
 
 
 def _extract_excel(path: str) -> dict:
-    """Extract headers + first 50 rows per sheet from .xlsx files via openpyxl.
+    """Extract every row of every sheet from .xlsx files via openpyxl.
 
     .xlsb and .xls are dispatched to dedicated parsers (_extract_xlsb,
     _extract_xls) before reaching this function — see extract_text_from_file.
@@ -497,18 +533,13 @@ def _extract_excel(path: str) -> dict:
     with open(path, "rb") as fh:
         wb = openpyxl.load_workbook(fh, read_only=True, data_only=True)
 
-        max_sheets = 20
-        for _sheet_idx, sheet_name in enumerate(wb.sheetnames[:max_sheets]):
+        for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
             rows_text = []
-            row_count = 0
-            for row in ws.iter_rows(max_row=51, values_only=True):
+            for row in ws.iter_rows(values_only=True):
                 cells = [str(c) if c is not None else "" for c in row]
                 if any(c.strip() for c in cells):
                     rows_text.append(" | ".join(c for c in cells if c.strip()))
-                row_count += 1
-                if row_count >= 51:
-                    break
 
             if rows_text:
                 parts.append(f"--- Sheet: {sheet_name} ---\n" + "\n".join(rows_text))
@@ -527,12 +558,11 @@ def _extract_excel(path: str) -> dict:
 
 
 def _extract_xls(path: str) -> dict:
-    """Extract headers + first 50 rows per sheet from legacy .xls files.
+    """Extract every row of every sheet from legacy .xls files.
 
     xlrd 2.0+ dropped .xlsx support and now handles only the legacy BIFF
-    .xls format — perfect fit for our case. Mirrors _extract_excel's shape
-    (sheet headers, max 20 sheets, max 51 rows per sheet) so downstream
-    LLM extraction sees the same structure regardless of source format.
+    .xls format. Mirrors _extract_excel's shape (a header per sheet) so
+    downstream LLM extraction sees the same structure regardless of source format.
     """
     import xlrd
 
@@ -547,10 +577,9 @@ def _extract_xls(path: str) -> dict:
         }
 
     parts = []
-    max_sheets = 20
-    for sheet in list(wb.sheets())[:max_sheets]:
+    for sheet in wb.sheets():
         rows_text = []
-        for row_idx in range(min(sheet.nrows, 51)):
+        for row_idx in range(sheet.nrows):
             cells = [str(c) if c is not None else "" for c in sheet.row_values(row_idx)]
             if any(c.strip() for c in cells):
                 rows_text.append(" | ".join(c for c in cells if c.strip()))
@@ -569,25 +598,20 @@ def _extract_xls(path: str) -> dict:
 
 
 def _extract_xlsb(path: str) -> dict:
-    """Extract headers + first 50 rows per sheet from .xlsb (Excel binary) files.
+    """Extract every row of every sheet from .xlsb (Excel binary) files.
 
-    pyxlsb is the only mature Python reader for the .xlsb format. It loads
-    the whole workbook (no read_only mode like openpyxl), but our per-sheet
-    + per-row caps below bound the per-file work.
+    pyxlsb is the only mature Python reader for the .xlsb format; it reads rows as a stream.
     """
     import pyxlsb
 
     parts = []
-    max_sheets = 20
 
     try:
         with pyxlsb.open_workbook(path) as wb:
-            for sheet_name in list(wb.sheets)[:max_sheets]:
+            for sheet_name in list(wb.sheets):
                 rows_text = []
                 with wb.get_sheet(sheet_name) as sheet:
-                    for row_idx, row in enumerate(sheet.rows()):
-                        if row_idx >= 51:
-                            break
+                    for row in sheet.rows():
                         cells = [
                             str(cell.v) if cell is not None and cell.v is not None else ""
                             for cell in row
@@ -687,14 +711,15 @@ def _extract_image_ocr(path: str) -> dict:
         }
 
 
-def _ocr_pdf_pages(path: str, max_pages: int = 30) -> dict:
+def _ocr_pdf_pages(path: str, seconds: float | None = None) -> dict:
     """Render each PDF page to a PIL image and OCR it. Used as fallback for
     scanned PDFs when PyMuPDF text extraction yields too little content.
 
-    200 DPI is the sweet spot for printed text — enough resolution for
+    200 DPI is the sweet spot for printed text: enough resolution for
     Tesseract to recognize Greek + English glyphs reliably, low enough that
-    a typical 2-page scan completes in 3-10 seconds. Hard-cap at 30 pages
-    to bound worst-case time on big documents (most ACME scans are <10).
+    a typical 2-page scan completes in 3-10 seconds. Every page is read until
+    `seconds` (OCR_MAX_SECONDS when None) is spent; then the pages read are kept
+    and the error says how many were left unread.
     """
     import io
 
@@ -702,11 +727,15 @@ def _ocr_pdf_pages(path: str, max_pages: int = 30) -> dict:
     import pytesseract
     from PIL import Image
 
+    budget = OCR_MAX_SECONDS if seconds is None else seconds
+    note = None
     try:
         doc = fitz.open(path)
         pages_text = []
+        started = time.monotonic()
         for page_num, page in enumerate(doc):
-            if page_num >= max_pages:
+            if page_num and time.monotonic() - started > budget:
+                note = f"time budget spent, {doc.page_count - page_num} pages left unread"
                 break
             pix = page.get_pixmap(dpi=200)
             img = Image.open(io.BytesIO(pix.tobytes("png")))
@@ -724,17 +753,18 @@ def _ocr_pdf_pages(path: str, max_pages: int = 30) -> dict:
 
     text = _truncate("\n\n".join(pages_text))
     if _apply_noise_filter(text):
+        insufficient = "OCR returned insufficient text"
         return {
             "text": None,
             "method": "pymupdf+tesseract",
             "status": "skipped",
-            "error": "OCR returned insufficient text",
+            "error": f"{insufficient}; {note}" if note else insufficient,
         }
     return {
         "text": text,
         "method": "pymupdf+tesseract",
         "status": "extracted",
-        "error": None,
+        "error": note,
     }
 
 
@@ -835,7 +865,7 @@ def _copy_at_most(src, dst, limit: int) -> int | None:
     return written
 
 
-def _extract_zip(path: str, depth: int, seconds: float) -> dict:
+def _extract_zip(path: str, depth: int, seconds: float, ocr_seconds: float | None = None) -> dict:
     """Unpack an archive into a temporary directory and extract every member.
 
     Nothing outlives the call. A member is written under a name made up here, never under the
@@ -843,7 +873,6 @@ def _extract_zip(path: str, depth: int, seconds: float) -> dict:
     """
     import mimetypes
     import tempfile
-    import time
     import zipfile
 
     if depth > ZIP_MAX_DEPTH:
@@ -896,7 +925,7 @@ def _extract_zip(path: str, depth: int, seconds: float) -> dict:
                         continue
                     mime = mimetypes.guess_type(name.lower())[0] or ""
                     result = extract_text_from_file(
-                        str(member), mime, depth + 1, zip_seconds=seconds
+                        str(member), mime, depth + 1, zip_seconds=seconds, ocr_seconds=ocr_seconds
                     )
                 except Exception as e:
                     notes.append(f"{name}: {type(e).__name__}: {str(e)[:200]}")
@@ -992,10 +1021,11 @@ def _strip_html_tags(raw_html: str) -> str:
     return text.strip()
 
 
-def _truncate(text: str, max_chars: int = MAX_TEXT_CHARS) -> str:
-    """Truncate text to max_chars."""
-    if len(text) > max_chars:
-        return text[:max_chars]
+def _truncate(text: str, max_chars: int | None = None) -> str:
+    """Truncate text to max_chars, MAX_TEXT_CHARS when None (read at call time)."""
+    limit = MAX_TEXT_CHARS if max_chars is None else max_chars
+    if len(text) > limit:
+        return text[:limit]
     return text
 
 

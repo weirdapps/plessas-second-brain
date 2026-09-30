@@ -100,3 +100,35 @@ def test_the_report_line_names_the_mode_and_the_states(db, tmp_path):
     line = hc.files_on_disk_detail(row)
     assert "report-only" in line and "1 stored and removable" in line
     assert chr(0x2014) not in line and chr(0x2013) not in line
+
+
+def test_a_scan_error_is_a_warn_row_not_a_crash(db, monkeypatch):
+    """main() runs the checks unguarded, so an exception here would take down the whole report."""
+
+    def boom(*_a, **_k):
+        raise OSError("disk went away")
+
+    monkeypatch.setattr("src.store.file_sweep.classify_files", boom)
+    row = hc.check_files_on_disk(db)
+    assert row["status"] == "WARN"
+    assert "disk went away" in hc.files_on_disk_detail(row)
+
+
+def test_an_unreadable_policy_file_warns(db, tmp_path):
+    """A hand edit with a trailing comma must not stop deletion while the row reads OK."""
+    (tmp_path / "policy.json").write_text('{"apply": true,}')
+    row = hc.check_files_on_disk(db)
+    assert row["status"] == "WARN"
+    assert "unreadable" in hc.files_on_disk_detail(row)
+
+
+def test_files_phase_1_could_not_read_are_counted(db, tmp_path):
+    _stored(db, tmp_path / "att", "a.pdf", hours_old=1)
+    db.execute(
+        "UPDATE attachment_content SET extraction_status = 'failed',"
+        " extraction_error = 'File not found: /elsewhere/a.pdf'"
+    )
+    db.commit()
+    row = hc.check_files_on_disk(db)
+    assert row["counts"]["unread"] == 1
+    assert "1 unread" in hc.files_on_disk_detail(row)

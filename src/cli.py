@@ -432,13 +432,13 @@ def cmd_hash_attachments(args):
 def cmd_sweep_files(args):
     """Delete attachment files whose content is already stored (src/store/file_sweep.py).
 
-    Report-only unless --apply, or unless --policy points at a policy file that says apply.
+    Report-only unless --apply, or unless --policy is given and the policy file says apply.
     Explicit flags win over the file.
     """
     from src.store.file_sweep import SweepPolicy, load_policy, parse_timestamp, sweep_files
     from src.store.schema import get_connection as get_conn
 
-    policy = load_policy(Path(args.policy)) if args.policy else SweepPolicy()
+    policy = load_policy() if args.policy else SweepPolicy()
     if args.apply:
         policy = SweepPolicy(apply=True, only_newer_than=policy.only_newer_than)
     if args.only_newer_than:
@@ -2875,12 +2875,11 @@ def main():
     parser_sweep.add_argument(
         "--only-newer-than", default=None, help="ISO time: delete only files modified since"
     )
+    # A flag, not a path: no path typed on the command line reaches a file read.
     parser_sweep.add_argument(
         "--policy",
-        nargs="?",
-        const=str(SWEEP_POLICY_FILE),
-        default=None,
-        help=f"Take apply and the cutoff from a policy file (default {SWEEP_POLICY_FILE})",
+        action="store_true",
+        help=f"Take apply and the cutoff from {SWEEP_POLICY_FILE}",
     )
     parser_sweep.add_argument(
         "--root", default=str(ATTACHMENTS_DIR), help="Attachments root to sweep"

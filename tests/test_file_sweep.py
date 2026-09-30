@@ -278,7 +278,7 @@ def test_the_cli_defaults_to_report_only(tmp_path, capsys):
 
     cmd_sweep_files(
         Namespace(
-            db=db_path, apply=False, only_newer_than=None, policy=None, root=str(tmp_path / "att")
+            db=db_path, apply=False, only_newer_than=None, policy=False, root=str(tmp_path / "att")
         )
     )
 
@@ -286,7 +286,8 @@ def test_the_cli_defaults_to_report_only(tmp_path, capsys):
     assert "REPORT ONLY" in capsys.readouterr().out
 
 
-def test_the_cli_applies_the_policy_file(tmp_path, capsys):
+def test_the_cli_applies_the_policy_file(tmp_path, monkeypatch, capsys):
+    import src.store.file_sweep
     from src.cli import cmd_sweep_files
 
     db_path = tmp_path / "brain.db"
@@ -295,19 +296,63 @@ def test_the_cli_applies_the_policy_file(tmp_path, capsys):
     conn.close()
     policy = tmp_path / "sweep-policy.json"
     policy.write_text(json.dumps({"apply": True, "only_newer_than": None}))
+    monkeypatch.setattr(src.store.file_sweep, "SWEEP_POLICY_FILE", policy)
 
     cmd_sweep_files(
         Namespace(
             db=db_path,
             apply=False,
             only_newer_than=None,
-            policy=str(policy),
+            policy=True,
             root=str(tmp_path / "att"),
         )
     )
 
     assert not f.exists()
     assert "APPLIED" in capsys.readouterr().out
+
+
+def _elsewhere_policy(tmp_path: Path) -> Path:
+    policy = tmp_path / "elsewhere.json"
+    policy.write_text(json.dumps({"apply": True, "only_newer_than": None}))
+    return policy
+
+
+def test_sweep_files_takes_no_policy_path(tmp_path, monkeypatch, capsys):
+    """--policy reads SWEEP_POLICY_FILE and nothing else: no path typed on the command line
+    reaches a file read (SonarCloud pythonsecurity:S8707)."""
+    import sys
+
+    from src.cli import main
+
+    db_path = tmp_path / "brain.db"
+    create_database(str(db_path)).close()
+    argv = ["brain", "--db", str(db_path), "sweep-files", "--root", str(tmp_path / "att")]
+    monkeypatch.setattr(sys, "argv", [*argv, "--policy", str(_elsewhere_policy(tmp_path))])
+
+    with pytest.raises(SystemExit) as exc:
+        main()
+
+    assert exc.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+def test_the_reaper_takes_no_policy_path(tmp_path, monkeypatch, capsys):
+    import sys
+
+    import tests.test_orphan_reaper as tor
+
+    db_path = tmp_path / "brain.db"
+    create_database(str(db_path)).close()
+    (tmp_path / "att").mkdir()
+    argv = ["reap_orphan_attachments", "--db", str(db_path), "--root", str(tmp_path / "att")]
+    monkeypatch.setattr(sys, "argv", [*argv, "--policy", str(_elsewhere_policy(tmp_path))])
+
+    with pytest.raises(SystemExit) as exc:
+        tor._REAPER.main()
+
+    assert exc.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
 
 
 # ---- Final-review fixes: nothing whose bytes were never read, and every image, is kept ----
@@ -483,7 +528,7 @@ def test_the_cli_reports_unread_files_and_errors(tmp_path, capsys):
 
     cmd_sweep_files(
         Namespace(
-            db=db_path, apply=False, only_newer_than=None, policy=None, root=str(tmp_path / "att")
+            db=db_path, apply=False, only_newer_than=None, policy=False, root=str(tmp_path / "att")
         )
     )
 

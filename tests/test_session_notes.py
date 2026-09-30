@@ -150,10 +150,44 @@ def test_malformed_records_are_skipped(tmp_path):
         {"type": "assistant", "message": {"content": [{"type": "tool_use"}]}},
         {"type": "user", "message": {"content": "plain text"}},
         {"type": "user", "message": {"content": [{"type": "tool_result"}]}},
+        {"type": "user", "message": "a message that is a string"},
+        {"type": "user", "message": ["a", "list"]},
+        {
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": ["not", "a", "string"], "name": "Write", "input": {}}
+                ]
+            },
+        },
         _use(1, "Write", file_path="/n/a.md", content="kept"),
         _result(1),
     )
     assert notes["/n/a.md"].text == "kept"
+
+
+def test_a_numeric_timestamp_does_not_break_the_comparison(conn, tmp_path):
+    ingest_session_notes(conn, [_session(tmp_path, "s1", LONG)])
+    odd = tmp_path / "s2.jsonl"
+    record = _use(1, "Write", session="s2", file_path="/n/plan.md", content=LONG + " Odd.")
+    record["timestamp"] = 1727690000
+    _write(odd, [record, _result(1, "s2")])
+
+    assert ingest_session_notes(conn, [odd])["errors"] == 0
+
+
+def test_an_invalid_byte_does_not_stop_the_read(tmp_path):
+    f = tmp_path / "s.jsonl"
+    good = json.dumps(_use(1, "Write", file_path="/n/a.md", content="after the bad byte"))
+    f.write_bytes(
+        b'{"type": "user", "message": "caf\xe9"}\n'
+        + good.encode()
+        + b"\n"
+        + json.dumps(_result(1)).encode()
+        + b"\n"
+    )
+
+    assert collect_session_notes(f)["/n/a.md"].text == "after the bad byte"
 
 
 @pytest.fixture
@@ -245,20 +279,96 @@ def test_a_document_two_paths_share_is_kept_when_one_changes(conn, tmp_path):
     )
 
 
-def test_the_scan_takes_only_transcripts_changed_since_the_last_one(conn, tmp_path, monkeypatch):
+def _projects(tmp_path, monkeypatch):
+    from src.export import session_notes
+
+    root = tmp_path / "projects"
+    (root / "-work-proj").mkdir(parents=True)
+    monkeypatch.setattr(session_notes, "CLAUDE_CODE_PROJECTS_DIR", root)
+    return root / "-work-proj"
+
+
+def _age(path, hours):
     import os
     import time
 
+    t = time.time() - hours * 3600
+    os.utime(path, (t, t))
+
+
+def test_a_transcript_read_once_is_not_read_again_until_it_changes(conn, tmp_path, monkeypatch):
+    from src.export.session_notes import transcripts_to_scan
+
+    proj = _projects(tmp_path, monkeypatch)
+    f = _session(proj, "s1", LONG)
+    assert transcripts_to_scan(conn, all_files=False) == [f]
+    ingest_session_notes(conn, [f])
+
+    assert transcripts_to_scan(conn, all_files=False) == []
+    with open(f, "a") as out:
+        out.write("\n")
+    assert transcripts_to_scan(conn, all_files=False) == [f]
+
+
+def test_a_transcript_arriving_late_with_an_old_mtime_is_read(conn, tmp_path, monkeypatch):
+    """rsync keeps the Mac's write time, so a laptop that syncs late delivers transcripts that
+    look older than the last scan. They are new to this host all the same."""
+    from src.export.session_notes import transcripts_to_scan
+
+    proj = _projects(tmp_path, monkeypatch)
+    _session(proj, "s1", LONG)
+    ingest_session_notes(conn, transcripts_to_scan(conn, all_files=False))
+    late = _session(proj, "s2", LONG + " Late.")
+    _age(late, 3)
+
+    assert transcripts_to_scan(conn, all_files=False) == [late]
+
+
+def test_the_first_scan_leaves_old_transcripts_to_the_backfill(conn, tmp_path, monkeypatch):
+    from src.export.session_notes import transcripts_to_scan
+
+    proj = _projects(tmp_path, monkeypatch)
+    old = _session(proj, "old", LONG)
+    _age(old, 24 * 5)
+    new = _session(proj, "new", LONG + " New.")
+
+    assert transcripts_to_scan(conn, all_files=False) == [new]
+    assert transcripts_to_scan(conn, all_files=False) == [new], "old stays with the backfill"
+    assert sorted(transcripts_to_scan(conn, all_files=True)) == sorted([new, old])
+
+
+def test_subagent_transcripts_are_read(conn, tmp_path, monkeypatch):
+    """Delegated agents write plans, specs and reports too; their transcripts sit under the
+    session's own directory."""
+    from src.export.session_notes import transcripts_to_scan
+
+    proj = _projects(tmp_path, monkeypatch)
+    nested = proj / "s1" / "subagents"
+    nested.mkdir(parents=True)
+    agent = _session(nested, "agent-1", LONG, path="/n/spec.md")
+
+    assert agent in transcripts_to_scan(conn, all_files=False)
+
+
+def test_one_failing_transcript_does_not_stop_the_others(conn, tmp_path, monkeypatch):
     from src.export import session_notes
 
-    old = _session(tmp_path, "old", LONG)
-    new = _session(tmp_path, "new", LONG + " New.")
-    os.utime(old, (time.time() - 7200, time.time() - 7200))
-    monkeypatch.setattr(session_notes, "scan_conversation_files", lambda: [new, old])
-    session_notes.mark_scanned(conn, time.time() - 3600)
+    proj = _projects(tmp_path, monkeypatch)
+    bad = _session(proj, "bad", LONG, path="/n/bad.md")
+    good = _session(proj, "good", LONG + " Good.", path="/n/good.md")
+    real = session_notes.collect_session_notes
 
-    assert session_notes.transcripts_to_scan(conn, all_files=False) == [new]
-    assert session_notes.transcripts_to_scan(conn, all_files=True) == [new, old]
+    def flaky(path):
+        if path == bad:
+            raise RuntimeError("database is locked")
+        return real(path)
+
+    monkeypatch.setattr(session_notes, "collect_session_notes", flaky)
+
+    stats = session_notes.ingest_session_notes(conn, [bad, good])
+
+    assert (stats["errors"], stats["stored"]) == (1, 1)
+    assert session_notes.transcripts_to_scan(conn, all_files=False) == [bad], "retried next run"
 
 
 def test_a_document_another_source_holds_is_kept_when_the_note_changes(conn, tmp_path):

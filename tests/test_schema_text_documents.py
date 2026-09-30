@@ -28,6 +28,7 @@ def test_a_fresh_store_has_the_v28_shape(tmp_path):
         "written_at",
         "sha256",
     }
+    assert _cols(conn, "session_note_transcripts") == {"path", "size", "mtime_ns"}
     for table in ("key_facts", "decisions", "action_items"):
         assert "attachment_id" in _cols(conn, table)
         indexes = {r[1] for r in conn.execute(f"PRAGMA index_list({table})")}

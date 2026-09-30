@@ -472,7 +472,7 @@ def cmd_reextract(args):
         root=args.root,
     )
     print(f"reextract ({', '.join(sorted(which))}){' DRY RUN' if args.dry_run else ''}:")
-    for key in ("selected", "reread", "resummarise", "missing", "summarised", "failed"):
+    for key in ("selected", "reread", "resummarise", "missing", "kept", "summarised", "failed"):
         print(f"  {key:<12}: {stats[key]:,}")
     return 0
 

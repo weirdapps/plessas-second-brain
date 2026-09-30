@@ -9,8 +9,11 @@
     unread  Phase 1 recorded the row without reading the bytes (the file was not found, or
             this host lacked the tool): read it again
 
-A row is updated in place, so its id, and the vector keyed on it, stay its own. The vector is
-dropped so the next index build embeds the new summary. Phase 2 replaces the attachment's own
+A row is updated in place, so its id, and the vector keyed on it, stay its own. A re-read that
+comes back with no text leaves a row that already had text untouched (counted as kept): a
+timeout or a parser error must not replace what was stored. The vector is dropped once Phase 2
+has run, for every row it did not fail, so the next index build embeds the new summary; a row
+whose new summary failed keeps its old summary and vector. Phase 2 replaces the attachment's own
 key facts, decisions and action items, and does not repeat one an older summary already put on
 the email.
 """
@@ -48,16 +51,25 @@ SELECTORS: dict[str, tuple[str, bool]] = {
 
 
 def select_rows(conn, which: set[str], limit: int | None = None) -> list[tuple]:
-    """(content id, attachment id, file path, mime type, whether Phase 1 runs) per chosen row."""
+    """(content id, attachment id, file path, mime type, whether Phase 1 runs, whether the row
+    holds text) per chosen row."""
     rows: dict[int, tuple] = {}
     for name in sorted(which):
         where, reread = SELECTORS[name]
-        for ac_id, att_id, file_path, mime in conn.execute(
-            "SELECT ac.id, a.id, a.file_path, a.mime_type FROM attachment_content ac"
+        for ac_id, att_id, file_path, mime, has_text in conn.execute(
+            "SELECT ac.id, a.id, a.file_path, a.mime_type, ac.extracted_text IS NOT NULL"
+            " FROM attachment_content ac"
             f" JOIN attachments a ON a.id = ac.attachment_id WHERE {where}"
         ):
             prior = rows.get(ac_id)
-            rows[ac_id] = (ac_id, att_id, file_path, mime, reread or bool(prior and prior[4]))
+            rows[ac_id] = (
+                ac_id,
+                att_id,
+                file_path,
+                mime,
+                reread or bool(prior and prior[4]),
+                bool(has_text),
+            )
     ordered = [rows[k] for k in sorted(rows)]
     return ordered[:limit] if limit else ordered
 
@@ -74,7 +86,7 @@ def reextract(
     db_path = str(db_path or DEFAULT_DB)
     root = Path(root) if root else ATTACHMENTS_DIR
     stats = dict.fromkeys(
-        ("selected", "reread", "resummarise", "missing", "summarised", "failed"), 0
+        ("selected", "reread", "resummarise", "missing", "kept", "summarised", "failed"), 0
     )
     touched: list[tuple[int, int]] = []
     conn = _connect(db_path)
@@ -82,7 +94,7 @@ def reextract(
         rows = select_rows(conn, which or set(), limit)
         stats["selected"] = len(rows)
         now = datetime.now().isoformat()
-        for ac_id, att_id, file_path, mime, reread in rows:
+        for ac_id, att_id, file_path, mime, reread, has_text in rows:
             if not reread:
                 stats["resummarise"] += 1
                 if not dry_run:
@@ -103,6 +115,9 @@ def reextract(
             if dry_run:
                 continue
             result = extract_text_from_file(str(path), mime or "", zip_seconds=math.inf)
+            if has_text and not result["text"]:
+                stats["kept"] += 1
+                continue
             conn.execute(
                 """UPDATE attachment_content
                    SET extracted_text = ?, extraction_method = ?, extraction_status = ?,
@@ -125,8 +140,22 @@ def reextract(
     if touched:
         from src.store.embeddings import remove_vectors
 
-        remove_vectors([-ac_id for ac_id, _ in touched])
         p2 = run_phase2(db_path, attachment_ids=[att for _, att in touched], workers=workers)
         stats["summarised"] = p2["extracted"]
         stats["failed"] = p2["failed"]
+        conn = _connect(db_path)
+        try:
+            marks = ",".join("?" * len(touched))
+            redone = [
+                ac_id
+                for (ac_id,) in conn.execute(
+                    f"SELECT id FROM attachment_content WHERE id IN ({marks})"
+                    " AND llm_status != 'failed'",
+                    [ac_id for ac_id, _ in touched],
+                )
+            ]
+        finally:
+            conn.close()
+        if redone:
+            remove_vectors([-ac_id for ac_id in redone])
     return stats

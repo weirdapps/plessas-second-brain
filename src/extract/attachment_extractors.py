@@ -12,8 +12,9 @@ from email.message import EmailMessage
 from email.parser import BytesParser
 from pathlib import Path
 
-# Maximum characters to store per file
-MAX_TEXT_CHARS = 100_000
+# A ceiling against runaway input, not a cap real documents reach: text is stored in full and
+# Phase 2 summarises a long one in parts (src/extract/attachment_pipeline.py).
+MAX_TEXT_CHARS = 2_000_000
 # Minimum characters to consider a successful extraction
 MIN_TEXT_CHARS = 50
 

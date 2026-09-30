@@ -1597,7 +1597,7 @@ def cmd_sync(args):
         print("\nNo new emails — skipping dedup and embeddings")
 
     # Step 6: Process new attachment content
-    from src.extract.attachment_pipeline import run_phase1, run_phase2
+    from src.extract.attachment_pipeline import LONG_TEXT_CHARS, run_phase1, run_phase2
 
     # Ensure attachment_content table exists
     from src.store.schema import run_migrations as run_mig
@@ -1622,7 +1622,12 @@ def cmd_sync(args):
             f"{p1_stats['failed']} failed, {p1_stats['skipped']} skipped"
             + (f", {deferred} deferred (out of time)" if deferred else "")
         )
-        p2_stats = run_phase2(db_path, attachment_ids=scope_ids, deadline_s=PHASE2_SYNC_DEADLINE_S)
+        p2_stats = run_phase2(
+            db_path,
+            attachment_ids=scope_ids,
+            deadline_s=PHASE2_SYNC_DEADLINE_S,
+            max_text_chars=LONG_TEXT_CHARS,
+        )
         p2_deferred = p2_stats.get("deferred", 0)
         print(
             f"  Phase 2: {p2_stats['extracted']} LLM extracted, {p2_stats['failed']} failed"

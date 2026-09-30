@@ -167,6 +167,15 @@ else
   echo "$(ts) — load done (rc=$rc4)" >> "$LOG"
 fi
 
+# Files are inputs, never stored: delete the attachment files whose content the load above
+# stored. Report-only until data/state/sweep-policy.json turns deletion on
+# (src/store/file_sweep.py). A failure is logged and not folded into rc: the health check's
+# "Files on disk" row catches a sweep that stops working.
+echo "$(ts) - start file sweep" >> "$LOG"
+"$PYTHON" -m src.cli sweep-files --policy >> "$LOG" 2>&1
+rc_sweep=$?
+echo "$(ts) - file sweep done (rc=$rc_sweep)" >> "$LOG"
+
 rc=$overall_rc
 
 failures=$(read_failures)

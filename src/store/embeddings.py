@@ -857,3 +857,37 @@ def build_whatsapp_index(conn, force: bool = False, limit: int = 0) -> int:
         conn.execute("UPDATE whatsapp_threads SET embedding_at = ? WHERE id = ?", (now, tid))
     conn.commit()
     return len(pairs)
+
+
+def remove_vectors(ids) -> int:
+    """Drop these vector ids from the index, atomically, under the index lock.
+
+    For rows the store has forgotten (src/store/forget.py). build_index only ever adds email
+    and attachment vectors, so a forgotten document's vector would otherwise keep answering
+    searches for a row that no longer exists. Returns how many were removed. A missing index
+    is not an error.
+    """
+    drop = {int(i) for i in ids}
+    if not drop:
+        return 0
+    removed = 0
+    with _index_lock():
+        if not EMBEDDINGS_FILE.exists():
+            return 0
+        data = np.load(EMBEDDINGS_FILE, allow_pickle=False)
+        order = [int(x) for x in data["ids"]]
+        vectors = data["vectors"]
+        if len(order) != len(vectors):
+            raise RuntimeError(
+                f"{EMBEDDINGS_FILE} holds {len(order)} ids for {len(vectors)} vectors; "
+                "refusing to rewrite a misaligned index"
+            )
+        keep = np.array([vid not in drop for vid in order], dtype=bool)
+        removed = len(order) - int(keep.sum())
+        if removed:
+            _atomic_savez(EMBEDDINGS_FILE, [v for v in order if v not in drop], vectors[keep])
+        del data, vectors
+        gc.collect()
+    if removed:
+        _log(f"Removed {removed} vectors of forgotten rows")
+    return removed

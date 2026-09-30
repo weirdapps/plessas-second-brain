@@ -294,7 +294,7 @@ Preferred credential path. Uses Application Default Credentials, no API key requ
 - `BRAIN_NEWS_DB`: the external news-reader SQLite database `news-sync` reads (default `~/SourceCode/news/data/news.db`). Read-only; no news ingestion happens without it.
 - `BRAIN_ROLE`: `producer` or `replica`. A replica holds a copy of the database built on another host, and every command but the read-only ones (`query`, `stats`, `stale`, `prep`, the Teams readers) refuses to run there, as do the maintenance scripts and store modules that write and the MCP `sharepoint_index` refetch, since the next pull replaces what they would write. Without this variable a host is a replica when the pull job's stamp `~/.second-brain/db-pull.stamp` exists.
 - `SECOND_BRAIN_VENV_PYTHON`: explicit venv override for `run_mcp.sh`.
-- `BRAIN_DATA_DIR`: data home for the DB, attachments, staging, embeddings and SharePoint files. Defaults to `<repo>/data`. Use an **absolute** path: `src/config.py` does not call `expanduser()`, and systemd's `EnvironmentFile=` does not expand `~` either, so a tilde produces a directory literally named `~`.
+- `BRAIN_DATA_DIR`: data home for the DB, attachments, staging, embeddings and SharePoint files. Attachment files are deleted once their content is stored, as described in [Files are inputs](docs/DEPLOY.md#10-files-are-inputs). Defaults to `<repo>/data`. Use an **absolute** path: `src/config.py` does not call `expanduser()`, and systemd's `EnvironmentFile=` does not expand `~` either, so a tilde produces a directory literally named `~`.
 - The database file is `brain.db` inside `BRAIN_DATA_DIR`, so `<repo>/data/brain.db` by default. The global `--db` flag (placed before the subcommand, e.g. `python -m src.cli --db /path/brain.db stats`) overrides it.
 
 `scripts/health_check.py` reads two more, `HEALTH_EMAIL_TO` and `HC_PING_URL`. Both are documented in [`docs/DEPLOY.md`](docs/DEPLOY.md).
@@ -363,6 +363,8 @@ python -m src.cli stats
 python -m src.cli migrate
 python -m src.cli embed --force
 python -m src.cli prune-staged
+python -m src.cli hash-attachments          # record a content hash for every attachment file still on disk
+python -m src.cli sweep-files --policy      # delete attachment files whose content is stored (report-only by default)
 ```
 
 Full subcommand list: `python -m src.cli --help`.

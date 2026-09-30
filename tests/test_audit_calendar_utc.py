@@ -83,7 +83,7 @@ def test_v25_marks_the_stored_graph_times_as_utc(tmp_path):
         "offset": ("2026-10-03T16:00:00+03:00", "2026-10-03T17:00:00+03:00"),
     }
     assert _times(conn) == after_one, "a second run changes nothing"
-    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION == 26
+    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION
 
 
 def test_a_fresh_store_loads_the_same_shape_the_migration_leaves(tmp_path):

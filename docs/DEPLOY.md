@@ -336,3 +336,19 @@ On a single host that is the database your scheduled jobs write, so queries see
 the latest ingest. On a replica it is whatever the last pull left behind: check
 `~/.second-brain/db-pull.stamp`, or the `data_as_of` and `age_hours` fields the
 `stats` tool returns, before trusting an answer about anything recent.
+
+## 10. Files are inputs
+
+Attachment files are deleted once their content is stored; the database keeps the text,
+summaries, facts and vectors. Three commands and one file control it:
+
+| Piece | What it does |
+| --- | --- |
+| `python -m src.cli hash-attachments` | Records `attachments.sha256` for files still on disk. Run it before deletion starts: afterwards the hash is the only evidence of what a file held |
+| `python -m src.cli sweep-files [--apply] [--only-newer-than ISO] [--policy]` | Deletes registered files whose content is stored. Report-only by default |
+| `scripts/reap_orphan_attachments.py [--apply] [--adopt-only] [--policy]` | Unregistered directories: stored duplicates go after a day, unique files are adopted after 7 days |
+| `data/state/sweep-policy.json` | `{"apply": true or false, "only_newer_than": ISO or null}`. Absent means report-only. The wrappers pass `--policy`, so this file alone decides whether anything is deleted |
+
+The wrappers under `scripts/wrappers/systemd/` call the sweep and the reaper; copy them into
+`~/.local/bin` after changing them (they are an archive, see section 3). The health check's
+"Files on disk" row shows what is still held and warns when the sweep stops.

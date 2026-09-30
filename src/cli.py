@@ -18,6 +18,7 @@ from src.config import (
     document_roots,
 )
 from src.llm_deadline import install_llm_deadline_for_this_process
+from src.store.file_sweep import SWEEP_POLICY_FILE
 
 # Attachments registered per sync run. Step 6 runs Phase 1 (local parse) and
 # Phase 2 (one LLM call each) over exactly this set, inside a unit with a
@@ -404,6 +405,64 @@ def cmd_register_attachments(args):
         f"  Registered: {stats['registered']:,} from {stats['scanned']:,} message dirs\n"
         f"  Awaiting their email: {stats['deferred']:,}"
     )
+
+
+def cmd_hash_attachments(args):
+    """Record a content hash for every attachment whose file is still on disk.
+
+    Run before anything deletes attachment files: afterwards the hash is the only evidence
+    of what a file held. Resumable; see src/store/file_hashes.py.
+    """
+    from src.store.file_hashes import hash_attachments
+    from src.store.schema import get_connection as get_conn
+
+    conn = get_conn(str(args.db or DEFAULT_DB))
+    try:
+        stats = hash_attachments(conn, limit=args.limit if args.limit > 0 else None)
+        left = conn.execute("SELECT COUNT(*) FROM attachments WHERE sha256 IS NULL").fetchone()[0]
+    finally:
+        conn.close()
+    print(
+        f"  Hashed: {stats['hashed']:,}  file missing: {stats['missing']:,}"
+        f"  still unhashed: {left:,}"
+    )
+    return 0
+
+
+def cmd_sweep_files(args):
+    """Delete attachment files whose content is already stored (src/store/file_sweep.py).
+
+    Report-only unless --apply, or unless --policy is given and the policy file says apply.
+    Explicit flags win over the file.
+    """
+    from src.store.file_sweep import SweepPolicy, load_policy, parse_timestamp, sweep_files
+    from src.store.schema import get_connection as get_conn
+
+    policy = load_policy() if args.policy else SweepPolicy()
+    if args.apply:
+        policy = SweepPolicy(apply=True, only_newer_than=policy.only_newer_than)
+    if args.only_newer_than:
+        policy = SweepPolicy(
+            apply=policy.apply, only_newer_than=parse_timestamp(args.only_newer_than)
+        )
+    conn = get_conn(str(args.db or DEFAULT_DB))
+    try:
+        stats = sweep_files(conn, Path(args.root), policy)
+    finally:
+        conn.close()
+    cutoff = policy.only_newer_than.isoformat() if policy.only_newer_than else "none"
+    verb = "deleted" if policy.apply else "would delete"
+    print(f"file sweep: {'APPLIED' if policy.apply else 'REPORT ONLY'} (only newer than: {cutoff})")
+    print(f"  content stored, file removable : {stats['deletable']:,}")
+    print(f"  of which older than the cutoff : {stats['before_cutoff']:,}")
+    print(f"  {verb:<31}: {stats['to_delete']:,} ({stats['bytes_freed'] / 2**20:,.0f} MiB)")
+    print(f"  awaiting text extraction       : {stats['pending-text']:,}")
+    print(f"  unread (Phase 1 could not read) : {stats['unread']:,}")
+    print(f"  images awaiting vision         : {stats['pending-image']:,}")
+    print(f"  unregistered (orphan reaper)   : {stats['unregistered']:,}")
+    print(f"  directories removed            : {stats['dirs_removed']:,}")
+    print(f"  delete errors                  : {stats['errors']:,}")
+    return 0
 
 
 def cmd_process_images(args):
@@ -2796,6 +2855,36 @@ def main():
         "--limit", type=int, default=0, help="Max attachments to register (0 = no limit)"
     )
     parser_register_att.set_defaults(func=cmd_register_attachments)
+
+    parser_hash_att = subparsers.add_parser(
+        "hash-attachments",
+        help="Record a content hash for every attachment file still on disk",
+    )
+    parser_hash_att.add_argument(
+        "--limit", type=int, default=0, help="Max rows to hash (0 = no limit)"
+    )
+    parser_hash_att.set_defaults(func=cmd_hash_attachments)
+
+    parser_sweep = subparsers.add_parser(
+        "sweep-files",
+        help="Delete attachment files whose content is already stored (report-only by default)",
+    )
+    parser_sweep.add_argument(
+        "--apply", action="store_true", help="Actually delete (default: report only)"
+    )
+    parser_sweep.add_argument(
+        "--only-newer-than", default=None, help="ISO time: delete only files modified since"
+    )
+    # A flag, not a path: no path typed on the command line reaches a file read.
+    parser_sweep.add_argument(
+        "--policy",
+        action="store_true",
+        help=f"Take apply and the cutoff from {SWEEP_POLICY_FILE}",
+    )
+    parser_sweep.add_argument(
+        "--root", default=str(ATTACHMENTS_DIR), help="Attachments root to sweep"
+    )
+    parser_sweep.set_defaults(func=cmd_sweep_files)
 
     # Process images command
     parser_process_img = subparsers.add_parser(

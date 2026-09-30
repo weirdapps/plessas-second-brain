@@ -149,3 +149,22 @@ def test_an_archive_stops_reading_members_once_its_time_is_spent(tmp_path, monke
     assert "Second." not in out["text"]
     assert "time budget" in out["error"]
     assert "2 members" in out["error"]
+
+
+def test_a_corrupt_member_is_named_and_the_rest_is_kept(tmp_path):
+    """A bad CRC or an unsupported method on one member must not throw away the others."""
+    z = _zip(
+        tmp_path / "mixed.zip",
+        {"good.txt": WORDS, "bad.txt": WORDS + " Corrupted."},
+        zipfile.ZIP_STORED,
+    )
+    data = bytearray(z.read_bytes())
+    at = data.find(b"Corrupted.")
+    data[at] ^= 0xFF
+    z.write_bytes(bytes(data))
+
+    out = extract_text_from_file(str(z), "application/zip")
+
+    assert out["status"] == "extracted"
+    assert "=== good.txt ===" in out["text"]
+    assert "bad.txt" in out["error"]

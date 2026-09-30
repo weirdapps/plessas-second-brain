@@ -886,13 +886,21 @@ def _extract_zip(path: str, depth: int, seconds: float) -> dict:
                     notes.append(f"{name}: compression ratio over {ZIP_MAX_RATIO}, skipped")
                     continue
                 member = Path(tmp) / f"{n}{Path(name).suffix.lower()}"
-                with zf.open(info) as src, open(member, "wb") as dst:
-                    copied = _copy_at_most(src, dst, info.file_size)
-                if copied is None:
-                    notes.append(f"{name}: larger than its header says, skipped")
+                # One member's fault (a bad CRC, an unsupported method such as Deflate64) is
+                # named and skipped; the readable members are not thrown away with it.
+                try:
+                    with zf.open(info) as src, open(member, "wb") as dst:
+                        copied = _copy_at_most(src, dst, info.file_size)
+                    if copied is None:
+                        notes.append(f"{name}: larger than its header says, skipped")
+                        continue
+                    mime = mimetypes.guess_type(name.lower())[0] or ""
+                    result = extract_text_from_file(
+                        str(member), mime, depth + 1, zip_seconds=seconds
+                    )
+                except Exception as e:
+                    notes.append(f"{name}: {type(e).__name__}: {str(e)[:200]}")
                     continue
-                mime = mimetypes.guess_type(name.lower())[0] or ""
-                result = extract_text_from_file(str(member), mime, depth + 1, zip_seconds=seconds)
                 if result.get("text"):
                     parts.append(f"=== {name} ===\n{result['text']}")
                 elif result.get("error"):

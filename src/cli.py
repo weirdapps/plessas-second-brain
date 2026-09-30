@@ -15,6 +15,7 @@ from src.config import (
     EXTRACT_ENGINE,
     IMAGE_CLASSIFY_BUDGET_S,
     NEWS_DB_PATH,
+    SHAREPOINT_DATA_DIR,
     document_roots,
 )
 from src.llm_deadline import install_llm_deadline_for_this_process
@@ -471,7 +472,12 @@ def cmd_sweep_files(args):
         )
     conn = get_conn(str(args.db or DEFAULT_DB))
     try:
-        stats = sweep_files(conn, Path(args.root), policy)
+        stats = sweep_files(
+            conn,
+            Path(args.root),
+            policy,
+            sharepoint_root=Path(sp) if (sp := getattr(args, "sharepoint_root", None)) else None,
+        )
     finally:
         conn.close()
     cutoff = policy.only_newer_than.isoformat() if policy.only_newer_than else "none"
@@ -646,13 +652,13 @@ def cmd_split_html(args) -> int:
 
 def cmd_process_sharepoint(args):
     """Scan emails for SharePoint URLs and fetch them."""
-    from src.config import SHAREPOINT_DATA_DIR, SHAREPOINT_HOST
+    from src.config import SHAREPOINT_HOST
     from src.export.sharepoint_fetcher import (
-        fetch_sharepoint_link,
         is_managed_sharepoint_host,
         record_link_in_db,
         retry_candidates,
     )
+    from src.extract.sharepoint_ingest import fetch_and_ingest
     from src.extract.sharepoint_url_scanner import extract_sharepoint_urls
     from src.store.email_html import markup_or_text
     from src.store.schema import get_connection, run_migrations
@@ -661,6 +667,23 @@ def cmd_process_sharepoint(args):
     if not Path(db_path).exists():
         print("Error: Database not found. Run 'brain load' first.")
         sys.exit(1)
+
+    # The files earlier fetches left on disk: stored as text, then left to the sweep. No
+    # fetching, so no tenant is needed (src/extract/sharepoint_ingest.py).
+    if getattr(args, "ingest_fetched", False):
+        from src.config import ATTACHMENTS_DIR
+        from src.extract.sharepoint_ingest import ingest_fetched_backlog
+
+        conn = get_connection(db_path)
+        run_migrations(conn)
+        try:
+            backlog = ingest_fetched_backlog(
+                conn, [SHAREPOINT_DATA_DIR, ATTACHMENTS_DIR / "sharepoint-refetch"]
+            )
+        finally:
+            conn.close()
+        print("SharePoint backlog: " + ", ".join(f"{k} {v:,}" for k, v in backlog.items()))
+        return 0
 
     # Fetching is gated on our own tenant (fetch_sharepoint_link), so with the
     # placeholder host every real link would be refused and parked as the
@@ -763,7 +786,8 @@ def cmd_process_sharepoint(args):
         """Fetch + record one URL, updating outcome stats. Returns True on a
         re-loginable (managed-host) auth failure so the caller stops the pass."""
         print(f"  Fetching: {url}")
-        result = fetch_sharepoint_link(url, SHAREPOINT_DATA_DIR)
+        # Fetched into a temporary directory and stored as text; no file is kept.
+        result, document = fetch_and_ingest(conn, url, message_id)
         # An auth failure on an external tenant (a host we hold no session for)
         # can never be fixed by our re-login, so record it distinctly and keep
         # going instead of aborting the whole pass. A foreign tenant announces
@@ -788,14 +812,15 @@ def cmd_process_sharepoint(args):
             url=url,
             message_id=message_id,
             status=recorded_status,
-            fetched_path=str(result.local_path) if result.local_path else None,
+            fetched_path=None,
             file_name=result.file_name,
             file_size=result.file_size,
+            document_message_id=document,
         )
         conn.commit()
 
         if result.status == "ok":
-            print(f"    ✓ Saved: {result.file_name}")
+            print(f"    ✓ Stored: {result.file_name}")
             stats["urls_fetched"] += 1
         elif external_auth:
             print("    ⤼ External host (no session) — skipping")
@@ -818,6 +843,10 @@ def cmd_process_sharepoint(args):
         if retry_rows:
             print(f"Retrying {len(retry_rows)} previously unfetched/stale link(s)...")
         for url, message_id in retry_rows:
+            # Bounded like the scan below: each fetch now extracts too, and the backlog pass
+            # can offer many lost links at once.
+            if max_fetches > 0 and stats["urls_retried"] >= max_fetches:
+                break
             attempted.add(url)
             stats["urls_retried"] += 1
             if _fetch_one(url, message_id):
@@ -2913,6 +2942,11 @@ def main():
     parser_sweep.add_argument(
         "--root", default=str(ATTACHMENTS_DIR), help="Attachments root to sweep"
     )
+    parser_sweep.add_argument(
+        "--sharepoint-root",
+        default=str(SHAREPOINT_DATA_DIR),
+        help="Where earlier SharePoint fetches left files, swept by content",
+    )
     parser_sweep.set_defaults(func=cmd_sweep_files)
 
     parser_reextract = subparsers.add_parser(
@@ -2990,6 +3024,11 @@ def main():
     )
     parser_process_sp.add_argument(
         "--dry-run", action="store_true", help="Scan and count only, no fetching"
+    )
+    parser_process_sp.add_argument(
+        "--ingest-fetched",
+        action="store_true",
+        help="Store the files earlier fetches left on disk, then exit",
     )
     parser_process_sp.set_defaults(func=cmd_process_sharepoint)
 

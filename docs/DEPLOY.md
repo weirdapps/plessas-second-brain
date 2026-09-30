@@ -366,17 +366,24 @@ are stored in full and summarised in parts. The one-time backfills are
 which `sweep-files` then also covers), `ingest-session-notes --all`, and
 `reextract --capped --long --zip --unread`, each with a count first (`reextract --dry-run`).
 
-**Files are read in full.** Every sheet and row of a spreadsheet, every page of a scan (OCR'd
-inside a two-minute budget per file; a scan it cuts short says "pages left unread"), and text up
-to a 50,000,000-character ceiling against runaway input (a text cut there says "the rest left
-unread"). The sweep keeps any file whose read was cut short. Phase 2 summarises a text of more
-than 50 parts (2,000,000 characters) from 50 parts spread evenly across it; the whole text stays
-stored and searchable. Rows the old readers read in part (spreadsheets to 20 sheets of 51 rows,
-scans to 30 pages, archives with both, texts to 2,000,000 characters) count as not stored until
-`reextract --partial` reads them again: the sweep and the reaper keep their files, and Phase 1
-does not copy them to another attachment with the same bytes. The backfill is resumable: its
-first run sets the `sync_metadata` row `reextract_partial_since`, and a row it has read carries a
-later `extracted_at`. A re-read that changes nothing is not summarised again. Count first with
+**Files are read in full.** Every sheet and row of a spreadsheet, and every page of a scan or a
+multi-page TIFF, OCR'd inside a two-minute budget per file; a scan it cuts short says "pages left
+unread", and `reextract` with no budget finishes it. Text stops at the 2,000,000-character
+ceiling, kept after a review measured 50,000,000 (3.3 GB of memory for every write to such a row,
+search snippets that never finished). A file cut there, or stopped by an archive's safety limits,
+says "file kept", and the sweep keeps it for good. Phase 2 summarises a text of more than 50
+parts from 50 parts spread evenly across it; the whole text stays stored and searchable.
+
+Rows the old readers read in part (spreadsheets to 20 sheets of 51 rows, scans to 30 pages,
+multi-page TIFFs to the first page, archives with all of these, texts at the old 100,000 storage
+cap or at the 2,000,000 ceiling) count as not stored until `reextract --partial` reads them again:
+the sweep and the reaper keep their files, and Phase 1 does not copy them to another attachment
+with the same bytes. Before its first run, pull the checkout the timers run and let running `sb-*`
+units finish: its first run records when it began (`sync_metadata` row
+`reextract_partial_since`), and a row an older reader writes after that would be taken for a new
+one. Run it in batches (`--limit 150`, as the stage 2 chain does), since Phase 2 and the vector
+refresh run at the end of each batch. A re-read that changes nothing is not summarised again; one
+that comes back shorter or empty keeps the stored row. Count first with
 `reextract --partial --dry-run`.
 
 **SharePoint links by kind.** A file behind a sharing or viewer link is downloaded by

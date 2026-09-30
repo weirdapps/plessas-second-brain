@@ -130,19 +130,20 @@ def build_merge_prompt(
     `covered` is (parts summarised, parts in the document) when only some were summarised.
     """
     body = "\n\n".join(
-        f"Part {i} of {len(parts)}:\n{json.dumps(p, ensure_ascii=False)}"
+        f"Extraction {i} of {len(parts)}:\n{json.dumps(p, ensure_ascii=False)}"
         for i, p in enumerate(parts, 1)
     )
+    # An instruction, so it belongs outside the fence, where the model is told to follow nothing.
     coverage = ""
     if covered and covered[0] < covered[1]:
         coverage = (
-            f"These are the extractions of {covered[0]} of the document's {covered[1]} parts,"
-            " spread evenly across it; the summary should say it covers"
-            f" {covered[0]} of {covered[1]} parts.\n"
+            f"\n4. These are the extractions of {covered[0]} of the document's {covered[1]} parts,"
+            " spread evenly across it: describe the whole document from them, and say the"
+            f" summary covers {covered[0]} of {covered[1]} parts"
         )
     document = f"""{_email_context(email_subject, email_date)}Attachment filename: {filename}
 File type: {mime_type or "unknown"}
-{coverage}
+
 {body}"""
 
     return f"""You are combining the extractions of the parts of one long document into one.
@@ -169,4 +170,4 @@ Return ONLY a valid JSON object (no markdown, no code blocks) with the same fiel
 Rules:
 1. The summary covers the whole document, not one part
 2. Keep every decision, action item and key fact that matters; drop only repeats
-3. Only use information present in the parts"""
+3. Only use information present in the parts{coverage}"""

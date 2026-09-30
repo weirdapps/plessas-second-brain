@@ -23,20 +23,32 @@ SKIP_MIME_TYPES = {
     "audio/mpeg",
     "audio/x-wav",
     "audio/wav",
-    "application/zip",
     "application/x-rar-compressed",
     "application/x-7z-compressed",
     "application/gzip",
 }
 
-SKIP_EXTENSIONS = {".mp4", ".mp3", ".wav", ".zip", ".rar", ".7z", ".gz", ".mso", ".wmz"}
+SKIP_EXTENSIONS = {".mp4", ".mp3", ".wav", ".rar", ".7z", ".gz", ".mso", ".wmz"}
+
+# A zip is unpacked into a temporary directory and every member extracted; nothing is kept.
+# The guards stop a hostile archive: too many members, too many bytes, a member compressed
+# like a zip bomb, or archives nested inside archives.
+ZIP_MAX_MEMBERS = 500
+ZIP_MAX_TOTAL_BYTES = 1 << 30
+ZIP_MAX_RATIO = 100
+ZIP_MAX_DEPTH = 1
+# A member can cost minutes (OCR), and an archive without a content row is offered again on
+# every run, so an archive stops reading members once this is spent and keeps what it read.
+ZIP_MAX_SECONDS = 120
+ZIP_MIME_TYPES = frozenset({"application/zip", "application/x-zip-compressed"})
 
 
-def extract_text_from_file(file_path: str, mime_type: str) -> dict:
+def extract_text_from_file(file_path: str, mime_type: str, _depth: int = 0) -> dict:
     """Extract text from a file based on its MIME type.
 
     Returns dict with keys: text, method, status, error.
     status is one of: 'extracted', 'partial', 'failed', 'skipped'.
+    _depth is how deep inside archives this file sits; only _extract_zip passes it.
     """
     ext = Path(file_path).suffix.lower()
 
@@ -80,6 +92,13 @@ def extract_text_from_file(file_path: str, mime_type: str) -> dict:
         }
 
     try:
+        if ext == ".zip" or mime_type in ZIP_MIME_TYPES:
+            sniffed = sniff_mime_type(file_path)
+            if sniffed == "application/zip":
+                return _extract_zip(file_path, _depth)
+            if sniffed is None:
+                return {"text": None, "method": None, "status": "skipped", "error": None}
+            mime_type = sniffed  # an Office document sent as a zip
         if mime_type == "application/pdf" or ext == ".pdf":
             return _extract_pdf(file_path)
         elif (
@@ -143,7 +162,7 @@ def extract_text_from_file(file_path: str, mime_type: str) -> dict:
             # recursion ends because a second pass sniffs the same type.
             sniffed = sniff_mime_type(file_path)
             if sniffed and sniffed != mime_type and sniffed not in SKIP_MIME_TYPES:
-                return extract_text_from_file(file_path, sniffed)
+                return extract_text_from_file(file_path, sniffed, _depth)
             return {
                 "text": None,
                 "method": None,
@@ -769,6 +788,95 @@ def _extract_rpmsg(path: str) -> dict:
         "method": "rpmsg",
         "status": "skipped",
         "error": f"unrecognised .rpmsg container (magic {magic.hex()}); not MSIPC",
+    }
+
+
+def _copy_at_most(src, dst, limit: int) -> int | None:
+    """Copy at most `limit` bytes; None when the source holds more than its header said."""
+    written = 0
+    while chunk := src.read(1 << 16):
+        written += len(chunk)
+        if written > limit:
+            return None
+        dst.write(chunk)
+    return written
+
+
+def _extract_zip(path: str, depth: int) -> dict:
+    """Unpack an archive into a temporary directory and extract every member.
+
+    Nothing outlives the call. A member is written under a name made up here, never under the
+    name the archive carries, so a member called "../x" cannot land outside the directory.
+    """
+    import mimetypes
+    import tempfile
+    import time
+    import zipfile
+
+    if depth > ZIP_MAX_DEPTH:
+        return {
+            "text": None,
+            "method": "zip",
+            "status": "skipped",
+            "error": f"nested archive deeper than {ZIP_MAX_DEPTH} level",
+        }
+    parts: list[str] = []
+    notes: list[str] = []
+    with zipfile.ZipFile(path) as zf:
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+        if len(infos) > ZIP_MAX_MEMBERS:
+            return {
+                "text": None,
+                "method": "zip",
+                "status": "skipped",
+                "error": f"{len(infos)} members, more than {ZIP_MAX_MEMBERS}",
+            }
+        total = sum(i.file_size for i in infos)
+        if total > ZIP_MAX_TOTAL_BYTES:
+            return {
+                "text": None,
+                "method": "zip",
+                "status": "skipped",
+                "error": f"{total} bytes uncompressed, more than {ZIP_MAX_TOTAL_BYTES}",
+            }
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory(prefix="sb-zip-") as tmp:
+            for n, info in enumerate(infos):
+                if n and time.monotonic() - started > ZIP_MAX_SECONDS:
+                    notes.append(f"time budget spent, {len(infos) - n} members left unread")
+                    break
+                name = info.filename
+                if info.flag_bits & 0x1:
+                    notes.append(f"{name}: encrypted, skipped")
+                    continue
+                if info.file_size > ZIP_MAX_RATIO * max(info.compress_size, 1):
+                    notes.append(f"{name}: compression ratio over {ZIP_MAX_RATIO}, skipped")
+                    continue
+                member = Path(tmp) / f"{n}{Path(name).suffix.lower()}"
+                with zf.open(info) as src, open(member, "wb") as dst:
+                    copied = _copy_at_most(src, dst, info.file_size)
+                if copied is None:
+                    notes.append(f"{name}: larger than its header says, skipped")
+                    continue
+                mime = mimetypes.guess_type(name.lower())[0] or ""
+                result = extract_text_from_file(str(member), mime, depth + 1)
+                if result.get("text"):
+                    parts.append(f"=== {name} ===\n{result['text']}")
+                elif result.get("error"):
+                    notes.append(f"{name}: {result['error']}")
+    error = "; ".join(notes) or None
+    if not parts:
+        return {
+            "text": None,
+            "method": "zip",
+            "status": "skipped",
+            "error": error or "no readable members",
+        }
+    return {
+        "text": _truncate("\n\n".join(parts)),
+        "method": "zip",
+        "status": "extracted",
+        "error": error,
     }
 
 

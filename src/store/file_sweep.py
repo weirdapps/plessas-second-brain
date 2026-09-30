@@ -47,18 +47,22 @@ STATES = (DELETABLE, PENDING_TEXT, UNREAD, PENDING_IMAGE, UNREGISTERED)
 # Shared with the orphan reaper, whose stored-hash rule must not count these rows either.
 # "No such file or directory" is how a missing converter used to surface (the older
 # "[Errno 2] ... 'textutil'" rows); a data file that vanished mid-read lands here too, which
-# errs on the side of keeping it. "left unread" is a read cut short, not to the end: an
-# archive's time budget (members), a scan's (pages), or the text ceiling (the rest).
+# errs on the side of keeping it. "left unread" is a read a time budget cut short (an archive's
+# members, a scan's pages), which reextract with no budget can finish. "file kept" is one no
+# re-read can finish (the text ceiling, an archive's safety limits): the file stays for good.
 UNREAD_SQL = (
     "(ac.extraction_error LIKE 'File not found%'"
     " OR ac.extraction_error LIKE 'No legacy .doc converter%'"
     " OR ac.extraction_error LIKE '%not installed%'"
     " OR ac.extraction_error LIKE '%No such file or directory%'"
-    " OR ac.extraction_error LIKE '%left unread%')"
+    " OR ac.extraction_error LIKE '%left unread%'"
+    " OR ac.extraction_error LIKE '%file kept%')"
 )
 
 # Rows the old readers read in part: spreadsheets stopped at 20 sheets of 51 rows, scans at 30
-# pages, archives read their members with both, and every text stopped at 2,000,000 characters.
+# pages, a multi-page TIFF at its first page, archives read their members with all of these,
+# stored text stopped at 100,000 characters until PR B, and every read at 2,000,000 without
+# saying so.
 # They count as read in part until reextract --partial reads them again: it sets this
 # sync_metadata row when it begins, and every row it reads gets a later extracted_at. Until the
 # row exists every such row counts, since the new readers leave no mark of their own.
@@ -71,11 +75,12 @@ PARTIAL_READERS = (
     "pymupdf+tesseract",
     "zip",
 )
-OLD_TEXT_CEILING = 2_000_000
+CUT_LENGTHS = (100_000, 2_000_000)
 PARTIAL_SQL = (
-    "((ac.extraction_method IN ("
-    + ", ".join(f"'{m}'" for m in PARTIAL_READERS)
-    + f") OR length(ac.extracted_text) = {OLD_TEXT_CEILING})"
+    "((ac.extraction_method IN (" + ", ".join(f"'{m}'" for m in PARTIAL_READERS) + ")"
+    " OR (ac.extraction_method = 'ocr'"
+    " AND (lower(a.filename) LIKE '%.tif' OR lower(a.filename) LIKE '%.tiff'))"
+    " OR length(ac.extracted_text) IN (" + ", ".join(str(n) for n in CUT_LENGTHS) + "))"
     " AND COALESCE(ac.extracted_at, '') < COALESCE("
     f"(SELECT value FROM sync_metadata WHERE key = '{PARTIAL_SINCE_KEY}'), '9999'))"
 )

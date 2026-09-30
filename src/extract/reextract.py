@@ -53,7 +53,12 @@ SELECTORS: dict[str, tuple[str, bool]] = {
         " OR ac.extraction_error LIKE '%members left unread%')",
         True,
     ),
-    "unread": (f"COALESCE({UNREAD_SQL}, 0)", True),
+    # A row whose file is kept for good (the text ceiling, an archive's limits) cannot be
+    # finished by reading it again.
+    "unread": (
+        f"COALESCE({UNREAD_SQL}, 0) AND COALESCE(ac.extraction_error NOT LIKE '%file kept%', 1)",
+        True,
+    ),
     # A text-only document kept no file to read again.
     "partial": (f"COALESCE({PARTIAL_SQL}, 0) AND a.file_path NOT LIKE 'text:%'", True),
 }
@@ -143,13 +148,18 @@ def reextract(
             result = extract_text_from_file(
                 str(path), mime or "", zip_seconds=math.inf, ocr_seconds=math.inf
             )
-            if has_text and not result["text"]:
+            # A re-read with no text, or with less than was stored (a reader that suddenly reads
+            # less), replaces nothing and does not mark the row read.
+            if not result["text"]:
                 stats["kept"] += 1
                 continue
-            text = redact_secrets(result["text"]) if result["text"] else result["text"]
+            text = redact_secrets(result["text"])
             (stored,) = conn.execute(
                 "SELECT extracted_text FROM attachment_content WHERE id = ?", (ac_id,)
             ).fetchone()
+            if stored and len(text) < len(stored):
+                stats["kept"] += 1
+                continue
             if has_text and text == stored:
                 conn.execute(
                     "UPDATE attachment_content SET extraction_method = ?, extraction_status = ?,"

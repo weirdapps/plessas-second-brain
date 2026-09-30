@@ -13,11 +13,12 @@ from email.message import EmailMessage
 from email.parser import BytesParser
 from pathlib import Path
 
-# A ceiling against runaway input, not a cap real documents reach: text is stored in full and
-# Phase 2 summarises a long one in parts (src/extract/attachment_pipeline.py). At 2,000,000 it
-# cut a 39.8M-character call log to 5%. A text cut here says the rest was left unread, which the
-# sweep treats as not stored (src/store/file_sweep.py UNREAD_SQL).
-MAX_TEXT_CHARS = 50_000_000
+# A ceiling against runaway input: text is stored in full up to it, and Phase 2 summarises a
+# long one in parts (src/extract/attachment_pipeline.py). Kept at 2,000,000 after a review
+# measured 50,000,000: 3.3 GB of memory for every write to such a row, and search snippets that
+# never finished. A text cut here says its file is kept, and the sweep keeps it
+# (src/store/file_sweep.py UNREAD_SQL): a 39.8M-character call log stays on disk.
+MAX_TEXT_CHARS = 2_000_000
 # Minimum characters to consider a successful extraction
 MIN_TEXT_CHARS = 50
 
@@ -76,8 +77,8 @@ def extract_text_from_file(
     )
     text = result.get("text")
     error = result.get("error") or ""
-    if text and len(text) >= MAX_TEXT_CHARS and "left unread" not in error:
-        note = f"text cut at {MAX_TEXT_CHARS:,} characters, the rest left unread"
+    if text and len(text) >= MAX_TEXT_CHARS and "file kept" not in error:
+        note = f"text cut at {MAX_TEXT_CHARS:,} characters; the rest is unread, file kept"
         result = {**result, "error": f"{error}; {note}" if error else note}
     return result
 
@@ -208,7 +209,7 @@ def _extract_by_type(
             and mime_type.startswith("image/")
             or ext in (".png", ".jpg", ".jpeg", ".gif", ".tiff", ".tif", ".bmp", ".jfif")
         ):
-            return _extract_image_ocr(file_path)
+            return _extract_image_ocr(file_path, ocr_seconds)
         elif mime_type == "message/rfc822" or ext == ".eml":
             return _extract_eml(file_path)
         elif mime_type == "application/encrypted" or ext == ".rpmsg":
@@ -270,6 +271,11 @@ def _extract_pdf(path: str, ocr_seconds: float | None = None) -> dict:
         ):
             return ocr_result
         if _apply_noise_filter(text):
+            # The scan's own verdict when it has one: an OCR that failed, or one its budget cut
+            # short. Reported as a plain skip, the sweep would take the file for finished.
+            ocr_error = ocr_result.get("error") or ""
+            if ocr_result["status"] == "failed" or "left unread" in ocr_error:
+                return ocr_result
             return {
                 "text": None,
                 "method": "pymupdf",
@@ -535,6 +541,9 @@ def _extract_excel(path: str) -> dict:
 
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
+            # Read-only mode stops at the size the sheet declares, and real files understate it.
+            if hasattr(ws, "reset_dimensions"):
+                ws.reset_dimensions()
             rows_text = []
             for row in ws.iter_rows(values_only=True):
                 cells = [str(c) if c is not None else "" for c in row]
@@ -662,8 +671,34 @@ def _extract_xlsb(path: str) -> dict:
     return {"text": text, "method": "pyxlsb", "status": "extracted", "error": None}
 
 
-def _extract_image_ocr(path: str) -> dict:
-    """Extract text from images using Tesseract OCR."""
+def _ocr_frames(img, budget: float) -> dict:
+    """OCR every page of a multi-page TIFF, inside the scan budget, like _ocr_pdf_pages."""
+    import pytesseract
+    from PIL import ImageSequence
+
+    pages, note = [], None
+    started = time.monotonic()
+    for i, frame in enumerate(ImageSequence.Iterator(img)):
+        if i and time.monotonic() - started > budget:
+            note = f"time budget spent, {img.n_frames - i} pages left unread"
+            break
+        page = pytesseract.image_to_string(frame.convert("RGB"), lang="eng+ell")
+        if page.strip():
+            pages.append(page.strip())
+    text = _truncate("\n\n".join(pages))
+    if _apply_noise_filter(text):
+        insufficient = "OCR returned insufficient text"
+        return {
+            "text": None,
+            "method": "ocr",
+            "status": "skipped",
+            "error": f"{insufficient}; {note}" if note else insufficient,
+        }
+    return {"text": text, "method": "ocr", "status": "extracted", "error": note}
+
+
+def _extract_image_ocr(path: str, ocr_seconds: float | None = None) -> dict:
+    """Extract text from images using Tesseract OCR; every page of a multi-page TIFF."""
     try:
         import io
 
@@ -686,6 +721,8 @@ def _extract_image_ocr(path: str) -> dict:
 
     try:
         img = Image.open(path)
+        if img.format == "TIFF" and getattr(img, "n_frames", 1) > 1:
+            return _ocr_frames(img, OCR_MAX_SECONDS if ocr_seconds is None else ocr_seconds)
         if img.format not in _TESSERACT_SAFE_FORMATS:
             buf = io.BytesIO()
             img.convert("RGB").save(buf, format="PNG")
@@ -880,7 +917,7 @@ def _extract_zip(path: str, depth: int, seconds: float, ocr_seconds: float | Non
             "text": None,
             "method": "zip",
             "status": "skipped",
-            "error": f"nested archive deeper than {ZIP_MAX_DEPTH} level",
+            "error": f"nested archive deeper than {ZIP_MAX_DEPTH} level; unread, file kept",
         }
     parts: list[str] = []
     notes: list[str] = []
@@ -891,7 +928,7 @@ def _extract_zip(path: str, depth: int, seconds: float, ocr_seconds: float | Non
                 "text": None,
                 "method": "zip",
                 "status": "skipped",
-                "error": f"{len(infos)} members, more than {ZIP_MAX_MEMBERS}",
+                "error": f"{len(infos)} members, more than {ZIP_MAX_MEMBERS}; unread, file kept",
             }
         total = sum(i.file_size for i in infos)
         if total > ZIP_MAX_TOTAL_BYTES:
@@ -899,7 +936,9 @@ def _extract_zip(path: str, depth: int, seconds: float, ocr_seconds: float | Non
                 "text": None,
                 "method": "zip",
                 "status": "skipped",
-                "error": f"{total} bytes uncompressed, more than {ZIP_MAX_TOTAL_BYTES}",
+                "error": (
+                    f"{total} bytes uncompressed, more than {ZIP_MAX_TOTAL_BYTES}; unread, file kept"
+                ),
             }
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="sb-zip-") as tmp:
@@ -912,7 +951,9 @@ def _extract_zip(path: str, depth: int, seconds: float, ocr_seconds: float | Non
                     notes.append(f"{name}: encrypted, skipped")
                     continue
                 if info.file_size > ZIP_MAX_RATIO * max(info.compress_size, 1):
-                    notes.append(f"{name}: compression ratio over {ZIP_MAX_RATIO}, skipped")
+                    notes.append(
+                        f"{name}: compression ratio over {ZIP_MAX_RATIO}; unread, file kept"
+                    )
                     continue
                 member = Path(tmp) / f"{n}{Path(name).suffix.lower()}"
                 # One member's fault (a bad CRC, an unsupported method such as Deflate64) is
@@ -930,8 +971,13 @@ def _extract_zip(path: str, depth: int, seconds: float, ocr_seconds: float | Non
                 except Exception as e:
                     notes.append(f"{name}: {type(e).__name__}: {str(e)[:200]}")
                     continue
+                member_error = result.get("error") or ""
                 if result.get("text"):
                     parts.append(f"=== {name} ===\n{result['text']}")
+                    # A member read in part marks the archive, or the sweep would take it for
+                    # read in full.
+                    if "left unread" in member_error or "file kept" in member_error:
+                        notes.append(f"{name}: {member_error}")
                 elif result.get("error"):
                     notes.append(f"{name}: {result['error']}")
     error = "; ".join(notes) or None

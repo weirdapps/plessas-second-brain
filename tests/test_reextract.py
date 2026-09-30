@@ -366,3 +366,64 @@ def test_a_text_at_the_old_ceiling_and_a_scan_are_selected(store):
         ).fetchone()[0]
         == 0
     )
+
+
+def test_a_re_read_shorter_than_the_stored_text_is_kept(store, monkeypatch):
+    """A reader that suddenly reads less (a sheet that understates its size) must not replace
+    what was stored, nor mark the row read."""
+    path, conn, root, _removed, summarised = store
+    att = _row(conn, root, "book.xlsx", WORDS * 10, body=_workbook(3), mime="")
+    _partial(conn, att)
+    monkeypatch.setattr(
+        rx,
+        "extract_text_from_file",
+        lambda *a, **k: {
+            "text": WORDS * 3,
+            "method": "openpyxl",
+            "status": "extracted",
+            "error": None,
+        },
+    )
+
+    stats = _run(path, root, "partial")
+
+    text, extracted_at = _content(conn, att, "extracted_text, extracted_at")
+    assert (stats["kept"], text, extracted_at) == (1, WORDS * 10, "2026-09-01")
+    assert summarised == []
+
+
+def test_a_failed_re_read_keeps_a_row_that_had_no_text(store, monkeypatch):
+    path, conn, root, _removed, _summarised = store
+    att = _row(conn, root, "big.xlsb", None, status="skipped", body=b"PK", mime="")
+    _partial(conn, att, method="pyxlsb")
+    monkeypatch.setattr(
+        rx,
+        "extract_text_from_file",
+        lambda *a, **k: {
+            "text": None,
+            "method": "pyxlsb",
+            "status": "failed",
+            "error": "MemoryError",
+        },
+    )
+
+    stats = _run(path, root, "partial")
+
+    status, extracted_at = _content(conn, att, "extraction_status, extracted_at")
+    assert (stats["kept"], status, extracted_at) == (1, "skipped", "2026-09-01")
+
+
+def test_a_row_whose_file_is_kept_for_good_is_not_selected_by_unread(store):
+    path, conn, root, _removed, _summarised = store
+    _row(
+        conn,
+        root,
+        "log.txt",
+        "x" * 2_000_000,
+        error="text cut at 2,000,000 characters; the rest is unread, file kept",
+        body="x",
+    )
+
+    stats = _run(path, root, "unread", dry_run=True)
+
+    assert stats["selected"] == 0

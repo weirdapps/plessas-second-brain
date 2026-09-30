@@ -202,7 +202,7 @@ def test_extensionless_image_goes_to_ocr(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ax,
         "_extract_image_ocr",
-        lambda p: (
+        lambda p, *_budget: (
             seen.append(p)
             or {"text": "x", "method": "tesseract", "status": "extracted", "error": None}
         ),

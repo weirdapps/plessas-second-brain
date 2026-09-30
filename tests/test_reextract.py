@@ -205,3 +205,30 @@ def test_the_command_needs_a_selector(tmp_path, capsys):
 
     assert rc == 2
     assert "--capped" in capsys.readouterr().err
+
+
+def test_an_archive_cut_short_is_read_again_in_full(store, monkeypatch):
+    """The hourly budget cut it; the one-time recovery has the time, so it reads every member."""
+    from src.extract import attachment_extractors
+
+    path, conn, root, _removed, _summarised = store
+    monkeypatch.setattr(attachment_extractors, "ZIP_MAX_SECONDS", -1)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name in ("a.txt", "b.txt", "c.txt"):
+            zf.writestr(name, WORDS * 3 + name)
+    att = _row(
+        conn,
+        root,
+        "pack.zip",
+        "=== a.txt ===\n" + WORDS,
+        error="time budget spent, 2 members left unread",
+        body=buf.getvalue(),
+        mime="application/zip",
+    )
+
+    _run(path, root, "zip")
+
+    text, error = _content(conn, att, "extracted_text, extraction_error")
+    assert all(f"=== {n} ===" in text for n in ("a.txt", "b.txt", "c.txt"))
+    assert not error

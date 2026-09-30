@@ -15,7 +15,7 @@ from src import cli
 from src.export.sharepoint_fetcher import SharepointFetchResult
 from src.store.schema import create_database
 
-URL = "https://contoso.sharepoint.com/sites/Team/Edeck"
+URL = "https://contoso.sharepoint.com/:w:/g/sites/Team/Edeck"
 
 
 @pytest.fixture(autouse=True)

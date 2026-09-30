@@ -406,6 +406,28 @@ def cmd_register_attachments(args):
     )
 
 
+def cmd_hash_attachments(args):
+    """Record a content hash for every attachment whose file is still on disk.
+
+    Run before anything deletes attachment files: afterwards the hash is the only evidence
+    of what a file held. Resumable; see src/store/file_hashes.py.
+    """
+    from src.store.file_hashes import hash_attachments
+    from src.store.schema import get_connection as get_conn
+
+    conn = get_conn(str(args.db or DEFAULT_DB))
+    try:
+        stats = hash_attachments(conn, limit=args.limit if args.limit > 0 else None)
+        left = conn.execute("SELECT COUNT(*) FROM attachments WHERE sha256 IS NULL").fetchone()[0]
+    finally:
+        conn.close()
+    print(
+        f"  Hashed: {stats['hashed']:,}  file missing: {stats['missing']:,}"
+        f"  still unhashed: {left:,}"
+    )
+    return 0
+
+
 def cmd_process_images(args):
     """Backfill image classification pipeline."""
     from src.extract.image_pipeline import run_backfill
@@ -2796,6 +2818,15 @@ def main():
         "--limit", type=int, default=0, help="Max attachments to register (0 = no limit)"
     )
     parser_register_att.set_defaults(func=cmd_register_attachments)
+
+    parser_hash_att = subparsers.add_parser(
+        "hash-attachments",
+        help="Record a content hash for every attachment file still on disk",
+    )
+    parser_hash_att.add_argument(
+        "--limit", type=int, default=0, help="Max rows to hash (0 = no limit)"
+    )
+    parser_hash_att.set_defaults(func=cmd_hash_attachments)
 
     # Process images command
     parser_process_img = subparsers.add_parser(

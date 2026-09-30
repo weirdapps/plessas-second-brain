@@ -5,7 +5,6 @@ Phase 2: Vertex AI structured extraction (LLM) — added in Task 4.
 Ingest: Import standalone documents (not from email) into the knowledge store.
 """
 
-import hashlib
 import os
 import shutil
 import sqlite3
@@ -17,6 +16,7 @@ from src.config import ATTACHMENTS_DIR, DEFAULT_DB
 from src.extract.attachment_extractors import extract_text_from_file
 from src.extract.vertex_auth import touch_sentinel
 from src.redact import redact_secrets
+from src.store.file_hashes import sha256_of_file
 
 # Processing constants
 PHASE1_BATCH_SIZE = 50
@@ -494,14 +494,18 @@ def run_phase2(
     return stats
 
 
-def _file_to_message_id(file_path: str) -> int:
-    """Generate a stable negative message_id from file content hash.
+def _sha256_to_message_id(sha256: str) -> int:
+    """A stable negative message_id from a content hash.
 
-    Uses negative IDs to avoid collision with real Apple Mail message IDs.
+    Negative so it cannot collide with a real mail message id. Documents are identified by
+    their bytes, so the same file ingested twice collides and is skipped.
     """
-    with open(file_path, "rb") as f:
-        digest = hashlib.sha256(f.read()).hexdigest()
-    return -abs(int(digest[:15], 16))
+    return -abs(int(sha256[:15], 16))
+
+
+def _file_to_message_id(file_path: str) -> int:
+    """Generate a stable negative message_id from file content hash."""
+    return _sha256_to_message_id(sha256_of_file(Path(file_path)))
 
 
 def _guess_mime_type(file_path: str) -> str:
@@ -552,7 +556,8 @@ def ingest_document(
     if not os.path.isfile(file_path):
         raise FileNotFoundError(f"File not found: {file_path}")
 
-    message_id = _file_to_message_id(file_path)
+    sha256 = sha256_of_file(Path(file_path))
+    message_id = _sha256_to_message_id(sha256)
     mime_type = _guess_mime_type(file_path)
     file_size = os.path.getsize(file_path)
     file_mtime = datetime.fromtimestamp(os.path.getmtime(file_path)).isoformat()
@@ -646,9 +651,10 @@ def ingest_document(
     # Create attachment record
     conn.execute(
         """INSERT INTO attachments
-           (email_id, message_id, filename, mime_type, file_size, file_path, is_inline, exported_at)
-           VALUES (?, ?, ?, ?, ?, ?, 0, ?)""",
-        (email_id, message_id, filename, mime_type, file_size, str(dest_path), now),
+           (email_id, message_id, filename, mime_type, file_size, file_path, is_inline,
+            exported_at, sha256)
+           VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+        (email_id, message_id, filename, mime_type, file_size, str(dest_path), now, sha256),
     )
     attachment_id = conn.execute(
         "SELECT id FROM attachments WHERE email_id = ? AND filename = ?",

@@ -64,10 +64,15 @@ cd "$REPO_DIR" || exit 1
 export_rc=$?
 "$PYTHON" -m src.cli extract-conversations --workers 2 >> "$LOG_FILE" 2>&1
 extract_rc=$?
+# Notes the sessions wrote (.md, .txt, .csv), stored as text-only documents. Only the
+# transcripts changed since the last scan are read (src/export/session_notes.py).
+"$PYTHON" -m src.cli ingest-session-notes >> "$LOG_FILE" 2>&1
+notes_rc=$?
 
-if [ "$export_rc" -ne 0 ] || [ "$extract_rc" -ne 0 ]; then
-  echo "$(date '+%Y-%m-%d %H:%M:%S') FAILED (export exit $export_rc, extract exit $extract_rc)" >> "$LOG_FILE"
+if [ "$export_rc" -ne 0 ] || [ "$extract_rc" -ne 0 ] || [ "$notes_rc" -ne 0 ]; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') FAILED (export exit $export_rc, extract exit $extract_rc, notes exit $notes_rc)" >> "$LOG_FILE"
   if [ "$export_rc" -ne 0 ]; then exit "$export_rc"; fi
-  exit "$extract_rc"
+  if [ "$extract_rc" -ne 0 ]; then exit "$extract_rc"; fi
+  exit "$notes_rc"
 fi
 echo "$(date '+%Y-%m-%d %H:%M:%S') ok" >> "$LOG_FILE"

@@ -1,11 +1,13 @@
-"""SharePoint files become text-only documents; the fetched file is never kept.
+"""SharePoint files and pages become text-only documents; the fetched file is never kept.
 
 A link found in mail is fetched into a temporary directory, extracted, and stored through
 ingest_text_document (src/extract/attachment_pipeline.py). The fetched bytes' hash is the
 document's identity, so a file linked from many emails is one document, and each link records
-it in sharepoint_links.document_message_id.
+it in sharepoint_links.document_message_id. An intranet page is read as text (sharepoint-cli
+page); its text is its identity. A link that is not content is not fetched at all.
 """
 
+import hashlib
 import sqlite3
 import tempfile
 from datetime import datetime
@@ -13,13 +15,14 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 from src.export import sharepoint_fetcher
-from src.export.sharepoint_fetcher import SharepointFetchResult
-from src.extract.attachment_extractors import extract_text_from_file
+from src.export.sharepoint_fetcher import SharepointFetchResult, SharepointPageResult
+from src.extract.attachment_extractors import _apply_noise_filter, extract_text_from_file
 from src.extract.attachment_pipeline import (
     _guess_mime_type,
     _sha256_to_message_id,
     ingest_text_document,
 )
+from src.extract.html_text import html_to_text
 from src.store.file_hashes import sha256_of_file
 
 
@@ -84,13 +87,61 @@ def ingest_fetched_file(
     return message_id, True
 
 
+def ingest_page(
+    conn: sqlite3.Connection, page: SharepointPageResult, date: str | None = None
+) -> int | None:
+    """Store a page's text as a text-only document: its message id, or None for no text.
+
+    The text is the identity, as for a session note: the same page linked from many emails is
+    one document, and a page edited since is a new one. The key is the page's lower-cased path.
+    """
+    text = html_to_text(page.html or "").strip()
+    if not text:
+        return None
+    path = page.path or unquote(urlparse(page.url).path)
+    name = Path(path).name
+    outcome = ingest_text_document(
+        conn,
+        source="sharepoint-page",
+        key=path.lower(),
+        filename=name,
+        mime_type="text/html",
+        text=text,
+        sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        method="sharepoint-page",
+        status="skipped" if _apply_noise_filter(text) else "extracted",
+        error=None,
+        subject=f"[SharePoint page] {page.title or _label(page.url, name)}",
+        sender_name="SharePoint",
+        date=date or datetime.now().isoformat(),
+    )
+    return outcome["message_id"]
+
+
 def fetch_and_ingest(
     conn: sqlite3.Connection, url: str, message_id
 ) -> tuple[SharepointFetchResult, int | None]:
-    """Fetch a link into a temporary directory and store its text. No file outlives the call.
+    """Fetch what a link points at and store its text. No file outlives the call.
 
-    The fetcher is looked up on its module at call time, where the tests replace it.
+    A file is fetched into a temporary directory, a page is read as text, and a link that is
+    not content is recorded as such without a fetch. The fetchers are looked up on their module
+    at call time, where the tests replace them.
     """
+    kind = sharepoint_fetcher.link_kind(url)
+    if kind == "not-content":
+        return SharepointFetchResult(url=url, status="not-content"), None
+    if kind == "page":
+        page = sharepoint_fetcher.fetch_sharepoint_page(url)
+        date = _email_date(conn, message_id)
+        document = ingest_page(conn, page, date) if page.status == "ok" else None
+        result = SharepointFetchResult(
+            url=url,
+            status=page.status,
+            http_status=page.http_status,
+            file_name=page.title or None,
+            error_message=page.error_message,
+        )
+        return result, document
     with tempfile.TemporaryDirectory(prefix="sb-sharepoint-") as tmp:
         result = sharepoint_fetcher.fetch_sharepoint_link(url, Path(tmp))
         document = None

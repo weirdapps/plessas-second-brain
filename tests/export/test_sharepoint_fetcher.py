@@ -191,7 +191,7 @@ def _insert_exhausted_link(conn, last_attempt_at, last_status="auth-required"):
 
     conn.execute(
         "INSERT INTO sharepoint_links (url, message_id, fetched_at, last_status, last_attempt_at, attempts) "
-        "VALUES ('https://dead', 'm', NULL, ?, ?, ?)",
+        "VALUES ('https://contoso.sharepoint.com/:w:/g/sites/t/Edead', 'm', NULL, ?, ?, ?)",
         (last_status, last_attempt_at, MAX_SHAREPOINT_ATTEMPTS),
     )
     conn.commit()
@@ -227,7 +227,9 @@ def test_process_sharepoint_retries_an_exhausted_link_after_the_cool_off(tmp_pat
     _insert_exhausted_link(_setup_db(tmp_path), long_ago)
 
     with patch("src.export.sharepoint_fetcher.fetch_sharepoint_link") as mock_fetch:
-        mock_fetch.return_value = SharepointFetchResult(url="https://dead", status="stale")
+        mock_fetch.return_value = SharepointFetchResult(
+            url="https://contoso.sharepoint.com/:w:/g/sites/t/Edead", status="stale"
+        )
         args = argparse.Namespace(db=str(tmp_path / "test.db"), since=None, limit=0, dry_run=False)
         cmd_process_sharepoint(args)
         assert mock_fetch.called
@@ -314,7 +316,7 @@ def test_process_sharepoint_skips_external_host_and_continues(mock_fetch, tmp_pa
         (
             "m-mgd",
             "2026-05-30T11:00:00",
-            "doc https://contoso.sharepoint.com/sites/foo/Eabc end",
+            "doc https://contoso.sharepoint.com/:w:/g/sites/foo/Eabc end",
         ),
     )
     conn.commit()
@@ -391,14 +393,14 @@ def _status_after_403(tmp_path, url):
 def test_a_403_from_a_foreign_tenant_is_recorded_as_unsupported_host(tmp_path):
     """No session for that host exists and no login of ours can create one, so
     the link is permanently out of reach and must stop being retried."""
-    url = "https://partner.sharepoint.com/sites/Org/Edoc"
+    url = "https://partner.sharepoint.com/:w:/g/sites/Org/Edoc"
     assert _status_after_403(tmp_path, url) == "unsupported-host"
 
 
 def test_a_403_from_the_managed_host_stays_an_http_error(tmp_path):
     """Our own tenant refusing one item is transient: access can be granted, so
     the link must stay in the retry pool."""
-    url = "https://contoso.sharepoint.com/sites/Team/Edoc"
+    url = "https://contoso.sharepoint.com/:w:/g/sites/Team/Edoc"
     assert _status_after_403(tmp_path, url) == "http-error"
 
 
@@ -414,7 +416,7 @@ def test_process_sharepoint_retries_known_unfetched_link(mock_fetch, tmp_path):
     from src.export.sharepoint_fetcher import SharepointFetchResult
     from src.store.schema import create_database, get_connection, run_migrations
 
-    url = "https://contoso.sharepoint.com/sites/foo/Estale"
+    url = "https://contoso.sharepoint.com/:w:/g/sites/foo/Estale"
     db_path = tmp_path / "test.db"
     conn = create_database(str(db_path))
     run_migrations(conn)
@@ -588,9 +590,9 @@ def test_retry_pass_requeues_own_tenant_links_parked_as_unsupported_host(tmp_pat
 
     from src.cli import cmd_process_sharepoint
 
-    own = "https://contoso.sharepoint.com/sites/a/E1"
-    twin = "https://contoso-my.sharepoint.com/personal/b/E2"
-    foreign = "https://partner.sharepoint.com/sites/c/E3"
+    own = "https://contoso.sharepoint.com/:w:/g/sites/a/E1"
+    twin = "https://contoso-my.sharepoint.com/:w:/g/personal/b/E2"
+    foreign = "https://partner.sharepoint.com/:w:/g/sites/c/E3"
     conn = _setup_db(tmp_path)
     for url in (own, twin, foreign):
         conn.execute(
@@ -620,7 +622,7 @@ def test_process_sharepoint_counts_a_refused_foreign_link_as_skipped(tmp_path, c
     from src.cli import cmd_process_sharepoint
     from src.store.schema import get_connection
 
-    url = "https://partner.sharepoint.com/sites/Org/Edoc"
+    url = "https://partner.sharepoint.com/:w:/g/sites/Org/Edoc"
     conn = _setup_db(tmp_path)
     conn.execute(
         "INSERT INTO emails (message_id, date_received, content) VALUES (?, ?, ?)",

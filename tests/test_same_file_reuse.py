@@ -125,3 +125,27 @@ def test_an_attachment_without_a_hash_is_extracted(db, tmp_path, monkeypatch):
     run_phase1(str(path))
 
     assert len(reads) == 1
+
+
+@pytest.mark.parametrize(
+    "status,llm,error",
+    [
+        ("failed", "pending", "BadZipFile: File is not a zip file"),
+        ("skipped", "pending", None),
+        ("extracted", "failed", None),
+    ],
+)
+def test_only_a_fully_finished_row_is_reused(db, tmp_path, monkeypatch, status, llm, error):
+    """An older extractor's failure or skip (a zip the old code never unpacked) must not pass to
+    a new copy, which would then never meet the current extractor; reading it again costs no
+    model call. A summary that failed is not passed on either."""
+    path, conn = db
+    _content(conn, _attachment(conn, tmp_path, 1), status=status, llm=llm, error=error)
+    _attachment(conn, tmp_path, 2)
+    conn.commit()
+    reads = _record_reads(monkeypatch)
+
+    stats = run_phase1(str(path))
+
+    assert len(reads) == 1
+    assert stats["reused"] == 0

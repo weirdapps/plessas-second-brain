@@ -93,6 +93,31 @@ def extract_text_from_file(file_path: str, mime_type: str, _depth: int = 0) -> d
         }
 
     try:
+        # A zero-byte file holds nothing to read. Parsers raise on it (PyMuPDF: EmptyFileError),
+        # which used to be recorded as a failure and counted as a parser fault.
+        if os.path.getsize(file_path) == 0:
+            return {
+                "text": None,
+                "method": None,
+                "status": "skipped",
+                "error": "empty file (0 bytes)",
+            }
+        # Rights protection is also stored as an OLE2 container holding \x06DataSpaces, whatever
+        # the declared type says; the check above sees only application/encrypted. Sent to the
+        # legacy readers, such a workbook was recorded as failed ("Can't find workbook in OLE2
+        # compound document"). \x06DataSpaces sits in the first directory sector, where
+        # _ole_stream_names reads; EncryptedPackage often does not.
+        if (
+            ext != ".rpmsg"
+            and _magic(file_path) == b"\xd0\xcf\x11\xe0"
+            and "\x06DataSpaces" in _ole_stream_names(file_path)
+        ):
+            return {
+                "text": None,
+                "method": None,
+                "status": "skipped",
+                "error": f"IRM-protected {ext or 'file'}: no extractable text without rights",
+            }
         if ext == ".zip" or mime_type in ZIP_MIME_TYPES:
             sniffed = sniff_mime_type(file_path)
             if sniffed == "application/zip":

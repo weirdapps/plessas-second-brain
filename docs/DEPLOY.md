@@ -346,9 +346,20 @@ summaries, facts and vectors. Three commands and one file control it:
 | --- | --- |
 | `python -m src.cli hash-attachments` | Records `attachments.sha256` for files still on disk. Run it before deletion starts: afterwards the hash is the only evidence of what a file held |
 | `python -m src.cli sweep-files [--apply] [--only-newer-than ISO] [--policy]` | Deletes registered files whose content is stored. Report-only by default |
-| `scripts/reap_orphan_attachments.py [--apply] [--adopt-only] [--policy]` | Unregistered directories: stored duplicates go after a day, unique files are adopted after 7 days |
+| `scripts/reap_orphan_attachments.py [--apply] [--adopt-only] [--policy]` | Unregistered directories: stored duplicates go after a day, unique files are adopted after 7 days. Unregistered files inside a registered directory: stored duplicates go, unique ones stay |
 | `data/state/sweep-policy.json` | `{"apply": true or false, "only_newer_than": ISO or null}`. Absent means report-only. The wrappers pass `--policy`, so this file alone decides whether anything is deleted |
 
 The wrappers under `scripts/wrappers/systemd/` call the sweep and the reaper; copy them into
 `~/.local/bin` after changing them (they are an archive, see section 3). The health check's
 "Files on disk" row shows what is still held and warns when the sweep stops.
+
+**Documents without files.** A SharePoint file linked from mail and a note a Claude session
+wrote (`.md`, `.txt`, `.csv`) are stored as text only: `attachments.file_path` reads
+`text:<source>:<key>`, and no file is kept. `process-sharepoint` fetches into a temporary
+directory; the conversation sync runs `ingest-session-notes` over the transcripts changed since
+its last scan, so copy `sb-conversation-sync.sh` into `~/.local/bin` after this change. Zip
+archives are unpacked in a temporary directory, the same file is extracted once, and long texts
+are stored in full and summarised in parts. The one-time backfills are
+`process-sharepoint --ingest-fetched` (the files earlier fetches left in `data/sharepoint`,
+which `sweep-files` then also covers), `ingest-session-notes --all`, and
+`reextract --capped --long --zip --unread`, each with a count first (`reextract --dry-run`).

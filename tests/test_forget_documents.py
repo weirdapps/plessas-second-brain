@@ -81,15 +81,21 @@ def _document(
     return email_id, content
 
 
-def _mail_attachment(db, sha: str) -> None:
+def _mail_attachment(db, sha: str, status: str = "extracted", message_id: str = "AAMk") -> None:
+    """A mail attachment with these bytes, whose Phase 1 ended in `status`."""
     mail = db.execute(
-        "INSERT INTO emails (message_id, date_received, mailbox_name)"
-        " VALUES ('AAMk', 'now', 'Inbox')"
+        "INSERT INTO emails (message_id, date_received, mailbox_name) VALUES (?, 'now', 'Inbox')",
+        (message_id,),
+    ).lastrowid
+    att = db.execute(
+        "INSERT INTO attachments (email_id, message_id, filename, file_path, exported_at, sha256)"
+        " VALUES (?, ?, 'deck.pptx', '/x', 'now', ?)",
+        (mail, message_id, sha),
     ).lastrowid
     db.execute(
-        "INSERT INTO attachments (email_id, message_id, filename, file_path, exported_at, sha256)"
-        " VALUES (?, 'AAMk', 'deck.pptx', '/x', 'now', ?)",
-        (mail, sha),
+        "INSERT INTO attachment_content (attachment_id, extraction_status, llm_status)"
+        " VALUES (?, ?, ?)",
+        (att, status, "extracted" if status == "extracted" else "pending"),
     )
     db.commit()
 
@@ -172,8 +178,8 @@ def test_finds_documents_identical_to_a_mail_attachment(db):
     tree = DOCUMENT_TREES[0]
     same = hashlib.sha256(b"deck").hexdigest()
     other = hashlib.sha256(b"notes").hexdigest()
-    _document(db, -abs(int(same[:15], 16)), f"[Document] {tree}/units")
-    _document(db, -abs(int(other[:15], 16)), f"[Document] {tree}/units")
+    _document(db, -abs(int(same[:15], 16)), f"[Document] {tree}/sample")
+    _document(db, -abs(int(other[:15], 16)), f"[Document] {tree}/sample")
     _mail_attachment(db, same)
 
     found = _SCRIPT.find_duplicate_documents(db)
@@ -184,7 +190,7 @@ def test_finds_documents_identical_to_a_mail_attachment(db):
 def test_the_script_is_a_dry_run_by_default(db, tmp_path, capsys, monkeypatch):
     tree = DOCUMENT_TREES[0]
     same = hashlib.sha256(b"deck").hexdigest()
-    _document(db, -abs(int(same[:15], 16)), f"[Document] {tree}/units")
+    _document(db, -abs(int(same[:15], 16)), f"[Document] {tree}/sample")
     _mail_attachment(db, same)
     monkeypatch.setattr(
         sys, "argv", ["forget_duplicate_documents.py", "--db", str(tmp_path / "brain.db")]
@@ -195,3 +201,13 @@ def test_the_script_is_a_dry_run_by_default(db, tmp_path, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "identical to a mail attachment: 1" in out and "DRY RUN" in out
     assert _count(db, "emails", "mailbox_name = 'External'") == 1
+
+
+def test_a_twin_without_extracted_text_does_not_count(db):
+    """The same bytes can extract differently under another name; keep the copy with the text."""
+    tree = DOCUMENT_TREES[0]
+    same = hashlib.sha256(b"deck").hexdigest()
+    _document(db, -abs(int(same[:15], 16)), f"[Document] {tree}/sample")
+    _mail_attachment(db, same, status="skipped")
+
+    assert _SCRIPT.find_duplicate_documents(db) == []

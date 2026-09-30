@@ -25,22 +25,49 @@ def _hash_to_message_id(sha256: str) -> int:
     return -abs(int(sha256[:15], 16))
 
 
-def find_duplicate_documents(conn) -> list[tuple[int, str]]:
-    """(message_id, subject) of synced documents identical to a mail attachment."""
-    mail_ids = {
+def _mail_twins(conn, with_text: bool) -> set[int]:
+    """ingest_document ids of the mail attachments' bytes; with_text: only those whose text
+    and summary are stored, so forgetting the document loses nothing."""
+    stored = (
+        " AND ac.extraction_status = 'extracted' AND ac.llm_status = 'extracted'"
+        if with_text
+        else ""
+    )
+    return {
         _hash_to_message_id(sha)
         for (sha,) in conn.execute(
-            """SELECT a.sha256 FROM attachments a JOIN emails e ON e.id = a.email_id
-               WHERE a.sha256 IS NOT NULL AND e.mailbox_name <> 'External'"""
+            "SELECT a.sha256 FROM attachments a JOIN emails e ON e.id = a.email_id"
+            " LEFT JOIN attachment_content ac ON ac.attachment_id = a.id"
+            " WHERE a.sha256 IS NOT NULL AND e.mailbox_name <> 'External'" + stored
         )
     }
+
+
+def _synced_documents(conn) -> list[tuple[int, str]]:
     patterns = [f"[Document] {tree}%" for tree in DOCUMENT_TREES]
     where = " OR ".join("subject LIKE ?" for _ in patterns)
-    docs = conn.execute(
+    return conn.execute(
         f"SELECT message_id, subject FROM emails WHERE mailbox_name = 'External' AND ({where})",
         patterns,
     ).fetchall()
-    return [(mid, subject) for mid, subject in docs if mid in mail_ids]
+
+
+def find_duplicate_documents(conn) -> list[tuple[int, str]]:
+    """(message_id, subject) of synced documents identical to a mail attachment with text.
+
+    The same bytes can extract differently: an extensionless mail part recorded as
+    octet-stream is skipped while the same file as a .pdf document is extracted. So the
+    mail twin must hold extracted text and a summary before its document copy may go.
+    """
+    with_text = _mail_twins(conn, with_text=True)
+    return [(mid, subject) for mid, subject in _synced_documents(conn) if mid in with_text]
+
+
+def count_kept_twins(conn) -> int:
+    """Synced documents byte-identical to a mail attachment that has no stored text."""
+    any_twin = _mail_twins(conn, with_text=False)
+    with_text = _mail_twins(conn, with_text=True)
+    return sum(1 for mid, _ in _synced_documents(conn) if mid in any_twin - with_text)
 
 
 def main() -> int:
@@ -59,6 +86,9 @@ def main() -> int:
         ).fetchone()[0]
         dupes = find_duplicate_documents(conn)
         print(f"Synced documents identical to a mail attachment: {len(dupes):,}")
+        kept = count_kept_twins(conn)
+        if kept:
+            print(f"  kept: {kept:,} whose mail twin has no extracted text and summary")
         if unhashed:
             print(
                 f"  note: {unhashed:,} attachments have no hash yet; run"

@@ -1127,7 +1127,7 @@ def check_sharepoint(db):
         ]
         if overdue:
             status = "STALE"
-        elif failed > total * 0.3:
+        elif failed > (total - not_content) * 0.3:
             status = "WARN"
         else:
             status = "OK"
@@ -1978,7 +1978,8 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
             else:
                 extra = " (nothing blocked)"
         elif c["name"] == "SharePoint":
-            count = f"{c.get('ok', 0)}/{c.get('total', 0)}"
+            not_content = c.get("not_content", 0)
+            count = f"{c.get('ok', 0)}/{c.get('total', 0) - not_content}"
             failed = c.get("failed", 0)
             if failed:
                 breakdown = ", ".join(f"{n} {s}" for s, n in sorted(c.get("by_status", {}).items()))
@@ -1991,6 +1992,10 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
                     extra = extra[:-1] + f"; {given_up} given up, no longer retried)"
             else:
                 extra = " (all fetched)"
+            # Links with nothing to read are settled, so they sit outside the count; say how
+            # many, or the line stops adding up to the table.
+            if not_content:
+                extra = extra[:-1] + f"; {not_content} not content)"
         elif c["name"] == "Doc Roots":
             if c.get("push_failing"):
                 # The marker names the cause; hedging about a disconnected

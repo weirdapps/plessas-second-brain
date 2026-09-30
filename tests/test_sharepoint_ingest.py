@@ -547,3 +547,27 @@ def test_a_refetch_stopped_early_resumes_where_it_stopped(conn, tmp_path, tenant
     _process(tmp_path / "brain.db", refetch_content=True, max_fetches=1)
 
     assert len(calls) == 2
+
+
+def test_viewer_links_on_one_web_each_fetch_their_own_file(conn, tmp_path, tenant, monkeypatch):
+    viewer = "https://contoso.sharepoint.com/sites/team/_layouts/15/Doc.aspx"
+    plan, budget = f"{viewer}?sourcedoc=%7BA%7D&file=Plan.docx", f"{viewer}?sourcedoc=%7BB%7D"
+    bodies = {plan: WORDS, budget: "The budget for next year, in enough words to pass the filter."}
+    for url in (plan, budget):
+        record_link_in_db(conn, url=url, message_id="AAMk-1", status="stale")
+    calls: list = []
+
+    def fake(url, out_dir, managed_host=None):
+        calls.append(url)
+        f = Path(out_dir) / "file.txt"
+        f.write_text(bodies[url])
+        return SharepointFetchResult(url=url, status="ok", local_path=f, file_name=f.name)
+
+    monkeypatch.setattr(sharepoint_fetcher, "fetch_sharepoint_link", fake)
+
+    _process(tmp_path / "brain.db")
+
+    links = _links(tmp_path / "brain.db")
+    assert sorted(calls) == sorted([plan, budget])
+    assert links[plan][1] != links[budget][1]
+    assert "budget for next year" in _text_of(conn, links[budget][1])

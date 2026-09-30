@@ -922,7 +922,7 @@ def cmd_process_sharepoint(args):
         )
         if stats["auth_required"]:
             print(
-                f"\n⚠ Auth required — run 'sharepoint-cli login --host {SHAREPOINT_HOST}' and retry"
+                f"\n⚠ Auth required: run 'sharepoint-cli login --host {SHAREPOINT_HOST}' and retry"
             )
             return EXIT_REAUTH
         return 0

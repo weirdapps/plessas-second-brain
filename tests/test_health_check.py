@@ -224,6 +224,22 @@ def test_check_sharepoint_counts_not_content_as_done(hc):
     assert "not-content" not in r["by_status"]
 
 
+def test_report_counts_links_that_are_not_content_apart(hc):
+    db = _sp_db(ok=10, not_content=490, http_error=2)
+
+    report, _ = hc.build_report([hc.check_sharepoint(db)], {}, {}, {}, [])
+
+    assert "10/12" in report
+    assert "490 not content" in report
+
+
+def test_check_sharepoint_warns_on_failures_among_content_links(hc):
+    """Links with nothing to read must not dilute the share of content links that failed."""
+    db = _sp_db(ok=6, http_error=4, not_content=100)
+
+    assert hc.check_sharepoint(db)["status"] == "WARN"
+
+
 def test_check_sharepoint_warns_when_most_links_are_unfetched(hc):
     db = _sp_db(ok=6, http_error=4)
 

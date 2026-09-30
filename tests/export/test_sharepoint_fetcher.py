@@ -765,16 +765,24 @@ def test_a_page_fetch_error_maps_like_a_file_fetch(mock_cli):
 
 
 @patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
-def test_not_a_file_maps_to_not_content(mock_cli, tmp_path):
+def test_not_a_file_is_a_failure_that_stays_visible_and_is_retried(mock_cli, tmp_path):
+    """A file link that answered with a page naming no file: a viewer format change, or an
+    interstitial nobody recognised. Settling it would hide it for good; it must stay a failure
+    that the health row and list_stale show and the retry pass offers again."""
     from src.export.sharepoint_cli import SharepointCliError
+    from src.export.sharepoint_fetcher import retry_candidates
 
     mock_cli.side_effect = SharepointCliError(
         exit_code=5, stderr='{"error":"not_a_file","message":"not a file"}', retryable=True
     )
-    result = fetch_sharepoint_link(
-        "https://x.sharepoint.com/:x:/g/sites/t/EQabc", tmp_path, managed_host=MANAGED
-    )
-    assert result.status == "not-content"
+    url = "https://contoso.sharepoint.com/:x:/g/sites/t/EQabc"
+    result = fetch_sharepoint_link(url, tmp_path, managed_host="contoso.sharepoint.com")
+    assert result.status == "not-a-file"
+
+    conn = _setup_db(tmp_path)
+    record_link_in_db(conn, url, "AAMk-1", result.status)
+    assert conn.execute("SELECT fetched_at FROM sharepoint_links").fetchone()[0] is None
+    assert [r[0] for r in retry_candidates(conn, managed_host="contoso.sharepoint.com")] == [url]
 
 
 def test_not_content_is_recorded_as_done_and_never_retried(tmp_path):
@@ -805,6 +813,28 @@ def test_not_content_is_recorded_as_done_and_never_retried(tmp_path):
             False,
         ),
         (PAGE_URL, "https://x-my.sharepoint.com/sites/news/SitePages/Launch.aspx", False),
+        # An Office viewer names its file only in the query.
+        (
+            "https://x.sharepoint.com/sites/team/_layouts/15/Doc.aspx?sourcedoc=%7BA%7D&file=Plan.docx",
+            "https://x.sharepoint.com/sites/team/_layouts/15/Doc.aspx?sourcedoc=%7BB%7D&file=Budget.xlsx",
+            False,
+        ),
+        (
+            "https://x.sharepoint.com/:w:/r/sites/team/_layouts/15/Doc.aspx?sourcedoc=%7BA%7D",
+            "https://x.sharepoint.com/:x:/r/sites/team/_layouts/15/Doc.aspx?sourcedoc=%7BB%7D",
+            False,
+        ),
+        (
+            "https://x.sharepoint.com/sites/team/_layouts/15/xlviewer.aspx?id=/sites/team/a.xlsx",
+            "https://x.sharepoint.com/sites/team/_layouts/15/xlviewer.aspx?id=/sites/team/b.xlsx",
+            False,
+        ),
+        # A link that is not content never shares a result with a file.
+        (
+            "https://x.sharepoint.com/:u:/r/sites/team/a.zip",
+            "https://x.sharepoint.com/sites/team/a.zip",
+            False,
+        ),
     ],
 )
 def test_links_share_a_target_when_they_fetch_the_same_thing(a, b, same):

@@ -229,6 +229,7 @@ def run_backfill(
         LEFT JOIN email_html h ON h.email_id = e.id
         WHERE a.mime_type LIKE 'image/%'
           AND a.file_path IS NOT NULL
+          AND a.file_path NOT LIKE 'text:%'
     """
 
     params: list[str | int] = []

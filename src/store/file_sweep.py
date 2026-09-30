@@ -207,8 +207,48 @@ def classify_files(conn: sqlite3.Connection, root: Path) -> list[FileState]:
     return found
 
 
+def classify_sharepoint_files(conn: sqlite3.Connection, root: Path) -> list[FileState]:
+    """Files earlier fetches left under data/sharepoint, by whether their text is stored.
+
+    No row names these files (fetches were saved flat by name, and a later file could replace
+    an earlier one), so they are matched by content: a file whose hash belongs to a row whose
+    bytes were read (its SharePoint document, or the same bytes mailed as an attachment) is
+    stored and may go.
+    """
+    from src.store.file_hashes import sha256_of_file
+
+    stored = {
+        sha
+        for (sha,) in conn.execute(
+            "SELECT a.sha256 FROM attachments a JOIN attachment_content ac"
+            " ON ac.attachment_id = a.id"
+            f" WHERE a.sha256 IS NOT NULL AND NOT COALESCE({UNREAD_SQL}, 0)"
+        )
+    }
+    found: list[FileState] = []
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return found
+    for e in entries:
+        try:
+            if not e.is_file(follow_symlinks=False):
+                continue
+            st = e.stat(follow_symlinks=False)
+            sha = sha256_of_file(Path(e.path))
+        except FileNotFoundError:
+            continue
+        state = DELETABLE if sha in stored else PENDING_TEXT
+        found.append(FileState(Path(e.path), state, st.st_size, st.st_mtime, ()))
+    return found
+
+
 def sweep_files(
-    conn: sqlite3.Connection, root: Path, policy: SweepPolicy, now: datetime | None = None
+    conn: sqlite3.Connection,
+    root: Path,
+    policy: SweepPolicy,
+    now: datetime | None = None,
+    sharepoint_root: Path | None = None,
 ) -> dict:
     """Delete the files whose content is stored, as far as the policy allows.
 
@@ -216,7 +256,8 @@ def sweep_files(
     deleted: that is how stage 4 turns deletion on for new downloads while the backlog waits
     for its own confirmation. A directory is removed only when this pass emptied it. A file
     that cannot be deleted is counted in "errors" and the pass carries on; the files it did
-    delete are stamped either way.
+    delete are stamped either way. With `sharepoint_root`, the files earlier SharePoint fetches
+    left there are swept too (classify_sharepoint_files); that directory itself stays.
     """
     now = now or datetime.now(UTC)
     stats: dict = dict.fromkeys(STATES, 0)
@@ -232,8 +273,11 @@ def sweep_files(
     cutoff = policy.only_newer_than.timestamp() if policy.only_newer_than else None
     removed: list[int] = []
     emptied: set[Path] = set()
+    files = classify_files(conn, Path(root))
+    if sharepoint_root is not None:
+        files += classify_sharepoint_files(conn, Path(sharepoint_root))
     try:
-        for f in classify_files(conn, Path(root)):
+        for f in files:
             stats[f.state] += 1
             if f.state != DELETABLE:
                 continue
@@ -254,7 +298,8 @@ def sweep_files(
             stats["deleted"] += 1
             stats["bytes_freed"] += f.size
             removed.extend(f.attachment_ids)
-            emptied.add(f.path.parent)
+            if sharepoint_root is None or f.path.parent != Path(sharepoint_root):
+                emptied.add(f.path.parent)
     finally:
         if policy.apply and removed:
             conn.executemany(

@@ -30,6 +30,7 @@ from src.config import (  # noqa: E402
     ATTACHMENTS_DIR,
     DEFAULT_DB,
     NEWS_DB_PATH,
+    SHAREPOINT_DATA_DIR,
     SHAREPOINT_HOST,
     WHATSAPP_SNAPSHOT,
     document_roots,
@@ -694,7 +695,7 @@ def check_attachments(db):
 
 
 def check_files_on_disk(db):
-    """Attachment files the VPS still holds, by state (src/store/file_sweep.py).
+    """Attachment and SharePoint files the VPS still holds, by state (src/store/file_sweep.py).
 
     OK while the sweep policy is report-only: until the backlog deletion is confirmed, the
     stored files are supposed to be there. Once the policy turns deletion on, a stored file
@@ -706,6 +707,7 @@ def check_files_on_disk(db):
 
     try:
         files = file_sweep.classify_files(db, ATTACHMENTS_DIR)
+        files += file_sweep.classify_sharepoint_files(db, SHAREPOINT_DATA_DIR)
     except (sqlite3.OperationalError, OSError) as e:
         # Same posture as check_attachments: main() runs the checks unguarded, so an
         # exception here would take down the whole report.
@@ -799,6 +801,7 @@ def check_images(db):
         "SELECT COUNT(*), MIN(e.date_received) FROM attachments a "
         "LEFT JOIN emails e ON a.email_id = e.id "
         "WHERE a.mime_type LIKE 'image/%' AND a.file_path IS NOT NULL "
+        "AND a.file_path NOT LIKE 'text:%' "
         f"AND {IMAGE_OWED_SQL}"
     ).fetchone()
     pending_age = _age(oldest_pending)

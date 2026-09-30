@@ -640,7 +640,8 @@ def migrate_add_text_documents(conn: sqlite3.Connection) -> None:
     A SharePoint file or a session note is stored as text only (ingest_text_document in
     src/extract/attachment_pipeline.py). sharepoint_links.document_message_id names the document
     a fetched link became. session_notes maps a note's path to its current document, so a newer
-    version can replace it. attachment_id on key_facts, decisions and action_items lets an
+    version can replace it, and session_note_transcripts records which transcripts it has read.
+    attachment_id on key_facts, decisions and action_items lets an
     attachment's summary be redone without touching the email's own rows; rows written before
     v28 keep NULL.
     """
@@ -656,6 +657,15 @@ def migrate_add_text_documents(conn: sqlite3.Connection) -> None:
             session_id TEXT,
             written_at TEXT,
             sha256 TEXT
+        )"""
+    )
+    # Which transcripts the session-notes scan has read, as they were then: a file whose size
+    # or modification time differs is read again (src/export/session_notes.py).
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS session_note_transcripts (
+            path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL
         )"""
     )
     for table in ("key_facts", "decisions", "action_items"):

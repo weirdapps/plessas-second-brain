@@ -11,27 +11,32 @@ An edit whose old text is no longer there means the replay has lost track of the
 keeps its last version known to be right and ignores that path's edits until the next Write.
 Only .md, .txt and .csv count. Files written by scripts or through Bash are not covered: the
 transcript does not carry their content.
+
+Which transcripts to read is decided per file, by its size and modification time against those
+recorded when it was last read (session_note_transcripts), never by a clock mark: transcripts
+reach this host by rsync with the writing Mac's times, so a laptop that syncs late delivers files
+that look older than the last scan. Subagent and workflow transcripts, under a session's own
+directory, are read too. One transcript's failure is counted and the others go on; it is read
+again next run.
 """
 
 import hashlib
 import json
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from src.export.conversation_export import scan_conversation_files
+from src.config import CLAUDE_CODE_PROJECTS_DIR
 from src.extract.attachment_extractors import _apply_noise_filter
 from src.extract.attachment_pipeline import _guess_mime_type, ingest_text_document
 from src.store.forget import forget_documents
 
 NOTE_SUFFIXES = (".md", ".txt", ".csv")
-SCAN_MARK_KEY = "session_notes_scanned_to"
-# How far back the first run without a mark reaches; the backfill is --all.
+# On the first scan, transcripts older than this are left to the backfill (--all).
 FIRST_SCAN_DAYS = 2
-# A transcript still being written while the scan reads it is taken again next time.
-SCAN_OVERLAP_S = 60
 
 
 @dataclass
@@ -44,7 +49,7 @@ class Note:
 
 def _records(jsonl_path: Path):
     try:
-        with open(jsonl_path, encoding="utf-8") as f:
+        with open(jsonl_path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 try:
                     record = json.loads(line)
@@ -75,10 +80,17 @@ def collect_session_notes(jsonl_path: Path) -> dict[str, Note]:
     pending: dict[str, tuple[str, dict, str]] = {}
     session_id = jsonl_path.stem
     for record in _records(jsonl_path):
-        session_id = record.get("sessionId") or session_id
-        content = (record.get("message") or {}).get("content")
+        # Every field is checked for its type: a transcript is third-party input to this code,
+        # and one odd record must not stop the read.
+        sid = record.get("sessionId")
+        if isinstance(sid, str) and sid:
+            session_id = sid
+        message = record.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
             continue
+        stamp = record.get("timestamp")
+        timestamp = stamp if isinstance(stamp, str) else ""
         for block in content:
             if not isinstance(block, dict):
                 continue
@@ -87,12 +99,9 @@ def collect_session_notes(jsonl_path: Path) -> dict[str, Note]:
                 "Edit",
                 "MultiEdit",
             ):
-                if block.get("id") and isinstance(block.get("input"), dict):
-                    pending[block["id"]] = (
-                        block["name"],
-                        block["input"],
-                        record.get("timestamp") or "",
-                    )
+                use_id, tool_input = block.get("id"), block.get("input")
+                if isinstance(use_id, str) and use_id and isinstance(tool_input, dict):
+                    pending[use_id] = (block["name"], tool_input, timestamp)
             elif block.get("type") == "tool_result" and not block.get("is_error"):
                 use_id = block.get("tool_use_id")
                 use = pending.pop(use_id, None) if isinstance(use_id, str) else None
@@ -181,30 +190,80 @@ def _store_note(conn: sqlite3.Connection, note: Note, stats: dict) -> None:
     stats["stored"] += 1
 
 
+def _mark_read(conn: sqlite3.Connection, path: Path, size: int, mtime_ns: int) -> None:
+    conn.execute(
+        """INSERT INTO session_note_transcripts (path, size, mtime_ns) VALUES (?, ?, ?)
+           ON CONFLICT(path) DO UPDATE SET size = excluded.size, mtime_ns = excluded.mtime_ns""",
+        (str(path), size, mtime_ns),
+    )
+    conn.commit()
+
+
 def ingest_session_notes(conn: sqlite3.Connection, jsonl_files) -> dict:
-    """Store the last version of every note the transcripts wrote. See the module docstring."""
-    stats = dict.fromkeys(("notes", "stored", "replaced", "unchanged", "older"), 0)
+    """Store the last version of every note the transcripts wrote. See the module docstring.
+
+    A transcript is recorded as read with the size and time it had before the read, so one that
+    grew meanwhile is read again. One that fails is counted in "errors", left unrecorded so the
+    next run reads it again, and does not stop the others.
+    """
+    stats = dict.fromkeys(
+        ("transcripts", "notes", "stored", "replaced", "unchanged", "older", "errors"), 0
+    )
     for jsonl in jsonl_files:
-        for note in collect_session_notes(Path(jsonl)).values():
-            stats["notes"] += 1
-            _store_note(conn, note, stats)
+        path = Path(jsonl)
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        stats["transcripts"] += 1
+        try:
+            for note in collect_session_notes(path).values():
+                stats["notes"] += 1
+                _store_note(conn, note, stats)
+        except Exception as e:
+            conn.rollback()
+            stats["errors"] += 1
+            print(f"  session notes: {path}: {type(e).__name__}: {e}", file=sys.stderr)
+            continue
+        _mark_read(conn, path, st.st_size, st.st_mtime_ns)
     return stats
 
 
+def _transcripts() -> list[Path]:
+    """Every transcript: sessions at the top of each project, and the subagent and workflow
+    transcripts under a session's own directory, which write plans, specs and reports too."""
+    if not CLAUDE_CODE_PROJECTS_DIR.is_dir():
+        return []
+    return sorted(p for p in CLAUDE_CODE_PROJECTS_DIR.glob("*/**/*.jsonl") if p.is_file())
+
+
 def transcripts_to_scan(conn: sqlite3.Connection, all_files: bool) -> list[Path]:
-    """The transcripts changed since the last scan, or every one for the backfill."""
-    files = scan_conversation_files()
+    """The transcripts new or changed since they were last read, or every one for the backfill.
+
+    On the first scan (nothing recorded yet) transcripts older than FIRST_SCAN_DAYS are recorded
+    as read without reading them: they are the backfill's (--all), and reading them all here
+    would not fit the conversation sync's unit.
+    """
+    files = _transcripts()
     if all_files:
         return files
-    row = conn.execute("SELECT value FROM sync_metadata WHERE key = ?", (SCAN_MARK_KEY,)).fetchone()
-    mark = float(row[0]) if row else time.time() - FIRST_SCAN_DAYS * 86400
-    return [f for f in files if f.stat().st_mtime > mark]
-
-
-def mark_scanned(conn: sqlite3.Connection, started: float) -> None:
-    """Remember where the next scan starts: a little before this one began."""
-    conn.execute(
-        "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES (?, ?)",
-        (SCAN_MARK_KEY, str(started - SCAN_OVERLAP_S)),
-    )
-    conn.commit()
+    seen = {
+        path: (size, mtime_ns)
+        for path, size, mtime_ns in conn.execute(
+            "SELECT path, size, mtime_ns FROM session_note_transcripts"
+        )
+    }
+    first = not seen
+    cutoff = time.time() - FIRST_SCAN_DAYS * 86400
+    todo = []
+    for f in files:
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        if first and st.st_mtime < cutoff:
+            _mark_read(conn, f, st.st_size, st.st_mtime_ns)
+            continue
+        if seen.get(str(f)) != (st.st_size, st.st_mtime_ns):
+            todo.append(f)
+    return todo

@@ -434,18 +434,14 @@ def cmd_hash_attachments(args):
 
 def cmd_ingest_session_notes(args):
     """Store what Claude sessions wrote to notes (src/export/session_notes.py)."""
-    import time
-
-    from src.export.session_notes import ingest_session_notes, mark_scanned, transcripts_to_scan
+    from src.export.session_notes import ingest_session_notes, transcripts_to_scan
     from src.store.schema import get_connection, run_migrations
 
-    started = time.time()
     conn = get_connection(str(args.db))
     try:
         run_migrations(conn)
         files = transcripts_to_scan(conn, all_files=args.all)
         stats = ingest_session_notes(conn, files)
-        mark_scanned(conn, started)
     finally:
         conn.close()
     print(

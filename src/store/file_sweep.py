@@ -1,9 +1,15 @@
 """Delete attachment files whose content is already in the database.
 
-A file is an input. Once Phase 1 has recorded its text (or recorded it as unreadable), and,
-for an image, once the vision pass is done with it, nothing reads the file again: the MCP
-tools, Phase 2 and the embeddings all read the database. This module finds those files and,
-when the policy allows, deletes them.
+A file is an input. Once Phase 1 has read its bytes and recorded the outcome (text, or
+"nothing to extract", or "unreadable"), and, for an image, once the vision pass is done with
+it, nothing reads the file again: the MCP tools, Phase 2 and the embeddings all read the
+database. This module finds those files and, when the policy allows, deletes them.
+
+A Phase 1 row is not always proof the bytes were read. Phase 1 opens the row's recorded
+absolute path, while this module finds files by directory and name, so a row recorded on
+another host says "File not found" about a file that is right here. A host missing a tool
+(no legacy .doc converter, no tesseract) records a row without reading anything either. Such
+files are UNREAD and kept.
 
 It owns REGISTERED files only. A directory no attachments row references belongs to the
 orphan reaper (scripts/reap_orphan_attachments.py), which knows the grace periods an
@@ -32,9 +38,24 @@ IMAGE_WAIT_HOURS = 72
 
 DELETABLE = "deletable"
 PENDING_TEXT = "pending-text"
+UNREAD = "unread"
 PENDING_IMAGE = "pending-image"
 UNREGISTERED = "unregistered"
-STATES = (DELETABLE, PENDING_TEXT, PENDING_IMAGE, UNREGISTERED)
+STATES = (DELETABLE, PENDING_TEXT, UNREAD, PENDING_IMAGE, UNREGISTERED)
+
+# Phase 1 errors that mean the bytes were never read (src/extract/attachment_extractors.py).
+# Shared with the orphan reaper, whose stored-hash rule must not count these rows either.
+UNREAD_SQL = (
+    "(ac.extraction_error LIKE 'File not found%'"
+    " OR ac.extraction_error LIKE 'No legacy .doc converter%'"
+    " OR ac.extraction_error LIKE '%not installed%')"
+)
+
+# The extractor OCRs these by extension whatever the mime says, and ingest_document used to
+# record them as application/octet-stream, so an image is known by either.
+IMAGE_SUFFIXES = frozenset(
+    {".png", ".jpg", ".jpeg", ".gif", ".tiff", ".tif", ".bmp", ".jfif", ".heic", ".heif", ".webp"}
+)
 
 
 @dataclass(frozen=True)
@@ -51,7 +72,7 @@ class FileState:
     state: str
     size: int
     mtime: float
-    attachment_id: int | None
+    attachment_ids: tuple[int, ...]
 
 
 def parse_timestamp(value: str) -> datetime:
@@ -60,31 +81,68 @@ def parse_timestamp(value: str) -> datetime:
     return ts if ts.tzinfo else ts.replace(tzinfo=UTC)
 
 
+def _read_policy(path: Path) -> SweepPolicy:
+    """Parse the policy strictly; raise ValueError on anything but the two documented shapes.
+
+    "only_newer_than" must be present and be either null (the backlog deletion) or a
+    non-empty ISO timestamp. A missing key, "", 0 or false would otherwise read as "no
+    cutoff", which is the one step the owner confirms by hand.
+    """
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict) or "only_newer_than" not in raw:
+        raise ValueError("policy must be an object with an only_newer_than key")
+    cutoff = raw["only_newer_than"]
+    if cutoff is not None and not (isinstance(cutoff, str) and cutoff.strip()):
+        raise ValueError(f"only_newer_than must be null or an ISO timestamp, not {cutoff!r}")
+    return SweepPolicy(
+        apply=raw.get("apply") is True,
+        only_newer_than=parse_timestamp(cutoff) if cutoff is not None else None,
+    )
+
+
 def load_policy(path: Path | None = None) -> SweepPolicy:
     """Read the sweep policy file. Absent or unreadable means report-only.
 
     A malformed file must never stop the hourly sync, and must never delete anything: the
-    safe reading of a policy nobody can parse is the policy that does nothing. The health
-    row prints the mode, so a sweep stuck in report-only shows up there.
+    safe reading of a policy nobody can parse is the policy that does nothing.
+    policy_problem() says why, so the health row can warn about it.
     """
     path = SWEEP_POLICY_FILE if path is None else Path(path)
     try:
-        raw = json.loads(path.read_text())
-        cutoff = raw.get("only_newer_than")
-        return SweepPolicy(
-            apply=raw.get("apply") is True,
-            only_newer_than=parse_timestamp(cutoff) if cutoff else None,
-        )
+        return _read_policy(path)
     except (OSError, ValueError, AttributeError, TypeError):
         return SweepPolicy()
 
 
-def _registered(conn: sqlite3.Connection) -> dict[tuple[str, str], tuple[int, bool, bool]]:
-    """(directory name, filename) -> (attachment id, content stored, image still owed)."""
+def policy_problem(path: Path | None = None) -> str | None:
+    """Why the policy file exists but cannot be used, or None when it is absent or valid."""
+    path = SWEEP_POLICY_FILE if path is None else Path(path)
+    if not path.exists():
+        return None
+    try:
+        _read_policy(path)
+    except (OSError, ValueError, AttributeError, TypeError) as e:
+        return f"{path} is unreadable, so the sweep is report-only: {e}"
+    return None
+
+
+def _is_image(mime: str | None, filename: str) -> bool:
+    return (mime or "").lower().startswith("image/") or Path(filename).suffix.lower() in (
+        IMAGE_SUFFIXES
+    )
+
+
+def _registered(conn: sqlite3.Connection) -> dict[tuple[str, str], tuple[tuple[int, ...], str]]:
+    """(directory name, filename) -> (attachment ids, the state their rows allow).
+
+    When several rows share a directory and name, the file is deletable only if every one of
+    them allows it: the least-finished row decides.
+    """
     rows = conn.execute(
-        """
-        SELECT a.id, a.file_path, a.mime_type,
+        f"""
+        SELECT a.id, a.file_path, a.mime_type, a.filename,
                ac.id IS NOT NULL,
+               COALESCE({UNREAD_SQL}, 0),
                ii.sha256 IS NOT NULL,
                ii.vision_description IS NOT NULL,
                COALESCE(ii.classification IN ('signature', 'noise'), 0),
@@ -95,21 +153,41 @@ def _registered(conn: sqlite3.Connection) -> dict[tuple[str, str], tuple[int, bo
         WHERE a.file_path IS NOT NULL
         """
     ).fetchall()
-    known: dict[tuple[str, str], tuple[int, bool, bool]] = {}
-    for att_id, file_path, mime, stored, seen, described, by_design, attempts in rows:
-        is_image = (mime or "").startswith("image/")
-        image_done = seen and (described or by_design or attempts >= VISION_ATTEMPTS_LIMIT)
+    rank = {DELETABLE: 0, PENDING_IMAGE: 1, UNREAD: 2, PENDING_TEXT: 3}
+    known: dict[tuple[str, str], tuple[tuple[int, ...], str]] = {}
+    for row in rows:
+        att_id, file_path, mime, filename, stored, unread, seen, described, by_design, tries = row
+        if not stored:
+            state = PENDING_TEXT
+        elif unread:
+            state = UNREAD
+        elif _is_image(mime, filename or file_path) and not (
+            seen and (described or by_design or tries >= VISION_ATTEMPTS_LIMIT)
+        ):
+            state = PENDING_IMAGE
+        else:
+            state = DELETABLE
         p = Path(file_path)
-        known[(p.parent.name, p.name)] = (att_id, bool(stored), is_image and not image_done)
+        key = (p.parent.name, p.name)
+        if key in known:
+            ids, prev = known[key]
+            state = max(state, prev, key=rank.__getitem__)
+            known[key] = (ids + (att_id,), state)
+        else:
+            known[key] = ((att_id,), state)
     return known
 
 
 def classify_files(conn: sqlite3.Connection, root: Path) -> list[FileState]:
-    """Every file under root/<directory>/, with the state that decides its fate."""
+    """Every file under root/<directory>/, with the state that decides its fate.
+
+    A directory reached through a symlink is not walked: it can point outside the root.
+    A file that disappears between the listing and its stat is skipped.
+    """
     known = _registered(conn)
     found: list[FileState] = []
     try:
-        dirs = [e for e in os.scandir(root) if e.is_dir()]
+        dirs = [e for e in os.scandir(root) if e.is_dir(follow_symlinks=False)]
     except OSError:
         return found
     for d in dirs:
@@ -118,21 +196,14 @@ def classify_files(conn: sqlite3.Connection, root: Path) -> list[FileState]:
         except OSError:
             continue
         for e in entries:
-            if not e.is_file(follow_symlinks=False):
+            try:
+                if not e.is_file(follow_symlinks=False):
+                    continue
+                st = e.stat(follow_symlinks=False)
+            except FileNotFoundError:
                 continue
-            st = e.stat(follow_symlinks=False)
-            hit = known.get((d.name, e.name))
-            if hit is None:
-                state, att_id = UNREGISTERED, None
-            else:
-                att_id, stored, image_owed = hit
-                if not stored:
-                    state = PENDING_TEXT
-                elif image_owed:
-                    state = PENDING_IMAGE
-                else:
-                    state = DELETABLE
-            found.append(FileState(Path(e.path), state, st.st_size, st.st_mtime, att_id))
+            ids, state = known.get((d.name, e.name), ((), UNREGISTERED))
+            found.append(FileState(Path(e.path), state, st.st_size, st.st_mtime, ids))
     return found
 
 
@@ -143,7 +214,9 @@ def sweep_files(
 
     Report-only unless policy.apply. With a cutoff, only files modified at or after it are
     deleted: that is how stage 4 turns deletion on for new downloads while the backlog waits
-    for its own confirmation. A directory is removed only when this pass emptied it.
+    for its own confirmation. A directory is removed only when this pass emptied it. A file
+    that cannot be deleted is counted in "errors" and the pass carries on; the files it did
+    delete are stamped either way.
     """
     now = now or datetime.now(UTC)
     stats: dict = dict.fromkeys(STATES, 0)
@@ -151,6 +224,7 @@ def sweep_files(
         before_cutoff=0,
         to_delete=0,
         deleted=0,
+        errors=0,
         bytes_freed=0,
         dirs_removed=0,
         applied=policy.apply,
@@ -158,31 +232,36 @@ def sweep_files(
     cutoff = policy.only_newer_than.timestamp() if policy.only_newer_than else None
     removed: list[int] = []
     emptied: set[Path] = set()
-    for f in classify_files(conn, Path(root)):
-        stats[f.state] += 1
-        if f.state != DELETABLE:
-            continue
-        if cutoff is not None and f.mtime < cutoff:
-            stats["before_cutoff"] += 1
-            continue
-        stats["to_delete"] += 1
-        stats["bytes_freed"] += f.size
-        if not policy.apply:
-            continue
-        try:
-            f.path.unlink()
-        except FileNotFoundError:
-            pass
-        stats["deleted"] += 1
-        if f.attachment_id is not None:
-            removed.append(f.attachment_id)
-        emptied.add(f.path.parent)
-    if policy.apply and removed:
-        conn.executemany(
-            "UPDATE attachments SET file_removed_at = ? WHERE id = ?",
-            [(now.isoformat(), att_id) for att_id in removed],
-        )
-        conn.commit()
+    try:
+        for f in classify_files(conn, Path(root)):
+            stats[f.state] += 1
+            if f.state != DELETABLE:
+                continue
+            if cutoff is not None and f.mtime < cutoff:
+                stats["before_cutoff"] += 1
+                continue
+            stats["to_delete"] += 1
+            if not policy.apply:
+                stats["bytes_freed"] += f.size
+                continue
+            try:
+                f.path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                stats["errors"] += 1
+                continue
+            stats["deleted"] += 1
+            stats["bytes_freed"] += f.size
+            removed.extend(f.attachment_ids)
+            emptied.add(f.path.parent)
+    finally:
+        if policy.apply and removed:
+            conn.executemany(
+                "UPDATE attachments SET file_removed_at = ? WHERE id = ?",
+                [(now.isoformat(), att_id) for att_id in removed],
+            )
+            conn.commit()
     for d in emptied:
         try:
             d.rmdir()

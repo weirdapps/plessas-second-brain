@@ -457,9 +457,11 @@ def cmd_sweep_files(args):
     print(f"  of which older than the cutoff : {stats['before_cutoff']:,}")
     print(f"  {verb:<31}: {stats['to_delete']:,} ({stats['bytes_freed'] / 2**20:,.0f} MiB)")
     print(f"  awaiting text extraction       : {stats['pending-text']:,}")
+    print(f"  unread (Phase 1 could not read) : {stats['unread']:,}")
     print(f"  images awaiting vision         : {stats['pending-image']:,}")
     print(f"  unregistered (orphan reaper)   : {stats['unregistered']:,}")
     print(f"  directories removed            : {stats['dirs_removed']:,}")
+    print(f"  delete errors                  : {stats['errors']:,}")
     return 0
 
 

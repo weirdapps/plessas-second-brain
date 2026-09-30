@@ -20,6 +20,7 @@ from src.export.sharepoint_fetcher import (
     record_link_in_db,
 )
 from src.extract.attachment_extractors import sniff_mime_type
+from src.store.file_hashes import sha256_of_file
 
 logger = logging.getLogger(__name__)
 
@@ -238,8 +239,8 @@ def register_downloaded_attachments(
             cur = conn.execute(
                 """INSERT INTO attachments
                    (email_id, message_id, filename, mime_type, file_size, file_path,
-                    is_inline, exported_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 0, ?)""",
+                    is_inline, exported_at, sha256)
+                   VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)""",
                 (
                     email_id,
                     stored_message_id,
@@ -253,6 +254,9 @@ def register_downloaded_attachments(
                     f.stat().st_size,
                     str(f),
                     stamp,
+                    # Recorded now because the file will not stay: the sweep deletes
+                    # it once its content is stored (src/store/file_sweep.py).
+                    sha256_of_file(f),
                 ),
             )
             stats["registered"] += 1

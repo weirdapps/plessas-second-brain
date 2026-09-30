@@ -98,8 +98,10 @@ def _build_mime_type_conditions(file_type: str | None) -> tuple[str, list]:
     return "", []
 
 
-# Another attachment with the same bytes whose row is finished: Phase 1 read the file itself
-# (not one of UNREAD_SQL's "never read" outcomes) and, if it extracted text, Phase 2 is done.
+# Another attachment with the same bytes whose row is fully finished: text extracted from the
+# file itself and summarised. Only that is passed on. A failure or a skip may come from an older
+# extractor (a zip the old code never unpacked, a converter a host lacked), and a copy that
+# inherited it would never meet the current one; reading it again costs no model call.
 _REUSABLE_SQL = f"""
     SELECT ac.extracted_text, ac.extraction_method, ac.extraction_status,
            ac.extraction_error, ac.summary, ac.language, ac.llm_status
@@ -107,7 +109,7 @@ _REUSABLE_SQL = f"""
     JOIN attachment_content ac ON ac.attachment_id = a.id
     WHERE a.sha256 = ? AND a.id != ?
       AND NOT COALESCE({UNREAD_SQL}, 0)
-      AND (ac.extraction_status != 'extracted' OR ac.llm_status IN ('extracted', 'failed'))
+      AND ac.extraction_status = 'extracted' AND ac.llm_status = 'extracted'
     ORDER BY ac.id
     LIMIT 1
 """

@@ -170,6 +170,15 @@ def compute_position_in_body(email_content: str | None, attachment_filename: str
     return 0.5
 
 
+def _image_is_done(conn: sqlite3.Connection, sha256: str) -> bool:
+    return (
+        conn.execute(
+            f"SELECT 1 FROM inline_images ii WHERE ii.sha256 = ? AND {IMAGE_DONE_SQL}", (sha256,)
+        ).fetchone()
+        is not None
+    )
+
+
 def run_backfill(
     conn: sqlite3.Connection,
     since: str | None = None,
@@ -203,11 +212,14 @@ def run_backfill(
             instead of being SIGTERMed mid-flight. None = no time box.
 
     Returns:
-        Stats dict: {scanned, classified, missing, failed, deferred}
+        Stats dict: {scanned, classified, recorded, missing, failed, deferred}. `recorded` counts
+        occurrences written from the stored hash for an image whose file is gone but which is
+        already done (see below).
     """
     stats = {
         "scanned": 0,
         "classified": 0,
+        "recorded": 0,
         "missing": 0,
         "failed": 0,
         "deferred": 0,
@@ -223,7 +235,8 @@ def run_backfill(
             COALESCE(e.sender_address, ''),
             e.content,
             e.date_received,
-            h.html
+            h.html,
+            a.sha256
         FROM attachments a
         LEFT JOIN emails e ON a.email_id = e.id
         LEFT JOIN email_html h ON h.email_id = e.id
@@ -261,12 +274,19 @@ def run_backfill(
     # hourly launchd / conversation-capture-hook writers.
     rows = conn.execute(query, params).fetchall()
 
-    # Count scanned + drop missing files up front; collect the real work list.
+    # Count scanned + drop missing files up front; collect the real work list. A file that is
+    # gone but whose image is done (the sweep deletes a file once its hash is done, whether or
+    # not this message's occurrence was recorded yet) only needs the occurrence, which the
+    # stored hash is enough for.
     todo = []
+    known = []
     for row in rows:
         file_path = row[1]
         stats["scanned"] += 1
         if not Path(file_path).exists():
+            if row[8] and _image_is_done(conn, row[8]):
+                known.append(row)
+                continue
             logger.warning(f"Image file not found: {file_path}")
             stats["missing"] += 1
             continue
@@ -275,13 +295,24 @@ def run_backfill(
     if dry_run:
         return stats
 
+    for row in known:
+        attachment_id, _, filename, message_id, sender_address, content, _, html, sha256 = row
+        position = compute_position_in_body(markup_or_text(content, html), filename)
+        conn.execute(
+            "INSERT OR IGNORE INTO inline_image_occurrences"
+            " (sha256, message_id, sender_email, position_in_body) VALUES (?, ?, ?, ?)",
+            (sha256, message_id, sender_address, position),
+        )
+        conn.commit()
+        stats["recorded"] += 1
+
     deadline = None if deadline_s is None else time.monotonic() + deadline_s
 
     def _out_of_time() -> bool:
         return deadline is not None and time.monotonic() >= deadline
 
     def _process(row, work_conn) -> bool:
-        attachment_id, file_path, filename, message_id, sender_address, content, _, html = row
+        attachment_id, file_path, filename, message_id, sender_address, content, _, html, _ = row
         # cid: references live in the markup, which an HTML body keeps in email_html.
         position = compute_position_in_body(markup_or_text(content, html), filename)
         try:
@@ -340,7 +371,7 @@ def run_backfill(
     # signature index once now. Same final state as per-image refresh (the last
     # recompute wins) but without serializing the parallel workers on every
     # write. Runs on `conn` after the worker pool has closed.
-    for sender in {row[4] for row in todo if row[4]}:
+    for sender in {row[4] for row in todo + known if row[4]}:
         refresh_signature_index(conn, sender)
 
     return stats

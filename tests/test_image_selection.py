@@ -148,3 +148,30 @@ def test_an_image_without_a_hash_gets_one_when_processed(conn, tmp_path, monkeyp
 
     assert conn.execute("SELECT sha256 FROM attachments").fetchone()[0] == sha256_of_file(img)
     assert run_backfill(conn, unprocessed_only=True)["scanned"] == 0
+
+
+def test_a_swept_copy_of_a_known_image_gets_its_occurrence_from_the_hash(
+    conn, tmp_path, monkeypatch
+):
+    """The sweep deletes an image file once its hash is done, even if this message's occurrence
+    was not recorded yet. The pass then records it from attachments.sha256 instead of counting
+    the row missing on every run, which would hold the Inline Images row at WARN for ever."""
+    img = _png(tmp_path / "a" / "logo.png", 8)
+    _image(conn, _email(conn, "AAMk-1"), "AAMk-1", img)
+    seen = _vision(monkeypatch)
+    run_backfill(conn, unprocessed_only=True)
+    conn.execute(
+        "INSERT INTO attachments (email_id, message_id, filename, mime_type, file_size,"
+        " file_path, exported_at, sha256) VALUES (?, 'AAMk-2', 'logo.png', 'image/png', 1, ?,"
+        " '2026-09-01', ?)",
+        (_email(conn, "AAMk-2"), str(tmp_path / "b" / "logo.png"), sha256_of_file(img)),
+    )
+    conn.commit()
+
+    stats = run_backfill(conn, unprocessed_only=True)
+
+    assert (stats["recorded"], stats["missing"]) == (1, 0)
+    assert seen == ["logo.png"], "described once"
+    messages = {r[0] for r in conn.execute("SELECT message_id FROM inline_image_occurrences")}
+    assert messages == {"AAMk-1", "AAMk-2"}
+    assert run_backfill(conn, unprocessed_only=True)["scanned"] == 0

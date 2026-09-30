@@ -561,6 +561,8 @@ def cmd_process_images(args):
     print("\nImage processing complete:")
     print(f"  Scanned: {stats['scanned']}")
     print(f"  Classified: {stats['classified']}")
+    if stats.get("recorded"):
+        print(f"  Recorded from the hash (file gone): {stats['recorded']}")
     print(f"  Missing: {stats['missing']}")
     print(f"  Failed: {stats['failed']}")
 

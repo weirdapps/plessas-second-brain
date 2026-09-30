@@ -108,7 +108,7 @@ def test_refetch_calls_fetcher(mock_fetch, mock_get_conn, mock_conn):
 
     from src.export.sharepoint_fetcher import SharepointFetchResult
 
-    url = _managed_url("stale")
+    url = _managed_url(":b:/g/sites/team/Estale")
     mock_conn.execute(
         "INSERT INTO sharepoint_links (url, message_id, last_status) VALUES (?, 'M5', 'stale')",
         (url,),

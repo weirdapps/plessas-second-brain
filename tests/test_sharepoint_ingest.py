@@ -333,3 +333,90 @@ def test_a_fetched_page_with_nothing_to_extract_makes_no_document(conn, monkeypa
 
     assert (result.status, document) == ("ok", None)
     assert conn.execute("SELECT COUNT(*) FROM attachments").fetchone()[0] == 0
+
+
+PAGE = "https://contoso.sharepoint.com/sites/News/SitePages/Launch.aspx?e=1"
+PAGE_HTML = (
+    "<div><h1>Launch</h1><p>The launch plan for next year, in enough words to pass.</p></div>"
+)
+
+
+def _fake_page(monkeypatch, html=PAGE_HTML, title="Launch", status="ok", calls=None):
+    from src.export.sharepoint_fetcher import SharepointPageResult
+
+    def fake(url, managed_host=None):
+        if calls is not None:
+            calls.append(url)
+        if status != "ok":
+            return SharepointPageResult(url=url, status=status, http_status=500, error_message="x")
+        return SharepointPageResult(
+            url=url, status="ok", path="/sites/News/SitePages/Launch.aspx", title=title, html=html
+        )
+
+    monkeypatch.setattr(sharepoint_fetcher, "fetch_sharepoint_page", fake)
+
+
+def _no_file_fetch(monkeypatch):
+    def refuse(*_a, **_k):
+        raise AssertionError("a file fetch was started")
+
+    monkeypatch.setattr(sharepoint_fetcher, "fetch_sharepoint_link", refuse)
+
+
+def test_a_page_becomes_a_document_with_its_title_and_text(conn, monkeypatch):
+    _fake_page(monkeypatch)
+    _no_file_fetch(monkeypatch)
+
+    result, document = fetch_and_ingest(conn, PAGE, "AAMk-1")
+
+    assert result.status == "ok"
+    subject, date = conn.execute(
+        "SELECT subject, date_received FROM emails WHERE message_id = ?", (document,)
+    ).fetchone()
+    assert (subject, date) == ("[SharePoint page] Launch", "2026-03-01")
+    text = _text_of(conn, document)
+    assert "launch plan for next year" in text
+    assert "<p>" not in text
+    file_path = conn.execute(
+        "SELECT file_path FROM attachments WHERE message_id = ?", (document,)
+    ).fetchone()[0]
+    assert file_path == "text:sharepoint-page:/sites/news/sitepages/launch.aspx"
+
+
+def test_a_page_linked_from_two_emails_is_one_document(conn, monkeypatch):
+    _fake_page(monkeypatch)
+
+    _, first = fetch_and_ingest(conn, PAGE, "AAMk-1")
+    _, second = fetch_and_ingest(conn, PAGE.replace("?e=1", "?e=2"), "AAMk-1")
+
+    assert first == second
+    assert conn.execute("SELECT COUNT(*) FROM attachments").fetchone()[0] == 1
+
+
+def test_a_page_with_no_text_makes_no_document(conn, monkeypatch):
+    _fake_page(monkeypatch, html="<div><img src='banner.png'></div>")
+
+    result, document = fetch_and_ingest(conn, PAGE, "AAMk-1")
+
+    assert (result.status, document) == ("ok", None)
+    assert conn.execute("SELECT COUNT(*) FROM attachments").fetchone()[0] == 0
+
+
+def test_a_page_that_fails_to_read_carries_its_status(conn, monkeypatch):
+    _fake_page(monkeypatch, status="http-error")
+
+    result, document = fetch_and_ingest(conn, PAGE, "AAMk-1")
+
+    assert (result.status, result.http_status, document) == ("http-error", 500, None)
+
+
+def test_a_link_that_is_not_content_is_not_fetched(conn, monkeypatch):
+    calls: list = []
+    _fake_page(monkeypatch, calls=calls)
+    _no_file_fetch(monkeypatch)
+
+    result, document = fetch_and_ingest(
+        conn, "https://contoso-my.sharepoint.com/personal/ann/_layouts/15/onedrive.aspx", "AAMk-1"
+    )
+
+    assert (result.status, document, calls) == ("not-content", None, [])

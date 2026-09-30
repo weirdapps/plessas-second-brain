@@ -43,11 +43,20 @@ def _email_date(conn: sqlite3.Connection, message_id) -> str | None:
 
 
 def ingest_fetched_file(
-    conn: sqlite3.Connection, path: Path, url: str | None = None, date: str | None = None
-) -> tuple[int, bool]:
+    conn: sqlite3.Connection,
+    path: Path,
+    url: str | None = None,
+    date: str | None = None,
+    *,
+    require_text: bool = False,
+) -> tuple[int | None, bool]:
     """Store a fetched file as a text-only document: (its message id, whether it is new).
 
-    The same bytes stored before are not extracted again.
+    The same bytes stored before are not extracted again. With `require_text`, a file that
+    yields no text makes no document and (None, False) comes back: a view link often returns
+    the browser page (an .aspx viewer, a sign-in or error page) instead of the file. The backlog
+    pass keeps its default, because a file left on disk needs its row for the sweep to know it
+    was read.
     """
     sha = sha256_of_file(path)
     message_id = _sha256_to_message_id(sha)
@@ -55,6 +64,8 @@ def ingest_fetched_file(
         return message_id, False
     mime = _guess_mime_type(str(path))
     result = extract_text_from_file(str(path), mime)
+    if require_text and not result["text"]:
+        return None, False
     ingest_text_document(
         conn,
         source="sharepoint",
@@ -85,7 +96,7 @@ def fetch_and_ingest(
         document = None
         if result.status == "ok" and result.local_path and result.local_path.is_file():
             document, _ = ingest_fetched_file(
-                conn, result.local_path, url, _email_date(conn, message_id)
+                conn, result.local_path, url, _email_date(conn, message_id), require_text=True
             )
     return result, document
 

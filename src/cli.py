@@ -432,6 +432,29 @@ def cmd_hash_attachments(args):
     return 0
 
 
+def cmd_ingest_session_notes(args):
+    """Store what Claude sessions wrote to notes (src/export/session_notes.py)."""
+    import time
+
+    from src.export.session_notes import ingest_session_notes, mark_scanned, transcripts_to_scan
+    from src.store.schema import get_connection, run_migrations
+
+    started = time.time()
+    conn = get_connection(str(args.db))
+    try:
+        run_migrations(conn)
+        files = transcripts_to_scan(conn, all_files=args.all)
+        stats = ingest_session_notes(conn, files)
+        mark_scanned(conn, started)
+    finally:
+        conn.close()
+    print(
+        f"session notes: {len(files):,} transcripts, "
+        + ", ".join(f"{k} {v:,}" for k, v in stats.items())
+    )
+    return 0
+
+
 def cmd_reextract(args):
     """Read again and summarise again rows earlier code capped, skipped or could not read."""
     from src.extract.reextract import SELECTORS, reextract
@@ -2967,6 +2990,17 @@ def main():
         "--root", default=str(ATTACHMENTS_DIR), help="Attachments root, for rows recorded elsewhere"
     )
     parser_reextract.set_defaults(func=cmd_reextract)
+
+    parser_notes = subparsers.add_parser(
+        "ingest-session-notes",
+        help="Store what Claude sessions wrote to notes (.md, .txt, .csv) as text-only documents",
+    )
+    parser_notes.add_argument(
+        "--all",
+        action="store_true",
+        help="Every transcript, not only those changed since the last scan",
+    )
+    parser_notes.set_defaults(func=cmd_ingest_session_notes)
 
     # Process images command
     parser_process_img = subparsers.add_parser(

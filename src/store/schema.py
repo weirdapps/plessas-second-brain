@@ -6,6 +6,7 @@ Includes FTS5 full-text search indexes for emails and key facts.
 
 import hashlib
 import json
+import mimetypes
 import re
 import sqlite3
 from pathlib import Path
@@ -601,6 +602,11 @@ def migrate_add_file_hashes(conn: sqlite3.Connection) -> None:
     file_removed_at records the sweep deleting a file. vision_attempts bounds the retries for
     an image the vision model keeps failing on: inline_images.classification carries a CHECK
     constraint, so a counter marks the image instead of a new classification value.
+
+    It also gives images recorded as octet-stream their image type. ingest_document mapped
+    no image extension, so every image it took in was OCRed by extension but never selected
+    by the vision pass (mime_type LIKE 'image/%'), and the sweep would have deleted it with
+    no description.
     """
     cols = {r[1] for r in conn.execute("PRAGMA table_info(attachments)")}
     if cols:
@@ -609,6 +615,15 @@ def migrate_add_file_hashes(conn: sqlite3.Connection) -> None:
         if "file_removed_at" not in cols:
             conn.execute("ALTER TABLE attachments ADD COLUMN file_removed_at TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_sha256 ON attachments(sha256)")
+        fixes = []
+        for att_id, filename in conn.execute(
+            "SELECT id, filename FROM attachments"
+            " WHERE mime_type IS NULL OR mime_type = 'application/octet-stream'"
+        ).fetchall():
+            guessed = mimetypes.guess_type(filename.lower())[0] if filename else None
+            if guessed and guessed.startswith("image/"):
+                fixes.append((guessed, att_id))
+        conn.executemany("UPDATE attachments SET mime_type = ? WHERE id = ?", fixes)
     image_cols = {r[1] for r in conn.execute("PRAGMA table_info(inline_images)")}
     if image_cols and "vision_attempts" not in image_cols:
         conn.execute(

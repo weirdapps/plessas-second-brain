@@ -108,3 +108,34 @@ def test_the_cli_reports_what_is_left(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "file missing: 1" in out
     assert "still unhashed: 1" in out
+
+
+def test_the_backfill_finds_a_file_recorded_under_another_hosts_path(db, tmp_path):
+    """Rows from the retired Mac exporter carry Mac paths while the file sits in this tree."""
+    (tmp_path / "AAMk-1").mkdir()
+    (tmp_path / "AAMk-1" / "a.pdf").write_bytes(b"moved")
+    _row(db, Path("/Users/someone/Mail/AAMk-1/a.pdf"))
+
+    stats = hash_attachments(db, root=tmp_path)
+
+    assert stats == {"hashed": 1, "missing": 0}
+    got = db.execute("SELECT sha256 FROM attachments").fetchone()[0]
+    assert got == hashlib.sha256(b"moved").hexdigest()
+
+
+def test_ingest_document_records_an_image_as_an_image(tmp_path, monkeypatch):
+    """An image recorded as octet-stream never reaches the vision pass."""
+    from src.extract.attachment_pipeline import ingest_document
+
+    monkeypatch.setattr("src.extract.attachment_pipeline.ATTACHMENTS_DIR", tmp_path / "att")
+    db_path = tmp_path / "brain.db"
+    create_database(str(db_path)).close()
+    img = tmp_path / "chart.PNG"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    ingest_document(str(img), db_path=str(db_path))
+
+    conn = sqlite3.connect(db_path)
+    mime = conn.execute("SELECT mime_type FROM attachments").fetchone()[0]
+    conn.close()
+    assert mime == "image/png"

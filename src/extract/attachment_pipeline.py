@@ -523,6 +523,19 @@ def _guess_mime_type(file_path: str) -> str:
         ".csv": "text/csv",
         ".html": "text/html",
         ".htm": "text/html",
+        # Images too: recorded as octet-stream, an ingested image was OCRed by extension
+        # but never selected by the vision pass (mime_type LIKE 'image/%').
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".jfif": "image/jpeg",
+        ".gif": "image/gif",
+        ".tif": "image/tiff",
+        ".tiff": "image/tiff",
+        ".bmp": "image/bmp",
+        ".heic": "image/heic",
+        ".heif": "image/heif",
+        ".webp": "image/webp",
     }
     return mime_map.get(ext, "application/octet-stream")
 

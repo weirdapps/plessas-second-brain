@@ -45,10 +45,14 @@ STATES = (DELETABLE, PENDING_TEXT, UNREAD, PENDING_IMAGE, UNREGISTERED)
 
 # Phase 1 errors that mean the bytes were never read (src/extract/attachment_extractors.py).
 # Shared with the orphan reaper, whose stored-hash rule must not count these rows either.
+# "No such file or directory" is how a missing converter used to surface (the older
+# "[Errno 2] ... 'textutil'" rows); a data file that vanished mid-read lands here too, which
+# errs on the side of keeping it.
 UNREAD_SQL = (
     "(ac.extraction_error LIKE 'File not found%'"
     " OR ac.extraction_error LIKE 'No legacy .doc converter%'"
-    " OR ac.extraction_error LIKE '%not installed%')"
+    " OR ac.extraction_error LIKE '%not installed%'"
+    " OR ac.extraction_error LIKE '%No such file or directory%')"
 )
 
 # The extractor OCRs these by extension whatever the mime says, and ingest_document used to

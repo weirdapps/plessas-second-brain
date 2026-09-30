@@ -276,9 +276,7 @@ def main() -> int:
     )
     ap.add_argument(
         "--policy",
-        nargs="?",
-        const="",
-        default=None,
+        action="store_true",
         help="take apply and the cutoff from the sweep policy file (src/store/file_sweep.py)",
     )
     ap.add_argument("--db", default=str(DEFAULT_DB))
@@ -286,8 +284,8 @@ def main() -> int:
     args = ap.parse_args()
     # Read before the replica check below, so a policy that says apply meets it too.
     only_newer_than = None
-    if args.policy is not None:
-        policy = load_policy(Path(args.policy) if args.policy else None)
+    if args.policy:
+        policy = load_policy()
         args.apply = args.apply or policy.apply
         if policy.only_newer_than is not None:
             only_newer_than = policy.only_newer_than.timestamp()

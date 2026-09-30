@@ -345,8 +345,8 @@ summaries, facts and vectors. Three commands and one file control it:
 | Piece | What it does |
 | --- | --- |
 | `python -m src.cli hash-attachments` | Records `attachments.sha256` for files still on disk. Run it before deletion starts: afterwards the hash is the only evidence of what a file held |
-| `python -m src.cli sweep-files [--apply] [--only-newer-than ISO] [--policy [PATH]]` | Deletes registered files whose content is stored. Report-only by default |
-| `scripts/reap_orphan_attachments.py [--apply] [--adopt-only] [--policy [PATH]]` | Unregistered directories: stored duplicates go after a day, unique files are adopted after 7 days |
+| `python -m src.cli sweep-files [--apply] [--only-newer-than ISO] [--policy]` | Deletes registered files whose content is stored. Report-only by default |
+| `scripts/reap_orphan_attachments.py [--apply] [--adopt-only] [--policy]` | Unregistered directories: stored duplicates go after a day, unique files are adopted after 7 days |
 | `data/state/sweep-policy.json` | `{"apply": true or false, "only_newer_than": ISO or null}`. Absent means report-only. The wrappers pass `--policy`, so this file alone decides whether anything is deleted |
 
 The wrappers under `scripts/wrappers/systemd/` call the sweep and the reaper; copy them into

@@ -484,6 +484,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_mark_calendar_times_utc(conn)
     if current < 26:
         migrate_add_whatsapp(conn)
+    if current < 27:
+        migrate_add_file_hashes(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -586,6 +588,32 @@ def migrate_add_whatsapp(conn: sqlite3.Connection) -> None:
 
     _fold_fts(conn, "whatsapp_messages_fts", "whatsapp_messages", ("content", "sender_name"))
     _fold_fts(conn, "whatsapp_threads_fts", "whatsapp_threads", ("title", "summary"))
+    conn.commit()
+
+
+def migrate_add_file_hashes(conn: sqlite3.Connection) -> None:
+    """v27: a content hash per attachment, when its file was removed, and vision attempts.
+
+    The VPS keeps an attachment file only until its content is stored; the sweep
+    (src/store/file_sweep.py) deletes it after that. The orphan reaper used to prove a
+    re-download was a duplicate by comparing it with a registered copy on disk, which no
+    longer exists once files are deleted, so the hash lives in the table instead.
+    file_removed_at records the sweep deleting a file. vision_attempts bounds the retries for
+    an image the vision model keeps failing on: inline_images.classification carries a CHECK
+    constraint, so a counter marks the image instead of a new classification value.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(attachments)")}
+    if cols:
+        if "sha256" not in cols:
+            conn.execute("ALTER TABLE attachments ADD COLUMN sha256 TEXT")
+        if "file_removed_at" not in cols:
+            conn.execute("ALTER TABLE attachments ADD COLUMN file_removed_at TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_attachments_sha256 ON attachments(sha256)")
+    image_cols = {r[1] for r in conn.execute("PRAGMA table_info(inline_images)")}
+    if image_cols and "vision_attempts" not in image_cols:
+        conn.execute(
+            "ALTER TABLE inline_images ADD COLUMN vision_attempts INTEGER NOT NULL DEFAULT 0"
+        )
     conn.commit()
 
 

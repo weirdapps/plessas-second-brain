@@ -685,3 +685,81 @@ def ingest_document(
         "filename": filename,
         "file_path": str(dest_path),
     }
+
+
+def ingest_text_document(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    key: str,
+    filename: str,
+    mime_type: str,
+    text: str | None,
+    sha256: str,
+    method: str | None,
+    status: str,
+    error: str | None,
+    subject: str,
+    sender_name: str,
+    date: str,
+) -> dict:
+    """Store a document that keeps no file: its email anchor, attachment row and content row.
+
+    The file a SharePoint link or a session note came from is not kept, so Phase 1's work is
+    done by the caller and the content row is complete from the start. Phase 1 selects only
+    attachments without a content row and never sees this document; Phase 2 selects extracted
+    rows still pending and summarises it.
+
+    The message id is the hash of the source bytes, as for ingest_document: the same file
+    ingested twice collides and the second is skipped. The three rows are written in one
+    transaction.
+    """
+    message_id = _sha256_to_message_id(sha256)
+    existing = conn.execute("SELECT id FROM emails WHERE message_id = ?", (message_id,)).fetchone()
+    if existing:
+        return {"skipped": True, "message_id": message_id, "email_id": existing[0]}
+    now = datetime.now().isoformat()
+    with conn:
+        email_id = conn.execute(
+            """INSERT INTO emails
+               (message_id, date_received, sender_name, sender_address, subject,
+                mailbox_name, content)
+               VALUES (?, ?, ?, ?, ?, 'External', ?)""",
+            (
+                message_id,
+                date,
+                sender_name,
+                f"{source}@documents.local",
+                subject,
+                f"Ingested document: {filename}\nSource: {source}",
+            ),
+        ).lastrowid
+        attachment_id = conn.execute(
+            """INSERT INTO attachments
+               (email_id, message_id, filename, mime_type, file_size, file_path, is_inline,
+                exported_at, sha256)
+               VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+            (
+                email_id,
+                message_id,
+                filename,
+                mime_type,
+                len((text or "").encode("utf-8")),
+                f"text:{source}:{key}",
+                now,
+                sha256,
+            ),
+        ).lastrowid
+        conn.execute(
+            """INSERT INTO attachment_content
+               (attachment_id, extracted_text, extraction_method, extraction_status,
+                extraction_error, extracted_at, llm_status)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
+            (attachment_id, redact_secrets(text) if text else text, method, status, error, now),
+        )
+    return {
+        "skipped": False,
+        "message_id": message_id,
+        "email_id": email_id,
+        "attachment_id": attachment_id,
+    }

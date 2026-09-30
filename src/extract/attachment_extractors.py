@@ -51,6 +51,9 @@ ZIP_MAX_SECONDS = 120
 # the pages it read; its error then says "pages left unread", like an archive's, and reextract
 # reads it again with no budget.
 OCR_MAX_SECONDS = 120
+# Tesseract's languages, and what a scan with too little text says.
+OCR_LANGS = "eng+ell"
+OCR_INSUFFICIENT = "OCR returned insufficient text"
 ZIP_MIME_TYPES = frozenset({"application/zip", "application/x-zip-compressed"})
 
 
@@ -617,7 +620,7 @@ def _extract_xlsb(path: str) -> dict:
 
     try:
         with pyxlsb.open_workbook(path) as wb:
-            for sheet_name in list(wb.sheets):
+            for sheet_name in wb.sheets:
                 rows_text = []
                 with wb.get_sheet(sheet_name) as sheet:
                     for row in sheet.rows():
@@ -682,17 +685,16 @@ def _ocr_frames(img, budget: float) -> dict:
         if i and time.monotonic() - started > budget:
             note = f"time budget spent, {img.n_frames - i} pages left unread"
             break
-        page = pytesseract.image_to_string(frame.convert("RGB"), lang="eng+ell")
+        page = pytesseract.image_to_string(frame.convert("RGB"), lang=OCR_LANGS)
         if page.strip():
             pages.append(page.strip())
     text = _truncate("\n\n".join(pages))
     if _apply_noise_filter(text):
-        insufficient = "OCR returned insufficient text"
         return {
             "text": None,
             "method": "ocr",
             "status": "skipped",
-            "error": f"{insufficient}; {note}" if note else insufficient,
+            "error": f"{OCR_INSUFFICIENT}; {note}" if note else OCR_INSUFFICIENT,
         }
     return {"text": text, "method": "ocr", "status": "extracted", "error": note}
 
@@ -728,7 +730,7 @@ def _extract_image_ocr(path: str, ocr_seconds: float | None = None) -> dict:
             img.convert("RGB").save(buf, format="PNG")
             buf.seek(0)
             img = Image.open(buf)
-        text = pytesseract.image_to_string(img, lang="eng+ell")
+        text = pytesseract.image_to_string(img, lang=OCR_LANGS)
         text = _truncate(text)
 
         if _apply_noise_filter(text):
@@ -736,7 +738,7 @@ def _extract_image_ocr(path: str, ocr_seconds: float | None = None) -> dict:
                 "text": None,
                 "method": "ocr",
                 "status": "skipped",
-                "error": "OCR returned insufficient text",
+                "error": OCR_INSUFFICIENT,
             }
         return {"text": text, "method": "ocr", "status": "extracted", "error": None}
     except Exception as e:
@@ -776,7 +778,7 @@ def _ocr_pdf_pages(path: str, seconds: float | None = None) -> dict:
                 break
             pix = page.get_pixmap(dpi=200)
             img = Image.open(io.BytesIO(pix.tobytes("png")))
-            page_text = pytesseract.image_to_string(img, lang="eng+ell")
+            page_text = pytesseract.image_to_string(img, lang=OCR_LANGS)
             if page_text.strip():
                 pages_text.append(page_text.strip())
         doc.close()
@@ -790,12 +792,11 @@ def _ocr_pdf_pages(path: str, seconds: float | None = None) -> dict:
 
     text = _truncate("\n\n".join(pages_text))
     if _apply_noise_filter(text):
-        insufficient = "OCR returned insufficient text"
         return {
             "text": None,
             "method": "pymupdf+tesseract",
             "status": "skipped",
-            "error": f"{insufficient}; {note}" if note else insufficient,
+            "error": f"{OCR_INSUFFICIENT}; {note}" if note else OCR_INSUFFICIENT,
         }
     return {
         "text": text,
@@ -902,6 +903,17 @@ def _copy_at_most(src, dst, limit: int) -> int | None:
     return written
 
 
+def _member_outcome(name: str, result: dict) -> tuple[str | None, str | None]:
+    """A member's text for its archive, and the note it leaves: its error when it gave no text,
+    or its mark when it was read in part, which the archive keeps so the sweep does not take it
+    for read in full."""
+    error = result.get("error") or ""
+    if result.get("text"):
+        in_part = "left unread" in error or "file kept" in error
+        return f"=== {name} ===\n{result['text']}", f"{name}: {error}" if in_part else None
+    return None, f"{name}: {error}" if error else None
+
+
 def _extract_zip(path: str, depth: int, seconds: float, ocr_seconds: float | None = None) -> dict:
     """Unpack an archive into a temporary directory and extract every member.
 
@@ -971,15 +983,11 @@ def _extract_zip(path: str, depth: int, seconds: float, ocr_seconds: float | Non
                 except Exception as e:
                     notes.append(f"{name}: {type(e).__name__}: {str(e)[:200]}")
                     continue
-                member_error = result.get("error") or ""
-                if result.get("text"):
-                    parts.append(f"=== {name} ===\n{result['text']}")
-                    # A member read in part marks the archive, or the sweep would take it for
-                    # read in full.
-                    if "left unread" in member_error or "file kept" in member_error:
-                        notes.append(f"{name}: {member_error}")
-                elif result.get("error"):
-                    notes.append(f"{name}: {result['error']}")
+                part, note = _member_outcome(name, result)
+                if part:
+                    parts.append(part)
+                if note:
+                    notes.append(note)
     error = "; ".join(notes) or None
     if not parts:
         return {

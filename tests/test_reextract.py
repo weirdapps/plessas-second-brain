@@ -265,3 +265,15 @@ def test_a_row_whose_new_summary_fails_keeps_its_vector(store, monkeypatch):
     _run(path, root, "long")
 
     assert removed == []
+
+
+def test_a_capped_row_read_in_full_is_not_selected_again(store):
+    """The old cap cut text at exactly 100,000 characters. A row read in full is longer than
+    that, and an interrupted or repeated run must not redo it."""
+    path, conn, root, _removed, _summarised = store
+    full = WORDS * 3000
+    _row(conn, root, "long.txt", full[:100_000], body=full)
+
+    _run(path, root, "capped")
+
+    assert rx.select_rows(conn, {"capped"}) == []

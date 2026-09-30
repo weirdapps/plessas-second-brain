@@ -20,7 +20,6 @@ from src.store.file_hashes import sha256_of_file
 from src.store.file_sweep import UNREAD_SQL
 
 # Processing constants
-PHASE1_BATCH_SIZE = 50
 PHASE2_BATCH_SIZE = 10
 PHASE2_COOLDOWN = 3  # seconds between LLM batches
 LLM_MAX_TEXT = 50_000  # max chars sent to LLM
@@ -221,6 +220,7 @@ def run_phase1(
         if sha256:
             reused = _reuse_content(conn, att_id, sha256, now)
             if reused is not None:
+                conn.commit()
                 stats["processed"] += 1
                 stats["reused"] += 1
                 stats[reused] = stats.get(reused, 0) + 1
@@ -248,11 +248,13 @@ def run_phase1(
             ),
         )
 
+        # Committed per row: the next extraction can take minutes (OCR, an archive), and an
+        # open write transaction across it blocks every other writer until SQLite gives up
+        # with "database is locked".
+        conn.commit()
+
         stats["processed"] += 1
         stats[result["status"]] = stats.get(result["status"], 0) + 1
-
-        if stats["processed"] % PHASE1_BATCH_SIZE == 0:
-            conn.commit()
 
     conn.commit()
     conn.close()
@@ -604,9 +606,9 @@ def run_phase2(
             stats["extracted"] += 1
 
         stats["processed"] += 1
-
-        if stats["processed"] % PHASE2_BATCH_SIZE == 0:
-            conn.commit()
+        # Committed per result: the next one may be minutes away (a long text in parts), and
+        # an open write transaction meanwhile blocks every other writer.
+        conn.commit()
 
     if workers <= 1:
         # Sequential mode (original behavior)

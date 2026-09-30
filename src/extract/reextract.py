@@ -1,7 +1,8 @@
 """Redo rows that earlier code capped, skipped or could not read, while their files exist.
 
-    capped  the text stopped at the old 100,000-character cap: read the file again in full,
-            then summarise it again (in parts, as Phase 2 now does for long texts)
+    capped  the text stopped at exactly the old 100,000-character cap: read the file again in
+            full, then summarise it again (in parts, as Phase 2 now does for long texts). A row
+            read in full is longer than the cap, so a repeated run does not select it again
     long    a text over 50,000 characters was summarised from its first 50,000 only: summarise
             it again
     zip     a zip archive Phase 1 skipped before it could unpack archives, or one its time budget
@@ -33,7 +34,7 @@ OLD_TEXT_CAP = 100_000
 
 # selector -> (the rows it takes, whether Phase 1 runs again)
 SELECTORS: dict[str, tuple[str, bool]] = {
-    "capped": (f"length(ac.extracted_text) >= {OLD_TEXT_CAP}", True),
+    "capped": (f"length(ac.extracted_text) = {OLD_TEXT_CAP}", True),
     "long": (
         f"length(ac.extracted_text) > {LONG_TEXT_CHARS}"
         f" AND length(ac.extracted_text) < {OLD_TEXT_CAP} AND ac.llm_status = 'extracted'",
@@ -103,6 +104,7 @@ def reextract(
                         " WHERE id = ?",
                         (ac_id,),
                     )
+                    conn.commit()
                     touched.append((ac_id, att_id))
                 continue
             path = None
@@ -133,6 +135,9 @@ def reextract(
                     ac_id,
                 ),
             )
+            # Per row: the next re-read can take minutes, and an open write transaction
+            # meanwhile blocks every other writer.
+            conn.commit()
             touched.append((ac_id, att_id))
         conn.commit()
     finally:

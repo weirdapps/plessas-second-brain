@@ -41,13 +41,13 @@ def conn(tmp_path):
     c.close()
 
 
-def _fake_fetch(monkeypatch, body=WORDS, status="ok", seen=None):
+def _fake_fetch(monkeypatch, body=WORDS, status="ok", seen=None, name="Plan.txt"):
     def fake(url, out_dir, managed_host=None):
         if seen is not None:
             seen.append(Path(out_dir))
         if status != "ok":
             return SharepointFetchResult(url=url, status=status, error_message="refused")
-        f = Path(out_dir) / "Plan.txt"
+        f = Path(out_dir) / name
         f.write_text(body)
         return SharepointFetchResult(
             url=url, status="ok", local_path=f, file_name=f.name, file_size=f.stat().st_size
@@ -320,3 +320,16 @@ def test_the_nightly_pass_gives_the_sharepoint_stage_a_budget():
     )
     line = next(ln for ln in wrapper.read_text().splitlines() if "process-sharepoint" in ln)
     assert "--deadline-s" in line
+
+
+def test_a_fetched_page_with_nothing_to_extract_makes_no_document(conn, monkeypatch):
+    """A view link can return the browser page instead of the file (an .aspx viewer, a sign-in
+    or error page). There is no text to store, so no document is made; the link still counts
+    as fetched, so it is not retried every night."""
+    page = "<!DOCTYPE html><html><head><script>var app = {};</script></head><body></body></html>"
+    _fake_fetch(monkeypatch, body=page, name="Doc.aspx")
+
+    result, document = fetch_and_ingest(conn, URL, "AAMk-1")
+
+    assert (result.status, document) == ("ok", None)
+    assert conn.execute("SELECT COUNT(*) FROM attachments").fetchone()[0] == 0

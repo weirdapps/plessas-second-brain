@@ -55,3 +55,21 @@ def test_an_existing_image_starts_with_no_attempts(tmp_path):
     )
     assert conn.execute("SELECT vision_attempts FROM inline_images").fetchone()[0] == 0
     conn.close()
+
+
+def test_v27_corrects_images_recorded_as_octet_stream(tmp_path):
+    """ingest_document recorded every image as octet-stream, so vision never saw them."""
+    conn = create_database(str(tmp_path / "b.db"))
+    for name, mime in (("a.PNG", "application/octet-stream"), ("b.jpg", None), ("c.pdf", None)):
+        conn.execute(
+            "INSERT INTO attachments (message_id, filename, mime_type, file_path, exported_at)"
+            " VALUES (-1, ?, ?, ?, 'now')",
+            (name, mime, f"/att/1/{name}"),
+        )
+    conn.commit()
+
+    migrate_add_file_hashes(conn)
+
+    got = dict(conn.execute("SELECT filename, mime_type FROM attachments").fetchall())
+    assert got == {"a.PNG": "image/png", "b.jpg": "image/jpeg", "c.pdf": None}
+    conn.close()

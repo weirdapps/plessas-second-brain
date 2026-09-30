@@ -682,3 +682,110 @@ def test_fetch_never_raises_on_a_url_urlparse_rejects(tmp_path, monkeypatch):
     )
     assert result.status == "exception"
     assert calls == []
+
+
+# What a link points at decides what is fetched: a file, an intranet page's text, or nothing.
+# The shapes mirror sharepoint-access src/sharepoint/links.ts classifyLink.
+@pytest.mark.parametrize(
+    ("url", "kind"),
+    [
+        ("https://x.sharepoint.com/sites/news/SitePages/Launch.aspx", "page"),
+        ("https://x.sharepoint.com/:u:/r/sites/news/SitePages/Launch.aspx?e=1", "page"),
+        ("https://x.sharepoint.com/sites/hr/news/SitePages/3684.aspx?amp%3Bat=1", "page"),
+        ("https://x-my.sharepoint.com/:x:/g/personal/ann/EQabc?e=1", "file"),
+        ("https://x.sharepoint.com/:w:/r/sites/team/Shared%20Documents/a.docx?d=w1", "file"),
+        ("https://x.sharepoint.com/:b:/s/team/EQpdf", "file"),
+        ("https://x.sharepoint.com/sites/team/Shared%20Documents/%CE%91.pdf", "file"),
+        ("https://x-my.sharepoint.com/personal/ann/_layouts/15/Doc.aspx?sourcedoc=%7Ba%7D", "file"),
+        ("https://x-my.sharepoint.com/personal/ann/_layouts/15/onedrive.aspx", "not-content"),
+        ("https://x.sharepoint.com/:f:/g/sites/team/EQfolder", "not-content"),
+        ("https://x.sharepoint.com/:v:/g/sites/team/EQvideo", "not-content"),
+        ("https://x.sharepoint.com/sites/team", "not-content"),
+        (
+            "https://x.sharepoint.com/sites/team/Shared%20Documents/Forms/AllItems.aspx",
+            "not-content",
+        ),
+        ("https://x.sharepoint.com/_layouts/15/sharepoint.aspx", "not-content"),
+        ("https://[x.sharepoint.com/a.docx", "not-content"),
+    ],
+)
+def test_link_kind(url, kind):
+    from src.export.sharepoint_fetcher import link_kind
+
+    assert link_kind(url) == kind
+
+
+PAGE_URL = "https://x.sharepoint.com/sites/news/SitePages/Launch.aspx"
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_the_page_fetch_reads_the_clis_json(mock_cli):
+    from src.export.sharepoint_fetcher import fetch_sharepoint_page
+
+    mock_cli.return_value = {
+        "source": PAGE_URL,
+        "path": "/sites/news/SitePages/Launch.aspx",
+        "title": "Launch",
+        "html": "<div><p>Hello team</p></div>",
+    }
+    result = fetch_sharepoint_page(PAGE_URL, managed_host=MANAGED)
+    assert (result.status, result.title, result.path, result.html) == (
+        "ok",
+        "Launch",
+        "/sites/news/SitePages/Launch.aspx",
+        "<div><p>Hello team</p></div>",
+    )
+    assert mock_cli.call_args[0][0] == ["page", PAGE_URL]
+    assert mock_cli.call_args[1]["host"] == "x.sharepoint.com"
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_the_page_fetch_refuses_an_unmanaged_host_without_a_subprocess(mock_cli):
+    from src.export.sharepoint_fetcher import fetch_sharepoint_page
+
+    result = fetch_sharepoint_page(
+        "https://partner.sharepoint.com/sites/a/SitePages/b.aspx", managed_host=MANAGED
+    )
+    assert result.status == "unsupported-host"
+    mock_cli.assert_not_called()
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_a_page_fetch_error_maps_like_a_file_fetch(mock_cli):
+    from src.export.sharepoint_cli import SharepointCliError
+    from src.export.sharepoint_fetcher import fetch_sharepoint_page
+
+    mock_cli.side_effect = SharepointCliError(
+        exit_code=5, stderr='{"error":"upstream","status":500}', retryable=True
+    )
+    result = fetch_sharepoint_page(PAGE_URL, managed_host=MANAGED)
+    assert (result.status, result.http_status) == ("http-error", 500)
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_not_a_file_maps_to_not_content(mock_cli, tmp_path):
+    from src.export.sharepoint_cli import SharepointCliError
+
+    mock_cli.side_effect = SharepointCliError(
+        exit_code=5, stderr='{"error":"not_a_file","message":"not a file"}', retryable=True
+    )
+    result = fetch_sharepoint_link(
+        "https://x.sharepoint.com/:x:/g/sites/t/EQabc", tmp_path, managed_host=MANAGED
+    )
+    assert result.status == "not-content"
+
+
+def test_not_content_is_recorded_as_done_and_never_retried(tmp_path):
+    from src.export.sharepoint_fetcher import retry_candidates
+
+    conn = _setup_db(tmp_path)
+    url = "https://contoso-my.sharepoint.com/personal/ann/_layouts/15/onedrive.aspx"
+    record_link_in_db(conn, url, "AAMk-1", "http-error")
+    record_link_in_db(conn, url, "AAMk-1", "http-error")
+    record_link_in_db(conn, url, "AAMk-1", "not-content")
+    fetched_at, attempts, status = conn.execute(
+        "SELECT fetched_at, attempts, last_status FROM sharepoint_links"
+    ).fetchone()
+    assert fetched_at is not None
+    assert (attempts, status) == (0, "not-content")
+    assert retry_candidates(conn, managed_host="contoso.sharepoint.com") == []

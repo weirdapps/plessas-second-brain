@@ -73,7 +73,49 @@ def is_managed_sharepoint_host(url: str, managed_host: str) -> bool:
     return netloc in managed_sharepoint_hosts(managed_host)
 
 
-FetchStatus = Literal["ok", "stale", "auth-required", "http-error", "exception", "unsupported-host"]
+FetchStatus = Literal[
+    "ok", "not-content", "stale", "auth-required", "http-error", "exception", "unsupported-host"
+]
+
+# The statuses that settle a link: its content was read, or it has none (a home page, a
+# OneDrive view, a folder). Neither is offered for retry.
+_DONE = frozenset({"ok", "not-content"})
+
+LinkKind = Literal["file", "page", "not-content"]
+
+# The shapes of sharepoint-access src/sharepoint/links.ts classifyLink, which get and page rely on.
+_FILE_LETTERS = frozenset("wxpbto")
+_SHARING = re.compile(r"^/:([a-z]):/([a-z])(/.*)?$", re.IGNORECASE)
+_PAGE = re.compile(r"/SitePages/[^/]+\.aspx$", re.IGNORECASE)
+_VIEWER = re.compile(r"/_layouts/15/(Doc|WopiFrame2?|xlviewer|PowerPoint)\.aspx$", re.IGNORECASE)
+_DOCUMENT = re.compile(
+    r"\.(docx?|docm|dotx|xlsx?|xlsm|xlsb|pptx?|pptm|ppsx|pdf|txt|csv|md|rtf|odt|ods|odp|msg|eml|zip)$",
+    re.IGNORECASE,
+)
+
+
+def link_kind(url: str) -> LinkKind:
+    """What a link points at: a file, an intranet page, or nothing to read.
+
+    Nothing to read is most of what mail links to besides pages: the SharePoint home, OneDrive
+    and library views, notification settings, folders (/:f:), videos (/:v:), site roots.
+    """
+    try:
+        path = unquote(urlparse(url).path)
+    except ValueError:
+        return "not-content"
+    m = _SHARING.match(path)
+    if m:
+        letter, form, rest = m.group(1).lower(), m.group(2).lower(), m.group(3) or ""
+        if letter == "u" and form == "r" and _PAGE.search(rest):
+            return "page"
+        return "file" if letter in _FILE_LETTERS else "not-content"
+    if _VIEWER.search(path):
+        return "file"
+    if _PAGE.search(path):
+        return "page"
+    return "file" if _DOCUMENT.search(path) else "not-content"
+
 
 # After this many consecutive failed fetch attempts, the retry pass stops trying
 # a link every night. It is a throttle, not an abandonment — see the cool-off.
@@ -144,6 +186,8 @@ class SharepointFetchResult:
 # sharepoint-cli error codes -> the FetchStatus vocabulary this module has
 # always exposed. Kept as data so the mapping is auditable at a glance.
 _ERROR_STATUS: dict[str, FetchStatus] = {
+    # The link led to a web page, not a file: settled, like a link that is not content at all.
+    "not_a_file": "not-content",
     "not_found": "stale",
     "auth_required": "auth-required",
     "access_denied": "http-error",
@@ -152,6 +196,70 @@ _ERROR_STATUS: dict[str, FetchStatus] = {
     "upstream": "http-error",
     "timeout": "http-error",
 }
+
+
+@dataclass
+class SharepointPageResult:
+    url: str
+    status: FetchStatus
+    path: str | None = None
+    title: str | None = None
+    html: str | None = None
+    http_status: int | None = None
+    error_message: str | None = None
+
+
+def _host_or_refusal(
+    url: str, managed_host: str | None
+) -> tuple[str, FetchStatus | None, str | None]:
+    """The URL's host when it is ours to fetch; else the status and message refusing it."""
+    if managed_host is None:
+        from src import config
+
+        managed_host = config.SHAREPOINT_HOST
+    try:
+        host = host_for_url(url)
+    except ValueError as err:  # urlparse rejects e.g. an unclosed "[": never raise
+        return "", "exception", str(err)
+    if not host:
+        return "", "exception", f"cannot derive host from URL: {url}"
+    if not is_managed_sharepoint_host(url, managed_host):
+        return host, "unsupported-host", f"{host} is not the managed SharePoint tenant; not fetched"
+    return host, None, None
+
+
+def _error_status(err: SharepointCliError) -> tuple[FetchStatus, int | None]:
+    payload = parse_error_payload(err.stderr)
+    code = str(payload.get("error", ""))
+    return _ERROR_STATUS.get(code, "exception" if not code else "http-error"), payload.get("status")
+
+
+def fetch_sharepoint_page(url: str, managed_host: str | None = None) -> SharepointPageResult:
+    """An intranet page's title and HTML, via `sharepoint-cli page`. Never raises.
+
+    Gated on our own tenant exactly as a file fetch is (fetch_sharepoint_link).
+    """
+    host, refused, message = _host_or_refusal(url, managed_host)
+    if refused:
+        return SharepointPageResult(url=url, status=refused, error_message=message)
+    try:
+        raw = run_sharepoint_cli(["page", url], host=host)
+        return SharepointPageResult(
+            url=url,
+            status="ok",
+            path=raw.get("path"),
+            title=raw.get("title"),
+            html=raw.get("html") or "",
+        )
+    except SharepointCliAuthRequired as err:
+        return SharepointPageResult(url=url, status="auth-required", error_message=str(err))
+    except SharepointCliError as err:
+        status, http_status = _error_status(err)
+        return SharepointPageResult(
+            url=url, status=status, http_status=http_status, error_message=str(err)
+        )
+    except Exception as err:  # subprocess timeout, OSError, malformed JSON
+        return SharepointPageResult(url=url, status="exception", error_message=str(err))
 
 
 def _name_from_url(url: str) -> str:
@@ -174,24 +282,9 @@ def fetch_sharepoint_link(
     'unsupported-host' with no subprocess at all. ``managed_host`` defaults to
     config.SHAREPOINT_HOST, read at call time.
     """
-    if managed_host is None:
-        from src import config
-
-        managed_host = config.SHAREPOINT_HOST
-    try:
-        host = host_for_url(url)
-    except ValueError as err:  # urlparse rejects e.g. an unclosed "[": never raise
-        return SharepointFetchResult(url=url, status="exception", error_message=str(err))
-    if not host:
-        return SharepointFetchResult(
-            url=url, status="exception", error_message=f"cannot derive host from URL: {url}"
-        )
-    if not is_managed_sharepoint_host(url, managed_host):
-        return SharepointFetchResult(
-            url=url,
-            status="unsupported-host",
-            error_message=f"{host} is not the managed SharePoint tenant; not fetched",
-        )
+    host, refused, message = _host_or_refusal(url, managed_host)
+    if refused:
+        return SharepointFetchResult(url=url, status=refused, error_message=message)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # sharepoint-cli writes to a FILE path, while this function's contract is
@@ -208,14 +301,9 @@ def fetch_sharepoint_link(
         return SharepointFetchResult(url=url, status="auth-required", error_message=str(err))
     except SharepointCliError as err:
         tmp_path.unlink(missing_ok=True)
-        payload = parse_error_payload(err.stderr)
-        code = str(payload.get("error", ""))
-        status = _ERROR_STATUS.get(code, "exception" if not code else "http-error")
+        status, http_status = _error_status(err)
         return SharepointFetchResult(
-            url=url,
-            status=status,
-            http_status=payload.get("status"),
-            error_message=str(err),
+            url=url, status=status, http_status=http_status, error_message=str(err)
         )
     except Exception as err:  # subprocess timeout, OSError, malformed JSON
         tmp_path.unlink(missing_ok=True)
@@ -249,7 +337,8 @@ def record_link_in_db(
     document_message_id: int | None = None,
 ) -> None:
     """Record one fetch attempt. `document_message_id` names the text-only document the fetched
-    file became (src/extract/sharepoint_ingest.py); a later attempt that stores none keeps it."""
+    file became (src/extract/sharepoint_ingest.py); a later attempt that stores none keeps it.
+    'not-content' settles a link as 'ok' does: fetched_at is set and the attempts reset."""
     now = datetime.now(UTC).isoformat()
     conn.execute(
         """INSERT INTO sharepoint_links
@@ -263,20 +352,20 @@ def record_link_in_db(
              last_attempt_at = excluded.last_attempt_at,
              file_name = excluded.file_name,
              file_size = excluded.file_size,
-             attempts = CASE WHEN excluded.last_status = 'ok'
+             attempts = CASE WHEN excluded.last_status IN ('ok', 'not-content')
                              THEN 0 ELSE sharepoint_links.attempts + 1 END,
              document_message_id = COALESCE(excluded.document_message_id,
                                             sharepoint_links.document_message_id)""",
         (
             url,
             message_id,
-            now if status == "ok" else None,
+            now if status in _DONE else None,
             fetched_path,
             status,
             now,
             file_name,
             file_size,
-            0 if status == "ok" else 1,
+            0 if status in _DONE else 1,
             document_message_id,
         ),
     )

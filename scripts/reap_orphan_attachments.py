@@ -30,6 +30,7 @@ import argparse
 import filecmp
 import os
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -68,8 +69,9 @@ def _registered_elsewhere(conn) -> dict[tuple[str, int], list[str]]:
 
 def _survey(
     db_path: str,
-) -> tuple[set[str], dict[tuple[str, int], list[str]], set[str], str | None]:
-    """Read the table once: claimed directories, what is held where, stored hashes, newest mail.
+) -> tuple[set[str], dict[tuple[str, int], list[str]], set[str], str | None, set[tuple[str, str]]]:
+    """Read the table once: claimed directories, what is held where, stored hashes, newest mail,
+    and the (directory, filename) of every registered file.
 
     A hash counts only when its row's content was read by Phase 1 (src/store/file_sweep.py's
     UNREAD_SQL): a row whose file vanished before Phase 1, or that this host could not read,
@@ -81,12 +83,14 @@ def _survey(
     """
     conn = get_connection(db_path)
     try:
-        referenced = {
-            Path(fp).parent.name
+        paths = [
+            Path(fp)
             for (fp,) in conn.execute(
                 "SELECT file_path FROM attachments WHERE file_path IS NOT NULL"
             )
-        }
+        ]
+        referenced = {p.parent.name for p in paths}
+        registered = {(p.parent.name, p.name) for p in paths}
         hashes = {
             sha
             for (sha,) in conn.execute(
@@ -99,7 +103,7 @@ def _survey(
             "SELECT MAX(date_received) FROM emails"
             " WHERE mailbox_name IS NULL OR mailbox_name <> 'External'"
         ).fetchone()[0]
-        return referenced, _registered_elsewhere(conn), hashes, newest
+        return referenced, _registered_elsewhere(conn), hashes, newest, registered
     finally:
         conn.close()
 
@@ -172,6 +176,39 @@ def _reap_one_dir(
         f.unlink()
 
 
+def _reap_strays(
+    msg_dir: Path,
+    registered: set[tuple[str, str]],
+    hashes: set[str],
+    apply: bool,
+    stats: dict,
+    grace_days: float,
+    only_newer_than: float | None,
+) -> None:
+    """Unregistered files inside a registered directory: stored duplicates go, the rest stay.
+
+    Nothing else owns them: the sweep takes registered files, and this script whole unregistered
+    directories. On the producer they were copies of stored content (a document ingested again
+    under a temporary name, a re-download beside its registered twin), so a file whose hash is
+    stored goes once it is `grace_days` old. A unique one is kept and counted: it may be the only
+    copy, and adopting it would detach it from the email it came with.
+    """
+    cutoff = time.time() - grace_days * 86400
+    for f in sorted(msg_dir.iterdir()):
+        if f.is_dir() or (msg_dir.name, f.name) in registered:
+            continue
+        st = f.stat()
+        if st.st_mtime > cutoff or (only_newer_than is not None and st.st_mtime < only_newer_than):
+            continue
+        if hashes and sha256_of_file(f) in hashes:
+            stats["strays_deleted"] += 1
+            stats["bytes_freed"] += st.st_size
+            if apply:
+                f.unlink()
+        else:
+            stats["strays_kept"] += 1
+
+
 def _mail_is_flowing(newest: str | None, days: float) -> bool:
     """Whether an email was received within `days`. Unknown or unparseable reads as stalled."""
     if not newest:
@@ -223,17 +260,31 @@ def reap_orphan_attachments(
         "waiting": 0,
         "dirs_removed": 0,
         "bytes_freed": 0,
+        "strays_deleted": 0,
+        "strays_kept": 0,
     }
     if not base_dir.is_dir():
         return stats
 
-    referenced, known, hashes, newest = _survey(db_path)
+    referenced, known, hashes, newest, registered = _survey(db_path)
     if not _mail_is_flowing(newest, duplicate_grace_days):
         duplicate_grace_days = grace_days
     stats["duplicate_grace_days"] = min(duplicate_grace_days, grace_days)
 
     for msg_dir in sorted(base_dir.iterdir()):
-        if not msg_dir.is_dir() or msg_dir.name in referenced:
+        if not msg_dir.is_dir():
+            continue
+        if msg_dir.name in referenced:
+            if not adopt_only:
+                _reap_strays(
+                    msg_dir,
+                    registered,
+                    hashes,
+                    apply,
+                    stats,
+                    min(duplicate_grace_days, grace_days),
+                    only_newer_than,
+                )
             continue
         if not is_abandoned_orphan(msg_dir, min(duplicate_grace_days, grace_days)):
             continue
@@ -311,6 +362,8 @@ def main() -> int:
     print(f"  directories scanned : {stats['scanned']:,}")
     print(f"  duplicates deleted  : {stats['deleted']:,}  ({stats['bytes_freed'] / 2**20:.0f} MiB)")
     print(f"  unique files adopted: {stats['adopted']:,}")
+    print(f"  stray duplicates deleted: {stats['strays_deleted']:,}")
+    print(f"  stray unique files kept : {stats['strays_kept']:,}")
     print(f"  content already held : {stats['already_ingested']:,}")
     print(f"  unique, still waiting : {stats['waiting']:,}")
     if "duplicate_grace_days" in stats:

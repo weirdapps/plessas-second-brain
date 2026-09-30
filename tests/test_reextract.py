@@ -277,3 +277,92 @@ def test_a_capped_row_read_in_full_is_not_selected_again(store):
     _run(path, root, "capped")
 
     assert rx.select_rows(conn, {"capped"}) == []
+
+
+def _partial(conn, att_id, method="openpyxl"):
+    conn.execute(
+        "UPDATE attachment_content SET extraction_method = ? WHERE attachment_id = ?",
+        (method, att_id),
+    )
+    conn.commit()
+
+
+def _workbook(rows):
+    import io as _io
+
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    for r in range(1, rows + 1):
+        wb.active.append([f"row {r}", WORDS])
+    buf = _io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def test_a_workbook_the_old_caps_cut_is_read_again_in_full_and_summarised(store):
+    path, conn, root, _removed, summarised = store
+    att = _row(conn, root, "book.xlsx", "row 1 ... row 50", body=_workbook(60), mime="")
+    _partial(conn, att)
+
+    stats = _run(path, root, "partial")
+
+    text, llm = _content(conn, att, "extracted_text, llm_status")
+    assert "row 60" in text
+    assert llm == "extracted" and summarised == [att]
+    assert stats["reread"] == 1
+    stamp = conn.execute(
+        "SELECT value FROM sync_metadata WHERE key = 'reextract_partial_since'"
+    ).fetchone()
+    assert stamp is not None
+
+
+def test_a_re_read_that_changes_nothing_is_not_summarised_again(store, monkeypatch):
+    path, conn, root, _removed, summarised = store
+    att = _row(conn, root, "book.xlsx", WORDS * 3, body=_workbook(3), mime="")
+    _partial(conn, att)
+    monkeypatch.setattr(
+        rx,
+        "extract_text_from_file",
+        lambda *a, **k: {
+            "text": WORDS * 3,
+            "method": "openpyxl",
+            "status": "extracted",
+            "error": None,
+        },
+    )
+
+    stats = _run(path, root, "partial")
+
+    (llm,) = _content(conn, att, "llm_status")
+    assert stats["unchanged"] == 1 and summarised == []
+    assert llm == "extracted"
+
+
+def test_a_partial_run_that_finished_selects_nothing_again(store):
+    path, conn, root, _removed, _summarised = store
+    att = _row(conn, root, "book.xlsx", "row 1 ... row 50", body=_workbook(60), mime="")
+    _partial(conn, att)
+    _run(path, root, "partial")
+
+    stats = _run(path, root, "partial")
+
+    assert stats["selected"] == 0
+
+
+def test_a_text_at_the_old_ceiling_and_a_scan_are_selected(store):
+    path, conn, root, _removed, _summarised = store
+    _row(conn, root, "log.txt", "x" * 2_000_000, body="x" * 2_100_000)
+    scan = _row(conn, root, "scan.pdf", WORDS, body=b"%PDF-1.4", mime="application/pdf")
+    _partial(conn, scan, method="pymupdf+tesseract")
+    _row(conn, root, "note.txt", WORDS, body=WORDS)
+
+    stats = _run(path, root, "partial", dry_run=True)
+
+    assert stats["selected"] == 2
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM sync_metadata WHERE key = 'reextract_partial_since'"
+        ).fetchone()[0]
+        == 0
+    )

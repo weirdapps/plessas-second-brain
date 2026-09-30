@@ -123,15 +123,26 @@ def build_merge_prompt(
     mime_type: str,
     email_subject: str | None = None,
     email_date: str | None = None,
+    covered: tuple[int, int] | None = None,
 ) -> str:
-    """One extraction over the extractions of a long document's parts."""
+    """One extraction over the extractions of a long document's parts.
+
+    `covered` is (parts summarised, parts in the document) when only some were summarised.
+    """
     body = "\n\n".join(
         f"Part {i} of {len(parts)}:\n{json.dumps(p, ensure_ascii=False)}"
         for i, p in enumerate(parts, 1)
     )
+    coverage = ""
+    if covered and covered[0] < covered[1]:
+        coverage = (
+            f"These are the extractions of {covered[0]} of the document's {covered[1]} parts,"
+            " spread evenly across it; the summary should say it covers"
+            f" {covered[0]} of {covered[1]} parts.\n"
+        )
     document = f"""{_email_context(email_subject, email_date)}Attachment filename: {filename}
 File type: {mime_type or "unknown"}
-
+{coverage}
 {body}"""
 
     return f"""You are combining the extractions of the parts of one long document into one.

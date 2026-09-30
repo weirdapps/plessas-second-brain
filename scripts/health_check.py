@@ -20,6 +20,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -690,6 +691,71 @@ def check_attachments(db):
         if stale
         else ("WARN" if llm_failed > 200 or unregistered > ATTACHMENT_UNREGISTERED_WARN else "OK"),
     }
+
+
+def check_files_on_disk(db):
+    """Attachment files the VPS still holds, by state (src/store/file_sweep.py).
+
+    OK while the sweep policy is report-only: until the backlog deletion is confirmed, the
+    stored files are supposed to be there. Once the policy turns deletion on, a stored file
+    the policy covers should be gone within the hour, so one older than STALL_HOURS means
+    the sweep stopped running. An image the vision pass has owed for longer than
+    IMAGE_WAIT_HOURS is its own warning.
+    """
+    from src.store import file_sweep
+
+    try:
+        files = file_sweep.classify_files(db, ATTACHMENTS_DIR)
+    except sqlite3.OperationalError as e:
+        # Same posture as check_attachments: main() runs the checks unguarded.
+        return {"name": "Files on disk", "status": "WARN", "error": str(e)}
+    policy = file_sweep.load_policy()
+    cutoff = policy.only_newer_than.timestamp() if policy.only_newer_than else None
+    now = time.time()
+    counts = dict.fromkeys(file_sweep.STATES, 0)
+    total_bytes = stalled = image_late = 0
+    for f in files:
+        counts[f.state] += 1
+        total_bytes += f.size
+        age_h = (now - f.mtime) / 3600
+        covered = policy.apply and (cutoff is None or f.mtime >= cutoff)
+        if f.state == file_sweep.DELETABLE and covered and age_h > file_sweep.STALL_HOURS:
+            stalled += 1
+        if f.state == file_sweep.PENDING_IMAGE and age_h > file_sweep.IMAGE_WAIT_HOURS:
+            image_late += 1
+    return {
+        "name": "Files on disk",
+        "total": len(files),
+        "bytes": total_bytes,
+        "counts": counts,
+        "stalled": stalled,
+        "image_late": image_late,
+        "mode": "apply" if policy.apply else "report-only",
+        "status": "WARN" if stalled or image_late else "OK",
+    }
+
+
+def files_on_disk_detail(c: dict) -> str:
+    """The report's parenthesis for the Files on disk row."""
+    from src.store import file_sweep
+
+    k = c.get("counts", {})
+    extra = (
+        f" ({c.get('bytes', 0) / 2**30:.1f} GB; {k.get('deletable', 0):,} stored and removable,"
+        f" {k.get('pending-text', 0):,} awaiting text, {k.get('pending-image', 0):,} awaiting"
+        f" vision, {k.get('unregistered', 0):,} unregistered; sweep {c.get('mode')})"
+    )
+    if c.get("stalled"):
+        extra += (
+            f"; {c['stalled']:,} stored files older than {file_sweep.STALL_HOURS}h:"
+            " the sweep is not running"
+        )
+    if c.get("image_late"):
+        extra += (
+            f"; {c['image_late']:,} images waiting more than"
+            f" {file_sweep.IMAGE_WAIT_HOURS}h for vision"
+        )
+    return extra
 
 
 def check_images(db):
@@ -1817,6 +1883,8 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
             # operator waits for a number that will never move on its own.
             if c.get("abandoned"):
                 extra = extra[:-1] + f"; {c['abandoned']:,} abandoned, no longer retried)"
+        elif c["name"] == "Files on disk":
+            extra = files_on_disk_detail(c)
         elif c["name"] == "Inline Images":
             # Counts, not a percentage. The old "87% classified" was a ceiling,
             # not a shortfall: its denominator included the signature and noise
@@ -2220,6 +2288,7 @@ def main():
         check_emails(db),
         check_teams(db),
         check_attachments(db),
+        check_files_on_disk(db),
         check_images(db),
         check_calendar(db),
         check_conversations(db),

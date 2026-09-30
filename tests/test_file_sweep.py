@@ -308,3 +308,185 @@ def test_the_cli_applies_the_policy_file(tmp_path, capsys):
 
     assert not f.exists()
     assert "APPLIED" in capsys.readouterr().out
+
+
+# ---- Final-review fixes: nothing whose bytes were never read, and every image, is kept ----
+
+
+def _content(db, att_id: int, status: str, error: str | None) -> None:
+    db.execute("DELETE FROM attachment_content WHERE attachment_id = ?", (att_id,))
+    db.execute(
+        "INSERT INTO attachment_content (attachment_id, extraction_status, extraction_error,"
+        " llm_status) VALUES (?, ?, ?, 'pending')",
+        (att_id, status, error),
+    )
+    db.commit()
+
+
+def test_keeps_a_file_phase_1_could_not_find(db, tmp_path):
+    """Phase 1 opens the recorded absolute path; the sweep finds files by directory and name."""
+    f, att = _att(db, tmp_path, "AAMk-1", "a.pdf")
+    _content(db, att, "failed", "File not found: /Users/someone/Mail/AAMk-1/a.pdf")
+
+    stats = sweep_files(db, tmp_path, APPLY)
+
+    assert f.exists()
+    assert stats["unread"] == 1 and stats["deleted"] == 0
+
+
+@pytest.mark.parametrize(
+    "status,error",
+    [
+        ("skipped", "No legacy .doc converter available (textutil/antiword/catdoc)"),
+        ("failed", "pytesseract or Pillow not installed"),
+    ],
+)
+def test_keeps_a_file_this_host_had_no_tool_for(db, tmp_path, status, error):
+    f, att = _att(db, tmp_path, "AAMk-1", "old.doc")
+    _content(db, att, status, error)
+    sweep_files(db, tmp_path, APPLY)
+    assert f.exists()
+
+
+def test_keeps_an_image_recorded_as_octet_stream_until_vision_is_done(db, tmp_path):
+    f, _ = _att(db, tmp_path, "AAMk-1", "chart.png", b"img", mime="application/octet-stream")
+    stats = sweep_files(db, tmp_path, APPLY)
+    assert f.exists()
+    assert stats["pending-image"] == 1
+
+
+def test_an_upper_case_image_mime_is_still_an_image(db, tmp_path):
+    f, _ = _att(db, tmp_path, "AAMk-1", "scan", b"img", mime="IMAGE/PNG")
+    sweep_files(db, tmp_path, APPLY)
+    assert f.exists()
+
+
+@pytest.mark.parametrize("stored_first", [True, False])
+def test_rows_sharing_a_directory_and_name_must_all_be_stored(db, tmp_path, stored_first):
+    f, first = _att(db, tmp_path, "AAMk-1", "a.pdf", content=stored_first)
+    cur = db.execute(
+        "INSERT INTO attachments (message_id, filename, file_path, exported_at, sha256)"
+        " VALUES ('AAMk-1', 'a.pdf', ?, 'now', 'h2')",
+        (str(f),),
+    )
+    if not stored_first:
+        db.execute(
+            "INSERT INTO attachment_content (attachment_id, extraction_status, llm_status)"
+            " VALUES (?, 'extracted', 'pending')",
+            (cur.lastrowid,),
+        )
+    db.commit()
+
+    sweep_files(db, tmp_path, APPLY)
+
+    assert f.exists()
+
+
+def test_never_follows_a_symlinked_directory(db, tmp_path):
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    f, _ = _att(db, outside, "AAMk-1", "a.pdf")
+    (root / "AAMk-1").symlink_to(outside / "AAMk-1")
+
+    sweep_files(db, root, APPLY)
+
+    assert f.exists()
+
+
+def test_a_file_that_vanishes_mid_scan_is_skipped(db, tmp_path, monkeypatch):
+    kept, _ = _att(db, tmp_path, "AAMk-1", "a.pdf", b"a")
+    real_scandir = os.scandir
+
+    class Vanished:
+        name = "gone.pdf"
+        path = str(tmp_path / "AAMk-1" / "gone.pdf")
+
+        def is_file(self, follow_symlinks=True):
+            return True
+
+        def stat(self, follow_symlinks=True):
+            raise FileNotFoundError(self.path)
+
+    def scandir(path):
+        entries = list(real_scandir(path))
+        if str(path).endswith("AAMk-1"):
+            entries.insert(0, Vanished())
+        return iter(entries)
+
+    monkeypatch.setattr("src.store.file_sweep.os.scandir", scandir)
+
+    stats = sweep_files(db, tmp_path, APPLY)
+
+    assert stats["deleted"] == 1 and not kept.exists()
+
+
+def test_an_unlink_error_is_counted_and_the_rest_are_swept_and_stamped(db, tmp_path):
+    stuck, stuck_id = _att(db, tmp_path, "AAMk-1", "a.pdf", b"a")
+    gone, gone_id = _att(db, tmp_path, "AAMk-2", "b.pdf", b"b")
+    stuck.parent.chmod(0o500)
+    try:
+        stats = sweep_files(db, tmp_path, APPLY)
+    finally:
+        stuck.parent.chmod(0o700)
+
+    assert stuck.exists() and not gone.exists()
+    assert stats["errors"] == 1 and stats["deleted"] == 1
+    stamped = {
+        r[0] for r in db.execute("SELECT id FROM attachments WHERE file_removed_at IS NOT NULL")
+    }
+    assert stamped == {gone_id}
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {"apply": True},
+        {"apply": True, "only_newer_than": ""},
+        {"apply": True, "only_newer_than": 0},
+        {"apply": True, "only_newer_than": False},
+    ],
+)
+def test_a_missing_or_empty_cutoff_is_report_only(tmp_path, policy):
+    """Apply with no cutoff is the backlog deletion; only an explicit null may ask for it."""
+    p = tmp_path / "sweep-policy.json"
+    p.write_text(json.dumps(policy))
+    assert load_policy(p) == SweepPolicy()
+
+
+def test_an_explicit_null_cutoff_is_the_backlog_deletion(tmp_path):
+    p = tmp_path / "sweep-policy.json"
+    p.write_text(json.dumps({"apply": True, "only_newer_than": None}))
+    assert load_policy(p) == SweepPolicy(apply=True)
+
+
+def test_policy_problem_names_an_unreadable_file(tmp_path):
+    from src.store.file_sweep import policy_problem
+
+    assert policy_problem(tmp_path / "absent.json") is None
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps({"apply": False, "only_newer_than": None}))
+    assert policy_problem(good) is None
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"apply": true,}')
+    assert policy_problem(bad)
+
+
+def test_the_cli_reports_unread_files_and_errors(tmp_path, capsys):
+    from src.cli import cmd_sweep_files
+
+    db_path = tmp_path / "brain.db"
+    conn = create_database(str(db_path))
+    _, att = _att(conn, tmp_path / "att", "AAMk-1", "a.pdf")
+    _content(conn, att, "failed", "File not found: /elsewhere/a.pdf")
+    conn.close()
+
+    cmd_sweep_files(
+        Namespace(
+            db=db_path, apply=False, only_newer_than=None, policy=None, root=str(tmp_path / "att")
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert "unread (Phase 1 could not read) : 1" in out
+    assert "delete errors" in out

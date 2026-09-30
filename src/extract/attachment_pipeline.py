@@ -29,6 +29,14 @@ LLM_MAX_TEXT = 50_000  # max chars sent to LLM
 # than the item (policy_bridge.is_transient): offered again, but no re-auth.
 TRANSIENT = "transient"
 
+# Phase 2 summarises a text longer than this in parts (spec: long files). The hourly sync
+# leaves such texts to the nightly pass, whose budget can hold a document's many calls.
+LONG_TEXT_CHARS = 50_000
+
+# The last element of a phase-2 worker's result when the budget ran out between the parts of a
+# long document: left pending for the next run, neither a failure nor a re-auth.
+DEFERRED = "deferred"
+
 
 def _connect(db_path: str) -> sqlite3.Connection:
     """Open brain.db with the same concurrency settings as schema.get_connection.
@@ -249,7 +257,75 @@ def run_phase1(
     return stats
 
 
-def _extract_one_attachment(row):
+def _complete_and_parse(prompt: str) -> dict:
+    """One Phase 2 model call, parsed into an extraction."""
+    from src.extract.claude_extract import _response_text, complete
+    from src.extract.parser import parse_extraction
+
+    response = complete(
+        # Dense documents (large spreadsheets/decks) yield long extraction
+        # JSON; 2048 truncated it mid-structure on ~40K-char docs, so every
+        # such attachment failed with "Expecting ',' delimiter". Give the
+        # structured output room to complete; parse_extraction additionally
+        # salvages any residual truncation rather than dropping the summary.
+        max_tokens=8192,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    # _response_text, never content[0]. With extended thinking the model leads the
+    # content list with a ThinkingBlock, which carries .thinking and no .text, so
+    # content[0].text raised "'ThinkingBlock' object has no attribute 'text'".
+    # 134 attachments failed permanently that way between 2026-08-06 and 2026-08-25;
+    # llm_status='failed' is terminal because run_phase2 only re-selects 'pending'.
+    # A thinking-only response (max_tokens spent before any text) used to raise
+    # "IndexError: list index out of range" here, 3 rows; it now raises a ValueError
+    # naming stop_reason and the block types, which is diagnosable from llm_error.
+    raw_text = _response_text(response)
+    if raw_text.startswith("```"):
+        lines = raw_text.split("\n")
+        raw_text = "\n".join(lines[1:-1])
+    return parse_extraction(raw_text)
+
+
+def _extract_in_parts(text, filename, mime_type, email_subject, email_date, out_of_time):
+    """Summarise a long text part by part, then once over the parts. None when time ran out."""
+    from src.extract.attachment_prompt import (
+        build_attachment_prompt,
+        build_merge_prompt,
+        split_text,
+    )
+
+    parts = split_text(text)
+    extractions = []
+    for i, part in enumerate(parts, 1):
+        if out_of_time is not None and out_of_time():
+            return None
+        extractions.append(
+            _complete_and_parse(
+                build_attachment_prompt(
+                    extracted_text=part,
+                    filename=filename,
+                    mime_type=mime_type,
+                    email_subject=email_subject,
+                    email_date=email_date,
+                    part=(i, len(parts)),
+                )
+            )
+        )
+    if out_of_time is not None and out_of_time():
+        return None
+    return _complete_and_parse(
+        build_merge_prompt(
+            extractions,
+            filename=filename,
+            mime_type=mime_type,
+            email_subject=email_subject,
+            email_date=email_date,
+        )
+    )
+
+
+def _extract_one_attachment(row, out_of_time=None):
     """Worker: call LLM for a single attachment.
 
     Returns ``(ac_id, email_id, extraction, error, auth_error)``. On success ``error`` is
@@ -268,14 +344,22 @@ def _extract_one_attachment(row):
     with the exception in hand, and hand the answer on.
     """
     from src.extract.attachment_prompt import build_attachment_prompt
-    from src.extract.claude_extract import _response_text, complete
-    from src.extract.parser import parse_extraction
     from src.extract.policy_bridge import classify_exception, is_item_timeout, is_transient
     from src.llm_policy import Outcome
 
     ac_id, att_id, text, filename, mime_type, email_id, email_subject, email_date = row
 
     try:
+        # A long text goes in parts, and `out_of_time` is asked between them: the deadline is
+        # checked before an item is dispatched, and a long document is many calls long.
+        if len(text or "") > LONG_TEXT_CHARS:
+            extraction = _extract_in_parts(
+                text, filename, mime_type, email_subject, email_date, out_of_time
+            )
+            if extraction is None:
+                return (ac_id, email_id, None, "deferred: out of time between parts", DEFERRED)
+            return (ac_id, email_id, extraction, None, False)
+
         prompt = build_attachment_prompt(
             extracted_text=text,
             filename=filename,
@@ -283,31 +367,7 @@ def _extract_one_attachment(row):
             email_subject=email_subject,
             email_date=email_date,
         )
-
-        response = complete(
-            # Dense documents (large spreadsheets/decks) yield long extraction
-            # JSON; 2048 truncated it mid-structure on ~40K-char docs, so every
-            # such attachment failed with "Expecting ',' delimiter". Give the
-            # structured output room to complete; parse_extraction additionally
-            # salvages any residual truncation rather than dropping the summary.
-            max_tokens=8192,
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        # _response_text, never content[0]. With extended thinking the model leads the
-        # content list with a ThinkingBlock, which carries .thinking and no .text, so
-        # content[0].text raised "'ThinkingBlock' object has no attribute 'text'".
-        # 134 attachments failed permanently that way between 2026-08-06 and 2026-08-25;
-        # llm_status='failed' is terminal because run_phase2 only re-selects 'pending'.
-        # A thinking-only response (max_tokens spent before any text) used to raise
-        # "IndexError: list index out of range" here, 3 rows; it now raises a ValueError
-        # naming stop_reason and the block types, which is diagnosable from llm_error.
-        raw_text = _response_text(response)
-        if raw_text.startswith("```"):
-            lines = raw_text.split("\n")
-            raw_text = "\n".join(lines[1:-1])
-
-        extraction = parse_extraction(raw_text)
+        extraction = _complete_and_parse(prompt)
         return (ac_id, email_id, extraction, None, False)
 
     except Exception as e:
@@ -331,6 +391,7 @@ def run_phase2(
     file_type: str | None = None,
     attachment_ids: list[int] | None = None,
     workers: int = 1,
+    max_text_chars: int | None = None,
 ) -> dict:
     """Run Phase 2: Vertex AI structured extraction on extracted text.
 
@@ -352,6 +413,9 @@ def run_phase2(
         file_type: Filter by original MIME type
         attachment_ids: If given, only process these attachment IDs (for sync scoping)
         workers: Number of concurrent LLM workers (default 1)
+        max_text_chars: Leave texts longer than this pending. The hourly sync passes
+            LONG_TEXT_CHARS: a long text is summarised in many calls, which belong in the
+            nightly pass's budget, not in a 600 s unit.
 
     Returns:
         Dict with processing stats: processed, extracted, failed, deferred.
@@ -387,6 +451,9 @@ def run_phase2(
 
     if type_condition:
         query += f"\n        {type_condition}"
+    if max_text_chars is not None:
+        query += "\n        AND length(ac.extracted_text) <= ?"
+        params.append(max_text_chars)
     query += "\n        ORDER BY ac.id"
     if limit > 0:
         query += f"\n        LIMIT {int(limit)}"
@@ -406,6 +473,11 @@ def run_phase2(
         policy uses. Re-deriving it here from ``error`` — which is a string by the time it
         arrives — is what made a surviving 401 permanent: see _extract_one_attachment.
         """
+        if auth_error == DEFERRED:
+            # Out of time between the parts of a long document: still pending, and not a
+            # failure, so the next run takes it from the start.
+            stats["deferred"] += 1
+            return
         now = datetime.now().isoformat()
         if error:
             if auth_error == TRANSIENT:
@@ -514,7 +586,9 @@ def run_phase2(
             if _out_of_time():
                 stats["deferred"] += 1
                 continue
-            ac_id, email_id, extraction, error, auth_error = _extract_one_attachment(row)
+            ac_id, email_id, extraction, error, auth_error = _extract_one_attachment(
+                row, _out_of_time
+            )
             _store_result(ac_id, email_id, extraction, error, auth_error)
             if stats["processed"] % PHASE2_BATCH_SIZE == 0:
                 time.sleep(PHASE2_COOLDOWN)
@@ -530,7 +604,7 @@ def run_phase2(
             def _run_or_defer(row):
                 if _out_of_time():
                     return None
-                return _extract_one_attachment(row)
+                return _extract_one_attachment(row, _out_of_time)
 
             futures = {executor.submit(_run_or_defer, row): row for row in rows}
             for future in as_completed(futures):

@@ -314,7 +314,7 @@ def test_phase2_stops_starting_work_once_the_deadline_passes(monkeypatch):
         monkeypatch.setattr(
             attachment_pipeline,
             "_extract_one_attachment",
-            lambda row: called.append(row) or (row[0], None, {}, None, False),
+            lambda row, *a: called.append(row) or (row[0], None, {}, None, False),
         )
 
         stats = run_phase2(db_path, deadline_s=0)
@@ -363,7 +363,7 @@ def test_phase2_deadline_also_applies_with_concurrent_workers(monkeypatch):
 
         # The budget must expire DURING the run, not before it: deadline_s=0 is
         # caught by any pre-flight filter and proves nothing.
-        def _slow(row):
+        def _slow(row, *a):
             time.sleep(0.15)
             called.append(row)
             return (row[0], None, {}, None, False)

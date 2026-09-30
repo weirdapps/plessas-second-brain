@@ -232,3 +232,36 @@ def test_an_archive_cut_short_is_read_again_in_full(store, monkeypatch):
     text, error = _content(conn, att, "extracted_text, extraction_error")
     assert all(f"=== {n} ===" in text for n in ("a.txt", "b.txt", "c.txt"))
     assert not error
+
+
+def test_a_failed_re_read_keeps_the_text_it_had(store, monkeypatch):
+    """A worse re-read (a timeout, a parser error) must not replace 100,000 good characters."""
+    path, conn, root, removed, summarised = store
+    full = WORDS * 3000
+    att = _row(conn, root, "long.txt", full[:100_000], body=full)
+    monkeypatch.setattr(
+        rx,
+        "extract_text_from_file",
+        lambda *a, **k: {"text": None, "method": None, "status": "failed", "error": "boom"},
+    )
+
+    stats = _run(path, root, "capped")
+
+    text, status, llm = _content(conn, att, "extracted_text, extraction_status, llm_status")
+    assert (len(text), status, llm) == (100_000, "extracted", "extracted")
+    assert stats["kept"] == 1
+    assert (summarised, removed) == ([], [])
+
+
+def test_a_row_whose_new_summary_fails_keeps_its_vector(store, monkeypatch):
+    path, conn, root, removed, _summarised = store
+    _row(conn, root, "mid.txt", "y" * 60_000)
+    monkeypatch.setattr(
+        attachment_pipeline,
+        "_extract_one_attachment",
+        lambda row, *a, **k: (row[0], row[5], None, "ValueError: bad json", False),
+    )
+
+    _run(path, root, "long")
+
+    assert removed == []

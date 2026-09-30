@@ -396,6 +396,17 @@ def test_keeps_a_file_this_host_had_no_tool_for(db, tmp_path, status, error):
     assert f.exists()
 
 
+def test_keeps_an_archive_read_only_in_part(db, tmp_path):
+    """An archive cut short by its time budget left members unread: not stored in full."""
+    f, att = _att(db, tmp_path, "AAMk-1", "pack.zip")
+    _content(db, att, "extracted", "time budget spent, 2 members left unread")
+
+    stats = sweep_files(db, tmp_path, APPLY)
+
+    assert f.exists()
+    assert stats["unread"] == 1
+
+
 def test_keeps_an_image_recorded_as_octet_stream_until_vision_is_done(db, tmp_path):
     f, _ = _att(db, tmp_path, "AAMk-1", "chart.png", b"img", mime="application/octet-stream")
     stats = sweep_files(db, tmp_path, APPLY)

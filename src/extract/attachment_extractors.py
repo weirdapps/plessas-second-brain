@@ -40,16 +40,22 @@ ZIP_MAX_RATIO = 100
 ZIP_MAX_DEPTH = 1
 # A member can cost minutes (OCR), and an archive without a content row is offered again on
 # every run, so an archive stops reading members once this is spent and keeps what it read.
+# Its error then says "members left unread", which the sweep treats as not stored
+# (src/store/file_sweep.py UNREAD_SQL) and reextract --zip reads again with no budget.
 ZIP_MAX_SECONDS = 120
 ZIP_MIME_TYPES = frozenset({"application/zip", "application/x-zip-compressed"})
 
 
-def extract_text_from_file(file_path: str, mime_type: str, _depth: int = 0) -> dict:
+def extract_text_from_file(
+    file_path: str, mime_type: str, _depth: int = 0, *, zip_seconds: float | None = None
+) -> dict:
     """Extract text from a file based on its MIME type.
 
     Returns dict with keys: text, method, status, error.
     status is one of: 'extracted', 'partial', 'failed', 'skipped'.
     _depth is how deep inside archives this file sits; only _extract_zip passes it.
+    zip_seconds is how long an archive may spend reading members, ZIP_MAX_SECONDS when None;
+    reextract passes math.inf, since a one-time recovery run has the time.
     """
     ext = Path(file_path).suffix.lower()
 
@@ -121,7 +127,8 @@ def extract_text_from_file(file_path: str, mime_type: str, _depth: int = 0) -> d
         if ext == ".zip" or mime_type in ZIP_MIME_TYPES:
             sniffed = sniff_mime_type(file_path)
             if sniffed == "application/zip":
-                return _extract_zip(file_path, _depth)
+                seconds = ZIP_MAX_SECONDS if zip_seconds is None else zip_seconds
+                return _extract_zip(file_path, _depth, seconds)
             if sniffed is None:
                 return {"text": None, "method": None, "status": "skipped", "error": None}
             mime_type = sniffed  # an Office document sent as a zip
@@ -188,7 +195,7 @@ def extract_text_from_file(file_path: str, mime_type: str, _depth: int = 0) -> d
             # recursion ends because a second pass sniffs the same type.
             sniffed = sniff_mime_type(file_path)
             if sniffed and sniffed != mime_type and sniffed not in SKIP_MIME_TYPES:
-                return extract_text_from_file(file_path, sniffed, _depth)
+                return extract_text_from_file(file_path, sniffed, _depth, zip_seconds=zip_seconds)
             return {
                 "text": None,
                 "method": None,
@@ -828,7 +835,7 @@ def _copy_at_most(src, dst, limit: int) -> int | None:
     return written
 
 
-def _extract_zip(path: str, depth: int) -> dict:
+def _extract_zip(path: str, depth: int, seconds: float) -> dict:
     """Unpack an archive into a temporary directory and extract every member.
 
     Nothing outlives the call. A member is written under a name made up here, never under the
@@ -868,7 +875,7 @@ def _extract_zip(path: str, depth: int) -> dict:
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="sb-zip-") as tmp:
             for n, info in enumerate(infos):
-                if n and time.monotonic() - started > ZIP_MAX_SECONDS:
+                if n and time.monotonic() - started > seconds:
                     notes.append(f"time budget spent, {len(infos) - n} members left unread")
                     break
                 name = info.filename
@@ -885,7 +892,7 @@ def _extract_zip(path: str, depth: int) -> dict:
                     notes.append(f"{name}: larger than its header says, skipped")
                     continue
                 mime = mimetypes.guess_type(name.lower())[0] or ""
-                result = extract_text_from_file(str(member), mime, depth + 1)
+                result = extract_text_from_file(str(member), mime, depth + 1, zip_seconds=seconds)
                 if result.get("text"):
                     parts.append(f"=== {name} ===\n{result['text']}")
                 elif result.get("error"):

@@ -4,7 +4,8 @@
             then summarise it again (in parts, as Phase 2 now does for long texts)
     long    a text over 50,000 characters was summarised from its first 50,000 only: summarise
             it again
-    zip     a zip archive Phase 1 skipped before it could unpack archives: read it again
+    zip     a zip archive Phase 1 skipped before it could unpack archives, or one its time budget
+            cut short: read it again, with no budget
     unread  Phase 1 recorded the row without reading the bytes (the file was not found, or
             this host lacked the tool): read it again
 
@@ -14,6 +15,7 @@ key facts, decisions and action items, and does not repeat one an older summary 
 the email.
 """
 
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -37,7 +39,8 @@ SELECTORS: dict[str, tuple[str, bool]] = {
     "zip": (
         "(lower(a.filename) LIKE '%.zip'"
         " OR a.mime_type IN ('application/zip', 'application/x-zip-compressed'))"
-        " AND ac.extraction_status = 'skipped' AND ac.extracted_text IS NULL",
+        " AND ((ac.extraction_status = 'skipped' AND ac.extracted_text IS NULL)"
+        " OR ac.extraction_error LIKE '%members left unread%')",
         True,
     ),
     "unread": (f"COALESCE({UNREAD_SQL}, 0)", True),
@@ -99,7 +102,7 @@ def reextract(
             stats["reread"] += 1
             if dry_run:
                 continue
-            result = extract_text_from_file(str(path), mime or "")
+            result = extract_text_from_file(str(path), mime or "", zip_seconds=math.inf)
             conn.execute(
                 """UPDATE attachment_content
                    SET extracted_text = ?, extraction_method = ?, extraction_status = ?,

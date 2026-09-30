@@ -356,8 +356,10 @@ The wrappers under `scripts/wrappers/systemd/` call the sweep and the reaper; co
 **Documents without files.** A SharePoint file linked from mail and a note a Claude session
 wrote (`.md`, `.txt`, `.csv`) are stored as text only: `attachments.file_path` reads
 `text:<source>:<key>`, and no file is kept. `process-sharepoint` fetches into a temporary
-directory; the conversation sync runs `ingest-session-notes` over the transcripts changed since
-its last scan, so copy `sb-conversation-sync.sh` into `~/.local/bin` after this change. Zip
+directory, within the nightly pass's `--deadline-s`; the conversation sync runs
+`ingest-session-notes` over the transcripts new or changed since they were last read (subagent
+transcripts included). Copy `sb-conversation-sync.sh` and `sb-attachment-pass.sh` into
+`~/.local/bin` after this change. Zip
 archives are unpacked in a temporary directory, the same file is extracted once, and long texts
 are stored in full and summarised in parts. The one-time backfills are
 `process-sharepoint --ingest-fetched` (the files earlier fetches left in `data/sharepoint`,

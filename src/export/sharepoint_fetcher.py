@@ -74,7 +74,14 @@ def is_managed_sharepoint_host(url: str, managed_host: str) -> bool:
 
 
 FetchStatus = Literal[
-    "ok", "not-content", "stale", "auth-required", "http-error", "exception", "unsupported-host"
+    "ok",
+    "not-content",
+    "not-a-file",
+    "stale",
+    "auth-required",
+    "http-error",
+    "exception",
+    "unsupported-host",
 ]
 
 # The statuses that settle a link: its content was read, or it has none (a home page, a
@@ -118,17 +125,19 @@ def link_kind(url: str) -> LinkKind:
 
 
 def target_of(url: str) -> str:
-    """What a link fetches, the same for every link to it: its host and path without the query,
-    an r sharing link's prefix removed. Paths fold case, as SharePoint does; a sharing token
-    does not, since two tokens can differ in case alone."""
-    try:
-        parsed = urlparse(url)
-        path = unquote(parsed.path)
-    except ValueError:
+    """What a link fetches, the same for every link to it.
+
+    Only pages share: a page's text is its own whatever the query, so every link to it is keyed
+    by host and path, the r prefix removed and case folded as SharePoint folds it. Any other
+    link is its own target. An Office viewer names its file only in the query, so keying files
+    by path would hand one file's result to another; and a file's bytes already make one
+    document of the many links to it.
+    """
+    if link_kind(url) != "page":
         return url
+    parsed = urlparse(url)  # link_kind parsed it already
+    path = unquote(parsed.path)
     m = _SHARING.match(path)
-    if m and m.group(2).lower() != "r":
-        return f"{parsed.netloc.lower()}{path}"
     if m and m.group(3):
         path = m.group(3)
     return f"{parsed.netloc}{path}".lower()
@@ -203,8 +212,9 @@ class SharepointFetchResult:
 # sharepoint-cli error codes -> the FetchStatus vocabulary this module has
 # always exposed. Kept as data so the mapping is auditable at a glance.
 _ERROR_STATUS: dict[str, FetchStatus] = {
-    # The link led to a web page, not a file: settled, like a link that is not content at all.
-    "not_a_file": "not-content",
+    # A file link answered with a page that names no file: a viewer format change, or an
+    # interstitial nobody recognised. A failure, shown and retried, never settled out of sight.
+    "not_a_file": "not-a-file",
     "not_found": "stale",
     "auth_required": "auth-required",
     "access_denied": "http-error",

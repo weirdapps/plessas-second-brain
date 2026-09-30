@@ -801,6 +801,7 @@ def cmd_process_sharepoint(args):
         "urls_retried": 0,
         "urls_fetched": 0,
         "urls_failed": 0,
+        "urls_not_content": 0,
         "urls_skipped_external": 0,
         "auth_required": False,
     }
@@ -862,6 +863,9 @@ def cmd_process_sharepoint(args):
         if result.status == "ok":
             print(f"    ✓ Stored: {result.file_name}")
             stats["urls_fetched"] += 1
+        elif result.status == "not-content":
+            print("    · Not content (nothing to read): not fetched")
+            stats["urls_not_content"] += 1
         elif external_auth:
             print("    ⤼ External host (no session) — skipping")
             stats["urls_skipped_external"] += 1
@@ -918,7 +922,7 @@ def cmd_process_sharepoint(args):
         conn.close()
         print(
             f"\nRefetch: {stats['urls_retried']} read, {stats['urls_fetched']} stored, "
-            f"{stats['urls_failed']} failed"
+            f"{stats['urls_failed']} failed, {stats['urls_not_content']} not content"
         )
         if stats["auth_required"]:
             print(
@@ -1011,6 +1015,8 @@ def cmd_process_sharepoint(args):
     if not args.dry_run:
         print(f"  URLs fetched: {stats['urls_fetched']}")
         print(f"  URLs failed: {stats['urls_failed']}")
+        if stats["urls_not_content"]:
+            print(f"  Not content (not fetched): {stats['urls_not_content']}")
         if stats["urls_skipped_external"]:
             print(f"  External hosts skipped (no session): {stats['urls_skipped_external']}")
         if capped:

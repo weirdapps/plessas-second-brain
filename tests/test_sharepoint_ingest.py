@@ -571,3 +571,17 @@ def test_viewer_links_on_one_web_each_fetch_their_own_file(conn, tmp_path, tenan
     assert sorted(calls) == sorted([plan, budget])
     assert links[plan][1] != links[budget][1]
     assert "budget for next year" in _text_of(conn, links[budget][1])
+
+
+def test_a_link_that_is_not_content_is_not_counted_as_failed(
+    conn, tmp_path, tenant, monkeypatch, capsys
+):
+    view = "https://contoso-my.sharepoint.com/personal/ann/_layouts/15/onedrive.aspx"
+    record_link_in_db(conn, url=view, message_id="AAMk-1", status="stale")
+    _no_file_fetch(monkeypatch)
+
+    _process(tmp_path / "brain.db")
+
+    out = capsys.readouterr().out
+    assert "URLs failed: 0" in out
+    assert "Not content (not fetched): 1" in out

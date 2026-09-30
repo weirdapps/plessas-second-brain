@@ -1,0 +1,436 @@
+"""Spreadsheets, scanned PDFs and text files are read in full.
+
+The old readers stopped at 20 sheets of 51 rows, at 30 scanned pages, and at 2,000,000
+characters. Now every sheet and row is read, every page is OCR'd inside a time budget, and text
+stops at the 2,000,000-character ceiling, which the owner kept once its cost at 50,000,000 was
+measured. A read that stops short says so, and the sweep keeps its file. Rows the old caps read in part are kept too,
+until reextract --partial reads them again. Phase 2 summarises a very long text from 50 parts
+spread across it.
+"""
+
+import hashlib
+import math
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from src.extract import attachment_extractors as ax
+from src.store.file_sweep import SweepPolicy, sweep_files
+from src.store.schema import create_database
+
+WORDS = "The plan for the regional network, in enough words to pass the filter. "
+APPLY = SweepPolicy(apply=True)
+
+
+def test_every_sheet_and_every_row_of_a_workbook_is_read(tmp_path):
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    for s in range(1, 26):
+        ws = wb.create_sheet(f"Sheet{s}")
+        for r in range(1, 61):
+            ws.append([f"s{s}r{r}", "value"])
+    path = tmp_path / "big.xlsx"
+    wb.save(path)
+
+    text = ax._extract_excel(str(path))["text"]
+
+    assert "--- Sheet: Sheet25 ---" in text
+    assert "s25r60" in text
+
+
+def test_every_sheet_and_every_row_of_a_legacy_workbook_is_read():
+    def sheet(name):
+        s = MagicMock()
+        s.name = name
+        s.nrows = 60
+        s.row_values.side_effect = lambda i: [f"{name}r{i}", "value"]
+        return s
+
+    book = MagicMock()
+    book.sheets.return_value = [sheet(f"S{n}") for n in range(1, 26)]
+    with patch("xlrd.open_workbook", return_value=book):
+        text = ax._extract_xls("/tmp/fake.xls")["text"]
+
+    assert "S25r59" in text
+
+
+def test_every_sheet_and_every_row_of_a_binary_workbook_is_read():
+    def cell(v):
+        c = MagicMock()
+        c.v = v
+        return c
+
+    rows = {f"S{n}": [[cell(f"S{n}r{r}"), cell("value")] for r in range(60)] for n in range(1, 26)}
+
+    def get_sheet(name):
+        handle = MagicMock()
+        handle.__enter__.return_value.rows.return_value = iter(rows[name])
+        handle.__exit__.return_value = False
+        return handle
+
+    wb = MagicMock()
+    wb.sheets = list(rows)
+    wb.get_sheet.side_effect = get_sheet
+    with patch("pyxlsb.open_workbook") as opened:
+        opened.return_value.__enter__.return_value = wb
+        opened.return_value.__exit__.return_value = False
+        text = ax._extract_xlsb("/tmp/fake.xlsb")["text"]
+
+    assert "S25r59" in text
+
+
+def _scan(pages):
+    page = MagicMock()
+    page.get_pixmap.return_value.tobytes.return_value = b"png"
+    doc = MagicMock()
+    doc.__iter__.return_value = iter([page] * pages)
+    doc.page_count = pages
+    numbers = iter(range(1, pages + 1))
+    return (
+        patch("fitz.open", return_value=doc),
+        patch("PIL.Image.open"),
+        patch(
+            "pytesseract.image_to_string",
+            side_effect=lambda img, lang: f"Page {next(numbers)} {WORDS}",
+        ),
+    )
+
+
+def test_every_page_of_a_scan_is_read():
+    opened, image, ocr = _scan(35)
+    with opened, image, ocr:
+        result = ax._ocr_pdf_pages("/tmp/scan.pdf", seconds=math.inf)
+
+    assert "Page 35 " in result["text"]
+    assert result["error"] is None
+
+
+def test_a_scan_its_time_budget_cuts_short_keeps_what_it_read_and_says_so(monkeypatch):
+    clock = iter(range(0, 10_000, 10))
+    monkeypatch.setattr("time.monotonic", lambda: next(clock))
+    opened, image, ocr = _scan(5)
+    with opened, image, ocr:
+        result = ax._ocr_pdf_pages("/tmp/scan.pdf", seconds=25)
+
+    assert result["status"] == "extracted"
+    assert "Page 1 " in result["text"] and "Page 5 " not in result["text"]
+    assert "pages left unread" in result["error"]
+
+
+def test_the_ocr_budget_reaches_a_scanned_pdf(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        ax,
+        "_ocr_pdf_pages",
+        lambda path, seconds=None: (
+            seen.append(seconds)
+            or {"text": None, "method": "pymupdf+tesseract", "status": "skipped", "error": "x"}
+        ),
+    )
+    pdf = tmp_path / "scan.pdf"
+    pdf.write_bytes(b"%PDF-1.4 scanned")
+    page = MagicMock()
+    page.get_text.return_value = ""
+
+    for budget in (math.inf, None):
+        doc = MagicMock()
+        doc.__iter__.return_value = iter([page])
+        with patch("fitz.open", return_value=doc):
+            ax.extract_text_from_file(str(pdf), "application/pdf", ocr_seconds=budget)
+
+    assert seen == [math.inf, ax.OCR_MAX_SECONDS]
+
+
+def test_the_text_ceiling_stays_at_two_million_characters():
+    """Measured at 50,000,000: 3.3 GB of memory for every write to the row, and search snippets
+    that never finished. A file cut at the ceiling is kept on disk instead."""
+    assert ax.MAX_TEXT_CHARS == 2_000_000
+
+
+def test_a_text_cut_at_the_ceiling_says_its_file_is_kept(tmp_path, monkeypatch):
+    monkeypatch.setattr(ax, "MAX_TEXT_CHARS", 1_000)
+    log = tmp_path / "log.txt"
+    log.write_text(WORDS * 100)
+
+    result = ax.extract_text_from_file(str(log), "text/plain")
+
+    assert len(result["text"]) == 1_000
+    assert result["status"] == "extracted"
+    assert "file kept" in result["error"]
+
+
+def test_a_very_long_text_is_summarised_from_fifty_parts_spread_across_it(monkeypatch):
+    from src.extract import attachment_pipeline as ap
+    from src.extract import attachment_prompt as prompt
+
+    monkeypatch.setattr(prompt, "split_text", lambda text: [f"part {i}" for i in range(1, 121)])
+    asked, merged = [], []
+    monkeypatch.setattr(
+        prompt, "build_attachment_prompt", lambda **kw: asked.append(kw["part"]) or "p"
+    )
+    monkeypatch.setattr(
+        prompt,
+        "build_merge_prompt",
+        lambda parts, **kw: merged.append((len(parts), kw["covered"])) or "m",
+    )
+    monkeypatch.setattr(ap, "_complete_and_parse", lambda _prompt: {"summary": "s"})
+
+    ap._extract_in_parts("x", "log.txt", "text/plain", None, None, None)
+
+    assert len(asked) == 50
+    assert (asked[0], asked[-1]) == ((1, 120), (120, 120))
+    assert merged == [(50, (50, 120))]
+
+
+def test_a_long_text_of_fifty_parts_or_fewer_is_summarised_whole(monkeypatch):
+    from src.extract import attachment_pipeline as ap
+    from src.extract import attachment_prompt as prompt
+
+    monkeypatch.setattr(prompt, "split_text", lambda text: [f"part {i}" for i in range(1, 31)])
+    asked, merged = [], []
+    monkeypatch.setattr(
+        prompt, "build_attachment_prompt", lambda **kw: asked.append(kw["part"]) or "p"
+    )
+    monkeypatch.setattr(
+        prompt,
+        "build_merge_prompt",
+        lambda parts, **kw: merged.append((len(parts), kw["covered"])) or "m",
+    )
+    monkeypatch.setattr(ap, "_complete_and_parse", lambda _prompt: {"summary": "s"})
+
+    ap._extract_in_parts("x", "log.txt", "text/plain", None, None, None)
+
+    assert len(asked) == 30
+    assert merged == [(30, (30, 30))]
+
+
+def test_the_merge_prompt_says_how_much_of_the_document_it_covers():
+    from src.extract.attachment_prompt import build_merge_prompt
+
+    text = build_merge_prompt(
+        [{"summary": "a"}], filename="log.txt", mime_type="text/plain", covered=(50, 120)
+    )
+
+    assert "50 of 120" in text
+
+
+def _file_row(
+    db, root, name, *, method, text=WORDS, extracted_at="2026-09-01T10:00:00", error=None
+):
+    d = root / "AAMk-1"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / name
+    f.write_bytes(b"data")
+    cur = db.execute(
+        "INSERT INTO attachments (message_id, filename, mime_type, file_size, file_path,"
+        " exported_at, sha256) VALUES ('AAMk-1', ?, 'application/octet-stream', 4, ?,"
+        " '2026-09-01', ?)",
+        (name, str(f), hashlib.sha256(name.encode()).hexdigest()),
+    )
+    db.execute(
+        "INSERT INTO attachment_content (attachment_id, extracted_text, extraction_method,"
+        " extraction_status, extraction_error, extracted_at, llm_status)"
+        " VALUES (?, ?, ?, 'extracted', ?, ?, 'extracted')",
+        (cur.lastrowid, text, method, error, extracted_at),
+    )
+    db.commit()
+    return f
+
+
+@pytest.mark.parametrize("method", ["openpyxl", "xlrd", "pyxlsb", "pymupdf+tesseract", "zip"])
+def test_a_file_the_old_caps_read_in_part_is_kept_until_read_again(tmp_path, method):
+    db = create_database(":memory:")
+    f = _file_row(db, tmp_path, "book.bin", method=method)
+
+    stats = sweep_files(db, tmp_path, APPLY)
+
+    assert f.exists() and stats["unread"] == 1
+
+
+@pytest.mark.parametrize("length", [100_000, 2_000_000])
+def test_a_text_at_an_old_cap_is_kept_until_read_again(tmp_path, length):
+    """100,000 was the storage cap until PR B; 2,000,000 the read ceiling, unmarked until now."""
+    db = create_database(":memory:")
+    f = _file_row(db, tmp_path, "log.txt", method="direct_read", text="x" * length)
+
+    sweep_files(db, tmp_path, APPLY)
+
+    assert f.exists()
+
+
+def test_a_file_read_again_after_the_backfill_began_may_go(tmp_path):
+    db = create_database(":memory:")
+    db.execute(
+        "INSERT INTO sync_metadata (key, value)"
+        " VALUES ('reextract_partial_since', '2026-10-01T00:00:00')"
+    )
+    old = _file_row(db, tmp_path, "old.xlsx", method="openpyxl")
+    new = _file_row(db, tmp_path, "new.xlsx", method="openpyxl", extracted_at="2026-10-02T10:00:00")
+
+    sweep_files(db, tmp_path, APPLY)
+
+    assert old.exists() and not new.exists()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "time budget spent, 12 pages left unread",
+        "text cut at 2,000,000 characters; the rest is unread, file kept",
+    ],
+)
+def test_a_file_read_in_part_is_kept(tmp_path, error):
+    db = create_database(":memory:")
+    f = _file_row(db, tmp_path, "scan.pdf", method="pymupdf", error=error)
+
+    sweep_files(db, tmp_path, APPLY)
+
+    assert f.exists()
+
+
+def _blank_text_layer():
+    page = MagicMock()
+    page.get_text.return_value = ""
+    doc = MagicMock()
+    doc.__iter__.return_value = iter([page])
+    return patch("fitz.open", return_value=doc)
+
+
+def test_a_scan_cut_short_with_too_little_text_says_what_it_left_unread(monkeypatch):
+    cut = "OCR returned insufficient text; time budget spent, 4 pages left unread"
+    monkeypatch.setattr(
+        ax,
+        "_ocr_pdf_pages",
+        lambda path, seconds=None: {
+            "text": None,
+            "method": "pymupdf+tesseract",
+            "status": "skipped",
+            "error": cut,
+        },
+    )
+    with _blank_text_layer():
+        result = ax._extract_pdf("/tmp/scan.pdf")
+
+    assert "left unread" in result["error"]
+
+
+def test_a_scan_whose_ocr_failed_says_why(monkeypatch):
+    why = "TesseractNotFoundError: tesseract is not installed or it's not in your PATH"
+    monkeypatch.setattr(
+        ax,
+        "_ocr_pdf_pages",
+        lambda path, seconds=None: {
+            "text": None,
+            "method": "pymupdf+tesseract",
+            "status": "failed",
+            "error": why,
+        },
+    )
+    with _blank_text_layer():
+        result = ax._extract_pdf("/tmp/scan.pdf")
+
+    assert (result["status"], result["error"]) == ("failed", why)
+
+
+def test_an_archive_keeps_the_mark_of_a_member_cut_short(tmp_path, monkeypatch):
+    import zipfile
+
+    pack = tmp_path / "pack.zip"
+    with zipfile.ZipFile(pack, "w") as zf:
+        zf.writestr("scan.pdf", "%PDF-1.4")
+    monkeypatch.setattr(
+        ax,
+        "extract_text_from_file",
+        lambda *a, **k: {
+            "text": WORDS,
+            "method": "pymupdf+tesseract",
+            "status": "extracted",
+            "error": "time budget spent, 3 pages left unread",
+        },
+    )
+
+    result = ax._extract_zip(str(pack), 0, 120)
+
+    assert "scan.pdf: time budget spent, 3 pages left unread" in result["error"]
+
+
+def test_a_workbook_that_understates_its_size_is_still_read_in_full(tmp_path):
+    """openpyxl's read-only mode stops at the size a sheet declares; real files lie."""
+    import zipfile
+
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    for r in range(1, 61):
+        wb.active.append([f"s1r{r}", "value"])
+    honest = tmp_path / "honest.xlsx"
+    wb.save(honest)
+    lying = tmp_path / "lying.xlsx"
+    with zipfile.ZipFile(honest) as src, zipfile.ZipFile(lying, "w") as dst:
+        for item in src.infolist():
+            data = src.read(item)
+            if item.filename == "xl/worksheets/sheet1.xml":
+                data = data.replace(b'<dimension ref="A1:B60"/>', b'<dimension ref="A1:B10"/>')
+            dst.writestr(item, data)
+
+    text = ax._extract_excel(str(lying))["text"]
+
+    assert "s1r60" in text
+
+
+def test_every_page_of_a_multi_page_tiff_is_read(tmp_path):
+    from PIL import Image
+
+    tiff = tmp_path / "scan.tiff"
+    first, *rest = [Image.new("RGB", (40, 40), color) for color in ("white", "gray", "black")]
+    first.save(tiff, save_all=True, append_images=rest)
+    pages = iter(range(1, 4))
+    with patch(
+        "pytesseract.image_to_string", side_effect=lambda img, lang: f"Page {next(pages)} {WORDS}"
+    ):
+        result = ax._extract_image_ocr(str(tiff))
+
+    assert all(f"Page {n} " in result["text"] for n in (1, 2, 3))
+
+
+@pytest.mark.parametrize("guard", ["members", "ratio", "nested"])
+def test_an_archive_a_safety_limit_stops_is_kept(tmp_path, guard):
+    import io
+    import zipfile
+
+    pack = tmp_path / "pack.zip"
+    with zipfile.ZipFile(pack, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("readme.txt", WORDS * 3)
+        if guard == "members":
+            for n in range(ax.ZIP_MAX_MEMBERS):
+                zf.writestr(f"m{n}.txt", "x")
+        elif guard == "ratio":
+            zf.writestr("blank.txt", "0" * 1_000_000)
+        else:
+            deepest = io.BytesIO()
+            with zipfile.ZipFile(deepest, "w") as z3:
+                z3.writestr("deep.txt", WORDS * 3)
+            inner = io.BytesIO()
+            with zipfile.ZipFile(inner, "w") as z2:
+                z2.writestr("deeper.zip", deepest.getvalue())
+            zf.writestr("inner.zip", inner.getvalue())
+
+    result = ax.extract_text_from_file(str(pack), "application/zip")
+
+    assert "file kept" in (result["error"] or "")
+
+
+def test_the_coverage_note_is_outside_the_untrusted_fence():
+    """Inside the fence the model is told to follow nothing; the note is an instruction."""
+    import re
+
+    from src.extract.attachment_prompt import build_merge_prompt
+
+    text = build_merge_prompt(
+        [{"summary": "a"}], filename="log.txt", mime_type="text/plain", covered=(50, 120)
+    )
+    fenced = re.search(r"<([A-Za-z0-9_-]+)>\n(.*)\n</\1>", text, re.S).group(2)
+
+    assert "50 of 120" in text and "50 of 120" not in fenced

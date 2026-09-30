@@ -455,9 +455,12 @@ def cmd_reextract(args):
     """Read again and summarise again rows earlier code capped, skipped or could not read."""
     from src.extract.reextract import SELECTORS, reextract
 
-    which = {name for name in SELECTORS if getattr(args, name)}
+    which = {name for name in SELECTORS if getattr(args, name, False)}
     if not which:
-        print("Error: choose at least one of --capped, --long, --zip, --unread", file=sys.stderr)
+        print(
+            "Error: choose at least one of --capped, --long, --zip, --unread, --partial",
+            file=sys.stderr,
+        )
         return 2
     stats = reextract(
         args.db,
@@ -468,7 +471,16 @@ def cmd_reextract(args):
         root=args.root,
     )
     print(f"reextract ({', '.join(sorted(which))}){' DRY RUN' if args.dry_run else ''}:")
-    for key in ("selected", "reread", "resummarise", "missing", "kept", "summarised", "failed"):
+    for key in (
+        "selected",
+        "reread",
+        "resummarise",
+        "missing",
+        "kept",
+        "unchanged",
+        "summarised",
+        "failed",
+    ):
         print(f"  {key:<12}: {stats[key]:,}")
     return 0
 
@@ -3064,6 +3076,11 @@ def main():
     parser_reextract.add_argument("--zip", action="store_true", help="zip archives once skipped")
     parser_reextract.add_argument(
         "--unread", action="store_true", help="rows Phase 1 recorded without reading the file"
+    )
+    parser_reextract.add_argument(
+        "--partial",
+        action="store_true",
+        help="rows the old readers read in part: spreadsheets, scans, archives, 2M-char texts",
     )
     parser_reextract.add_argument("--limit", type=int, default=0, help="Max rows (0 = all)")
     parser_reextract.add_argument("--dry-run", action="store_true", help="Count only")

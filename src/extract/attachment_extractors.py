@@ -903,15 +903,15 @@ def _copy_at_most(src, dst, limit: int) -> int | None:
     return written
 
 
-def _member_outcome(name: str, result: dict) -> tuple[str | None, str | None]:
+def _member_outcome(name: str, result: dict) -> tuple[list[str], list[str]]:
     """A member's text for its archive, and the note it leaves: its error when it gave no text,
     or its mark when it was read in part, which the archive keeps so the sweep does not take it
     for read in full."""
     error = result.get("error") or ""
     if result.get("text"):
         in_part = "left unread" in error or "file kept" in error
-        return f"=== {name} ===\n{result['text']}", f"{name}: {error}" if in_part else None
-    return None, f"{name}: {error}" if error else None
+        return [f"=== {name} ===\n{result['text']}"], [f"{name}: {error}"] if in_part else []
+    return [], [f"{name}: {error}"] if error else []
 
 
 def _extract_zip(path: str, depth: int, seconds: float, ocr_seconds: float | None = None) -> dict:
@@ -983,11 +983,9 @@ def _extract_zip(path: str, depth: int, seconds: float, ocr_seconds: float | Non
                 except Exception as e:
                     notes.append(f"{name}: {type(e).__name__}: {str(e)[:200]}")
                     continue
-                part, note = _member_outcome(name, result)
-                if part:
-                    parts.append(part)
-                if note:
-                    notes.append(note)
+                text, said = _member_outcome(name, result)
+                parts.extend(text)
+                notes.extend(said)
     error = "; ".join(notes) or None
     if not parts:
         return {

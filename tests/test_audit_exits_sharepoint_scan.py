@@ -31,7 +31,7 @@ def _configured_tenant(monkeypatch):
 
 
 def _url(n: int) -> str:
-    return f"https://contoso.sharepoint.com/sites/Team/Edoc{n}"
+    return f"https://contoso.sharepoint.com/:w:/g/sites/Team/Edoc{n}"
 
 
 def _db(tmp_path, emails):

@@ -131,7 +131,9 @@ The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register t
 
 ### SharePoint
 
-- `sharepoint_index(operation, url)`. `list_stale` (any link whose `last_status` is not `ok`), `list_unfetched`, or `refetch` a specific URL.
+- `sharepoint_index(operation, url)`. `list_stale` (any link whose `last_status` is not `ok` or `not-content`), `list_unfetched`, or `refetch` a specific URL.
+
+  What a link points at decides what is fetched (`link_kind` in `src/export/sharepoint_fetcher.py`): a file (a sharing link to a document, an Office viewer URL, a document URL) is downloaded through `sharepoint-cli get` and stored as text; an intranet page (`/SitePages/*.aspx`) is read through `sharepoint-cli page` and stored as a text-only document titled `[SharePoint page] <title>`; anything else (the SharePoint home, OneDrive and library views, folders, videos) is recorded once as `not-content` and never fetched. Links to the same target share one fetch per run.
 
   `refetch` accepts only a URL already present in `sharepoint_links` and only on the configured `SHAREPOINT_HOST`. Both checks matter: the URL reaches `sharepoint-cli --host` and the CLI will point the stored session, cookies included, at whatever host it is given. Since search results carry attacker-authored subject and body text to the model, an unconstrained refetch is a route for sending your SharePoint session to a tenant someone else controls.
 
@@ -368,6 +370,7 @@ python -m src.cli sweep-files --policy      # delete attachment files whose cont
 python -m src.cli reextract --capped --zip --unread    # read and summarise again rows earlier code capped, skipped or never read
 python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents
 python -m src.cli process-sharepoint --ingest-fetched  # store the files earlier SharePoint fetches left on disk
+python -m src.cli process-sharepoint --refetch-content --max-fetches 0 --deadline-s 1800  # read again the links recorded ok with no text
 ```
 
 Full subcommand list: `python -m src.cli --help`.

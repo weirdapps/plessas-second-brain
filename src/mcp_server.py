@@ -851,7 +851,7 @@ def sharepoint_index(
     """Operations on the sharepoint_links table.
 
     Operations:
-      - list_stale: URLs whose last_status is anything other than 'ok'
+      - list_stale: URLs whose last_status is anything other than 'ok' or 'not-content'
       - list_unfetched: URLs that have never been successfully fetched
       - refetch: force a re-attempt for a specific URL (requires `url`)
 
@@ -871,12 +871,13 @@ def sharepoint_index(
             # arrived later without anyone thinking to add it here, so a whole
             # class of unfetched link was invisible to this tool. A new status
             # must show up as a problem, not vanish: fail open, the way
-            # scripts/health_check.py counts them.
+            # scripts/health_check.py counts them. 'not-content' is settled, not failing: a
+            # link with nothing to read, recorded once and never fetched.
             rows = conn.execute(
                 """
                 SELECT url, message_id, last_status, last_attempt_at
                 FROM sharepoint_links
-                WHERE last_status != 'ok'
+                WHERE last_status NOT IN ('ok', 'not-content')
                 ORDER BY last_attempt_at DESC
                 """
             ).fetchall()

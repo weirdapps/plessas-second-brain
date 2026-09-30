@@ -365,3 +365,15 @@ are stored in full and summarised in parts. The one-time backfills are
 `process-sharepoint --ingest-fetched` (the files earlier fetches left in `data/sharepoint`,
 which `sweep-files` then also covers), `ingest-session-notes --all`, and
 `reextract --capped --long --zip --unread`, each with a count first (`reextract --dry-run`).
+
+**SharePoint links by kind.** A file behind a sharing or viewer link is downloaded by
+`sharepoint-cli get`, which resolves the link through its viewer page; an intranet page is read
+by `sharepoint-cli page` as text; a link with nothing to read is recorded `not-content` and
+never fetched. A file link whose page names no file is recorded `not-a-file`: a failure the
+health row shows and the retry pass offers again, since a viewer format change looks the same. Both commands need a `sharepoint-access` build that has them (`git pull && npm ci
+&& npm run build` in `~/SourceCode/sharepoint-access`, or wait for repo-autoupdate). The one-time
+backfill for links recorded `ok` with no text stored (mostly viewer pages saved as the file) is
+`process-sharepoint --refetch-content --max-fetches 0 --deadline-s 1800`, with a count first
+(`--dry-run`). It is resumable: the `sync_metadata` row `sharepoint_refetch_since` marks when it
+began, a link attempted since is done, and a finished pass finds nothing. Delete that row to read
+them all again.

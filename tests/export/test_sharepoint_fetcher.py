@@ -191,7 +191,7 @@ def _insert_exhausted_link(conn, last_attempt_at, last_status="auth-required"):
 
     conn.execute(
         "INSERT INTO sharepoint_links (url, message_id, fetched_at, last_status, last_attempt_at, attempts) "
-        "VALUES ('https://dead', 'm', NULL, ?, ?, ?)",
+        "VALUES ('https://contoso.sharepoint.com/:w:/g/sites/t/Edead', 'm', NULL, ?, ?, ?)",
         (last_status, last_attempt_at, MAX_SHAREPOINT_ATTEMPTS),
     )
     conn.commit()
@@ -227,7 +227,9 @@ def test_process_sharepoint_retries_an_exhausted_link_after_the_cool_off(tmp_pat
     _insert_exhausted_link(_setup_db(tmp_path), long_ago)
 
     with patch("src.export.sharepoint_fetcher.fetch_sharepoint_link") as mock_fetch:
-        mock_fetch.return_value = SharepointFetchResult(url="https://dead", status="stale")
+        mock_fetch.return_value = SharepointFetchResult(
+            url="https://contoso.sharepoint.com/:w:/g/sites/t/Edead", status="stale"
+        )
         args = argparse.Namespace(db=str(tmp_path / "test.db"), since=None, limit=0, dry_run=False)
         cmd_process_sharepoint(args)
         assert mock_fetch.called
@@ -314,7 +316,7 @@ def test_process_sharepoint_skips_external_host_and_continues(mock_fetch, tmp_pa
         (
             "m-mgd",
             "2026-05-30T11:00:00",
-            "doc https://contoso.sharepoint.com/sites/foo/Eabc end",
+            "doc https://contoso.sharepoint.com/:w:/g/sites/foo/Eabc end",
         ),
     )
     conn.commit()
@@ -391,14 +393,14 @@ def _status_after_403(tmp_path, url):
 def test_a_403_from_a_foreign_tenant_is_recorded_as_unsupported_host(tmp_path):
     """No session for that host exists and no login of ours can create one, so
     the link is permanently out of reach and must stop being retried."""
-    url = "https://partner.sharepoint.com/sites/Org/Edoc"
+    url = "https://partner.sharepoint.com/:w:/g/sites/Org/Edoc"
     assert _status_after_403(tmp_path, url) == "unsupported-host"
 
 
 def test_a_403_from_the_managed_host_stays_an_http_error(tmp_path):
     """Our own tenant refusing one item is transient: access can be granted, so
     the link must stay in the retry pool."""
-    url = "https://contoso.sharepoint.com/sites/Team/Edoc"
+    url = "https://contoso.sharepoint.com/:w:/g/sites/Team/Edoc"
     assert _status_after_403(tmp_path, url) == "http-error"
 
 
@@ -414,7 +416,7 @@ def test_process_sharepoint_retries_known_unfetched_link(mock_fetch, tmp_path):
     from src.export.sharepoint_fetcher import SharepointFetchResult
     from src.store.schema import create_database, get_connection, run_migrations
 
-    url = "https://contoso.sharepoint.com/sites/foo/Estale"
+    url = "https://contoso.sharepoint.com/:w:/g/sites/foo/Estale"
     db_path = tmp_path / "test.db"
     conn = create_database(str(db_path))
     run_migrations(conn)
@@ -588,9 +590,9 @@ def test_retry_pass_requeues_own_tenant_links_parked_as_unsupported_host(tmp_pat
 
     from src.cli import cmd_process_sharepoint
 
-    own = "https://contoso.sharepoint.com/sites/a/E1"
-    twin = "https://contoso-my.sharepoint.com/personal/b/E2"
-    foreign = "https://partner.sharepoint.com/sites/c/E3"
+    own = "https://contoso.sharepoint.com/:w:/g/sites/a/E1"
+    twin = "https://contoso-my.sharepoint.com/:w:/g/personal/b/E2"
+    foreign = "https://partner.sharepoint.com/:w:/g/sites/c/E3"
     conn = _setup_db(tmp_path)
     for url in (own, twin, foreign):
         conn.execute(
@@ -620,7 +622,7 @@ def test_process_sharepoint_counts_a_refused_foreign_link_as_skipped(tmp_path, c
     from src.cli import cmd_process_sharepoint
     from src.store.schema import get_connection
 
-    url = "https://partner.sharepoint.com/sites/Org/Edoc"
+    url = "https://partner.sharepoint.com/:w:/g/sites/Org/Edoc"
     conn = _setup_db(tmp_path)
     conn.execute(
         "INSERT INTO emails (message_id, date_received, content) VALUES (?, ?, ?)",
@@ -682,3 +684,162 @@ def test_fetch_never_raises_on_a_url_urlparse_rejects(tmp_path, monkeypatch):
     )
     assert result.status == "exception"
     assert calls == []
+
+
+# What a link points at decides what is fetched: a file, an intranet page's text, or nothing.
+# The shapes mirror sharepoint-access src/sharepoint/links.ts classifyLink.
+@pytest.mark.parametrize(
+    ("url", "kind"),
+    [
+        ("https://x.sharepoint.com/sites/news/SitePages/Launch.aspx", "page"),
+        ("https://x.sharepoint.com/:u:/r/sites/news/SitePages/Launch.aspx?e=1", "page"),
+        ("https://x.sharepoint.com/sites/hr/news/SitePages/3684.aspx?amp%3Bat=1", "page"),
+        ("https://x-my.sharepoint.com/:x:/g/personal/ann/EQabc?e=1", "file"),
+        ("https://x.sharepoint.com/:w:/r/sites/team/Shared%20Documents/a.docx?d=w1", "file"),
+        ("https://x.sharepoint.com/:b:/s/team/EQpdf", "file"),
+        ("https://x.sharepoint.com/sites/team/Shared%20Documents/%CE%91.pdf", "file"),
+        ("https://x.sharepoint.com/sites/team/Shared%20Documents/REPORT.PDF", "file"),
+        ("https://x.sharepoint.com/sites/team/Shared%20Documents/notes.docx.aspx", "not-content"),
+        ("https://x-my.sharepoint.com/personal/ann/_layouts/15/Doc.aspx?sourcedoc=%7Ba%7D", "file"),
+        ("https://x-my.sharepoint.com/personal/ann/_layouts/15/onedrive.aspx", "not-content"),
+        ("https://x.sharepoint.com/:f:/g/sites/team/EQfolder", "not-content"),
+        ("https://x.sharepoint.com/:v:/g/sites/team/EQvideo", "not-content"),
+        ("https://x.sharepoint.com/sites/team", "not-content"),
+        (
+            "https://x.sharepoint.com/sites/team/Shared%20Documents/Forms/AllItems.aspx",
+            "not-content",
+        ),
+        ("https://x.sharepoint.com/_layouts/15/sharepoint.aspx", "not-content"),
+        ("https://[x.sharepoint.com/a.docx", "not-content"),
+    ],
+)
+def test_link_kind(url, kind):
+    from src.export.sharepoint_fetcher import link_kind
+
+    assert link_kind(url) == kind
+
+
+PAGE_URL = "https://x.sharepoint.com/sites/news/SitePages/Launch.aspx"
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_the_page_fetch_reads_the_clis_json(mock_cli):
+    from src.export.sharepoint_fetcher import fetch_sharepoint_page
+
+    mock_cli.return_value = {
+        "source": PAGE_URL,
+        "path": "/sites/news/SitePages/Launch.aspx",
+        "title": "Launch",
+        "html": "<div><p>Hello team</p></div>",
+    }
+    result = fetch_sharepoint_page(PAGE_URL, managed_host=MANAGED)
+    assert (result.status, result.title, result.path, result.html) == (
+        "ok",
+        "Launch",
+        "/sites/news/SitePages/Launch.aspx",
+        "<div><p>Hello team</p></div>",
+    )
+    assert mock_cli.call_args[0][0] == ["page", PAGE_URL]
+    assert mock_cli.call_args[1]["host"] == "x.sharepoint.com"
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_the_page_fetch_refuses_an_unmanaged_host_without_a_subprocess(mock_cli):
+    from src.export.sharepoint_fetcher import fetch_sharepoint_page
+
+    result = fetch_sharepoint_page(
+        "https://partner.sharepoint.com/sites/a/SitePages/b.aspx", managed_host=MANAGED
+    )
+    assert result.status == "unsupported-host"
+    mock_cli.assert_not_called()
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_a_page_fetch_error_maps_like_a_file_fetch(mock_cli):
+    from src.export.sharepoint_cli import SharepointCliError
+    from src.export.sharepoint_fetcher import fetch_sharepoint_page
+
+    mock_cli.side_effect = SharepointCliError(
+        exit_code=5, stderr='{"error":"upstream","status":500}', retryable=True
+    )
+    result = fetch_sharepoint_page(PAGE_URL, managed_host=MANAGED)
+    assert (result.status, result.http_status) == ("http-error", 500)
+
+
+@patch("src.export.sharepoint_fetcher.run_sharepoint_cli")
+def test_not_a_file_is_a_failure_that_stays_visible_and_is_retried(mock_cli, tmp_path):
+    """A file link that answered with a page naming no file: a viewer format change, or an
+    interstitial nobody recognised. Settling it would hide it for good; it must stay a failure
+    that the health row and list_stale show and the retry pass offers again."""
+    from src.export.sharepoint_cli import SharepointCliError
+    from src.export.sharepoint_fetcher import retry_candidates
+
+    mock_cli.side_effect = SharepointCliError(
+        exit_code=5, stderr='{"error":"not_a_file","message":"not a file"}', retryable=True
+    )
+    url = "https://contoso.sharepoint.com/:x:/g/sites/t/EQabc"
+    result = fetch_sharepoint_link(url, tmp_path, managed_host="contoso.sharepoint.com")
+    assert result.status == "not-a-file"
+
+    conn = _setup_db(tmp_path)
+    record_link_in_db(conn, url, "AAMk-1", result.status)
+    assert conn.execute("SELECT fetched_at FROM sharepoint_links").fetchone()[0] is None
+    assert [r[0] for r in retry_candidates(conn, managed_host="contoso.sharepoint.com")] == [url]
+
+
+def test_not_content_is_recorded_as_done_and_never_retried(tmp_path):
+    from src.export.sharepoint_fetcher import retry_candidates
+
+    conn = _setup_db(tmp_path)
+    url = "https://contoso-my.sharepoint.com/personal/ann/_layouts/15/onedrive.aspx"
+    record_link_in_db(conn, url, "AAMk-1", "http-error")
+    record_link_in_db(conn, url, "AAMk-1", "http-error")
+    record_link_in_db(conn, url, "AAMk-1", "not-content")
+    fetched_at, attempts, status = conn.execute(
+        "SELECT fetched_at, attempts, last_status FROM sharepoint_links"
+    ).fetchone()
+    assert fetched_at is not None
+    assert (attempts, status) == (0, "not-content")
+    assert retry_candidates(conn, managed_host="contoso.sharepoint.com") == []
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "same"),
+    [
+        (PAGE_URL + "?e=1", PAGE_URL + "?amp%3Bat=2", True),
+        (PAGE_URL, "https://x.sharepoint.com/:u:/r/sites/news/SitePages/Launch.aspx", True),
+        (PAGE_URL, PAGE_URL.replace("Launch", "launch"), True),
+        (
+            "https://x.sharepoint.com/:x:/g/sites/t/EQab",
+            "https://x.sharepoint.com/:x:/g/sites/t/EQAB",
+            False,
+        ),
+        (PAGE_URL, "https://x-my.sharepoint.com/sites/news/SitePages/Launch.aspx", False),
+        # An Office viewer names its file only in the query.
+        (
+            "https://x.sharepoint.com/sites/team/_layouts/15/Doc.aspx?sourcedoc=%7BA%7D&file=Plan.docx",
+            "https://x.sharepoint.com/sites/team/_layouts/15/Doc.aspx?sourcedoc=%7BB%7D&file=Budget.xlsx",
+            False,
+        ),
+        (
+            "https://x.sharepoint.com/:w:/r/sites/team/_layouts/15/Doc.aspx?sourcedoc=%7BA%7D",
+            "https://x.sharepoint.com/:x:/r/sites/team/_layouts/15/Doc.aspx?sourcedoc=%7BB%7D",
+            False,
+        ),
+        (
+            "https://x.sharepoint.com/sites/team/_layouts/15/xlviewer.aspx?id=/sites/team/a.xlsx",
+            "https://x.sharepoint.com/sites/team/_layouts/15/xlviewer.aspx?id=/sites/team/b.xlsx",
+            False,
+        ),
+        # A link that is not content never shares a result with a file.
+        (
+            "https://x.sharepoint.com/:u:/r/sites/team/a.zip",
+            "https://x.sharepoint.com/sites/team/a.zip",
+            False,
+        ),
+    ],
+)
+def test_links_share_a_target_when_they_fetch_the_same_thing(a, b, same):
+    from src.export.sharepoint_fetcher import target_of
+
+    assert (target_of(a) == target_of(b)) is same

@@ -678,6 +678,7 @@ def cmd_process_sharepoint(args):
         is_managed_sharepoint_host,
         record_link_in_db,
         retry_candidates,
+        target_of,
     )
     from src.extract.sharepoint_ingest import fetch_and_ingest
     from src.extract.sharepoint_url_scanner import extract_sharepoint_urls
@@ -800,6 +801,7 @@ def cmd_process_sharepoint(args):
         "urls_retried": 0,
         "urls_fetched": 0,
         "urls_failed": 0,
+        "urls_not_content": 0,
         "urls_skipped_external": 0,
         "auth_required": False,
     }
@@ -811,13 +813,22 @@ def cmd_process_sharepoint(args):
     # URLs attempted this run (retry pass + scan) — avoids double-fetching a URL
     # the email scan rediscovers after the retry pass already handled it.
     attempted: set[str] = set()
+    # One fetch per target this run: the same page is linked from hundreds of emails, under as
+    # many query strings, and every link to it records the one result (target_of).
+    by_target: dict[str, tuple] = {}
 
     def _fetch_one(url: str, message_id: str) -> bool:
         """Fetch + record one URL, updating outcome stats. Returns True on a
         re-loginable (managed-host) auth failure so the caller stops the pass."""
         print(f"  Fetching: {url}")
-        # Fetched into a temporary directory and stored as text; no file is kept.
-        result, document = fetch_and_ingest(conn, url, message_id)
+        target = target_of(url)
+        if target in by_target:
+            result, document = by_target[target]
+            print("    (the same target as a link above: not fetched again)")
+        else:
+            # Fetched into a temporary directory and stored as text; no file is kept.
+            result, document = fetch_and_ingest(conn, url, message_id)
+            by_target[target] = (result, document)
         # An auth failure on an external tenant (a host we hold no session for)
         # can never be fixed by our re-login, so record it distinctly and keep
         # going instead of aborting the whole pass. A foreign tenant announces
@@ -852,6 +863,9 @@ def cmd_process_sharepoint(args):
         if result.status == "ok":
             print(f"    ✓ Stored: {result.file_name}")
             stats["urls_fetched"] += 1
+        elif result.status == "not-content":
+            print("    · Not content (nothing to read): not fetched")
+            stats["urls_not_content"] += 1
         elif external_auth:
             print("    ⤼ External host (no session) — skipping")
             stats["urls_skipped_external"] += 1
@@ -863,6 +877,59 @@ def cmd_process_sharepoint(args):
             print(f"    ✗ {result.status}: {result.error_message or 'unknown error'}")
             stats["urls_failed"] += 1
         return False
+
+    # The links earlier fetches recorded 'ok' with no text stored: most were a viewer or
+    # sign-in page saved as the file. Each is read again once, by what it points at. A link
+    # attempted since the refetch began is done, so a run stopped by its budget resumes where
+    # it stopped and a finished one finds nothing. Delete the sync_metadata row
+    # 'sharepoint_refetch_since' to read them all again.
+    if getattr(args, "refetch_content", False):
+        from datetime import UTC, datetime
+
+        mark = conn.execute(
+            "SELECT value FROM sync_metadata WHERE key = 'sharepoint_refetch_since'"
+        ).fetchone()
+        since = mark[0] if mark else datetime.now(UTC).isoformat()
+        if not mark and not args.dry_run:
+            conn.execute(
+                "INSERT INTO sync_metadata (key, value) VALUES ('sharepoint_refetch_since', ?)",
+                (since,),
+            )
+            conn.commit()
+        rows = conn.execute(
+            "SELECT l.url, l.message_id FROM sharepoint_links l "
+            "WHERE l.last_status = 'ok' AND COALESCE(l.last_attempt_at, '') < ? "
+            "AND NOT EXISTS (SELECT 1 FROM attachments a "
+            "  JOIN attachment_content ac ON ac.attachment_id = a.id "
+            "  WHERE a.message_id = l.document_message_id "
+            "  AND LENGTH(TRIM(COALESCE(ac.extracted_text, ''))) > 0) "
+            "ORDER BY l.url",
+            (since,),
+        ).fetchall()
+        targets = len({target_of(url) for url, _m in rows})
+        print(f"Refetch: {len(rows)} link(s), {targets} target(s), with no text since {since}")
+        if not args.dry_run:
+            for url, message_id in rows:
+                if max_fetches > 0 and stats["urls_retried"] >= max_fetches:
+                    print(f"  Fetch cap of {max_fetches} reached: the rest wait for the next run")
+                    break
+                if _out_of_time():
+                    print("  Time budget spent: the rest wait for the next run")
+                    break
+                stats["urls_retried"] += 1
+                if _fetch_one(url, message_id):
+                    break
+        conn.close()
+        print(
+            f"\nRefetch: {stats['urls_retried']} read, {stats['urls_fetched']} stored, "
+            f"{stats['urls_failed']} failed, {stats['urls_not_content']} not content"
+        )
+        if stats["auth_required"]:
+            print(
+                f"\n⚠ Auth required: run 'sharepoint-cli login --host {SHAREPOINT_HOST}' and retry"
+            )
+            return EXIT_REAUTH
+        return 0
 
     # Retry pass: links seen before but never fetched OK (fetched_at NULL) or
     # gone stale get re-attempted regardless of whether their source email is
@@ -948,6 +1015,8 @@ def cmd_process_sharepoint(args):
     if not args.dry_run:
         print(f"  URLs fetched: {stats['urls_fetched']}")
         print(f"  URLs failed: {stats['urls_failed']}")
+        if stats["urls_not_content"]:
+            print(f"  Not content (not fetched): {stats['urls_not_content']}")
         if stats["urls_skipped_external"]:
             print(f"  External hosts skipped (no session): {stats['urls_skipped_external']}")
         if capped:
@@ -3082,6 +3151,12 @@ def main():
         "--ingest-fetched",
         action="store_true",
         help="Store the files earlier fetches left on disk, then exit",
+    )
+    parser_process_sp.add_argument(
+        "--refetch-content",
+        action="store_true",
+        help="Read again, once per target, the links recorded ok with no text stored, then "
+        "exit; resumable, bounded by --deadline-s and --max-fetches",
     )
     parser_process_sp.set_defaults(func=cmd_process_sharepoint)
 

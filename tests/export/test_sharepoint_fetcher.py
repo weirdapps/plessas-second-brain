@@ -698,6 +698,8 @@ def test_fetch_never_raises_on_a_url_urlparse_rejects(tmp_path, monkeypatch):
         ("https://x.sharepoint.com/:w:/r/sites/team/Shared%20Documents/a.docx?d=w1", "file"),
         ("https://x.sharepoint.com/:b:/s/team/EQpdf", "file"),
         ("https://x.sharepoint.com/sites/team/Shared%20Documents/%CE%91.pdf", "file"),
+        ("https://x.sharepoint.com/sites/team/Shared%20Documents/REPORT.PDF", "file"),
+        ("https://x.sharepoint.com/sites/team/Shared%20Documents/notes.docx.aspx", "not-content"),
         ("https://x-my.sharepoint.com/personal/ann/_layouts/15/Doc.aspx?sourcedoc=%7Ba%7D", "file"),
         ("https://x-my.sharepoint.com/personal/ann/_layouts/15/onedrive.aspx", "not-content"),
         ("https://x.sharepoint.com/:f:/g/sites/team/EQfolder", "not-content"),

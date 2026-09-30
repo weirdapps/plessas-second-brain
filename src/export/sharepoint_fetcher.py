@@ -95,9 +95,9 @@ _FILE_LETTERS = frozenset("wxpbto")
 _SHARING = re.compile(r"^/:([a-z]):/([a-z])(/.*)?$", re.IGNORECASE)
 _PAGE = re.compile(r"/SitePages/[^/]+\.aspx$", re.IGNORECASE)
 _VIEWER = re.compile(r"/_layouts/15/(Doc|WopiFrame2?|xlviewer|PowerPoint)\.aspx$", re.IGNORECASE)
-_DOCUMENT = re.compile(
-    r"\.(docx?|docm|dotx|xlsx?|xlsm|xlsb|pptx?|pptm|ppsx|pdf|txt|csv|md|rtf|odt|ods|odp|msg|eml|zip)$",
-    re.IGNORECASE,
+_DOCUMENT_EXTENSIONS = frozenset(
+    "doc docx docm dotx xls xlsx xlsm xlsb ppt pptx pptm ppsx "
+    "pdf txt csv md rtf odt ods odp msg eml zip".split()
 )
 
 
@@ -121,7 +121,8 @@ def link_kind(url: str) -> LinkKind:
         return "file"
     if _PAGE.search(path):
         return "page"
-    return "file" if _DOCUMENT.search(path) else "not-content"
+    extension = Path(path).suffix.lower().lstrip(".")
+    return "file" if extension in _DOCUMENT_EXTENSIONS else "not-content"
 
 
 def target_of(url: str) -> str:

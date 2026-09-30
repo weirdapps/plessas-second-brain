@@ -275,3 +275,48 @@ def test_the_mcp_refetch_keeps_no_file(conn, monkeypatch):
     assert out["status"] == "ok"
     assert out["document_message_id"]
     assert not seen[0].exists()
+
+
+def test_no_fetch_starts_once_the_time_budget_is_spent(tmp_path, monkeypatch):
+    """Each fetch now extracts too, and the nightly pass has an hour for every stage: a spent
+    budget stops the SharePoint stage instead of the unit being killed before the sweep."""
+    from src import cli
+
+    db = tmp_path / "brain.db"
+    c = create_database(str(db))
+    for i in range(3):
+        record_link_in_db(c, url=f"{URL}?n={i}", message_id="AAMk-1", status="http-error")
+    c.close()
+    monkeypatch.setenv("SHAREPOINT_HOST", "tenant.example.com")
+    monkeypatch.setattr("src.config.SHAREPOINT_HOST", "tenant.example.com")
+    calls: list = []
+    monkeypatch.setattr(
+        sharepoint_ingest,
+        "fetch_and_ingest",
+        lambda conn, url, message_id: (
+            calls.append(url)
+            or (SharepointFetchResult(url=url, status="http-error", error_message="x"), None)
+        ),
+    )
+
+    cli.cmd_process_sharepoint(
+        Namespace(
+            db=db,
+            dry_run=False,
+            since=None,
+            limit=0,
+            max_fetches=0,
+            ingest_fetched=False,
+            deadline_s=0,
+        )
+    )
+
+    assert calls == []
+
+
+def test_the_nightly_pass_gives_the_sharepoint_stage_a_budget():
+    wrapper = (
+        Path(__file__).resolve().parent.parent / "scripts/wrappers/systemd/sb-attachment-pass.sh"
+    )
+    line = next(ln for ln in wrapper.read_text().splitlines() if "process-sharepoint" in ln)
+    assert "--deadline-s" in line

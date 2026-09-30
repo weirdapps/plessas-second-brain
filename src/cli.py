@@ -770,6 +770,15 @@ def cmd_process_sharepoint(args):
     # TimeoutStartSec: the mark stops before the first email it could not
     # finish, and the next run starts there.
     max_fetches = getattr(args, "max_fetches", 0) or 0
+    # Wall clock too: a fetch now also extracts the file, and the nightly pass has one hour for
+    # every stage. Checked before each fetch; the scan mark stops before the email it left.
+    import time
+
+    deadline_s = getattr(args, "deadline_s", None)
+    deadline = None if deadline_s is None else time.monotonic() + deadline_s
+
+    def _out_of_time() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
 
     print("Scanning emails for SharePoint URLs...")
     if args.since:
@@ -868,6 +877,9 @@ def cmd_process_sharepoint(args):
             # can offer many lost links at once.
             if max_fetches > 0 and stats["urls_retried"] >= max_fetches:
                 break
+            if _out_of_time():
+                print("  Time budget spent: the rest wait for the next run")
+                break
             attempted.add(url)
             stats["urls_retried"] += 1
             if _fetch_one(url, message_id):
@@ -897,6 +909,9 @@ def cmd_process_sharepoint(args):
                     if url in existing_urls or url in attempted:
                         continue
                     if not args.dry_run and max_fetches > 0 and fetches >= max_fetches:
+                        capped = True
+                        break
+                    if not args.dry_run and _out_of_time():
                         capped = True
                         break
                     attempted.add(url)
@@ -3056,6 +3071,12 @@ def main():
     )
     parser_process_sp.add_argument(
         "--dry-run", action="store_true", help="Scan and count only, no fetching"
+    )
+    parser_process_sp.add_argument(
+        "--deadline-s",
+        type=float,
+        default=None,
+        help="Wall-clock budget in seconds: no fetch starts once it is spent (default: none)",
     )
     parser_process_sp.add_argument(
         "--ingest-fetched",

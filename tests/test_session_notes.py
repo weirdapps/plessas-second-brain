@@ -259,3 +259,46 @@ def test_the_scan_takes_only_transcripts_changed_since_the_last_one(conn, tmp_pa
 
     assert session_notes.transcripts_to_scan(conn, all_files=False) == [new]
     assert session_notes.transcripts_to_scan(conn, all_files=True) == [new, old]
+
+
+def test_a_document_another_source_holds_is_kept_when_the_note_changes(conn, tmp_path):
+    """A note whose bytes equal a SharePoint document shares that document's identity. Its next
+    version must not forget the document the SharePoint link still points at."""
+    import hashlib
+
+    from src.export.sharepoint_fetcher import record_link_in_db
+    from src.extract.attachment_pipeline import ingest_text_document
+
+    sha = hashlib.sha256(LONG.encode("utf-8")).hexdigest()
+    shared = ingest_text_document(
+        conn,
+        source="sharepoint",
+        key=sha,
+        filename="plan.md",
+        mime_type="text/markdown",
+        text=LONG,
+        sha256=sha,
+        method="direct_read",
+        status="extracted",
+        error=None,
+        subject="[SharePoint] host/plan.md",
+        sender_name="SharePoint",
+        date="2026-09-29T10:00:00",
+    )
+    record_link_in_db(
+        conn,
+        url="https://host/plan.md",
+        message_id="AAMk-1",
+        status="ok",
+        document_message_id=shared["message_id"],
+    )
+    ingest_session_notes(conn, [_session(tmp_path, "s1", LONG)])
+
+    ingest_session_notes(
+        conn, [_session(tmp_path, "s2", LONG + " Revised.", ts="2026-09-30T11:00:00Z")]
+    )
+
+    kept = conn.execute(
+        "SELECT COUNT(*) FROM emails WHERE message_id = ?", (shared["message_id"],)
+    ).fetchone()[0]
+    assert kept == 1

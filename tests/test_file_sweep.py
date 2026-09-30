@@ -384,6 +384,9 @@ def test_keeps_a_file_phase_1_could_not_find(db, tmp_path):
     [
         ("skipped", "No legacy .doc converter available (textutil/antiword/catdoc)"),
         ("failed", "pytesseract or Pillow not installed"),
+        # The older wording, from before the antiword and catdoc fallback: 21 rows on the
+        # producer carry it.
+        ("failed", "[Errno 2] No such file or directory: 'textutil'"),
     ],
 )
 def test_keeps_a_file_this_host_had_no_tool_for(db, tmp_path, status, error):

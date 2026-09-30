@@ -118,6 +118,27 @@ def collect_session_notes(jsonl_path: Path) -> dict[str, Note]:
     return notes
 
 
+def _held_elsewhere(conn: sqlite3.Connection, message_id: int, path: str) -> bool:
+    """Whether anything but this note holds the document, so replacing the note must keep it.
+
+    A note's identity is the hash of its bytes, the same identity SharePoint documents, imports
+    and adopted attachments use. So the document may be another note path's, a SharePoint link's,
+    or not a session note at all; only a document this note alone holds is forgotten.
+    """
+    if conn.execute(
+        "SELECT 1 FROM session_notes WHERE message_id = ? AND path != ?", (message_id, path)
+    ).fetchone():
+        return True
+    if conn.execute(
+        "SELECT 1 FROM sharepoint_links WHERE document_message_id = ?", (message_id,)
+    ).fetchone():
+        return True
+    row = conn.execute(
+        "SELECT file_path FROM attachments WHERE message_id = ?", (message_id,)
+    ).fetchone()
+    return row is None or not str(row[0]).startswith("text:session-note:")
+
+
 def _store_note(conn: sqlite3.Connection, note: Note, stats: dict) -> None:
     sha = hashlib.sha256(note.text.encode("utf-8")).hexdigest()
     held = conn.execute(
@@ -130,11 +151,7 @@ def _store_note(conn: sqlite3.Connection, note: Note, stats: dict) -> None:
         if (held[1] or "") > (note.written_at or ""):
             stats["older"] += 1
             return
-        shared = conn.execute(
-            "SELECT COUNT(*) FROM session_notes WHERE message_id = ? AND path != ?",
-            (held[0], note.path),
-        ).fetchone()[0]
-        if not shared:
+        if not _held_elsewhere(conn, held[0], note.path):
             forget_documents(conn, [held[0]])
         stats["replaced"] += 1
     outcome = ingest_text_document(

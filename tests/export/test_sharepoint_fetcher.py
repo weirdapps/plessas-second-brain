@@ -791,3 +791,23 @@ def test_not_content_is_recorded_as_done_and_never_retried(tmp_path):
     assert fetched_at is not None
     assert (attempts, status) == (0, "not-content")
     assert retry_candidates(conn, managed_host="contoso.sharepoint.com") == []
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "same"),
+    [
+        (PAGE_URL + "?e=1", PAGE_URL + "?amp%3Bat=2", True),
+        (PAGE_URL, "https://x.sharepoint.com/:u:/r/sites/news/SitePages/Launch.aspx", True),
+        (PAGE_URL, PAGE_URL.replace("Launch", "launch"), True),
+        (
+            "https://x.sharepoint.com/:x:/g/sites/t/EQab",
+            "https://x.sharepoint.com/:x:/g/sites/t/EQAB",
+            False,
+        ),
+        (PAGE_URL, "https://x-my.sharepoint.com/sites/news/SitePages/Launch.aspx", False),
+    ],
+)
+def test_links_share_a_target_when_they_fetch_the_same_thing(a, b, same):
+    from src.export.sharepoint_fetcher import target_of
+
+    assert (target_of(a) == target_of(b)) is same

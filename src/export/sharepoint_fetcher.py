@@ -117,6 +117,23 @@ def link_kind(url: str) -> LinkKind:
     return "file" if _DOCUMENT.search(path) else "not-content"
 
 
+def target_of(url: str) -> str:
+    """What a link fetches, the same for every link to it: its host and path without the query,
+    an r sharing link's prefix removed. Paths fold case, as SharePoint does; a sharing token
+    does not, since two tokens can differ in case alone."""
+    try:
+        parsed = urlparse(url)
+        path = unquote(parsed.path)
+    except ValueError:
+        return url
+    m = _SHARING.match(path)
+    if m and m.group(2).lower() != "r":
+        return f"{parsed.netloc.lower()}{path}"
+    if m and m.group(3):
+        path = m.group(3)
+    return f"{parsed.netloc}{path}".lower()
+
+
 # After this many consecutive failed fetch attempts, the retry pass stops trying
 # a link every night. It is a throttle, not an abandonment — see the cool-off.
 MAX_SHAREPOINT_ATTEMPTS = 5

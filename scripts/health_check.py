@@ -784,19 +784,22 @@ def check_images(db):
     # `pending`. The counts below say the same thing without the false ceiling.
     # selects on. Coverage % alone hid a growing backlog: it stayed flat at 88% while
     # the queue sat 200 deep, because the denominator grows with the numerator.
-    # The JOIN matters: run_backfill only sees attachments joinable to an email, so
-    # counting orphans (email_id NULL) inflates this permanently — 91 reported vs 2
-    # reachable on prod — and would trip the WARN for work that can never drain.
+    # The LEFT JOIN matches run_backfill, which now takes an image whose email row is
+    # gone (with a blank sender). It used to JOIN, and this count then had to leave such
+    # images out, because nothing could drain them.
     # The same query also ages the queue, so the count and the age can never be
     # read off two predicates that drift apart. Depth alone has no time dimension:
     # sync swallows any Step 8 exception, so a step that raises on every run writes
     # no occurrences, `stuck` stays 0, and `pending` took 8-10 days to cross
     # IMAGE_QUEUE_WARN.
+    from src.extract.image_pipeline import IMAGE_OWED_SQL
+    from src.store.file_sweep import VISION_ATTEMPTS_LIMIT
+
     pending, oldest_pending = db.execute(
         "SELECT COUNT(*), MIN(e.date_received) FROM attachments a "
-        "JOIN emails e ON a.email_id = e.id "
+        "LEFT JOIN emails e ON a.email_id = e.id "
         "WHERE a.mime_type LIKE 'image/%' AND a.file_path IS NOT NULL "
-        "AND a.message_id NOT IN (SELECT message_id FROM inline_image_occurrences)"
+        f"AND {IMAGE_OWED_SQL}"
     ).fetchone()
     pending_age = _age(oldest_pending)
     pending_stale = (
@@ -811,11 +814,24 @@ def check_images(db):
     # Ageing each image against its OWN arrival (not wall-clock) keeps a genuinely
     # quiet stretch silent while a stalled one is loud.
     placeholders = ", ".join("?" * len(VISION_SKIPPED_CLASSES))
+    # An image given up on after VISION_ATTEMPTS_LIMIT failed descriptions is done, not
+    # stuck and not owed: counting it would keep the row at WARN for work nothing will do.
+    given_up = db.execute(
+        "SELECT COUNT(*) FROM inline_images WHERE vision_description IS NULL "
+        f"AND (classification IS NULL OR classification NOT IN ({placeholders})) "
+        "AND vision_attempts >= ?",
+        (*VISION_SKIPPED_CLASSES, VISION_ATTEMPTS_LIMIT),
+    ).fetchone()[0]
     stuck = db.execute(
         "SELECT COUNT(*) FROM inline_images WHERE vision_description IS NULL "
         f"AND (classification IS NULL OR classification NOT IN ({placeholders})) "
+        "AND vision_attempts < ? "
         "AND datetime(classified_at) < datetime('now', ?)",
-        (*VISION_SKIPPED_CLASSES, f"-{STALE_THRESHOLDS['images_vision'].days} days"),
+        (
+            *VISION_SKIPPED_CLASSES,
+            VISION_ATTEMPTS_LIMIT,
+            f"-{STALE_THRESHOLDS['images_vision'].days} days",
+        ),
     ).fetchone()[0]
     # The population vision is actually asked to describe, and the remainder that
     # is deliberately excluded from it. Reporting these two as counts is what
@@ -835,7 +851,7 @@ def check_images(db):
     # What is genuinely owed: eligible, undescribed, and not yet old enough to be
     # counted as `stuck`. This is the number that must reach zero, and unlike
     # `pct` it can.
-    owed = eligible - described_eligible
+    owed = eligible - described_eligible - given_up
     latest_vision = db.execute("SELECT MAX(visioned_at) FROM inline_images").fetchone()[0]
     return {
         "name": "Inline Images",
@@ -846,6 +862,7 @@ def check_images(db):
         "described_eligible": described_eligible,
         "skipped": skipped,
         "owed": owed,
+        "given_up": given_up,
         "pending": pending,
         "pending_age": pending_age,
         "pending_stale": pending_stale,
@@ -1899,10 +1916,13 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
             # rows vision is never asked to describe, so it read as permanently
             # behind while nothing was owed. "skipped by design" is the same
             # population stated as the policy it actually is.
+            given_up = c.get("given_up", 0)
             extra = (
                 f" ({c.get('described_eligible', 0):,} described,"
                 f" {c.get('owed', 0):,} owed, {c.get('pending', 0):,} queued;"
-                f" {c.get('skipped', 0):,} skipped by design)"
+                f" {c.get('skipped', 0):,} skipped by design"
+                + (f"; {given_up:,} given up" if given_up else "")
+                + ")"
             )
             if c.get("stuck"):
                 extra += (

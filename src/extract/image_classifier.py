@@ -164,12 +164,21 @@ def _store(
     b: int,
 ) -> Classification:
     now = datetime.now(UTC).isoformat()
+    # An upsert, not INSERT OR REPLACE: REPLACE deletes the row first, which reset
+    # vision_attempts and, with foreign keys on, cascaded away the image's occurrences.
     conn.execute(
-        """INSERT OR REPLACE INTO inline_images
-           (sha256, width, height, bytes, classification, classification_method, classified_at, user_overridden)
-           VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(
-              (SELECT user_overridden FROM inline_images WHERE sha256 = ?), 0))""",
-        (sha, w, h, b, classification.value, method, now, sha),
+        """INSERT INTO inline_images
+           (sha256, width, height, bytes, classification, classification_method,
+            classified_at, user_overridden)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+           ON CONFLICT(sha256) DO UPDATE SET
+             width = excluded.width,
+             height = excluded.height,
+             bytes = excluded.bytes,
+             classification = excluded.classification,
+             classification_method = excluded.classification_method,
+             classified_at = excluded.classified_at""",
+        (sha, w, h, b, classification.value, method, now),
     )
     conn.commit()
     return classification

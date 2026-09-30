@@ -30,6 +30,7 @@ import argparse
 import filecmp
 import os
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -37,16 +38,19 @@ from src.config import ATTACHMENTS_DIR, DEFAULT_DB, is_replica, replica_refusal 
 from src.export.outlook_attachments import ORPHAN_GRACE_DAYS, is_abandoned_orphan  # noqa: E402
 from src.extract.attachment_pipeline import ingest_document  # noqa: E402
 from src.store.file_hashes import sha256_of_file  # noqa: E402
-from src.store.file_sweep import load_policy  # noqa: E402
+from src.store.file_sweep import UNREAD_SQL, load_policy  # noqa: E402
 from src.store.schema import get_connection  # noqa: E402
 
 # outlook_attachments skips it on the way in and sharepoint_links tracks it with
 # its own fetch state and its own given-up rule. Not this script's to delete.
 SHAREPOINT_SUBDIR = "sharepoint"
 
-# Downloads happen after their email commits, so an unregistered directory a day old will
-# never get its email. A file in it whose bytes are already stored can go then; a unique file
-# still waits ORPHAN_GRACE_DAYS before it is adopted.
+# Attachments download right after their message is staged, and its email row lands at the
+# next load, normally within the hour. So a directory still unregistered after a day, while
+# mail keeps loading, belongs to a message that will never load (a message moved to Archive
+# gets a new id, and the loader drops its email as a duplicate). A file in it whose content is
+# already stored can go then. While loading is stalled (no email received in the last day),
+# duplicates wait the full ORPHAN_GRACE_DAYS like everything else. A unique file always does.
 DUPLICATE_GRACE_DAYS = 1.0
 
 
@@ -62,8 +66,14 @@ def _registered_elsewhere(conn) -> dict[tuple[str, int], list[str]]:
     return index
 
 
-def _survey(db_path: str) -> tuple[set[str], dict[tuple[str, int], list[str]], set[str]]:
-    """Read the table once: claimed directories, what is held where, and every stored hash.
+def _survey(
+    db_path: str,
+) -> tuple[set[str], dict[tuple[str, int], list[str]], set[str], str | None]:
+    """Read the table once: claimed directories, what is held where, stored hashes, newest mail.
+
+    A hash counts only when its row's content was read by Phase 1 (src/store/file_sweep.py's
+    UNREAD_SQL): a row whose file vanished before Phase 1, or that this host could not read,
+    proves nothing about the bytes, and the orphan may be the last copy.
 
     Closes before anything writes. Adoption goes through `ingest_document`, which opens its
     own connection, and holding a second one across those writes is how six concurrent sb-*
@@ -79,9 +89,17 @@ def _survey(db_path: str) -> tuple[set[str], dict[tuple[str, int], list[str]], s
         }
         hashes = {
             sha
-            for (sha,) in conn.execute("SELECT sha256 FROM attachments WHERE sha256 IS NOT NULL")
+            for (sha,) in conn.execute(
+                "SELECT a.sha256 FROM attachments a"
+                " JOIN attachment_content ac ON ac.attachment_id = a.id"
+                f" WHERE a.sha256 IS NOT NULL AND NOT COALESCE({UNREAD_SQL}, 0)"
+            )
         }
-        return referenced, _registered_elsewhere(conn), hashes
+        newest = conn.execute(
+            "SELECT MAX(date_received) FROM emails"
+            " WHERE mailbox_name IS NULL OR mailbox_name <> 'External'"
+        ).fetchone()[0]
+        return referenced, _registered_elsewhere(conn), hashes, newest
     finally:
         conn.close()
 
@@ -154,6 +172,19 @@ def _reap_one_dir(
         f.unlink()
 
 
+def _mail_is_flowing(newest: str | None, days: float) -> bool:
+    """Whether an email was received within `days`. Unknown or unparseable reads as stalled."""
+    if not newest:
+        return False
+    try:
+        ts = datetime.fromisoformat(str(newest).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=UTC)
+    return datetime.now(UTC) - ts <= timedelta(days=days)
+
+
 def _husk_is_empty(msg_dir: Path) -> bool:
     """Nothing left but, at most, someone else's subtree."""
     return not any(p.name != SHAREPOINT_SUBDIR for p in msg_dir.iterdir())
@@ -184,7 +215,7 @@ def reap_orphan_attachments(
     """
     db_path = str(db_path)
     base_dir = Path(base_dir)
-    stats = {
+    stats: dict[str, float] = {
         "scanned": 0,
         "deleted": 0,
         "adopted": 0,
@@ -196,7 +227,10 @@ def reap_orphan_attachments(
     if not base_dir.is_dir():
         return stats
 
-    referenced, known, hashes = _survey(db_path)
+    referenced, known, hashes, newest = _survey(db_path)
+    if not _mail_is_flowing(newest, duplicate_grace_days):
+        duplicate_grace_days = grace_days
+    stats["duplicate_grace_days"] = min(duplicate_grace_days, grace_days)
 
     for msg_dir in sorted(base_dir.iterdir()):
         if not msg_dir.is_dir() or msg_dir.name in referenced:
@@ -281,6 +315,8 @@ def main() -> int:
     print(f"  unique files adopted: {stats['adopted']:,}")
     print(f"  content already held : {stats['already_ingested']:,}")
     print(f"  unique, still waiting : {stats['waiting']:,}")
+    if "duplicate_grace_days" in stats:
+        print(f"  duplicate grace (days): {stats['duplicate_grace_days']:g}")
     print(f"  directories removed : {stats['dirs_removed']:,}")
     return 0
 

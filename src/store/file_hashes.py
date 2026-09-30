@@ -12,12 +12,12 @@ from pathlib import Path
 from src.config import ATTACHMENTS_DIR
 from src.extract.image_classifier import sha256_of_file
 
-__all__ = ["HASH_BATCH", "hash_attachments", "sha256_of_file"]
+__all__ = ["HASH_BATCH", "hash_attachments", "locate_file", "sha256_of_file"]
 
 HASH_BATCH = 500
 
 
-def _locate(file_path: str, root: Path) -> Path | None:
+def locate_file(file_path: str, root: Path) -> Path | None:
     """The file behind a row: its recorded path, else the same directory and name under root.
 
     Rows written by the retired Mac exporter carry Mac paths while their files sit in this
@@ -45,7 +45,7 @@ def hash_attachments(
     if limit is not None:
         query += f" LIMIT {int(limit)}"
     for n, (att_id, file_path) in enumerate(conn.execute(query).fetchall(), 1):
-        path = _locate(file_path, root) if file_path else None
+        path = locate_file(file_path, root) if file_path else None
         if path is None:
             stats["missing"] += 1
             continue

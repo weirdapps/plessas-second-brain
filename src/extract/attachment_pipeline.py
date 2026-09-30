@@ -384,6 +384,17 @@ def _extract_one_attachment(row, out_of_time=None):
         return (ac_id, email_id, None, f"{type(e).__name__}: {str(e)[:500]}", verdict)
 
 
+def _held(conn: sqlite3.Connection, table: str, column: str, email_id: int, value: str) -> bool:
+    """Whether the email already carries this row, from its body or an earlier summary."""
+    return (
+        conn.execute(
+            f"SELECT 1 FROM {table} WHERE email_id = ? AND {column} = ? LIMIT 1",
+            (email_id, value),
+        ).fetchone()
+        is not None
+    )
+
+
 def run_phase2(
     db_path: str | None = None,
     limit: int = 0,
@@ -532,7 +543,16 @@ def run_phase2(
                 (extraction.get("summary"), extraction.get("language"), now, ac_id),
             )
 
+            att_id = conn.execute(
+                "SELECT attachment_id FROM attachment_content WHERE id = ?", (ac_id,)
+            ).fetchone()[0]
             if email_id:
+                # The attachment's own rows are replaced by a new summary of it. Rows written
+                # before v28 carry no attachment_id, so a row already on the email is not added
+                # twice: it may be an older summary of this same attachment.
+                for table in ("decisions", "action_items", "key_facts"):
+                    conn.execute(f"DELETE FROM {table} WHERE attachment_id = ?", (att_id,))
+
                 for topic_name in extraction.get("topics", []):
                     topic_id = find_or_create_topic(conn, topic_name)
                     conn.execute(
@@ -542,33 +562,41 @@ def run_phase2(
 
                 for decision in extraction.get("decisions", []):
                     if isinstance(decision, dict) and decision.get("decision"):
+                        if _held(conn, "decisions", "decision", email_id, decision["decision"]):
+                            continue
                         conn.execute(
-                            "INSERT INTO decisions (email_id, decision, decided_by) VALUES (?, ?, ?)",
+                            "INSERT INTO decisions (email_id, decision, decided_by, attachment_id)"
+                            " VALUES (?, ?, ?, ?)",
                             (
                                 email_id,
                                 decision["decision"],
                                 decision.get("decided_by"),
+                                att_id,
                             ),
                         )
 
                 for action in extraction.get("action_items", []):
                     if isinstance(action, dict) and action.get("task"):
+                        if _held(conn, "action_items", "task", email_id, action["task"]):
+                            continue
                         conn.execute(
-                            "INSERT INTO action_items (email_id, task, owner, deadline, status) "
-                            "VALUES (?, ?, ?, ?, 'open')",
+                            "INSERT INTO action_items"
+                            " (email_id, task, owner, deadline, status, attachment_id)"
+                            " VALUES (?, ?, ?, ?, 'open', ?)",
                             (
                                 email_id,
                                 action["task"],
                                 action.get("owner"),
                                 action.get("deadline"),
+                                att_id,
                             ),
                         )
 
                 for fact in extraction.get("key_facts", []):
-                    if fact:
+                    if fact and not _held(conn, "key_facts", "fact", email_id, fact):
                         conn.execute(
-                            "INSERT INTO key_facts (email_id, fact) VALUES (?, ?)",
-                            (email_id, fact),
+                            "INSERT INTO key_facts (email_id, fact, attachment_id) VALUES (?, ?, ?)",
+                            (email_id, fact, att_id),
                         )
 
             stats["extracted"] += 1

@@ -1064,7 +1064,11 @@ def check_sharepoint(db):
         # later shows up as a problem instead of silently disappearing again.
         total = sum(status_map.values())
         ok = status_map.get("ok", 0)
-        failed = total - ok
+        # A link with nothing to read (a home page, a OneDrive view, a folder) is settled, as
+        # the fetcher records it (_DONE in src/export/sharepoint_fetcher.py): most mail links
+        # are one, and counted here they would pin the row at WARN with nothing left to do.
+        not_content = status_map.get("not-content", 0)
+        failed = total - ok - not_content
         # A ratio cannot move once the fetcher stops: no row changes status, so
         # the share of non-'ok' rows is pinned and this reads OK forever. Age the
         # ELIGIBLE work instead. Links past MAX_SHAREPOINT_ATTEMPTS are resting
@@ -1131,7 +1135,8 @@ def check_sharepoint(db):
             "name": "SharePoint",
             "ok": ok,
             "failed": failed,
-            "by_status": {s: n for s, n in status_map.items() if s != "ok"},
+            "not_content": not_content,
+            "by_status": {s: n for s, n in status_map.items() if s not in ("ok", "not-content")},
             "total": total,
             "overdue": overdue,
             "given_up": given_up,

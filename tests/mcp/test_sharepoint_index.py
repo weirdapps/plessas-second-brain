@@ -51,6 +51,21 @@ def _managed_url(path: str) -> str:
 
 
 @patch("src.mcp_server._get_conn")
+def test_list_stale_leaves_out_links_that_are_not_content(mock_get_conn, mock_conn):
+    mock_conn.execute(
+        "INSERT INTO sharepoint_links (url, message_id, fetched_at, last_status, last_attempt_at)"
+        " VALUES ('https://sp/view', 'M9', '2026-04-05T00:00:00Z', 'not-content',"
+        " '2026-04-05T00:00:00Z')"
+    )
+    mock_get_conn.return_value = mock_conn
+    from src.mcp_server import sharepoint_index
+
+    urls = [row["url"] for row in sharepoint_index(operation="list_stale")["links"]]
+    assert "https://sp/view" not in urls
+    assert "https://sp/stale" in urls
+
+
+@patch("src.mcp_server._get_conn")
 def test_list_stale_returns_stale_and_http_error(mock_get_conn, mock_conn):
     mock_get_conn.return_value = mock_conn
     from src.mcp_server import sharepoint_index

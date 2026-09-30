@@ -177,7 +177,7 @@ def _sp_db(attempted_days_ago=0, attempts=1, **status_counts):
                     last_status,
                     attempts,
                     f"-{attempted_days_ago} days",
-                    "2026-01-01T00:00:00Z" if last_status == "ok" else None,
+                    "2026-01-01T00:00:00Z" if last_status in ("ok", "not-content") else None,
                 ),
             )
     db.commit()
@@ -211,6 +211,17 @@ def test_check_sharepoint_counts_unknown_status_as_failed(hc):
 
     assert r["total"] == 2
     assert r["failed"] == 1
+
+
+def test_check_sharepoint_counts_not_content_as_done(hc):
+    """A home page, a OneDrive view or a folder is settled, not failed, and most links in
+    mail are one: counted as failures they would pin this row at WARN for good."""
+    db = _sp_db(ok=10, not_content=490, http_error=2)
+
+    r = hc.check_sharepoint(db)
+
+    assert (r["status"], r["failed"], r["not_content"]) == ("OK", 2, 490)
+    assert "not-content" not in r["by_status"]
 
 
 def test_check_sharepoint_warns_when_most_links_are_unfetched(hc):

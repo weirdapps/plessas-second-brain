@@ -706,10 +706,12 @@ def check_files_on_disk(db):
 
     try:
         files = file_sweep.classify_files(db, ATTACHMENTS_DIR)
-    except sqlite3.OperationalError as e:
-        # Same posture as check_attachments: main() runs the checks unguarded.
+    except (sqlite3.OperationalError, OSError) as e:
+        # Same posture as check_attachments: main() runs the checks unguarded, so an
+        # exception here would take down the whole report.
         return {"name": "Files on disk", "status": "WARN", "error": str(e)}
     policy = file_sweep.load_policy()
+    problem = file_sweep.policy_problem()
     cutoff = policy.only_newer_than.timestamp() if policy.only_newer_than else None
     now = time.time()
     counts = dict.fromkeys(file_sweep.STATES, 0)
@@ -731,7 +733,8 @@ def check_files_on_disk(db):
         "stalled": stalled,
         "image_late": image_late,
         "mode": "apply" if policy.apply else "report-only",
-        "status": "WARN" if stalled or image_late else "OK",
+        "policy_problem": problem,
+        "status": "WARN" if stalled or image_late or problem else "OK",
     }
 
 
@@ -739,12 +742,17 @@ def files_on_disk_detail(c: dict) -> str:
     """The report's parenthesis for the Files on disk row."""
     from src.store import file_sweep
 
+    if c.get("error"):
+        return f" (could not scan the attachments tree: {c['error']})"
     k = c.get("counts", {})
     extra = (
         f" ({c.get('bytes', 0) / 2**30:.1f} GB; {k.get('deletable', 0):,} stored and removable,"
-        f" {k.get('pending-text', 0):,} awaiting text, {k.get('pending-image', 0):,} awaiting"
-        f" vision, {k.get('unregistered', 0):,} unregistered; sweep {c.get('mode')})"
+        f" {k.get('pending-text', 0):,} awaiting text, {k.get('unread', 0):,} unread,"
+        f" {k.get('pending-image', 0):,} awaiting vision, {k.get('unregistered', 0):,}"
+        f" unregistered; sweep {c.get('mode')})"
     )
+    if c.get("policy_problem"):
+        extra += f"; {c['policy_problem']}"
     if c.get("stalled"):
         extra += (
             f"; {c['stalled']:,} stored files older than {file_sweep.STALL_HOURS}h:"

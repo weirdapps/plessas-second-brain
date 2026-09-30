@@ -357,6 +357,8 @@ def cmd_process_attachments(args):
         print(f"  Extracted: {stats['extracted']}")
         print(f"  Failed: {stats['failed']}")
         print(f"  Skipped: {stats['skipped']}")
+        if stats.get("reused"):
+            print(f"  Reused (same file): {stats['reused']}")
         if stats.get("deferred"):
             print(f"  Deferred (out of time): {stats['deferred']}")
         phase_failed |= stats["failed"] > 0 and stats["extracted"] == 0

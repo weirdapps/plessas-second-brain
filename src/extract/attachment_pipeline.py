@@ -17,6 +17,7 @@ from src.extract.attachment_extractors import extract_text_from_file
 from src.extract.vertex_auth import touch_sentinel
 from src.redact import redact_secrets
 from src.store.file_hashes import sha256_of_file
+from src.store.file_sweep import UNREAD_SQL
 
 # Processing constants
 PHASE1_BATCH_SIZE = 50
@@ -89,6 +90,41 @@ def _build_mime_type_conditions(file_type: str | None) -> tuple[str, list]:
     return "", []
 
 
+# Another attachment with the same bytes whose row is finished: Phase 1 read the file itself
+# (not one of UNREAD_SQL's "never read" outcomes) and, if it extracted text, Phase 2 is done.
+_REUSABLE_SQL = f"""
+    SELECT ac.extracted_text, ac.extraction_method, ac.extraction_status,
+           ac.extraction_error, ac.summary, ac.language, ac.llm_status
+    FROM attachments a
+    JOIN attachment_content ac ON ac.attachment_id = a.id
+    WHERE a.sha256 = ? AND a.id != ?
+      AND NOT COALESCE({UNREAD_SQL}, 0)
+      AND (ac.extraction_status != 'extracted' OR ac.llm_status IN ('extracted', 'failed'))
+    ORDER BY ac.id
+    LIMIT 1
+"""
+
+
+def _reuse_content(conn: sqlite3.Connection, att_id: int, sha256: str, now: str) -> str | None:
+    """Copy the finished content row of another attachment with the same bytes.
+
+    Returns the copied extraction status, or None when there is nothing to copy. The key facts
+    are not copied: they describe the document, and the first email already carries them.
+    """
+    row = conn.execute(_REUSABLE_SQL, (sha256, att_id)).fetchone()
+    if row is None:
+        return None
+    text, method, status, error, summary, language, llm_status = row
+    conn.execute(
+        """INSERT OR IGNORE INTO attachment_content
+           (attachment_id, extracted_text, extraction_method, extraction_status,
+            extraction_error, extracted_at, summary, language, llm_status, llm_extracted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (att_id, text, method, status, error, now, summary, language, llm_status, now),
+    )
+    return status
+
+
 def run_phase1(
     db_path: str | None = None,
     limit: int = 0,
@@ -126,7 +162,7 @@ def run_phase1(
 
     # Build base query
     query = """
-        SELECT a.id, a.file_path, a.mime_type, a.filename
+        SELECT a.id, a.file_path, a.mime_type, a.filename, a.sha256
         FROM attachments a
         LEFT JOIN attachment_content ac ON a.id = ac.attachment_id
         WHERE ac.id IS NULL
@@ -153,16 +189,32 @@ def run_phase1(
     # Find attachments not yet in attachment_content
     rows = conn.execute(query, params).fetchall()
 
-    stats = {"processed": 0, "extracted": 0, "failed": 0, "skipped": 0, "deferred": 0}
+    stats = {
+        "processed": 0,
+        "extracted": 0,
+        "failed": 0,
+        "skipped": 0,
+        "deferred": 0,
+        "reused": 0,
+    }
     deadline = None if deadline_s is None else time.monotonic() + deadline_s
 
-    for att_id, file_path, mime_type, _filename in rows:
+    for att_id, file_path, mime_type, _filename, sha256 in rows:
         # Checked before starting, never mid-file: extract_text_from_file has no
         # interruption point, and abandoning a partial parse would leave the row
         # unwritten and the work repeated next run.
         if deadline is not None and time.monotonic() >= deadline:
             stats["deferred"] += 1
             continue
+
+        # The same bytes seen before: take that row, no extraction and no model call.
+        if sha256:
+            reused = _reuse_content(conn, att_id, sha256, now)
+            if reused is not None:
+                stats["processed"] += 1
+                stats["reused"] += 1
+                stats[reused] = stats.get(reused, 0) + 1
+                continue
 
         result = extract_text_from_file(file_path, mime_type or "")
         # Attachments do NOT pass through data/staging, so the redaction applied

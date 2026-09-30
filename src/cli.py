@@ -15,6 +15,7 @@ from src.config import (
     EXTRACT_ENGINE,
     IMAGE_CLASSIFY_BUDGET_S,
     NEWS_DB_PATH,
+    SHAREPOINT_DATA_DIR,
     document_roots,
 )
 from src.llm_deadline import install_llm_deadline_for_this_process
@@ -357,6 +358,8 @@ def cmd_process_attachments(args):
         print(f"  Extracted: {stats['extracted']}")
         print(f"  Failed: {stats['failed']}")
         print(f"  Skipped: {stats['skipped']}")
+        if stats.get("reused"):
+            print(f"  Reused (same file): {stats['reused']}")
         if stats.get("deferred"):
             print(f"  Deferred (out of time): {stats['deferred']}")
         phase_failed |= stats["failed"] > 0 and stats["extracted"] == 0
@@ -429,6 +432,47 @@ def cmd_hash_attachments(args):
     return 0
 
 
+def cmd_ingest_session_notes(args):
+    """Store what Claude sessions wrote to notes (src/export/session_notes.py)."""
+    from src.export.session_notes import ingest_session_notes, transcripts_to_scan
+    from src.store.schema import get_connection, run_migrations
+
+    conn = get_connection(str(args.db))
+    try:
+        run_migrations(conn)
+        files = transcripts_to_scan(conn, all_files=args.all)
+        stats = ingest_session_notes(conn, files)
+    finally:
+        conn.close()
+    print(
+        f"session notes: {len(files):,} transcripts, "
+        + ", ".join(f"{k} {v:,}" for k, v in stats.items())
+    )
+    return 0
+
+
+def cmd_reextract(args):
+    """Read again and summarise again rows earlier code capped, skipped or could not read."""
+    from src.extract.reextract import SELECTORS, reextract
+
+    which = {name for name in SELECTORS if getattr(args, name)}
+    if not which:
+        print("Error: choose at least one of --capped, --long, --zip, --unread", file=sys.stderr)
+        return 2
+    stats = reextract(
+        args.db,
+        which,
+        limit=args.limit or None,
+        dry_run=args.dry_run,
+        workers=args.workers,
+        root=args.root,
+    )
+    print(f"reextract ({', '.join(sorted(which))}){' DRY RUN' if args.dry_run else ''}:")
+    for key in ("selected", "reread", "resummarise", "missing", "kept", "summarised", "failed"):
+        print(f"  {key:<12}: {stats[key]:,}")
+    return 0
+
+
 def cmd_sweep_files(args):
     """Delete attachment files whose content is already stored (src/store/file_sweep.py).
 
@@ -447,7 +491,12 @@ def cmd_sweep_files(args):
         )
     conn = get_conn(str(args.db or DEFAULT_DB))
     try:
-        stats = sweep_files(conn, Path(args.root), policy)
+        stats = sweep_files(
+            conn,
+            Path(args.root),
+            policy,
+            sharepoint_root=Path(sp) if (sp := getattr(args, "sharepoint_root", None)) else None,
+        )
     finally:
         conn.close()
     cutoff = policy.only_newer_than.isoformat() if policy.only_newer_than else "none"
@@ -508,6 +557,8 @@ def cmd_process_images(args):
     print("\nImage processing complete:")
     print(f"  Scanned: {stats['scanned']}")
     print(f"  Classified: {stats['classified']}")
+    if stats.get("recorded"):
+        print(f"  Recorded from the hash (file gone): {stats['recorded']}")
     print(f"  Missing: {stats['missing']}")
     print(f"  Failed: {stats['failed']}")
 
@@ -622,13 +673,13 @@ def cmd_split_html(args) -> int:
 
 def cmd_process_sharepoint(args):
     """Scan emails for SharePoint URLs and fetch them."""
-    from src.config import SHAREPOINT_DATA_DIR, SHAREPOINT_HOST
+    from src.config import SHAREPOINT_HOST
     from src.export.sharepoint_fetcher import (
-        fetch_sharepoint_link,
         is_managed_sharepoint_host,
         record_link_in_db,
         retry_candidates,
     )
+    from src.extract.sharepoint_ingest import fetch_and_ingest
     from src.extract.sharepoint_url_scanner import extract_sharepoint_urls
     from src.store.email_html import markup_or_text
     from src.store.schema import get_connection, run_migrations
@@ -637,6 +688,23 @@ def cmd_process_sharepoint(args):
     if not Path(db_path).exists():
         print("Error: Database not found. Run 'brain load' first.")
         sys.exit(1)
+
+    # The files earlier fetches left on disk: stored as text, then left to the sweep. No
+    # fetching, so no tenant is needed (src/extract/sharepoint_ingest.py).
+    if getattr(args, "ingest_fetched", False):
+        from src.config import ATTACHMENTS_DIR
+        from src.extract.sharepoint_ingest import ingest_fetched_backlog
+
+        conn = get_connection(db_path)
+        run_migrations(conn)
+        try:
+            backlog = ingest_fetched_backlog(
+                conn, [SHAREPOINT_DATA_DIR, ATTACHMENTS_DIR / "sharepoint-refetch"]
+            )
+        finally:
+            conn.close()
+        print("SharePoint backlog: " + ", ".join(f"{k} {v:,}" for k, v in backlog.items()))
+        return 0
 
     # Fetching is gated on our own tenant (fetch_sharepoint_link), so with the
     # placeholder host every real link would be refused and parked as the
@@ -702,6 +770,15 @@ def cmd_process_sharepoint(args):
     # TimeoutStartSec: the mark stops before the first email it could not
     # finish, and the next run starts there.
     max_fetches = getattr(args, "max_fetches", 0) or 0
+    # Wall clock too: a fetch now also extracts the file, and the nightly pass has one hour for
+    # every stage. Checked before each fetch; the scan mark stops before the email it left.
+    import time
+
+    deadline_s = getattr(args, "deadline_s", None)
+    deadline = None if deadline_s is None else time.monotonic() + deadline_s
+
+    def _out_of_time() -> bool:
+        return deadline is not None and time.monotonic() >= deadline
 
     print("Scanning emails for SharePoint URLs...")
     if args.since:
@@ -739,7 +816,8 @@ def cmd_process_sharepoint(args):
         """Fetch + record one URL, updating outcome stats. Returns True on a
         re-loginable (managed-host) auth failure so the caller stops the pass."""
         print(f"  Fetching: {url}")
-        result = fetch_sharepoint_link(url, SHAREPOINT_DATA_DIR)
+        # Fetched into a temporary directory and stored as text; no file is kept.
+        result, document = fetch_and_ingest(conn, url, message_id)
         # An auth failure on an external tenant (a host we hold no session for)
         # can never be fixed by our re-login, so record it distinctly and keep
         # going instead of aborting the whole pass. A foreign tenant announces
@@ -764,14 +842,15 @@ def cmd_process_sharepoint(args):
             url=url,
             message_id=message_id,
             status=recorded_status,
-            fetched_path=str(result.local_path) if result.local_path else None,
+            fetched_path=None,
             file_name=result.file_name,
             file_size=result.file_size,
+            document_message_id=document,
         )
         conn.commit()
 
         if result.status == "ok":
-            print(f"    ✓ Saved: {result.file_name}")
+            print(f"    ✓ Stored: {result.file_name}")
             stats["urls_fetched"] += 1
         elif external_auth:
             print("    ⤼ External host (no session) — skipping")
@@ -794,6 +873,13 @@ def cmd_process_sharepoint(args):
         if retry_rows:
             print(f"Retrying {len(retry_rows)} previously unfetched/stale link(s)...")
         for url, message_id in retry_rows:
+            # Bounded like the scan below: each fetch now extracts too, and the backlog pass
+            # can offer many lost links at once.
+            if max_fetches > 0 and stats["urls_retried"] >= max_fetches:
+                break
+            if _out_of_time():
+                print("  Time budget spent: the rest wait for the next run")
+                break
             attempted.add(url)
             stats["urls_retried"] += 1
             if _fetch_one(url, message_id):
@@ -823,6 +909,9 @@ def cmd_process_sharepoint(args):
                     if url in existing_urls or url in attempted:
                         continue
                     if not args.dry_run and max_fetches > 0 and fetches >= max_fetches:
+                        capped = True
+                        break
+                    if not args.dry_run and _out_of_time():
                         capped = True
                         break
                     attempted.add(url)
@@ -1595,7 +1684,7 @@ def cmd_sync(args):
         print("\nNo new emails — skipping dedup and embeddings")
 
     # Step 6: Process new attachment content
-    from src.extract.attachment_pipeline import run_phase1, run_phase2
+    from src.extract.attachment_pipeline import LONG_TEXT_CHARS, run_phase1, run_phase2
 
     # Ensure attachment_content table exists
     from src.store.schema import run_migrations as run_mig
@@ -1620,7 +1709,12 @@ def cmd_sync(args):
             f"{p1_stats['failed']} failed, {p1_stats['skipped']} skipped"
             + (f", {deferred} deferred (out of time)" if deferred else "")
         )
-        p2_stats = run_phase2(db_path, attachment_ids=scope_ids, deadline_s=PHASE2_SYNC_DEADLINE_S)
+        p2_stats = run_phase2(
+            db_path,
+            attachment_ids=scope_ids,
+            deadline_s=PHASE2_SYNC_DEADLINE_S,
+            max_text_chars=LONG_TEXT_CHARS,
+        )
         p2_deferred = p2_stats.get("deferred", 0)
         print(
             f"  Phase 2: {p2_stats['extracted']} LLM extracted, {p2_stats['failed']} failed"
@@ -2884,7 +2978,42 @@ def main():
     parser_sweep.add_argument(
         "--root", default=str(ATTACHMENTS_DIR), help="Attachments root to sweep"
     )
+    parser_sweep.add_argument(
+        "--sharepoint-root",
+        default=str(SHAREPOINT_DATA_DIR),
+        help="Where earlier SharePoint fetches left files, swept by content",
+    )
     parser_sweep.set_defaults(func=cmd_sweep_files)
+
+    parser_reextract = subparsers.add_parser(
+        "reextract", help="Read and summarise again rows earlier code capped, skipped or missed"
+    )
+    parser_reextract.add_argument("--capped", action="store_true", help="text at the old 100k cap")
+    parser_reextract.add_argument(
+        "--long", action="store_true", help="summarised from the first 50k characters only"
+    )
+    parser_reextract.add_argument("--zip", action="store_true", help="zip archives once skipped")
+    parser_reextract.add_argument(
+        "--unread", action="store_true", help="rows Phase 1 recorded without reading the file"
+    )
+    parser_reextract.add_argument("--limit", type=int, default=0, help="Max rows (0 = all)")
+    parser_reextract.add_argument("--dry-run", action="store_true", help="Count only")
+    parser_reextract.add_argument("--workers", type=int, default=4, help="Phase 2 workers")
+    parser_reextract.add_argument(
+        "--root", default=str(ATTACHMENTS_DIR), help="Attachments root, for rows recorded elsewhere"
+    )
+    parser_reextract.set_defaults(func=cmd_reextract)
+
+    parser_notes = subparsers.add_parser(
+        "ingest-session-notes",
+        help="Store what Claude sessions wrote to notes (.md, .txt, .csv) as text-only documents",
+    )
+    parser_notes.add_argument(
+        "--all",
+        action="store_true",
+        help="Every transcript, not only those changed since the last scan",
+    )
+    parser_notes.set_defaults(func=cmd_ingest_session_notes)
 
     # Process images command
     parser_process_img = subparsers.add_parser(
@@ -2942,6 +3071,17 @@ def main():
     )
     parser_process_sp.add_argument(
         "--dry-run", action="store_true", help="Scan and count only, no fetching"
+    )
+    parser_process_sp.add_argument(
+        "--deadline-s",
+        type=float,
+        default=None,
+        help="Wall-clock budget in seconds: no fetch starts once it is spent (default: none)",
+    )
+    parser_process_sp.add_argument(
+        "--ingest-fetched",
+        action="store_true",
+        help="Store the files earlier fetches left on disk, then exit",
     )
     parser_process_sp.set_defaults(func=cmd_process_sharepoint)
 

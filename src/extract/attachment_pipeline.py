@@ -17,6 +17,7 @@ from src.extract.attachment_extractors import extract_text_from_file
 from src.extract.vertex_auth import touch_sentinel
 from src.redact import redact_secrets
 from src.store.file_hashes import sha256_of_file
+from src.store.file_sweep import UNREAD_SQL
 
 # Processing constants
 PHASE1_BATCH_SIZE = 50
@@ -27,6 +28,14 @@ LLM_MAX_TEXT = 50_000  # max chars sent to LLM
 # The last element of a phase-2 worker's result when the service failed rather
 # than the item (policy_bridge.is_transient): offered again, but no re-auth.
 TRANSIENT = "transient"
+
+# Phase 2 summarises a text longer than this in parts (spec: long files). The hourly sync
+# leaves such texts to the nightly pass, whose budget can hold a document's many calls.
+LONG_TEXT_CHARS = 50_000
+
+# The last element of a phase-2 worker's result when the budget ran out between the parts of a
+# long document: left pending for the next run, neither a failure nor a re-auth.
+DEFERRED = "deferred"
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -89,6 +98,43 @@ def _build_mime_type_conditions(file_type: str | None) -> tuple[str, list]:
     return "", []
 
 
+# Another attachment with the same bytes whose row is fully finished: text extracted from the
+# file itself and summarised. Only that is passed on. A failure or a skip may come from an older
+# extractor (a zip the old code never unpacked, a converter a host lacked), and a copy that
+# inherited it would never meet the current one; reading it again costs no model call.
+_REUSABLE_SQL = f"""
+    SELECT ac.extracted_text, ac.extraction_method, ac.extraction_status,
+           ac.extraction_error, ac.summary, ac.language, ac.llm_status
+    FROM attachments a
+    JOIN attachment_content ac ON ac.attachment_id = a.id
+    WHERE a.sha256 = ? AND a.id != ?
+      AND NOT COALESCE({UNREAD_SQL}, 0)
+      AND ac.extraction_status = 'extracted' AND ac.llm_status = 'extracted'
+    ORDER BY ac.id
+    LIMIT 1
+"""
+
+
+def _reuse_content(conn: sqlite3.Connection, att_id: int, sha256: str, now: str) -> str | None:
+    """Copy the finished content row of another attachment with the same bytes.
+
+    Returns the copied extraction status, or None when there is nothing to copy. The key facts
+    are not copied: they describe the document, and the first email already carries them.
+    """
+    row = conn.execute(_REUSABLE_SQL, (sha256, att_id)).fetchone()
+    if row is None:
+        return None
+    text, method, status, error, summary, language, llm_status = row
+    conn.execute(
+        """INSERT OR IGNORE INTO attachment_content
+           (attachment_id, extracted_text, extraction_method, extraction_status,
+            extraction_error, extracted_at, summary, language, llm_status, llm_extracted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (att_id, text, method, status, error, now, summary, language, llm_status, now),
+    )
+    return status
+
+
 def run_phase1(
     db_path: str | None = None,
     limit: int = 0,
@@ -126,7 +172,7 @@ def run_phase1(
 
     # Build base query
     query = """
-        SELECT a.id, a.file_path, a.mime_type, a.filename
+        SELECT a.id, a.file_path, a.mime_type, a.filename, a.sha256
         FROM attachments a
         LEFT JOIN attachment_content ac ON a.id = ac.attachment_id
         WHERE ac.id IS NULL
@@ -153,16 +199,32 @@ def run_phase1(
     # Find attachments not yet in attachment_content
     rows = conn.execute(query, params).fetchall()
 
-    stats = {"processed": 0, "extracted": 0, "failed": 0, "skipped": 0, "deferred": 0}
+    stats = {
+        "processed": 0,
+        "extracted": 0,
+        "failed": 0,
+        "skipped": 0,
+        "deferred": 0,
+        "reused": 0,
+    }
     deadline = None if deadline_s is None else time.monotonic() + deadline_s
 
-    for att_id, file_path, mime_type, _filename in rows:
+    for att_id, file_path, mime_type, _filename, sha256 in rows:
         # Checked before starting, never mid-file: extract_text_from_file has no
         # interruption point, and abandoning a partial parse would leave the row
         # unwritten and the work repeated next run.
         if deadline is not None and time.monotonic() >= deadline:
             stats["deferred"] += 1
             continue
+
+        # The same bytes seen before: take that row, no extraction and no model call.
+        if sha256:
+            reused = _reuse_content(conn, att_id, sha256, now)
+            if reused is not None:
+                stats["processed"] += 1
+                stats["reused"] += 1
+                stats[reused] = stats.get(reused, 0) + 1
+                continue
 
         result = extract_text_from_file(file_path, mime_type or "")
         # Attachments do NOT pass through data/staging, so the redaction applied
@@ -197,7 +259,75 @@ def run_phase1(
     return stats
 
 
-def _extract_one_attachment(row):
+def _complete_and_parse(prompt: str) -> dict:
+    """One Phase 2 model call, parsed into an extraction."""
+    from src.extract.claude_extract import _response_text, complete
+    from src.extract.parser import parse_extraction
+
+    response = complete(
+        # Dense documents (large spreadsheets/decks) yield long extraction
+        # JSON; 2048 truncated it mid-structure on ~40K-char docs, so every
+        # such attachment failed with "Expecting ',' delimiter". Give the
+        # structured output room to complete; parse_extraction additionally
+        # salvages any residual truncation rather than dropping the summary.
+        max_tokens=8192,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    # _response_text, never content[0]. With extended thinking the model leads the
+    # content list with a ThinkingBlock, which carries .thinking and no .text, so
+    # content[0].text raised "'ThinkingBlock' object has no attribute 'text'".
+    # 134 attachments failed permanently that way between 2026-08-06 and 2026-08-25;
+    # llm_status='failed' is terminal because run_phase2 only re-selects 'pending'.
+    # A thinking-only response (max_tokens spent before any text) used to raise
+    # "IndexError: list index out of range" here, 3 rows; it now raises a ValueError
+    # naming stop_reason and the block types, which is diagnosable from llm_error.
+    raw_text = _response_text(response)
+    if raw_text.startswith("```"):
+        lines = raw_text.split("\n")
+        raw_text = "\n".join(lines[1:-1])
+    return parse_extraction(raw_text)
+
+
+def _extract_in_parts(text, filename, mime_type, email_subject, email_date, out_of_time):
+    """Summarise a long text part by part, then once over the parts. None when time ran out."""
+    from src.extract.attachment_prompt import (
+        build_attachment_prompt,
+        build_merge_prompt,
+        split_text,
+    )
+
+    parts = split_text(text)
+    extractions = []
+    for i, part in enumerate(parts, 1):
+        if out_of_time is not None and out_of_time():
+            return None
+        extractions.append(
+            _complete_and_parse(
+                build_attachment_prompt(
+                    extracted_text=part,
+                    filename=filename,
+                    mime_type=mime_type,
+                    email_subject=email_subject,
+                    email_date=email_date,
+                    part=(i, len(parts)),
+                )
+            )
+        )
+    if out_of_time is not None and out_of_time():
+        return None
+    return _complete_and_parse(
+        build_merge_prompt(
+            extractions,
+            filename=filename,
+            mime_type=mime_type,
+            email_subject=email_subject,
+            email_date=email_date,
+        )
+    )
+
+
+def _extract_one_attachment(row, out_of_time=None):
     """Worker: call LLM for a single attachment.
 
     Returns ``(ac_id, email_id, extraction, error, auth_error)``. On success ``error`` is
@@ -216,14 +346,22 @@ def _extract_one_attachment(row):
     with the exception in hand, and hand the answer on.
     """
     from src.extract.attachment_prompt import build_attachment_prompt
-    from src.extract.claude_extract import _response_text, complete
-    from src.extract.parser import parse_extraction
     from src.extract.policy_bridge import classify_exception, is_item_timeout, is_transient
     from src.llm_policy import Outcome
 
     ac_id, att_id, text, filename, mime_type, email_id, email_subject, email_date = row
 
     try:
+        # A long text goes in parts, and `out_of_time` is asked between them: the deadline is
+        # checked before an item is dispatched, and a long document is many calls long.
+        if len(text or "") > LONG_TEXT_CHARS:
+            extraction = _extract_in_parts(
+                text, filename, mime_type, email_subject, email_date, out_of_time
+            )
+            if extraction is None:
+                return (ac_id, email_id, None, "deferred: out of time between parts", DEFERRED)
+            return (ac_id, email_id, extraction, None, False)
+
         prompt = build_attachment_prompt(
             extracted_text=text,
             filename=filename,
@@ -231,31 +369,7 @@ def _extract_one_attachment(row):
             email_subject=email_subject,
             email_date=email_date,
         )
-
-        response = complete(
-            # Dense documents (large spreadsheets/decks) yield long extraction
-            # JSON; 2048 truncated it mid-structure on ~40K-char docs, so every
-            # such attachment failed with "Expecting ',' delimiter". Give the
-            # structured output room to complete; parse_extraction additionally
-            # salvages any residual truncation rather than dropping the summary.
-            max_tokens=8192,
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        # _response_text, never content[0]. With extended thinking the model leads the
-        # content list with a ThinkingBlock, which carries .thinking and no .text, so
-        # content[0].text raised "'ThinkingBlock' object has no attribute 'text'".
-        # 134 attachments failed permanently that way between 2026-08-06 and 2026-08-25;
-        # llm_status='failed' is terminal because run_phase2 only re-selects 'pending'.
-        # A thinking-only response (max_tokens spent before any text) used to raise
-        # "IndexError: list index out of range" here, 3 rows; it now raises a ValueError
-        # naming stop_reason and the block types, which is diagnosable from llm_error.
-        raw_text = _response_text(response)
-        if raw_text.startswith("```"):
-            lines = raw_text.split("\n")
-            raw_text = "\n".join(lines[1:-1])
-
-        extraction = parse_extraction(raw_text)
+        extraction = _complete_and_parse(prompt)
         return (ac_id, email_id, extraction, None, False)
 
     except Exception as e:
@@ -272,6 +386,17 @@ def _extract_one_attachment(row):
         return (ac_id, email_id, None, f"{type(e).__name__}: {str(e)[:500]}", verdict)
 
 
+def _held(conn: sqlite3.Connection, table: str, column: str, email_id: int, value: str) -> bool:
+    """Whether the email already carries this row, from its body or an earlier summary."""
+    return (
+        conn.execute(
+            f"SELECT 1 FROM {table} WHERE email_id = ? AND {column} = ? LIMIT 1",
+            (email_id, value),
+        ).fetchone()
+        is not None
+    )
+
+
 def run_phase2(
     db_path: str | None = None,
     limit: int = 0,
@@ -279,6 +404,7 @@ def run_phase2(
     file_type: str | None = None,
     attachment_ids: list[int] | None = None,
     workers: int = 1,
+    max_text_chars: int | None = None,
 ) -> dict:
     """Run Phase 2: Vertex AI structured extraction on extracted text.
 
@@ -300,6 +426,9 @@ def run_phase2(
         file_type: Filter by original MIME type
         attachment_ids: If given, only process these attachment IDs (for sync scoping)
         workers: Number of concurrent LLM workers (default 1)
+        max_text_chars: Leave texts longer than this pending. The hourly sync passes
+            LONG_TEXT_CHARS: a long text is summarised in many calls, which belong in the
+            nightly pass's budget, not in a 600 s unit.
 
     Returns:
         Dict with processing stats: processed, extracted, failed, deferred.
@@ -335,6 +464,9 @@ def run_phase2(
 
     if type_condition:
         query += f"\n        {type_condition}"
+    if max_text_chars is not None:
+        query += "\n        AND length(ac.extracted_text) <= ?"
+        params.append(max_text_chars)
     query += "\n        ORDER BY ac.id"
     if limit > 0:
         query += f"\n        LIMIT {int(limit)}"
@@ -354,6 +486,11 @@ def run_phase2(
         policy uses. Re-deriving it here from ``error`` — which is a string by the time it
         arrives — is what made a surviving 401 permanent: see _extract_one_attachment.
         """
+        if auth_error == DEFERRED:
+            # Out of time between the parts of a long document: still pending, and not a
+            # failure, so the next run takes it from the start.
+            stats["deferred"] += 1
+            return
         now = datetime.now().isoformat()
         if error:
             if auth_error == TRANSIENT:
@@ -408,7 +545,16 @@ def run_phase2(
                 (extraction.get("summary"), extraction.get("language"), now, ac_id),
             )
 
+            att_id = conn.execute(
+                "SELECT attachment_id FROM attachment_content WHERE id = ?", (ac_id,)
+            ).fetchone()[0]
             if email_id:
+                # The attachment's own rows are replaced by a new summary of it. Rows written
+                # before v28 carry no attachment_id, so a row already on the email is not added
+                # twice: it may be an older summary of this same attachment.
+                for table in ("decisions", "action_items", "key_facts"):
+                    conn.execute(f"DELETE FROM {table} WHERE attachment_id = ?", (att_id,))
+
                 for topic_name in extraction.get("topics", []):
                     topic_id = find_or_create_topic(conn, topic_name)
                     conn.execute(
@@ -418,33 +564,41 @@ def run_phase2(
 
                 for decision in extraction.get("decisions", []):
                     if isinstance(decision, dict) and decision.get("decision"):
+                        if _held(conn, "decisions", "decision", email_id, decision["decision"]):
+                            continue
                         conn.execute(
-                            "INSERT INTO decisions (email_id, decision, decided_by) VALUES (?, ?, ?)",
+                            "INSERT INTO decisions (email_id, decision, decided_by, attachment_id)"
+                            " VALUES (?, ?, ?, ?)",
                             (
                                 email_id,
                                 decision["decision"],
                                 decision.get("decided_by"),
+                                att_id,
                             ),
                         )
 
                 for action in extraction.get("action_items", []):
                     if isinstance(action, dict) and action.get("task"):
+                        if _held(conn, "action_items", "task", email_id, action["task"]):
+                            continue
                         conn.execute(
-                            "INSERT INTO action_items (email_id, task, owner, deadline, status) "
-                            "VALUES (?, ?, ?, ?, 'open')",
+                            "INSERT INTO action_items"
+                            " (email_id, task, owner, deadline, status, attachment_id)"
+                            " VALUES (?, ?, ?, ?, 'open', ?)",
                             (
                                 email_id,
                                 action["task"],
                                 action.get("owner"),
                                 action.get("deadline"),
+                                att_id,
                             ),
                         )
 
                 for fact in extraction.get("key_facts", []):
-                    if fact:
+                    if fact and not _held(conn, "key_facts", "fact", email_id, fact):
                         conn.execute(
-                            "INSERT INTO key_facts (email_id, fact) VALUES (?, ?)",
-                            (email_id, fact),
+                            "INSERT INTO key_facts (email_id, fact, attachment_id) VALUES (?, ?, ?)",
+                            (email_id, fact, att_id),
                         )
 
             stats["extracted"] += 1
@@ -462,7 +616,9 @@ def run_phase2(
             if _out_of_time():
                 stats["deferred"] += 1
                 continue
-            ac_id, email_id, extraction, error, auth_error = _extract_one_attachment(row)
+            ac_id, email_id, extraction, error, auth_error = _extract_one_attachment(
+                row, _out_of_time
+            )
             _store_result(ac_id, email_id, extraction, error, auth_error)
             if stats["processed"] % PHASE2_BATCH_SIZE == 0:
                 time.sleep(PHASE2_COOLDOWN)
@@ -478,7 +634,7 @@ def run_phase2(
             def _run_or_defer(row):
                 if _out_of_time():
                     return None
-                return _extract_one_attachment(row)
+                return _extract_one_attachment(row, _out_of_time)
 
             futures = {executor.submit(_run_or_defer, row): row for row in rows}
             for future in as_completed(futures):
@@ -684,4 +840,82 @@ def ingest_document(
         "message_id": message_id,
         "filename": filename,
         "file_path": str(dest_path),
+    }
+
+
+def ingest_text_document(
+    conn: sqlite3.Connection,
+    *,
+    source: str,
+    key: str,
+    filename: str,
+    mime_type: str,
+    text: str | None,
+    sha256: str,
+    method: str | None,
+    status: str,
+    error: str | None,
+    subject: str,
+    sender_name: str,
+    date: str,
+) -> dict:
+    """Store a document that keeps no file: its email anchor, attachment row and content row.
+
+    The file a SharePoint link or a session note came from is not kept, so Phase 1's work is
+    done by the caller and the content row is complete from the start. Phase 1 selects only
+    attachments without a content row and never sees this document; Phase 2 selects extracted
+    rows still pending and summarises it.
+
+    The message id is the hash of the source bytes, as for ingest_document: the same file
+    ingested twice collides and the second is skipped. The three rows are written in one
+    transaction.
+    """
+    message_id = _sha256_to_message_id(sha256)
+    existing = conn.execute("SELECT id FROM emails WHERE message_id = ?", (message_id,)).fetchone()
+    if existing:
+        return {"skipped": True, "message_id": message_id, "email_id": existing[0]}
+    now = datetime.now().isoformat()
+    with conn:
+        email_id = conn.execute(
+            """INSERT INTO emails
+               (message_id, date_received, sender_name, sender_address, subject,
+                mailbox_name, content)
+               VALUES (?, ?, ?, ?, ?, 'External', ?)""",
+            (
+                message_id,
+                date,
+                sender_name,
+                f"{source}@documents.local",
+                subject,
+                f"Ingested document: {filename}\nSource: {source}",
+            ),
+        ).lastrowid
+        attachment_id = conn.execute(
+            """INSERT INTO attachments
+               (email_id, message_id, filename, mime_type, file_size, file_path, is_inline,
+                exported_at, sha256)
+               VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+            (
+                email_id,
+                message_id,
+                filename,
+                mime_type,
+                len((text or "").encode("utf-8")),
+                f"text:{source}:{key}",
+                now,
+                sha256,
+            ),
+        ).lastrowid
+        conn.execute(
+            """INSERT INTO attachment_content
+               (attachment_id, extracted_text, extraction_method, extraction_status,
+                extraction_error, extracted_at, llm_status)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
+            (attachment_id, redact_secrets(text) if text else text, method, status, error, now),
+        )
+    return {
+        "skipped": False,
+        "message_id": message_id,
+        "email_id": email_id,
+        "attachment_id": attachment_id,
     }

@@ -487,6 +487,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_whatsapp(conn)
     if current < 27:
         migrate_add_file_hashes(conn)
+    if current < 28:
+        migrate_add_text_documents(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -628,6 +630,52 @@ def migrate_add_file_hashes(conn: sqlite3.Connection) -> None:
     if image_cols and "vision_attempts" not in image_cols:
         conn.execute(
             "ALTER TABLE inline_images ADD COLUMN vision_attempts INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.commit()
+
+
+def migrate_add_text_documents(conn: sqlite3.Connection) -> None:
+    """v28: documents that keep no file, session notes, and facts that know their attachment.
+
+    A SharePoint file or a session note is stored as text only (ingest_text_document in
+    src/extract/attachment_pipeline.py). sharepoint_links.document_message_id names the document
+    a fetched link became. session_notes maps a note's path to its current document, so a newer
+    version can replace it, and session_note_transcripts records which transcripts it has read.
+    attachment_id on key_facts, decisions and action_items lets an
+    attachment's summary be redone without touching the email's own rows; rows written before
+    v28 keep NULL.
+    """
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "sharepoint_links" in tables:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sharepoint_links)")}
+        if "document_message_id" not in cols:
+            conn.execute("ALTER TABLE sharepoint_links ADD COLUMN document_message_id INTEGER")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS session_notes (
+            path TEXT PRIMARY KEY,
+            message_id INTEGER NOT NULL,
+            session_id TEXT,
+            written_at TEXT,
+            sha256 TEXT
+        )"""
+    )
+    # Which transcripts the session-notes scan has read, as they were then: a file whose size
+    # or modification time differs is read again (src/export/session_notes.py).
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS session_note_transcripts (
+            path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL
+        )"""
+    )
+    for table in ("key_facts", "decisions", "action_items"):
+        if table not in tables:
+            continue
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if "attachment_id" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN attachment_id INTEGER")
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{table}_attachment_id ON {table}(attachment_id)"
         )
     conn.commit()
 

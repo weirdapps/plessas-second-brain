@@ -14,8 +14,27 @@ from src.extract.image_classifier import (
     sha256_of_file,
 )
 from src.store.email_html import markup_or_text
+from src.store.file_sweep import VISION_ATTEMPTS_LIMIT
 
 logger = logging.getLogger(__name__)
+
+# An image the pipeline is finished with: described, filed as a signature or noise by Stage 1,
+# or given up on after VISION_ATTEMPTS_LIMIT failed descriptions. The sweep applies the same
+# rule (src/store/file_sweep.py) before it deletes an image file.
+IMAGE_DONE_SQL = (
+    "(ii.vision_description IS NOT NULL OR ii.classification IN ('signature', 'noise')"
+    f" OR ii.vision_attempts >= {VISION_ATTEMPTS_LIMIT})"
+)
+
+# An image attachment the pipeline still owes work (alias a): its occurrence in this message is
+# not recorded, which image search and the signature counts read, or the image is not done. A
+# known image in a new message is therefore taken once, as a cache hit with no vision call.
+IMAGE_OWED_SQL = (
+    "(NOT EXISTS (SELECT 1 FROM inline_image_occurrences o"
+    " WHERE o.sha256 = a.sha256 AND o.message_id = a.message_id)"
+    " OR NOT EXISTS (SELECT 1 FROM inline_images ii"
+    f" WHERE ii.sha256 = a.sha256 AND {IMAGE_DONE_SQL}))"
+)
 
 
 class VisionFailed(Exception):
@@ -56,6 +75,12 @@ def process_single_image(
 
     # Compute SHA256
     sha256 = sha256_of_file(img_path)
+    # A row registered before hashes were recorded gets its hash here, so the next run can
+    # tell the image is done (IMAGE_OWED_SQL keys on it). Committed with the occurrence below.
+    conn.execute(
+        "UPDATE attachments SET sha256 = ? WHERE id = ? AND sha256 IS NULL",
+        (sha256, attachment_id),
+    )
 
     # Call Stage 1 classifier first (creates inline_images row)
     classification = classify_stage1(img_path, sender_email, position_in_body, conn)
@@ -81,6 +106,13 @@ def process_single_image(
             classification, _ = classify_with_vision(img_path, conn)
         except Exception as e:
             logger.error(f"Vision classification failed for {img_path}: {e}")
+            # Counted, so an image the model keeps failing on is given up after
+            # VISION_ATTEMPTS_LIMIT tries instead of being offered every run for ever.
+            conn.execute(
+                "UPDATE inline_images SET vision_attempts = vision_attempts + 1 WHERE sha256 = ?",
+                (sha256,),
+            )
+            conn.commit()
             # The Stage-1 row and its occurrence stay — they are real
             # observations and the signature index is built from them. But the
             # image did NOT get described, and reporting that as success is how
@@ -138,6 +170,15 @@ def compute_position_in_body(email_content: str | None, attachment_filename: str
     return 0.5
 
 
+def _image_is_done(conn: sqlite3.Connection, sha256: str) -> bool:
+    return (
+        conn.execute(
+            f"SELECT 1 FROM inline_images ii WHERE ii.sha256 = ? AND {IMAGE_DONE_SQL}", (sha256,)
+        ).fetchone()
+        is not None
+    )
+
+
 def run_backfill(
     conn: sqlite3.Connection,
     since: str | None = None,
@@ -161,10 +202,9 @@ def run_backfill(
             dedicated connection per worker thread (WAL + busy_timeout serialize
             the writes); requires a file-backed DB. Defaults to 1 (sequential,
             uses `conn`) so callers and tests are unaffected.
-        unprocessed_only: If True, skip attachments whose message already has
-            recorded image occurrences (i.e. processed on a prior run), so the
-            per-run limit targets new images and the backlog drains instead of
-            re-scanning the same newest images every run.
+        unprocessed_only: If True, take only images the pipeline still owes work
+            (IMAGE_OWED_SQL), so the per-run limit targets that work and the backlog
+            drains instead of re-scanning the same newest images every run.
         deadline_s: Optional wall-clock budget in seconds. Once spent, no further
             images are STARTED and the rest are returned as `deferred`; images
             already in flight run to completion. Lets a caller under an external
@@ -172,11 +212,14 @@ def run_backfill(
             instead of being SIGTERMed mid-flight. None = no time box.
 
     Returns:
-        Stats dict: {scanned, classified, missing, failed, deferred}
+        Stats dict: {scanned, classified, recorded, missing, failed, deferred}. `recorded` counts
+        occurrences written from the stored hash for an image whose file is gone but which is
+        already done (see below).
     """
     stats = {
         "scanned": 0,
         "classified": 0,
+        "recorded": 0,
         "missing": 0,
         "failed": 0,
         "deferred": 0,
@@ -189,15 +232,17 @@ def run_backfill(
             a.file_path,
             a.filename,
             a.message_id,
-            e.sender_address,
+            COALESCE(e.sender_address, ''),
             e.content,
             e.date_received,
-            h.html
+            h.html,
+            a.sha256
         FROM attachments a
-        JOIN emails e ON a.email_id = e.id
+        LEFT JOIN emails e ON a.email_id = e.id
         LEFT JOIN email_html h ON h.email_id = e.id
         WHERE a.mime_type LIKE 'image/%'
           AND a.file_path IS NOT NULL
+          AND a.file_path NOT LIKE 'text:%'
     """
 
     params: list[str | int] = []
@@ -205,12 +250,11 @@ def run_backfill(
         query += " AND e.date_received >= ?"
         params.append(since)
 
-    # Skip attachments whose message already has recorded image occurrences —
-    # i.e. images processed on a prior run. Lets the limited per-run budget
-    # target genuinely new images instead of re-scanning the same newest ones
-    # (dedup makes those cache-hits), and guarantees the backlog drains.
+    # Only work still owed. This used to skip every image of a message once one of them had
+    # an occurrence, so a message's second image was never processed. An image whose email
+    # row is gone is taken too (the LEFT JOIN above), with a blank sender.
     if unprocessed_only:
-        query += " AND a.message_id NOT IN (SELECT message_id FROM inline_image_occurrences)"
+        query += f" AND {IMAGE_OWED_SQL}"
 
     query += " ORDER BY e.date_received DESC"
 
@@ -230,12 +274,19 @@ def run_backfill(
     # hourly launchd / conversation-capture-hook writers.
     rows = conn.execute(query, params).fetchall()
 
-    # Count scanned + drop missing files up front; collect the real work list.
+    # Count scanned + drop missing files up front; collect the real work list. A file that is
+    # gone but whose image is done (the sweep deletes a file once its hash is done, whether or
+    # not this message's occurrence was recorded yet) only needs the occurrence, which the
+    # stored hash is enough for.
     todo = []
+    known = []
     for row in rows:
         file_path = row[1]
         stats["scanned"] += 1
         if not Path(file_path).exists():
+            if row[8] and _image_is_done(conn, row[8]):
+                known.append(row)
+                continue
             logger.warning(f"Image file not found: {file_path}")
             stats["missing"] += 1
             continue
@@ -244,13 +295,24 @@ def run_backfill(
     if dry_run:
         return stats
 
+    for row in known:
+        attachment_id, _, filename, message_id, sender_address, content, _, html, sha256 = row
+        position = compute_position_in_body(markup_or_text(content, html), filename)
+        conn.execute(
+            "INSERT OR IGNORE INTO inline_image_occurrences"
+            " (sha256, message_id, sender_email, position_in_body) VALUES (?, ?, ?, ?)",
+            (sha256, message_id, sender_address, position),
+        )
+        conn.commit()
+        stats["recorded"] += 1
+
     deadline = None if deadline_s is None else time.monotonic() + deadline_s
 
     def _out_of_time() -> bool:
         return deadline is not None and time.monotonic() >= deadline
 
     def _process(row, work_conn) -> bool:
-        attachment_id, file_path, filename, message_id, sender_address, content, _, html = row
+        attachment_id, file_path, filename, message_id, sender_address, content, _, html, _ = row
         # cid: references live in the markup, which an HTML body keeps in email_html.
         position = compute_position_in_body(markup_or_text(content, html), filename)
         try:
@@ -309,7 +371,7 @@ def run_backfill(
     # signature index once now. Same final state as per-image refresh (the last
     # recompute wins) but without serializing the parallel workers on every
     # write. Runs on `conn` after the worker pool has closed.
-    for sender in {row[4] for row in todo if row[4]}:
+    for sender in {row[4] for row in todo + known if row[4]}:
         refresh_signature_index(conn, sender)
 
     return stats

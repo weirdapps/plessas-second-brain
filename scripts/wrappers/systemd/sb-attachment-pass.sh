@@ -84,7 +84,9 @@ run_stage "image classification" "$PYTHON" -m src.cli process-images --limit 500
 
 # SharePoint URL fetch backfill
 echo "$(date '+%Y-%m-%d %H:%M:%S') — starting SharePoint fetch" >> "$LOG_FILE"
-run_stage "SharePoint fetch" "$PYTHON" -m src.cli process-sharepoint --max-fetches 100
+# --deadline-s: each fetch also extracts the file now, so bound the stage by time as well, or a
+# heavy night runs the unit into its hour before the reap and sweep stages below.
+run_stage "SharePoint fetch" "$PYTHON" -m src.cli process-sharepoint --max-fetches 100 --deadline-s 600
 
 # Orphans: files whose bytes are already stored go once their directory is a day old; unique
 # files are adopted after the 7-day grace (scripts/reap_orphan_attachments.py). --policy:

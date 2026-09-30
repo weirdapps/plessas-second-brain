@@ -21,7 +21,8 @@ def mock_conn():
             last_attempt_at TIMESTAMP,
             file_name TEXT,
             file_size INTEGER,
-            attempts INTEGER NOT NULL DEFAULT 0
+            attempts INTEGER NOT NULL DEFAULT 0,
+            document_message_id INTEGER
         );
 
         INSERT INTO sharepoint_links
@@ -125,7 +126,10 @@ def test_refetch_calls_fetcher(mock_fetch, mock_get_conn, mock_conn):
 
     result = sharepoint_index(operation="refetch", url=url)
     assert result["status"] == "ok"
-    assert result["local_path"] == "/tmp/refetched.pdf"
+    # A refetch keeps no file: it stores the text as a document (none here, the fake
+    # fetch wrote nothing) and reports that document, not a path.
+    assert "local_path" not in result
+    assert result["document_message_id"] is None
     mock_fetch.assert_called_once()
 
 

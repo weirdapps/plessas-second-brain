@@ -172,6 +172,12 @@ def test_refusal_text_never_doubles_the_period(db):
     assert ".." not in out["error"]
 
 
+def test_pragma_names_match_in_any_case(db):
+    out = sql_readonly.run_query("PRAGMA TABLE_INFO(emails)", db_path=db)
+    assert "error" not in out, out
+    assert "subject" in {row[1] for row in out["rows"]}
+
+
 def test_fts_match_works_through_the_authorizer(db):
     out = sql_readonly.run_query(
         "SELECT rowid FROM emails_fts WHERE emails_fts MATCH 'budget'", db_path=db
@@ -202,6 +208,13 @@ def test_missing_database_is_an_error_not_a_crash(tmp_path):
     assert "not found" in out["error"]
 
 
+def test_a_file_that_is_not_a_database_is_an_error_not_a_crash(tmp_path):
+    bad = tmp_path / "bad.db"
+    bad.write_bytes(b"not a database " * 100)
+    assert "not a database" in sql_readonly.run_query("SELECT 1", db_path=bad)["error"]
+    assert "not a database" in sql_readonly.describe(db_path=bad)["error"]
+
+
 def _capture_uris(monkeypatch) -> list[str]:
     seen: list[str] = []
     real = sqlite3.connect
@@ -228,6 +241,19 @@ def test_producer_opens_plain_read_only(db, tmp_path, monkeypatch):
     seen = _capture_uris(monkeypatch)
     sql_readonly.connect_read_only(db).close()
     assert seen[0].endswith("?mode=ro")
+
+
+def test_connection_refuses_writes_without_the_authorizer(db):
+    # describe() runs on this connection with no authorizer: mode=ro and
+    # query_only are all that stand between it and a write.
+    conn = sql_readonly.connect_read_only(db)
+    try:
+        assert conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("DELETE FROM emails")
+    finally:
+        conn.close()
+    assert _email_count(db) == 3
 
 
 def test_sorts_get_a_16_mb_cache_and_spill_to_files(db):

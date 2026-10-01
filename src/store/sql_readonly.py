@@ -55,7 +55,7 @@ def _authorize(
 ) -> int:
     if action in _READ_ACTIONS:
         return sqlite3.SQLITE_OK
-    if action == sqlite3.SQLITE_PRAGMA and arg1 in _READ_ONLY_PRAGMAS:
+    if action == sqlite3.SQLITE_PRAGMA and (arg1 or "").lower() in _READ_ONLY_PRAGMAS:
         return sqlite3.SQLITE_OK
     return sqlite3.SQLITE_DENY
 
@@ -104,7 +104,7 @@ def run_query(sql: str, limit: int = MAX_ROWS, db_path: Path | None = None) -> d
     limit = max(1, min(int(limit), MAX_ROWS))
     try:
         conn = connect_read_only(db_path)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, sqlite3.Error) as exc:
         return {"error": str(exc)}
     _arm_budget(conn)
     conn.set_authorizer(_authorize)
@@ -138,7 +138,7 @@ def run_query(sql: str, limit: int = MAX_ROWS, db_path: Path | None = None) -> d
             rows.append(row)
             total += size
     except sqlite3.OperationalError as exc:
-        if str(exc) == "interrupted":
+        if exc.sqlite_errorcode == sqlite3.SQLITE_INTERRUPT:
             return {
                 "error": f"query exceeded the {BUDGET_SECONDS:.0f} s budget; narrow it or add a LIMIT"
             }
@@ -168,7 +168,7 @@ def describe(table: str | None = None, db_path: Path | None = None) -> dict:
     """
     try:
         conn = connect_read_only(db_path)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, sqlite3.Error) as exc:
         return {"error": str(exc)}
     try:
         if table is not None:

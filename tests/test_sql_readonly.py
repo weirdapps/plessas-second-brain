@@ -111,6 +111,30 @@ def test_value_over_the_size_limit_is_an_error_not_a_memory_spike(db, monkeypatc
     assert normal["row_count"] == 3
 
 
+def test_every_table_fits_under_the_column_limit(db):
+    # Below the widest table SQLite cannot read the schema and every query fails,
+    # so this pins schema growth to the limit. table_xinfo counts generated columns.
+    check = sqlite3.connect(db)
+    try:
+        names = [
+            r[0]
+            for r in check.execute("SELECT name FROM sqlite_master WHERE type IN ('table', 'view')")
+        ]
+        widest = max(
+            check.execute("SELECT count(*) FROM pragma_table_xinfo(?)", (name,)).fetchone()[0]
+            for name in names
+        )
+    finally:
+        check.close()
+    assert widest < sql_readonly.MAX_COLUMNS
+
+
+def test_a_result_wider_than_the_column_limit_says_to_name_columns(db):
+    wide = ", ".join(f"{i} AS c{i}" for i in range(sql_readonly.MAX_COLUMNS + 1))
+    out = sql_readonly.run_query(f"SELECT {wide}", db_path=db)
+    assert "name only the columns" in out["error"]
+
+
 @pytest.mark.parametrize(
     "sql",
     [

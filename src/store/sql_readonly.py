@@ -19,10 +19,14 @@ MAX_ROWS = 200
 CELL_CHARS = 4000
 TOTAL_CHARS = 100_000
 BUDGET_SECONDS = 10.0
-# SQLite builds and reads no value longer than this, so one oversized expression
-# cannot take gigabytes; the caps above only shorten a value already in memory.
-# The largest value the store holds is about 4 MB.
-MAX_VALUE_BYTES = 16 * 1024 * 1024
+# The caps above only shorten values already in memory, and a row arrives with
+# all its values at once: one row of 40 values of 8 MB peaked at 949 MB (about
+# 3x per value). So SQLite builds and reads no value over MAX_VALUE_BYTES (the
+# largest stored value is 3.6 MB) and no result wider than MAX_COLUMNS, which
+# must stay above the widest table (calendar_events, 23 columns counting
+# generated ones) or no query can run.
+MAX_VALUE_BYTES = 8 * 1024 * 1024
+MAX_COLUMNS = 32
 _PROGRESS_STEPS = 10_000
 
 _READ_ACTIONS = frozenset(
@@ -67,6 +71,7 @@ def connect_read_only(db_path: Path | None = None) -> sqlite3.Connection:
         uri += "&immutable=1"
     conn = sqlite3.connect(uri, uri=True)
     conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
+    conn.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, MAX_COLUMNS)
     conn.row_factory = sqlite3.Row
     register_sql_functions(conn)
     # SQLite sizes a sort's in-memory runs from cache_size. A sort that carries
@@ -126,6 +131,11 @@ def run_query(sql: str, limit: int = MAX_ROWS, db_path: Path | None = None) -> d
         if str(exc) == "interrupted":
             return {
                 "error": f"query exceeded the {BUDGET_SECONDS:.0f} s budget; narrow it or add a LIMIT"
+            }
+        if "too many columns" in str(exc):
+            return {
+                "error": f"the result has more than {MAX_COLUMNS} columns; "
+                "name only the columns you need instead of SELECT *"
             }
         return {"error": f"SQLite: {exc}"}
     except sqlite3.DataError:  # SQLITE_TOOBIG: a value over MAX_VALUE_BYTES

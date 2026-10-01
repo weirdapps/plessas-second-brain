@@ -203,6 +203,12 @@ def test_runaway_query_stops_at_the_budget(db, monkeypatch):
     assert "budget" in out["error"]
 
 
+def test_text_that_is_not_utf8_is_an_error_not_a_crash(db):
+    # The sqlite3 module raises this one itself, so it carries no sqlite_errorcode.
+    out = sql_readonly.run_query("SELECT CAST(x'ff' AS TEXT) AS bad", db_path=db)
+    assert "error" in out
+
+
 def test_missing_database_is_an_error_not_a_crash(tmp_path):
     out = sql_readonly.run_query("SELECT 1", db_path=tmp_path / "absent.db")
     assert "not found" in out["error"]
@@ -213,6 +219,24 @@ def test_a_file_that_is_not_a_database_is_an_error_not_a_crash(tmp_path):
     bad.write_bytes(b"not a database " * 100)
     assert "not a database" in sql_readonly.run_query("SELECT 1", db_path=bad)["error"]
     assert "not a database" in sql_readonly.describe(db_path=bad)["error"]
+
+
+def test_a_failed_connect_closes_its_connection(tmp_path, monkeypatch):
+    bad = tmp_path / "bad.db"
+    bad.write_bytes(b"not a database " * 100)
+    opened: list[sqlite3.Connection] = []
+    real = sqlite3.connect
+
+    def keep(database, *args, **kwargs):
+        opened.append(real(database, *args, **kwargs))
+        return opened[-1]
+
+    monkeypatch.setattr(sql_readonly.sqlite3, "connect", keep)
+    with pytest.raises(sqlite3.DatabaseError, match="not a database"):
+        sql_readonly.connect_read_only(bad)
+    # Held here, so only an explicit close can have closed it.
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        opened[0].execute("SELECT 1")
 
 
 def _capture_uris(monkeypatch) -> list[str]:

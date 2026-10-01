@@ -72,17 +72,21 @@ def connect_read_only(db_path: Path | None = None) -> sqlite3.Connection:
         # branch: immutable=1 skips locking on a database that is being written.
         uri += "&immutable=1"
     conn = sqlite3.connect(uri, uri=True)
-    conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
-    conn.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, MAX_COLUMNS)
-    conn.row_factory = sqlite3.Row
-    register_sql_functions(conn)
-    # SQLite sizes a sort's in-memory runs from cache_size. A sort that carries
-    # long texts peaked at 1.06 GB on a real store with the default 2 MB, and at
-    # 0.31 GB with 16 MB. temp_store=FILE keeps sort data on disk even where a
-    # build defaults temporary storage to memory.
-    conn.execute("PRAGMA cache_size = -16384")
-    conn.execute("PRAGMA temp_store = FILE")
-    conn.execute("PRAGMA query_only = ON")
+    try:
+        conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, MAX_COLUMNS)
+        conn.row_factory = sqlite3.Row
+        register_sql_functions(conn)
+        # SQLite sizes a sort's in-memory runs from cache_size. A sort that carries
+        # long texts peaked at 1.06 GB on a real store with the default 2 MB, and
+        # at 0.31 GB with 16 MB. temp_store=FILE keeps sort data on disk even where
+        # a build defaults temporary storage to memory.
+        conn.execute("PRAGMA cache_size = -16384")
+        conn.execute("PRAGMA temp_store = FILE")
+        conn.execute("PRAGMA query_only = ON")
+    except BaseException:
+        conn.close()  # a file that is not a database, or a schema too wide to read
+        raise
     return conn
 
 
@@ -138,7 +142,9 @@ def run_query(sql: str, limit: int = MAX_ROWS, db_path: Path | None = None) -> d
             rows.append(row)
             total += size
     except sqlite3.OperationalError as exc:
-        if exc.sqlite_errorcode == sqlite3.SQLITE_INTERRUPT:
+        # Errors the sqlite3 module raises itself (a column that is not UTF-8)
+        # carry no sqlite_errorcode.
+        if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
             return {
                 "error": f"query exceeded the {BUDGET_SECONDS:.0f} s budget; narrow it or add a LIMIT"
             }

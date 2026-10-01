@@ -8,6 +8,14 @@ import pytest
 from src.store import sql_readonly
 
 
+@pytest.fixture(autouse=True)
+def _no_pull_stamp(tmp_path: Path, monkeypatch) -> None:
+    """Open the producer's way on any host. sql_readonly reads REPLICA_STAMP, not
+    BRAIN_ROLE, so on a host with a pull stamp every fixture database opened with
+    immutable=1. A test that needs the stamp sets it."""
+    monkeypatch.setattr(sql_readonly, "REPLICA_STAMP", tmp_path / "absent-db-pull.stamp")
+
+
 @pytest.fixture
 def db(tmp_path: Path) -> Path:
     """A real store built by create_database, with three emails to read."""
@@ -281,6 +289,14 @@ def test_producer_opens_plain_read_only(db, tmp_path, monkeypatch):
     monkeypatch.setattr(sql_readonly, "REPLICA_STAMP", tmp_path / "absent.stamp")
     seen = _capture_uris(monkeypatch)
     sql_readonly.connect_read_only(db).close()
+    assert seen[0].endswith("?mode=ro")
+
+
+def test_the_host_pull_stamp_does_not_choose_the_open_here(db, monkeypatch):
+    # Nothing set by this test: the autouse fixture alone keeps a replica host
+    # from running every other test here against immutable=1.
+    seen = _capture_uris(monkeypatch)
+    sql_readonly.run_query("SELECT 1", db_path=db)
     assert seen[0].endswith("?mode=ro")
 
 

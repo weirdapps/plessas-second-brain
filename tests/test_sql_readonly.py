@@ -380,17 +380,21 @@ def test_the_routing_text_names_the_sql_tools():
 
 def test_the_sql_query_docstring_states_the_live_limits():
     # A constant changed without the docstring would have agents trust stale caps.
+    # Each number is matched in its phrase: a bare "100" is also in "100,000", so
+    # MAX_ROWS = 100 passed a substring check.
     import inspect
 
     from src import mcp_server
 
-    doc = inspect.getdoc(mcp_server.sql_query)
-    for live in (
-        str(sql_readonly.MAX_ROWS),
-        str(sql_readonly.MAX_COLUMNS),
-        f"{sql_readonly.CELL_CHARS:,}",
-        f"{sql_readonly.TOTAL_CHARS:,}",
-        f"{sql_readonly.BUDGET_SECONDS:.0f} s",
-        f"{sql_readonly.MAX_VALUE_BYTES // 2**20} MiB",
+    doc = " ".join(inspect.getdoc(mcp_server.sql_query).split())
+    s = sql_readonly
+    for phrase in (
+        f"rows (cap {s.MAX_ROWS})",
+        f"1 to {s.MAX_ROWS} (default {s.MAX_ROWS})",
+        f"cut to {s.CELL_CHARS:,} characters",
+        f"the whole answer to {s.TOTAL_CHARS:,};",
+        f"a {s.BUDGET_SECONDS:.0f} s budget",
+        f"wider than {s.MAX_COLUMNS} columns",
+        f"a value over {s.MAX_VALUE_BYTES // 2**20} MiB",
     ):
-        assert live in doc, live
+        assert phrase in doc, phrase

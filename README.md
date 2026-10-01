@@ -445,6 +445,7 @@ src/
     action_lifecycle.py        Dedups action items and ages out stale ones
     conversation_query.py      Claude Code conversation search
     teams_query.py             Teams thread, chat, and search
+    sql_readonly.py            Read-only SQL over brain.db for the sql_query and sql_schema tools
     calendar_loader.py         Calendar event and attendee loader
   ingest/
     reverse_scan.py            Filesystem scan with latest-version-per-name dedup

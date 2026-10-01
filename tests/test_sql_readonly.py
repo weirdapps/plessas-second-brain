@@ -351,3 +351,11 @@ def test_sql_schema_tool(db, monkeypatch):
     monkeypatch.setattr(sql_readonly, "DEFAULT_DB", db)
     assert any(t["table"] == "emails" for t in mcp_server.sql_schema()["tables"])
     assert {c["name"] for c in mcp_server.sql_schema("emails")["columns"]} >= {"id", "subject"}
+
+
+def test_the_routing_text_names_the_sql_tools():
+    # Under tool search only tool names and this text load at session start.
+    from src.mcp_server import _INSTRUCTIONS
+
+    assert "`sql_schema`" in _INSTRUCTIONS
+    assert "`sql_query`" in _INSTRUCTIONS

@@ -34,7 +34,9 @@ when you already know the kind you want (`search_emails`, `search_attachments`, 
 `search_teams`, `search_whatsapp`, `search_conversations`, \
 `query_calendar_events`), or the \
 dossier tools for an entity (`person_context`, `topic_context`, `sender_brief`, \
-`meeting_prep`). `stats` reports corpus size, how fresh the data is, and \
+`meeting_prep`). For counts, trends, aggregates and full bodies the other tools \
+only summarise, call `sql_schema`, then `sql_query` (read-only, one SELECT). \
+`stats` reports corpus size, how fresh the data is, and \
 `coverage`: the first and last date held per mailbox, Teams, WhatsApp, calendar \
 and conversations. Sources start at different dates, most later than you would \
 guess: check `coverage` before concluding that something did not happen.

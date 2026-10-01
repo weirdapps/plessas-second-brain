@@ -98,7 +98,24 @@ def run_query(sql: str, limit: int = MAX_ROWS, db_path: Path | None = None) -> d
     try:
         cur = conn.execute(sql)
         columns = [d[0] for d in cur.description or ()]
-        fetched = cur.fetchmany(limit + 1)
+        rows: list[list[object]] = []
+        total = 0
+        truncated = False
+        # One row at a time, cut as it arrives, so no more than one uncut row is
+        # ever held and nothing past the caps is read. The cursor itself steps one
+        # row ahead, so SQLite evaluates at most one row more than is read here.
+        for raw in cur:
+            if len(rows) == limit:
+                truncated = True
+                break
+            row = [_cell(v) for v in tuple(raw)]
+            del raw
+            size = sum(len(str(v)) for v in row)
+            if rows and total + size > TOTAL_CHARS:
+                truncated = True
+                break
+            rows.append(row)
+            total += size
     except sqlite3.OperationalError as exc:
         if str(exc) == "interrupted":
             return {
@@ -114,18 +131,6 @@ def run_query(sql: str, limit: int = MAX_ROWS, db_path: Path | None = None) -> d
         return {"error": f"refused: {str(exc).rstrip('.')}. One read-only SELECT per call."}
     finally:
         conn.close()
-
-    truncated = len(fetched) > limit
-    rows: list[list[object]] = []
-    total = 0
-    for raw in fetched[:limit]:
-        row = [_cell(v) for v in tuple(raw)]
-        size = sum(len(str(v)) for v in row)
-        if rows and total + size > TOTAL_CHARS:
-            truncated = True
-            break
-        rows.append(row)
-        total += size
     return {"columns": columns, "rows": rows, "row_count": len(rows), "truncated": truncated}
 
 

@@ -75,6 +75,22 @@ def test_total_size_cap(db, monkeypatch):
     assert out["truncated"] is True
 
 
+def test_rows_past_the_total_cap_are_never_read(db, monkeypatch):
+    # Row 4 raises if SQLite ever evaluates it: json() of text that is not JSON.
+    # Row 2 overflows the cap, and the sqlite3 cursor steps one row ahead of the
+    # row it hands over, so streaming evaluates rows 1 to 3 and never row 4. A
+    # reader that fetches a batch before applying the cap hits the error.
+    monkeypatch.setattr(sql_readonly, "TOTAL_CHARS", 15)
+    out = sql_readonly.run_query(
+        "WITH t(x) AS (VALUES (1), (2), (3), (4), (5)) "
+        "SELECT x, CASE WHEN x < 4 THEN printf('%.10c', 'x') ELSE json('no ' || x) END FROM t",
+        db_path=db,
+    )
+    assert "error" not in out, out
+    assert out["rows"] == [[1, "xxxxxxxxxx"]]
+    assert out["truncated"] is True
+
+
 def test_blob_cells_are_described_not_dumped(db):
     out = sql_readonly.run_query("SELECT zeroblob(16) AS b", db_path=db)
     assert out["rows"] == [["<16 bytes>"]]

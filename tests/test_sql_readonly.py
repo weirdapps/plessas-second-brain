@@ -80,6 +80,21 @@ def test_blob_cells_are_described_not_dumped(db):
     assert out["rows"] == [["<16 bytes>"]]
 
 
+def test_value_over_the_size_limit_is_an_error_not_a_memory_spike(db, monkeypatch):
+    # The limit also applies to the schema SQLite reads on the first statement, so
+    # it must stay above the longest CREATE text (about 1.8 KB). The value is built
+    # the way a careless query builds one, by joining rows: 3 x 4,000 + 2 bytes.
+    # printf() alone cannot show this; past the limit it returns NULL, not an error.
+    monkeypatch.setattr(sql_readonly, "MAX_VALUE_BYTES", 10_000)
+    out = sql_readonly.run_query(
+        "SELECT group_concat(printf('%.4000c', 'x')) FROM emails", db_path=db
+    )
+    assert "too big" in out["error"]
+    assert "substr(" in out["error"]
+    normal = sql_readonly.run_query("SELECT id, subject FROM emails ORDER BY id", db_path=db)
+    assert normal["row_count"] == 3
+
+
 @pytest.mark.parametrize(
     "sql",
     [

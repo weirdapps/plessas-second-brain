@@ -19,6 +19,10 @@ MAX_ROWS = 200
 CELL_CHARS = 4000
 TOTAL_CHARS = 100_000
 BUDGET_SECONDS = 10.0
+# SQLite builds and reads no value longer than this, so one oversized expression
+# cannot take gigabytes; the caps above only shorten a value already in memory.
+# The largest value the store holds is about 4 MB.
+MAX_VALUE_BYTES = 16 * 1024 * 1024
 _PROGRESS_STEPS = 10_000
 
 _READ_ACTIONS = frozenset(
@@ -62,6 +66,7 @@ def connect_read_only(db_path: Path | None = None) -> sqlite3.Connection:
         # branch: immutable=1 skips locking on a database that is being written.
         uri += "&immutable=1"
     conn = sqlite3.connect(uri, uri=True)
+    conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
     conn.row_factory = sqlite3.Row
     register_sql_functions(conn)
     conn.execute("PRAGMA query_only = ON")
@@ -100,6 +105,11 @@ def run_query(sql: str, limit: int = MAX_ROWS, db_path: Path | None = None) -> d
                 "error": f"query exceeded the {BUDGET_SECONDS:.0f} s budget; narrow it or add a LIMIT"
             }
         return {"error": f"SQLite: {exc}"}
+    except sqlite3.DataError:  # SQLITE_TOOBIG: a value over MAX_VALUE_BYTES
+        return {
+            "error": f"a value is too big (over {MAX_VALUE_BYTES:,} bytes); select a slice "
+            f"with substr(column, start, {CELL_CHARS}), or combine fewer rows"
+        }
     except (sqlite3.DatabaseError, sqlite3.Warning) as exc:
         return {"error": f"refused: {exc}. One read-only SELECT per call."}
     finally:

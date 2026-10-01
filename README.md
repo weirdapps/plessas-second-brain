@@ -325,7 +325,7 @@ python -m src.mcp_server
 To serve it over HTTP instead, for a client that cannot spawn it (one process then holds the embedding index for every request):
 
 ```bash
-umask 077 && openssl rand -hex 32 > ~/.config/second-brain/mcp-token
+(umask 077 && mkdir -p ~/.config/second-brain && openssl rand -hex 32 > ~/.config/second-brain/mcp-token)
 BRAIN_MCP_TOKEN_FILE=~/.config/second-brain/mcp-token python -m src.mcp_server --http 127.0.0.1:8765
 ```
 

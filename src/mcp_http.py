@@ -14,6 +14,8 @@ import stat
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from mcp.server.transport_security import TransportSecuritySettings
+
 if TYPE_CHECKING:
     from mcp.server import MCPServer
     from starlette.types import ASGIApp, Receive, Scope, Send
@@ -28,12 +30,15 @@ def load_token(path: str) -> str:
         raise ValueError("BRAIN_MCP_TOKEN_FILE is not set; --http needs a bearer token file")
     token_file = Path(path).expanduser()
     try:
-        mode = token_file.stat().st_mode
+        if token_file.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+            raise ValueError(f"{token_file} is readable by others; chmod 600 it")
         token = token_file.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise ValueError(f"cannot read the token file {token_file}: {exc.strerror}") from exc
-    if mode & (stat.S_IRWXG | stat.S_IRWXO):
-        raise ValueError(f"{token_file} is readable by others; chmod 600 it")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"{token_file} is not UTF-8 text; write a new one with: openssl rand -hex 32"
+        ) from exc
     if len(token) < MIN_TOKEN_CHARS:
         raise ValueError(
             f"{token_file} holds {len(token)} characters, fewer than {MIN_TOKEN_CHARS}; "
@@ -50,10 +55,11 @@ def _header(scope: Scope, name: bytes) -> bytes:
 
 
 class BearerAuth:
-    """ASGI middleware: an HTTP request without `Authorization: Bearer <token>` gets 401.
+    """ASGI middleware: nothing reaches the app without `Authorization: Bearer <token>`.
 
-    Lifespan messages pass straight through, so the wrapped app still starts its
-    session manager.
+    Deny by default, whatever the scope type: an HTTP request gets 401 and a
+    websocket is closed with 1008 (policy violation). Only lifespan messages pass
+    without the token, so the wrapped app still starts its session manager.
     """
 
     def __init__(self, app: ASGIApp, token: str) -> None:
@@ -61,9 +67,13 @@ class BearerAuth:
         self._expected = f"Bearer {token}".encode()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http" and not hmac.compare_digest(
+        if scope["type"] == "lifespan" or hmac.compare_digest(
             _header(scope, b"authorization"), self._expected
         ):
+            await self.app(scope, receive, send)
+        elif scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+        else:
             await send(
                 {
                     "type": "http.response.start",
@@ -75,14 +85,18 @@ class BearerAuth:
                 }
             )
             await send({"type": "http.response.body", "body": b"unauthorized\n"})
-            return
-        await self.app(scope, receive, send)
 
 
 def build_http_app(server: MCPServer, token: str, host: str = "127.0.0.1") -> BearerAuth:
     """The streamable-HTTP app for `server`, behind bearer auth, for a loopback host."""
     if host not in LOOPBACK_HOSTS:
         raise ValueError(f"refusing to serve on {host!r}: HTTP mode binds loopback only")
-    # A loopback host also turns on the SDK's DNS-rebinding protection (Host and
-    # Origin checks) in streamable_http_app.
-    return BearerAuth(server.streamable_http_app(host=host), token)
+    # Host and Origin checks (DNS-rebinding protection), set here rather than left
+    # to the SDK, which turns them on only while transport_security is None and the
+    # host is loopback. The lists are the SDK's own loopback defaults.
+    security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*"],
+        allowed_origins=["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"],
+    )
+    return BearerAuth(server.streamable_http_app(host=host, transport_security=security), token)

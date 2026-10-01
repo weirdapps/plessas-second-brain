@@ -38,16 +38,22 @@ class _Inner:
             await send({"type": "http.response.start", "status": 200, "headers": []})
 
 
-def _http(app, headers: list[tuple[bytes, bytes]]) -> list[dict]:
+def _call(app, scope: dict) -> list[dict]:
     sent: list[dict] = []
 
     async def send(message: dict) -> None:
         sent.append(message)
 
-    _drive(
-        app({"type": "http", "method": "POST", "path": "/mcp", "headers": headers}, _receive, send)
-    )
+    _drive(app(scope, _receive, send))
     return sent
+
+
+def _http(app, headers: list[tuple[bytes, bytes]]) -> list[dict]:
+    return _call(app, {"type": "http", "method": "POST", "path": "/mcp", "headers": headers})
+
+
+def _websocket(app, headers: list[tuple[bytes, bytes]]) -> list[dict]:
+    return _call(app, {"type": "websocket", "path": "/mcp", "headers": headers})
 
 
 def test_missing_header_gets_401():
@@ -83,6 +89,19 @@ def test_lifespan_passes_through_without_a_token():
     assert inner.calls == ["lifespan"]
 
 
+def test_websocket_without_a_token_is_closed_before_the_app():
+    inner = _Inner()
+    sent = _websocket(mcp_http.BearerAuth(inner, TOKEN), [])
+    assert sent == [{"type": "websocket.close", "code": 1008}]
+    assert inner.calls == []
+
+
+def test_websocket_with_the_right_token_reaches_the_app():
+    inner = _Inner()
+    _websocket(mcp_http.BearerAuth(inner, TOKEN), [(b"authorization", f"Bearer {TOKEN}".encode())])
+    assert inner.calls == ["websocket"]
+
+
 def _token_file(tmp_path, text: str, mode: int = 0o600) -> str:
     path = tmp_path / "mcp-token"
     path.write_text(text)
@@ -100,9 +119,30 @@ def test_token_missing_file(tmp_path):
         mcp_http.load_token(str(tmp_path / "absent"))
 
 
-def test_token_readable_by_others(tmp_path):
+@pytest.mark.parametrize("mode", [0o644, 0o640, 0o604, 0o620], ids=oct)
+def test_token_readable_by_others(tmp_path, mode):
     with pytest.raises(ValueError, match="chmod 600"):
-        mcp_http.load_token(_token_file(tmp_path, "a" * 64, mode=0o644))
+        mcp_http.load_token(_token_file(tmp_path, "a" * 64, mode=mode))
+
+
+def _binary_token_file(tmp_path, mode: int = 0o600) -> str:
+    """What `openssl rand 32 > file` writes when -hex is left out."""
+    path = tmp_path / "mcp-token"
+    path.write_bytes(bytes(range(128, 160)))
+    path.chmod(mode)
+    return str(path)
+
+
+def test_token_not_text(tmp_path):
+    path = _binary_token_file(tmp_path)
+    with pytest.raises(ValueError, match="openssl rand -hex 32") as raised:
+        mcp_http.load_token(path)
+    assert path in str(raised.value)
+
+
+def test_token_permissions_are_checked_before_the_content(tmp_path):
+    with pytest.raises(ValueError, match="chmod 600"):
+        mcp_http.load_token(_binary_token_file(tmp_path, mode=0o640))
 
 
 def test_token_too_short(tmp_path):
@@ -123,6 +163,19 @@ def test_build_wraps_the_streamable_app():
     app = mcp_http.build_http_app(mcp_server.mcp, TOKEN)
     assert isinstance(app, mcp_http.BearerAuth)
     assert type(app.app).__name__ == "Starlette"
+
+
+def test_build_turns_on_host_and_origin_checks_explicitly():
+    with patch.object(mcp_server.mcp, "streamable_http_app", autospec=True) as factory:
+        mcp_http.build_http_app(mcp_server.mcp, TOKEN)
+    security = factory.call_args.kwargs["transport_security"]
+    assert security.enable_dns_rebinding_protection is True
+    assert security.allowed_hosts == ["127.0.0.1:*", "localhost:*", "[::1]:*"]
+    assert security.allowed_origins == [
+        "http://127.0.0.1:*",
+        "http://localhost:*",
+        "http://[::1]:*",
+    ]
 
 
 def test_no_arguments_serves_stdio_as_before():
@@ -154,7 +207,7 @@ def test_http_serves_on_loopback(tmp_path, monkeypatch):
     ):
         assert mcp_server.main(["--http", "127.0.0.1:8765"]) == 0
     build.assert_called_once_with(mcp_server.mcp, "a" * 64, host="127.0.0.1")
-    run.assert_called_once_with("APP", host="127.0.0.1", port=8765, log_level="warning")
+    run.assert_called_once_with("APP", host="127.0.0.1", port=8765, log_level="warning", ws="none")
 
 
 def test_http_accepts_bracketed_ipv6(tmp_path, monkeypatch):

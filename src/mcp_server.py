@@ -1246,7 +1246,9 @@ def main(argv: list[str] | None = None) -> int:
 
     import uvicorn
 
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    # The MCP transport uses no websockets. ws="none" makes an upgrade request a
+    # plain HTTP request, so it gets the same 401 as any other without the token.
+    uvicorn.run(app, host=host, port=port, log_level="warning", ws="none")
     return 0
 
 

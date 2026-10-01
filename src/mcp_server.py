@@ -1173,12 +1173,13 @@ def sql_query(sql: str, limit: int = 200) -> dict:
     spelling.
 
     Read-only by construction: anything but reading is refused. One statement per
-    call (WITH ... SELECT is fine), a 10 s budget, at most `limit` rows (cap 200)
-    and 32 columns (name the columns you need instead of SELECT *), each cell cut
-    to 4,000 characters and the whole answer to 100,000; `truncated` says when
-    something was left out. A query that reads or builds a value over 8 MB fails:
-    read long text with substr(). Select ids first, then read long text by id with
-    substr(), instead of sorting or scanning on long text columns.
+    call (WITH ... SELECT is fine), a 10 s budget, at most `limit` rows (cap 200),
+    each cell cut to 4,000 characters (a cut cell ends "… [cut, N chars]", N its
+    full length) and the whole answer to 100,000; `truncated` says when something
+    was left out. A result wider than 32 columns is refused (name the columns you
+    need), and so is a query that reads or builds a value over 8 MiB: read long
+    text with substr(). Select ids first, then read long text by id with substr(),
+    instead of sorting or scanning on long text columns.
 
     Args:
         sql: A single SELECT. Inline the literals; there are no parameters.
@@ -1193,8 +1194,9 @@ def sql_query(sql: str, limit: int = 200) -> dict:
 def sql_schema(table: str | None = None) -> dict:
     """Tables of brain.db for sql_query: the list, or one table's columns and indexes.
 
-    The list gives every table and view with its row count, except full-text
-    (virtual) tables, which are listed without one and marked "virtual": true.
+    The list gives every table and view with its row count. "rows" is null for
+    full-text (virtual) tables, which are marked "virtual": true, and also where
+    counting ran out of the shared time budget (or a view cannot be counted).
     Full-text index shadow tables are left out of the list.
 
     Args:

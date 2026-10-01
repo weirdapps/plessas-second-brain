@@ -152,10 +152,10 @@ The MCP server exposes 27 tools (all defined in `src/mcp_server.py`). Register t
 
 ### SQL (read-only)
 
-- `sql_schema(table=None)`. Without a table, every table and view with its row count, except full-text (virtual) tables, which are listed without one and marked `"virtual": true` (their shadow tables are left out); with one, its columns and indexes.
-- `sql_query(sql, limit=200)`. One read-only `SELECT` (or `WITH ... SELECT`) against `brain.db`, for counts, trends and aggregates the curated tools cannot express, and for the full text they only summarise: `emails.content`, `teams_messages.content_text`, `attachment_content.extracted_text`, `conversation_turns.content`. `sb_fold(text)` folds case, Greek accents and final sigma; apply it to both sides of a `LIKE`.
+- `sql_schema(table=None)`. Without a table, every table and view with its row count; with one, its columns and indexes. `rows` is null for full-text (virtual) tables, which are marked `"virtual": true`, and also where counting ran out of the shared time budget (or a view cannot be counted). Full-text shadow tables are left out of the list.
+- `sql_query(sql, limit=200)`. One read-only `SELECT` (or `WITH ... SELECT`) against `brain.db`, for counts, trends and aggregates the curated tools cannot express, and for the full text they only summarise: `emails.content`, `teams_messages.content_text`, `attachment_content.extracted_text`, `conversation_turns.content`. `sb_fold(text)` folds case, Greek accents and final sigma, so fold both sides: `WHERE sb_fold(subject) LIKE '%' || sb_fold('term') || '%'`.
 
-  It cannot write: the connection is read-only with `query_only` on, and a SQLite authorizer allows nothing but reading. One statement per call, a 10 s budget, at most 200 rows and 32 columns (name the columns you need), 4,000 characters per cell and 100,000 per answer; `truncated` says when something was left out. A query that reads or builds a value over 8 MB fails: read long text with `substr()`. On a replica (the pull stamp exists) it opens with `immutable=1`, the only read-only open that works on a pulled copy.
+  It cannot write: the connection is read-only with `query_only` on, and a SQLite authorizer allows nothing but reading. One statement per call, a 10 s budget, at most 200 rows, 4,000 characters per cell (a cut cell ends `… [cut, N chars]`, N its full length) and 100,000 per answer; `truncated` says when something was left out. A result wider than 32 columns is refused (name the columns you need), and so is a query that reads or builds a value over 8 MiB: read long text with `substr()`. On a replica (the pull stamp exists) it opens with `immutable=1`, the only read-only open that works on a pulled copy.
 
 ## WhatsApp
 

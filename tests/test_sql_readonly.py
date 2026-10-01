@@ -368,3 +368,21 @@ def test_the_routing_text_names_the_sql_tools():
 
     assert "`sql_schema`" in _INSTRUCTIONS
     assert "`sql_query`" in _INSTRUCTIONS
+
+
+def test_the_sql_query_docstring_states_the_live_limits():
+    # A constant changed without the docstring would have agents trust stale caps.
+    import inspect
+
+    from src import mcp_server
+
+    doc = inspect.getdoc(mcp_server.sql_query)
+    for live in (
+        str(sql_readonly.MAX_ROWS),
+        str(sql_readonly.MAX_COLUMNS),
+        f"{sql_readonly.CELL_CHARS:,}",
+        f"{sql_readonly.TOTAL_CHARS:,}",
+        f"{sql_readonly.BUDGET_SECONDS:.0f} s",
+        f"{sql_readonly.MAX_VALUE_BYTES // 2**20} MiB",
+    ):
+        assert live in doc, live

@@ -325,11 +325,11 @@ python -m src.mcp_server
 To serve it over HTTP instead, for a client that cannot spawn it (one process then holds the embedding index for every request):
 
 ```bash
-(umask 077 && mkdir -p ~/.config/second-brain && openssl rand -hex 32 > ~/.config/second-brain/mcp-token)
+(umask 077 && mkdir -p ~/.config/second-brain && { [ -s ~/.config/second-brain/mcp-token ] || openssl rand -hex 32 > ~/.config/second-brain/mcp-token; })
 BRAIN_MCP_TOKEN_FILE=~/.config/second-brain/mcp-token python -m src.mcp_server --http 127.0.0.1:8765
 ```
 
-The endpoint is `http://127.0.0.1:8765/mcp`. Loopback only, and every request needs `Authorization: Bearer <token>`: the server refuses to start with a non-loopback host, a token file others can read, or a token under 32 characters. On the producer, run it with `BRAIN_ROLE=replica` so the one MCP write path (the `sharepoint_index` refetch) stays off; `docs/DEPLOY.md` section 9 has the systemd setup.
+The endpoint is `http://127.0.0.1:8765/mcp`. Loopback only, and every request needs `Authorization: Bearer <token>`: the server refuses to start with a non-loopback host, a token file others can read, or a token under 32 characters. On the producer, run it with `BRAIN_ROLE=replica` so the one write path into `brain.db` (the `sharepoint_index` refetch) stays off; `docs/DEPLOY.md` section 9 has the systemd setup.
 
 ### Register with Claude Code
 

@@ -345,7 +345,7 @@ server, or would spawn it per request, should use the HTTP mode instead.
 
 ```bash
 # 1. A token only the owner can read
-(umask 077 && mkdir -p ~/.config/second-brain && openssl rand -hex 32 > ~/.config/second-brain/mcp-token)
+(umask 077 && mkdir -p ~/.config/second-brain && { [ -s ~/.config/second-brain/mcp-token ] || openssl rand -hex 32 > ~/.config/second-brain/mcp-token; })
 
 # 2. The wrapper (archived at scripts/wrappers/systemd/sb-mcp.sh)
 install -m 755 scripts/wrappers/systemd/sb-mcp.sh ~/.local/bin/sb-mcp.sh

@@ -120,7 +120,11 @@ def run_query(sql: str, limit: int = MAX_ROWS, db_path: Path | None = None) -> d
 
 
 def describe(table: str | None = None, db_path: Path | None = None) -> dict:
-    """Every table and view with its row count, or one table's columns and indexes."""
+    """Every table and view with its row count, or one table's columns and indexes.
+
+    Full-text (virtual) tables are listed with rows None, not counted: counting
+    one scans its whole content table, which took over 30 s on a real store.
+    """
     try:
         conn = connect_read_only(db_path)
     except FileNotFoundError as exc:
@@ -162,12 +166,15 @@ def describe(table: str | None = None, db_path: Path | None = None) -> dict:
             name = entry["name"]
             if name in shadows:
                 continue
+            if name in virtual:
+                tables.append({"table": name, "rows": None, "virtual": True})
+                continue
             quoted = name.replace('"', '""')
             try:
                 rows: int | None = conn.execute(f'SELECT COUNT(*) FROM "{quoted}"').fetchone()[0]
             except sqlite3.OperationalError:
                 rows = None  # budget spent, or a view that cannot be counted
-            tables.append({"table": name, "rows": rows})
+            tables.append({"table": name, "rows": rows, "virtual": False})
         return {"tables": tables}
     finally:
         conn.close()

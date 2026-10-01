@@ -170,6 +170,14 @@ def test_describe_lists_tables_without_fts_shadows(db):
     assert emails["rows"] == 3
 
 
+def test_describe_lists_full_text_tables_without_counting_them(db):
+    tables = {t["table"]: t for t in sql_readonly.describe(db_path=db)["tables"]}
+    assert tables["emails_fts"]["rows"] is None
+    assert tables["emails_fts"]["virtual"] is True
+    assert tables["emails"]["rows"] == 3
+    assert tables["emails"]["virtual"] is False
+
+
 def test_describe_one_table(db):
     out = sql_readonly.describe("emails", db_path=db)
     columns = {c["name"] for c in out["columns"]}

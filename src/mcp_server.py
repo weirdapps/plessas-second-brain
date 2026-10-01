@@ -1178,11 +1178,12 @@ def sql_query(sql: str, limit: int = 200) -> dict:
     Read-only by construction: anything but reading is refused. One statement per
     call (WITH ... SELECT is fine), a 10 s budget, at most `limit` rows (cap 200),
     each cell cut to 4,000 characters (a cut cell ends "… [cut, N chars]", N its
-    full length) and the whole answer to 100,000; `truncated` says when something
-    was left out. A result wider than 32 columns is refused (name the columns you
-    need), and so is a query that reads or builds a value over 8 MiB: read long
-    text with substr(). Select ids first, then read long text by id with substr(),
-    instead of sorting or scanning on long text columns.
+    full length) and the whole answer to 100,000; binary values come back as
+    "<N bytes>", and `truncated` says when something was left out. A result wider
+    than 32 columns is refused (name the columns you need), and so is a query that
+    reads or builds a value over 8 MiB: read long text with substr(). Select ids
+    first, then read long text by id with substr(), instead of sorting or scanning
+    on long text columns.
 
     Args:
         sql: A single SELECT. Inline the literals; there are no parameters.

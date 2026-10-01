@@ -112,6 +112,14 @@ def test_rows_past_the_total_cap_are_never_read(db, monkeypatch):
 def test_blob_cells_are_described_not_dumped(db):
     out = sql_readonly.run_query("SELECT zeroblob(16) AS b", db_path=db)
     assert out["rows"] == [["<16 bytes>"]]
+    # The bytes were left out, as a cut cell's text is.
+    assert out["truncated"] is True
+
+
+def test_an_empty_blob_leaves_nothing_out(db):
+    out = sql_readonly.run_query("SELECT x'' AS b", db_path=db)
+    assert out["rows"] == [["<0 bytes>"]]
+    assert out["truncated"] is False
 
 
 def test_value_over_the_size_limit_is_an_error_not_a_memory_spike(db, monkeypatch):

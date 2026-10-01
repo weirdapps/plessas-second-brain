@@ -27,7 +27,7 @@ cp ~/.local/bin/sb-db-pull.sh ~/.local/bin/sync-documents-to-vps.sh \
 
 | Directory | Host | Scheduler | Count |
 | --- | --- | --- | --- |
-| `systemd/` | VPS | `systemctl --user` timers | 15 |
+| `systemd/` | VPS | `systemctl --user` timers, plus one long-running service | 15 |
 | `launchd/` | Mac | LaunchAgents | 4, plus one plist template |
 
 The VPS runs all ingestion. A Mac is a read replica: `sb-db-pull.sh` pulls the

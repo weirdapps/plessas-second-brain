@@ -351,9 +351,14 @@ server, or would spawn it per request, should use the HTTP mode instead.
 install -m 755 scripts/wrappers/systemd/sb-mcp.sh ~/.local/bin/sb-mcp.sh
 ```
 
+The archived wrapper assumes the reference producer's layout (the checkout at
+`~/SourceCode/plessas-second-brain`, the venv at `~/.venvs/second-brain`), so
+for another layout edit `PROJECT` and `PYTHON` in `~/.local/bin/sb-mcp.sh`.
+
 `~/scripts/run-sb-mcp.sh` is the host-local shim, like the other `run-sb-*.sh`:
 it sets `PATH`, sources the Vertex environment file (query embeddings need it),
-and execs `~/.local/bin/sb-mcp.sh`.
+sets `BRAIN_DATA_DIR` when the host uses one (`src/config.py` reads it only from
+the process environment), and execs `~/.local/bin/sb-mcp.sh`.
 
 ```ini
 # ~/.config/systemd/user/sb-mcp.service
@@ -386,6 +391,11 @@ systemctl --user daemon-reload && systemctl --user enable --now sb-mcp.service
 # Without the token: 401
 curl --retry 5 --retry-connrefused --retry-delay 1 -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8765/mcp
 ```
+
+After a start-limit failure the unit stays failed: fix the cause, then run
+`systemctl --user reset-failed sb-mcp.service && systemctl --user start sb-mcp.service`.
+A user service stops when your last session ends unless linger is on (section 5,
+`loginctl enable-linger`).
 
 A client authenticates with `Authorization: Bearer <token>`; for Claude Code,
 an `http` entry with that header in its MCP configuration.

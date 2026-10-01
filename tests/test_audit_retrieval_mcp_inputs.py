@@ -88,6 +88,7 @@ CASES = [
     ("attachment_image_search", {"query": "okapi"}, "src.store.recall:_folded_bucket", 3),
     ("search_teams", {"query": "okapi"}, "src.store.teams_query:search_teams", "limit"),
     ("search_whatsapp", {"query": "okapi"}, "src.store.whatsapp_query:search_whatsapp", "limit"),
+    ("sql_query", {"sql": "SELECT 1"}, "src.store.sql_readonly:run_query", "limit"),
 ]
 
 

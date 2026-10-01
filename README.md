@@ -80,7 +80,7 @@ See [`examples/example_exporter.py`](examples/example_exporter.py) for a ~40-lin
 
 ## MCP tools
 
-The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register the server once with `claude mcp add` (see [Register with Claude Code](#register-with-claude-code)), then every session picks them up.
+The MCP server exposes 27 tools (all defined in `src/mcp_server.py`). Register the server once with `claude mcp add` (see [Register with Claude Code](#register-with-claude-code)), then every session picks them up.
 
 ### Unified recall
 
@@ -149,6 +149,13 @@ The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register t
 - `stats()`. Counts across emails, news articles, standalone documents, conversations, topics, people, decisions, actions, attachments, key facts and calendar events, plus `coverage`: the first and last date held per mailbox, Teams, WhatsApp, calendar and conversations. Check it before reading an empty answer as 'nothing happened'.
 
   It also returns `data_as_of`, `age_hours` and `stale`. `data_as_of` is the older of two stamps, both returned as stored: `last_sync_date`, which every `sync` writes, and `mail_export_ok_at`, the Inbox export's last success, which `sync` copies in. `stale_warning` names the one that is behind. On a read replica that is the only way to tell a live corpus from one whose feed stopped, because both answer queries identically.
+
+### SQL (read-only)
+
+- `sql_schema(table=None)`. Without a table, every table and view with its row count, except full-text (virtual) tables, which are listed without one and marked `"virtual": true` (their shadow tables are left out); with one, its columns and indexes.
+- `sql_query(sql, limit=200)`. One read-only `SELECT` (or `WITH ... SELECT`) against `brain.db`, for counts, trends and aggregates the curated tools cannot express, and for the full text they only summarise: `emails.content`, `teams_messages.content_text`, `attachment_content.extracted_text`, `conversation_turns.content`. `sb_fold(text)` folds case, Greek accents and final sigma; apply it to both sides of a `LIKE`.
+
+  It cannot write: the connection is read-only with `query_only` on, and a SQLite authorizer allows nothing but reading. One statement per call, a 10 s budget, at most 200 rows and 32 columns (name the columns you need), 4,000 characters per cell and 100,000 per answer; `truncated` says when something was left out. A query that reads or builds a value over 8 MB fails: read long text with `substr()`. On a replica (the pull stamp exists) it opens with `immutable=1`, the only read-only open that works on a pulled copy.
 
 ## WhatsApp
 
@@ -382,7 +389,7 @@ Full subcommand list: `python -m src.cli --help`.
 src/
   cli.py                       Command-line entry (`brain` wrapper points here)
   config.py                    Paths, env-driven settings, schema version
-  mcp_server.py                MCP server (MCPServer, mcp SDK v2), 24 tools
+  mcp_server.py                MCP server (MCPServer, mcp SDK v2), 27 tools
   bridge.py                    Legacy JSON-over-CLI bridge (superseded by MCP)
   llm_policy.py                Shared Vertex retry and auth policy (vendored, SHA256 drift-checked)
   llm_deadline.py              Derives PTS_LLM_DEADLINE from the calling unit's own budget

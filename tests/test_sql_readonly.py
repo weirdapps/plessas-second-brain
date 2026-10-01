@@ -317,3 +317,37 @@ def test_describe_one_table(db):
 
 def test_describe_unknown_table(db):
     assert "no table" in sql_readonly.describe("nope", db_path=db)["error"]
+
+
+def test_sql_query_tool_reads_the_store(db, monkeypatch):
+    from src import mcp_server
+
+    monkeypatch.setattr(sql_readonly, "DEFAULT_DB", db)
+    out = mcp_server.sql_query("SELECT COUNT(*) AS n FROM emails")
+    assert out["columns"] == ["n"]
+    assert out["rows"] == [[3]]
+
+
+def test_sql_query_tool_clamps_limit(db, monkeypatch):
+    from src import mcp_server
+
+    monkeypatch.setattr(sql_readonly, "DEFAULT_DB", db)
+    out = mcp_server.sql_query("SELECT id FROM emails ORDER BY id", limit=0)
+    assert out["row_count"] == 1
+    assert out["truncated"] is True
+
+
+def test_sql_query_tool_refuses_writes(db, monkeypatch):
+    from src import mcp_server
+
+    monkeypatch.setattr(sql_readonly, "DEFAULT_DB", db)
+    assert "error" in mcp_server.sql_query("DELETE FROM emails")
+    assert _email_count(db) == 3
+
+
+def test_sql_schema_tool(db, monkeypatch):
+    from src import mcp_server
+
+    monkeypatch.setattr(sql_readonly, "DEFAULT_DB", db)
+    assert any(t["table"] == "emails" for t in mcp_server.sql_schema()["tables"])
+    assert {c["name"] for c in mcp_server.sql_schema("emails")["columns"]} >= {"id", "subject"}

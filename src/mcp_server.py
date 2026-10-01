@@ -1157,5 +1157,51 @@ def teams_chat_summary(chat_id: int, days: int = 30) -> dict:
         conn.close()
 
 
+@mcp.tool()
+def sql_query(sql: str, limit: int = 200) -> dict:
+    """Run ONE read-only SELECT against brain.db and return the rows.
+
+    For counts, trends and aggregates the other tools cannot express, and for the
+    full text they only summarise: emails.content, teams_messages.content_text,
+    attachment_content.extracted_text (join attachments.id =
+    attachment_content.attachment_id) and conversation_turns.content. Call
+    sql_schema first for table and column names. sb_fold(text) lowercases, strips
+    Greek accents and merges final ς into σ, so fold both sides:
+    `WHERE sb_fold(subject) LIKE '%' || sb_fold('term') || '%'` matches every
+    spelling.
+
+    Read-only by construction: anything but reading is refused. One statement per
+    call (WITH ... SELECT is fine), a 10 s budget, at most `limit` rows (cap 200)
+    and 32 columns (name the columns you need instead of SELECT *), each cell cut
+    to 4,000 characters and the whole answer to 100,000; `truncated` says when
+    something was left out. A query that reads or builds a value over 8 MB fails:
+    read long text with substr(). Select ids first, then read long text by id with
+    substr(), instead of sorting or scanning on long text columns.
+
+    Args:
+        sql: A single SELECT. Inline the literals; there are no parameters.
+        limit: Maximum rows to return, 1 to 200 (default 200).
+    """
+    from src.store.sql_readonly import run_query
+
+    return run_query(sql, limit=_cap(limit))
+
+
+@mcp.tool()
+def sql_schema(table: str | None = None) -> dict:
+    """Tables of brain.db for sql_query: the list, or one table's columns and indexes.
+
+    The list gives every table and view with its row count, except full-text
+    (virtual) tables, which are listed without one and marked "virtual": true.
+    Full-text index shadow tables are left out of the list.
+
+    Args:
+        table: A table or view name for its columns and indexes; omit for the list.
+    """
+    from src.store.sql_readonly import describe
+
+    return describe(table)
+
+
 if __name__ == "__main__":
     mcp.run()

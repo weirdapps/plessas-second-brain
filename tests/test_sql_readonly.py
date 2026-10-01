@@ -197,6 +197,15 @@ def test_producer_opens_plain_read_only(db, tmp_path, monkeypatch):
     assert seen[0].endswith("?mode=ro")
 
 
+def test_sorts_get_a_16_mb_cache_and_spill_to_files(db):
+    conn = sql_readonly.connect_read_only(db)
+    try:
+        assert conn.execute("PRAGMA cache_size").fetchone()[0] == -16384
+        assert conn.execute("PRAGMA temp_store").fetchone()[0] == 1  # FILE
+    finally:
+        conn.close()
+
+
 def test_describe_lists_tables_without_fts_shadows(db):
     out = sql_readonly.describe(db_path=db)
     names = {t["table"] for t in out["tables"]}

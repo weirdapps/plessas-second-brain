@@ -69,6 +69,12 @@ def connect_read_only(db_path: Path | None = None) -> sqlite3.Connection:
     conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
     conn.row_factory = sqlite3.Row
     register_sql_functions(conn)
+    # SQLite sizes a sort's in-memory runs from cache_size. A sort that carries
+    # long texts peaked at 1.06 GB on a real store with the default 2 MB, and at
+    # 0.31 GB with 16 MB. temp_store=FILE keeps sort data on disk even where a
+    # build defaults temporary storage to memory.
+    conn.execute("PRAGMA cache_size = -16384")
+    conn.execute("PRAGMA temp_store = FILE")
     conn.execute("PRAGMA query_only = ON")
     return conn
 

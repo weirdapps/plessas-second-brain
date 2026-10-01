@@ -4,7 +4,10 @@ Exposes the knowledge store as MCP tools for Claude Code plugins.
 Run: python -m src.mcp_server
 """
 
+import argparse
+import os
 import re
+import sys
 from datetime import UTC
 
 from mcp.server import MCPServer
@@ -1207,5 +1210,45 @@ def sql_schema(table: str | None = None) -> dict:
     return describe(table)
 
 
+def _host_port(value: str) -> tuple[str, int]:
+    """argparse type for --http: HOST:PORT, with an IPv6 host in brackets ([::1]:8765)."""
+    host, sep, port = value.rpartition(":")
+    host = host.strip("[]")
+    if not sep or not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise argparse.ArgumentTypeError(f"expected HOST:PORT, got {value!r}")
+    return host, int(port)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """stdio by default, exactly as before; --http HOST:PORT serves streamable HTTP."""
+    parser = argparse.ArgumentParser(prog="python -m src.mcp_server")
+    parser.add_argument(
+        "--http",
+        type=_host_port,
+        metavar="HOST:PORT",
+        help="serve streamable HTTP on a loopback HOST:PORT instead of stdio; "
+        "needs BRAIN_MCP_TOKEN_FILE",
+    )
+    args = parser.parse_args(argv)
+    if args.http is None:
+        mcp.run()
+        return 0
+
+    from src.mcp_http import build_http_app, load_token
+
+    host, port = args.http
+    try:
+        token = load_token(os.environ.get("BRAIN_MCP_TOKEN_FILE", ""))
+        app = build_http_app(mcp, token, host=host)
+    except ValueError as exc:
+        print(f"second-brain MCP: {exc}", file=sys.stderr)
+        return 2
+
+    import uvicorn
+
+    uvicorn.run(app, host=host, port=port, log_level="warning")
+    return 0
+
+
 if __name__ == "__main__":
-    mcp.run()
+    raise SystemExit(main())

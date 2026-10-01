@@ -97,7 +97,9 @@ def test_every_mcp_tool_runs_against_a_fresh_database(tmp_path, monkeypatch):
         "chat_id": 1,
     }
 
-    skip = {"outlook_live_search"}  # shells out to outlook-cli; not a DB path
+    # outlook_live_search shells out to outlook-cli; not a DB path. main is the
+    # command-line entry point, not a tool: called bare it parses pytest's argv.
+    skip = {"outlook_live_search", "main"}
     checked = 0
     for name, fn in vars(server).items():
         if name.startswith("_") or name in skip or not callable(fn):

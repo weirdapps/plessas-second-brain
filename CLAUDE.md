@@ -12,13 +12,13 @@ Multi-modal personal knowledge base: ingests emails, attachments, calendar event
 
 ## Running
 
-- MCP server: `./run_mcp.sh` (auto-detects the venv: `$SECOND_BRAIN_VENV_PYTHON`, `./.venv`, `./venv`, `~/.venvs/second-brain`, then `python3`).
+- MCP server: `./run_mcp.sh` (auto-detects the venv: `$SECOND_BRAIN_VENV_PYTHON`, `./.venv`, `./venv`, `~/.venvs/second-brain`, then `python3`). Over HTTP: `python -m src.mcp_server --http 127.0.0.1:8765` (loopback only, bearer token from the file `BRAIN_MCP_TOKEN_FILE` names; see `README.md`).
 - CLI: `python -m src.cli --help` (or the `./brain` wrapper).
 - Incremental sync over staged mail (extract → load → attachments → dedup → embed → conversations → images): `python -m src.cli sync`. Mail is staged by `python -m src.export.outlook_export` (outlook-cli); `sync` never exports it. Teams, calendar, news, SharePoint and the filesystem scan are separate subcommands and need their own schedule.
 
 ## Hosts
 
-- The producer, a Linux VPS in this deployment, runs every ingest job on `systemd --user` timers and owns the only writable `brain.db`. Deploy code there by pulling; the wrappers the units run are archived in `scripts/wrappers/systemd/`.
+- The producer, a Linux VPS in this deployment, runs every ingest job on `systemd --user` timers and owns the only writable `brain.db`. For the brain bot it also runs `sb-mcp`, the HTTP mode as a long-running `systemd --user` unit with `BRAIN_ROLE=replica` (`docs/DEPLOY.md` section 9). Deploy code there by pulling, then `systemctl --user try-restart sb-mcp.service`: a pull restarts nothing, and sb-mcp keeps serving the old code. The wrappers the units run are archived in `scripts/wrappers/systemd/`.
 - A Mac is a replica: an hourly pull (`scripts/wrappers/launchd/sb-db-pull.sh`) copies `brain.db` and `embeddings.npz` down, and the local MCP server reads that copy. Every writer refuses to run on a replica: the `python -m src.cli` subcommands that write, the action lifecycle, the store maintenance modules, the scripts that write and the MCP `sharepoint_index` refetch (`BRAIN_ROLE=replica`, or the pull's stamp `~/.second-brain/db-pull.stamp`); `BRAIN_ROLE=producer` overrides the stamp.
 - Schema migrations run on the producer and reach replicas with the next pull.
 
@@ -40,7 +40,7 @@ CI (`.github/workflows/ci.yml`), five jobs on every push and PR to `master`: `li
 1. **Ingest** → raw content into `data/staging/batch-*.json`. The staging JSON shape is the source-agnostic contract (see "Bring your own source" in `README.md` and `examples/`). Microsoft 365 sources use the external, optional `outlook-cli` / `teams-cli` / `sharepoint-cli` adapters. `news-sync` reads an external news-reader SQLite DB (`BRAIN_NEWS_DB`) and stages digests plus above-threshold articles under `mailbox_name = 'News'`.
 2. **Extract** → an LLM (Claude via Vertex AI by default, or `ANTHROPIC_API_KEY`; Gemini optional) produces structured JSON: summary, sentiment, urgency, topics, decisions, action items, people, key facts.
 3. **Load** → `src/store/loader.py` writes to SQLite with FTS5 indexes + embedding vectors + thread reconstruction. `create_database` stamps version 0 and then calls `run_migrations`, so a fresh store and a migrated one converge on the same tables; `CURRENT_SCHEMA_VERSION` lives in `src/config.py`. `python -m src.cli load` is the only command that creates the DB: `stats`, `sync` and `migrate` all exit 1 if it is absent.
-4. **Serve** → `src/mcp_server.py` (`mcp.server.MCPServer`, mcp SDK v2) exposes the store as MCP tools; `src/cli.py` mirrors them for the terminal.
+4. **Serve** → `src/mcp_server.py` (`mcp.server.MCPServer`, mcp SDK v2) exposes the store as MCP tools; `src/cli.py` mirrors them for the terminal, except `sql_query` and `sql_schema` (read-only SQL, MCP only).
 
 ## Key conventions
 

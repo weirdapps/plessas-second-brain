@@ -393,6 +393,10 @@ systemctl --user daemon-reload && systemctl --user enable --now sb-mcp.service
 curl --retry 5 --retry-connrefused --retry-delay 1 -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8765/mcp
 ```
 
+Updating the checkout restarts nothing, and sb-mcp, unlike the scheduled jobs,
+keeps running the code it started with: after each update run
+`systemctl --user try-restart sb-mcp.service`.
+
 After a start-limit failure the unit stays failed: fix the cause, then run
 `systemctl --user reset-failed sb-mcp.service && systemctl --user start sb-mcp.service`.
 A user service stops when your last session ends unless linger is on (section 5,

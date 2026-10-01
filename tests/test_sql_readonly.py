@@ -116,6 +116,13 @@ def test_anything_but_reading_is_refused(db, sql):
     assert _email_count(db) == 3
 
 
+def test_refusal_text_never_doubles_the_period(db):
+    # SQLite's own message for this one already ends in a period.
+    out = sql_readonly.run_query("SELECT 1; SELECT 2", db_path=db)
+    assert out["error"].startswith("refused: ")
+    assert ".." not in out["error"]
+
+
 def test_fts_match_works_through_the_authorizer(db):
     out = sql_readonly.run_query(
         "SELECT rowid FROM emails_fts WHERE emails_fts MATCH 'budget'", db_path=db

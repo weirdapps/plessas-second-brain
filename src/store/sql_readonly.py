@@ -111,7 +111,7 @@ def run_query(sql: str, limit: int = MAX_ROWS, db_path: Path | None = None) -> d
             f"with substr(column, start, {CELL_CHARS}), or combine fewer rows"
         }
     except (sqlite3.DatabaseError, sqlite3.Warning) as exc:
-        return {"error": f"refused: {exc}. One read-only SELECT per call."}
+        return {"error": f"refused: {str(exc).rstrip('.')}. One read-only SELECT per call."}
     finally:
         conn.close()
 

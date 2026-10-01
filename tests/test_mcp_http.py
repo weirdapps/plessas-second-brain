@@ -1,12 +1,22 @@
 """Tests for the HTTP serving mode: token file, bearer middleware, loopback rule, CLI entry."""
 
+import os
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
 from unittest.mock import patch
 
+import anyio
 import pytest
 
 from src import mcp_http, mcp_server
 
 TOKEN = "t" * 40
+REPO = Path(__file__).resolve().parents[1]
 
 
 def _drive(coro) -> None:
@@ -221,3 +231,80 @@ def test_http_accepts_bracketed_ipv6(tmp_path, monkeypatch):
 def test_http_rejects_a_malformed_address(bad):
     with pytest.raises(SystemExit):
         mcp_server.main(["--http", bad])
+
+
+def _free_loopback_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+@pytest.mark.allow_network
+def test_a_real_server_refuses_without_the_token_and_lists_tools_with_it(tmp_path, monkeypatch):
+    """The server in a subprocess on loopback, through BearerAuth into the streamable app.
+
+    Every test above steps the ASGI code by hand, so a dependency update that broke
+    routing or the lifespan would leave them all green. This is the one test that
+    opens sockets, and only on 127.0.0.1.
+    """
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.shared._httpx_utils import create_mcp_http_client
+
+    token = "e" * 64
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    port = _free_loopback_port()
+    url = f"http://127.0.0.1:{port}/mcp"
+    # A proxy from the environment (or, on macOS, the system's) must not carry loopback.
+    monkeypatch.setenv("no_proxy", "127.0.0.1")
+    env = {
+        **os.environ,
+        "BRAIN_MCP_TOKEN_FILE": _token_file(tmp_path, token),
+        "BRAIN_DATA_DIR": str(data_dir),
+    }
+    log = tmp_path / "server.log"
+    with log.open("wb") as err:
+        server = subprocess.Popen(
+            [sys.executable, "-m", "src.mcp_server", "--http", f"127.0.0.1:{port}"],
+            cwd=REPO,
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=err,
+        )
+    try:
+        deadline = time.monotonic() + 20
+        while True:
+            assert server.poll() is None, log.read_text()
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                break
+            except OSError:
+                assert time.monotonic() < deadline, "not listening after 20 s\n" + log.read_text()
+                time.sleep(0.1)
+
+        direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            direct.open(urllib.request.Request(url, data=b"{}", method="POST"), timeout=10)
+        refused.value.close()
+        assert refused.value.code == 401
+
+        async def list_tools() -> list[str]:
+            with anyio.fail_after(30):
+                headers = {"Authorization": f"Bearer {token}"}
+                async with create_mcp_http_client(headers=headers) as http:
+                    async with streamable_http_client(url, http_client=http) as (read, write):
+                        async with ClientSession(read, write) as session:
+                            await session.initialize()
+                            return [tool.name for tool in (await session.list_tools()).tools]
+
+        names = anyio.run(list_tools)
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait()
+    assert len(names) == 27, names
+    assert {"sql_query", "sql_schema"} <= set(names)

@@ -337,6 +337,74 @@ the latest ingest. On a replica it is whatever the last pull left behind: check
 `~/.second-brain/db-pull.stamp`, or the `data_as_of` and `age_hours` fields the
 `stats` tool returns, before trusting an answer about anything recent.
 
+### Over HTTP: one process for every client
+
+Each stdio client spawns its own server, and each server loads the embedding
+index (about 1.6 GB) on its first semantic query. A client that cannot spawn the
+server, or would spawn it per request, should use the HTTP mode instead.
+
+```bash
+# 1. A token only the owner can read
+(umask 077 && mkdir -p ~/.config/second-brain && { [ -s ~/.config/second-brain/mcp-token ] || openssl rand -hex 32 > ~/.config/second-brain/mcp-token; })
+
+# 2. The wrapper (archived at scripts/wrappers/systemd/sb-mcp.sh)
+install -m 755 scripts/wrappers/systemd/sb-mcp.sh ~/.local/bin/sb-mcp.sh
+```
+
+The archived wrapper assumes the reference producer's layout (the checkout at
+`~/SourceCode/plessas-second-brain`, the venv at `~/.venvs/second-brain`), so
+for another layout edit `PROJECT` and `PYTHON` in `~/.local/bin/sb-mcp.sh`.
+
+`~/scripts/run-sb-mcp.sh` is the host-local shim, like the other `run-sb-*.sh`:
+it sets `PATH`, sources the Vertex environment file (query embeddings need it),
+sets `BRAIN_DATA_DIR` when the host uses one (`src/config.py` reads it only from
+the process environment), and execs `~/.local/bin/sb-mcp.sh`.
+
+```ini
+# ~/.config/systemd/user/sb-mcp.service
+[Unit]
+Description=second-brain MCP over HTTP (loopback, bearer token)
+# notify-failure@ is a host-local template that mails the failure; drop the line if the host has none.
+OnFailure=notify-failure@%n.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%h/scripts/run-sb-mcp.sh
+Restart=always
+RestartSec=10
+# On systemd 254+ a crash otherwise enters failed before each restart, so OnFailure=
+# would mail every 10 s. In direct mode the restarts are silent, and OnFailure= fires
+# once, when the start limit in [Unit] gives up.
+RestartMode=direct
+# A reload after embeddings.npz changes holds one index (about 1.6 GB), plus the
+# old one only while a reader is still mid-call.
+MemoryMax=4G
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload && systemctl --user enable --now sb-mcp.service
+# Without the token: 401
+curl --retry 5 --retry-connrefused --retry-delay 1 -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8765/mcp
+```
+
+Updating the checkout restarts nothing, and sb-mcp, unlike the scheduled jobs,
+keeps running the code it started with: after each update run
+`systemctl --user try-restart sb-mcp.service`.
+
+After a start-limit failure the unit stays failed: fix the cause, then run
+`systemctl --user reset-failed sb-mcp.service && systemctl --user start sb-mcp.service`.
+A user service stops when your last session ends unless linger is on (section 5,
+`loginctl enable-linger`).
+
+A client authenticates with `Authorization: Bearer <token>`; for Claude Code,
+an `http` entry with that header in its MCP configuration.
+
 ## 10. Files are inputs
 
 Attachment files are deleted once their content is stored; the database keeps the text,

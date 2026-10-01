@@ -276,6 +276,41 @@ def test_the_instructions_say_results_are_data_and_where_to_find_coverage():
     assert "2018 to present" not in _INSTRUCTIONS
 
 
+# The freshness paragraph as every replica has always read it.
+_REPLICA_FRESHNESS = (
+    "Freshness. This is a REPLICA, synced from the machine that builds it, so it can "
+    "lag. `stats` returns data_as_of / age_hours / stale, and `recall` attaches "
+    "_stale_warning when it matters. For mail newer than the replica, use "
+    "`outlook_live_search`, which looks back 24 hours at most."
+)
+
+
+def test_the_instructions_say_replica_only_where_the_pull_stamp_exists(tmp_path, monkeypatch):
+    """Over HTTP on the producer the store is the master, so "This is a REPLICA"
+    was false there. The pull stamp decides, as it does for sql_query's open; the
+    producer serves with BRAIN_ROLE=replica, so that variable must not."""
+    from src import mcp_server
+
+    stamp = tmp_path / "db-pull.stamp"
+    stamp.write_text("pulled")
+    monkeypatch.setattr(mcp_server, "REPLICA_STAMP", stamp)
+    replica = mcp_server._instructions()
+    monkeypatch.setattr(mcp_server, "REPLICA_STAMP", tmp_path / "absent.stamp")
+    monkeypatch.setenv("BRAIN_ROLE", "replica")
+    producer = mcp_server._instructions()
+
+    assert _REPLICA_FRESHNESS in replica
+    assert "replica" not in producer.lower()
+    for text in (replica, producer):
+        assert "`stats` returns data_as_of / age_hours / stale" in text
+        assert "use `outlook_live_search`, which looks back 24 hours at most" in text
+
+    def rest(text: str) -> list[str]:
+        return [p for p in text.split("\n\n") if not p.startswith("Freshness.")]
+
+    assert rest(producer) == rest(replica)
+
+
 def test_stats_reports_where_each_source_starts_and_ends(conn, monkeypatch):
     """'2018 to present' came from 19 old documents; real mail starts years
     later, and each source starts somewhere else. An agent that cannot see

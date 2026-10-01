@@ -25,8 +25,9 @@ directory's conftest, which can import src.config first; this file's own import
 precedes both, so it catches every one. (See tests/test_config_paths.py.)
 
 `no_network` blocks socket creation for the whole session. A test that genuinely
-needs the network marks itself `@pytest.mark.allow_network`; there are none
-today, and adding one should be a deliberate act.
+needs the network marks itself `@pytest.mark.allow_network`; there is one today,
+the loopback end-to-end test in tests/test_mcp_http.py, and adding another should
+be a deliberate act.
 """
 
 import os

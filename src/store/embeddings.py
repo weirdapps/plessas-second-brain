@@ -46,7 +46,7 @@ _INDEX_CACHE: dict = {"path": None, "mtime": None, "ids": None, "unit": None}
 # overlap. Unlocked, every one that missed the cache loaded its own copy: 3.3 GB
 # for two cold callers on the 1.6 GB index, 5 GB for two after a rewrite, against
 # a 4 GB MemoryMax. Every read and write of _INDEX_CACHE holds this lock.
-_INDEX_LOCK = threading.Lock()
+_CACHE_LOCK = threading.Lock()
 
 
 def _load_index(index_path=None):
@@ -59,7 +59,7 @@ def _load_index(index_path=None):
     path = EMBEDDINGS_FILE if index_path is None else Path(index_path)
     if not path.exists():
         raise FileNotFoundError("No embedding index found. Run 'python -m src.cli embed' first.")
-    with _INDEX_LOCK:
+    with _CACHE_LOCK:
         # The hit is checked under the lock as well: the cache is four fields, and
         # a check outside it could match the path and mtime, then read the None a
         # reload had just put in their place.

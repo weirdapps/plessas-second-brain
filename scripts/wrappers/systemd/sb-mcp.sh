@@ -4,7 +4,7 @@
 # (Restart=always), so this wrapper only sets the scene and execs.
 #
 # Loopback only, bearer token required: src/mcp_http.py refuses anything else.
-# BRAIN_ROLE=replica turns off the one MCP write path (the sharepoint_index
+# BRAIN_ROLE=replica turns off the one write path into brain.db (the sharepoint_index
 # refetch), although the master database sits next to this process.
 
 set -uo pipefail

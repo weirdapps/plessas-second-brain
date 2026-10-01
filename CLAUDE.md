@@ -40,7 +40,7 @@ CI (`.github/workflows/ci.yml`), five jobs on every push and PR to `master`: `li
 1. **Ingest** → raw content into `data/staging/batch-*.json`. The staging JSON shape is the source-agnostic contract (see "Bring your own source" in `README.md` and `examples/`). Microsoft 365 sources use the external, optional `outlook-cli` / `teams-cli` / `sharepoint-cli` adapters. `news-sync` reads an external news-reader SQLite DB (`BRAIN_NEWS_DB`) and stages digests plus above-threshold articles under `mailbox_name = 'News'`.
 2. **Extract** → an LLM (Claude via Vertex AI by default, or `ANTHROPIC_API_KEY`; Gemini optional) produces structured JSON: summary, sentiment, urgency, topics, decisions, action items, people, key facts.
 3. **Load** → `src/store/loader.py` writes to SQLite with FTS5 indexes + embedding vectors + thread reconstruction. `create_database` stamps version 0 and then calls `run_migrations`, so a fresh store and a migrated one converge on the same tables; `CURRENT_SCHEMA_VERSION` lives in `src/config.py`. `python -m src.cli load` is the only command that creates the DB: `stats`, `sync` and `migrate` all exit 1 if it is absent.
-4. **Serve** → `src/mcp_server.py` (`mcp.server.MCPServer`, mcp SDK v2) exposes the store as MCP tools; `src/cli.py` mirrors them for the terminal, except `sql_query` and `sql_schema` (read-only SQL, MCP only).
+4. **Serve** → `src/mcp_server.py` (`mcp.server.MCPServer`, mcp SDK v2) exposes the store as MCP tools; `src/cli.py` mirrors some of them for the terminal (not `sql_query` or `sql_schema`, which are MCP only).
 
 ## Key conventions
 

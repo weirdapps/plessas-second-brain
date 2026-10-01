@@ -4,6 +4,10 @@ These avoid the real 1 GB embeddings.npz and any Vertex call by writing a tiny
 temp index and injecting a fake embedder.
 """
 
+import os
+import threading
+import weakref
+
 import numpy as np
 
 from src.store.embeddings import (
@@ -51,6 +55,68 @@ class TestLoadIndex:
 
         assert np.allclose(np.sqrt((unit * unit).sum(axis=1)), [1.0, 0.0, 1.0])
         assert np.allclose(unit[0], [0.6, 0.8, 0.0])
+
+    def test_concurrent_callers_share_one_load(self, tmp_path, monkeypatch):
+        """The HTTP server runs each session's tool call in a worker thread. Each
+        caller that missed the cache loaded its own copy beside the other: 3.3 GB
+        for two cold callers on the real 1.6 GB index, against a 4 GB MemoryMax."""
+        p = tmp_path / "emb.npz"
+        _write_npz(p, [1, 2], [[3.0, 0.0, 0.0], [0.0, 5.0, 0.0]])
+        real_load = np.load
+        loads: list[str] = []
+        loading = threading.Condition()
+
+        def slow_load(*args, **kwargs):
+            with loading:
+                loads.append(threading.current_thread().name)
+                loading.notify_all()
+                # Held open until a second load starts, or half a second passes.
+                loading.wait_for(lambda: len(loads) > 1, timeout=0.5)
+            return real_load(*args, **kwargs)
+
+        monkeypatch.setattr(np, "load", slow_load)
+        results: dict[int, tuple] = {}
+
+        def call(n):
+            results[n] = _load_index(str(p))
+
+        first = threading.Thread(target=call, args=(1,))
+        first.start()
+        with loading:
+            assert loading.wait_for(lambda: loads, timeout=5)
+        second = threading.Thread(target=call, args=(2,))
+        second.start()
+        first.join(10)
+        second.join(10)
+
+        assert len(loads) == 1
+        assert results[1][1] is results[2][1]
+        assert np.allclose(np.linalg.norm(results[2][1], axis=1), 1.0)
+
+    def test_a_reload_lets_go_of_the_old_index_before_loading_the_new(self, tmp_path, monkeypatch):
+        """The old arrays stayed in the cache until the new ones replaced them, so
+        every reload after the producer rewrote the index held two."""
+        p = tmp_path / "emb.npz"
+        _write_npz(p, [1], [[1.0, 0.0, 0.0]])
+        ids, unit = _load_index(str(p))
+        old = (weakref.ref(ids), weakref.ref(unit))
+        del ids, unit
+        _write_npz(p, [2], [[0.0, 2.0, 0.0]])
+        later = p.stat().st_mtime + 5
+        os.utime(p, (later, later))
+        real_load = np.load
+        old_alive_at_load: list[bool] = []
+
+        def watching_load(*args, **kwargs):
+            old_alive_at_load.append(any(ref() is not None for ref in old))
+            return real_load(*args, **kwargs)
+
+        monkeypatch.setattr(np, "load", watching_load)
+        new_ids, new_unit = _load_index(str(p))
+
+        assert old_alive_at_load == [False]
+        assert new_ids.tolist() == [2]
+        assert np.allclose(new_unit, [[0.0, 1.0, 0.0]])
 
 
 class TestSemanticEmailCandidates:

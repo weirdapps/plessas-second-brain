@@ -378,7 +378,8 @@ RestartSec=10
 # would mail every 10 s. In direct mode the restarts are silent, and OnFailure= fires
 # once, when the start limit in [Unit] gives up.
 RestartMode=direct
-# One index is about 1.6 GB; a reload after embeddings.npz changes briefly holds two.
+# A reload after embeddings.npz changes holds one index (about 1.6 GB), plus the
+# old one only while a reader is still mid-call.
 MemoryMax=4G
 NoNewPrivileges=yes
 

@@ -359,14 +359,20 @@ and execs `~/.local/bin/sb-mcp.sh`.
 # ~/.config/systemd/user/sb-mcp.service
 [Unit]
 Description=second-brain MCP over HTTP (loopback, bearer token)
-After=network-online.target
+# notify-failure@ is a host-local template that mails the failure; drop the line if the host has none.
 OnFailure=notify-failure@%n.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=%h/scripts/run-sb-mcp.sh
 Restart=always
 RestartSec=10
+# On systemd 254+ a crash otherwise enters failed before each restart, so OnFailure=
+# would mail every 10 s. In direct mode the restarts are silent, and OnFailure= fires
+# once, when the start limit in [Unit] gives up.
+RestartMode=direct
 # One index is about 1.6 GB; a reload after embeddings.npz changes briefly holds two.
 MemoryMax=4G
 NoNewPrivileges=yes
@@ -378,7 +384,7 @@ WantedBy=default.target
 ```bash
 systemctl --user daemon-reload && systemctl --user enable --now sb-mcp.service
 # Without the token: 401
-curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8765/mcp
+curl --retry 5 --retry-connrefused --retry-delay 1 -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8765/mcp
 ```
 
 A client authenticates with `Authorization: Bearer <token>`; for Claude Code,

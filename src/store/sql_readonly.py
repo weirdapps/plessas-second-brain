@@ -126,6 +126,8 @@ def run_query(sql: str, limit: int = MAX_ROWS, db_path: Path | None = None) -> d
                 truncated = True
                 break
             row = [_cell(v) for v in tuple(raw)]
+            if any(isinstance(v, str) and len(v) > CELL_CHARS for v in raw):
+                truncated = True  # a cut cell left text out, as a dropped row does
             size = sum(len(str(v)) for v in row)
             if not rows and size > TOTAL_CHARS:
                 # One row wider than the whole answer: every cell gets an equal

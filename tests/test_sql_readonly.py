@@ -66,6 +66,15 @@ def test_cell_cut(db):
     cell = out["rows"][0][0]
     assert cell.startswith("x" * sql_readonly.CELL_CHARS)
     assert "cut, 5000 chars" in cell
+    # A cut body read as whole is the failure this flag exists to prevent.
+    assert out["truncated"] is True
+
+
+def test_a_cell_exactly_at_the_cap_is_whole_and_not_truncated(db):
+    width = sql_readonly.CELL_CHARS
+    out = sql_readonly.run_query(f"SELECT printf('%.{width}c', 'x') AS edge", db_path=db)
+    assert out["rows"] == [["x" * width]]
+    assert out["truncated"] is False
 
 
 def test_total_size_cap_drops_whole_rows_and_leaves_small_ones_untouched(db, monkeypatch):

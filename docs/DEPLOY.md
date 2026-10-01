@@ -337,6 +337,53 @@ the latest ingest. On a replica it is whatever the last pull left behind: check
 `~/.second-brain/db-pull.stamp`, or the `data_as_of` and `age_hours` fields the
 `stats` tool returns, before trusting an answer about anything recent.
 
+### Over HTTP: one process for every client
+
+Each stdio client spawns its own server, and each server loads the embedding
+index (about 1.6 GB) on its first semantic query. A client that cannot spawn the
+server, or would spawn it per request, should use the HTTP mode instead.
+
+```bash
+# 1. A token only the owner can read
+(umask 077 && mkdir -p ~/.config/second-brain && openssl rand -hex 32 > ~/.config/second-brain/mcp-token)
+
+# 2. The wrapper (archived at scripts/wrappers/systemd/sb-mcp.sh)
+install -m 755 scripts/wrappers/systemd/sb-mcp.sh ~/.local/bin/sb-mcp.sh
+```
+
+`~/scripts/run-sb-mcp.sh` is the host-local shim, like the other `run-sb-*.sh`:
+it sets `PATH`, sources the Vertex environment file (query embeddings need it),
+and execs `~/.local/bin/sb-mcp.sh`.
+
+```ini
+# ~/.config/systemd/user/sb-mcp.service
+[Unit]
+Description=second-brain MCP over HTTP (loopback, bearer token)
+After=network-online.target
+OnFailure=notify-failure@%n.service
+
+[Service]
+Type=simple
+ExecStart=%h/scripts/run-sb-mcp.sh
+Restart=always
+RestartSec=10
+# One index is about 1.6 GB; a reload after embeddings.npz changes briefly holds two.
+MemoryMax=4G
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload && systemctl --user enable --now sb-mcp.service
+# Without the token: 401
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8765/mcp
+```
+
+A client authenticates with `Authorization: Bearer <token>`; for Claude Code,
+an `http` entry with that header in its MCP configuration.
+
 ## 10. Files are inputs
 
 Attachment files are deleted once their content is stored; the database keeps the text,

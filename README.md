@@ -80,7 +80,7 @@ See [`examples/example_exporter.py`](examples/example_exporter.py) for a ~40-lin
 
 ## MCP tools
 
-The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register the server once with `claude mcp add` (see [Register with Claude Code](#register-with-claude-code)), then every session picks them up.
+The MCP server exposes 27 tools (all defined in `src/mcp_server.py`). Register the server once with `claude mcp add` (see [Register with Claude Code](#register-with-claude-code)), then every session picks them up.
 
 ### Unified recall
 
@@ -149,6 +149,13 @@ The MCP server exposes 24 tools (all defined in `src/mcp_server.py`). Register t
 - `stats()`. Counts across emails, news articles, standalone documents, conversations, topics, people, decisions, actions, attachments, key facts and calendar events, plus `coverage`: the first and last date held per mailbox, Teams, WhatsApp, calendar and conversations. Check it before reading an empty answer as 'nothing happened'.
 
   It also returns `data_as_of`, `age_hours` and `stale`. `data_as_of` is the older of two stamps, both returned as stored: `last_sync_date`, which every `sync` writes, and `mail_export_ok_at`, the Inbox export's last success, which `sync` copies in. `stale_warning` names the one that is behind. On a read replica that is the only way to tell a live corpus from one whose feed stopped, because both answer queries identically.
+
+### SQL (read-only)
+
+- `sql_schema(table=None)`. Without a table, every table and view with its row count; with one, its columns and indexes. `rows` is null for full-text (virtual) tables, which are marked `"virtual": true`, and also where counting ran out of the shared time budget (or a view cannot be counted). Full-text shadow tables are left out of the list.
+- `sql_query(sql, limit=200)`. One read-only `SELECT` (or `WITH ... SELECT`) against `brain.db`, for counts, trends and aggregates the curated tools cannot express, and for the full text they only summarise: `emails.content`, `teams_messages.content_text`, `attachment_content.extracted_text`, `conversation_turns.content`. `sb_fold(text)` folds case, Greek accents and final sigma, so fold both sides: `WHERE sb_fold(subject) LIKE '%' || sb_fold('term') || '%'`.
+
+  It cannot write: the connection is read-only with `query_only` on, and a SQLite authorizer allows nothing but reading. One statement per call, a 10 s budget, at most 200 rows, 4,000 characters per cell (a cut cell ends `… [cut, N chars]`, N its full length) and 100,000 per answer; binary values come back as `<N bytes>`, and `truncated` says when something was left out. A result wider than 32 columns is refused (name the columns you need), and so is a query that reads or builds a value over 8 MiB: read long text with `substr()`. On a replica (the pull stamp exists) it opens with `immutable=1`, the only read-only open that works on a pulled copy.
 
 ## WhatsApp
 
@@ -315,6 +322,15 @@ python -m src.mcp_server
 
 `run_mcp.sh` auto-detects the venv in this order: `$SECOND_BRAIN_VENV_PYTHON`, `./.venv/bin/python`, `./venv/bin/python`, `~/.venvs/second-brain/bin/python`, then `python3`. The script is portable across hosts (in-repo venv on macOS, out-of-repo `~/.venvs/` on the VPS).
 
+To serve it over HTTP instead, for a client that cannot spawn it (one process then holds the embedding index for every request):
+
+```bash
+(umask 077 && mkdir -p ~/.config/second-brain && { [ -s ~/.config/second-brain/mcp-token ] || openssl rand -hex 32 > ~/.config/second-brain/mcp-token; })
+BRAIN_MCP_TOKEN_FILE=~/.config/second-brain/mcp-token python -m src.mcp_server --http 127.0.0.1:8765
+```
+
+The endpoint is `http://127.0.0.1:8765/mcp`. Loopback only, and every request needs `Authorization: Bearer <token>`: the server refuses to start with a non-loopback host, a token file others can read, or a token under 32 characters. On the producer, run it with `BRAIN_ROLE=replica` so the one write path into `brain.db` (the `sharepoint_index` refetch) stays off; `docs/DEPLOY.md` section 9 has the systemd setup.
+
 ### Register with Claude Code
 
 ```bash
@@ -382,7 +398,7 @@ Full subcommand list: `python -m src.cli --help`.
 src/
   cli.py                       Command-line entry (`brain` wrapper points here)
   config.py                    Paths, env-driven settings, schema version
-  mcp_server.py                MCP server (MCPServer, mcp SDK v2), 24 tools
+  mcp_server.py                MCP server (MCPServer, mcp SDK v2), 27 tools
   bridge.py                    Legacy JSON-over-CLI bridge (superseded by MCP)
   llm_policy.py                Shared Vertex retry and auth policy (vendored, SHA256 drift-checked)
   llm_deadline.py              Derives PTS_LLM_DEADLINE from the calling unit's own budget
@@ -438,6 +454,7 @@ src/
     action_lifecycle.py        Dedups action items and ages out stale ones
     conversation_query.py      Claude Code conversation search
     teams_query.py             Teams thread, chat, and search
+    sql_readonly.py            Read-only SQL over brain.db for the sql_query and sql_schema tools
     calendar_loader.py         Calendar event and attendee loader
   ingest/
     reverse_scan.py            Filesystem scan with latest-version-per-name dedup

@@ -9,6 +9,7 @@ import gc
 import os
 import sqlite3
 import sys
+import threading
 import time
 import zipfile
 from contextlib import contextmanager
@@ -41,6 +42,11 @@ WHATSAPP_THREAD_ID_OFFSET = -1_000_000_000
 # server) loads and unit-normalizes the ~1 GB index ONCE instead of on every query.
 # Reloads automatically when embeddings.npz changes (a sync job appended vectors).
 _INDEX_CACHE: dict = {"path": None, "mtime": None, "ids": None, "unit": None}
+# The HTTP server runs each session's tool call in a worker thread, so callers
+# overlap. Unlocked, every one that missed the cache loaded its own copy: 3.3 GB
+# for two cold callers on the 1.6 GB index, 5 GB for two after a rewrite, against
+# a 4 GB MemoryMax. Every read and write of _INDEX_CACHE holds this lock.
+_CACHE_LOCK = threading.Lock()
 
 
 def _load_index(index_path=None):
@@ -48,31 +54,39 @@ def _load_index(index_path=None):
 
     Vectors are L2-normalized once at load, so cosine similarity at query time is a
     single matrix-vector product. Raises FileNotFoundError if no index exists.
+    Concurrent callers share one load: the others wait for it, then read the cache.
     """
     path = EMBEDDINGS_FILE if index_path is None else Path(index_path)
     if not path.exists():
         raise FileNotFoundError("No embedding index found. Run 'python -m src.cli embed' first.")
-    mtime = path.stat().st_mtime
-    if _INDEX_CACHE["path"] == str(path) and _INDEX_CACHE["mtime"] == mtime:
-        return _INDEX_CACHE["ids"], _INDEX_CACHE["unit"]
-    data = np.load(path, allow_pickle=False)
-    ids = data["ids"]
-    # Normalise IN PLACE. `vectors` is a fresh array this call owns, so dividing
-    # into it is safe, and it is the difference between one 1.44 GB allocation
-    # and three: `vectors / norms` builds a second full array and `.astype()`
-    # copies again even when the dtype already matches. Every MCP server process
-    # pays this on its first semantic query, and there are routinely a dozen of
-    # them alive at once across sessions. The norms come from einsum, which sums
-    # the squares row by row: np.linalg.norm squared the whole array into a
-    # second one first, and the allocator kept it, so a process held 2.84 GB
-    # after its first recall, not 1.43.
-    vectors = np.ascontiguousarray(data["vectors"], dtype=np.float32)
-    norms = np.sqrt(np.einsum("ij,ij->i", vectors, vectors))[:, None]
-    norms[norms == 0] = 1
-    vectors /= norms
-    unit = vectors
-    _INDEX_CACHE.update({"path": str(path), "mtime": mtime, "ids": ids, "unit": unit})
-    return ids, unit
+    with _CACHE_LOCK:
+        # The hit is checked under the lock as well: the cache is four fields, and
+        # a check outside it could match the path and mtime, then read the None a
+        # reload had just put in their place.
+        mtime = path.stat().st_mtime
+        if _INDEX_CACHE["path"] == str(path) and _INDEX_CACHE["mtime"] == mtime:
+            return _INDEX_CACHE["ids"], _INDEX_CACHE["unit"]
+        # Let go of the stale index before reading the new one, so a reload holds
+        # one index, plus the old one only while a reader is still mid-call.
+        _INDEX_CACHE.update({"path": None, "mtime": None, "ids": None, "unit": None})
+        data = np.load(path, allow_pickle=False)
+        ids = data["ids"]
+        # Normalise IN PLACE. `vectors` is a fresh array this call owns, so dividing
+        # into it is safe, and it is the difference between one 1.44 GB allocation
+        # and three: `vectors / norms` builds a second full array and `.astype()`
+        # copies again even when the dtype already matches. Every MCP server process
+        # pays this on its first semantic query, and there are routinely a dozen of
+        # them alive at once across sessions. The norms come from einsum, which sums
+        # the squares row by row: np.linalg.norm squared the whole array into a
+        # second one first, and the allocator kept it, so a process held 2.84 GB
+        # after its first recall, not 1.43.
+        vectors = np.ascontiguousarray(data["vectors"], dtype=np.float32)
+        norms = np.sqrt(np.einsum("ij,ij->i", vectors, vectors))[:, None]
+        norms[norms == 0] = 1
+        vectors /= norms
+        unit = vectors
+        _INDEX_CACHE.update({"path": str(path), "mtime": mtime, "ids": ids, "unit": unit})
+        return ids, unit
 
 
 def _log(msg: str):

@@ -28,6 +28,8 @@ BUDGET_SECONDS = 10.0
 MAX_VALUE_BYTES = 8 * 1024 * 1024
 MAX_COLUMNS = 32
 _PROGRESS_STEPS = 10_000
+# Room for the cut marker, "… [cut, N chars]", with N up to eight digits.
+_MARKER_CHARS = len("… [cut, 99999999 chars]")
 
 _READ_ACTIONS = frozenset(
     {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE}
@@ -89,11 +91,11 @@ def _arm_budget(conn: sqlite3.Connection) -> None:
     conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, _PROGRESS_STEPS)
 
 
-def _cell(value: object) -> object:
+def _cell(value: object, width: int = CELL_CHARS) -> object:
     if isinstance(value, bytes):
         return f"<{len(value)} bytes>"
-    if isinstance(value, str) and len(value) > CELL_CHARS:
-        return f"{value[:CELL_CHARS]}… [cut, {len(value)} chars]"
+    if isinstance(value, str) and len(value) > width:
+        return f"{value[:width]}… [cut, {len(value)} chars]"
     return value
 
 
@@ -120,8 +122,16 @@ def run_query(sql: str, limit: int = MAX_ROWS, db_path: Path | None = None) -> d
                 truncated = True
                 break
             row = [_cell(v) for v in tuple(raw)]
-            del raw
             size = sum(len(str(v)) for v in row)
+            if not rows and size > TOTAL_CHARS:
+                # One row wider than the whole answer: every cell gets an equal
+                # share, cut marker included, so the cap holds for every answer. A
+                # share is at least TOTAL_CHARS // MAX_COLUMNS characters.
+                width = max(0, TOTAL_CHARS // len(row) - _MARKER_CHARS)
+                row = [_cell(v, width) for v in tuple(raw)]
+                size = sum(len(str(v)) for v in row)
+                truncated = True
+            del raw
             if rows and total + size > TOTAL_CHARS:
                 truncated = True
                 break

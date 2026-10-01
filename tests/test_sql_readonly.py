@@ -68,10 +68,19 @@ def test_cell_cut(db):
     assert "cut, 5000 chars" in cell
 
 
-def test_total_size_cap(db, monkeypatch):
-    monkeypatch.setattr(sql_readonly, "TOTAL_CHARS", 10)
+def test_total_size_cap_drops_whole_rows_and_leaves_small_ones_untouched(db, monkeypatch):
+    monkeypatch.setattr(sql_readonly, "TOTAL_CHARS", 25)
     out = sql_readonly.run_query("SELECT subject FROM emails ORDER BY id", db_path=db)
-    assert out["row_count"] == 1  # the first row always fits
+    assert out["rows"] == [["Budget plan"]]  # 11 chars fit; 11 + 19 would not
+    assert out["truncated"] is True
+
+
+def test_a_first_row_wider_than_the_answer_cap_is_cut_to_fit(db):
+    wide = ", ".join(f"printf('%.5000c', 'x') AS c{i}" for i in range(sql_readonly.MAX_COLUMNS))
+    out = sql_readonly.run_query(f"SELECT {wide}", db_path=db)
+    row = out["rows"][0]
+    assert sum(len(cell) for cell in row) <= sql_readonly.TOTAL_CHARS
+    assert all(cell.endswith("… [cut, 5000 chars]") for cell in row)
     assert out["truncated"] is True
 
 

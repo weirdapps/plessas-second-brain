@@ -39,7 +39,7 @@ _SIDECAR_RM = 'rm -f "$LOCAL_DATA/brain.db-wal" "$LOCAL_DATA/brain.db-shm"'
 # path. Match the line by its fixed ends rather than by the interpolated middle,
 # so this test pins the sidecar ORDERING it is about and stops re-breaking every
 # time the source path changes.
-_DB_RSYNC_HEAD = 'rsync $RSYNC_OPTS "$VPS:~/.second-brain/'
+_DB_RSYNC_HEAD = '"$RSYNC" $DB_RSYNC_OPTS "$VPS:~/.second-brain/'
 _DB_RSYNC_TAIL = '" "$LOCAL_DATA/brain.db"'
 
 # Captures whatever sits between `sqlite3` and the database path, i.e. the flags
@@ -302,7 +302,7 @@ class TestSnapshotPathAgreement:
         assert 'REMOTE_SNAP="\\$HOME/.second-brain/$SNAP_NAME"' in text, (
             "REMOTE_SNAP must be built from SNAP_NAME, not spelled out again"
         )
-        assert 'rsync $RSYNC_OPTS "$VPS:~/.second-brain/$SNAP_NAME"' in text, (
+        assert '"$RSYNC" $DB_RSYNC_OPTS "$VPS:~/.second-brain/$SNAP_NAME"' in text, (
             "the rsync must read $SNAP_NAME, the same file .backup wrote"
         )
 
@@ -314,4 +314,52 @@ class TestSnapshotPathAgreement:
                 continue
             assert 'brain.snapshot.db"' not in line, (
                 f"a shared, non-per-host snapshot path is back: {line.strip()}"
+            )
+
+
+class TestRsyncChoice:
+    """macOS /usr/bin/rsync is openrsync, which fails a delta transfer once the
+    local copy passes 4 GiB. brain.db crossed it on 2026-10-01 and every hourly
+    pull then died at the same byte (rc=12) while embeddings.npz kept syncing,
+    because launchd's PATH has no Homebrew."""
+
+    def _choice(self, present: set[str], tmp_path: Path) -> tuple[str, str]:
+        text = _WRAPPER.read_text()
+        start = text.index("RSYNC=/usr/bin/rsync")
+        fallback = 'DB_RSYNC_OPTS="$RSYNC_OPTS --whole-file"'
+        end = text.index("\n", text.index(fallback))
+        block = text[start:end]
+        for name in ("/opt/homebrew/bin/rsync", "/usr/local/bin/rsync"):
+            fake = tmp_path / name.strip("/").replace("/", "_")
+            if name in present:
+                fake.write_text("#!/bin/sh\n")
+                fake.chmod(0o755)
+            block = block.replace(name, str(fake))
+        script = (
+            f'RSYNC_OPTS="-az --timeout=180"\n{block}\nprintf "%s|%s" "$RSYNC" "$DB_RSYNC_OPTS"\n'
+        )
+        out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
+        rsync, opts = out.stdout.split("|")
+        return rsync, opts
+
+    def test_homebrew_rsync_is_preferred(self, tmp_path):
+        rsync, opts = self._choice({"/opt/homebrew/bin/rsync", "/usr/local/bin/rsync"}, tmp_path)
+        assert rsync.endswith("opt_homebrew_bin_rsync")
+        assert "--whole-file" not in opts
+
+    def test_usr_local_rsync_is_next(self, tmp_path):
+        rsync, opts = self._choice({"/usr/local/bin/rsync"}, tmp_path)
+        assert rsync.endswith("usr_local_bin_rsync")
+        assert "--whole-file" not in opts
+
+    def test_openrsync_alone_copies_brain_db_whole(self, tmp_path):
+        rsync, opts = self._choice(set(), tmp_path)
+        assert rsync == "/usr/bin/rsync"
+        assert opts.split() == ["-az", "--timeout=180", "--whole-file"]
+
+    def test_every_transfer_goes_through_the_choice(self):
+        for line in _WRAPPER.read_text().splitlines():
+            code = line.split("#", 1)[0]
+            assert not re.match(r"\s*rsync\s", code), (
+                f"a bare rsync call bypasses the chosen binary: {line.strip()}"
             )

@@ -21,6 +21,7 @@ from unittest.mock import patch
 import pytest
 
 from src.extract import local
+from src.extract.extraction_files import extraction_path
 
 
 @pytest.fixture
@@ -166,7 +167,7 @@ def test_an_interrupted_state_save_leaves_the_previous_state(paths, monkeypatch)
 def test_an_interrupted_extraction_write_leaves_the_previous_file(paths, monkeypatch, no_stop):
     extracted = paths / "extracted"
     extracted.mkdir()
-    (extracted / "m0.json").write_text(json.dumps({"summary": "earlier"}))
+    extraction_path(extracted, "m0").write_text(json.dumps({"summary": "earlier"}))
     monkeypatch.setattr(local, "collect_emails", lambda: [_mail(0)])
     monkeypatch.setattr(
         local,
@@ -178,7 +179,7 @@ def test_an_interrupted_extraction_write_leaves_the_previous_file(paths, monkeyp
     with pytest.raises(OSError):
         local.run_extraction(workers=1)
 
-    assert json.loads((extracted / "m0.json").read_text()) == {"summary": "earlier"}
+    assert json.loads(extraction_path(extracted, "m0").read_text()) == {"summary": "earlier"}
 
 
 def test_an_interrupted_conversation_state_save_leaves_the_previous_state(

@@ -421,6 +421,7 @@ src/
     teams_prompt.py            Teams thread extraction prompt
     untrusted.py               Fences third-party text in extraction prompts
     local.py                   Concurrent extraction dispatcher
+    extraction_files.py        Where an email's extraction file lives; read back by the exact id
     news_extract.py            News items without the model: the synthesis brief or the article's opening
     parser.py                  Tolerant LLM JSON parser
     claude_extract.py          Claude via Vertex AI or direct API
@@ -463,6 +464,7 @@ scripts/
   health_check.py              Per-source freshness and job status; email + Healthchecks ping
   backup_db.py                 MVCC-safe encrypted DB snapshot + retention (see docs/RESTORE.md)
   recover_missing_extractions.py  Backfill emails that staged but never extracted
+  repair_case_twins.py         Gives emails back their own extraction where a case twin's was stored (report by default)
   reap_orphan_attachments.py   Resolves attachment dirs the registrar can never claim
   scrub_secrets.py             Redacts credentials already in the DB (dry run by default)
   repair_people.py             Mends garbled people names and unsaved sender addresses (dry run by default)

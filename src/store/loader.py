@@ -10,10 +10,11 @@ import sqlite3
 from pathlib import Path
 
 from src.export.state import load_json_or_quarantine
+from src.extract.extraction_files import read_extraction
 from src.extract.parser import _as_string_list
 
 from .email_html import save_html, split_body
-from .normalizer import find_or_create_person, find_or_create_topic
+from .normalizer import find_or_create_person, find_or_create_topic, normalize_topic
 from .schema import normalize_subject
 
 
@@ -26,7 +27,7 @@ def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
 
     Args:
         db_path: Path to SQLite database
-        extracted_dir: Directory containing extracted JSON files ({message_id}.json)
+        extracted_dir: Directory containing extracted JSON files (see extraction_files.py)
         staging_dir: Directory containing staged batch files (batch-NNNNN.json)
 
     Returns:
@@ -69,28 +70,16 @@ def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
             msgids.add(msgid)
         batch_to_msgids[batch_file] = msgids
 
-    # Index available extraction files by lowercased stem. Outlook message-ids
-    # are case-sensitive base64, but macOS/APFS is case-insensitive (and
-    # case-preserving), so an extraction written as "{message_id}.json" can
-    # land on disk with different letter-case than the staged message_id.
-    # Driving the load from the staging entries (the source of truth for the
-    # canonical message_id and metadata) and matching extraction files
-    # case-insensitively avoids silently dropping those emails.
-    extracted_by_lower: dict[str, Path] = {}
-    for ef in extracted_path.glob("*.json"):
-        extracted_by_lower[ef.stem.lower()] = ef
-
     loaded_count = 0
     batch_count = 0
 
     for message_id, metadata in staging_index.items():
-        extraction_file = extracted_by_lower.get(message_id.lower())
-        if extraction_file is None:
+        # By the exact id, never the lowercased one: two ids can differ in case
+        # alone, and matching them folded handed one email its twin's extraction
+        # (see src/extract/extraction_files.py).
+        extraction = read_extraction(extracted_path, message_id)
+        if extraction is None:
             continue  # staged but not yet extracted
-
-        # Load extraction (metadata carries the canonical, correct-case id)
-        with open(extraction_file, encoding="utf-8") as f:
-            extraction = json.load(f)
 
         # Load into database
         if load_single_email(conn, metadata, extraction):
@@ -322,9 +311,90 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
         ),
     )
     email_id = cursor.lastrowid
+    assert email_id is not None  # mypy: INSERT always sets it
     if html is not None and email_id is not None:
         save_html(conn, email_id, html)
 
+    _write_extraction(conn, email_id, metadata, extraction)
+
+    # Also add sender as a person. The header names below are the only ones that
+    # may rename a person found by address (display_name=True): the model's
+    # people_roles names above never do.
+    if sender_name and sender_address:
+        sender_id = find_or_create_person(conn, sender_name, sender_address, display_name=True)
+        conn.execute(
+            "INSERT OR IGNORE INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, ?)",
+            (email_id, sender_id, "sender"),
+        )
+
+    # Add all recipients
+    for recipient in metadata.get("to_recipients", metadata.get("to", [])):
+        if recipient.get("address"):
+            recipient_id = find_or_create_person(
+                conn,
+                recipient.get("name") or recipient["address"],
+                recipient["address"],
+                display_name=True,
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, ?)",
+                (email_id, recipient_id, "recipient"),
+            )
+
+    for cc_recipient in metadata.get("cc_recipients", metadata.get("cc", [])):
+        if cc_recipient.get("address"):
+            cc_id = find_or_create_person(
+                conn,
+                cc_recipient.get("name") or cc_recipient["address"],
+                cc_recipient["address"],
+                display_name=True,
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, ?)",
+                (email_id, cc_id, "cc"),
+            )
+
+    # Forward hook: Stage 1 image classification for inline images
+    try:
+        from src.extract.image_pipeline import (
+            compute_position_in_body,
+            process_single_image,
+        )
+
+        image_attachments = conn.execute(
+            """SELECT id, file_path, filename, message_id
+               FROM attachments
+               WHERE email_id = ? AND mime_type LIKE 'image/%' AND file_path IS NOT NULL""",
+            (email_id,),
+        ).fetchall()
+
+        for att in image_attachments:
+            img_path = Path(att[1]) if att[1] else None
+            if img_path and img_path.exists():
+                position = compute_position_in_body(metadata.get("content"), att[2])
+                process_single_image(
+                    conn=conn,
+                    attachment_id=att[0],
+                    img_path=img_path,
+                    sender_email=metadata.get("sender", {}).get("address", ""),
+                    message_id=str(att[3]),
+                    position_in_body=position,
+                    run_vision=False,
+                )
+    except Exception as e:
+        import logging
+
+        logging.getLogger(__name__).debug("Image hook: %s", e)
+
+    return True
+
+
+def _write_extraction(
+    conn: sqlite3.Connection, email_id: int, metadata: dict, extraction: dict
+) -> None:
+    """Write the rows an extraction gives a stored email: its topics, decisions,
+    action items, commitments, the people the model named with their roles, and
+    its key facts. The header people (sender, recipients) are the caller's."""
     # Load topics
     for topic_name in extraction.get("topics", []):
         topic_id = find_or_create_topic(conn, topic_name)
@@ -436,81 +506,70 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
                     (email_id, person_id, role),
                 )
 
-    # Also add sender as a person. The header names below are the only ones that
-    # may rename a person found by address (display_name=True): the model's
-    # people_roles names above never do.
-    if sender_name and sender_address:
-        sender_id = find_or_create_person(conn, sender_name, sender_address, display_name=True)
-        conn.execute(
-            "INSERT OR IGNORE INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, ?)",
-            (email_id, sender_id, "sender"),
-        )
-
-    # Add all recipients
-    for recipient in metadata.get("to_recipients", metadata.get("to", [])):
-        if recipient.get("address"):
-            recipient_id = find_or_create_person(
-                conn,
-                recipient.get("name") or recipient["address"],
-                recipient["address"],
-                display_name=True,
-            )
-            conn.execute(
-                "INSERT OR IGNORE INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, ?)",
-                (email_id, recipient_id, "recipient"),
-            )
-
-    for cc_recipient in metadata.get("cc_recipients", metadata.get("cc", [])):
-        if cc_recipient.get("address"):
-            cc_id = find_or_create_person(
-                conn,
-                cc_recipient.get("name") or cc_recipient["address"],
-                cc_recipient["address"],
-                display_name=True,
-            )
-            conn.execute(
-                "INSERT OR IGNORE INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, ?)",
-                (email_id, cc_id, "cc"),
-            )
-
     # Load key facts
     for fact in extraction.get("key_facts", []):
         if fact:
             conn.execute("INSERT INTO key_facts (email_id, fact) VALUES (?, ?)", (email_id, fact))
 
-    # Forward hook: Stage 1 image classification for inline images
-    try:
-        from src.extract.image_pipeline import (
-            compute_position_in_body,
-            process_single_image,
+
+def _stored_texts(items, key: str | None) -> list:
+    """The text _write_extraction stores for each item: a dict's `key`, or the item."""
+    texts = []
+    for item in items or []:
+        text = item.get(key) if isinstance(item, dict) else item
+        if text:
+            texts.append(text)
+    return texts
+
+
+def replace_extraction(
+    conn: sqlite3.Connection, email_id: int, metadata: dict, *, wrong: dict, right: dict
+) -> None:
+    """Give a stored email the extraction `right` in place of `wrong`, the one it holds.
+
+    For emails the loader handed a case twin's extraction (extraction_files.py).
+    The rows `wrong` wrote go, matched by their text and topic names, because an
+    attachment's decisions, key facts and topics sit on the same email and those
+    written before attachment_id existed carry none; an attachment's row with the
+    same text or topic goes with them. The model's people go, and so does a person
+    it named sender, recipient or cc who has no address: the headers' people always
+    have one, and they stay. The email keeps its id, and with it its attachments,
+    HTML and thread; its vector is the caller's to drop.
+    """
+    conn.execute(
+        "UPDATE emails SET summary = ?, sentiment = ?, urgency = ?, language = ? WHERE id = ?",
+        (
+            right.get("summary"),
+            right.get("sentiment"),
+            right.get("urgency"),
+            right.get("language"),
+            email_id,
+        ),
+    )
+    for table, column, key, own_rows in (
+        ("decisions", "decision", "decision", " AND attachment_id IS NULL"),
+        ("action_items", "task", "task", " AND attachment_id IS NULL"),
+        ("commitments", "commitment", "commitment", ""),
+        ("key_facts", "fact", None, " AND attachment_id IS NULL"),
+    ):
+        for text in _stored_texts(wrong.get(table), key):
+            conn.execute(
+                f"DELETE FROM {table} WHERE email_id = ? AND {column} = ?{own_rows}",
+                (email_id, text),
+            )
+    for topic_name in wrong.get("topics") or []:
+        conn.execute(
+            "DELETE FROM email_topics WHERE email_id = ? AND topic_id IN"
+            " (SELECT id FROM topics WHERE name = ?)",
+            (email_id, normalize_topic(topic_name)),
         )
-
-        image_attachments = conn.execute(
-            """SELECT id, file_path, filename, message_id
-               FROM attachments
-               WHERE email_id = ? AND mime_type LIKE 'image/%' AND file_path IS NOT NULL""",
-            (email_id,),
-        ).fetchall()
-
-        for att in image_attachments:
-            img_path = Path(att[1]) if att[1] else None
-            if img_path and img_path.exists():
-                position = compute_position_in_body(metadata.get("content"), att[2])
-                process_single_image(
-                    conn=conn,
-                    attachment_id=att[0],
-                    img_path=img_path,
-                    sender_email=metadata.get("sender", {}).get("address", ""),
-                    message_id=str(att[3]),
-                    position_in_body=position,
-                    run_vision=False,
-                )
-    except Exception as e:
-        import logging
-
-        logging.getLogger(__name__).debug("Image hook: %s", e)
-
-    return True
+    conn.execute(
+        "DELETE FROM email_people WHERE email_id = ?"
+        " AND (role_in_email NOT IN ('sender', 'recipient', 'cc')"
+        " OR person_id IN (SELECT id FROM people WHERE COALESCE(email, '') = ''))",
+        (email_id,),
+    )
+    _write_extraction(conn, email_id, metadata, right)
 
 
 def load_conversations(db_path: str) -> int:

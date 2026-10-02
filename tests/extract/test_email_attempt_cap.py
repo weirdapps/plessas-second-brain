@@ -18,6 +18,7 @@ import pytest
 from google.genai import errors as genai_errors
 
 from src.extract import local
+from src.extract.extraction_files import extraction_path
 
 
 @pytest.fixture
@@ -50,6 +51,7 @@ def run(monkeypatch, tmp_path):
     go.failure = lambda e: (e["message_id"], None, False, "fault")
     go.calls = calls
     go.extracted = tmp_path / "extracted"
+    go.file = lambda message_id: extraction_path(go.extracted, message_id)
     go.state = lambda: json.loads((tmp_path / "state.json").read_text())
     return go
 
@@ -63,7 +65,7 @@ def test_an_email_that_keeps_failing_is_loaded_bare_after_the_cap(run, workers):
     for n in range(local.EMAIL_MAX_ATTEMPTS):
         run([_mail("bad"), _mail(f"ok{n}")], workers)
 
-    stub = json.loads((run.extracted / "bad.json").read_text())
+    stub = json.loads(run.file("bad").read_text())
     assert {k: v for k, v in stub.items() if k != "message_id"} == {
         k: v for k, v in local._stub_extraction("x").items() if k != "message_id"
     }
@@ -79,7 +81,7 @@ def test_before_the_cap_it_is_offered_again(run):
     for n in range(local.EMAIL_MAX_ATTEMPTS - 1):
         run([_mail("bad"), _mail(f"ok{n}")])
 
-    assert not (run.extracted / "bad.json").exists()
+    assert not run.file("bad").exists()
     assert run.state()["failed_attempts"] == {"bad": local.EMAIL_MAX_ATTEMPTS - 1}
 
 
@@ -100,7 +102,7 @@ def test_news_is_no_evidence_that_the_model_works(run, workers):
         run([_mail("bad"), {**news, "message_id": f"news:article:{n}"}], workers)
         assert run.state()["failed_attempts"] == {}
 
-    assert not (run.extracted / "bad.json").exists()
+    assert not run.file("bad").exists()
 
 
 def _met_twice(run, monkeypatch, outcomes):
@@ -143,7 +145,7 @@ def test_an_email_that_both_fails_and_extracts_in_one_run_is_not_counted(run, mo
     _met_twice(run, monkeypatch, ["fault", "extracts"])
 
     assert run.state()["failed_attempts"] == {}
-    assert json.loads((run.extracted / "twice.json").read_text())["summary"] == "real"
+    assert json.loads(run.file("twice").read_text())["summary"] == "real"
 
 
 def test_quota_failures_never_count(run):
@@ -151,7 +153,7 @@ def test_quota_failures_never_count(run):
     for n in range(local.EMAIL_MAX_ATTEMPTS + 2):
         run([_mail("m"), _mail(f"ok{n}")])
 
-    assert not (run.extracted / "m.json").exists()
+    assert not run.file("m").exists()
     assert run.state()["failed_attempts"] == {}
 
 
@@ -186,7 +188,7 @@ def test_news_never_reaches_the_model(run, workers):
     result = run(emails, workers)
 
     assert run.calls == ["ok-mail"]
-    assert json.loads((run.extracted / "news:article:1.json").read_text())["summary"] == "Body"
+    assert json.loads(run.file("news:article:1").read_text())["summary"] == "Body"
     assert result["extracted"] == 2
 
 
@@ -324,11 +326,11 @@ def test_an_email_that_keeps_timing_out_is_retired_on_the_longer_cap(run):
     for n in range(local.EMAIL_MAX_TIMEOUTS - 1):
         run([_mail("huge"), _mail(f"ok{n}")])
     assert run.state()["timeout_attempts"] == {"huge": local.EMAIL_MAX_TIMEOUTS - 1}
-    assert not (run.extracted / "huge.json").exists()
+    assert not run.file("huge").exists()
 
     run([_mail("huge"), _mail("ok-last")])
 
-    assert json.loads((run.extracted / "huge.json").read_text())["summary"] == ""
+    assert json.loads(run.file("huge").read_text())["summary"] == ""
     assert run.state()["timeout_attempts"] == {}
 
 

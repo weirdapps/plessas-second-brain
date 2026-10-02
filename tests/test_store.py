@@ -894,68 +894,6 @@ class TestLoader:
             with pytest.raises(FileNotFoundError):
                 load_extractions(db_path, "/nonexistent/extracted", "/nonexistent/staging")
 
-    def test_load_extractions_case_insensitive_extraction_filename(self):
-        """Match extraction files case-insensitively.
-
-        Outlook message-ids are case-sensitive base64, but macOS/APFS is
-        case-insensitive (and case-preserving), so the extraction file on
-        disk can end up with a different letter-case than the staged
-        message_id. The loader must still pair them, using the staged
-        message_id as the canonical (correct-case) identifier.
-        """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmppath = Path(tmpdir)
-            db_path = str(tmppath / "test.db")
-            create_database(db_path).close()
-            staging_dir = tmppath / "staging"
-            staging_dir.mkdir()
-            extracted_dir = tmppath / "extracted"
-            extracted_dir.mkdir()
-
-            mid = "AAMkExampleAbCdEfGhIj=="
-            batch = {
-                "batch_number": 1,
-                "exported_at": "2026-05-30T00:00:00Z",
-                "emails": [
-                    {
-                        "message_id": mid,
-                        "date_received": "2026-05-30T10:00:00",
-                        "sender": {"name": "Alice", "address": "alice@example.com"},
-                        "subject": "Case test",
-                        "content": "body",
-                        "mailbox": "Inbox",
-                        "to": [],
-                        "cc": [],
-                        "internet_message_id": "<case-test@example.com>",
-                    }
-                ],
-            }
-            with open(staging_dir / "batch-00001.json", "w") as f:
-                json.dump(batch, f)
-
-            extraction = {
-                "summary": "Case summary",
-                "sentiment": "informational",
-                "urgency": "low",
-                "language": "english",
-                "topics": [],
-                "decisions": [],
-                "action_items": [],
-                "people_roles": {},
-                "key_facts": [],
-            }
-            # Written with a DIFFERENT case than the staged message_id.
-            with open(extracted_dir / (mid.lower() + ".json"), "w") as f:
-                json.dump(extraction, f)
-
-            count = load_extractions(db_path, str(extracted_dir), str(staging_dir))
-            assert count == 1
-
-            conn = get_connection(db_path)
-            row = conn.execute("SELECT message_id FROM emails").fetchone()
-            assert row[0] == mid  # canonical (staged) case is preserved
-            conn.close()
-
     def test_load_extractions_prunes_cross_source_duplicate_batch(self):
         """Prune batches whose emails are cross-source duplicates.
 

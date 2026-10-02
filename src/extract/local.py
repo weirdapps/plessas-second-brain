@@ -18,6 +18,7 @@ from pathlib import Path
 
 from src.config import DATA_ROOT, EXTRACT_ENGINE, GEMINI_MODEL
 from src.export.state import load_json_or_quarantine, write_json_atomic
+from src.extract.extraction_files import extraction_path
 
 # Repo root
 REPO_ROOT = Path(__file__).parent.parent.parent
@@ -462,7 +463,7 @@ def run_extraction(
                 continue
             attempt_counts.pop(msg_id, None)
             timeout_counts.pop(msg_id, None)
-            write_json_atomic(EXTRACTED_DIR / f"{msg_id}.json", _stub_extraction(msg_id))
+            write_json_atomic(extraction_path(EXTRACTED_DIR, msg_id), _stub_extraction(msg_id))
             processed_ids.add(msg_id)
             log(
                 f"GAVE UP on msg {msg_id} after {runs} runs ({kind}); it loads without an extraction"
@@ -538,7 +539,7 @@ def run_extraction(
             msg_id, extraction, is_quota, failure = _worker_fn(email, api_key, engine)
 
             if extraction is not None:
-                write_json_atomic(EXTRACTED_DIR / f"{msg_id}.json", extraction)
+                write_json_atomic(extraction_path(EXTRACTED_DIR, msg_id), extraction)
                 processed_ids.add(msg_id)
                 attempt_counts.pop(msg_id, None)
                 timeout_counts.pop(msg_id, None)
@@ -658,7 +659,7 @@ def run_extraction(
                     email = futures[future]
 
                     if extraction is not None:
-                        write_json_atomic(EXTRACTED_DIR / f"{msg_id}.json", extraction)
+                        write_json_atomic(extraction_path(EXTRACTED_DIR, msg_id), extraction)
                         with _state_lock:
                             processed_ids.add(msg_id)
                             attempt_counts.pop(msg_id, None)

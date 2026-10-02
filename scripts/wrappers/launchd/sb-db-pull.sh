@@ -94,6 +94,21 @@ fi
 # meantime, and the modes block after the transfers makes the result owner-only.
 RSYNC_OPTS="-az --timeout=180"
 
+# openrsync also fails a delta transfer once the local copy passes 4 GiB: brain.db
+# crossed it on 2026-10-01 and every pull after that died at the same byte
+# ("connection unexpectedly closed (1705084 bytes received so far)", rc=12), while
+# embeddings.npz (1.5 GB) kept syncing. launchd's PATH has no Homebrew, so name a
+# real rsync when one is installed; without one, copy brain.db whole.
+RSYNC=/usr/bin/rsync
+for candidate in /opt/homebrew/bin/rsync /usr/local/bin/rsync; do
+  if [ -x "$candidate" ]; then
+    RSYNC=$candidate
+    break
+  fi
+done
+DB_RSYNC_OPTS=$RSYNC_OPTS
+[ "$RSYNC" = /usr/bin/rsync ] && DB_RSYNC_OPTS="$RSYNC_OPTS --whole-file"
+
 # Snapshot on the VPS FIRST, then copy the snapshot. rsync'ing brain.db directly
 # copied a live WAL-mode database that the VPS kept writing during the ~60s
 # transfer, so the local file was a mix of pages from different points in time.
@@ -151,7 +166,7 @@ else
   # previous replica short whatever an interrupted local checkpoint had not yet
   # folded in. That is acceptable: the next run re-copies the file entire.
   rm -f "$LOCAL_DATA/brain.db-wal" "$LOCAL_DATA/brain.db-shm"
-  rsync $RSYNC_OPTS "$VPS:~/.second-brain/$SNAP_NAME" "$LOCAL_DATA/brain.db" 2>> "$LOG_FILE"
+  "$RSYNC" $DB_RSYNC_OPTS "$VPS:~/.second-brain/$SNAP_NAME" "$LOCAL_DATA/brain.db" 2>> "$LOG_FILE"
   DB_RC=$?
   # rsync renames its temp file into place, so a reader that had the old inode
   # open can recreate a -wal against the NEW file between the two lines above.
@@ -165,7 +180,7 @@ else
 fi
 
 # --- Rsync embeddings.npz ---
-rsync $RSYNC_OPTS "$VPS:~/$REMOTE_DATA/embeddings.npz" "$LOCAL_DATA/embeddings.npz" 2>> "$LOG_FILE"
+"$RSYNC" $RSYNC_OPTS "$VPS:~/$REMOTE_DATA/embeddings.npz" "$LOCAL_DATA/embeddings.npz" 2>> "$LOG_FILE"
 EMB_RC=$?
 if [ $EMB_RC -eq 0 ]; then
   EMB_SIZE=$(du -h "$LOCAL_DATA/embeddings.npz" | cut -f1)
@@ -217,7 +232,7 @@ fi
 # rather than assuming: rsync will not create a two-level destination on its own.
 OFFSITE_LOCAL="$HOME/second-brain-backups/offsite"
 mkdir -p "$OFFSITE_LOCAL" && chmod 700 "$OFFSITE_LOCAL"
-rsync $RSYNC_OPTS "$VPS:~/$REMOTE_DATA/backups/offsite/brain-*.db.zst.enc" \
+"$RSYNC" $RSYNC_OPTS "$VPS:~/$REMOTE_DATA/backups/offsite/brain-*.db.zst.enc" \
   "$OFFSITE_LOCAL/" 2>> "$LOG_FILE"
 OFF_RC=$?
 if [ "$OFF_RC" -eq 0 ]; then

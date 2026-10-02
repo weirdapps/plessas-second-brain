@@ -175,7 +175,8 @@ def _loaded_with_the_twins_extraction(tmp_path):
         decisions=[{"decision": "twin decision", "decided_by": "Someone"}],
         action_items=[{"task": "twin task", "owner": "Someone"}],
         commitments=[{"commitment": "twin promise", "by": "A", "to": "B"}],
-        people_roles={"Twin Person": "approver"},
+        # A recipient by the model's word, with no address: not a header person.
+        people_roles={"Twin Person": "approver", "Twin Recipient": "recipient"},
         key_facts=["twin fact"],
     )
     assert load_single_email(conn, metadata, wrong)

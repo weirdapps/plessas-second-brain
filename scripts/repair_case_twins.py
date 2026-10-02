@@ -20,7 +20,9 @@ stored summary is compared with the email's own extraction file:
                  alone, and listed
 
 The vectors of the emails it rewrites are dropped, so the next index build embeds
-their new summaries.
+their new summaries. Each rewrite records its vector as owed in sync_metadata, in
+the same transaction, so a run stopped before it drops them leaves them for the
+next --apply rather than forgotten: build_index embeds only ids it lacks.
 
     python scripts/repair_case_twins.py                        # report only
     python scripts/repair_case_twins.py --apply                # rewrite from files
@@ -32,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -49,12 +52,16 @@ from src.config import (  # noqa: E402
 )
 from src.export.state import write_json_atomic  # noqa: E402
 from src.extract.extraction_files import extraction_path  # noqa: E402
+from src.redact import redact_payload  # noqa: E402
 from src.store.embeddings import remove_vectors  # noqa: E402
 from src.store.loader import replace_extraction  # noqa: E402
 from src.store.schema import get_connection  # noqa: E402
 
 EXTRACTED = DATA_ROOT / "extracted"
 SAMPLES = 10
+HEADER_ROLES = ("sender", "recipient", "cc")
+OWED_KEY = "repair_case_twins_vectors_owed"  # sync_metadata: rewritten, vector not dropped
+SETTLE_EVERY = 500  # rewrites between two drops of the owed vectors
 
 
 @dataclass
@@ -154,21 +161,43 @@ def plan(conn, extracted: Path) -> tuple[list[Repair], dict, list[int]]:
     return repairs, counts, unexplained
 
 
-def stored_email(conn, email_id: int) -> dict:
+def _header_named(extraction: dict) -> set[str]:
+    """The names, lowercased, an extraction gave a header role (sender, recipient, cc)."""
+    names: set[str] = set()
+    people_roles = extraction.get("people_roles")
+    if not isinstance(people_roles, dict):
+        return names
+    for name, roles in people_roles.items():
+        for role in [roles] if isinstance(roles, str) else roles or []:
+            if (role.get("role") if isinstance(role, dict) else role) in HEADER_ROLES:
+                names.add(str(name).lower())
+    return names
+
+
+def stored_email(conn, email_id: int, leave_out: set[str] | frozenset[str] = frozenset()) -> dict:
     """The email as the loader was given it, rebuilt from the store: what the
-    extraction prompt reads, and the header people replace_extraction names from."""
+    extraction prompt reads, and the header people replace_extraction names from.
+
+    A header person always has an address, so one without is the model's. `leave_out`
+    drops the names a twin's extraction called recipients, which have rows on this
+    email as well: the model must not be told they received it.
+    """
     row = conn.execute(
         "SELECT message_id, subject, date_received, sender_name, sender_address, content,"
         " mailbox_name FROM emails WHERE id = ?",
         (email_id,),
     ).fetchone()
-    people = conn.execute(
-        "SELECT ep.role_in_email, p.name, p.email FROM email_people ep"
-        " JOIN people p ON p.id = ep.person_id"
-        " WHERE ep.email_id = ? AND ep.role_in_email IN ('recipient', 'cc')"
-        " ORDER BY ep.rowid",
-        (email_id,),
-    ).fetchall()
+    people = [
+        (role, name, address)
+        for role, name, address in conn.execute(
+            "SELECT ep.role_in_email, p.name, p.email FROM email_people ep"
+            " JOIN people p ON p.id = ep.person_id"
+            " WHERE ep.email_id = ? AND ep.role_in_email IN ('recipient', 'cc')"
+            " AND COALESCE(p.email, '') != '' ORDER BY ep.rowid",
+            (email_id,),
+        )
+        if (name or "").lower() not in leave_out
+    ]
     return {
         "message_id": row[0],
         "subject": row[1],
@@ -176,9 +205,33 @@ def stored_email(conn, email_id: int) -> dict:
         "sender": {"name": row[3] or "", "address": row[4] or ""},
         "content": row[5],
         "mailbox_name": row[6],
-        "to_recipients": [{"name": n, "address": e} for r, n, e in people if r == "recipient"],
-        "cc_recipients": [{"name": n, "address": e} for r, n, e in people if r == "cc"],
+        "to_recipients": [{"name": n, "address": a} for r, n, a in people if r == "recipient"],
+        "cc_recipients": [{"name": n, "address": a} for r, n, a in people if r == "cc"],
     }
+
+
+def _owed(conn) -> list[int]:
+    row = conn.execute("SELECT value FROM sync_metadata WHERE key = ?", (OWED_KEY,)).fetchone()
+    return json.loads(row[0]) if row else []
+
+
+def _owe(conn, email_id: int) -> None:
+    """Record the email's vector as owed, in the transaction of its rewrite."""
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES (?, ?)",
+        (OWED_KEY, json.dumps(sorted({*_owed(conn), email_id}))),
+    )
+
+
+def _settle(conn) -> int:
+    """Drop the owed vectors, then the record of them; how many vectors went."""
+    owed = _owed(conn)
+    if not owed:
+        return 0
+    removed = remove_vectors(owed)
+    conn.execute("DELETE FROM sync_metadata WHERE key = ?", (OWED_KEY,))
+    conn.commit()
+    return removed
 
 
 def _ask_model(email: dict) -> tuple[dict | None, bool]:
@@ -193,36 +246,55 @@ def _ask_model(email: dict) -> tuple[dict | None, bool]:
 
 def apply(conn, repairs: list[Repair], extracted: Path, reextract: bool, limit: int) -> dict:
     """Rewrite each repair, one commit each: the producer's syncs write meanwhile. The
-    ones with a file go first, so a model that runs out stops only the asking."""
-    done: list[int] = []
-    asked = failed = 0
-    for repair in sorted(repairs, key=lambda r: r.right is None):
-        right = repair.right
-        if right is None:
-            if not reextract or (limit and asked >= limit):
-                continue
-            asked += 1
-            right, stop = _ask_model(stored_email(conn, repair.email_id))
+    ones with a file go first, so a model that runs out stops only the asking.
+
+    Vectors are dropped after the commits: a build that ran between them found the
+    old vectors still indexed and embedded nothing, and the next embeds the new
+    summaries. Drops happen every SETTLE_EVERY rewrites, before the first question
+    to the model, and on the way out, however the run ends.
+    """
+    rewritten = asked = failed = 0
+    removed = _settle(conn)  # owed by a run that stopped before dropping them
+    try:
+        for repair in sorted(repairs, key=lambda r: r.right is None):
+            right = repair.right
             if right is None:
-                failed += 1
-                if stop:
-                    print("The model is out of quota or credentials; stopping.", file=sys.stderr)
-                    break
-                continue
-            write_json_atomic(extraction_path(extracted, repair.message_id), right)
-        replace_extraction(
-            conn,
-            repair.email_id,
-            stored_email(conn, repair.email_id),
-            wrong=repair.wrong,
-            right=right,
-        )
-        conn.commit()
-        done.append(repair.email_id)
-    # After the commits: a build that ran between them saw the old vectors still
-    # indexed and embedded nothing, and the next one embeds the new summaries.
-    removed = remove_vectors(done) if done else 0
-    return {"rewritten": len(done), "asked": asked, "failed": failed, "vectors_removed": removed}
+                if not reextract or (limit and asked >= limit):
+                    continue
+                if not asked:
+                    removed += _settle(conn)
+                asked += 1
+                email = stored_email(conn, repair.email_id, _header_named(repair.wrong))
+                right, stop = _ask_model(email)
+                if right is None:
+                    failed += 1
+                    if stop:
+                        print(
+                            "The model is out of quota or credentials; stopping.", file=sys.stderr
+                        )
+                        break
+                    continue
+                write_json_atomic(extraction_path(extracted, repair.message_id), right)
+            # Redacted on the way in, as staging is: a file older than the redaction
+            # may hold a credential scrub_secrets took out of the row.
+            replace_extraction(
+                conn,
+                repair.email_id,
+                stored_email(conn, repair.email_id),
+                wrong=repair.wrong,
+                right=redact_payload(right),
+            )
+            _owe(conn, repair.email_id)
+            conn.commit()
+            rewritten += 1
+            if rewritten % SETTLE_EVERY == 0:
+                removed += _settle(conn)
+    except BaseException:
+        conn.rollback()  # a rewrite cut short is not committed by the drop below
+        raise
+    finally:
+        removed += _settle(conn)
+    return {"rewritten": rewritten, "asked": asked, "failed": failed, "vectors_removed": removed}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -255,6 +327,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         if unexplained:
             print(f"  unexplained, first {SAMPLES}: {unexplained[:SAMPLES]}")
+        owed = _owed(conn)
+        if owed:
+            print(f"{len(owed)} rewritten emails still hold their old vectors; --apply drops them")
         if not args.apply:
             print("Report only; --apply rewrites.")
             return 0
@@ -266,4 +341,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # A stop (systemctl stop, kill) ends the run through apply's finally, which drops
+    # the owed vectors, instead of where the default handler would leave it.
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
     raise SystemExit(main())

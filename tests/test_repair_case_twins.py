@@ -57,7 +57,7 @@ def _extraction(message_id, summary, **extra):
     }
 
 
-def _metadata(message_id):
+def _metadata(message_id, cc=()):
     return {
         "message_id": message_id,
         "internet_message_id": f"<{message_id}@example.com>",
@@ -67,7 +67,7 @@ def _metadata(message_id):
         "content": f"body of {message_id}",
         "mailbox_name": "Inbox",
         "to_recipients": [{"name": "Reader", "address": "reader@example.com"}],
-        "cc_recipients": [],
+        "cc_recipients": list(cc),
     }
 
 
@@ -80,6 +80,8 @@ def store(tmp_path):
     own = {mid: _extraction(mid, f"own summary of {mid}") for mid in (KEPT, CROSSED, SOURCE, ALONE)}
     own[CROSSED]["decisions"] = [{"decision": "crossed decision"}]
     own[KEPT]["decisions"] = [{"decision": "kept decision"}]
+    # The model named SOURCE's people recipients: one known by address, one not.
+    own[SOURCE]["people_roles"] = {"Known Colleague": "recipient", "Source Boss": "recipient"}
     # Old names where a disk that folds case allows them, current names otherwise.
     (extracted / f"{KEPT}.json").write_text(json.dumps(own[KEPT]))
     extraction_path(extracted, CROSSED).write_text(json.dumps(own[CROSSED]))
@@ -88,14 +90,15 @@ def store(tmp_path):
     (extracted / f"{ALONE}.json").write_text(json.dumps(own[ALONE]))
 
     conn = create_database(str(db))
-    for message_id, extraction in (
-        (KEPT, own[KEPT]),
-        (CROSSED, own[KEPT]),
-        (SOURCE, own[SOURCE]),
-        (LOST, own[SOURCE]),
-        (ALONE, own[ALONE]),
+    colleague = {"name": "Known Colleague", "address": "known@example.com"}
+    for metadata, extraction in (
+        (_metadata(KEPT, cc=[colleague]), own[KEPT]),
+        (_metadata(CROSSED), own[KEPT]),
+        (_metadata(SOURCE), own[SOURCE]),
+        (_metadata(LOST), own[SOURCE]),
+        (_metadata(ALONE), own[ALONE]),
     ):
-        assert load_single_email(conn, _metadata(message_id), extraction)
+        assert load_single_email(conn, metadata, extraction)
     conn.commit()
     conn.close()
     return db
@@ -193,3 +196,44 @@ def test_apply_refuses_on_a_replica(repair, store, monkeypatch):
     assert repair.main(["--db", str(store), "--apply"]) == 2
 
     assert _stored(store) == before
+
+
+def test_a_crash_while_asking_still_drops_the_rewritten_vectors(repair, store, monkeypatch):
+    def crash(email):
+        raise RuntimeError("the model client failed")
+
+    monkeypatch.setattr(repair, "_ask_model", crash)
+
+    with pytest.raises(RuntimeError):
+        repair.main(["--db", str(store), "--apply", "--reextract"])
+
+    summaries, _, ids = _stored(store)
+    assert summaries[CROSSED] == f"own summary of {CROSSED}"
+    assert repair.removed == [ids[CROSSED]]
+
+
+def test_vectors_a_stopped_run_owed_are_dropped_by_the_next(repair, store, monkeypatch, capsys):
+    """Stopped before it dropped them, a run leaves the vectors owed, not forgotten:
+    the rewritten emails read as correct from then on, and build_index embeds only
+    ids it lacks, so nothing else would ever replace their vectors."""
+    recorder = repair.remove_vectors
+
+    def stopped(ids):
+        raise OSError("stopped while rewriting the index")
+
+    monkeypatch.setattr(repair, "remove_vectors", stopped)
+    with pytest.raises(OSError):
+        repair.main(["--db", str(store), "--apply"])
+    monkeypatch.setattr(repair, "remove_vectors", recorder)
+    capsys.readouterr()
+
+    assert repair.main(["--db", str(store)]) == 0
+    assert "1 rewritten emails still hold their old vectors" in capsys.readouterr().out
+
+    assert repair.main(["--db", str(store), "--apply"]) == 0
+
+    _, _, ids = _stored(store)
+    assert repair.removed == [ids[CROSSED]]
+    capsys.readouterr()
+    repair.main(["--db", str(store)])
+    assert "still hold their old vectors" not in capsys.readouterr().out

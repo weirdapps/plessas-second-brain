@@ -528,11 +528,13 @@ def replace_extraction(
     """Give a stored email the extraction `right` in place of `wrong`, the one it holds.
 
     For emails the loader handed a case twin's extraction (extraction_files.py).
-    Only rows `wrong` wrote go: an attachment's decisions, key facts and topics sit
-    on the same email, and those written before attachment_id existed carry none,
-    so they are told apart by their text. The header people (sender, recipient, cc)
-    stay. The email keeps its id, and with it its attachments, HTML and thread; its
-    vector is the caller's to drop, so the next index build embeds the new summary.
+    The rows `wrong` wrote go, matched by their text and topic names, because an
+    attachment's decisions, key facts and topics sit on the same email and those
+    written before attachment_id existed carry none; an attachment's row with the
+    same text or topic goes with them. The model's people go, and so does a person
+    it named sender, recipient or cc who has no address: the headers' people always
+    have one, and they stay. The email keeps its id, and with it its attachments,
+    HTML and thread; its vector is the caller's to drop.
     """
     conn.execute(
         "UPDATE emails SET summary = ?, sentiment = ?, urgency = ?, language = ? WHERE id = ?",
@@ -563,7 +565,8 @@ def replace_extraction(
         )
     conn.execute(
         "DELETE FROM email_people WHERE email_id = ?"
-        " AND role_in_email NOT IN ('sender', 'recipient', 'cc')",
+        " AND (role_in_email NOT IN ('sender', 'recipient', 'cc')"
+        " OR person_id IN (SELECT id FROM people WHERE COALESCE(email, '') = ''))",
         (email_id,),
     )
     _write_extraction(conn, email_id, metadata, right)

@@ -1,7 +1,7 @@
 """Recover messages with extractions on disk that never made it into the DB.
 
 Symptom: data/staging/batch-*.json contains messages with valid extraction
-files at data/extracted/<msg_id>.json, but the messages are missing from the
+files in data/extracted/ (see extraction_files.py), but the messages are missing from the
 `emails` table. The state file claims they were extracted, so run_extraction
 won't retry; load_extractions doesn't log per-file failures, so silent drops
 went unnoticed.
@@ -24,6 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.config import DATA_ROOT, DEFAULT_DB, is_replica, replica_refusal  # noqa: E402
+from src.extract.extraction_files import read_extraction  # noqa: E402
 from src.store.loader import load_single_email  # noqa: E402
 from src.store.schema import get_connection, run_migrations  # noqa: E402
 
@@ -66,10 +67,12 @@ def main() -> int:
     # its markup, the failure to keep it caught below and the text committed.
     run_migrations(conn)
 
-    targets: list[str] = []
-    for ext_file in sorted(EXTRACTED.glob("*.json")):
-        mid = ext_file.stem
-        if mid not in staging_index:
+    targets: list[tuple[str, dict]] = []
+    for mid in sorted(staging_index):
+        # By the exact id: a lowercased match gave one email its case twin's
+        # extraction (src/extract/extraction_files.py).
+        extraction = read_extraction(EXTRACTED, mid)
+        if extraction is None:
             continue
         iid = staging_index[mid].get("internet_message_id")
         row = conn.execute(
@@ -78,7 +81,7 @@ def main() -> int:
             (mid, iid),
         ).fetchone()
         if not row:
-            targets.append(mid)
+            targets.append((mid, extraction))
 
     print(f"Recoverable: {len(targets)} extractions exist for messages not in DB")
     if not targets:
@@ -87,9 +90,7 @@ def main() -> int:
 
     loaded = dup = error = 0
     error_samples: list[tuple[str, str]] = []
-    for i, mid in enumerate(targets, 1):
-        with (EXTRACTED / f"{mid}.json").open() as f:
-            extraction = json.load(f)
+    for i, (mid, extraction) in enumerate(targets, 1):
         metadata = staging_index[mid]
         try:
             if load_single_email(conn, metadata, extraction):

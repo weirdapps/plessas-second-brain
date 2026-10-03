@@ -4,13 +4,16 @@ Claude-based email extraction via Vertex AI or direct Anthropic API.
 Drop-in replacement for the Gemini extractor in local.py.
 """
 
+import json
 import os
 import sys
 import threading
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from src.config import DATA_ROOT
 from src.llm_policy import (
     Action,
     Attempt,
@@ -33,6 +36,37 @@ CLAUDE_MODEL_BASE = os.environ.get("CLAUDE_EXTRACT_MODEL") or os.environ.get(
 # its extraction JSON legitimately runs long and stopped mid-object.
 # attachment_pipeline already uses 8192 for the same reason.
 MAX_OUTPUT_TOKENS = 8192
+
+# One JSON line per completed call, in llm-usage-YYYY-MM.jsonl. None of these calls
+# writes a Claude Code transcript, so before this the extraction spend could only be
+# estimated from item counts. A refused primary call that the fallback answered is
+# not counted; only the response complete() returns is.
+USAGE_LOG_DIR = DATA_ROOT
+
+
+def _log_usage(response: Any, site: str) -> None:
+    """Append the call's token usage. Never raises: a full disk must not cost an
+    extraction."""
+    try:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        now = datetime.now(UTC)
+        record = {
+            "ts": now.isoformat(timespec="seconds"),
+            "site": site,
+            "model": getattr(response, "model", None),
+            "stop_reason": getattr(response, "stop_reason", None),
+            "input_tokens": getattr(usage, "input_tokens", None),
+            "output_tokens": getattr(usage, "output_tokens", None),
+            "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", None),
+            "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", None),
+        }
+        path = Path(USAGE_LOG_DIR) / f"llm-usage-{now.strftime('%Y-%m')}.jsonl"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
 
 
 def _response_text(response) -> str:
@@ -370,7 +404,10 @@ def complete(*, max_tokens: int, messages: list, model: str | None = None, **kwa
             **kwargs,
         )
 
-    return call_with_policy(_do_call, max_call_seconds=120.0, refusal_is_final=True)
+    response = call_with_policy(_do_call, max_call_seconds=120.0, refusal_is_final=True)
+    caller = sys._getframe(1)
+    _log_usage(response, f"{caller.f_globals.get('__name__')}.{caller.f_code.co_name}")
+    return response
 
 
 def extract_one(email: dict) -> dict | None:

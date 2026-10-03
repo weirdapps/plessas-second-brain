@@ -4,11 +4,16 @@ For every thread with extraction_status IN ('pending','failed'):
   1. Build prompt over its messages.
   2. Call Vertex AI Claude.
   3. Parse JSON; clear prior decisions/actions/facts for this thread; insert new.
-  4. Update thread row to extraction_status = 'extracted' (or 'failed' / 'skipped').
+  4. Update thread row to extraction_status = 'extracted' (or 'failed' / 'skipped' /
+     'refused').
 
 Re-extraction (when new messages land in an already-extracted thread) is
 handled by deleting prior child rows BEFORE re-insert. The Step 6 embedder
 detects extracted_at > embedding_at and re-embeds.
+
+'refused' means both model tiers refused the thread. It is not selected again,
+because replaying the same prompt cannot change a refusal; new messages reset the
+thread to 'pending' (teams_threads.py), so new content is still read.
 """
 
 import json
@@ -29,6 +34,10 @@ from src.llm_policy import Outcome
 MIN_SUBSTANTIVE_MESSAGES = 1
 MIN_SUBSTANTIVE_LENGTH = 20
 MIN_SUBSTANTIVE_TOTAL_CHARS = 100
+
+
+class ThreadRefused(Exception):
+    """Both model tiers refused the thread: complete() already tried the fallback."""
 
 
 def extract_threads(
@@ -83,6 +92,7 @@ def extract_threads(
     failed = 0
     skipped = 0
     deferred = 0
+    refused = 0
 
     deadline = None if deadline_s is None else time.monotonic() + deadline_s
 
@@ -101,12 +111,15 @@ def extract_threads(
             skipped += 1
         elif outcome == "deferred":
             deferred += 1
+        elif outcome == "refused":
+            refused += 1
 
     return {
         "extracted": extracted,
         "failed": failed,
         "skipped": skipped,
         "deferred": deferred,
+        "refused": refused,
     }
 
 
@@ -166,6 +179,12 @@ def _extract_one_thread(conn: sqlite3.Connection, thread_id: int) -> str:
     try:
         raw = _call_llm(system_prompt, user_prompt)
         data = parse_response(raw)
+    except ThreadRefused as e:
+        conn.execute(
+            "UPDATE teams_threads SET extraction_status='refused', extraction_error=? WHERE id = ?",
+            (str(e)[:500], thread_id),
+        )
+        return "refused"
     except Exception as e:
         # The classifier, not a pattern list. is_vertex_auth_error matches on the message,
         # and two of the three types the policy calls re-authable —
@@ -296,6 +315,8 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
     )
+    if getattr(resp, "stop_reason", None) == "refusal":
+        raise ThreadRefused("both model tiers refused the thread (stop_reason='refusal')")
     # Same leading-ThinkingBlock hazard as every other call site. No teams_threads row
     # has hit it yet (extraction_error is NULL on all 6008), so this one is preventive:
     # the sixth site should not be the one left indexing position 0.

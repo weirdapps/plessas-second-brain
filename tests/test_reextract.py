@@ -427,3 +427,177 @@ def test_a_row_whose_file_is_kept_for_good_is_not_selected_by_unread(store):
     stats = _run(path, root, "unread", dry_run=True)
 
     assert stats["selected"] == 0
+
+
+def _ac_id(conn, att_id):
+    return conn.execute(
+        "SELECT id FROM attachment_content WHERE attachment_id = ?", (att_id,)
+    ).fetchone()[0]
+
+
+def _reads(monkeypatch, text, method):
+    monkeypatch.setattr(
+        rx,
+        "extract_text_from_file",
+        lambda *a, **k: {"text": text, "method": method, "status": "extracted", "error": None},
+    )
+
+
+def test_an_ocr_re_read_a_few_characters_short_counts_as_read(store, monkeypatch):
+    """OCR on another machine or another tesseract drifts by a character or a word, both ways.
+    A drift that small is the same scan read again: the row is read, its text and summary stay."""
+    path, conn, root, removed, summarised = store
+    stored = WORDS * 40
+    att = _row(conn, root, "scan.pdf", stored, body=b"%PDF-1.4", mime="application/pdf")
+    _partial(conn, att, method="pymupdf+tesseract")
+    _reads(monkeypatch, stored[:-3], "pymupdf+tesseract")
+
+    stats = _run(path, root, "partial")
+
+    text, extracted_at, llm, summary = _content(
+        conn, att, "extracted_text, extracted_at, llm_status, summary"
+    )
+    assert (stats["kept"], stats["ocr_close"]) == (0, 1)
+    assert (text, llm, summary) == (stored, "extracted", "old summary")
+    assert extracted_at != "2026-09-01"
+    assert (summarised, removed) == ([], [])
+    assert _run(path, root, "partial", dry_run=True)["selected"] == 0
+
+
+def test_an_ocr_re_read_a_few_characters_long_keeps_the_stored_text(store, monkeypatch):
+    path, conn, root, _removed, summarised = store
+    stored = WORDS * 40
+    att = _row(conn, root, "scan.tif", stored, body=b"II*\x00", mime="image/tiff")
+    _partial(conn, att, method="ocr")
+    _reads(monkeypatch, stored + " a.", "ocr")
+
+    stats = _run(path, root, "partial")
+
+    text, extracted_at = _content(conn, att, "extracted_text, extracted_at")
+    assert (stats["ocr_close"], text, summarised) == (1, stored, [])
+    assert extracted_at != "2026-09-01"
+
+
+def test_an_ocr_re_read_well_short_of_the_stored_text_is_still_kept(store, monkeypatch):
+    path, conn, root, _removed, summarised = store
+    stored = WORDS * 40
+    att = _row(conn, root, "scan.pdf", stored, body=b"%PDF-1.4", mime="application/pdf")
+    _partial(conn, att, method="pymupdf+tesseract")
+    _reads(monkeypatch, stored[: len(stored) * 9 // 10], "pymupdf+tesseract")
+
+    stats = _run(path, root, "partial")
+
+    text, extracted_at = _content(conn, att, "extracted_text, extracted_at")
+    assert (stats["kept"], stats["ocr_close"]) == (1, 0)
+    assert (text, extracted_at, summarised) == (stored, "2026-09-01", [])
+
+
+def test_an_ocr_re_read_that_reports_pages_unread_is_still_kept(store, monkeypatch):
+    """Close in length is not enough when the reader says it stopped early."""
+    path, conn, root, _removed, summarised = store
+    stored = WORDS * 40
+    att = _row(conn, root, "scan.pdf", stored, body=b"%PDF-1.4", mime="application/pdf")
+    _partial(conn, att, method="pymupdf+tesseract")
+    monkeypatch.setattr(
+        rx,
+        "extract_text_from_file",
+        lambda *a, **k: {
+            "text": stored[:-3],
+            "method": "pymupdf+tesseract",
+            "status": "extracted",
+            "error": "time budget spent, 2 pages left unread",
+        },
+    )
+
+    stats = _run(path, root, "partial")
+
+    (extracted_at,) = _content(conn, att, "extracted_at")
+    assert (stats["kept"], stats["ocr_close"], extracted_at) == (1, 0, "2026-09-01")
+    assert summarised == []
+
+
+def test_an_ocr_re_read_far_longer_is_stored_and_summarised(store, monkeypatch):
+    """A scan the old reader stopped at 30 pages comes back with the pages it never read."""
+    path, conn, root, _removed, summarised = store
+    stored = WORDS * 40
+    att = _row(conn, root, "scan.pdf", stored, body=b"%PDF-1.4", mime="application/pdf")
+    _partial(conn, att, method="pymupdf+tesseract")
+    _reads(monkeypatch, stored * 2, "pymupdf+tesseract")
+
+    stats = _run(path, root, "partial")
+
+    (text,) = _content(conn, att, "extracted_text")
+    assert (stats["ocr_close"], len(text), summarised) == (0, len(stored) * 2, [att])
+
+
+def test_a_spreadsheet_re_read_a_few_characters_short_is_still_kept(store, monkeypatch):
+    """Spreadsheet readers do not drift: a shorter read is a reader reading less."""
+    path, conn, root, _removed, summarised = store
+    stored = WORDS * 40
+    att = _row(conn, root, "book.xlsx", stored, body=_workbook(3), mime="")
+    _partial(conn, att)
+    _reads(monkeypatch, stored[:-3], "openpyxl")
+
+    stats = _run(path, root, "partial")
+
+    (extracted_at,) = _content(conn, att, "extracted_at")
+    assert (stats["kept"], stats["ocr_close"], extracted_at) == (1, 0, "2026-09-01")
+
+
+def test_after_id_offers_only_the_rows_above_it(store, monkeypatch):
+    """A batch runner passes the highest id it handled, so a row kept unread is not offered to
+    every later batch again."""
+    path, conn, root, _removed, _summarised = store
+    first = _row(conn, root, "a.xlsx", WORDS * 3, body=_workbook(3), mime="")
+    second = _row(conn, root, "b.xlsx", WORDS * 3, body=_workbook(3), mime="")
+    for att in (first, second):
+        _partial(conn, att)
+    _reads(monkeypatch, None, "pyxlsb")
+
+    stats = _run(path, root, "partial", after_id=_ac_id(conn, first))
+
+    assert (stats["selected"], stats["kept"]) == (1, 1)
+    assert stats["highest_id"] == _ac_id(conn, second)
+
+
+def test_the_highest_id_is_zero_when_nothing_is_left(store):
+    path, conn, root, _removed, _summarised = store
+    att = _row(conn, root, "a.xlsx", WORDS * 3, body=_workbook(3), mime="")
+    _partial(conn, att)
+
+    stats = _run(path, root, "partial", dry_run=True, after_id=_ac_id(conn, att))
+
+    assert (stats["selected"], stats["highest_id"]) == (0, 0)
+
+
+def test_the_command_passes_after_id_and_prints_the_highest_id(store, capsys):
+    from argparse import Namespace
+
+    from src.cli import cmd_reextract
+
+    path, conn, root, _removed, _summarised = store
+    first = _row(conn, root, "a.xlsx", WORDS * 3, body=_workbook(3), mime="")
+    second = _row(conn, root, "b.xlsx", WORDS * 3, body=_workbook(3), mime="")
+    for att in (first, second):
+        _partial(conn, att)
+
+    rc = cmd_reextract(
+        Namespace(
+            db=str(path),
+            capped=False,
+            long=False,
+            zip=False,
+            unread=False,
+            partial=True,
+            limit=0,
+            after_id=_ac_id(conn, first),
+            dry_run=True,
+            workers=1,
+            root=str(root / "att"),
+        )
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "  selected    : 1" in out
+    assert f"  highest id  : {_ac_id(conn, second)}\n" in out

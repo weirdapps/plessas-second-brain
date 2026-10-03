@@ -469,6 +469,7 @@ def cmd_reextract(args):
         dry_run=args.dry_run,
         workers=args.workers,
         root=args.root,
+        after_id=getattr(args, "after_id", 0) or None,
     )
     print(f"reextract ({', '.join(sorted(which))}){' DRY RUN' if args.dry_run else ''}:")
     for key in (
@@ -478,10 +479,13 @@ def cmd_reextract(args):
         "missing",
         "kept",
         "unchanged",
+        "ocr_close",
         "summarised",
         "failed",
     ):
         print(f"  {key:<12}: {stats[key]:,}")
+    # No thousands separator: a batch runner passes this back as --after-id.
+    print(f"  {'highest id':<12}: {stats['highest_id']}")
     return 0
 
 
@@ -3103,6 +3107,12 @@ def main():
         help="rows the old readers read in part: spreadsheets, scans, archives, 2M-char texts",
     )
     parser_reextract.add_argument("--limit", type=int, default=0, help="Max rows (0 = all)")
+    parser_reextract.add_argument(
+        "--after-id",
+        type=int,
+        default=0,
+        help="Only rows above this content id: the highest id a previous batch printed",
+    )
     parser_reextract.add_argument("--dry-run", action="store_true", help="Count only")
     parser_reextract.add_argument("--workers", type=int, default=4, help="Phase 2 workers")
     parser_reextract.add_argument(

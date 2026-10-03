@@ -5,14 +5,17 @@ Phase 2: Vertex AI structured extraction (LLM) — added in Task 4.
 Ingest: Import standalone documents (not from email) into the knowledge store.
 """
 
+import hashlib
+import json
 import os
 import shutil
 import sqlite3
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
-from src.config import ATTACHMENTS_DIR, DEFAULT_DB
+from src.config import ATTACHMENTS_DIR, DATA_ROOT, DEFAULT_DB
 from src.extract.attachment_extractors import extract_text_from_file
 from src.extract.vertex_auth import touch_sentinel
 from src.redact import redact_secrets
@@ -38,9 +41,15 @@ DEFERRED = "deferred"
 
 # A longer text is summarised from this many parts, spread evenly across it (2,000,000
 # characters at 40,000 a part). Every part of a 40M-character log would be 1,000 calls in a
-# row, more than a night's budget, and a deferred text starts over the next night. The whole
-# text is still stored and searchable.
+# row, more than a night's budget. The whole text is still stored and searchable.
 MAX_SUMMARY_PARTS = 50
+
+# Each finished part of a long document is kept here, one JSON file per attachment_content
+# row, so a document the budget cuts short resumes where it stopped. Until 2026-10-04 a
+# deferred text started over the next night: its finished parts were paid for and dropped,
+# night after night. A part is reused only while its text and place are unchanged, and the
+# file goes once the merge is done.
+PARTS_DIR = DATA_ROOT / "state" / "attachment_parts"
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -297,8 +306,55 @@ def _complete_and_parse(prompt: str) -> dict:
     return parse_extraction(raw_text)
 
 
-def _extract_in_parts(text, filename, mime_type, email_subject, email_date, out_of_time):
-    """Summarise a long text part by part, then once over the parts. None when time ran out."""
+def _part_key(*inputs) -> str:
+    """Fingerprint of what a part's prompt is built from: its text, place and metadata."""
+    digest = hashlib.sha256()
+    for value in inputs:
+        digest.update(repr(value).encode())
+        digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+def _load_parts(ac_id) -> dict:
+    """The parts a row has already finished, by index. Unreadable means none."""
+    if ac_id is None:
+        return {}
+    try:
+        return json.loads((PARTS_DIR / f"{ac_id}.json").read_text()).get("parts", {})
+    except Exception:
+        return {}
+
+
+def _save_parts(ac_id, parts: dict) -> None:
+    """Never raises: a lost save costs a part paid again, which is where it started."""
+    if ac_id is None:
+        return
+    try:
+        PARTS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = PARTS_DIR / f".{ac_id}.{os.getpid()}.{threading.get_ident()}.tmp"
+        tmp.write_text(json.dumps({"parts": parts}))
+        os.replace(tmp, PARTS_DIR / f"{ac_id}.json")
+    except Exception:
+        pass
+
+
+def _drop_parts(ac_id) -> None:
+    if ac_id is None:
+        return
+    try:
+        (PARTS_DIR / f"{ac_id}.json").unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _extract_in_parts(
+    text, filename, mime_type, email_subject, email_date, out_of_time, ac_id=None
+):
+    """Summarise a long text part by part, then once over the parts. None when time ran out.
+
+    With ``ac_id`` every finished part is saved as it lands, and a part saved by an
+    earlier run is reused while its text and place are unchanged, so a document the
+    budget cut short resumes instead of starting over."""
     from src.extract.attachment_prompt import (
         build_attachment_prompt,
         build_merge_prompt,
@@ -307,25 +363,32 @@ def _extract_in_parts(text, filename, mime_type, email_subject, email_date, out_
 
     parts = split_text(text)
     chosen = _spread(len(parts), MAX_SUMMARY_PARTS)
+    saved = _load_parts(ac_id)
     extractions = []
     for i in chosen:
+        key = _part_key(parts[i], i, len(parts), filename, mime_type, email_subject, email_date)
+        entry = saved.get(str(i))
+        if isinstance(entry, dict) and entry.get("key") == key:
+            extractions.append(entry["extraction"])
+            continue
         if out_of_time is not None and out_of_time():
             return None
-        extractions.append(
-            _complete_and_parse(
-                build_attachment_prompt(
-                    extracted_text=parts[i],
-                    filename=filename,
-                    mime_type=mime_type,
-                    email_subject=email_subject,
-                    email_date=email_date,
-                    part=(i + 1, len(parts)),
-                )
+        extraction = _complete_and_parse(
+            build_attachment_prompt(
+                extracted_text=parts[i],
+                filename=filename,
+                mime_type=mime_type,
+                email_subject=email_subject,
+                email_date=email_date,
+                part=(i + 1, len(parts)),
             )
         )
+        extractions.append(extraction)
+        saved[str(i)] = {"key": key, "extraction": extraction}
+        _save_parts(ac_id, saved)
     if out_of_time is not None and out_of_time():
         return None
-    return _complete_and_parse(
+    merged = _complete_and_parse(
         build_merge_prompt(
             extractions,
             filename=filename,
@@ -335,6 +398,8 @@ def _extract_in_parts(text, filename, mime_type, email_subject, email_date, out_
             covered=(len(chosen), len(parts)),
         )
     )
+    _drop_parts(ac_id)
+    return merged
 
 
 def _spread(n: int, k: int) -> list[int]:
@@ -373,7 +438,7 @@ def _extract_one_attachment(row, out_of_time=None):
         # checked before an item is dispatched, and a long document is many calls long.
         if len(text or "") > LONG_TEXT_CHARS:
             extraction = _extract_in_parts(
-                text, filename, mime_type, email_subject, email_date, out_of_time
+                text, filename, mime_type, email_subject, email_date, out_of_time, ac_id=ac_id
             )
             if extraction is None:
                 return (ac_id, email_id, None, "deferred: out of time between parts", DEFERRED)
@@ -484,7 +549,10 @@ def run_phase2(
     if max_text_chars is not None:
         query += "\n        AND length(ac.extracted_text) <= ?"
         params.append(max_text_chars)
-    query += "\n        ORDER BY ac.id"
+    # Short texts first, then by id. A long document is many calls long, and in id order
+    # the long rows of 10-01 came first every night, so 743 short rows waited behind them
+    # for days (2026-10-04). A long one cut short now resumes, so going last costs it nothing.
+    query += f"\n        ORDER BY length(ac.extracted_text) > {LONG_TEXT_CHARS}, ac.id"
     if limit > 0:
         query += f"\n        LIMIT {int(limit)}"
 

@@ -1,5 +1,6 @@
 """Calendar event extraction via LLM."""
 
+import hashlib
 import json
 
 from src.extract.claude_extract import _response_text, complete
@@ -61,47 +62,11 @@ def parse_extraction_response(raw: str) -> dict:
     raise ValueError(f"calendar extraction response is not JSON: {raw[:80]!r}")
 
 
-def extract_event(event: dict, body: str | None = None) -> dict:
-    """
-    Run LLM extraction on a calendar event.
+# The prompt around the invite. Its text is part of event_prompt_hash, so an edit
+# here re-extracts every event once, as a changed prompt should.
+_PROMPT_TEMPLATE = """You are analyzing a calendar event from a corporate email system.
 
-    Args:
-        event: Event dict with subject, organizer, attendees, start_at
-        body: Optional event body/description
-
-    Returns:
-        dict with body_summary, decisions, action_items
-    """
-    # If body is None or too short, return empty result (no LLM call)
-    if body is None or len(body.strip()) < 50:
-        return {"body_summary": "", "decisions": [], "action_items": []}
-
-    # Redact credentials, then truncate to 4000 chars. Redacting first means a
-    # key straddling the cut cannot survive as an unrecognisable fragment.
-    truncated_body = redact_secrets(body)[:4000]
-
-    # Extract event metadata
-    subject = event.get("subject", "")
-    organizer = event.get("organizer", "")
-    # `or`, not a get() default: Graph sends "name": null, and get() returns the
-    # stored None rather than the default, which str.join rejects.
-    attendees = ", ".join(
-        str(a.get("name") or a.get("email") or "") if isinstance(a, dict) else str(a)
-        for a in event.get("attendees", [])
-    )
-    start_at = event.get("start_at", "")
-
-    # Build prompt. Whoever sent the invite wrote all of it, the subject included.
-    invite = f"""Event subject: {subject}
-Organizer: {organizer}
-Attendees: {attendees}
-Date: {start_at}
-
-Event body/description:
-{truncated_body}"""
-    prompt = f"""You are analyzing a calendar event from a corporate email system.
-
-{fence(invite)}
+{invite}
 
 Extract the following as JSON:
 {{
@@ -118,6 +83,40 @@ Set decision_date to the date the text states for the decision, as YYYY-MM-DD, o
 If the body is empty or contains only a Teams link with no agenda, return empty summary and empty arrays.
 Respond with ONLY the JSON object, no other text."""
 
+
+def event_prompt_hash(event: dict, body: str | None) -> str | None:
+    """sha256 of what the model would read for this event: the invite and the prompt
+    around it. The fence tag is random per call, so it is left out. None when the
+    body is too short to extract.
+
+    calendar-sync stores it with an extraction. Outlook moves an event's etag on
+    edits the model never sees (an attendee answering, a room change), and the same
+    hash then means the extraction on record still stands."""
+    invite = _invite_text(event, body)
+    if invite is None:
+        return None
+    return hashlib.sha256(f"{_PROMPT_TEMPLATE}\x00{invite}".encode()).hexdigest()
+
+
+def extract_event(event: dict, body: str | None = None) -> dict:
+    """
+    Run LLM extraction on a calendar event.
+
+    Args:
+        event: Event dict with subject, organizer, attendees, start_at
+        body: Optional event body/description
+
+    Returns:
+        dict with body_summary, decisions, action_items
+    """
+    invite = _invite_text(event, body)
+    # If body is None or too short, return empty result (no LLM call)
+    if invite is None:
+        return {"body_summary": "", "decisions": [], "action_items": []}
+
+    # Whoever sent the invite wrote all of it, the subject included.
+    prompt = _PROMPT_TEMPLATE.format(invite=fence(invite))
+
     response = complete(max_tokens=1024, messages=[{"role": "user", "content": prompt}])
 
     # First text block, never content[0]: extended thinking puts a ThinkingBlock there.
@@ -129,3 +128,32 @@ Respond with ONLY the JSON object, no other text."""
 
     # Parse response
     return parse_extraction_response(raw_text)
+
+
+def _invite_text(event: dict, body: str | None) -> str | None:
+    """The invite as the prompt shows it, or None when the body is too short."""
+    if body is None or len(body.strip()) < 50:
+        return None
+
+    # Redact credentials, then truncate to 4000 chars. Redacting first means a
+    # key straddling the cut cannot survive as an unrecognisable fragment.
+    truncated_body = redact_secrets(body)[:4000]
+
+    # Extract event metadata
+    subject = event.get("subject", "")
+    organizer = event.get("organizer", "")
+    # `or`, not a get() default: Graph sends "name": null, and get() returns the
+    # stored None rather than the default, which str.join rejects.
+    attendees = ", ".join(
+        str(a.get("name") or a.get("email") or "") if isinstance(a, dict) else str(a)
+        for a in event.get("attendees", [])
+    )
+    start_at = event.get("start_at", "")
+
+    return f"""Event subject: {subject}
+Organizer: {organizer}
+Attendees: {attendees}
+Date: {start_at}
+
+Event body/description:
+{truncated_body}"""

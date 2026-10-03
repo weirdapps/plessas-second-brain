@@ -2018,8 +2018,10 @@ def cmd_teams_sync(args):
         deadline_s=TEAMS_EXTRACT_DEADLINE_S,
     )
     e_deferred = e.get("deferred", 0)
+    e_refused = e.get("refused", 0)
     print(
         f"  {e['extracted']} extracted, {e['skipped']} skipped, {e['failed']} failed"
+        + (f", {e_refused} refused" if e_refused else "")
         + (f", {e_deferred} deferred (out of time)" if e_deferred else "")
     )
 

@@ -377,6 +377,23 @@ def test_migration_v21_adds_the_calendar_change_key_idempotently():
         bare.close()
 
 
+def test_migration_v29_adds_the_calendar_extraction_hash_idempotently():
+    """Nullable and not backfilled: a row stored before it has no hash, so its next
+    etag change is extracted once more and stamped."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        conn = sqlite3.connect(str(Path(tmpdir) / "test.db"))
+        _v16_calendar_db(conn)
+        schema.migrate_add_calendar_extraction_hash(conn)
+        schema.migrate_add_calendar_extraction_hash(conn)  # must not crash
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(calendar_events)").fetchall()}
+        assert "extraction_hash" in cols
+        conn.close()
+
+        bare = sqlite3.connect(":memory:")
+        schema.migrate_add_calendar_extraction_hash(bare)  # no calendar tables: a no-op
+        bare.close()
+
+
 def test_migration_v21_loses_a_race_cleanly():
     """Two units can start together after a deploy. The loser reads the column
     as missing, then finds it there when it ALTERs; that must be a no-op, not

@@ -2223,7 +2223,7 @@ def cmd_calendar_sync(args):
         parse_event,
     )
     from src.export.outlook_cli import OutlookCliAuthRequired
-    from src.extract.calendar_extractor import extract_event
+    from src.extract.calendar_extractor import event_prompt_hash, extract_event
     from src.extract.policy_bridge import classify_exception, is_transient
     from src.extract.vertex_auth import touch_sentinel
     from src.llm_policy import Outcome
@@ -2281,6 +2281,7 @@ def cmd_calendar_sync(args):
     stats = {
         "loaded": 0,
         "skipped_unchanged": 0,
+        "same_input": 0,
         "extracted": 0,
         "failed": 0,
         "deferred": 0,
@@ -2317,7 +2318,8 @@ def cmd_calendar_sync(args):
         # it, so every event was fetched and re-extracted on every run. The etag comes
         # with every list entry. No etag on either side is never "unchanged".
         existing = conn.execute(
-            "SELECT change_key, llm_status FROM calendar_events WHERE outlook_event_id = ?",
+            "SELECT change_key, llm_status, extraction_hash FROM calendar_events "
+            "WHERE outlook_event_id = ?",
             (event["outlook_event_id"],),
         ).fetchone()
         if (
@@ -2407,7 +2409,20 @@ def cmd_calendar_sync(args):
             llm_status = "pending" if long_enough or prior_status == "pending" else "skipped"
         else:
             llm_status = "skipped"
-        if not args.skip_extraction and long_enough:
+        # The etag moves on edits the model never sees (an attendee answering, a room
+        # change). The same prompt hash means the extraction on record was made from
+        # this very prompt, so it stands: keep it and refresh only the facts.
+        prompt_hash = event_prompt_hash(event, body_html) if long_enough else None
+        keep_extraction = (
+            not args.skip_extraction
+            and prompt_hash is not None
+            and prior_status == "extracted"
+            and existing["extraction_hash"] == prompt_hash
+        )
+        if keep_extraction:
+            llm_status = "extracted"
+            stats["same_input"] += 1
+        elif not args.skip_extraction and long_enough:
             try:
                 extraction = extract_event(event, body_html)
                 llm_status = "extracted"
@@ -2445,6 +2460,8 @@ def cmd_calendar_sync(args):
             user_email_pattern=USER_EMAIL_PATTERN,
             proxy_emails=proxy_emails,
             llm_status=llm_status,
+            extraction_hash=prompt_hash,
+            keep_extraction=keep_extraction,
         )
         stats["loaded"] += 1
 
@@ -2534,6 +2551,7 @@ def cmd_calendar_sync(args):
 
     print(f"  Loaded:     {stats['loaded']}")
     print(f"  Unchanged:  {stats['skipped_unchanged']}")
+    print(f"  Same input: {stats['same_input']} (etag moved, extraction kept)")
     print(f"  Extracted:  {stats['extracted']}")
     print(f"  Failed:     {stats['failed']}")
     print(f"  Deferred:   {stats['deferred']}")

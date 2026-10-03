@@ -133,6 +133,8 @@ def load_event(
     proxy_emails: set[str] | None = None,
     *,
     llm_status: str,
+    extraction_hash: str | None = None,
+    keep_extraction: bool = False,
 ) -> int:
     """
     UPSERT calendar event + attendees + decisions + action items.
@@ -153,12 +155,20 @@ def load_event(
             default would be a default answer to "did the extraction succeed?", and a
             caller that forgot to pass it would silently record a failure as a success —
             which is the exact bug this column was added to fix.
+        extraction_hash: event_prompt_hash() of the prompt behind an 'extracted'
+            row; stored with it, kept by any other status.
+        keep_extraction: the etag moved but the prompt did not (same hash), so the
+            extraction on record still stands: refresh the facts and the etag, keep
+            the summary, its stamp, the decisions and the action items. Only with
+            llm_status='extracted'.
 
     Returns:
         event_id
     """
     if llm_status not in LLM_STATUSES:
         raise ValueError(f"llm_status must be one of {LLM_STATUSES}, got {llm_status!r}")
+    if keep_extraction and llm_status != "extracted":
+        raise ValueError("keep_extraction only applies to an 'extracted' row")
 
     # Compute is_self_organized
     is_self_organized = _is_self_organized(
@@ -170,6 +180,16 @@ def load_event(
 
     # Determine body_extracted_at
     body_extracted_at = now_utc if extraction.get("body_summary") else None
+    body_summary = extraction.get("body_summary")
+    if keep_extraction:
+        # Written back as they are, because the UPSERT replaces both on 'extracted'.
+        prior = conn.execute(
+            "SELECT body_summary, body_extracted_at FROM calendar_events "
+            "WHERE outlook_event_id = ?",
+            (event["outlook_event_id"],),
+        ).fetchone()
+        if prior is not None:
+            body_summary, body_extracted_at = prior[0], prior[1]
 
     # UPSERT event. The summary and its stamp are replaced only by a new
     # extraction, as the decisions and actions below are. Any other status comes
@@ -184,8 +204,8 @@ def load_event(
             start_at, end_at, location, is_recurring, recurrence_master_id,
             response_status, is_cancelled, is_self_organized,
             created_at, modified_at, ingested_at, body_extracted_at, body_summary,
-            llm_status, change_key
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            llm_status, change_key, extraction_hash
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(outlook_event_id) DO UPDATE SET
             subject = excluded.subject,
             organizer_email = excluded.organizer_email,
@@ -206,7 +226,9 @@ def load_event(
             body_summary = CASE WHEN excluded.llm_status = 'extracted'
                 THEN excluded.body_summary ELSE calendar_events.body_summary END,
             llm_status = excluded.llm_status,
-            change_key = excluded.change_key
+            change_key = excluded.change_key,
+            extraction_hash = CASE WHEN excluded.llm_status = 'extracted'
+                THEN excluded.extraction_hash ELSE calendar_events.extraction_hash END
         """,
         (
             event["outlook_event_id"],
@@ -225,9 +247,10 @@ def load_event(
             event.get("modified_at"),
             now_utc,
             body_extracted_at,
-            extraction.get("body_summary"),
+            body_summary,
             llm_status,
             event.get("change_key"),
+            extraction_hash,
         ),
     )
 
@@ -268,8 +291,9 @@ def load_event(
     # attendee rows above are replaced. Appending is what stacked a full new set
     # on every re-extraction (916 decisions on one meeting by 2026-09-23). Any
     # other status arrives with an empty extraction that says nothing about the
-    # event, so the previous decisions and actions are kept.
-    if llm_status == "extracted":
+    # event, so the previous decisions and actions are kept, as they are when the
+    # extraction on record is kept (keep_extraction).
+    if llm_status == "extracted" and not keep_extraction:
         conn.execute("DELETE FROM decisions WHERE event_id = ?", (event_id,))
         conn.execute("DELETE FROM action_items WHERE event_id = ?", (event_id,))
 

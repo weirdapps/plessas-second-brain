@@ -174,3 +174,86 @@ def test_the_hourly_sync_leaves_long_texts_for_the_nightly_pass():
     source = inspect.getsource(cli)
     at = source.index("deadline_s=PHASE2_SYNC_DEADLINE_S")
     assert "max_text_chars=LONG_TEXT_CHARS" in source[at - 200 : at + 200]
+
+
+# --- Resume, 2026-10-04 -------------------------------------------------------
+# A long document the nightly budget cut short started over the next night: its
+# finished parts were paid for and dropped. In id order the long rows of 10-01 came
+# first every night, so 743 short rows waited behind them for days and the nightly
+# pass fell from ~300 rows to 13-48. Finished parts are now kept per row and reused
+# while their text and place are unchanged, and short texts drain first.
+
+
+def _three_part_row(text=None):
+    text = text or "\n\n".join(["word " * 8000] * 3)
+    return (1, 2, text, "deck.txt", "text/plain", 3, "deck", "2026-09-01"), text
+
+
+def test_a_document_cut_short_resumes_from_its_last_finished_part(monkeypatch):
+    calls = []
+    _fake_model(monkeypatch, calls)
+    row, text = _three_part_row()
+
+    first = attachment_pipeline._extract_one_attachment(row, lambda: len(calls) >= 1)
+    assert first[4] == DEFERRED and len(calls) == 1
+
+    _ac, _email, extraction, error, _verdict = attachment_pipeline._extract_one_attachment(
+        row, None
+    )
+
+    assert error is None and extraction["summary"] == "the whole document"
+    assert len(calls) == len(split_text(text)) + 1  # every part once, then the merge
+
+
+def test_a_finished_document_leaves_no_saved_parts(monkeypatch):
+    calls = []
+    _fake_model(monkeypatch, calls)
+    row, _ = _three_part_row()
+    attachment_pipeline._extract_one_attachment(row, lambda: len(calls) >= 1)
+    assert list(attachment_pipeline.PARTS_DIR.glob("*.json"))
+
+    attachment_pipeline._extract_one_attachment(row, None)
+
+    assert not list(attachment_pipeline.PARTS_DIR.glob("*"))
+
+
+def test_a_saved_part_is_paid_again_when_its_text_changed(monkeypatch):
+    calls = []
+    _fake_model(monkeypatch, calls)
+    row, text = _three_part_row()
+    attachment_pipeline._extract_one_attachment(row, lambda: len(calls) >= 1)
+
+    changed_row, _ = _three_part_row(text.replace("word", "term", 1))
+    attachment_pipeline._extract_one_attachment(changed_row, None)
+
+    assert len(calls) == 1 + len(split_text(text)) + 1
+
+
+def test_short_texts_drain_before_long_ones(tmp_path, monkeypatch):
+    path, _ = _long_row(tmp_path, 130_000)  # the older row, and the long one
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO attachments (email_id, message_id, filename, mime_type, file_size,"
+        " file_path, exported_at)"
+        " VALUES (1, 7, 'note.txt', 'text/plain', 1, '/x/note.txt', '2026-09-01')"
+    )
+    conn.execute(
+        "INSERT INTO attachment_content (attachment_id, extracted_text, extraction_method,"
+        " extraction_status, extracted_at, llm_status)"
+        " VALUES (2, ?, 'direct_read', 'extracted', '2026-09-01', 'pending')",
+        ("A short note about the plan. " * 20,),
+    )
+    conn.commit()
+    conn.close()
+    seen = []
+    monkeypatch.setattr(
+        attachment_pipeline,
+        "_extract_one_attachment",
+        lambda row, *a, **k: (
+            seen.append(len(row[2])) or (row[0], row[5], {"summary": "s"}, None, False)
+        ),
+    )
+
+    run_phase2(str(path), workers=1)
+
+    assert len(seen) == 2 and seen[0] < LONG_TEXT_CHARS < seen[1]

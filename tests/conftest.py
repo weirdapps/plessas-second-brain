@@ -85,3 +85,15 @@ def _no_network(request, monkeypatch):
     if request.node.get_closest_marker("allow_network"):
         return
     monkeypatch.setattr(socket, "socket", _BlockedSocket)
+
+
+@pytest.fixture(autouse=True)
+def _own_attachment_parts(tmp_path, monkeypatch):
+    """The parts a long document has finished are saved under the data root, keyed by
+    row id. Shared across the session, one test's parts would be handed to the next
+    test that uses the same id and text, so each test gets a directory of its own."""
+    from src.extract import attachment_pipeline
+
+    monkeypatch.setattr(
+        attachment_pipeline, "PARTS_DIR", tmp_path / "attachment_parts", raising=False
+    )

@@ -173,6 +173,41 @@ def test_extract_threads_marks_failed_on_llm_error(db, monkeypatch):
     assert "vertex 503" in t["extraction_error"]
 
 
+def test_a_refused_thread_is_not_resent_every_run(db, monkeypatch):
+    """A thread both tiers refused went back to 'failed', which extract_threads selects,
+    so it cost two billed calls every hourly run for an answer that cannot change
+    (2026-10-03: thread 9873, all afternoon). 'refused' is not selected; new messages
+    reset the thread to 'pending' (teams_threads.py), so new content is still read."""
+    from src.extract.teams_pipeline import ThreadRefused
+
+    monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "test-project")
+    _seed_thread(db)
+    with patch(
+        "src.extract.teams_pipeline._call_llm", side_effect=ThreadRefused("stop_reason='refusal'")
+    ) as mock:
+        first = extract_threads(db, workers=1)
+        second = extract_threads(db, workers=1)
+
+    assert first["refused"] == 1 and first["failed"] == 0
+    assert mock.call_count == 1
+    assert second["refused"] == 0
+    t = db.execute("SELECT extraction_status, extraction_error FROM teams_threads").fetchone()
+    assert t["extraction_status"] == "refused"
+    assert "refusal" in t["extraction_error"]
+
+
+def test_call_llm_raises_thread_refused_on_a_final_refusal(monkeypatch):
+    from src.extract.teams_pipeline import ThreadRefused, _call_llm
+
+    class Refused:
+        content: list = []
+        stop_reason = "refusal"
+
+    monkeypatch.setattr("src.extract.claude_extract.complete", lambda **kw: Refused())
+    with pytest.raises(ThreadRefused):
+        _call_llm("system", "user")
+
+
 def test_extract_threads_re_extraction_clears_old_decisions(db, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "test-project")
     thread_id = _seed_thread(db)

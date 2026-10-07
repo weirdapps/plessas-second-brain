@@ -358,6 +358,8 @@ def cmd_process_attachments(args):
         print(f"  Extracted: {stats['extracted']}")
         print(f"  Failed: {stats['failed']}")
         print(f"  Skipped: {stats['skipped']}")
+        if stats.get("encrypted"):
+            print(f"  Encrypted (no text without a key): {stats['encrypted']}")
         if stats.get("reused"):
             print(f"  Reused (same file): {stats['reused']}")
         if stats.get("deferred"):
@@ -575,7 +577,7 @@ def cmd_reextract(args):
     which = {name for name in SELECTORS if getattr(args, name, False)}
     if not which:
         print(
-            "Error: choose at least one of --capped, --long, --zip, --unread, --partial",
+            "Error: choose at least one of " + ", ".join(f"--{name}" for name in SELECTORS),
             file=sys.stderr,
         )
         return 2
@@ -596,6 +598,7 @@ def cmd_reextract(args):
         "missing",
         "kept",
         "unchanged",
+        "relabelled",
         "ocr_close",
         "summarised",
         "failed",
@@ -2037,9 +2040,11 @@ def cmd_sync(args):
     p1_stats = run_phase1(db_path, deadline_s=PHASE1_SYNC_DEADLINE_S)
     if p1_stats["processed"] > 0:
         deferred = p1_stats.get("deferred", 0)
+        encrypted = p1_stats.get("encrypted", 0)
         print(
             f"  Phase 1: {p1_stats['extracted']} text extracted, "
             f"{p1_stats['failed']} failed, {p1_stats['skipped']} skipped"
+            + (f", {encrypted} encrypted" if encrypted else "")
             + (f", {deferred} deferred (out of time)" if deferred else "")
         )
         p2_stats = run_phase2(
@@ -3396,6 +3401,17 @@ def main():
         "--partial",
         action="store_true",
         help="rows the old readers read in part: spreadsheets, scans, archives, 2M-char texts",
+    )
+    parser_reextract.add_argument(
+        "--stale", action="store_true", help="skipped as unsupported before the sniffs landed"
+    )
+    parser_reextract.add_argument(
+        "--formats",
+        action="store_true",
+        help=".mso/.wmz/.emz, failed .docx/.pptx, images that would not open",
+    )
+    parser_reextract.add_argument(
+        "--ocr", action="store_true", help="scans and images whose OCR found too little text"
     )
     parser_reextract.add_argument("--limit", type=int, default=0, help="Max rows (0 = all)")
     parser_reextract.add_argument(

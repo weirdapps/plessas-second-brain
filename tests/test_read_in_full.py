@@ -124,8 +124,8 @@ def test_the_ocr_budget_reaches_a_scanned_pdf(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ax,
         "_ocr_pdf_pages",
-        lambda path, seconds=None: (
-            seen.append(seconds)
+        lambda path, seconds=None, gray=False: (
+            (None if gray else seen.append(seconds))
             or {"text": None, "method": "pymupdf+tesseract", "status": "skipped", "error": "x"}
         ),
     )
@@ -135,7 +135,7 @@ def test_the_ocr_budget_reaches_a_scanned_pdf(tmp_path, monkeypatch):
     page.get_text.return_value = ""
 
     for budget in (math.inf, None):
-        doc = MagicMock()
+        doc = MagicMock(needs_pass=False)
         doc.__iter__.return_value = iter([page])
         with patch("fitz.open", return_value=doc):
             ax.extract_text_from_file(str(pdf), "application/pdf", ocr_seconds=budget)
@@ -293,7 +293,7 @@ def test_a_file_read_in_part_is_kept(tmp_path, error):
 def _blank_text_layer():
     page = MagicMock()
     page.get_text.return_value = ""
-    doc = MagicMock()
+    doc = MagicMock(needs_pass=False)
     doc.__iter__.return_value = iter([page])
     return patch("fitz.open", return_value=doc)
 

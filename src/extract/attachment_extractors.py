@@ -1,13 +1,17 @@
 """Local text extraction from attachment files.
 
-Extracts text from PDF, Word, PowerPoint, Excel, images (OCR),
-.eml, .rpmsg, and plain text files. No API calls — all local.
+Extracts text from PDF, Word, PowerPoint, Excel, images (OCR), .eml, Office object
+containers (.mso), drawings (.wmz, .emz) and text formats told apart by their bytes; files
+encrypted at rest are recognised and recorded as such. No API calls — all local.
 """
 
 import html
+import io
 import os
 import re
+import struct
 import time
+import zlib
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
@@ -25,6 +29,7 @@ MIN_TEXT_CHARS = 50
 # MIME types we skip entirely (video, audio, archives, Outlook artifacts)
 SKIP_MIME_TYPES = {
     "video/mp4",
+    "video/quicktime",
     "audio/mpeg",
     "audio/x-wav",
     "audio/wav",
@@ -33,7 +38,44 @@ SKIP_MIME_TYPES = {
     "application/gzip",
 }
 
-SKIP_EXTENSIONS = {".mp4", ".mp3", ".wav", ".rar", ".7z", ".gz", ".mso", ".wmz"}
+SKIP_EXTENSIONS = {".mp4", ".mov", ".mp3", ".wav", ".rar", ".7z", ".gz"}
+
+# Why a skipped format is not read, by extension and by declared type. Every skip records a
+# reason: 564 producer rows were skipped with none, which cannot be told from a bug.
+_VIDEO, _AUDIO = "video: no text to read", "audio: no text to read"
+SKIP_REASONS = {
+    ".mp4": _VIDEO,
+    ".mov": _VIDEO,
+    ".mp3": _AUDIO,
+    ".wav": _AUDIO,
+    ".rar": "RAR archive: no reader for this format",
+    ".7z": "7-Zip archive: no reader for this format",
+    ".gz": "gzip archive: no reader for this format",
+    "video/mp4": _VIDEO,
+    "video/quicktime": _VIDEO,
+    "audio/mpeg": _AUDIO,
+    "audio/x-wav": _AUDIO,
+    "audio/wav": _AUDIO,
+    "application/x-rar-compressed": "RAR archive: no reader for this format",
+    "application/x-7z-compressed": "7-Zip archive: no reader for this format",
+    "application/gzip": "gzip archive: no reader for this format",
+}
+
+# Formats with a reader of their own, chosen by the name: their bytes have no magic a sniff
+# knows, and senders declare them as anything (image/g3fax, application/gzip, x-coff).
+OWN_READER_EXTENSIONS = frozenset({".mso", ".wmz", ".emz"})
+# What one file may inflate to, all of its compressed layers together (an .mso container and
+# every object in it; a .wmz or .emz drawing). The largest .mso on the producer inflates to
+# 1.6 MB and the largest .wmz to 1.9 MB, and the VPS that reads them has 7 GB shared with the
+# MCP server. Past this a file is taken for a decompression bomb: what was read is kept, and
+# the error says the rest is unread for good.
+INFLATE_MAX_BYTES = 64 << 20
+# An Office part the XML fallbacks read: refused past this size or past ZIP_MAX_RATIO, and the
+# read itself stops here whatever the zip header claims.
+XML_PART_MAX_BYTES = 64 << 20
+# Records a drawing's parser reads before it stops; the largest .wmz on the producer inflates to
+# 1.9 MB, a few tens of thousands of records.
+METAFILE_MAX_RECORDS = 500_000
 
 # A zip is unpacked into a temporary directory and every member extracted; nothing is kept.
 # The guards stop a hostile archive: too many members, too many bytes, a member compressed
@@ -54,6 +96,10 @@ OCR_MAX_SECONDS = 120
 # Tesseract's languages, and what a scan with too little text says.
 OCR_LANGS = "eng+ell"
 OCR_INSUFFICIENT = "OCR returned insufficient text"
+# Pillow's own decompression-bomb threshold, twice its default MAX_IMAGE_PIXELS. An image past it
+# is not OCR'd, whatever limit another module sets for its own Image.open calls: tesseract on a
+# 342-megapixel page needs gigabytes and minutes, and Phase 1 cannot stop an item mid-file.
+OCR_MAX_PIXELS = 178_956_970
 ZIP_MIME_TYPES = frozenset({"application/zip", "application/x-zip-compressed"})
 
 
@@ -68,7 +114,8 @@ def extract_text_from_file(
     """Extract text from a file based on its MIME type.
 
     Returns dict with keys: text, method, status, error.
-    status is one of: 'extracted', 'partial', 'failed', 'skipped'.
+    status is one of: 'extracted', 'partial', 'failed', 'skipped', 'encrypted' (the bytes are
+    ciphertext; method 'rms', 'rms-message' or 'password', see encrypted_result).
     _depth is how deep inside archives this file sits; only _extract_zip passes it.
     zip_seconds is how long an archive may spend reading members, ZIP_MAX_SECONDS when None;
     ocr_seconds how long a scan may spend on its pages, OCR_MAX_SECONDS when None. reextract
@@ -86,6 +133,29 @@ def extract_text_from_file(
     return result
 
 
+def verdict_without_reading(file_path: str, mime_type: str) -> dict | None:
+    """The verdict Phase 1 reaches from a file's name, declared type and first bytes alone.
+
+    None when the file has to be read for one (or is missing). The same checks, in the same
+    order, as the start of _extract_by_type: the skip lists, an empty file, encryption at rest.
+    scripts/relabel_attachment_status.py gives old rows these verdicts without reading any text.
+    """
+    ext = Path(file_path).suffix.lower()
+    if ext in SKIP_EXTENSIONS:
+        reason = SKIP_REASONS.get(ext, f"{ext}: no reader for this format")
+        return {"text": None, "method": None, "status": "skipped", "error": reason}
+    if mime_type in SKIP_MIME_TYPES and ext not in OWN_READER_EXTENSIONS:
+        sniffed = sniff_mime_type(file_path)
+        if sniffed is None or sniffed in SKIP_MIME_TYPES:
+            reason = SKIP_REASONS.get(mime_type, f"{mime_type}: no reader for this format")
+            return {"text": None, "method": None, "status": "skipped", "error": reason}
+    if not os.path.isfile(file_path):
+        return None
+    if os.path.getsize(file_path) == 0:
+        return {"text": None, "method": None, "status": "skipped", "error": "empty file (0 bytes)"}
+    return encryption_of(file_path)
+
+
 def _extract_by_type(
     file_path: str,
     mime_type: str,
@@ -98,17 +168,19 @@ def _extract_by_type(
 
     # Skip unsupported types
     if ext in SKIP_EXTENSIONS:
-        return {"text": None, "method": None, "status": "skipped", "error": None}
+        reason = SKIP_REASONS.get(ext, f"{ext}: no reader for this format")
+        return {"text": None, "method": None, "status": "skipped", "error": reason}
 
     # A declared archive or media type is a claim, and senders make it wrongly:
     # 60 .docx and 15 .pptx on the replica arrived labelled application/zip and
     # were skipped here unread, although every one of them opens. So the bytes
     # get the last word. A genuine archive still sniffs as application/zip (or
     # as nothing) and is skipped exactly as before.
-    if mime_type in SKIP_MIME_TYPES:
+    if mime_type in SKIP_MIME_TYPES and ext not in OWN_READER_EXTENSIONS:
         sniffed = sniff_mime_type(file_path)
         if sniffed is None or sniffed in SKIP_MIME_TYPES:
-            return {"text": None, "method": None, "status": "skipped", "error": None}
+            reason = SKIP_REASONS.get(mime_type, f"{mime_type}: no reader for this format")
+            return {"text": None, "method": None, "status": "skipped", "error": reason}
         mime_type = sniffed
 
     # Check file exists
@@ -118,21 +190,6 @@ def _extract_by_type(
             "method": None,
             "status": "failed",
             "error": f"File not found: {file_path}",
-        }
-
-    # IRM/RMS-protected content arrives with mime application/encrypted but an
-    # ordinary .xlsx/.docx/.pptx name, so the extension branches below claimed
-    # it first and the zip-based readers logged "BadZipFile: File is not a zip
-    # file" as a hard FAILURE — 750 rows on the live DB. The bytes are encrypted
-    # at rest: no parser reads them without IRM rights, so this is a permanent
-    # skip, not a fault worth re-counting. .rpmsg still falls through to
-    # _extract_rpmsg, which recovers best-effort metadata from the OLE wrapper.
-    if mime_type == "application/encrypted" and ext != ".rpmsg":
-        return {
-            "text": None,
-            "method": None,
-            "status": "skipped",
-            "error": f"IRM-protected {ext or 'file'}: no extractable text without rights",
         }
 
     try:
@@ -145,37 +202,42 @@ def _extract_by_type(
                 "status": "skipped",
                 "error": "empty file (0 bytes)",
             }
-        # Rights protection is also stored as an OLE2 container holding \x06DataSpaces, whatever
-        # the declared type says; the check above sees only application/encrypted. Sent to the
-        # legacy readers, such a workbook was recorded as failed ("Can't find workbook in OLE2
-        # compound document"). \x06DataSpaces sits in the first directory sector, where
-        # _ole_stream_names reads; EncryptedPackage often does not.
-        if (
-            ext != ".rpmsg"
-            and _magic(file_path) == b"\xd0\xcf\x11\xe0"
-            and "\x06DataSpaces" in _ole_stream_names(file_path)
-        ):
-            return {
-                "text": None,
-                "method": None,
-                "status": "skipped",
-                "error": f"IRM-protected {ext or 'file'}: no extractable text without rights",
-            }
+        # Encrypted at rest, whatever the name or the declared type says: rights-protected
+        # Office files and messages, password-protected ones. Sent to the readers they were
+        # recorded as failures (BadZipFile, "Can't find workbook in OLE2 compound document",
+        # CompoundFileInvalidMagicError), or as skips blaming a custom export format.
+        protected = encryption_of(file_path)
+        if protected:
+            return protected
+        if ext == ".mso":
+            return _extract_mso(file_path, _depth, zip_seconds, ocr_seconds)
+        if ext in (".wmz", ".emz"):
+            return _extract_metafile(file_path)
         if ext == ".zip" or mime_type in ZIP_MIME_TYPES:
             sniffed = sniff_mime_type(file_path)
             if sniffed == "application/zip":
                 seconds = ZIP_MAX_SECONDS if zip_seconds is None else zip_seconds
                 return _extract_zip(file_path, _depth, seconds, ocr_seconds)
             if sniffed is None:
-                return {"text": None, "method": None, "status": "skipped", "error": None}
+                return {
+                    "text": None,
+                    "method": None,
+                    "status": "skipped",
+                    "error": "declared a zip archive, but the bytes are not one",
+                }
             mime_type = sniffed  # an Office document sent as a zip
+        # The Office 2007+ readers open a zip, so a file named or labelled as one is sent to them
+        # only when it is one. Anything else goes by its bytes (the else branch below): a legacy
+        # .doc named .docx, an HTML page named .pptx, a CSV labelled application/vnd.ms-excel.
+        magic = _magic(file_path)
+        is_zip = magic == b"PK\x03\x04"
         if mime_type == "application/pdf" or ext == ".pdf":
             return _extract_pdf(file_path, ocr_seconds)
         elif (
             mime_type
             in ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",)
             or ext == ".docx"
-        ):
+        ) and is_zip:
             return _extract_docx(file_path)
         elif mime_type == "application/msword" or ext == ".doc":
             return _extract_doc(file_path)
@@ -183,7 +245,7 @@ def _extract_by_type(
             mime_type
             in ("application/vnd.openxmlformats-officedocument.presentationml.presentation",)
             or ext == ".pptx"
-        ):
+        ) and is_zip:
             return _extract_pptx(file_path)
         elif ext == ".xlsb":
             return _extract_xlsb(file_path)
@@ -196,7 +258,7 @@ def _extract_by_type(
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
             or ext == ".xlsx"
-        ):
+        ) and (is_zip or magic == b"\xd0\xcf\x11\xe0"):
             # Sniff, do not trust the extension. 993 attachments on the live
             # corpus are named .xlsx and are legacy OLE2 .xls: Excel keeps the
             # name when a user saves an old workbook, and mail systems relabel
@@ -204,7 +266,7 @@ def _extract_by_type(
             # failed, and nothing retries it, so their content was simply absent
             # from the brain. The same two-magic-number check already guards
             # _extract_xlsb below; this is the branch it was missing.
-            if _magic(file_path) == b"\xd0\xcf\x11\xe0":
+            if magic == b"\xd0\xcf\x11\xe0":
                 return _extract_xls(file_path)
             return _extract_excel(file_path)
         elif (
@@ -212,10 +274,16 @@ def _extract_by_type(
             and mime_type.startswith("image/")
             or ext in (".png", ".jpg", ".jpeg", ".gif", ".tiff", ".tif", ".bmp", ".jfif")
         ):
+            # An SVG, or a script someone saved under an image name, is text: the image reader
+            # failed on 11 producer rows with UnidentifiedImageError. A real image is binary.
+            kind = _sniff_text(file_path)
+            if kind:
+                return _extract_sniffed_text(file_path, kind)
             return _extract_image_ocr(file_path, ocr_seconds)
         elif mime_type == "message/rfc822" or ext == ".eml":
             return _extract_eml(file_path)
-        elif mime_type == "application/encrypted" or ext == ".rpmsg":
+        elif ext == ".rpmsg":
+            # An MSIPC one was recorded as encrypted above; this is a container that is not.
             return _extract_rpmsg(file_path)
         elif mime_type in ("text/plain", "text/csv", "text/markdown") or ext in (
             ".txt",
@@ -225,6 +293,10 @@ def _extract_by_type(
             return _extract_plain_text(file_path)
         elif mime_type == "text/html" or ext in (".html", ".htm"):
             return _extract_html(file_path)
+        elif mime_type in ("application/rtf", "text/rtf") or ext == ".rtf":
+            return _extract_sniffed_text(file_path, "application/rtf")
+        elif mime_type == "application/vnd.ms-outlook" or ext == ".msg":
+            return {"text": None, "method": None, "status": "skipped", "error": MSG_REASON}
         else:
             # Neither the declared type nor the name said what this is, which
             # is what an extensionless Outlook part or a name that lost its dot
@@ -235,6 +307,12 @@ def _extract_by_type(
                 return extract_text_from_file(
                     file_path, sniffed, _depth, zip_seconds=zip_seconds, ocr_seconds=ocr_seconds
                 )
+            # Text the declared type or the name does not route: calendar invites, contact
+            # cards, XML, EPS, subtitles, shortcuts, clear-signed mail. Only bytes that are text
+            # get here; the plain-text reader would decode any binary as latin-1.
+            kind = _sniff_text(file_path)
+            if kind:
+                return _extract_sniffed_text(file_path, kind)
             return {
                 "text": None,
                 "method": None,
@@ -255,6 +333,11 @@ def _extract_pdf(path: str, ocr_seconds: float | None = None) -> dict:
     import fitz
 
     doc = fitz.open(path)
+    # Reading pages of a PDF that needs a password raises "document closed or encrypted", which
+    # was recorded as a failure (14 rows). The dispatcher records it first (encryption_of).
+    if doc.needs_pass:
+        doc.close()
+        return encrypted_result("password", ".pdf")
     pages = []
     for page in doc:
         pages.append(page.get_text())
@@ -268,7 +351,14 @@ def _extract_pdf(path: str, ocr_seconds: float | None = None) -> dict:
     # renders each page via fitz.get_pixmap before OCR-ing. See B3 spec.
     if len(text.strip()) < MIN_TEXT_CHARS:
         budget = OCR_MAX_SECONDS if ocr_seconds is None else ocr_seconds
+        started = time.monotonic()
         ocr_result = _ocr_pdf_pages(path, seconds=budget)
+        if ocr_result["status"] == "skipped" and "left unread" not in (ocr_result["error"] or ""):
+            # Too little in colour: once more in grayscale, in what is left of the budget.
+            left = max(budget - (time.monotonic() - started), 0)
+            gray = _ocr_pdf_pages(path, seconds=left, gray=True)
+            if gray["status"] == "extracted":
+                ocr_result = gray
         if ocr_result["status"] == "extracted" and len(ocr_result["text"] or "") > len(
             text.strip()
         ):
@@ -290,10 +380,19 @@ def _extract_pdf(path: str, ocr_seconds: float | None = None) -> dict:
 
 
 def _extract_docx(path: str) -> dict:
-    """Extract text from .docx using python-docx."""
+    """Extract text from .docx using python-docx, or from its XML when python-docx refuses it."""
     from docx import Document
 
-    doc = Document(path)
+    try:
+        doc = Document(path)
+    except Exception:
+        # python-docx loads every relationship target, and Word writes some footer
+        # relationships with Target="NULL": Document() raised KeyError ("There is no item
+        # named 'word/NULL' in the archive") on 9 files whose body was intact.
+        fallback = _read_xml_fallback(path, _docx_xml_text, "docx-xml")
+        if fallback is None:
+            raise
+        return fallback
     parts = []
 
     for para in doc.paragraphs:
@@ -393,10 +492,19 @@ def _collect_shape_text(shapes, out: list[str]) -> None:
 
 
 def _extract_pptx(path: str) -> dict:
-    """Extract text from PowerPoint using python-pptx."""
+    """Extract text from PowerPoint using python-pptx, or from its XML when python-pptx refuses."""
     from pptx import Presentation
 
-    prs = Presentation(path)
+    try:
+        prs = Presentation(path)
+    except Exception:
+        # python-pptx reads every part, so one media member with a bad CRC
+        # ("BadZipFile: Bad CRC-32 for file 'ppt/media/image5.svg'") failed 4 decks whose
+        # slides were intact. A truncated deck has no readable zip and stays a failure.
+        fallback = _read_xml_fallback(path, _pptx_xml_text, "pptx-xml")
+        if fallback is None:
+            raise
+        return fallback
     parts = []
 
     for i, slide in enumerate(prs.slides, 1):
@@ -420,6 +528,127 @@ def _extract_pptx(path: str) -> dict:
             "error": "Insufficient text extracted",
         }
     return {"text": text, "method": "python-pptx", "status": "extracted", "error": None}
+
+
+# Text runs, tabs and line breaks of WordprocessingML (w:) and DrawingML (a:) parts. Read with a
+# pattern rather than a parser: these fallbacks exist for files a strict reader rejects, and a
+# pattern expands no entities.
+_XML_RUNS = {
+    ns: re.compile(rf"<{ns}:t(?:\s[^>]*)?>([^<]*)</{ns}:t>|<{ns}:(tab|br|cr)\b[^>]*/>")
+    for ns in ("w", "a")
+}
+
+
+def _xml_paragraphs(xml: str, ns: str) -> list[str]:
+    """The text of each paragraph of one Office XML part, empty paragraphs dropped."""
+    out = []
+    for chunk in xml.split(f"</{ns}:p>"):
+        runs = [
+            text if not mark else ("\t" if mark == "tab" else "\n")
+            for text, mark in _XML_RUNS[ns].findall(chunk)
+        ]
+        line = html.unescape("".join(runs)).strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def _read_member(zf, name: str) -> bytes | None:
+    """A zip member's bytes, or None when it is missing, unreadable or out of bounds.
+
+    The declared size and compression ratio are checked before reading (XML_PART_MAX_BYTES,
+    ZIP_MAX_RATIO), and the read stops at the size bound whatever the header said.
+    """
+    try:
+        info = zf.getinfo(name)
+    except KeyError:
+        return None
+    if info.file_size > XML_PART_MAX_BYTES or info.file_size > ZIP_MAX_RATIO * max(
+        info.compress_size, 1
+    ):
+        return None
+    try:
+        with zf.open(info) as member:
+            data = member.read(XML_PART_MAX_BYTES + 1)
+    except Exception:
+        return None  # a bad CRC, a bad deflate, a header that understated the size
+    return data if len(data) <= XML_PART_MAX_BYTES else None
+
+
+def _member_paragraphs(zf, name: str, ns: str) -> list[str]:
+    """A member's paragraphs; nothing when it cannot be read or is out of bounds."""
+    data = _read_member(zf, name)
+    return [] if data is None else _xml_paragraphs(data.decode("utf-8", "replace"), ns)
+
+
+def _docx_xml_text(path: str) -> str:
+    """The body, then the headers and footers, of a .docx read from its XML parts."""
+    import zipfile
+
+    with zipfile.ZipFile(path) as zf:
+        names = set(zf.namelist())
+        ordered = ["word/document.xml"] + sorted(
+            n for n in names if re.fullmatch(r"word/(?:header|footer)\d*\.xml", n)
+        )
+        lines = [line for n in ordered if n in names for line in _member_paragraphs(zf, n, "w")]
+    return "\n".join(lines)
+
+
+def _pptx_xml_text(path: str) -> str:
+    """Each slide's text and its speaker notes, read from a .pptx's XML parts.
+
+    Same shape as _extract_pptx. Slides go by the number in their part name. A slide's notes
+    are the notes part its relationships name, and of that part only the body placeholder,
+    which is what python-pptx calls the notes text.
+    """
+    import posixpath
+    import zipfile
+
+    parts = []
+    with zipfile.ZipFile(path) as zf:
+        names = set(zf.namelist())
+        slides = sorted(
+            (int(m.group(1)), n)
+            for n in names
+            if (m := re.fullmatch(r"ppt/slides/slide(\d+)\.xml", n))
+        )
+        for number, name in slides:
+            lines = _member_paragraphs(zf, name, "a")
+            if lines:
+                parts.append(f"--- Slide {number} ---\n" + "\n".join(lines))
+            rels = _read_member(zf, f"ppt/slides/_rels/slide{number}.xml.rels") or b""
+            targets = re.findall(
+                r'Target="([^"]*notesSlide[^"]*)"', rels.decode("utf-8", "replace")
+            )
+            for target in targets[:1]:
+                notes = _read_member(zf, posixpath.normpath(posixpath.join("ppt/slides", target)))
+                if notes is None:
+                    continue
+                xml = notes.decode("utf-8", "replace")
+                body = [
+                    line
+                    for shape in re.findall(r"<p:sp\b.*?</p:sp>", xml, flags=re.DOTALL)
+                    if 'type="body"' in shape
+                    for line in _xml_paragraphs(shape, "a")
+                ]
+                if body:
+                    parts.append("[Notes] " + "\n".join(body))
+    return "\n\n".join(parts)
+
+
+def _read_xml_fallback(path: str, read, method: str) -> dict | None:
+    """The text `read` finds in an Office zip's XML, or None when it finds too little.
+
+    For a file the library reader refused: None hands the reader's own error back to the
+    caller, which records it, so a file with no readable text stays a failure that says why.
+    """
+    try:
+        text = _truncate(read(path))
+    except Exception:
+        return None
+    if _apply_noise_filter(text):
+        return None
+    return {"text": text, "method": method, "status": "extracted", "error": None}
 
 
 def _magic(path: str, n: int = 4) -> bytes:
@@ -496,36 +725,168 @@ def sniff_mime_type(path: str) -> str | None:
     return None
 
 
-def _ole_stream_names(path: str) -> set[str]:
-    """Names in the first directory sector of an OLE2 file, or an empty set.
+# Sector numbers above this are markers (end of chain, free, FAT, DIFAT), not sectors.
+_OLE_MAXREGSECT = 0xFFFFFFFA
+_OLE_ENDOFCHAIN = 0xFFFFFFFE
+# A real directory holds tens of entries, an Outlook item a few thousand; past this the walk
+# stops with the names it has. A DIFAT sector lists 127 FAT sectors (8 MB of a 512-byte-sector
+# file), so this many describe 32 GB.
+_OLE_MAX_DIRECTORY_ENTRIES = 65_536
+_OLE_MAX_DIFAT_SECTORS = 4096
 
-    The header fixes the sector size (a power of two at offset 30) and the
-    first directory sector (offset 48), and each 128-byte directory entry holds
-    a UTF-16LE name whose byte length sits at offset 64. The streams that say
-    which application wrote the file are children of the root entry, so they
-    sit in that first sector; reading one sector avoids a parser dependency.
+
+def _ole_stream_names(path: str) -> set[str]:
+    """Every name in an OLE2 file's directory, or an empty set when it cannot be read.
+
+    The header fixes the sector size (a power of two at offset 30), the number of FAT sectors
+    (offset 44), the first directory sector (offset 48) and where the FAT sectors are: the first
+    109 at offset 76, any more in the DIFAT chain that starts at offset 68. The directory is a
+    chain of sectors linked through the FAT, and each 128-byte entry holds a UTF-16LE name whose
+    byte length sits at offset 64. The whole chain is read. Until 2026-10 only its first sector
+    was, which holds four entries in a 512-byte file: the names that say a file is encrypted
+    and how (DRMEncryptedDataSpace, EncryptionInfo, EncryptedPackage) sit deeper, so 1,436
+    encrypted files reached the readers and were recorded as failures. A broken chain ends the
+    walk with the names read so far; a chain that loops (directory or DIFAT) ends where it
+    repeats; and the walk stops at _OLE_MAX_DIRECTORY_ENTRIES entries and
+    _OLE_MAX_DIFAT_SECTORS DIFAT sectors, so a crafted header cannot make it read without end.
     """
     import struct
 
+    names: set[str] = set()
     try:
         with open(path, "rb") as f:
             header = f.read(512)
             if len(header) < 512:
-                return set()
+                return names
             (shift,) = struct.unpack_from("<H", header, 30)
-            (first_dir,) = struct.unpack_from("<I", header, 48)
             if shift not in (9, 12):
-                return set()
-            f.seek((first_dir + 1) << shift)
-            sector = f.read(1 << shift)
+                return names
+            size, per = 1 << shift, (1 << shift) // 4
+            fat_count, first_dir = struct.unpack_from("<II", header, 44)
+            difat_sector, difat_count = struct.unpack_from("<II", header, 68)
+            fat_sectors = list(struct.unpack_from("<109I", header, 76))
+            seen: set[int] = set()
+            while (
+                len(fat_sectors) < fat_count
+                and len(seen) < min(difat_count, _OLE_MAX_DIFAT_SECTORS)
+                and difat_sector <= _OLE_MAXREGSECT
+                and difat_sector not in seen
+            ):
+                seen.add(difat_sector)
+                f.seek((difat_sector + 1) << shift)
+                block = f.read(size)
+                if len(block) < size:
+                    break
+                entries = struct.unpack(f"<{per}I", block)
+                fat_sectors.extend(entries[:-1])
+                difat_sector = entries[-1]
+            fat_sectors = fat_sectors[:fat_count]
+            fat_cache: dict[int, tuple[int, ...]] = {}
+
+            def next_sector(sector: int) -> int:
+                index, slot = divmod(sector, per)
+                if index >= len(fat_sectors) or fat_sectors[index] > _OLE_MAXREGSECT:
+                    return _OLE_ENDOFCHAIN
+                if index not in fat_cache:
+                    f.seek((fat_sectors[index] + 1) << shift)
+                    block = f.read(size)
+                    if len(block) < size:
+                        return _OLE_ENDOFCHAIN
+                    fat_cache[index] = struct.unpack(f"<{per}I", block)
+                return fat_cache[index][slot]
+
+            sector, visited = first_dir, set[int]()
+            while (
+                sector <= _OLE_MAXREGSECT
+                and sector not in visited
+                and len(visited) * (size // 128) < _OLE_MAX_DIRECTORY_ENTRIES
+            ):
+                visited.add(sector)
+                f.seek((sector + 1) << shift)
+                block = f.read(size)
+                for offset in range(0, len(block) - 127, 128):
+                    (length,) = struct.unpack_from("<H", block, offset + 64)
+                    if 2 <= length <= 64:
+                        names.add(
+                            block[offset : offset + length - 2].decode("utf-16-le", "replace")
+                        )
+                if len(block) < size:
+                    break
+                sector = next_sector(sector)
     except OSError:
-        return set()
-    names = set()
-    for offset in range(0, len(sector) - 127, 128):
-        (length,) = struct.unpack_from("<H", sector, offset + 64)
-        if 2 <= length <= 64:
-            names.add(sector[offset : offset + length - 2].decode("utf-16-le", "replace"))
+        return names
     return names
+
+
+# Directory names that say an Office file is encrypted, and how ([MS-OFFCRYPTO] 2.2.11, 2.3.4).
+# Rights Management keeps an Office 2007+ file as EncryptedPackage under a DRMEncrypted data
+# space, and a 97-2003 one as \tDRMContent under a \tDRMDataSpace. Password encryption keeps
+# EncryptionInfo beside EncryptedPackage, which rights management never writes.
+_RMS_NAMES = frozenset(
+    {
+        "DRMEncryptedDataSpace",
+        "DRMEncryptedTransform",
+        "\tDRMDataSpace",
+        "\tDRMTransform",
+        "\tDRMContent",
+    }
+)
+_ENCRYPTED_PAYLOAD_NAMES = frozenset({"EncryptedPackage", "\x06DataSpaces"})
+
+
+def encrypted_result(method: str, ext: str) -> dict:
+    """The verdict for a file encrypted at rest. method: 'rms', 'rms-message' or 'password'.
+
+    status 'encrypted' is a contract: the sweep keeps such a file, the health check counts it
+    apart from failures, and Phase 2 never sees it, since it selects 'extracted' rows only. The
+    error names the kind and carries none of the markers (file_sweep.UNREAD_SQL) that mean the
+    bytes were never read: they were, and they are ciphertext.
+    """
+    what = ext or "file"
+    reasons = {
+        "rms": f"Rights-protected (RMS) {what}: encrypted at rest, "
+        "cannot be read without the issuer's rights",
+        "rms-message": "Rights-protected message (.rpmsg, MSIPC): encrypted at rest, "
+        "cannot be read without the sender's rights",
+        "password": f"Password-protected {what}: encrypted, cannot be read without its password",
+    }
+    return {"text": None, "method": method, "status": "encrypted", "error": reasons[method]}
+
+
+def encryption_of(path: str) -> dict | None:
+    """The 'encrypted' verdict for a file whose bytes are encrypted at rest, or None.
+
+    Decided by the bytes alone, never by the name or the declared type: senders label these
+    files application/encrypted, octet-stream or an ordinary Office type, and name them .xlsx
+    whatever they hold. An MSIPC container is a protected message; an OLE2 container is
+    encrypted when its directory says so; a PDF when it cannot be opened without a password (an
+    owner password alone only restricts printing and copying, and the text reads). A legacy
+    workbook's password sits inside its BIFF stream, so _extract_xls reports that one.
+    """
+    ext = Path(path).suffix.lower()
+    magic = _magic(path, 8)
+    if magic.startswith(_RPMSG_MAGIC):
+        return encrypted_result("rms-message", ext)
+    if magic.startswith(b"\xd0\xcf\x11\xe0"):
+        names = _ole_stream_names(path)
+        if names & _RMS_NAMES:
+            return encrypted_result("rms", ext)
+        if "EncryptionInfo" in names and names & _ENCRYPTED_PAYLOAD_NAMES:
+            return encrypted_result("password", ext)
+        if names & _ENCRYPTED_PAYLOAD_NAMES:
+            return encrypted_result("rms", ext)
+        return None
+    if magic.startswith(b"%PDF"):
+        import fitz
+
+        try:
+            doc = fitz.open(path)
+            locked = bool(doc.needs_pass)
+            doc.close()
+        except Exception:
+            return None  # a damaged PDF is the reader's to report
+        return encrypted_result("password", ext) if locked else None
+    return None
 
 
 def _extract_excel(path: str) -> dict:
@@ -581,6 +942,10 @@ def _extract_xls(path: str) -> dict:
     try:
         wb = xlrd.open_workbook(path)
     except Exception as e:
+        # A FILEPASS record after the workbook's BOF: the sheets are RC4-encrypted under a
+        # password (Excel's default one included), which xlrd does not decrypt. 6 rows.
+        if str(e) == "Workbook is encrypted":
+            return encrypted_result("password", Path(path).suffix.lower())
         return {
             "text": None,
             "method": "xlrd",
@@ -644,6 +1009,8 @@ def _extract_xlsb(path: str) -> dict:
                 # Tag method so downstream debugging can see the extension/format mismatch.
                 xls_result["method"] = "xlrd (fallback from .xlsb)"
                 return xls_result
+            if xls_result["status"] == "encrypted":
+                return xls_result
             # OLE compound document with no Excel workbook stream — likely a
             # custom export format (ACME financial tools, etc.) that wraps
             # binary content in OLE but has no spreadsheet payload. No library
@@ -674,20 +1041,51 @@ def _extract_xlsb(path: str) -> dict:
     return {"text": text, "method": "pyxlsb", "status": "extracted", "error": None}
 
 
+def _too_large_to_ocr(img) -> str | None:
+    """Why an image is not OCR'd for its size, or None. Read from the header, before decoding."""
+    pixels = img.width * img.height
+    if pixels > OCR_MAX_PIXELS:
+        return f"{pixels:,} pixels, over the {OCR_MAX_PIXELS:,} limit"
+    return None
+
+
+def _grayscale(img):
+    """The image in grayscale for a second OCR pass, transparency flattened onto white first.
+
+    Tesseract thresholds a colour image channel by channel, which reads most images best: on 40
+    producer screenshots a grayscale read found 2% more words in all, but fewer on 5 of them.
+    Where the colour read comes back with too little text, a grayscale read recovered 4 of 44
+    scanned PDFs and about 12% of content images, so it is a second pass for those only.
+    Converted straight to grayscale, a transparent background over black pixels turns black and
+    hides black text, so an image with transparency is laid on white paper first.
+    """
+    from PIL import Image
+
+    if img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        img = Image.alpha_composite(Image.new("RGBA", rgba.size, (255, 255, 255, 255)), rgba)
+    return img.convert("L")
+
+
 def _ocr_frames(img, budget: float) -> dict:
     """OCR every page of a multi-page TIFF, inside the scan budget, like _ocr_pdf_pages."""
     import pytesseract
     from PIL import ImageSequence
 
-    pages, note = [], None
+    pages, notes = [], []
     started = time.monotonic()
     for i, frame in enumerate(ImageSequence.Iterator(img)):
         if i and time.monotonic() - started > budget:
-            note = f"time budget spent, {img.n_frames - i} pages left unread"
+            notes.append(f"time budget spent, {img.n_frames - i} pages left unread")
             break
+        too_large = _too_large_to_ocr(frame)
+        if too_large:
+            notes.append(f"page {i + 1} too large to OCR: {too_large}; unread, file kept")
+            continue
         page = pytesseract.image_to_string(frame.convert("RGB"), lang=OCR_LANGS)
         if page.strip():
             pages.append(page.strip())
+    note = "; ".join(notes) or None
     text = _truncate("\n\n".join(pages))
     if _apply_noise_filter(text):
         return {
@@ -723,6 +1121,14 @@ def _extract_image_ocr(path: str, ocr_seconds: float | None = None) -> dict:
 
     try:
         img = Image.open(path)
+        too_large = _too_large_to_ocr(img)
+        if too_large:
+            return {
+                "text": None,
+                "method": "ocr",
+                "status": "skipped",
+                "error": f"image too large to OCR: {too_large}",
+            }
         if img.format == "TIFF" and getattr(img, "n_frames", 1) > 1:
             return _ocr_frames(img, OCR_MAX_SECONDS if ocr_seconds is None else ocr_seconds)
         if img.format not in _TESSERACT_SAFE_FORMATS:
@@ -732,6 +1138,11 @@ def _extract_image_ocr(path: str, ocr_seconds: float | None = None) -> dict:
             img = Image.open(buf)
         text = pytesseract.image_to_string(img, lang=OCR_LANGS)
         text = _truncate(text)
+        if _apply_noise_filter(text):
+            # Too little in colour: once more in grayscale, kept only when it reads.
+            gray = _truncate(pytesseract.image_to_string(_grayscale(img), lang=OCR_LANGS))
+            if not _apply_noise_filter(gray):
+                text = gray
 
         if _apply_noise_filter(text):
             return {
@@ -741,6 +1152,14 @@ def _extract_image_ocr(path: str, ocr_seconds: float | None = None) -> dict:
                 "error": OCR_INSUFFICIENT,
             }
         return {"text": text, "method": "ocr", "status": "extracted", "error": None}
+    except Image.DecompressionBombError as e:
+        # Pillow refuses it before decoding: a size limit, not a fault in the file.
+        return {
+            "text": None,
+            "method": "ocr",
+            "status": "skipped",
+            "error": f"image too large to OCR: {str(e)[:200]}",
+        }
     except Exception as e:
         return {
             "text": None,
@@ -750,7 +1169,7 @@ def _extract_image_ocr(path: str, ocr_seconds: float | None = None) -> dict:
         }
 
 
-def _ocr_pdf_pages(path: str, seconds: float | None = None) -> dict:
+def _ocr_pdf_pages(path: str, seconds: float | None = None, gray: bool = False) -> dict:
     """Render each PDF page to a PIL image and OCR it. Used as fallback for
     scanned PDFs when PyMuPDF text extraction yields too little content.
 
@@ -758,7 +1177,9 @@ def _ocr_pdf_pages(path: str, seconds: float | None = None) -> dict:
     Tesseract to recognize Greek + English glyphs reliably, low enough that
     a typical 2-page scan completes in 3-10 seconds. Every page is read until
     `seconds` (OCR_MAX_SECONDS when None) is spent; then the pages read are kept
-    and the error says how many were left unread.
+    and the error says how many were left unread. With `gray` each page is read
+    in grayscale (_grayscale), the second pass for a scan the colour read found
+    too little in.
     """
     import io
 
@@ -778,6 +1199,8 @@ def _ocr_pdf_pages(path: str, seconds: float | None = None) -> dict:
                 break
             pix = page.get_pixmap(dpi=200)
             img = Image.open(io.BytesIO(pix.tobytes("png")))
+            if gray:
+                img = _grayscale(img)
             page_text = pytesseract.image_to_string(img, lang=OCR_LANGS)
             if page_text.strip():
                 pages_text.append(page_text.strip())
@@ -860,11 +1283,11 @@ def _extract_rpmsg(path: str) -> dict:
     from setup.py on every install on every host. Removing it is what lets the
     dependency install refuse to build source distributions at all.
 
-    The honest verdict is a skip, matching how the dispatcher already treats
-    other IRM-protected content: the payload is encrypted, and no parser reads
-    it without rights. Marking it 'skipped' rather than 'failed' also stops it
-    counting against the extraction failure rate, which is what a fault should
-    mean.
+    The honest verdict is 'encrypted' (method 'rms-message'), the one every
+    rights-protected file gets: the payload is encrypted, and no parser reads it
+    without rights. It is not a fault, so it does not count against the
+    extraction failure rate. The dispatcher records it from the magic before it
+    gets here (encryption_of); this answers the same when called directly.
     """
     try:
         with open(path, "rb") as f:
@@ -878,18 +1301,186 @@ def _extract_rpmsg(path: str) -> dict:
         }
 
     if magic == _RPMSG_MAGIC:
-        return {
-            "text": None,
-            "method": "rpmsg",
-            "status": "skipped",
-            "error": "IRM-protected message (MSIPC): encrypted, no extractable text without rights",
-        }
+        return encrypted_result("rms-message", ".rpmsg")
     return {
         "text": None,
         "method": "rpmsg",
         "status": "skipped",
         "error": f"unrecognised .rpmsg container (magic {magic.hex()}); not MSIPC",
     }
+
+
+# Windows charsets (a font's lfCharSet) and the code page WMF text drawn in that font is in.
+# SYMBOL_CHARSET (2) draws glyphs (bullets, arrows), not text, so it is left out.
+_CHARSET_CODEPAGES = {
+    0: "cp1252",
+    1: "cp1252",
+    77: "mac_roman",
+    128: "cp932",
+    129: "cp949",
+    134: "gbk",
+    136: "big5",
+    161: "cp1253",
+    162: "cp1254",
+    163: "cp1258",
+    177: "cp1255",
+    178: "cp1256",
+    186: "cp1257",
+    204: "cp1251",
+    222: "cp874",
+    238: "cp1250",
+    255: "cp437",
+}
+_SYMBOL_CHARSET = 2
+# WMF records that create an object, which takes the lowest free slot of the object table.
+_WMF_CREATES_OBJECT = frozenset({0x00F7, 0x0142, 0x01F9, 0x02FA, 0x02FB, 0x02FC, 0x06FF})
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def _drawing_note(kind: str, count: int) -> str:
+    if kind == "bound":
+        return f"stopped at the record bound ({METAFILE_MAX_RECORDS:,}); the rest unread, file kept"
+    return f"record {count:,} is malformed; the rest unread, file kept"
+
+
+def _wmf_runs(body: bytes) -> tuple[list[tuple[int, str]], str | None]:
+    """(baseline, text) of each text record of a WMF, and a note when the parse stopped early.
+
+    WMF text is 8-bit in the code page of the font selected when it is drawn, so the object
+    table is kept: a font takes the lowest free slot when created, SelectObject makes it
+    current, DeleteObject frees its slot.
+    """
+    runs: list[tuple[int, str]] = []
+    if len(body) < 18:
+        return runs, None
+    off = struct.unpack_from("<H", body, 2)[0] * 2
+    objects: list[int | None] = []
+    codepage: str | None = "cp1252"
+    count = 0
+    while off + 6 <= len(body):
+        if count >= METAFILE_MAX_RECORDS:
+            return runs, _drawing_note("bound", count)
+        count += 1
+        words, function = struct.unpack_from("<IH", body, off)
+        size = words * 2
+        if words < 3 or off + size > len(body):
+            return runs, _drawing_note("malformed", count)
+        if function == 0x0000:  # META_EOF
+            break
+        if function in _WMF_CREATES_OBJECT:
+            charset = body[off + 19] if function == 0x02FB and size >= 20 else -1
+            slot = objects.index(None) if None in objects else len(objects)
+            objects[slot : slot + 1] = [charset]
+        elif function in (0x012D, 0x01F0) and size >= 8:  # SelectObject, DeleteObject
+            (index,) = struct.unpack_from("<H", body, off + 6)
+            if index < len(objects):
+                if function == 0x01F0:
+                    objects[index] = None
+                elif (charset := objects[index]) is not None and charset >= 0:
+                    codepage = (
+                        None
+                        if charset == _SYMBOL_CHARSET
+                        else _CHARSET_CODEPAGES.get(charset, "cp1252")
+                    )
+        elif function in (0x0A32, 0x0521) and size >= 10:  # ExtTextOut, TextOut
+            if function == 0x0A32 and size >= 14:
+                y, _x, length, options = struct.unpack_from("<hhHH", body, off + 6)
+                start = off + 14 + (8 if options & 0x0006 else 0)
+            else:
+                (length,) = struct.unpack_from("<H", body, off + 6)
+                start = off + 8
+                after = start + length + length % 2
+                y = struct.unpack_from("<h", body, after)[0] if after + 2 <= off + size else 0
+            if codepage and start + length <= off + size:
+                text = body[start : start + length].decode(codepage, "replace")
+                text = _CONTROL_CHARS.sub("", text).strip()
+                if text:
+                    runs.append((y, text))
+        off += size
+    return runs, None
+
+
+def _emf_runs(raw: bytes) -> tuple[list[tuple[int, str]], str | None]:
+    """(baseline, text) of each EMR_EXTTEXTOUTW record of an EMF; its text is UTF-16."""
+    runs: list[tuple[int, str]] = []
+    off = count = 0
+    while off + 8 <= len(raw):
+        if count >= METAFILE_MAX_RECORDS:
+            return runs, _drawing_note("bound", count)
+        count += 1
+        kind, size = struct.unpack_from("<II", raw, off)
+        if size < 8 or size % 4 or off + size > len(raw):
+            return runs, _drawing_note("malformed", count)
+        if kind == 84 and size >= 76:  # EMR_EXTTEXTOUTW: an EmrText at offset 36
+            _x, y, chars, at = struct.unpack_from("<iiII", raw, off + 36)
+            if 76 <= at and at + 2 * chars <= size:
+                text = raw[off + at : off + at + 2 * chars].decode("utf-16-le", "replace")
+                text = _CONTROL_CHARS.sub("", text).strip()
+                if text:
+                    runs.append((y, text))
+        elif kind == 14:  # EMR_EOF
+            break
+        off += size
+    return runs, None
+
+
+def _join_runs(runs: list[tuple[int, str]]) -> str:
+    """Runs drawn one after another on one baseline make a line; a new baseline, a new line."""
+    lines: list[str] = []
+    line: list[str] = []
+    baseline = None
+    for y, text in runs:
+        if line and y != baseline:
+            lines.append(" ".join(line))
+            line = []
+        line.append(text)
+        baseline = y
+    if line:
+        lines.append(" ".join(line))
+    return "\n".join(lines)
+
+
+def _extract_metafile(path: str) -> dict:
+    """The text a gzip-wrapped drawing draws: a .wmz (WMF) or an .emz (EMF).
+
+    Office keeps the diagrams and charts of an HTML mail as these. On the producer 235 .wmz and
+    18 .emz were skipped unread, though the text records of 189 hold 50 characters or more.
+    The gzip layer inflates under the file's budget (INFLATE_MAX_BYTES), and the records are
+    walked with bounds: a record of size zero or one that runs past the end ends the walk, as
+    does METAFILE_MAX_RECORDS, and the text read before it is kept.
+    """
+    method = "emf" if path.lower().endswith(".emz") else "wmf"
+
+    def skipped(reason: str) -> dict:
+        return {"text": None, "method": method, "status": "skipped", "error": reason}
+
+    budget = _InflateBudget()
+    with open(path, "rb") as f:
+        data = f.read(budget.limit + 1)
+    if not data.startswith(b"\x1f\x8b"):
+        return skipped("not a gzip-compressed drawing")
+    try:
+        raw = budget.inflate(data, 16 + zlib.MAX_WBITS)
+    except _InflatesTooFar as e:
+        return skipped(f"drawing {e}; unread, file kept")
+    except zlib.error as e:
+        return {"text": None, "method": method, "status": "failed", "error": f"gzip: {e}"}
+    if raw.startswith(b"\xd7\xcd\xc6\x9a"):  # a placeable WMF: a 22-byte header first
+        method, (runs, note) = "wmf", _wmf_runs(raw[22:])
+    elif len(raw) >= 44 and raw[:4] == b"\x01\x00\x00\x00" and raw[40:44] == b" EMF":
+        method, (runs, note) = "emf", _emf_runs(raw)
+    elif raw[:4] in (b"\x01\x00\x09\x00", b"\x02\x00\x09\x00"):
+        method, (runs, note) = "wmf", _wmf_runs(raw)
+    else:
+        return skipped("not a Windows metafile")
+    text = _truncate(_join_runs(runs))
+    if not text:
+        return skipped(f"no text in the drawing; {note}" if note else "no text in the drawing")
+    if _apply_noise_filter(text):
+        return skipped(
+            f"Insufficient text extracted; {note}" if note else "Insufficient text extracted"
+        )
+    return {"text": text, "method": method, "status": "extracted", "error": note}
 
 
 def _copy_at_most(src, dst, limit: int) -> int | None:
@@ -1002,6 +1593,149 @@ def _extract_zip(path: str, depth: int, seconds: float, ocr_seconds: float | Non
     }
 
 
+class _InflatesTooFar(ValueError):
+    pass
+
+
+class _InflateBudget:
+    """The bytes one file may still inflate to, across all of its compressed layers.
+
+    zlib is asked for at most what is left (decompressobj with max_length), never for the
+    whole stream, so a bomb costs no more memory than the budget.
+    """
+
+    def __init__(self, limit: int | None = None):
+        self.limit = INFLATE_MAX_BYTES if limit is None else limit
+        self.left = self.limit
+
+    def inflate(self, data: bytes, wbits: int = zlib.MAX_WBITS) -> bytes:
+        out = zlib.decompressobj(wbits).decompress(data, self.left + 1)
+        if len(out) > self.left:
+            raise _InflatesTooFar(f"inflates past {self.limit:,} bytes")
+        self.left -= len(out)
+        return out
+
+
+def _unpack(data: bytes, budget: _InflateBudget) -> bytes | None:
+    """The OLE2 file in a part packed as a 4-byte length and a zlib stream, or None."""
+    if len(data) < 6 or data[4] != 0x78:
+        return None
+    try:
+        inflated = budget.inflate(data[4:])
+    except zlib.error:
+        return None
+    return inflated if inflated.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") else None
+
+
+def _root_streams(ole: bytes):
+    """(xlrd compound document, names of the streams directly under its root)."""
+    from xlrd import compdoc
+
+    doc = compdoc.CompDoc(ole, logfile=io.StringIO())
+    return doc, [doc.dirlist[i].name for i in doc.dirlist[0].children if doc.dirlist[i].etype == 2]
+
+
+def _read_embedded_object(
+    ole: bytes, stem: Path, depth: int, zip_seconds: float | None, ocr_seconds: float | None
+) -> dict:
+    """One embedded object, read by the reader its payload calls for.
+
+    A Package stream is an Office 2007+ file, written out whole and read by its bytes. A
+    Workbook (or Book) stream is a BIFF workbook, which xlrd finds inside the object's own
+    OLE2 file, so the object is written out as it is.
+    """
+    doc, names = _root_streams(ole)
+    if "Package" in names:
+        stem.write_bytes(doc.get_named_stream("Package"))
+        mime = ""
+    elif "Workbook" in names or "Book" in names:
+        stem = stem.with_suffix(".xls")
+        stem.write_bytes(ole)
+        mime = "application/vnd.ms-excel"
+    else:
+        return {
+            "text": None,
+            "method": None,
+            "status": "skipped",
+            "error": "no workbook or package inside",
+        }
+    return extract_text_from_file(
+        str(stem), mime, depth + 1, zip_seconds=zip_seconds, ocr_seconds=ocr_seconds
+    )
+
+
+def _extract_mso(
+    path: str, depth: int, zip_seconds: float | None = None, ocr_seconds: float | None = None
+) -> dict:
+    """Read the objects in an Office object container (.mso), each with its own reader.
+
+    Outlook keeps the objects pasted into an HTML mail, most often Excel charts, in an
+    oledata.mso part: a 4-byte length and a zlib stream holding an OLE2 file, whose root
+    streams each hold one object packed the same way. On the producer all 255 had that shape,
+    and their 349 objects were BIFF chart workbooks or Office 2007+ packages. Each object is
+    read like an archive member, in a temporary directory nothing outlives; one that cannot be
+    read is named in the error and the rest are kept.
+    """
+    import tempfile
+
+    budget = _InflateBudget()
+    with open(path, "rb") as f:
+        data = f.read(budget.limit + 1)
+    try:
+        container = _unpack(data, budget)
+    except _InflatesTooFar as e:
+        return {
+            "text": None,
+            "method": "mso",
+            "status": "skipped",
+            "error": f"container {e}; unread, file kept",
+        }
+    if container is None:
+        return {
+            "text": None,
+            "method": "mso",
+            "status": "skipped",
+            "error": "not an Office object container: no packed OLE2 file inside",
+        }
+    doc, streams = _root_streams(container)
+    parts: list[str] = []
+    notes: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="sb-mso-") as tmp:
+        for n, name in enumerate(streams, 1):
+            label = f"embedded object {n}"
+            try:
+                obj = _unpack(doc.get_named_stream(name), budget)
+                if obj is None:
+                    notes.append(f"{label}: not a packed OLE2 object")
+                    continue
+                result = _read_embedded_object(
+                    obj, Path(tmp) / str(n), depth, zip_seconds, ocr_seconds
+                )
+            except _InflatesTooFar as e:
+                notes.append(f"{label}: {e}; it and {len(streams) - n} more unread, file kept")
+                break
+            except Exception as e:
+                notes.append(f"{label}: {type(e).__name__}: {str(e)[:200]}")
+                continue
+            text, said = _member_outcome(label, result)
+            parts.extend(text)
+            notes.extend(said)
+    error = "; ".join(notes) or None
+    if not parts:
+        return {
+            "text": None,
+            "method": "mso",
+            "status": "skipped",
+            "error": error or "no embedded objects",
+        }
+    return {
+        "text": _truncate("\n\n".join(parts)),
+        "method": "mso",
+        "status": "extracted",
+        "error": error,
+    }
+
+
 def _extract_plain_text(path: str) -> dict:
     """Read plain text, CSV, or markdown files directly."""
     for encoding in ("utf-8", "latin-1", "cp1253"):
@@ -1030,6 +1764,68 @@ def _extract_plain_text(path: str) -> dict:
         "status": "failed",
         "error": "Could not decode file with any supported encoding",
     }
+
+
+RTF_REASON = "RTF document: no reader for this format, and its raw markup is not text"
+MSG_REASON = "Outlook item (.msg): no reader for this format"
+
+# How a text file's first line says what it is, lower-cased, after any leading space.
+_TEXT_LEADS = (
+    ("{\\rtf", "application/rtf"),
+    ("%!ps", "application/postscript"),
+    ("begin:vcalendar", "text/calendar"),
+    ("begin:vcard", "text/vcard"),
+    ("webvtt", "text/vtt"),
+)
+# A saved mail starts with header lines, and says so in one of these somewhere near the top.
+# Two plain notes that begin "Date:" or "To:" are not mail.
+_HEADER_LINE = re.compile(r"[a-z][a-z0-9-]*:[ \t]")
+_MAIL_HEADERS = re.compile(
+    r"^(?:mime-version|content-type|received|return-path|message-id|x-[a-z0-9-]+):", re.M
+)
+
+
+def _sniff_text(path: str) -> str | None:
+    """The type a text file's head says it is, or None when the bytes are not text.
+
+    Text means no NUL and almost no other control bytes in the first 4 KB; bytes over 0x7F are
+    allowed (UTF-8, or a Windows code page). PDF, Office, images and archives are told apart
+    by sniff_mime_type first; this is for what that leaves: SVG, HTML and XML, RTF, mail
+    headers, calendar and contact text, PostScript, subtitles, and plain text.
+    """
+    head = _magic(path, 4096)
+    if not head or b"\x00" in head:
+        return None
+    controls = sum(1 for b in head if b < 0x20 and b not in (0x09, 0x0A, 0x0C, 0x0D, 0x1B))
+    if controls > len(head) // 100:
+        return None
+    lead = head.decode("utf-8", "replace").lstrip("﻿ \t\r\n").lower()
+    for prefix, kind in _TEXT_LEADS:
+        if lead.startswith(prefix):
+            return kind
+    if lead.startswith("<"):
+        if "<svg" in lead[:2048]:
+            return "image/svg+xml"
+        if re.search(r"<(?:!doctype html|html|head|body)\b", lead[:2048]):
+            return "text/html"
+        return "application/xml"
+    if _HEADER_LINE.match(lead) and _MAIL_HEADERS.search(lead[:2048]):
+        return "message/rfc822"
+    return "text/plain"
+
+
+def _extract_sniffed_text(path: str, kind: str) -> dict:
+    """Read a file _sniff_text found to be text, with the reader its kind calls for."""
+    if kind == "application/rtf":
+        return {"text": None, "method": None, "status": "skipped", "error": RTF_REASON}
+    if kind == "message/rfc822":
+        return _extract_eml(path)
+    if kind in ("text/html", "application/xml", "image/svg+xml"):
+        result = _extract_html(path)
+        if kind == "image/svg+xml":
+            result["method"] = "svg"
+        return result
+    return _extract_plain_text(path)
 
 
 def _extract_html(path: str) -> dict:

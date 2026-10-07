@@ -182,7 +182,8 @@ def test_the_transcription_asks_for_the_visible_text_within_a_bounded_budget(
     Image.new("RGB", (300, 200), "white").save(img)
 
     assert transcribe_image(img) == TRANSCRIPTION
-    assert 1_000 <= TRANSCRIBE_MAX_TOKENS <= 1_500
+    # Raised from 1,500 on 2026-10-07: at low effort dense report screenshots ran past it.
+    assert 1_000 <= TRANSCRIBE_MAX_TOKENS <= 4_000
     assert calls[0]["max_tokens"] == TRANSCRIBE_MAX_TOKENS
     image_block, prompt = calls[0]["messages"][0]["content"]
     assert image_block["type"] == "image"

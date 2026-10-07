@@ -36,16 +36,34 @@ def _png(tmp_path):
     return path
 
 
-def _model(monkeypatch, *replies):
+def _model(monkeypatch, *replies, requests=None):
     budgets = []
     queue = list(replies)
 
     def fake(**kwargs):
         budgets.append(kwargs["max_tokens"])
+        if requests is not None:
+            requests.append(kwargs)
         return queue.pop(0)
 
     monkeypatch.setattr("src.extract.claude_extract.complete", fake)
     return budgets
+
+
+def test_every_transcription_request_asks_for_low_effort(tmp_path, monkeypatch):
+    """On the real model, low effort stopped the runaway thinking: three images that had
+    failed twice at 1,500 and 6,000 tokens each came back with their text."""
+    requests: list[dict] = []
+    _model(
+        monkeypatch,
+        _Reply("max_tokens", _Thinking()),
+        _Reply("end_turn", _Text("Q1 | 1,250")),
+        requests=requests,
+    )
+
+    transcribe_image(_png(tmp_path))
+
+    assert [r.get("output_config") for r in requests] == [{"effort": "low"}] * 2
 
 
 def test_a_reply_cut_short_by_thinking_is_asked_again_with_a_larger_budget(tmp_path, monkeypatch):

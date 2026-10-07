@@ -645,12 +645,9 @@ def cmd_sweep_files(args):
     print(f"  unread (Phase 1 could not read) : {stats['unread']:,}")
     print(f"  content not held (kept)        : {stats['not-held']:,}")
     print(f"  images awaiting vision         : {stats['pending-image']:,}")
-    print(f"  awaiting curation              : {stats['curation']:,}")
     print(f"  unregistered (orphan reaper)   : {stats['unregistered']:,}")
     print(f"  directories removed            : {stats['dirs_removed']:,}")
     print(f"  delete errors                  : {stats['errors']:,}")
-    if stats.get("curation_problem"):
-        print(f"  {stats['curation_problem']}")
     return 0
 
 

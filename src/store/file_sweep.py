@@ -9,8 +9,7 @@ Only a file whose content is HELD goes. A row that failed, was skipped (nothing 
 an unsupported type, an image with too little text) or holds an encrypted original records an
 outcome, not the content: the file is the only copy of what the database lacks, and a password,
 granted rights or a better reader may still open it. Neither goes a picture the vision pass
-described in place of text, nor an original document curation has deferred and will copy into
-its folders later (scripts/curate_documents_daily.py).
+described in place of text.
 
 A Phase 1 row is not always proof the bytes were read. Phase 1 opens the row's recorded
 absolute path, while this module finds files by directory and name, so a row recorded on
@@ -48,9 +47,8 @@ PENDING_TEXT = "pending-text"
 UNREAD = "unread"
 NOT_HELD = "not-held"
 PENDING_IMAGE = "pending-image"
-CURATION = "curation"
 UNREGISTERED = "unregistered"
-STATES = (DELETABLE, PENDING_TEXT, UNREAD, NOT_HELD, PENDING_IMAGE, CURATION, UNREGISTERED)
+STATES = (DELETABLE, PENDING_TEXT, UNREAD, NOT_HELD, PENDING_IMAGE, UNREGISTERED)
 
 # Phase 1 errors that mean the bytes were never read (src/extract/attachment_extractors.py).
 # Shared with the orphan reaper, whose stored-hash rule must not count these rows either.
@@ -183,49 +181,13 @@ def policy_problem(path: Path | None = None) -> str | None:
     return None
 
 
-def curate_state_file() -> Path:
-    """Where document curation keeps its state: STATE in scripts/curate_documents_daily.py.
-
-    Pinned by a test, since that script cannot be imported (it exits without its private
-    taxonomy file). BRAIN_CURATE_STATE moves it for this module only; the test suite sets it
-    so that no test reads the state of the machine it runs on.
-    """
-    override = os.environ.get("BRAIN_CURATE_STATE")
-    return Path(override) if override else Path.home() / ".second-brain" / "curate-state.json"
-
-
-def curation_sources(path: Path | None = None) -> tuple[frozenset[int], str | None]:
-    """The attachments document curation has deferred, and why that is unknown when it is.
-
-    Curation parks a candidate the per-folder cap turned away under "deferred" and copies its
-    original file once the folder has room, so that file must stay. No state file means no
-    curation on this host. One that cannot be read (curation writes it in place, so a sweep
-    can meet it half-written) cannot say which files curation needs: the problem comes back,
-    and the sweep deletes nothing that run.
-    """
-    path = curate_state_file() if path is None else Path(path)
-    try:
-        state = json.loads(path.read_text())
-    except FileNotFoundError:
-        return frozenset(), None
-    except (OSError, ValueError) as e:
-        return frozenset(), f"{path} is unreadable, so the sweep deleted nothing: {e}"
-    deferred = state.get("deferred") if isinstance(state, dict) else None
-    try:
-        return frozenset(int(k) for k in (deferred or {})), None
-    except (TypeError, ValueError) as e:
-        return frozenset(), f"{path} names deferred candidates oddly, so nothing was deleted: {e}"
-
-
 def _is_image(mime: str | None, filename: str) -> bool:
     return (mime or "").lower().startswith("image/") or Path(filename).suffix.lower() in (
         IMAGE_SUFFIXES
     )
 
 
-def _registered(
-    conn: sqlite3.Connection, curation: frozenset[int]
-) -> dict[tuple[str, str], tuple[tuple[int, ...], str]]:
+def _registered(conn: sqlite3.Connection) -> dict[tuple[str, str], tuple[tuple[int, ...], str]]:
     """(directory name, filename) -> (attachment ids, the state their rows allow).
 
     When several rows share a directory and name, the file is deletable only if every one of
@@ -247,7 +209,7 @@ def _registered(
         WHERE a.file_path IS NOT NULL
         """
     ).fetchall()
-    rank = {DELETABLE: 0, CURATION: 1, PENDING_IMAGE: 2, NOT_HELD: 3, UNREAD: 4, PENDING_TEXT: 5}
+    rank = {DELETABLE: 0, PENDING_IMAGE: 1, NOT_HELD: 2, UNREAD: 3, PENDING_TEXT: 4}
     known: dict[tuple[str, str], tuple[tuple[int, ...], str]] = {}
     for row in rows:
         att_id, file_path, mime, filename, stored, unread, held = row[:7]
@@ -262,8 +224,6 @@ def _registered(
             seen and (described or by_design or tries >= VISION_ATTEMPTS_LIMIT)
         ):
             state = PENDING_IMAGE
-        elif att_id in curation:
-            state = CURATION
         else:
             state = DELETABLE
         p = Path(file_path)
@@ -277,18 +237,13 @@ def _registered(
     return known
 
 
-def classify_files(
-    conn: sqlite3.Connection, root: Path, curation: frozenset[int] | None = None
-) -> list[FileState]:
+def classify_files(conn: sqlite3.Connection, root: Path) -> list[FileState]:
     """Every file under root/<directory>/, with the state that decides its fate.
 
     A directory reached through a symlink is not walked: it can point outside the root.
-    A file that disappears between the listing and its stat is skipped. `curation` is the
-    attachments document curation has deferred, read from its state file when not given.
+    A file that disappears between the listing and its stat is skipped.
     """
-    if curation is None:
-        curation = curation_sources()[0]
-    known = _registered(conn, curation)
+    known = _registered(conn)
     found: list[FileState] = []
     try:
         dirs = [e for e in os.scandir(root) if e.is_dir(follow_symlinks=False)]
@@ -357,7 +312,6 @@ def sweep_files(
     policy: SweepPolicy,
     now: datetime | None = None,
     sharepoint_root: Path | None = None,
-    curate_state: Path | None = None,
 ) -> dict:
     """Delete the files whose content is stored, as far as the policy allows.
 
@@ -366,14 +320,9 @@ def sweep_files(
     for its own confirmation. A directory is removed only when this pass emptied it. A file
     that cannot be deleted is counted in "errors" and the pass carries on; the files it did
     delete are stamped either way. With `sharepoint_root`, the files earlier SharePoint fetches
-    left there are swept too (classify_sharepoint_files); that directory itself stays. A
-    curation state (`curate_state`, curate_state_file() when not given) that cannot be read
-    makes the pass report-only, and "curation_problem" says why.
+    left there are swept too (classify_sharepoint_files); that directory itself stays.
     """
     now = now or datetime.now(UTC)
-    curation, curation_problem = curation_sources(curate_state)
-    if curation_problem:
-        policy = SweepPolicy(only_newer_than=policy.only_newer_than)
     stats: dict = dict.fromkeys(STATES, 0)
     stats.update(
         before_cutoff=0,
@@ -383,12 +332,11 @@ def sweep_files(
         bytes_freed=0,
         dirs_removed=0,
         applied=policy.apply,
-        curation_problem=curation_problem,
     )
     cutoff = policy.only_newer_than.timestamp() if policy.only_newer_than else None
     removed: list[int] = []
     emptied: set[Path] = set()
-    files = classify_files(conn, Path(root), curation)
+    files = classify_files(conn, Path(root))
     if sharepoint_root is not None:
         files += classify_sharepoint_files(conn, Path(sharepoint_root))
     try:

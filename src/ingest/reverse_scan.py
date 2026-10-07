@@ -10,19 +10,20 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-# Curated filename pattern: YYYYMMDDHHMM_<rest>
-# Set by an external curation step when it mirrors email attachments to disk.
+# Dated filename pattern: YYYYMMDDHHMM_<rest>
+# The operator's own naming convention. The curation step (retired 2026-10-07) used it too
+# when it mirrored email attachments to disk, so the files it placed still carry it.
 _PREFIX_RE = re.compile(r"^(\d{12})_(.+)$")
 
 
 def is_curated_filename(name: str) -> bool:
-    """True iff the filename starts with the curate-docs YYYYMMDDHHMM_ prefix."""
+    """True iff the filename starts with the dated YYYYMMDDHHMM_ prefix."""
     return _PREFIX_RE.match(name) is not None
 
 
 def _version_key(path: Path) -> str:
     """Return a YYYYMMDDHHMM string used to compare versions of the same logical
-    document. Files with the curate-docs prefix use that prefix verbatim.
+    document. Files with the dated prefix use that prefix verbatim.
     Files without a prefix fall back to the file's mtime, formatted to the
     same fixed-width string. Lex sort over this key matches chronological order.
     """

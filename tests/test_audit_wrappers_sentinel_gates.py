@@ -46,7 +46,6 @@ def _run(wrapper: str, home: Path) -> subprocess.CompletedProcess:
             "PATH": "/usr/bin:/bin",
             "SHELL": "/bin/bash",
             "SB_CONVERSATION_SYNC_LOCK": str(home / "conversation-sync.lock"),
-            "SB_CURATE_DOCS_LOCK": str(home / "curate-docs.lock"),
         },
         capture_output=True,
         text=True,
@@ -88,7 +87,6 @@ def test_reverse_ingest_does_not_gate_on_the_outlook_sentinel(tmp_path):
         ("sb-reverse-ingest.sh", "needs_gcloud_reauth"),
         ("sb-calendar-sync.sh", "needs_gcloud_reauth"),
         ("sb-calendar-sync.sh", "needs_reauth"),
-        ("sb-curate-docs.sh", "needs_gcloud_reauth"),
         ("sb-conversation-sync.sh", "needs_gcloud_reauth"),
     ],
 )

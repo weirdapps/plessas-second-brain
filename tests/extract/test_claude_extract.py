@@ -507,11 +507,12 @@ def test_reauth_receives_the_same_is_linux_as_decide(monkeypatch):
 
 # --- _response_text is the repo's single reader of a Claude response -----------
 #
-# Six call sites now route through it: extract_one, extract_conversation,
-# attachment_pipeline, calendar_extractor, teams_pipeline and
-# scripts/curate_documents_daily. image_vision keeps its own copy because its
-# message is vision-specific. The raise is the diagnostic surface: its string is
-# what lands in attachment_content.llm_error and in the sync logs.
+# Five call sites now route through it: extract_one, extract_conversation,
+# attachment_pipeline, calendar_extractor and teams_pipeline (a sixth,
+# scripts/curate_documents_daily, was retired on 2026-10-07). image_vision keeps
+# its own copy because its message is vision-specific. The raise is the
+# diagnostic surface: its string is what lands in attachment_content.llm_error
+# and in the sync logs.
 
 
 class _ThinkingBlock:

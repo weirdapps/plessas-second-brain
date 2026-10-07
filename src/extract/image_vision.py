@@ -39,10 +39,10 @@ VISION_IMAGE_MAX_DIMENSION = 8000
 # Pillow's decompression-bomb guard for both stages, raised only around their own
 # opens (image_classifier.admit_large_images), never for the process. The
 # effective admission ceiling is 2x this, 550 M px; the largest admitted image
-# peaks at ~4.5 GB to decode, survivable on the 7 GB host because
-# `process-images` runs sequentially (--workers defaults to 1). Beyond that
-# Pillow raises DecompressionBombError, which the caller records as a visible
-# failure rather than an image that quietly never gets described.
+# peaks at ~4.5 GB to decode, survivable on the 7 GB host because a process
+# decodes one such image at a time (_DECODE_LOCK), whatever its workers. Beyond
+# that Pillow raises DecompressionBombError, which the caller records as a
+# visible failure rather than an image that quietly never gets described.
 VISION_IMAGE_BOMB_LIMIT = IMAGE_PIXEL_LIMIT
 
 # Measured peak RSS while decoding and downscaling a 532 M px PNG: 4.33 GB.

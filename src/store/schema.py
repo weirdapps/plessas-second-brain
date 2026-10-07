@@ -652,14 +652,19 @@ def migrate_add_image_transcription(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(inline_images)")}
     if not cols:
         return
-    if "vision_transcription" not in cols:
-        conn.execute("ALTER TABLE inline_images ADD COLUMN vision_transcription TEXT")
-    if "transcribed_at" not in cols:
-        conn.execute("ALTER TABLE inline_images ADD COLUMN transcribed_at TIMESTAMP")
-    if "transcription_attempts" not in cols:
-        conn.execute(
-            "ALTER TABLE inline_images ADD COLUMN transcription_attempts INTEGER NOT NULL DEFAULT 0"
-        )
+    for name, decl in (
+        ("vision_transcription", "TEXT"),
+        ("transcribed_at", "TIMESTAMP"),
+        ("transcription_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if name in cols:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE inline_images ADD COLUMN {name} {decl}")
+        except sqlite3.OperationalError as e:
+            # Another process added it between the check and the ALTER (see v21).
+            if "duplicate column name" not in str(e):
+                raise
     conn.commit()
 
 

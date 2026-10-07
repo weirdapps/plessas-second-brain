@@ -1,7 +1,8 @@
 """Local text extraction from attachment files.
 
-Extracts text from PDF, Word, PowerPoint, Excel, images (OCR),
-.eml, .rpmsg, and plain text files. No API calls — all local.
+Extracts text from PDF, Word, PowerPoint, Excel, images (OCR), .eml, Office object
+containers (.mso), drawings (.wmz, .emz) and text formats told apart by their bytes; files
+encrypted at rest are recognised and recorded as such. No API calls — all local.
 """
 
 import html

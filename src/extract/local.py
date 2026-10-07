@@ -381,14 +381,18 @@ def _without_stored_copies(
     store holds, by its message_id or by its RFC822 Message-ID under another one,
     stays staged instead, and the load notes its move and its alias
     (src/store/loader.py). So does a second staged copy of a message whose first is
-    extracted or pending. The ids are compared exactly, as the loader compares them,
-    so a copy skipped here is one the loader finds.
+    pending, or extracted and on disk awaiting the load: one recorded as extracted
+    whose file is gone never loads, and must not hold the other back. The ids are
+    compared exactly, as the loader compares them, so a copy skipped here is one the
+    loader finds.
     """
-    claimed = {
-        e.get("internet_message_id")
-        for e in staged
-        if e.get("internet_message_id") and str(e.get("message_id", "")) in processed_ids
-    }
+    extracted_copies: dict[str, list[str]] = {}
+    for e in staged:
+        if e.get("internet_message_id") and str(e.get("message_id", "")) in processed_ids:
+            extracted_copies.setdefault(e["internet_message_id"], []).append(
+                str(e.get("message_id", ""))
+            )
+    claimed: set[str] = set()
     conn = sqlite3.connect(str(db_path), timeout=60) if db_path and Path(db_path).exists() else None
     kept: list[dict] = []
     stored = held = 0
@@ -398,7 +402,9 @@ def _without_stored_copies(
             imid = email.get("internet_message_id") or None
             if conn is not None and _is_stored(conn, message_id, imid):
                 stored += 1
-            elif imid and imid in claimed:
+            elif imid and (
+                imid in claimed or any(map(_has_extraction, extracted_copies.get(imid, ())))
+            ):
                 held += 1
             else:
                 if imid:
@@ -412,6 +418,14 @@ def _without_stored_copies(
     if held:
         log(f"Held back {held} staged copies of messages already being extracted")
     return kept
+
+
+def _has_extraction(message_id: str) -> bool:
+    """Whether an extraction file for the email is on disk (extraction_files.py names)."""
+    return (
+        extraction_path(EXTRACTED_DIR, message_id).is_file()
+        or (EXTRACTED_DIR / f"{message_id}.json").is_file()
+    )
 
 
 def _is_stored(conn: sqlite3.Connection, message_id: str, imid: str | None) -> bool:

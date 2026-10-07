@@ -421,7 +421,7 @@ def main() -> int:
     print(f"  stray duplicates deleted: {stats['strays_deleted']:,}")
     print(f"  stray unique files kept : {stats['strays_kept']:,}")
     print(f"  content already held : {stats['already_ingested']:,}")
-    print(f"  originals kept, no other copy: {stats['originals_kept']:,}")
+    print(f"  originals kept, no other copy: {stats.get('originals_kept', 0):,}")
     print(f"  unique, still waiting : {stats['waiting']:,}")
     if "duplicate_grace_days" in stats:
         print(f"  duplicate grace (days): {stats['duplicate_grace_days']:g}")

@@ -259,6 +259,11 @@ def search_emails(query: str, search_type: str = "keyword", limit: int = 20) -> 
     subject, summary or body says how many in thread_matches, and email_thread
     reads the rest of it.
 
+    When the embedding model cannot embed the query, semantic mode ranks by
+    similarity to the query's best keyword matches instead, and every row says
+    so in `semantic` ('keyword_seeded: <error type>'); with no keyword match at
+    all it returns {"error": ...} naming the cause.
+
     Args:
         query: Search query text. Keyword mode wants every word, then falls back to
             any meaningful word, flagging those rows partial_match.
@@ -272,9 +277,12 @@ def search_emails(query: str, search_type: str = "keyword", limit: int = 20) -> 
     conn = _get_conn()
     try:
         if search_type == "semantic":
-            from src.store.embeddings import query_semantic
+            from src.store.embeddings import SemanticUnavailable, query_semantic
 
-            return query_semantic(conn, query, limit=limit)
+            try:
+                return query_semantic(conn, query, limit=limit)
+            except SemanticUnavailable as e:
+                return {"error": str(e)}
         else:
             from src.store.query import query_by_keyword
 
@@ -770,6 +778,9 @@ def search_conversations(
 ) -> list[dict] | dict:
     """Search past Claude Code conversations by keyword (FTS5) or semantic similarity.
 
+    When the query cannot be embedded, semantic mode behaves as search_emails
+    describes: rows ranked around the best keyword matches, marked in `semantic`.
+
     Args:
         query: Search query text. Keyword mode wants every word, then falls back to
             any meaningful word, flagging those rows partial_match.
@@ -785,7 +796,11 @@ def search_conversations(
     try:
         if search_type == "semantic":
             from src.store.conversation_query import conversation_ids_in_workspace
-            from src.store.embeddings import CONVERSATION_ID_OFFSET, query_semantic
+            from src.store.embeddings import (
+                CONVERSATION_ID_OFFSET,
+                SemanticUnavailable,
+                query_semantic,
+            )
 
             # The workspace filter goes in before the ranking, as the keyword
             # search's goes in the SQL. Applied to the global top 2 x limit, it
@@ -798,9 +813,12 @@ def search_conversations(
                 }
                 if not allowed:
                     return []
-            return query_semantic(
-                conn, query, limit=limit, kinds={"conversation"}, allowed_ids=allowed
-            )
+            try:
+                return query_semantic(
+                    conn, query, limit=limit, kinds={"conversation"}, allowed_ids=allowed
+                )
+            except SemanticUnavailable as e:
+                return {"error": str(e)}
         else:
             from src.store.conversation_query import search_conversations_keyword
 

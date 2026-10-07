@@ -388,6 +388,36 @@ def test_check_attachments_pending_is_actionable_only(hc):
     assert r["llm_done"] == 3
 
 
+def test_encrypted_attachments_are_their_own_figure(hc):
+    """A rights- or password-protected original is neither a failure nor a file with no text:
+    its text exists and needs rights. Phase 1 records it as 'encrypted' (about 2,150 rows), and
+    folded into failed or no-text it would read as a reader fault or vanish from both."""
+    import sqlite3
+
+    db = sqlite3.connect(":memory:")
+    db.execute(
+        "CREATE TABLE attachment_content (id INTEGER PRIMARY KEY, "
+        "extraction_status TEXT, llm_status TEXT, llm_extracted_at TEXT)"
+    )
+    rows = (
+        [("encrypted", "pending", None)] * 4
+        + [("failed", "pending", None)]
+        + [("skipped", "pending", None)] * 2
+    )
+    db.executemany(
+        "INSERT INTO attachment_content "
+        "(extraction_status, llm_status, llm_extracted_at) VALUES (?,?,?)",
+        rows,
+    )
+    db.commit()
+
+    r = hc.check_attachments(db)
+    report, _ = hc.build_report([r], {}, {}, {}, [])
+
+    assert (r["encrypted"], r["text_failed"], r["llm_no_text"]) == (4, 1, 3)
+    assert "4 encrypted" in report
+
+
 def _images_db():
     """In-memory DB with the tables check_images reads."""
     import sqlite3
@@ -2739,7 +2769,7 @@ def test_split_separates_a_fresh_deferral_from_an_abandoned_one(hc, tmp_path):
     _aged_dirs(tmp_path, 40, "dead-orphan-1", "dead-orphan-2")
     db = _attachments_db(root, "known-1")
 
-    pending, abandoned = hc.split_unregistered_attachment_dirs(db, root=root)
+    pending, abandoned, _copies = hc.split_unregistered_attachment_dirs(db, root=root)
 
     assert pending == 1
     assert abandoned == 2
@@ -2751,7 +2781,7 @@ def test_abandoned_dirs_do_not_raise_a_warn(hc, tmp_path):
     _aged_dirs(tmp_path, 40, *[f"dead-{i}" for i in range(500)])
     db = _attachments_db(tmp_path)
 
-    pending, abandoned = hc.split_unregistered_attachment_dirs(db, root=tmp_path)
+    pending, abandoned, _copies = hc.split_unregistered_attachment_dirs(db, root=tmp_path)
 
     assert pending == 0
     assert abandoned == 500
@@ -2763,10 +2793,75 @@ def test_a_fresh_backlog_still_raises_a_warn(hc, tmp_path):
     _attachment_dirs(tmp_path, *[f"new-{i}" for i in range(500)])
     db = _attachments_db(tmp_path)
 
-    pending, abandoned = hc.split_unregistered_attachment_dirs(db, root=tmp_path)
+    pending, abandoned, _copies = hc.split_unregistered_attachment_dirs(db, root=tmp_path)
 
     assert pending == 500
     assert abandoned == 0
+
+
+# Most unregistered directories are not missing anything. A message triaged into an archive
+# folder gets a new Graph id, the sync downloads its attachments again under it and registers
+# them there, and the directory under the old id keeps byte-identical copies of files the
+# table already holds. On the producer on 2026-10-07 that was 921 of the 946 unregistered
+# directories; only 24 held a file found nowhere else (32 files). Counted with the rest they
+# kept this row at WARN with nothing missing from search, so they are counted apart.
+
+
+def _with_held_file(tmp_path, body=b"the deck"):
+    """A store whose one attachment holds `body`, hashed as the registrar's hasher leaves it."""
+    import hashlib
+
+    from src.store.schema import create_database
+
+    db = create_database(":memory:")
+    root = tmp_path / "att"
+    held = root / "AAMk-new" / "deck.pdf"
+    held.parent.mkdir(parents=True)
+    held.write_bytes(body)
+    db.execute(
+        "INSERT INTO attachments (message_id, filename, file_size, file_path, exported_at, sha256)"
+        " VALUES ('AAMk-new', 'deck.pdf', ?, ?, 'now', ?)",
+        (len(body), str(held), hashlib.sha256(body).hexdigest()),
+    )
+    db.commit()
+    return db, root
+
+
+def test_a_directory_of_copies_of_held_files_is_counted_apart(hc, tmp_path):
+    db, root = _with_held_file(tmp_path)
+    copies = root / "AAMk-old"
+    copies.mkdir()
+    (copies / "deck (1).pdf").write_bytes(b"the deck")
+
+    assert hc.split_unregistered_attachment_dirs(db, root=root) == (0, 0, 1)
+
+
+def test_one_file_found_nowhere_else_keeps_the_directory_counted(hc, tmp_path):
+    db, root = _with_held_file(tmp_path)
+    mixed = root / "AAMk-old"
+    mixed.mkdir()
+    (mixed / "deck.pdf").write_bytes(b"the deck")
+    (mixed / "minutes.docx").write_bytes(b"only here")
+
+    assert hc.split_unregistered_attachment_dirs(db, root=root) == (1, 0, 0)
+
+
+def test_copies_of_held_files_do_not_raise_the_warn(hc, tmp_path, monkeypatch):
+    db, root = _with_held_file(tmp_path)
+    for i in range(hc.ATTACHMENT_UNREGISTERED_WARN + 1):
+        d = root / f"AAMk-moved-{i}"
+        d.mkdir()
+        (d / "deck.pdf").write_bytes(b"the deck")
+    monkeypatch.setattr(hc, "ATTACHMENTS_DIR", root)
+
+    r = hc.check_attachments(db)
+    report, _ = hc.build_report([r], {}, {}, {}, [])
+
+    assert r["status"] == "OK" and r["unregistered"] == 0
+    assert f"{hc.ATTACHMENT_UNREGISTERED_WARN + 1:,} only copies of held files" in report
+    assert hc.count_unregistered_attachment_dirs(db, root=root) == (
+        hc.ATTACHMENT_UNREGISTERED_WARN + 1
+    )
 
 
 def test_total_count_still_reports_every_unregistered_dir(hc, tmp_path):

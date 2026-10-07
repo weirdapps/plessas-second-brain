@@ -187,14 +187,25 @@ def _is_image(mime: str | None, filename: str) -> bool:
     )
 
 
-def _registered(conn: sqlite3.Connection) -> dict[tuple[str, str], tuple[tuple[int, ...], str]]:
-    """(directory name, filename) -> (attachment ids, the state their rows allow).
+SWEEP_INDEX = "idx_attachment_content_sweep"
 
-    When several rows share a directory and name, the file is deletable only if every one of
-    them allows it: the least-finished row decides.
+
+def registered_sql(conn: sqlite3.Connection) -> str:
+    """Every attachment with its content row and image facts.
+
+    It reads only columns that SWEEP_INDEX (schema v32) holds, so SQLite can answer from the
+    index. It has to be told to: the UNIQUE index on attachment_id looks cheaper to the planner,
+    and through it every row is fetched from the table, which reads all of that row's stored text
+    (extracted_text sits ahead of the columns behind it) and took minutes on the producer. A
+    store that has not migrated yet has no such index, and the hint would be an error, so it is
+    given only when the index exists. Add a column of attachment_content to this query and it
+    reads every stored text again.
     """
-    rows = conn.execute(
-        f"""
+    has_index = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?", (SWEEP_INDEX,)
+    ).fetchone()
+    hint = f" INDEXED BY {SWEEP_INDEX}" if has_index else ""
+    return f"""
         SELECT a.id, a.file_path, a.mime_type, a.filename,
                ac.id IS NOT NULL,
                COALESCE({NOT_FULLY_READ_SQL}, 0),
@@ -204,11 +215,19 @@ def _registered(conn: sqlite3.Connection) -> dict[tuple[str, str], tuple[tuple[i
                COALESCE(ii.classification IN ('signature', 'noise'), 0),
                COALESCE(ii.vision_attempts, 0)
         FROM attachments a
-        LEFT JOIN attachment_content ac ON ac.attachment_id = a.id
+        LEFT JOIN attachment_content ac{hint} ON ac.attachment_id = a.id
         LEFT JOIN inline_images ii ON ii.sha256 = a.sha256
         WHERE a.file_path IS NOT NULL
         """
-    ).fetchall()
+
+
+def _registered(conn: sqlite3.Connection) -> dict[tuple[str, str], tuple[tuple[int, ...], str]]:
+    """(directory name, filename) -> (attachment ids, the state their rows allow).
+
+    When several rows share a directory and name, the file is deletable only if every one of
+    them allows it: the least-finished row decides.
+    """
+    rows = conn.execute(registered_sql(conn)).fetchall()
     rank = {DELETABLE: 0, PENDING_IMAGE: 1, NOT_HELD: 2, UNREAD: 3, PENDING_TEXT: 4}
     known: dict[tuple[str, str], tuple[tuple[int, ...], str]] = {}
     for row in rows:

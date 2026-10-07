@@ -319,6 +319,20 @@ the old listing kept the ten earliest of each month, so run
 `python -m src.cli calendar-sync --backfill` once to fill the months it capped,
 best after outlook-access pages list-calendar itself.
 
+**Upgrading to schema v32.** From v32 `attachment_content` has three small indexes that
+answer the file sweep's classification and two health-check queries without reading the
+stored text. `extracted_text` (3 GB on the producer) sits ahead of the columns those queries
+read, and SQLite reaches a column behind a long text by reading all of it: the sweep took
+160 s with a cold cache inside every hourly sync, and the nightly check 8.5 minutes against a
+300 s unit limit. On a copy of the replica on 2026-10-08 the sweep's query went from 14 s
+cold (3.8 s warm) to 0.3 s and the other two from 0.5 s to under 10 ms; the three indexes
+take 6.5 MiB. Each is built by reading the table once, so on the producer with a cold cache
+expect a few minutes each, with the write lock held meanwhile (the migration waits up to
+thirty minutes for it, the other units only sixty seconds). Stop the `sb-*` timers, let the
+running syncs exit, pull, run `python -m src.cli migrate`, and start the timers again. A
+store that has not migrated yet sweeps as before, only slower: the index hint is given only
+when the index exists.
+
 ## 8. Backup and restore
 
 `scripts/backup_db.py` takes an MVCC-consistent snapshot of a live `brain.db`,

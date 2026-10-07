@@ -225,31 +225,6 @@ def test_daily_sync_extracts_with_claude_whenever_it_has_credentials(tmp_path, v
     assert f"--engine {engine}" in sync
 
 
-@pytest.mark.parametrize(
-    ("variable", "runs"),
-    [("VERTEX_SDK_PROJECT", True), ("ANTHROPIC_VERTEX_PROJECT_ID", True), (None, False)],
-)
-def test_reverse_ingest_runs_with_either_vertex_project_name(tmp_path, variable, runs):
-    home = _daily_home(tmp_path, "exit 0\n")
-
-    result = subprocess.run(
-        ["/bin/bash", str(_WRAPPERS / "sb-reverse-ingest.sh")],
-        env={
-            "HOME": str(home),
-            "PATH": "/usr/bin:/bin",
-            "SHELL": "/bin/bash",
-            **({variable: "x"} if variable else {}),
-        },
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-
-    assert result.returncode == 0
-    ran = (home / "calls.log").exists() and any("reverse-ingest" in c for c in _calls(home))
-    assert ran is runs
-
-
 def test_a_failed_daily_sync_keeps_its_code_and_skips_the_lifecycle(tmp_path):
     home = _daily_home(tmp_path, 'case "$*" in *"src.cli sync"*) exit 3;; esac\nexit 0\n')
 

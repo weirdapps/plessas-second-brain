@@ -58,9 +58,9 @@ from src.llm_policy import MAX_ATTEMPTS, ROW_CAPS, backoff
 
 # Effective TimeoutStartSec of each scheduled second-brain unit, read live from the VPS
 # on 2026-08-11 with `systemctl --user show sb-<name>.service -p TimeoutStartUSec`.
-# These nine are the whole scheduled set (sb-curate-docs, the tenth, was retired on
-# 2026-10-07 and its entry removed). A unit missing from this map gets no deadline
-# rather than a guessed one.
+# These eight are the whole scheduled set (sb-curate-docs and sb-reverse-ingest were
+# retired on 2026-10-07 and their entries removed). A unit missing from this map gets no
+# deadline rather than a guessed one.
 #
 # Re-read 2026-09-23. Three drop-ins had raised units since, each an owner decision
 # with its reason in the drop-in: sb-calendar-sync and sb-conversation-sync to 15min
@@ -76,11 +76,10 @@ _UNIT_TIMEOUT_SECONDS: dict[str, int] = {
     "sb-news-sync": 1800,
     "sb-noon-catchup": 1800,
     "sb-outlook-sync": 1200,
-    "sb-reverse-ingest": 1800,
     "sb-teams-sync": 600,
 }
 
-# TimeoutStopSec on all nine units, which is also the user manager's
+# TimeoutStopSec on all eight units, which is also the user manager's
 # DefaultTimeoutStopUSec. Held back from the budget so a terminal GIVE_UP still has room
 # to finish its bookkeeping and flush its logs before systemd's SIGTERM.
 _SHUTDOWN_GRACE_SECONDS = 90

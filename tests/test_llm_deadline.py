@@ -16,8 +16,8 @@ TimeoutStopUSec`:
 Re-read on 2026-09-23, after three drop-ins: sb-outlook-sync 20min, sb-calendar-sync
 15min, sb-conversation-sync 15min. The other seven are unchanged.
 
-sb-curate-docs, in the first table, was retired on 2026-10-07: that table is the record
-of the 2026-08-11 reading, and nine units remain.
+sb-curate-docs and sb-reverse-ingest, in the first table, were retired on 2026-10-07:
+that table is the record of the 2026-08-11 reading, and eight units remain.
 """
 
 import logging
@@ -45,7 +45,6 @@ UNIT_TIMEOUT_AND_BUDGET = {
     "sb-news-sync": (1800, 1590),
     "sb-noon-catchup": (1800, 1590),
     "sb-outlook-sync": (1200, 990),
-    "sb-reverse-ingest": (1800, 1590),
     "sb-teams-sync": (600, 390),
 }
 
@@ -151,11 +150,11 @@ def test_the_reserve_excludes_the_largest_backoff():
     ("unit", "timeout", "budget"), [(u, t, b) for u, (t, b) in UNIT_TIMEOUT_AND_BUDGET.items()]
 )
 def test_each_unit_gets_its_own_budget(unit, timeout, budget):
-    """Nine units, nine budgets, each an exact literal.
+    """Eight units, eight budgets, each an exact literal.
 
     Would this pass with the behaviour removed? No. Returning the flat
     DEFAULT_BUDGET_SECONDS of 900 that the estate falls back to today — the exact
-    status quo this task exists to replace — matches none of the nine.
+    status quo this task exists to replace — matches none of the eight.
     """
     assert llm_deadline._llm_budget_seconds(unit, 120.0, unit_timeout_seconds=timeout) == budget
 
@@ -164,24 +163,25 @@ def test_each_unit_gets_its_own_budget(unit, timeout, budget):
     ("unit", "budget"), [(u, b) for u, (_, b) in UNIT_TIMEOUT_AND_BUDGET.items()]
 )
 def test_the_checked_in_timeout_table_is_what_production_actually_reads(unit, budget):
-    """Same nine budgets, but with the timeout coming from _UNIT_TIMEOUT_SECONDS itself.
+    """Same eight budgets, but with the timeout coming from _UNIT_TIMEOUT_SECONDS itself.
 
     NO ``unit_timeout_seconds`` OVERRIDE, and that omission is the entire test. The
     parametrised test above feeds the timeout in from this file's own table, so it
     exercises the subtraction and never once reads the module's table — which is the only
-    checked-in record of what the nine production units are actually configured with, and
+    checked-in record of what the eight production units are actually configured with, and
     is what the no-override path in ``install_llm_deadline`` reads on the VPS.
 
     Would this pass with the behaviour removed? No, and it was a measured gap: mutating
     each of the then ten entries to 999 in turn left SIX green — sb-calendar-sync,
-    sb-conversation-sync, sb-curate-docs (retired 2026-10-07), sb-news-sync,
-    sb-reverse-ingest and sb-teams-sync, every unit not separately named in another test.
+    sb-conversation-sync, sb-curate-docs, sb-news-sync, sb-reverse-ingest and
+    sb-teams-sync (the two named first and fourth were retired on 2026-10-07), every unit
+    not separately named in another test.
     Under this test any one of those mutations yields 789 against its literal and fails.
     """
     assert llm_deadline._llm_budget_seconds(unit, 120.0) == budget
 
 
-def test_the_timeout_table_holds_exactly_the_nine_scheduled_units():
+def test_the_timeout_table_holds_exactly_the_eight_scheduled_units():
     """Set equality, so an ADDED key is caught as well as a changed or renamed one.
 
     The per-unit test above cannot see a spurious eleventh entry: nothing asks about a
@@ -216,21 +216,21 @@ def test_every_scheduled_unit_has_a_positive_margin():
 
 
 def test_only_the_long_units_can_fund_a_token_push_wait():
-    """Five units can afford the wait, four cannot. The split is the point of the port.
+    """Four units can afford the wait, four cannot. The split is the point of the port.
 
-    CAPABILITY, NOT PRACTICE. This is the set whose BUDGET clears the bar. Each of the five
+    CAPABILITY, NOT PRACTICE. This is the set whose BUDGET clears the bar. Each of the four
     has a wrapper that runs src.cli (`grep -c src.cli scripts/wrappers/systemd/<wrapper>`
-    returns 6, 2, 1, 2 and 3 for sb-attachment-pass, sb-daily-sync, sb-news-sync,
-    sb-noon-catchup and sb-reverse-ingest), so the hook that installs PTS_LLM_DEADLINE runs
-    for every one of them and the table is not a claim about production that nobody
-    checked. Until 2026-10-07 a sixth unit, sb-curate-docs, cleared the bar on paper and
-    never got that budget: its wrapper called scripts/curate_documents_daily.py directly
-    and never touched src.cli, so it kept the flat 900s default. The unit is retired and
-    that gap went with it.
+    returns 6, 2, 1 and 2 for sb-attachment-pass, sb-daily-sync, sb-news-sync and
+    sb-noon-catchup), so the hook that installs PTS_LLM_DEADLINE runs for every one of them
+    and the table is not a claim about production that nobody checked. Until 2026-10-07 two
+    more units cleared the bar. sb-reverse-ingest ran src.cli. sb-curate-docs cleared it on
+    paper and never got that budget: its wrapper called scripts/curate_documents_daily.py
+    directly and never touched src.cli, so it kept the flat 900s default. Both are retired
+    and that gap went with them.
 
     Would this pass with the behaviour removed? No. Under today's flat 900s default,
     900 < 1140, so NO unit funds a wait and the qualifying set is empty rather than
-    these five. Under a per-unit budget it is exactly these five.
+    these four. Under a per-unit budget it is exactly these four.
     """
     funds_wait = {
         unit
@@ -243,7 +243,6 @@ def test_only_the_long_units_can_fund_a_token_push_wait():
         "sb-daily-sync",
         "sb-news-sync",
         "sb-noon-catchup",
-        "sb-reverse-ingest",
     }
 
 
@@ -256,7 +255,7 @@ def test_the_wait_is_affordable_only_in_the_first_450_seconds_of_a_1800s_unit():
     yields UNRECOVERABLE_AUTH instead, and that is the mechanism working, not failing: a
     wait begun at t=451 would be cut short by SIGTERM with nothing written.
 
-    This is also why the anchor in _deadline_anchor is not a detail. Four of these units
+    This is also why the anchor in _deadline_anchor is not a detail. Three of these units
     run more than one src.cli process per invocation; anchored per process, a sibling
     starting at t=1800 would believe it was inside its own first 450 seconds and take a
     wait the unit has no room for at all.

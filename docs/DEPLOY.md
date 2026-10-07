@@ -117,8 +117,8 @@ places under `$BRAIN_DATA_DIR`. A run that exits 7 has no cursor: move it
 across, and do not answer with `--bootstrap`, which fetches only the newest 100
 messages. A replica's pull (`sb-db-pull.sh`) reads the producer's
 `<repo>/data`: edit its `REMOTE_DATA` to the new data home too. The wrappers in
-`scripts/wrappers/` are an archive, so copy the updated `sb-outlook-sync.sh`,
-`sb-daily-sync.sh` and `sb-reverse-ingest.sh` into `~/.local/bin` as well. To
+`scripts/wrappers/` are an archive, so copy the updated `sb-outlook-sync.sh` and
+`sb-daily-sync.sh` into `~/.local/bin` as well. To
 roll back, rename `<repo>/data/state/*.json.carried` back to `*.json`, after
 copying across any newer cursor from `$BRAIN_DATA_DIR/state`.
 
@@ -235,9 +235,8 @@ itself; `outlook_export` does, one run per folder (Inbox, Archive, Sent Items),
 and `python -m src.export.inbox_reconcile` records Inbox mail you have since
 moved. `scripts/wrappers/systemd/sb-outlook-sync.sh` runs all of these hourly.
 It does not cover Teams, calendar,
-news, SharePoint or the filesystem scan, so `calendar-sync`, `teams-sync`,
-`news-sync`, `process-sharepoint` and `reverse-ingest` each want their own
-schedule. `python -m src.cli --help` lists every subcommand.
+news or SharePoint, so `calendar-sync`, `teams-sync`, `news-sync` and
+`process-sharepoint` each want their own schedule. `python -m src.cli --help` lists every subcommand.
 
 Nor does it close action items: extraction only appends, so run
 `python -m src.store.action_lifecycle` after a successful sync. It drops

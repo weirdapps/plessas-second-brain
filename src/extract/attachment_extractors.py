@@ -40,9 +40,15 @@ SKIP_EXTENSIONS = {".mp4", ".mp3", ".wav", ".rar", ".7z", ".gz", ".wmz"}
 # Formats with a reader of their own, chosen by the name: their bytes have no magic a sniff
 # knows, and senders declare them as anything (image/g3fax, application/gzip, x-coff).
 OWN_READER_EXTENSIONS = frozenset({".mso"})
-# An .mso part inflates to an OLE2 file, and each object in it inflates again. The largest of
-# 255 on the producer inflates to 1.6 MB; past this a container is taken for a zlib bomb.
-MSO_MAX_INFLATED = 64 << 20
+# What one file may inflate to, all of its compressed layers together (an .mso container and
+# every object in it; a .wmz or .emz drawing). The largest .mso on the producer inflates to
+# 1.6 MB and the largest .wmz to 1.9 MB, and the VPS that reads them has 7 GB shared with the
+# MCP server. Past this a file is taken for a decompression bomb: what was read is kept, and
+# the error says the rest is unread for good.
+INFLATE_MAX_BYTES = 64 << 20
+# An Office part the XML fallbacks read: refused past this size or past ZIP_MAX_RATIO, and the
+# read itself stops here whatever the zip header claims.
+XML_PART_MAX_BYTES = 64 << 20
 
 # A zip is unpacked into a temporary directory and every member extracted; nothing is kept.
 # The guards stop a hostile archive: too many members, too many bytes, a member compressed
@@ -462,12 +468,32 @@ def _xml_paragraphs(xml: str, ns: str) -> list[str]:
     return out
 
 
-def _member_paragraphs(zf, name: str, ns: str) -> list[str]:
-    """A member's paragraphs; nothing when it cannot be read (a bad CRC, a bad deflate)."""
+def _read_member(zf, name: str) -> bytes | None:
+    """A zip member's bytes, or None when it is missing, unreadable or out of bounds.
+
+    The declared size and compression ratio are checked before reading (XML_PART_MAX_BYTES,
+    ZIP_MAX_RATIO), and the read stops at the size bound whatever the header said.
+    """
     try:
-        return _xml_paragraphs(zf.read(name).decode("utf-8", "replace"), ns)
+        info = zf.getinfo(name)
+    except KeyError:
+        return None
+    if info.file_size > XML_PART_MAX_BYTES or info.file_size > ZIP_MAX_RATIO * max(
+        info.compress_size, 1
+    ):
+        return None
+    try:
+        with zf.open(info) as member:
+            data = member.read(XML_PART_MAX_BYTES + 1)
     except Exception:
-        return []
+        return None  # a bad CRC, a bad deflate, a header that understated the size
+    return data if len(data) <= XML_PART_MAX_BYTES else None
+
+
+def _member_paragraphs(zf, name: str, ns: str) -> list[str]:
+    """A member's paragraphs; nothing when it cannot be read or is out of bounds."""
+    data = _read_member(zf, name)
+    return [] if data is None else _xml_paragraphs(data.decode("utf-8", "replace"), ns)
 
 
 def _docx_xml_text(path: str) -> str:
@@ -505,17 +531,15 @@ def _pptx_xml_text(path: str) -> str:
             lines = _member_paragraphs(zf, name, "a")
             if lines:
                 parts.append(f"--- Slide {number} ---\n" + "\n".join(lines))
-            rels = f"ppt/slides/_rels/slide{number}.xml.rels"
-            try:
-                targets = re.findall(r'Target="([^"]*notesSlide[^"]*)"', zf.read(rels).decode())
-            except Exception:
-                targets = []
+            rels = _read_member(zf, f"ppt/slides/_rels/slide{number}.xml.rels") or b""
+            targets = re.findall(
+                r'Target="([^"]*notesSlide[^"]*)"', rels.decode("utf-8", "replace")
+            )
             for target in targets[:1]:
-                notes = posixpath.normpath(posixpath.join("ppt/slides", target))
-                try:
-                    xml = zf.read(notes).decode("utf-8", "replace")
-                except Exception:
+                notes = _read_member(zf, posixpath.normpath(posixpath.join("ppt/slides", target)))
+                if notes is None:
                     continue
+                xml = notes.decode("utf-8", "replace")
                 body = [
                     line
                     for shape in re.findall(r"<p:sp\b.*?</p:sp>", xml, flags=re.DOTALL)
@@ -619,8 +643,11 @@ def sniff_mime_type(path: str) -> str | None:
 # Sector numbers above this are markers (end of chain, free, FAT, DIFAT), not sectors.
 _OLE_MAXREGSECT = 0xFFFFFFFA
 _OLE_ENDOFCHAIN = 0xFFFFFFFE
-# A real directory is a few sectors long; a chain longer than this is damaged or hostile.
-_OLE_MAX_DIRECTORY_SECTORS = 20_000
+# A real directory holds tens of entries, an Outlook item a few thousand; past this the walk
+# stops with the names it has. A DIFAT sector lists 127 FAT sectors (8 MB of a 512-byte-sector
+# file), so this many describe 32 GB.
+_OLE_MAX_DIRECTORY_ENTRIES = 65_536
+_OLE_MAX_DIFAT_SECTORS = 4096
 
 
 def _ole_stream_names(path: str) -> set[str]:
@@ -634,7 +661,9 @@ def _ole_stream_names(path: str) -> set[str]:
     was, which holds four entries in a 512-byte file: the names that say a file is encrypted
     and how (DRMEncryptedDataSpace, EncryptionInfo, EncryptedPackage) sit deeper, so 1,436
     encrypted files reached the readers and were recorded as failures. A broken chain ends the
-    walk with the names read so far, and a chain that loops ends where it repeats.
+    walk with the names read so far; a chain that loops (directory or DIFAT) ends where it
+    repeats; and the walk stops at _OLE_MAX_DIRECTORY_ENTRIES entries and
+    _OLE_MAX_DIFAT_SECTORS DIFAT sectors, so a crafted header cannot make it read without end.
     """
     import struct
 
@@ -654,7 +683,7 @@ def _ole_stream_names(path: str) -> set[str]:
             seen: set[int] = set()
             while (
                 len(fat_sectors) < fat_count
-                and len(seen) < difat_count
+                and len(seen) < min(difat_count, _OLE_MAX_DIFAT_SECTORS)
                 and difat_sector <= _OLE_MAXREGSECT
                 and difat_sector not in seen
             ):
@@ -685,7 +714,7 @@ def _ole_stream_names(path: str) -> set[str]:
             while (
                 sector <= _OLE_MAXREGSECT
                 and sector not in visited
-                and len(visited) < _OLE_MAX_DIRECTORY_SECTORS
+                and len(visited) * (size // 128) < _OLE_MAX_DIRECTORY_ENTRIES
             ):
                 visited.add(sector)
                 f.seek((sector + 1) << shift)
@@ -1254,16 +1283,33 @@ class _InflatesTooFar(ValueError):
     pass
 
 
-def _unpack(data: bytes) -> bytes | None:
+class _InflateBudget:
+    """The bytes one file may still inflate to, across all of its compressed layers.
+
+    zlib is asked for at most what is left (decompressobj with max_length), never for the
+    whole stream, so a bomb costs no more memory than the budget.
+    """
+
+    def __init__(self, limit: int | None = None):
+        self.limit = INFLATE_MAX_BYTES if limit is None else limit
+        self.left = self.limit
+
+    def inflate(self, data: bytes, wbits: int = zlib.MAX_WBITS) -> bytes:
+        out = zlib.decompressobj(wbits).decompress(data, self.left + 1)
+        if len(out) > self.left:
+            raise _InflatesTooFar(f"inflates past {self.limit:,} bytes")
+        self.left -= len(out)
+        return out
+
+
+def _unpack(data: bytes, budget: _InflateBudget) -> bytes | None:
     """The OLE2 file in a part packed as a 4-byte length and a zlib stream, or None."""
     if len(data) < 6 or data[4] != 0x78:
         return None
     try:
-        inflated = zlib.decompressobj().decompress(data[4:], MSO_MAX_INFLATED + 1)
+        inflated = budget.inflate(data[4:])
     except zlib.error:
         return None
-    if len(inflated) > MSO_MAX_INFLATED:
-        raise _InflatesTooFar(f"inflates past {MSO_MAX_INFLATED:,} bytes")
     return inflated if inflated.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") else None
 
 
@@ -1318,12 +1364,18 @@ def _extract_mso(
     """
     import tempfile
 
+    budget = _InflateBudget()
     with open(path, "rb") as f:
-        data = f.read(MSO_MAX_INFLATED + 1)
+        data = f.read(budget.limit + 1)
     try:
-        container = _unpack(data)
+        container = _unpack(data, budget)
     except _InflatesTooFar as e:
-        return {"text": None, "method": "mso", "status": "skipped", "error": f"container {e}"}
+        return {
+            "text": None,
+            "method": "mso",
+            "status": "skipped",
+            "error": f"container {e}; unread, file kept",
+        }
     if container is None:
         return {
             "text": None,
@@ -1338,13 +1390,16 @@ def _extract_mso(
         for n, name in enumerate(streams, 1):
             label = f"embedded object {n}"
             try:
-                obj = _unpack(doc.get_named_stream(name))
+                obj = _unpack(doc.get_named_stream(name), budget)
                 if obj is None:
                     notes.append(f"{label}: not a packed OLE2 object")
                     continue
                 result = _read_embedded_object(
                     obj, Path(tmp) / str(n), depth, zip_seconds, ocr_seconds
                 )
+            except _InflatesTooFar as e:
+                notes.append(f"{label}: {e}; it and {len(streams) - n} more unread, file kept")
+                break
             except Exception as e:
                 notes.append(f"{label}: {type(e).__name__}: {str(e)[:200]}")
                 continue

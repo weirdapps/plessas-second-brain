@@ -388,6 +388,7 @@ python -m src.cli reextract --capped --zip --unread    # read and summarise agai
 python -m src.cli reextract --partial                  # read again in full what the old readers read in part (resumable)
 python -m src.cli reextract --stale --formats          # read with today's readers what older code skipped or failed on
 python -m src.cli reextract --ocr --limit 500          # OCR low-text scans and images again (grayscale second pass), in batches
+python scripts/relabel_attachment_status.py [--apply]  # give old failed/skipped rows today's unread verdicts: encrypted kinds, skip reasons
 python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents
 python -m src.cli process-sharepoint --ingest-fetched  # store the files earlier SharePoint fetches left on disk
 python -m src.cli process-sharepoint --refetch-content --max-fetches 0 --deadline-s 1800  # read again the links recorded ok with no text

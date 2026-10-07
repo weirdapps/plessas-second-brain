@@ -132,6 +132,29 @@ def extract_text_from_file(
     return result
 
 
+def verdict_without_reading(file_path: str, mime_type: str) -> dict | None:
+    """The verdict Phase 1 reaches from a file's name, declared type and first bytes alone.
+
+    None when the file has to be read for one (or is missing). The same checks, in the same
+    order, as the start of _extract_by_type: the skip lists, an empty file, encryption at rest.
+    scripts/relabel_attachment_status.py gives old rows these verdicts without reading any text.
+    """
+    ext = Path(file_path).suffix.lower()
+    if ext in SKIP_EXTENSIONS:
+        reason = SKIP_REASONS.get(ext, f"{ext}: no reader for this format")
+        return {"text": None, "method": None, "status": "skipped", "error": reason}
+    if mime_type in SKIP_MIME_TYPES and ext not in OWN_READER_EXTENSIONS:
+        sniffed = sniff_mime_type(file_path)
+        if sniffed is None or sniffed in SKIP_MIME_TYPES:
+            reason = SKIP_REASONS.get(mime_type, f"{mime_type}: no reader for this format")
+            return {"text": None, "method": None, "status": "skipped", "error": reason}
+    if not os.path.isfile(file_path):
+        return None
+    if os.path.getsize(file_path) == 0:
+        return {"text": None, "method": None, "status": "skipped", "error": "empty file (0 bytes)"}
+    return encryption_of(file_path)
+
+
 def _extract_by_type(
     file_path: str,
     mime_type: str,

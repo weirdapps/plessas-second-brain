@@ -39,6 +39,7 @@ from src.extract.attachment_extractors import (  # noqa: E402
     verdict_without_reading,
 )
 from src.store.file_hashes import locate_file  # noqa: E402
+from src.store.schema import get_connection  # noqa: E402
 
 SHELL_REASON = (
     "SharePoint page shell: the fetch returned the page frame (an .aspx page, or a sign-in or"
@@ -135,8 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         print(replica_refusal("the attachment relabel"), file=sys.stderr)
         return 2
 
-    conn = sqlite3.connect(args.db, timeout=60)
-    conn.execute("PRAGMA busy_timeout = 60000")
+    conn = get_connection(args.db)
     try:
         changes, stats = plan(conn, Path(args.root))
         written = apply(conn, changes) if args.apply else 0

@@ -294,7 +294,8 @@ Preferred credential path. Uses Application Default Credentials, no API key requ
 ### Alternative credentials
 
 - `ANTHROPIC_API_KEY`: direct Anthropic API. Used only when no Vertex project is set; a key left in the environment never overrides Vertex. The backend in use is printed on stderr when the client is built.
-- `GEMINI_API_KEY`: required when `BRAIN_EXTRACT_ENGINE=gemini`.
+- `GEMINI_API_KEY`: required when `BRAIN_EXTRACT_ENGINE=gemini` or `BRAIN_EMBED_BACKEND=gemini`.
+- `BRAIN_EMBED_BACKEND`: `vertex` (default) or `gemini`. `gemini` reaches the same `gemini-embedding-001` through the Gemini API with `GEMINI_API_KEY`, even where a Vertex project is set, so its vectors join the existing index. Use it when the Vertex project refuses the embedding model. On a free-tier key Google may use the submitted text to improve its products; a key on a project with billing enabled is not used that way.
 
 ### Paths and hosts
 

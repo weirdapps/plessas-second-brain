@@ -186,10 +186,25 @@ def _atomic_savez(path, ids, vectors) -> None:
 
 
 def _get_client():
-    """Get a Google GenAI client via Vertex AI (ADC auth)."""
+    """Get a Google GenAI client: Vertex AI (ADC auth) by default, or the Gemini
+    API with GEMINI_API_KEY when BRAIN_EMBED_BACKEND=gemini.
+
+    The Gemini API serves the same gemini-embedding-001, so its vectors join the
+    existing index. The switch exists because the Vertex project can refuse the
+    model while it still serves Claude, and every host sets a Vertex project.
+    """
     import os
 
     from google import genai
+
+    backend = os.environ.get("BRAIN_EMBED_BACKEND", "vertex").strip().lower() or "vertex"
+    if backend not in ("vertex", "gemini"):
+        raise ValueError(f"BRAIN_EMBED_BACKEND must be vertex or gemini; got {backend!r}")
+    if backend == "gemini":
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("BRAIN_EMBED_BACKEND=gemini needs GEMINI_API_KEY")
+        return genai.Client(api_key=api_key)
 
     project = os.environ.get("VERTEX_SDK_PROJECT") or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
     # Embeddings run on Gemini via Vertex. Use the dedicated embed region —
@@ -516,6 +531,29 @@ def _top_indices(similarities, ids, limit: int, kinds=None, allowed_ids=None) ->
     return candidates[np.argsort(similarities[candidates])[::-1][:limit]]
 
 
+# The index outlives the embedding model. Since 2026-10-06 an organisation
+# policy on the Vertex project refuses gemini-embedding-001 while every stored
+# vector is still good, so a query that cannot be embedded stands instead at
+# the centroid of its best keyword matches' vectors.
+KEYWORD_SEED_LIMIT = 10
+
+
+class SemanticUnavailable(RuntimeError):
+    """The query could not be embedded and no keyword match could stand in."""
+
+
+def _keyword_seed_vector(conn: sqlite3.Connection, query: str, ids, unit) -> np.ndarray | None:
+    """Centroid of the indexed vectors of the query's top keyword matches, or None."""
+    from src.store.query import query_by_keyword
+
+    hits = query_by_keyword(conn, query, limit=KEYWORD_SEED_LIMIT)
+    wanted = [int(h["email_id"]) for h in hits if h.get("email_id") is not None]
+    rows = np.flatnonzero(np.isin(ids, wanted))
+    if rows.size == 0:
+        return None
+    return unit[rows].mean(axis=0)
+
+
 def query_semantic(
     conn: sqlite3.Connection,
     query: str,
@@ -547,7 +585,19 @@ def query_semantic(
 
     # Generate query embedding
     embed = embed_fn or generate_embeddings
-    query_vec = np.asarray(embed([query])[0], dtype=np.float32)
+    seeded = None
+    try:
+        query_vec = np.asarray(embed([query])[0], dtype=np.float32)
+    except Exception as e:  # the model is unreachable; the index is not
+        seed = _keyword_seed_vector(conn, query, ids, normalized)
+        if seed is None:
+            raise SemanticUnavailable(
+                "semantic search unavailable: the query could not be embedded "
+                f"({type(e).__name__}: {str(e)[:300]}) and no keyword match could "
+                "stand in for it; search_type='keyword' still works"
+            ) from e
+        query_vec = seed
+        seeded = f"keyword_seeded: {type(e).__name__}"
     query_norm = query_vec / (np.linalg.norm(query_vec) or 1)
 
     similarities = normalized @ query_norm
@@ -655,6 +705,9 @@ def query_semantic(
                 result["similarity"] = round(similarity, 4)
                 results.append(result)
 
+    if seeded:
+        for result in results:
+            result["semantic"] = seeded
     return results
 
 

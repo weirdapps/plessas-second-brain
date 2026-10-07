@@ -9,6 +9,7 @@ import functools
 import json
 import os
 import signal
+import sqlite3
 import sys
 import threading
 import time
@@ -369,14 +370,72 @@ def _stub_extraction(msg_id: str) -> dict:
     return stub
 
 
+def _without_stored_copies(
+    pending: list[dict], staged: list[dict], processed_ids: set[str], db_path
+) -> list[dict]:
+    """`pending` less the copies of email the store holds, or is about to.
+
+    A move to another folder gives a message a new Graph id, and the Archive export
+    stages it again under that id. The model extracted the copy and the loader then
+    dropped it as a duplicate: 11,636 wasted extractions by 2026-10-07. A copy the
+    store holds, by its message_id or by its RFC822 Message-ID under another one,
+    stays staged instead, and the load notes its move and its alias
+    (src/store/loader.py). So does a second staged copy of a message whose first is
+    extracted or pending. The ids are compared exactly, as the loader compares them,
+    so a copy skipped here is one the loader finds.
+    """
+    claimed = {
+        e.get("internet_message_id")
+        for e in staged
+        if e.get("internet_message_id") and str(e.get("message_id", "")) in processed_ids
+    }
+    conn = sqlite3.connect(str(db_path), timeout=60) if db_path and Path(db_path).exists() else None
+    kept: list[dict] = []
+    stored = held = 0
+    try:
+        for email in pending:
+            message_id = str(email.get("message_id", ""))
+            imid = email.get("internet_message_id") or None
+            if conn is not None and _is_stored(conn, message_id, imid):
+                stored += 1
+            elif imid and imid in claimed:
+                held += 1
+            else:
+                if imid:
+                    claimed.add(imid)
+                kept.append(email)
+    finally:
+        if conn is not None:
+            conn.close()
+    if stored:
+        log(f"Skipped {stored} staged copies of emails already stored")
+    if held:
+        log(f"Held back {held} staged copies of messages already being extracted")
+    return kept
+
+
+def _is_stored(conn: sqlite3.Connection, message_id: str, imid: str | None) -> bool:
+    """Whether the store holds the email, as the loader's duplicate checks find it."""
+    if conn.execute("SELECT 1 FROM emails WHERE message_id = ?", (message_id,)).fetchone():
+        return True
+    return bool(
+        imid
+        and conn.execute("SELECT 1 FROM emails WHERE internet_message_id = ?", (imid,)).fetchone()
+    )
+
+
 @_stops_on_signals
 def run_extraction(
     workers: int = 1,
     limit: int = 0,
     engine: str | None = None,
     deadline_s: float | None = None,
+    db_path: str | Path | None = None,
 ):
     """Extract every pending staged email, or as many as fit in ``deadline_s``.
+
+    With ``db_path``, a staged copy of an email the store holds is not extracted
+    (see _without_stored_copies).
 
     With a deadline (the scheduled syncs pass one) the run stops taking new work
     once it passes, and a quota pause ends the run instead of sleeping
@@ -479,6 +538,7 @@ def run_extraction(
     # again every hour until it loads: one that kept failing went to the model
     # once per copy, in parallel, three and four times in a run.
     pending = list({str(e.get("message_id", "")): e for e in pending}.values())
+    pending = _without_stored_copies(pending, all_emails, processed_ids, db_path)
     log(f"Pending extraction: {len(pending)} emails")
     if deadline is not None:
         # By the mail's own date, not staging order: Archive and Sent bootstraps
@@ -1074,7 +1134,7 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="Max emails to process (default: all)")
     args = parser.parse_args()
 
-    run_extraction(workers=args.workers, limit=args.limit)
+    run_extraction(workers=args.workers, limit=args.limit, db_path=DATA_DIR / "brain.db")
 
 
 if __name__ == "__main__":

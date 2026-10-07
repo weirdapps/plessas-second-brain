@@ -42,7 +42,7 @@ graph TD
 | Source | Module | Notes |
 | --- | --- | --- |
 | Microsoft 365 mail | `src/export/outlook_export.py` + `outlook_cli.py` | Primary. Hourly, one `--since` cursor per folder. |
-| Attachments | `src/export/outlook_attachments.py`, `src/extract/attachment_extractors.py` | PDF (PyMuPDF), DOCX (`python-docx`), PPTX (`python-pptx`), XLSX (`openpyxl`), XLSB (`pyxlsb`), XLS (`xlrd`), images (Tesseract OCR), EML. RPMSG is recognised and skipped: it is IRM-encrypted, and nothing reads it without rights. |
+| Attachments | `src/export/outlook_attachments.py`, `src/extract/attachment_extractors.py` | PDF (PyMuPDF), DOCX (`python-docx`), PPTX (`python-pptx`), XLSX (`openpyxl`), XLSB (`pyxlsb`), XLS (`xlrd`), images (Tesseract OCR, a grayscale second pass when colour finds too little), EML and clear-signed `.p7m`, `.mso` object containers (the workbooks behind charts pasted into mail), `.wmz`/`.emz` drawings (their text records), and text formats routed by their bytes (ICS, VCF, XML, SVG, EPS, VTT). Files encrypted at rest (rights-protected Office files and `.rpmsg` messages, password-protected Office files and PDFs) are recognised from their bytes and recorded as `extraction_status = 'encrypted'`, method `rms`, `rms-message` or `password`: nothing reads them without the key. |
 | Inline email images | `src/extract/image_classifier.py`, `image_pipeline.py`, `image_vision.py` | Dimensions plus bytes plus sender-scoped SHA256 dedup cascade; vision LLM stage for content images, cached by SHA256. |
 | Calendar events | `src/export/calendar_export.py`, `src/extract/calendar_extractor.py` | Outlook events with attendees, body summary, decisions. |
 | MS Teams | `src/export/teams_cli.py`, `teams_export.py`, `src/extract/teams_pipeline.py` | Chats, threads, messages, MRI resolution. |
@@ -386,6 +386,9 @@ python -m src.cli hash-attachments          # record a content hash for every at
 python -m src.cli sweep-files --policy      # delete attachment files whose content is stored (report-only by default)
 python -m src.cli reextract --capped --zip --unread    # read and summarise again rows earlier code capped, skipped or never read
 python -m src.cli reextract --partial                  # read again in full what the old readers read in part (resumable)
+python -m src.cli reextract --stale --formats          # read with today's readers what older code skipped or failed on
+python -m src.cli reextract --ocr --limit 500          # OCR low-text scans and images again (grayscale second pass), in batches
+python scripts/relabel_attachment_status.py [--apply]  # give old failed/skipped rows today's unread verdicts: encrypted kinds, skip reasons
 python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents
 python -m src.cli process-sharepoint --ingest-fetched  # store the files earlier SharePoint fetches left on disk
 python -m src.cli process-sharepoint --refetch-content --max-fetches 0 --deadline-s 1800  # read again the links recorded ok with no text

@@ -237,13 +237,13 @@ def test_dispatcher_routes_xlsb_to_extract_xlsb(tmp_path):
 
 
 def test_dispatcher_still_routes_xlsx_to_extract_excel(tmp_path):
-    """Regression: .xlsx must still go to _extract_excel (openpyxl)."""
+    """Regression: .xlsx must still go to _extract_excel (openpyxl), when it is a zip."""
     from unittest.mock import patch
 
     from src.extract.attachment_extractors import extract_text_from_file
 
     f = tmp_path / "report.xlsx"
-    f.write_bytes(b"placeholder")
+    f.write_bytes(b"PK\x03\x04placeholder")
 
     with patch("src.extract.attachment_extractors._extract_excel") as mock_excel:
         mock_excel.return_value = {
@@ -441,24 +441,25 @@ def test_extract_xlsb_skips_ole_with_no_workbook(tmp_path):
     assert result["text"] is None
 
 
-def test_irm_protected_office_file_is_skipped_not_failed(tmp_path):
-    """IRM-protected Office files must classify as skipped, not as a zip failure.
+def test_irm_protected_office_file_is_encrypted_not_failed(tmp_path):
+    """IRM-protected Office files must classify as encrypted, not as a zip failure.
 
     Outlook hands these over with mime application/encrypted but a normal
     .xlsx/.pptx filename. The dispatcher matched the extension branch first, so
     they hit the zip-based Excel reader and recorded
     "BadZipFile: File is not a zip file" as a hard extraction FAILURE — 750 rows
     on the live DB. They are encrypted at rest: unextractable without IRM
-    rights, so they are a permanent skip, not a fault to keep counting.
+    rights, which their own directory says (tests/test_encrypted_attachments.py).
     """
     from src.extract.attachment_extractors import extract_text_from_file
+    from tests.ole_fixtures import RMS_NAMES, ole_file
 
     f = tmp_path / "Daily Report.xlsx"
-    f.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64)
+    f.write_bytes(ole_file(RMS_NAMES))
 
     result = extract_text_from_file(str(f), "application/encrypted")
 
-    assert result["status"] == "skipped"
+    assert (result["status"], result["method"]) == ("encrypted", "rms")
     assert "BadZipFile" not in (result["error"] or "")
 
 
@@ -509,16 +510,16 @@ class TestRpmsgIsReportedHonestly:
         p.write_bytes(magic + b"\x00" * 64)
         return str(p)
 
-    def test_a_real_msipc_file_is_skipped_with_a_clear_reason(self, tmp_path):
+    def test_a_real_msipc_file_is_recorded_encrypted_with_a_clear_reason(self, tmp_path):
         from src.extract.attachment_extractors import _extract_rpmsg
 
         r = _extract_rpmsg(self._write(tmp_path, b"\x76\xe8\x04\x60"))
-        assert r["status"] == "skipped"
+        assert (r["status"], r["method"]) == ("encrypted", "rms-message")
         assert r["text"] is None
-        assert "IRM-protected" in r["error"]
+        assert "Rights-protected message" in r["error"]
 
-    def test_skipped_not_failed_so_it_does_not_count_as_a_fault(self, tmp_path):
-        """685 permanent skips reported as failures would swamp the real ones."""
+    def test_not_failed_so_it_does_not_count_as_a_fault(self, tmp_path):
+        """685 permanently unreadable files reported as failures would swamp the real ones."""
         from src.extract.attachment_extractors import _extract_rpmsg
 
         assert _extract_rpmsg(self._write(tmp_path, b"\x76\xe8\x04\x60"))["status"] != "failed"

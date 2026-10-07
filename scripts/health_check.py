@@ -772,7 +772,8 @@ def files_on_disk_detail(c: dict) -> str:
         f" ({c.get('bytes', 0) / 2**30:.1f} GB; {k.get('deletable', 0):,} stored and removable,"
         f" {k.get('pending-text', 0):,} awaiting text, {k.get('unread', 0):,} unread,"
         f" {k.get('not-held', 0):,} content not held, {k.get('pending-image', 0):,} awaiting"
-        f" vision, {k.get('unregistered', 0):,} unregistered; sweep {c.get('mode')})"
+        f" vision or transcription, {k.get('unregistered', 0):,} unregistered;"
+        f" sweep {c.get('mode')})"
     )
     if c.get("policy_problem"):
         extra += f"; {c['policy_problem']}"
@@ -784,7 +785,7 @@ def files_on_disk_detail(c: dict) -> str:
     if c.get("image_late"):
         extra += (
             f"; {c['image_late']:,} images waiting more than"
-            f" {file_sweep.IMAGE_WAIT_HOURS}h for vision"
+            f" {file_sweep.IMAGE_WAIT_HOURS}h for vision or transcription"
         )
     return extra
 

@@ -21,6 +21,7 @@ def _write(tmp_path, name, data=b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64):
     ("name", "mime", "reason"),
     [
         ("clip.mp4", "video/mp4", "video: no text to read"),
+        ("clip.mov", "video/quicktime", "video: no text to read"),
         ("note.mp3", "audio/mpeg", "audio: no text to read"),
         ("memo.wav", "audio/x-wav", "audio: no text to read"),
         ("pack.7z", "application/x-7z-compressed", "7-Zip archive: no reader for this format"),

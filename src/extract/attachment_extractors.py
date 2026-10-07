@@ -28,6 +28,7 @@ MIN_TEXT_CHARS = 50
 # MIME types we skip entirely (video, audio, archives, Outlook artifacts)
 SKIP_MIME_TYPES = {
     "video/mp4",
+    "video/quicktime",
     "audio/mpeg",
     "audio/x-wav",
     "audio/wav",
@@ -36,19 +37,21 @@ SKIP_MIME_TYPES = {
     "application/gzip",
 }
 
-SKIP_EXTENSIONS = {".mp4", ".mp3", ".wav", ".rar", ".7z", ".gz"}
+SKIP_EXTENSIONS = {".mp4", ".mov", ".mp3", ".wav", ".rar", ".7z", ".gz"}
 
 # Why a skipped format is not read, by extension and by declared type. Every skip records a
 # reason: 564 producer rows were skipped with none, which cannot be told from a bug.
 _VIDEO, _AUDIO = "video: no text to read", "audio: no text to read"
 SKIP_REASONS = {
     ".mp4": _VIDEO,
+    ".mov": _VIDEO,
     ".mp3": _AUDIO,
     ".wav": _AUDIO,
     ".rar": "RAR archive: no reader for this format",
     ".7z": "7-Zip archive: no reader for this format",
     ".gz": "gzip archive: no reader for this format",
     "video/mp4": _VIDEO,
+    "video/quicktime": _VIDEO,
     "audio/mpeg": _AUDIO,
     "audio/x-wav": _AUDIO,
     "audio/wav": _AUDIO,
@@ -243,6 +246,11 @@ def _extract_by_type(
             and mime_type.startswith("image/")
             or ext in (".png", ".jpg", ".jpeg", ".gif", ".tiff", ".tif", ".bmp", ".jfif")
         ):
+            # An SVG, or a script someone saved under an image name, is text: the image reader
+            # failed on 11 producer rows with UnidentifiedImageError. A real image is binary.
+            kind = _sniff_text(file_path)
+            if kind:
+                return _extract_sniffed_text(file_path, kind)
             return _extract_image_ocr(file_path, ocr_seconds)
         elif mime_type == "message/rfc822" or ext == ".eml":
             return _extract_eml(file_path)
@@ -257,6 +265,10 @@ def _extract_by_type(
             return _extract_plain_text(file_path)
         elif mime_type == "text/html" or ext in (".html", ".htm"):
             return _extract_html(file_path)
+        elif mime_type in ("application/rtf", "text/rtf") or ext == ".rtf":
+            return _extract_sniffed_text(file_path, "application/rtf")
+        elif mime_type == "application/vnd.ms-outlook" or ext == ".msg":
+            return {"text": None, "method": None, "status": "skipped", "error": MSG_REASON}
         else:
             # Neither the declared type nor the name said what this is, which
             # is what an extensionless Outlook part or a name that lost its dot
@@ -267,6 +279,12 @@ def _extract_by_type(
                 return extract_text_from_file(
                     file_path, sniffed, _depth, zip_seconds=zip_seconds, ocr_seconds=ocr_seconds
                 )
+            # Text the declared type or the name does not route: calendar invites, contact
+            # cards, XML, EPS, subtitles, shortcuts, clear-signed mail. Only bytes that are text
+            # get here; the plain-text reader would decode any binary as latin-1.
+            kind = _sniff_text(file_path)
+            if kind:
+                return _extract_sniffed_text(file_path, kind)
             return {
                 "text": None,
                 "method": None,
@@ -1655,6 +1673,68 @@ def _extract_plain_text(path: str) -> dict:
         "status": "failed",
         "error": "Could not decode file with any supported encoding",
     }
+
+
+RTF_REASON = "RTF document: no reader for this format, and its raw markup is not text"
+MSG_REASON = "Outlook item (.msg): no reader for this format"
+
+# How a text file's first line says what it is, lower-cased, after any leading space.
+_TEXT_LEADS = (
+    ("{\\rtf", "application/rtf"),
+    ("%!ps", "application/postscript"),
+    ("begin:vcalendar", "text/calendar"),
+    ("begin:vcard", "text/vcard"),
+    ("webvtt", "text/vtt"),
+)
+# A saved mail starts with header lines, and says so in one of these somewhere near the top.
+# Two plain notes that begin "Date:" or "To:" are not mail.
+_HEADER_LINE = re.compile(r"[a-z][a-z0-9-]*:[ \t]")
+_MAIL_HEADERS = re.compile(
+    r"^(?:mime-version|content-type|received|return-path|message-id|x-[a-z0-9-]+):", re.M
+)
+
+
+def _sniff_text(path: str) -> str | None:
+    """The type a text file's head says it is, or None when the bytes are not text.
+
+    Text means no NUL and almost no other control bytes in the first 4 KB; bytes over 0x7F are
+    allowed (UTF-8, or a Windows code page). PDF, Office, images and archives are told apart
+    by sniff_mime_type first; this is for what that leaves: SVG, HTML and XML, RTF, mail
+    headers, calendar and contact text, PostScript, subtitles, and plain text.
+    """
+    head = _magic(path, 4096)
+    if not head or b"\x00" in head:
+        return None
+    controls = sum(1 for b in head if b < 0x20 and b not in (0x09, 0x0A, 0x0C, 0x0D, 0x1B))
+    if controls > len(head) // 100:
+        return None
+    lead = head.decode("utf-8", "replace").lstrip("﻿ \t\r\n").lower()
+    for prefix, kind in _TEXT_LEADS:
+        if lead.startswith(prefix):
+            return kind
+    if lead.startswith("<"):
+        if "<svg" in lead[:2048]:
+            return "image/svg+xml"
+        if re.search(r"<(?:!doctype html|html|head|body)\b", lead[:2048]):
+            return "text/html"
+        return "application/xml"
+    if _HEADER_LINE.match(lead) and _MAIL_HEADERS.search(lead[:2048]):
+        return "message/rfc822"
+    return "text/plain"
+
+
+def _extract_sniffed_text(path: str, kind: str) -> dict:
+    """Read a file _sniff_text found to be text, with the reader its kind calls for."""
+    if kind == "application/rtf":
+        return {"text": None, "method": None, "status": "skipped", "error": RTF_REASON}
+    if kind == "message/rfc822":
+        return _extract_eml(path)
+    if kind in ("text/html", "application/xml", "image/svg+xml"):
+        result = _extract_html(path)
+        if kind == "image/svg+xml":
+            result["method"] = "svg"
+        return result
+    return _extract_plain_text(path)
 
 
 def _extract_html(path: str) -> dict:

@@ -577,7 +577,7 @@ def cmd_reextract(args):
     which = {name for name in SELECTORS if getattr(args, name, False)}
     if not which:
         print(
-            "Error: choose at least one of --capped, --long, --zip, --unread, --partial",
+            "Error: choose at least one of " + ", ".join(f"--{name}" for name in SELECTORS),
             file=sys.stderr,
         )
         return 2
@@ -598,6 +598,7 @@ def cmd_reextract(args):
         "missing",
         "kept",
         "unchanged",
+        "relabelled",
         "ocr_close",
         "summarised",
         "failed",
@@ -3400,6 +3401,17 @@ def main():
         "--partial",
         action="store_true",
         help="rows the old readers read in part: spreadsheets, scans, archives, 2M-char texts",
+    )
+    parser_reextract.add_argument(
+        "--stale", action="store_true", help="skipped as unsupported before the sniffs landed"
+    )
+    parser_reextract.add_argument(
+        "--formats",
+        action="store_true",
+        help=".mso/.wmz/.emz, failed .docx/.pptx, images that would not open",
+    )
+    parser_reextract.add_argument(
+        "--ocr", action="store_true", help="scans and images whose OCR found too little text"
     )
     parser_reextract.add_argument("--limit", type=int, default=0, help="Max rows (0 = all)")
     parser_reextract.add_argument(

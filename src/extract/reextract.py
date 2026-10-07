@@ -14,11 +14,22 @@
             full. The first run records when it began (sync_metadata reextract_partial_since);
             a row it has read carries a later extracted_at, so a repeated run takes only what
             is left. Until then the sweep keeps the file (src/store/file_sweep.py PARTIAL_SQL)
+    stale   skipped as an unsupported type before the byte sniff and the text sniff landed,
+            though today's readers take most of them: extensionless and dot-lost names,
+            calendar invites, saved mail, SVG, XML
+    formats the formats the readers of 2026-10 added: .mso, .wmz and .emz from the skip list,
+            .docx and .pptx the library readers failed on, images that would not open
+    ocr     scans and images whose OCR found too little text, read again for the grayscale
+            second pass. Thousands of rows on the producer: run it in batches
 
 A row is updated in place, so its id, and the vector keyed on it, stay its own. A re-read that
 comes back with no text leaves a row that already had text untouched (counted as kept): a
-timeout or a parser error must not replace what was stored. A re-read that comes back with the
-same text only records when it was read (counted as unchanged): nothing new to summarise.
+timeout or a parser error must not replace what was stored. A row that holds no text takes the
+verdict of a re-read with none, 'encrypted' or a skip with its reason, unless that verdict is a
+failure (counted as relabelled when it changed, unchanged when not). A re-read that comes back
+with the same text only records when it was read (counted as unchanged): nothing new to
+summarise. A row the images pass owns (extraction_method 'vision') is never selected, and no
+write lands on one, even a row that became one while the file was being read.
 OCR is the exception to "shorter is kept": the same scan read again on another machine or another
 tesseract drifts by a few characters either way, so an OCR re-read within the OCR drift of what is
 stored is the same text read again (counted as ocr_close): the row is read, its text and summary
@@ -78,7 +89,32 @@ SELECTORS: dict[str, tuple[str, bool]] = {
     ),
     # A text-only document kept no file to read again.
     "partial": (f"COALESCE({PARTIAL_SQL}, 0) AND a.file_path NOT LIKE 'text:%'", True),
+    "stale": (
+        "ac.extraction_status = 'skipped' AND ac.extraction_error LIKE 'Unsupported type:%'"
+        " AND a.file_path NOT LIKE 'text:%'",
+        True,
+    ),
+    "formats": (
+        "a.file_path NOT LIKE 'text:%' AND ("
+        "(ac.extraction_status = 'skipped' AND (lower(a.filename) LIKE '%.mso'"
+        " OR lower(a.filename) LIKE '%.wmz' OR lower(a.filename) LIKE '%.emz'))"
+        " OR (ac.extraction_status = 'failed' AND (lower(a.filename) LIKE '%.docx'"
+        " OR lower(a.filename) LIKE '%.pptx'"
+        " OR ac.extraction_error LIKE 'UnidentifiedImageError%'"
+        " OR ac.extraction_error LIKE 'DecompressionBombError%')))",
+        True,
+    ),
+    "ocr": (
+        "ac.extraction_status = 'skipped'"
+        " AND (ac.extraction_error = 'OCR returned insufficient text'"
+        " OR (ac.extraction_method = 'pymupdf'"
+        " AND ac.extraction_error = 'Insufficient text extracted'))",
+        True,
+    ),
 }
+
+# The images pass owns these rows (src/extract/image_*.py): never selected, never written.
+NOT_VISION = "COALESCE(extraction_method, '') != 'vision'"
 
 
 def select_rows(
@@ -92,7 +128,8 @@ def select_rows(
         for ac_id, att_id, file_path, mime, has_text in conn.execute(
             "SELECT ac.id, a.id, a.file_path, a.mime_type, ac.extracted_text IS NOT NULL"
             " FROM attachment_content ac"
-            f" JOIN attachments a ON a.id = ac.attachment_id WHERE ({where}) AND ac.id > ?",
+            f" JOIN attachments a ON a.id = ac.attachment_id WHERE ({where}) AND ac.id > ?"
+            " AND COALESCE(ac.extraction_method, '') != 'vision'",
             (after_id or 0,),
         ):
             prior = rows.get(ac_id)
@@ -135,6 +172,7 @@ def reextract(
             "missing",
             "kept",
             "unchanged",
+            "relabelled",
             "ocr_close",
             "summarised",
             "failed",
@@ -159,13 +197,14 @@ def reextract(
             if not reread:
                 stats["resummarise"] += 1
                 if not dry_run:
-                    conn.execute(
+                    done = conn.execute(
                         "UPDATE attachment_content SET llm_status = 'pending', llm_error = NULL"
-                        " WHERE id = ?",
+                        f" WHERE id = ? AND {NOT_VISION}",
                         (ac_id,),
-                    )
+                    ).rowcount
                     conn.commit()
-                    touched.append((ac_id, att_id))
+                    if done:
+                        touched.append((ac_id, att_id))
                 continue
             path = None
             if file_path and not file_path.startswith("text:"):
@@ -180,9 +219,29 @@ def reextract(
                 str(path), mime or "", zip_seconds=math.inf, ocr_seconds=math.inf
             )
             # A re-read with no text, or with less than was stored (a reader that suddenly reads
-            # less), replaces nothing and does not mark the row read.
+            # less), replaces no text and does not mark a row with text read.
             if not result["text"]:
-                stats["kept"] += 1
+                if has_text or result["status"] not in ("skipped", "encrypted"):
+                    stats["kept"] += 1
+                    continue
+                # No text before and none now: the row takes the re-read's verdict, encrypted or
+                # a skip with its reason, so an old label ("failed: BadZipFile") does not stand.
+                verdict = (result["status"], result["method"], result["error"])
+                before = conn.execute(
+                    "SELECT extraction_status, extraction_method, extraction_error"
+                    " FROM attachment_content WHERE id = ?",
+                    (ac_id,),
+                ).fetchone()
+                done = conn.execute(
+                    "UPDATE attachment_content SET extraction_status = ?, extraction_method = ?,"
+                    f" extraction_error = ?, extracted_at = ? WHERE id = ? AND {NOT_VISION}",
+                    (*verdict, now, ac_id),
+                ).rowcount
+                conn.commit()
+                if not done:
+                    stats["kept"] += 1
+                else:
+                    stats["unchanged" if tuple(before) == verdict else "relabelled"] += 1
                 continue
             text = redact_secrets(result["text"])
             stored, stored_method = conn.execute(
@@ -202,18 +261,18 @@ def reextract(
                 # Read again and found the same: only when, and by what, is new.
                 conn.execute(
                     "UPDATE attachment_content SET extraction_method = ?, extraction_status = ?,"
-                    " extraction_error = ?, extracted_at = ? WHERE id = ?",
+                    f" extraction_error = ?, extracted_at = ? WHERE id = ? AND {NOT_VISION}",
                     (result["method"], result["status"], result["error"], now, ac_id),
                 )
                 conn.commit()
                 stats["unchanged" if text == stored else "ocr_close"] += 1
                 continue
-            conn.execute(
-                """UPDATE attachment_content
+            done = conn.execute(
+                f"""UPDATE attachment_content
                    SET extracted_text = ?, extraction_method = ?, extraction_status = ?,
                        extraction_error = ?, extracted_at = ?, llm_status = 'pending',
                        llm_error = NULL
-                   WHERE id = ?""",
+                   WHERE id = ? AND {NOT_VISION}""",
                 (
                     text,
                     result["method"],
@@ -222,10 +281,13 @@ def reextract(
                     now,
                     ac_id,
                 ),
-            )
+            ).rowcount
             # Per row: the next re-read can take minutes, and an open write transaction
             # meanwhile blocks every other writer.
             conn.commit()
+            if not done:  # it became a 'vision' row while the file was read
+                stats["kept"] += 1
+                continue
             touched.append((ac_id, att_id))
         conn.commit()
     finally:

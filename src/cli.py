@@ -901,6 +901,32 @@ def cmd_process_sharepoint(args):
         print("SharePoint backlog: " + ", ".join(f"{k} {v:,}" for k, v in backlog.items()))
         return 0
 
+    # What the old scanner and the old page fetch left in sharepoint_links: queued for the
+    # retry pass, not fetched, so no tenant is needed (src/export/sharepoint_repair.py).
+    if getattr(args, "repair_links", False):
+        from src.export.sharepoint_repair import reread_pages, rescan_links
+
+        conn = get_connection(db_path)
+        run_migrations(conn)
+        try:
+            links = rescan_links(conn, apply=not args.dry_run)
+            pages = reread_pages(conn, apply=not args.dry_run)
+        finally:
+            conn.close()
+        print(
+            f"Mangled links: {links['emails']:,} email(s) read again, {links['dropped']:,}"
+            f" dropped, {links['added']:,} recorded for the retry pass"
+        )
+        print(
+            f"Unread pages: {pages['links']:,} link(s) to {pages['pages']:,} page(s) offered again"
+        )
+        print(
+            "DRY RUN: nothing changed"
+            if args.dry_run
+            else "Run 'brain process-sharepoint' to read them now, or leave them to the nightly pass"
+        )
+        return 0
+
     # Fetching is gated on our own tenant (fetch_sharepoint_link), so with the
     # placeholder host every real link would be refused and parked as the
     # permanent 'unsupported-host'. That happened on the producer, where the
@@ -1220,6 +1246,45 @@ def cmd_process_sharepoint(args):
         # The warning alone left the nightly stage green while new links piled
         # up unfetched. run_stage in sb-attachment-pass.sh judges the exit code.
         return EXIT_REAUTH
+    return 0
+
+
+def cmd_sharepoint_refused(args):
+    """The documents our tenant refuses and the ones on tenants we hold no login for. Read only.
+
+    One entry per document, however many emails link it, with those emails: what to name when
+    asking the owner for access.
+    """
+    from urllib.parse import unquote
+
+    from src.export.sharepoint_repair import refused_links
+    from src.store.schema import get_connection
+
+    conn = get_connection(str(args.db))
+    try:
+        sections = [
+            (
+                "Refused by our own tenant (http-error, mostly access denied): ask the owner",
+                refused_links(conn, "http-error"),
+            ),
+            (
+                "On another tenant (unsupported-host): this login cannot fetch them",
+                refused_links(conn, "unsupported-host"),
+            ),
+        ]
+    finally:
+        conn.close()
+    for title, docs in sections:
+        links = sum(d["links"] for d in docs)
+        print(f"{title}: {len(docs)} document(s), {links} link(s)")
+        for d in docs:
+            print(
+                f"  {unquote(d['url'])}\n"
+                f"    {d['links']} link(s), {d['attempts']} attempt(s), last {d['last_attempt'][:10]}"
+            )
+            for e in d["emails"]:
+                print(f"    {(e['date'] or '?')[:10]}  {e['sender'] or '?'}  {e['subject'] or ''}")
+        print()
     return 0
 
 
@@ -3138,6 +3203,7 @@ READ_ONLY_COMMANDS = frozenset(
         "prune-staged",
         # Its writes (--refetch, --record-aliases) refuse on a replica themselves.
         "mail-reconcile",
+        "sharepoint-refused",
     }
 )
 
@@ -3448,7 +3514,19 @@ def main():
         help="Read again, once per target, the links recorded ok with no text stored, then "
         "exit; resumable, bounded by --deadline-s and --max-fetches",
     )
+    parser_process_sp.add_argument(
+        "--repair-links",
+        action="store_true",
+        help="Drop the links an email no longer yields and record what it does, offer again "
+        "the pages recorded ok without their text, then exit; fetches nothing (--dry-run counts)",
+    )
     parser_process_sp.set_defaults(func=cmd_process_sharepoint)
+
+    parser_sp_refused = subparsers.add_parser(
+        "sharepoint-refused",
+        help="List the documents our SharePoint tenant refuses, with the emails linking them",
+    )
+    parser_sp_refused.set_defaults(func=cmd_sharepoint_refused)
 
     # split-html command
     parser_split_html = subparsers.add_parser(

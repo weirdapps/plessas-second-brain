@@ -149,6 +149,53 @@ def test_a_giant_screenshot_reaches_the_memory_gate_under_the_default_process_gu
     assert Image.MAX_IMAGE_PIXELS == PILLOW_DEFAULT_LIMIT
 
 
+def test_two_oversized_images_never_decode_at_once(tmp_path, monkeypatch):
+    """The memory gate reads the memory free BEFORE Pillow allocates.
+
+    Two workers checking at once would each see room for one image and decode two:
+    two 342 M px screenshots are ~5.6 GB on a 7 GB host. The hourly sync's Step 8
+    and `transcribe-images` both run more than one worker.
+    """
+    import threading
+    import time
+
+    import src.extract.image_vision as image_vision
+
+    tall = []
+    for name in ("a.png", "b.png"):
+        p = tmp_path / name
+        Image.new("L", (10, VISION_IMAGE_MAX_DIMENSION + 100), 200).save(p)
+        tall.append(p)
+    events, first_checking, release = [], threading.Event(), threading.Event()
+
+    def gate(pixels):
+        events.append("check")
+        if len(events) == 1:
+            first_checking.set()
+            release.wait(5)
+        return True
+
+    monkeypatch.setattr(image_vision, "_decode_fits_in_memory", gate)
+
+    def first():
+        _encode_image_for_vision(tall[0])
+        events.append("first decoded")
+
+    def second():
+        first_checking.wait(5)
+        _encode_image_for_vision(tall[1])
+
+    threads = [threading.Thread(target=first), threading.Thread(target=second)]
+    for t in threads:
+        t.start()
+    time.sleep(0.05)  # the second would have checked by now if nothing held it out
+    release.set()
+    for t in threads:
+        t.join(5)
+
+    assert events == ["check", "first decoded", "check"]
+
+
 # Reading the answer out of the response. `resp.content[0].text` held only while
 # the first block was the answer; with extended thinking the model emits a
 # ThinkingBlock first, so every single call died on

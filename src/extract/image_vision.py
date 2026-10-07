@@ -6,6 +6,7 @@ import base64
 import io
 import logging
 import sqlite3
+import threading
 from pathlib import Path
 
 from PIL import Image
@@ -55,6 +56,13 @@ VISION_DECODE_BYTES_PER_PIXEL = 8.1
 # Gating on memory free at decode time keeps one ceiling for both — the same
 # screenshot is deferred under load and described when the box is quiet.
 VISION_DECODE_MEMORY_RESERVE = 1_500_000_000
+
+# One full-raster decode at a time in a process. The gate reads the memory free
+# before Pillow allocates, so two workers checking at once would each see room for
+# one image and decode two: two 342 M px screenshots are ~5.6 GB on the 7 GB host.
+# The hourly sync's Step 8 runs four workers, and transcription decodes the same
+# images again. An image sent as it is never takes the lock.
+_DECODE_LOCK = threading.Lock()
 
 
 class VisionDecodeTooLarge(Exception):
@@ -170,37 +178,40 @@ def _encode_image_for_vision(img_path: Path) -> tuple[str, str]:
     if media_type and not oversized_px and len(b64) <= VISION_IMAGE_MAX_B64:
         return b64, media_type
 
-    # Everything below decodes the full raster. Check the cost BEFORE Pillow
-    # allocates: probing size does not decode, so this is the last safe point.
-    if not _decode_fits_in_memory(width * height):
-        raise VisionDecodeTooLarge(
-            f"{img_path.name} is {width}x{height} (~"
-            f"{width * height * VISION_DECODE_BYTES_PER_PIXEL / 1e9:.1f} GB to decode); "
-            "deferring until the host has room"
-        )
+    # Everything below decodes the full raster, one image at a time (_DECODE_LOCK).
+    # Check the cost BEFORE Pillow allocates: probing size does not decode, so
+    # this is the last safe point.
+    with _DECODE_LOCK:
+        if not _decode_fits_in_memory(width * height):
+            raise VisionDecodeTooLarge(
+                f"{img_path.name} is {width}x{height} (~"
+                f"{width * height * VISION_DECODE_BYTES_PER_PIXEL / 1e9:.1f} GB to decode); "
+                "deferring until the host has room"
+            )
 
-    # Admitted at the open, where Pillow checks the size; the decode below runs
-    # outside the scope, so the process-wide guard is back before it starts. A JPEG
-    # still decodes at a fraction of its size: thumbnail() drafts it first.
-    with admit_large_images():
-        im: Image.Image = Image.open(io.BytesIO(raw))
-    if im.mode not in ("RGB", "L"):
-        im = im.convert("RGB")
+        # Admitted at the open, where Pillow checks the size; the decode below runs
+        # outside the scope, so the process-wide guard is back before it starts. A
+        # JPEG still decodes at a fraction of its size: thumbnail() drafts it first.
+        with admit_large_images():
+            im: Image.Image = Image.open(io.BytesIO(raw))
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
 
-    # thumbnail() preserves aspect ratio and is a no-op when already within
-    # bounds. A squashed report is an unreadable report, and the description is
-    # the entire product here.
-    if oversized_px:
-        im.thumbnail((VISION_IMAGE_MAX_DIMENSION, VISION_IMAGE_MAX_DIMENSION))
+        # thumbnail() preserves aspect ratio and is a no-op when already within
+        # bounds. A squashed report is an unreadable report, and the description
+        # is the entire product here.
+        if oversized_px:
+            im.thumbnail((VISION_IMAGE_MAX_DIMENSION, VISION_IMAGE_MAX_DIMENSION))
 
-    for _ in range(12):
-        buf = io.BytesIO()
-        im.save(buf, format="JPEG", quality=85, optimize=True)
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        if len(b64) <= VISION_IMAGE_MAX_B64:
-            break
-        w, h = im.size
-        im = im.resize((max(1, int(w * 0.75)), max(1, int(h * 0.75))))
+        for _ in range(12):
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=85, optimize=True)
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            if len(b64) <= VISION_IMAGE_MAX_B64:
+                break
+            w, h = im.size
+            im = im.resize((max(1, int(w * 0.75)), max(1, int(h * 0.75))))
+        del im
 
     logger.info(
         "Downscaled oversized image %s (raw %d B -> base64 %d B) for vision",

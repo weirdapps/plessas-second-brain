@@ -493,6 +493,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_calendar_extraction_hash(conn)
     if current < 30:
         migrate_add_email_aliases(conn)
+    if current < 31:
+        migrate_add_image_transcription(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -635,6 +637,34 @@ def migrate_add_file_hashes(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE inline_images ADD COLUMN vision_attempts INTEGER NOT NULL DEFAULT 0"
         )
+    conn.commit()
+
+
+def migrate_add_image_transcription(conn: sqlite3.Connection) -> None:
+    """v31: the text a content image shows, transcribed beside its one-line description.
+
+    The description lost the figures, labels and table cells of a chart or a screenshot.
+    vision_transcription holds them ('' when the image shows no text) and transcribed_at says
+    when. transcription_attempts counts failed calls, so an image the model keeps failing on is
+    given up after VISION_ATTEMPTS_LIMIT instead of being sent every night
+    (src/extract/image_pipeline.py run_transcription).
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(inline_images)")}
+    if not cols:
+        return
+    for name, decl in (
+        ("vision_transcription", "TEXT"),
+        ("transcribed_at", "TIMESTAMP"),
+        ("transcription_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if name in cols:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE inline_images ADD COLUMN {name} {decl}")
+        except sqlite3.OperationalError as e:
+            # Another process added it between the check and the ALTER (see v21).
+            if "duplicate column name" not in str(e):
+                raise
     conn.commit()
 
 

@@ -94,8 +94,17 @@ def ingest_page(
 
     The text is the identity, as for a session note: the same page linked from many emails is
     one document, and a page edited since is a new one. The key is the page's lower-cased path.
+
+    A page whose body holds no text is stored by its title. Intranet news pages are often a
+    title banner over a picture (15 of them on 2026-09-30), and making no document for them
+    left their links recorded 'ok' with nothing held. The method says the text is the title.
+    Only a page with neither comes back None.
     """
     text = html_to_text(page.html or "").strip()
+    method = "sharepoint-page"
+    if not text:
+        text = (page.title or "").strip()
+        method = "sharepoint-page-title"
     if not text:
         return None
     path = page.path or unquote(urlparse(page.url).path)
@@ -108,7 +117,7 @@ def ingest_page(
         mime_type="text/html",
         text=text,
         sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
-        method="sharepoint-page",
+        method=method,
         status="skipped" if _apply_noise_filter(text) else "extracted",
         error=None,
         subject=f"[SharePoint page] {page.title or _label(page.url, name)}",
@@ -134,12 +143,17 @@ def fetch_and_ingest(
         page = sharepoint_fetcher.fetch_sharepoint_page(url)
         date = _email_date(conn, message_id)
         document = ingest_page(conn, page, date) if page.status == "ok" else None
+        status, error = page.status, page.error_message
+        if status == "ok" and document is None:
+            # Read, but nothing to store: recorded 'ok' this would settle the link with no
+            # document and never offer it again.
+            status, error = "no-text", "the page came back with neither text nor a title"
         result = SharepointFetchResult(
             url=url,
-            status=page.status,
+            status=status,
             http_status=page.http_status,
             file_name=page.title or None,
-            error_message=page.error_message,
+            error_message=error,
         )
         return result, document
     with tempfile.TemporaryDirectory(prefix="sb-sharepoint-") as tmp:

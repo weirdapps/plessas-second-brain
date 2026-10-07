@@ -1680,6 +1680,7 @@ def cmd_sync(args):
         engine=engine,
         workers=args.workers or 1,
         deadline_s=_extract_deadline_s(),
+        db_path=db_path,
     )
     # A stop signal ends extraction at a checkpoint. The steps after it used to
     # carry on regardless, until systemd's SIGKILL 90 s later; now they do not

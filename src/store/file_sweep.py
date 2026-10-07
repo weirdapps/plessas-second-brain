@@ -9,7 +9,8 @@ Only a file whose content is HELD goes. A row that failed, was skipped (nothing 
 an unsupported type, an image with too little text) or holds an encrypted original records an
 outcome, not the content: the file is the only copy of what the database lacks, and a password,
 granted rights or a better reader may still open it. Neither goes a picture the vision pass
-described in place of text.
+described in place of text. And an image the transcription pass still owes (described, not
+yet transcribed) keeps its file, because run_transcription reads it.
 
 A Phase 1 row is not always proof the bytes were read. Phase 1 opens the row's recorded
 absolute path, while this module finds files by directory and name, so a row recorded on
@@ -113,6 +114,30 @@ IMAGE_SUFFIXES = frozenset(
 )
 
 
+# An attachment_content row (alias ac) that an image's vision text may fill: it holds no text
+# read from the file (OCR found too little, or failed), or it is vision's own. A row with text
+# from the file is never overwritten, and none is inserted: Phase 1 stays the first writer, so
+# an image Phase 1 has not reached yet is filled once it has.
+VISION_FILLABLE_SQL = (
+    "(COALESCE(trim(ac.extracted_text, char(32, 9, 10, 11, 12, 13)), '') = ''"
+    " OR ac.extraction_method = 'vision')"
+)
+
+# A content image (alias ii) that still owes its transcription: described, not transcribed,
+# under VISION_ATTEMPTS_LIMIT failed attempts, and with an attachment row its text may fill
+# (an image whose rows all hold OCR text is searchable by it already). run_transcription takes
+# these (src/extract/image_pipeline.py), and it reads the file, so the sweep keeps the file of
+# such an image. The hourly sweep runs long before the nightly transcription does.
+TRANSCRIPTION_OWED_SQL = (
+    "(ii.classification = 'content' AND ii.vision_description IS NOT NULL"
+    " AND ii.transcribed_at IS NULL"
+    f" AND ii.transcription_attempts < {VISION_ATTEMPTS_LIMIT}"
+    " AND EXISTS (SELECT 1 FROM attachments ta"
+    " JOIN attachment_content ac ON ac.attachment_id = ta.id"
+    f" WHERE ta.sha256 = ii.sha256 AND {VISION_FILLABLE_SQL}))"
+)
+
+
 @dataclass(frozen=True)
 class SweepPolicy:
     """What the sweep may do. The default deletes nothing."""
@@ -205,6 +230,11 @@ def registered_sql(conn: sqlite3.Connection) -> str:
         "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?", (SWEEP_INDEX,)
     ).fetchone()
     hint = f" INDEXED BY {SWEEP_INDEX}" if has_index else ""
+    # A store from before schema v31 has no transcription columns, and owes none.
+    image_columns = {r[1] for r in conn.execute("PRAGMA table_info(inline_images)")}
+    owes_transcription = "0"
+    if {"transcribed_at", "transcription_attempts"} <= image_columns:
+        owes_transcription = f"COALESCE(ii.sha256 IS NOT NULL AND {TRANSCRIPTION_OWED_SQL}, 0)"
     return f"""
         SELECT a.id, a.file_path, a.mime_type, a.filename,
                ac.id IS NOT NULL,
@@ -213,7 +243,8 @@ def registered_sql(conn: sqlite3.Connection) -> str:
                ii.sha256 IS NOT NULL,
                ii.vision_description IS NOT NULL,
                COALESCE(ii.classification IN ('signature', 'noise'), 0),
-               COALESCE(ii.vision_attempts, 0)
+               COALESCE(ii.vision_attempts, 0),
+               {owes_transcription}
         FROM attachments a
         LEFT JOIN attachment_content ac{hint} ON ac.attachment_id = a.id
         LEFT JOIN inline_images ii ON ii.sha256 = a.sha256
@@ -232,15 +263,16 @@ def _registered(conn: sqlite3.Connection) -> dict[tuple[str, str], tuple[tuple[i
     known: dict[tuple[str, str], tuple[tuple[int, ...], str]] = {}
     for row in rows:
         att_id, file_path, mime, filename, stored, unread, held = row[:7]
-        seen, described, by_design, tries = row[7:]
+        seen, described, by_design, tries, owes_transcription = row[7:]
         if not stored:
             state = PENDING_TEXT
         elif unread:
             state = UNREAD
         elif not held:
             state = NOT_HELD
-        elif _is_image(mime, filename or file_path) and not (
-            seen and (described or by_design or tries >= VISION_ATTEMPTS_LIMIT)
+        elif _is_image(mime, filename or file_path) and (
+            owes_transcription
+            or not (seen and (described or by_design or tries >= VISION_ATTEMPTS_LIMIT))
         ):
             state = PENDING_IMAGE
         else:

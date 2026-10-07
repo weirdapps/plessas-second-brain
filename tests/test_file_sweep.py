@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from src.store.file_sweep import (
+    VISION_ATTEMPTS_LIMIT,
     SweepPolicy,
     classify_files,
     load_policy,
@@ -128,13 +129,6 @@ def test_keeps_an_image_the_vision_pass_has_not_seen(db, tmp_path):
     f, _ = _att(db, tmp_path, "AAMk-1", "i.png", b"img", mime="image/png")
     sweep_files(db, tmp_path, APPLY)
     assert f.exists()
-
-
-def test_deletes_an_image_once_described(db, tmp_path):
-    f, _ = _att(db, tmp_path, "AAMk-1", "i.png", b"img", mime="image/png")
-    _image(db, b"img", described=True)
-    sweep_files(db, tmp_path, APPLY)
-    assert not f.exists()
 
 
 @pytest.mark.parametrize("classification", ["signature", "noise"])
@@ -603,12 +597,70 @@ def test_keeps_an_image_held_only_as_its_description(db, tmp_path):
 
 
 def test_deletes_an_image_whose_text_is_held_once_vision_is_done(db, tmp_path):
+    """OCR text makes the image searchable, so it owes no transcription either."""
     f, att = _att(db, tmp_path, "AAMk-1", "scan.png", b"img", mime="image/png")
     db.execute(
-        "UPDATE attachment_content SET extraction_method = 'ocr' WHERE attachment_id = ?", (att,)
+        "UPDATE attachment_content SET extraction_method = 'ocr', extracted_text = ?"
+        " WHERE attachment_id = ?",
+        ("Quarterly revenue by region, Q3", att),
     )
     db.commit()
     _image(db, b"img", described=True)
+
+    sweep_files(db, tmp_path, APPLY)
+
+    assert not f.exists()
+
+
+def _transcription(db, body: bytes, *, done: bool = False, attempts: int = 0) -> None:
+    db.execute(
+        "UPDATE inline_images SET transcribed_at = ?, transcription_attempts = ? WHERE sha256 = ?",
+        ("2026-10-01" if done else None, attempts, hashlib.sha256(body).hexdigest()),
+    )
+    db.commit()
+
+
+def test_keeps_a_described_image_that_still_owes_its_transcription(db, tmp_path):
+    """run_transcription reads the file, and the description lost the chart's figures and labels.
+
+    The hourly sweep runs before the nightly transcription, so without this it deleted every
+    described image, with a row that holds no text, before its text could be read.
+    """
+    f, _ = _att(db, tmp_path, "AAMk-1", "chart.png", b"img", mime="image/png")
+    _image(db, b"img", described=True)
+
+    stats = sweep_files(db, tmp_path, APPLY)
+
+    assert f.exists()
+    assert stats["pending-image"] == 1 and stats["deleted"] == 0
+
+
+def test_deletes_an_image_once_it_is_transcribed(db, tmp_path):
+    f, _ = _att(db, tmp_path, "AAMk-1", "chart.png", b"img", mime="image/png")
+    _image(db, b"img", described=True)
+    _transcription(db, b"img", done=True)
+
+    sweep_files(db, tmp_path, APPLY)
+
+    assert not f.exists()
+
+
+def test_deletes_an_image_whose_transcription_was_given_up(db, tmp_path):
+    f, _ = _att(db, tmp_path, "AAMk-1", "chart.png", b"img", mime="image/png")
+    _image(db, b"img", described=True)
+    _transcription(db, b"img", attempts=VISION_ATTEMPTS_LIMIT)
+
+    sweep_files(db, tmp_path, APPLY)
+
+    assert not f.exists()
+
+
+def test_a_store_without_the_transcription_columns_still_sweeps(db, tmp_path):
+    f, _ = _att(db, tmp_path, "AAMk-1", "chart.png", b"img", mime="image/png")
+    _image(db, b"img", described=True)
+    db.execute("ALTER TABLE inline_images DROP COLUMN transcribed_at")
+    db.execute("ALTER TABLE inline_images DROP COLUMN transcription_attempts")
+    db.commit()
 
     sweep_files(db, tmp_path, APPLY)
 

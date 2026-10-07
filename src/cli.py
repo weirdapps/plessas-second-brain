@@ -432,6 +432,123 @@ def cmd_hash_attachments(args):
     return 0
 
 
+def cmd_mail_reconcile(args):
+    """List the Outlook messages the store lacks; on the producer, stage them again.
+
+    The report only reads the store, so it runs on a replica. --record-aliases and
+    --refetch write, and are the producer's (src/export/mail_reconcile.py). Exit
+    codes follow the M365 convention: 4 re-authenticate, 5 outlook-cli misbehaved.
+    """
+    import subprocess
+    from datetime import UTC
+
+    from src import config
+    from src.export import mail_reconcile as mr
+    from src.export.outlook_cli import OutlookCliAuthRequired, OutlookCliError
+    from src.export.state import write_json_atomic
+
+    if (args.refetch or args.record_aliases) and config.is_replica():
+        print(config.replica_refusal("mail-reconcile --refetch/--record-aliases"), file=sys.stderr)
+        return 2
+    if not Path(args.db).exists():
+        print(f"Error: database not found: {args.db}", file=sys.stderr)
+        return 1
+    since = mr.parse_when(args.since)
+    until = mr.parse_when(args.until) if args.until else datetime.now(UTC)
+    if since is None or until is None:
+        print("Error: --since and --until take ISO dates, e.g. 2025-03-16", file=sys.stderr)
+        return 1
+    folders = [name.strip() for name in args.folders.split(",") if name.strip()]
+    try:
+        report = mr.reconcile(args.db, folders, since, until, DATA_ROOT / "staging")
+        _print_reconcile(report)
+        if args.json:
+            write_json_atomic(Path(args.json), report.as_json())
+            print(f"Report written to {args.json}")
+        if args.record_aliases:
+            from src.store.schema import get_connection as get_conn
+
+            conn = get_conn(str(args.db))
+            try:
+                added = mr.record_aliases(conn, report.copies)
+            finally:
+                conn.close()
+            print(f"Aliases: {added:,} new of {len(report.copies):,} copies found by Message-ID")
+        if args.refetch:
+            stats = mr.refetch(report.missing, concurrency=args.concurrency, limit=args.limit)
+            print(
+                f"Refetch: staged {stats['staged']:,} of {stats['requested']:,} for the next sync,"
+                f" {len(stats['failed']):,} failed, attachments for {stats['attachments']:,}"
+            )
+            for message_id in stats["failed"][:20]:
+                print(f"  failed: {message_id}")
+    except OutlookCliAuthRequired as e:
+        print(f"outlook-cli needs re-authentication: {e.stderr}", file=sys.stderr)
+        return 4
+    except (OutlookCliError, subprocess.TimeoutExpired, mr.TruncatedListing) as e:
+        print(f"outlook-cli failed: {e}", file=sys.stderr)
+        return 5
+    return 0
+
+
+def cmd_retry_stubs(args):
+    """Extract again the emails loaded as stubs, and replace each stub in place.
+
+    See src/extract/stub_retry.py. Exits 1 when an email failed again, 75 when
+    quota or an expired credential ended the run.
+    """
+    from src.extract.stub_retry import retry_stubs, select_stubs
+    from src.store.schema import get_connection as get_conn
+
+    conn = get_conn(str(args.db))
+    try:
+        if args.dry_run:
+            stubs = select_stubs(conn, args.since, args.limit)
+            print(f"{len(stubs):,} stub(s) would be extracted again")
+            for email_id, message_id in stubs[:20]:
+                print(f"  email {email_id}: {message_id}")
+            return 0
+        stats = retry_stubs(
+            conn, DATA_ROOT / "extracted", args.engine or EXTRACT_ENGINE, args.since, args.limit
+        )
+    finally:
+        conn.close()
+    print(
+        f"{stats['stubs']:,} stub(s): {stats['replaced']:,} extracted and replaced,"
+        f" {stats['failed']:,} failed"
+        + (" (stopped: quota or credentials)" if stats["stopped"] else "")
+    )
+    if stats["stopped"]:
+        return 75
+    return 1 if stats["failed"] else 0
+
+
+def _print_reconcile(report) -> None:
+    from collections import Counter
+
+    cutoff = report.cutoff.isoformat() if report.cutoff else "none"
+    print(
+        f"Outlook against the store, {report.since:%Y-%m-%d %H:%M} to {report.until:%Y-%m-%d %H:%M}"
+        f" UTC (the store's newest mail: {cutoff})"
+    )
+    kinds = ("listed", "by_id", "by_rfc822_id", "by_subject_time", "staged", "newer", "missing")
+    print("  " + f"{'folder':<12}" + "".join(f"{k:>16}" for k in kinds))
+    for folder, counts in report.counts.items():
+        print("  " + f"{folder:<12}" + "".join(f"{counts.get(k, 0):>16,}" for k in kinds))
+    months = Counter(str(m.get("ReceivedDateTime") or "")[:7] for m in report.missing)
+    print(
+        f"Missing: {len(report.missing):,}"
+        + (f" by month {dict(sorted(months.items()))}" if months else "")
+    )
+    for m in report.missing[:20]:
+        print(
+            f"  {str(m.get('ReceivedDateTime') or '')[:16]}  {m['folder']:<10}"
+            f" {str(m.get('Subject') or '')[:70]}"
+        )
+    if len(report.missing) > 20:
+        print(f"  ... and {len(report.missing) - 20:,} more (--json writes them all)")
+
+
 def cmd_ingest_session_notes(args):
     """Store what Claude sessions wrote to notes (src/export/session_notes.py)."""
     from src.export.session_notes import ingest_session_notes, transcripts_to_scan
@@ -1680,6 +1797,7 @@ def cmd_sync(args):
         engine=engine,
         workers=args.workers or 1,
         deadline_s=_extract_deadline_s(),
+        db_path=db_path,
     )
     # A stop signal ends extraction at a checkpoint. The steps after it used to
     # carry on regardless, until systemd's SIGKILL 90 s later; now they do not
@@ -2957,6 +3075,8 @@ READ_ONLY_COMMANDS = frozenset(
         "teams-chat",
         "teams-stats",
         "prune-staged",
+        # Its writes (--refetch, --record-aliases) refuse on a replica themselves.
+        "mail-reconcile",
     }
 )
 
@@ -3063,6 +3183,46 @@ def main():
         "--limit", type=int, default=0, help="Max rows to hash (0 = no limit)"
     )
     parser_hash_att.set_defaults(func=cmd_hash_attachments)
+
+    parser_reconcile = subparsers.add_parser(
+        "mail-reconcile",
+        help="List Outlook messages the store lacks; --refetch stages them (producer only)",
+    )
+    parser_reconcile.add_argument(
+        "--since", required=True, help="ISO date: mail received from then on, e.g. 2025-03-16"
+    )
+    parser_reconcile.add_argument(
+        "--until", default=None, help="ISO date, exclusive (default: now)"
+    )
+    parser_reconcile.add_argument(
+        "--folders", default="Archive,Sent Items,Inbox", help="Comma-separated Outlook folders"
+    )
+    parser_reconcile.add_argument("--json", default=None, help="Write the report here")
+    parser_reconcile.add_argument(
+        "--refetch", action="store_true", help="Stage the missing messages for the next sync"
+    )
+    parser_reconcile.add_argument(
+        "--record-aliases",
+        action="store_true",
+        help="Note the Graph id of each copy found by its Message-ID under another id",
+    )
+    parser_reconcile.add_argument(
+        "--limit", type=int, default=0, help="--refetch at most this many (0 = all)"
+    )
+    parser_reconcile.add_argument(
+        "--concurrency", type=int, default=2, help="get-mail calls at once (at most 2)"
+    )
+    parser_reconcile.set_defaults(func=cmd_mail_reconcile)
+
+    parser_stubs = subparsers.add_parser(
+        "retry-stubs",
+        help="Extract again the emails loaded without an extraction, replacing each stub",
+    )
+    parser_stubs.add_argument("--since", default=None, help="Only mail received from this date")
+    parser_stubs.add_argument("--limit", type=int, default=0, help="At most this many (0 = all)")
+    parser_stubs.add_argument("--engine", default=None, help="claude or gemini (default: config)")
+    parser_stubs.add_argument("--dry-run", action="store_true", help="List them; ask nothing")
+    parser_stubs.set_defaults(func=cmd_retry_stubs)
 
     parser_sweep = subparsers.add_parser(
         "sweep-files",

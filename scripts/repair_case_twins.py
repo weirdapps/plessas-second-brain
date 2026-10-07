@@ -54,7 +54,7 @@ from src.export.state import write_json_atomic  # noqa: E402
 from src.extract.extraction_files import extraction_path  # noqa: E402
 from src.redact import redact_payload  # noqa: E402
 from src.store.embeddings import remove_vectors  # noqa: E402
-from src.store.loader import replace_extraction  # noqa: E402
+from src.store.loader import replace_extraction, stored_email  # noqa: E402
 from src.store.schema import get_connection  # noqa: E402
 
 EXTRACTED = DATA_ROOT / "extracted"
@@ -172,42 +172,6 @@ def _header_named(extraction: dict) -> set[str]:
             if (role.get("role") if isinstance(role, dict) else role) in HEADER_ROLES:
                 names.add(str(name).lower())
     return names
-
-
-def stored_email(conn, email_id: int, leave_out: set[str] | frozenset[str] = frozenset()) -> dict:
-    """The email as the loader was given it, rebuilt from the store: what the
-    extraction prompt reads, and the header people replace_extraction names from.
-
-    A header person always has an address, so one without is the model's. `leave_out`
-    drops the names a twin's extraction called recipients, which have rows on this
-    email as well: the model must not be told they received it.
-    """
-    row = conn.execute(
-        "SELECT message_id, subject, date_received, sender_name, sender_address, content,"
-        " mailbox_name FROM emails WHERE id = ?",
-        (email_id,),
-    ).fetchone()
-    people = [
-        (role, name, address)
-        for role, name, address in conn.execute(
-            "SELECT ep.role_in_email, p.name, p.email FROM email_people ep"
-            " JOIN people p ON p.id = ep.person_id"
-            " WHERE ep.email_id = ? AND ep.role_in_email IN ('recipient', 'cc')"
-            " AND COALESCE(p.email, '') != '' ORDER BY ep.rowid",
-            (email_id,),
-        )
-        if (name or "").lower() not in leave_out
-    ]
-    return {
-        "message_id": row[0],
-        "subject": row[1],
-        "date_received": row[2],
-        "sender": {"name": row[3] or "", "address": row[4] or ""},
-        "content": row[5],
-        "mailbox_name": row[6],
-        "to_recipients": [{"name": n, "address": a} for r, n, a in people if r == "recipient"],
-        "cc_recipients": [{"name": n, "address": a} for r, n, a in people if r == "cc"],
-    }
 
 
 def _owed(conn) -> list[int]:

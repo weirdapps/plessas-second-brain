@@ -72,6 +72,7 @@ def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
 
     loaded_count = 0
     batch_count = 0
+    unextracted: list[dict] = []
 
     for message_id, metadata in staging_index.items():
         # By the exact id, never the lowercased one: two ids can differ in case
@@ -79,7 +80,8 @@ def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
         # (see src/extract/extraction_files.py).
         extraction = read_extraction(extracted_path, message_id)
         if extraction is None:
-            continue  # staged but not yet extracted
+            unextracted.append(metadata)  # staged but not yet extracted
+            continue
 
         # Load into database
         if load_single_email(conn, metadata, extraction):
@@ -90,6 +92,12 @@ def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
             if batch_count >= 100:
                 conn.commit()
                 batch_count = 0
+
+    # A copy of a stored email gets no extraction (src/extract/local.py skips it),
+    # so its move and its alias are noted from the staged batch alone. After the
+    # loads above, so a copy staged beside its original finds it stored.
+    for metadata in unextracted:
+        _note_stored(conn, metadata)
 
     # Final commit, whatever loaded: a stored email's move to another folder is
     # written too, and whatever transaction a write opened is closed.
@@ -208,6 +216,60 @@ def _moved(stored: str | None, staged: str | None) -> bool:
     return bool(staged) and staged != stored and (staged != "Inbox" or not stored)
 
 
+def record_alias(conn: sqlite3.Connection, alias: str, email_id: int) -> bool:
+    """Note that the stored email `email_id` also went by the Graph id `alias`;
+    whether it was new.
+
+    A move to another folder mints a new id, and the attachment registrar resolves
+    a directory named by it through this (src/export/outlook_attachments.py).
+    Written once: a pass over copies already noted waits for no writer.
+    """
+    known = conn.execute(
+        "SELECT 1 FROM email_aliases WHERE message_id = ?", (str(alias),)
+    ).fetchone()
+    if known:
+        return False
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO email_aliases (message_id, email_id, recorded_at)"
+        " VALUES (?, ?, datetime('now'))",
+        (str(alias), email_id),
+    )
+    return cur.rowcount > 0
+
+
+def _note_stored(conn: sqlite3.Connection, metadata: dict) -> bool:
+    """Whether the store holds this staged email already, noting what the copy says.
+
+    By its own message_id, or by its RFC822 Message-ID under another one: the same
+    message from another source (AppleScript vs outlook-cli), or a copy the Archive
+    export staged under the new id a move gave it, which is recorded as an alias.
+    A copy in another folder records the move (e.g. Inbox to Archive by
+    /triage-inbox), so the store does not go stale on the original folder.
+    """
+    message_id = metadata["message_id"]
+    internet_message_id = metadata.get("internet_message_id") or None
+    new_mailbox = metadata.get("mailbox_name") or metadata.get("mailbox")
+
+    row = conn.execute(
+        "SELECT id, mailbox_name FROM emails WHERE message_id = ?", (message_id,)
+    ).fetchone()
+    if row is None and internet_message_id:
+        row = conn.execute(
+            "SELECT id, mailbox_name FROM emails WHERE internet_message_id = ?",
+            (internet_message_id,),
+        ).fetchone()
+        if row is not None:
+            record_alias(conn, message_id, row[0])
+    if row is None:
+        return False
+    if _moved(row[1], new_mailbox):
+        conn.execute(
+            "UPDATE emails SET mailbox_name = ? WHERE id = ?",
+            (new_mailbox, row[0]),
+        )
+    return True
+
+
 def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict) -> bool:
     """Load a single email with its extraction into the database.
 
@@ -221,37 +283,10 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
     """
     message_id = metadata["message_id"]
     internet_message_id = metadata.get("internet_message_id") or None
-    new_mailbox = metadata.get("mailbox_name") or metadata.get("mailbox")
 
-    # Check if already exists by source-specific message_id.
-    # If found AND the folder changed (e.g. user moved Inbox→Archive via
-    # /triage-inbox), UPDATE the mailbox_name so the DB reflects the
-    # current location instead of going stale on the original folder.
-    cursor = conn.execute("SELECT id, mailbox_name FROM emails WHERE message_id = ?", (message_id,))
-    row = cursor.fetchone()
-    if row:
-        if _moved(row[1], new_mailbox):
-            conn.execute(
-                "UPDATE emails SET mailbox_name = ? WHERE id = ?",
-                (new_mailbox, row[0]),
-            )
-        return False  # Duplicate; mailbox reconciled if needed
-
-    # Cross-source dedup: same RFC822 Message-ID from a different source
-    # (AppleScript vs outlook-cli) means we already have this email.
-    if internet_message_id:
-        cursor = conn.execute(
-            "SELECT id, mailbox_name FROM emails WHERE internet_message_id = ?",
-            (internet_message_id,),
-        )
-        row = cursor.fetchone()
-        if row:
-            if _moved(row[1], new_mailbox):
-                conn.execute(
-                    "UPDATE emails SET mailbox_name = ? WHERE id = ?",
-                    (new_mailbox, row[0]),
-                )
-            return False  # Duplicate by RFC822 Message-ID; mailbox reconciled
+    # A duplicate: its move and alias are noted (see _note_stored).
+    if _note_stored(conn, metadata):
+        return False
 
     # Not stored: about to write, so the checks again under the write lock.
     if _take_the_write_lock(conn):
@@ -570,6 +605,44 @@ def replace_extraction(
         (email_id,),
     )
     _write_extraction(conn, email_id, metadata, right)
+
+
+def stored_email(
+    conn: sqlite3.Connection, email_id: int, leave_out: set[str] | frozenset[str] = frozenset()
+) -> dict:
+    """The email as the loader was given it, rebuilt from the store: what the
+    extraction prompt reads, and the header people replace_extraction names from.
+
+    A header person always has an address, so one without is the model's. `leave_out`
+    drops the names, lowercased, that must not be offered as recipients
+    (scripts/repair_case_twins.py passes those a twin's extraction called recipients).
+    """
+    row = conn.execute(
+        "SELECT message_id, subject, date_received, sender_name, sender_address, content,"
+        " mailbox_name FROM emails WHERE id = ?",
+        (email_id,),
+    ).fetchone()
+    people = [
+        (role, name, address)
+        for role, name, address in conn.execute(
+            "SELECT ep.role_in_email, p.name, p.email FROM email_people ep"
+            " JOIN people p ON p.id = ep.person_id"
+            " WHERE ep.email_id = ? AND ep.role_in_email IN ('recipient', 'cc')"
+            " AND COALESCE(p.email, '') != '' ORDER BY ep.rowid",
+            (email_id,),
+        )
+        if (name or "").lower() not in leave_out
+    ]
+    return {
+        "message_id": row[0],
+        "subject": row[1],
+        "date_received": row[2],
+        "sender": {"name": row[3] or "", "address": row[4] or ""},
+        "content": row[5],
+        "mailbox_name": row[6],
+        "to_recipients": [{"name": n, "address": a} for r, n, a in people if r == "recipient"],
+        "cc_recipients": [{"name": n, "address": a} for r, n, a in people if r == "cc"],
+    }
 
 
 def load_conversations(db_path: str) -> int:

@@ -389,6 +389,9 @@ python -m src.cli reextract --partial                  # read again in full what
 python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents
 python -m src.cli process-sharepoint --ingest-fetched  # store the files earlier SharePoint fetches left on disk
 python -m src.cli process-sharepoint --refetch-content --max-fetches 0 --deadline-s 1800  # read again the links recorded ok with no text
+python -m src.cli mail-reconcile --since 2025-03-16 --json gaps.json   # Outlook messages the store lacks; read-only, so it runs on a replica
+python -m src.cli mail-reconcile --since 2026-05-01 --refetch --record-aliases  # producer: stage them for the next sync, note the ids of Archive copies
+python -m src.cli retry-stubs [--dry-run]   # extract again the emails loaded without an extraction after failing three runs
 ```
 
 Full subcommand list: `python -m src.cli --help`.

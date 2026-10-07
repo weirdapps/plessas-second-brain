@@ -39,7 +39,7 @@ from src.config import ATTACHMENTS_DIR, DEFAULT_DB, is_replica, replica_refusal 
 from src.export.outlook_attachments import ORPHAN_GRACE_DAYS, is_abandoned_orphan  # noqa: E402
 from src.extract.attachment_pipeline import ingest_document  # noqa: E402
 from src.store.file_hashes import sha256_of_file  # noqa: E402
-from src.store.file_sweep import NOT_FULLY_READ_SQL, load_policy  # noqa: E402
+from src.store.file_sweep import FULLY_HELD_SQL, load_policy  # noqa: E402
 from src.store.schema import get_connection  # noqa: E402
 
 # outlook_attachments skips it on the way in and sharepoint_links tracks it with
@@ -69,14 +69,22 @@ def _registered_elsewhere(conn) -> dict[tuple[str, int], list[str]]:
 
 def _survey(
     db_path: str,
-) -> tuple[set[str], dict[tuple[str, int], list[str]], set[str], str | None, set[tuple[str, str]]]:
+) -> tuple[
+    set[str],
+    dict[tuple[str, int], list[str]],
+    set[str],
+    str | None,
+    set[tuple[str, str]],
+    dict[str, list[str]],
+]:
     """Read the table once: claimed directories, what is held where, stored hashes, newest mail,
-    and the (directory, filename) of every registered file.
+    the (directory, filename) of every registered file, and where the unheld ones lie.
 
-    A hash counts only when its row's content was read in full (src/store/file_sweep.py's
-    NOT_FULLY_READ_SQL): a row whose file vanished before Phase 1, that this host could not read,
-    or that a cap read in part proves nothing about the rest of the bytes, and the orphan may be
-    the last copy.
+    A hash counts as stored only when its row's content is held (src/store/file_sweep.py's
+    FULLY_HELD_SQL): a row whose file vanished before Phase 1, that this host could not read, that
+    a cap read in part, or that failed, was skipped or holds an encrypted original proves nothing
+    about the bytes, and the orphan may be the last copy. Such a row's registered file is a copy
+    only where it still lies on disk, so `twins` maps its hash to its recorded paths.
 
     Closes before anything writes. Adoption goes through `ingest_document`, which opens its
     own connection, and holding a second one across those writes is how six concurrent sb-*
@@ -97,29 +105,64 @@ def _survey(
             for (sha,) in conn.execute(
                 "SELECT a.sha256 FROM attachments a"
                 " JOIN attachment_content ac ON ac.attachment_id = a.id"
-                f" WHERE a.sha256 IS NOT NULL AND NOT COALESCE({NOT_FULLY_READ_SQL}, 0)"
+                f" WHERE a.sha256 IS NOT NULL AND COALESCE({FULLY_HELD_SQL}, 0)"
             )
         }
+        twins: dict[str, list[str]] = {}
+        for sha, fp in conn.execute(
+            "SELECT sha256, file_path FROM attachments"
+            " WHERE sha256 IS NOT NULL AND file_path IS NOT NULL"
+        ):
+            if sha not in hashes:
+                twins.setdefault(sha, []).append(fp)
         newest = conn.execute(
             "SELECT MAX(date_received) FROM emails"
             " WHERE mailbox_name IS NULL OR mailbox_name <> 'External'"
         ).fetchone()[0]
-        return referenced, _registered_elsewhere(conn), hashes, newest, registered
+        return referenced, _registered_elsewhere(conn), hashes, newest, registered, twins
     finally:
         conn.close()
 
 
+def _another_copy(path: str | None, f: Path) -> bool:
+    """Whether `path` is a file on disk other than `f` itself."""
+    if not path:
+        return False
+    other = Path(path)
+    try:
+        return other.is_file() and not os.path.samefile(other, f)
+    except OSError:
+        return False
+
+
+def _is_stored(f: Path, hashes: set[str], twins: dict[str, list[str]]) -> bool:
+    """Whether the store holds these bytes: their content, or a registered copy on disk.
+
+    A registered copy whose content is not held stays (the sweep keeps it), so the bytes are
+    safe in it; one that is gone leaves this file as the last copy.
+    """
+    if not hashes and not twins:
+        return False
+    sha = sha256_of_file(f)
+    return sha in hashes or any(_another_copy(p, f) for p in twins.get(sha, []))
+
+
 def _is_duplicate(
-    f: Path, size: int, known: dict[tuple[str, int], list[str]], hashes: set[str]
+    f: Path,
+    size: int,
+    known: dict[tuple[str, int], list[str]],
+    hashes: set[str],
+    twins: dict[str, list[str]],
 ) -> bool:
     """Whether these bytes are already stored.
 
-    First by the stored hash, which survives the sweep deleting the registered copy. Then,
-    for rows that have no hash yet, by the byte comparison this used to rely on alone: a
-    matching name and size is not enough (402 registered (filename, size) groups on the VPS
-    hold more than one distinct content), and a row whose copy has vanished proves nothing.
+    First by the stored hash, which survives the sweep deleting the registered copy, or by a
+    registered copy of an unheld row that is still on disk. Then, for rows that have no hash
+    yet, by the byte comparison this used to rely on alone: a matching name and size is not
+    enough (402 registered (filename, size) groups on the VPS hold more than one distinct
+    content), and a row whose copy has vanished proves nothing.
     """
-    if hashes and sha256_of_file(f) in hashes:
+    if _is_stored(f, hashes, twins):
         return True
     return any(
         Path(p).exists() and filecmp.cmp(f, p, shallow=False) for p in known.get((f.name, size), [])
@@ -130,6 +173,7 @@ def _reap_one_dir(
     msg_dir: Path,
     known: dict[tuple[str, int], list[str]],
     hashes: set[str],
+    twins: dict[str, list[str]],
     apply: bool,
     db_path: str,
     stats: dict,
@@ -140,7 +184,7 @@ def _reap_one_dir(
         if f.is_dir():
             continue
         size = f.stat().st_size
-        if _is_duplicate(f, size, known, hashes):
+        if _is_duplicate(f, size, known, hashes, twins):
             if adopt_only:
                 continue
             stats["deleted"] += 1
@@ -174,6 +218,14 @@ def _reap_one_dir(
         settled = outcome.get("file_path")
         if settled and Path(settled).exists() and os.path.samefile(settled, f):
             continue
+        # The original goes only once a copy of its bytes lies on disk. "Already
+        # ingested" can name a copy that is not there: a text-only document of the
+        # same bytes ("text:..."), or one whose file is gone. Unlinked then, the
+        # bytes were nowhere, and lost for good when that document's content is
+        # not held either.
+        if not _another_copy(settled, f):
+            stats["originals_kept"] += 1
+            continue
         f.unlink()
 
 
@@ -181,6 +233,7 @@ def _reap_strays(
     msg_dir: Path,
     registered: set[tuple[str, str]],
     hashes: set[str],
+    twins: dict[str, list[str]],
     apply: bool,
     stats: dict,
     grace_days: float,
@@ -201,7 +254,7 @@ def _reap_strays(
         st = f.stat()
         if st.st_mtime > cutoff or (only_newer_than is not None and st.st_mtime < only_newer_than):
             continue
-        if hashes and sha256_of_file(f) in hashes:
+        if _is_stored(f, hashes, twins):
             stats["strays_deleted"] += 1
             stats["bytes_freed"] += st.st_size
             if apply:
@@ -263,11 +316,12 @@ def reap_orphan_attachments(
         "bytes_freed": 0,
         "strays_deleted": 0,
         "strays_kept": 0,
+        "originals_kept": 0,
     }
     if not base_dir.is_dir():
         return stats
 
-    referenced, known, hashes, newest, registered = _survey(db_path)
+    referenced, known, hashes, newest, registered, twins = _survey(db_path)
     if not _mail_is_flowing(newest, duplicate_grace_days):
         duplicate_grace_days = grace_days
     stats["duplicate_grace_days"] = min(duplicate_grace_days, grace_days)
@@ -281,6 +335,7 @@ def reap_orphan_attachments(
                     msg_dir,
                     registered,
                     hashes,
+                    twins,
                     apply,
                     stats,
                     min(duplicate_grace_days, grace_days),
@@ -297,7 +352,7 @@ def reap_orphan_attachments(
 
         stats["scanned"] += 1
         adopt = is_abandoned_orphan(msg_dir, grace_days)
-        _reap_one_dir(msg_dir, known, hashes, apply, db_path, stats, adopt, adopt_only)
+        _reap_one_dir(msg_dir, known, hashes, twins, apply, db_path, stats, adopt, adopt_only)
 
         if not _husk_is_empty(msg_dir):
             if apply:
@@ -366,6 +421,7 @@ def main() -> int:
     print(f"  stray duplicates deleted: {stats['strays_deleted']:,}")
     print(f"  stray unique files kept : {stats['strays_kept']:,}")
     print(f"  content already held : {stats['already_ingested']:,}")
+    print(f"  originals kept, no other copy: {stats['originals_kept']:,}")
     print(f"  unique, still waiting : {stats['waiting']:,}")
     if "duplicate_grace_days" in stats:
         print(f"  duplicate grace (days): {stats['duplicate_grace_days']:g}")

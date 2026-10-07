@@ -386,6 +386,8 @@ python -m src.cli hash-attachments          # record a content hash for every at
 python -m src.cli sweep-files --policy      # delete attachment files whose content is stored (report-only by default)
 python -m src.cli reextract --capped --zip --unread    # read and summarise again rows earlier code capped, skipped or never read
 python -m src.cli reextract --partial                  # read again in full what the old readers read in part (resumable)
+python -m src.cli reextract --stale --formats          # read with today's readers what older code skipped or failed on
+python -m src.cli reextract --ocr --limit 500          # OCR low-text scans and images again (grayscale second pass), in batches
 python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents
 python -m src.cli process-sharepoint --ingest-fetched  # store the files earlier SharePoint fetches left on disk
 python -m src.cli process-sharepoint --refetch-content --max-fetches 0 --deadline-s 1800  # read again the links recorded ok with no text

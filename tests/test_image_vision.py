@@ -27,6 +27,8 @@ SECOND_LARGEST_OBSERVED_PX = 10610 * 32768
 
 # Pillow warns above MAX_IMAGE_PIXELS and only raises above 2x it.
 PILLOW_HARD_REFUSAL_MULTIPLIER = 2
+# Pillow's own MAX_IMAGE_PIXELS, which every caller outside the image pipeline keeps.
+PILLOW_DEFAULT_LIMIT = int(1024 * 1024 * 1024 // 4 // 3)
 
 
 def test_small_image_passes_through_unchanged(tmp_path):
@@ -125,6 +127,73 @@ def test_bomb_limit_keeps_the_largest_admitted_image_within_host_memory():
     peak_gb = PILLOW_HARD_REFUSAL_MULTIPLIER * VISION_IMAGE_BOMB_LIMIT * 8.1 / 1e9
 
     assert peak_gb < 5.0, f"largest admitted image would peak at {peak_gb:.1f} GB"
+
+
+def test_a_giant_screenshot_reaches_the_memory_gate_under_the_default_process_guard(
+    tmp_path, monkeypatch
+):
+    """Vision admits the giant at its own open, not by raising Pillow's guard for the process.
+
+    The process keeps Pillow's default here, which refuses this 200 M px image outright. It
+    must still get past the open and stop where the decode cost is judged.
+    """
+    import src.extract.image_vision as image_vision
+
+    big = tmp_path / "report.png"
+    Image.new("1", (20_000, 10_000)).save(big)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", PILLOW_DEFAULT_LIMIT)
+    monkeypatch.setattr(image_vision, "_decode_fits_in_memory", lambda pixels: False)
+
+    with pytest.raises(VisionDecodeTooLarge):
+        _encode_image_for_vision(big)
+    assert Image.MAX_IMAGE_PIXELS == PILLOW_DEFAULT_LIMIT
+
+
+def test_two_oversized_images_never_decode_at_once(tmp_path, monkeypatch):
+    """The memory gate reads the memory free BEFORE Pillow allocates.
+
+    Two workers checking at once would each see room for one image and decode two:
+    two 342 M px screenshots are ~5.6 GB on a 7 GB host. The hourly sync's Step 8
+    and `transcribe-images` both run more than one worker.
+    """
+    import threading
+    import time
+
+    import src.extract.image_vision as image_vision
+
+    tall = []
+    for name in ("a.png", "b.png"):
+        p = tmp_path / name
+        Image.new("L", (10, VISION_IMAGE_MAX_DIMENSION + 100), 200).save(p)
+        tall.append(p)
+    events, first_checking, release = [], threading.Event(), threading.Event()
+
+    def gate(pixels):
+        events.append("check")
+        if len(events) == 1:
+            first_checking.set()
+            release.wait(5)
+        return True
+
+    monkeypatch.setattr(image_vision, "_decode_fits_in_memory", gate)
+
+    def first():
+        _encode_image_for_vision(tall[0])
+        events.append("first decoded")
+
+    def second():
+        first_checking.wait(5)
+        _encode_image_for_vision(tall[1])
+
+    threads = [threading.Thread(target=first), threading.Thread(target=second)]
+    for t in threads:
+        t.start()
+    time.sleep(0.05)  # the second would have checked by now if nothing held it out
+    release.set()
+    for t in threads:
+        t.join(5)
+
+    assert events == ["check", "first decoded", "check"]
 
 
 # Reading the answer out of the response. `resp.content[0].text` held only while

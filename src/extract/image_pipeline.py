@@ -5,6 +5,7 @@ Image pipeline orchestrator — connects classifier stages to database.
 import logging
 import sqlite3
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from src.extract.image_classifier import (
@@ -13,6 +14,7 @@ from src.extract.image_classifier import (
     refresh_signature_index,
     sha256_of_file,
 )
+from src.redact import redact_secrets
 from src.store.email_html import markup_or_text
 from src.store.file_sweep import VISION_ATTEMPTS_LIMIT
 
@@ -37,8 +39,204 @@ IMAGE_OWED_SQL = (
 )
 
 
+# An attachment_content row (alias ac) that an image's vision text may fill: it holds no text
+# read from the file (OCR found too little, or failed), or it is vision's own. A row with text
+# from the file is never overwritten, and none is inserted: Phase 1 stays the first writer, so
+# an image Phase 1 has not reached yet is filled once it has.
+VISION_FILLABLE_SQL = (
+    "(COALESCE(trim(ac.extracted_text, char(32, 9, 10, 11, 12, 13)), '') = ''"
+    " OR ac.extraction_method = 'vision')"
+)
+
+# A content image (alias ii) that still owes its transcription: described, not transcribed,
+# under VISION_ATTEMPTS_LIMIT failed attempts, and with an attachment row its text may fill
+# (an image whose rows all hold OCR text is searchable by it already). run_transcription takes
+# these, and it reads the file, so the sweep must keep the file of such an image.
+TRANSCRIPTION_OWED_SQL = (
+    "(ii.classification = 'content' AND ii.vision_description IS NOT NULL"
+    " AND ii.transcribed_at IS NULL"
+    f" AND ii.transcription_attempts < {VISION_ATTEMPTS_LIMIT}"
+    " AND EXISTS (SELECT 1 FROM attachments ta"
+    " JOIN attachment_content ac ON ac.attachment_id = ta.id"
+    f" WHERE ta.sha256 = ii.sha256 AND {VISION_FILLABLE_SQL}))"
+)
+
+
 class VisionFailed(Exception):
     """Stage 3 could not describe the image. The Stage-1 row is still recorded."""
+
+
+def file_on_disk(conn: sqlite3.Connection, sha256: str) -> Path | None:
+    """The first file of these bytes still on disk, by attachment id, or None."""
+    for (file_path,) in conn.execute(
+        "SELECT file_path FROM attachments WHERE sha256 = ? AND file_path IS NOT NULL"
+        " AND file_path NOT LIKE 'text:%' ORDER BY id",
+        (sha256,),
+    ):
+        path = Path(file_path)
+        if path.exists():
+            return path
+    return None
+
+
+def project_vision_text(conn: sqlite3.Connection) -> int:
+    """Write each content image's vision text into its attachments' text-free rows.
+
+    That is how a content image reaches attachment search (attachment_content_fts) and the
+    embeddings index (build_index), with no namespace of its own. Each row VISION_FILLABLE_SQL
+    allows becomes extraction_method 'vision', extracted and summarised:
+
+        summary         the description: what build_index embeds. It does not change when the
+                        transcription arrives, so the vector made from it stays right.
+        extracted_text  the description, then the transcription when there is one.
+
+    Credentials are redacted on the way, as Phase 1 redacts what it reads. Returns the rows
+    written; a row that already holds exactly this is left alone.
+    """
+    rows = conn.execute(
+        f"""SELECT ac.id, ii.vision_description, ii.vision_transcription,
+                   ac.extracted_text, ac.summary, ac.extraction_method
+            FROM inline_images ii
+            JOIN attachments a ON a.sha256 = ii.sha256
+            JOIN attachment_content ac ON ac.attachment_id = a.id
+            WHERE ii.classification = 'content' AND ii.vision_description IS NOT NULL
+              AND {VISION_FILLABLE_SQL}"""
+    ).fetchall()
+    # attachment_content keeps Phase 1's timestamp format.
+    now = datetime.now().isoformat()
+    written = 0
+    for ac_id, description, transcription, stored_text, stored_summary, method in rows:
+        summary = redact_secrets(description)
+        text = "\n\n".join(part for part in (summary, transcription) if part)
+        if method == "vision" and stored_text == text and stored_summary == summary:
+            continue
+        conn.execute(
+            """UPDATE attachment_content
+               SET extracted_text = ?, extraction_method = 'vision',
+                   extraction_status = 'extracted', extraction_error = NULL, extracted_at = ?,
+                   summary = ?, llm_status = 'extracted', llm_error = NULL,
+                   llm_extracted_at = ?
+               WHERE id = ?""",
+            (text, now, summary, now, ac_id),
+        )
+        written += 1
+    conn.commit()
+    return written
+
+
+def _service_failed(e: Exception) -> bool:
+    """The service or the host failed, not the image: offer it again, count no attempt.
+
+    The same split as Phase 2 (attachment_pipeline._extract_one_attachment): an outage, a
+    quota or an expired login must not use up the attempts of every image it meets. A request
+    that ran out of time will again, so it counts.
+    """
+    from src.extract.image_vision import VisionDecodeTooLarge
+    from src.extract.policy_bridge import classify_exception, is_item_timeout, is_transient
+    from src.llm_policy import Outcome
+
+    if isinstance(e, VisionDecodeTooLarge):
+        return True
+    if classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED:
+        return True
+    return is_transient(e) and not is_item_timeout(e)
+
+
+def run_transcription(
+    conn: sqlite3.Connection,
+    limit: int | None = None,
+    workers: int = 1,
+    dry_run: bool = False,
+    deadline_s: float | None = None,
+) -> dict:
+    """Transcribe the content images whose attachments hold no text from their file.
+
+    Taken: TRANSCRIPTION_OWED_SQL, newest description first. An image with no file on disk is
+    counted `missing` and does not use up `limit`.
+
+    One call per image (image_vision.transcribe_image), then project_vision_text writes the
+    text into the rows. A failure of the image counts an attempt; a failure of the service or
+    of the host (_service_failed) is counted `failed` but offered again next run. `workers`
+    and `deadline_s` work as in run_backfill.
+
+    Returns {candidates, missing, transcribed, empty, failed, deferred, projected}:
+    `candidates` have a file on disk, and `empty` is an image that shows no text.
+    """
+    stats = dict.fromkeys(
+        ("candidates", "missing", "transcribed", "empty", "failed", "deferred", "projected"), 0
+    )
+    hashes = [
+        sha
+        for (sha,) in conn.execute(
+            f"SELECT ii.sha256 FROM inline_images ii WHERE {TRANSCRIPTION_OWED_SQL}"
+            " ORDER BY ii.visioned_at DESC, ii.sha256"
+        )
+    ]
+    todo: list[tuple[str, Path]] = []
+    for sha in hashes:
+        path = file_on_disk(conn, sha)
+        if path is None:
+            stats["missing"] += 1
+            continue
+        stats["candidates"] += 1
+        if not limit or len(todo) < limit:
+            todo.append((sha, path))
+    if dry_run:
+        return stats
+
+    deadline = None if deadline_s is None else time.monotonic() + deadline_s
+
+    def _transcribe(sha: str, path: Path, work_conn: sqlite3.Connection) -> str:
+        if deadline is not None and time.monotonic() >= deadline:
+            return "deferred"
+        from src.extract.image_vision import transcribe_image
+
+        try:
+            text = transcribe_image(path)
+        except Exception as e:
+            logger.error(f"Transcription failed for {path}: {e}")
+            if not _service_failed(e):
+                work_conn.execute(
+                    "UPDATE inline_images SET transcription_attempts ="
+                    " transcription_attempts + 1 WHERE sha256 = ?",
+                    (sha,),
+                )
+                work_conn.commit()
+            return "failed"
+        work_conn.execute(
+            "UPDATE inline_images SET vision_transcription = ?, transcribed_at = ?"
+            " WHERE sha256 = ?",
+            (text, datetime.now(UTC).isoformat(), sha),
+        )
+        work_conn.commit()
+        return "transcribed" if text else "empty"
+
+    db_file = next(
+        (f for _id, name, f in conn.execute("PRAGMA database_list") if name == "main"),
+        None,
+    )
+    if workers > 1 and db_file:
+        # One connection per task, opened and closed in its own thread, as in run_backfill.
+        from concurrent.futures import ThreadPoolExecutor
+
+        from src.store.schema import get_connection
+
+        def worker(item: tuple[str, Path]) -> str:
+            c = get_connection(db_file)
+            try:
+                return _transcribe(*item, c)
+            finally:
+                c.close()
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for outcome in ex.map(worker, todo):
+                stats[outcome] += 1
+    else:
+        for sha, path in todo:
+            stats[_transcribe(sha, path, conn)] += 1
+
+    stats["projected"] = project_vision_text(conn)
+    return stats
 
 
 def process_single_image(
@@ -108,11 +306,16 @@ def process_single_image(
             logger.error(f"Vision classification failed for {img_path}: {e}")
             # Counted, so an image the model keeps failing on is given up after
             # VISION_ATTEMPTS_LIMIT tries instead of being offered every run for ever.
-            conn.execute(
-                "UPDATE inline_images SET vision_attempts = vision_attempts + 1 WHERE sha256 = ?",
-                (sha256,),
-            )
-            conn.commit()
+            # Not when the service or the host failed rather than the image: a giant
+            # deferred for memory waits for a quiet run, and an outage must not give up
+            # every image it meets.
+            if not _service_failed(e):
+                conn.execute(
+                    "UPDATE inline_images SET vision_attempts = vision_attempts + 1"
+                    " WHERE sha256 = ?",
+                    (sha256,),
+                )
+                conn.commit()
             # The Stage-1 row and its occurrence stay — they are real
             # observations and the signature index is built from them. But the
             # image did NOT get described, and reporting that as success is how
@@ -212,9 +415,10 @@ def run_backfill(
             instead of being SIGTERMed mid-flight. None = no time box.
 
     Returns:
-        Stats dict: {scanned, classified, recorded, missing, failed, deferred}. `recorded` counts
-        occurrences written from the stored hash for an image whose file is gone but which is
-        already done (see below).
+        Stats dict: {scanned, classified, recorded, missing, failed, deferred, projected}.
+        `recorded` counts occurrences written from the stored hash for an image whose file is
+        gone but which is already done (see below). `projected` counts attachment rows given
+        a content image's vision text (project_vision_text).
     """
     stats = {
         "scanned": 0,
@@ -223,6 +427,7 @@ def run_backfill(
         "missing": 0,
         "failed": 0,
         "deferred": 0,
+        "projected": 0,
     }
 
     # Build query
@@ -373,5 +578,9 @@ def run_backfill(
     # write. Runs on `conn` after the worker pool has closed.
     for sender in {row[4] for row in todo + known if row[4]}:
         refresh_signature_index(conn, sender)
+
+    # A description written above reaches attachment search and the embeddings index through
+    # the image's text-free attachment rows; its transcription follows in run_transcription.
+    stats["projected"] = project_vision_text(conn)
 
     return stats

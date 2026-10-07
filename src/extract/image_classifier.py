@@ -14,6 +14,9 @@ Stage 3 lives in image_vision.py to keep the LLM dependency optional.
 import hashlib
 import logging
 import sqlite3
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -51,6 +54,43 @@ MIN_SIGNATURE_OCCURRENCES = 3
 MIN_DIMENSION_PX = 100
 MIN_BYTES = 5_000
 SIGNATURE_POSITION_CUTOFF = 0.85
+
+# Deliberate, bounded raise of Pillow's decompression-bomb guard for this
+# pipeline's own opens. Its ~89 M px default hard-refuses the report screenshots
+# the pipeline exists to read (measured on prod: 10610x32768 = 348 M px and
+# 16237x32768 = 532 M px), and under it Stage 1 filed five such screenshots as
+# noise/decode_failed, so vision never saw them.
+#
+# Pillow WARNS above this value and only RAISES above 2x it, so the effective
+# admission ceiling is 550 M px. Decoding measured ~8.1 bytes/px, putting the
+# largest admitted image at ~4.5 GB peak; image_vision gates every decode on the
+# memory free at the time.
+IMAGE_PIXEL_LIMIT = 275_000_000
+
+# The guard is one value for the whole process, and every other Pillow caller
+# (Phase 1 OCR above all, which reaches this module through file_hashes) keeps
+# Pillow's default. So the limit is raised only around the pipeline's own opens,
+# never at import, and one lock keeps two threads from restoring each other's
+# value: interleaved, the second would put the first one's raised value back.
+_PIXEL_LIMIT_LOCK = threading.Lock()
+
+
+@contextmanager
+def admit_large_images() -> Iterator[None]:
+    """Pillow's bomb guard at IMAGE_PIXEL_LIMIT for the Image.open calls inside, restored after.
+
+    Pillow checks the size when it opens a file, from the header, so hold this
+    around the open only and decode outside it. A lower guard is raised; a higher
+    one, or none, is kept.
+    """
+    with _PIXEL_LIMIT_LOCK:
+        previous = Image.MAX_IMAGE_PIXELS
+        if previous is not None and previous < IMAGE_PIXEL_LIMIT:
+            Image.MAX_IMAGE_PIXELS = IMAGE_PIXEL_LIMIT
+        try:
+            yield
+        finally:
+            Image.MAX_IMAGE_PIXELS = previous
 
 
 def sha256_of_file(path: Path) -> str:
@@ -121,12 +161,14 @@ def classify_stage1(
         if overridden or c != Classification.UNCLASSIFIED.value:
             return Classification(c)
 
-    # Stage 1a — dimensions. An image PIL cannot decode (corrupt, unsupported
-    # format such as HEIC without a plugin, or a decompression bomb) is recorded
-    # as a decode failure so the caller stops re-scanning it on every run.
+    # Stage 1a — dimensions, read from the header; nothing is decoded. An image PIL
+    # cannot identify (corrupt, unsupported format such as HEIC without a plugin, or
+    # over the pipeline's 550 M px ceiling) is recorded as a decode failure so the
+    # caller stops re-scanning it on every run.
     bytes_size = img_path.stat().st_size
     try:
-        width, height = Image.open(img_path).size
+        with admit_large_images(), Image.open(img_path) as im:
+            width, height = im.size
     except (UnidentifiedImageError, Image.DecompressionBombError, OSError) as e:
         logger.warning("Undecodable image %s: %s", img_path, e)
         return _store(conn, sha, Classification.NOISE, "decode_failed", 0, 0, bytes_size)

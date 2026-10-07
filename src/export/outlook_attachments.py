@@ -202,6 +202,7 @@ def register_downloaded_attachments(
     else:
         rows = conn.execute("SELECT message_id, id FROM emails")
     emails = {str(mid): (mid, eid) for mid, eid in rows}
+    aliases = _aliases(conn, since)
 
     for msg_dir in sorted(base_dir.iterdir()):
         if not msg_dir.is_dir():
@@ -209,11 +210,15 @@ def register_downloaded_attachments(
         stats["scanned"] += 1
         message_id = msg_dir.name
 
-        files = [
-            f
-            for f in sorted(msg_dir.iterdir())
-            if f.is_file() and (message_id, f.name) not in known
-        ]
+        # A directory named by a copy's Graph id (a move to Archive mints one)
+        # belongs to the email the loader kept, under that email's own message_id:
+        # what the email already has is known by the same (message_id, filename).
+        found = emails.get(message_id)
+        via_alias = found is None and message_id in aliases
+        if via_alias:
+            found = aliases[message_id]
+        key = str(found[0]) if found is not None else message_id
+        files = [f for f in sorted(msg_dir.iterdir()) if f.is_file() and (key, f.name) not in known]
         if not files:
             continue
 
@@ -221,7 +226,6 @@ def register_downloaded_attachments(
         # flight. Recording email_id NULL would orphan the row for good: the
         # image and text pipelines JOIN emails, so it would never be picked up
         # even once the email lands. Leave it on disk for a later pass instead.
-        found = emails.get(message_id)
         if found is None:
             # Only the unwindowed pass may abandon. Under `since` the email map
             # holds just the hourly window, so a loaded-but-older email is
@@ -231,11 +235,27 @@ def register_downloaded_attachments(
             stats["abandoned" if aged else "deferred"] += 1
             continue
         stored_message_id, email_id = found
+        # The copy's files are the email's own under the same names, known above;
+        # one under another name is known by its content.
+        held = (
+            {
+                sha
+                for (sha,) in conn.execute(
+                    "SELECT sha256 FROM attachments WHERE email_id = ? AND sha256 IS NOT NULL",
+                    (email_id,),
+                )
+            }
+            if via_alias
+            else set()
+        )
 
         for f in files:
             if limit is not None and stats["registered"] >= limit:
                 conn.commit()
                 return stats
+            sha256 = sha256_of_file(f)
+            if via_alias and sha256 in held:
+                continue
             cur = conn.execute(
                 """INSERT INTO attachments
                    (email_id, message_id, filename, mime_type, file_size, file_path,
@@ -256,11 +276,32 @@ def register_downloaded_attachments(
                     stamp,
                     # Recorded now because the file will not stay: the sweep deletes
                     # it once its content is stored (src/store/file_sweep.py).
-                    sha256_of_file(f),
+                    sha256,
                 ),
             )
             stats["registered"] += 1
             stats["ids"].append(cur.lastrowid)
+            # Another directory of the same message later in this pass finds it.
+            known.add((key, f.name))
+            held.add(sha256)
 
     conn.commit()
     return stats
+
+
+def _aliases(conn, since: str | None) -> dict[str, tuple]:
+    """Graph id of a copy -> (the stored email's own message_id, its id), from the
+    aliases the loader records (src/store/loader.py), within the same window as the
+    emails themselves."""
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'email_aliases'"
+    ).fetchone():
+        return {}  # a store from before v30
+    sql = (
+        "SELECT a.message_id, e.message_id, e.id FROM email_aliases a"
+        " JOIN emails e ON e.id = a.email_id"
+    )
+    rows = (
+        conn.execute(sql + " WHERE e.date_received >= ?", (since,)) if since else conn.execute(sql)
+    )
+    return {str(alias): (mid, eid) for alias, mid, eid in rows}

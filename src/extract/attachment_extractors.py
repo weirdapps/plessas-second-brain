@@ -146,13 +146,18 @@ def _extract_by_type(
             if sniffed is None:
                 return {"text": None, "method": None, "status": "skipped", "error": None}
             mime_type = sniffed  # an Office document sent as a zip
+        # The Office 2007+ readers open a zip, so a file named or labelled as one is sent to them
+        # only when it is one. Anything else goes by its bytes (the else branch below): a legacy
+        # .doc named .docx, an HTML page named .pptx, a CSV labelled application/vnd.ms-excel.
+        magic = _magic(file_path)
+        is_zip = magic == b"PK\x03\x04"
         if mime_type == "application/pdf" or ext == ".pdf":
             return _extract_pdf(file_path, ocr_seconds)
         elif (
             mime_type
             in ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",)
             or ext == ".docx"
-        ):
+        ) and is_zip:
             return _extract_docx(file_path)
         elif mime_type == "application/msword" or ext == ".doc":
             return _extract_doc(file_path)
@@ -160,7 +165,7 @@ def _extract_by_type(
             mime_type
             in ("application/vnd.openxmlformats-officedocument.presentationml.presentation",)
             or ext == ".pptx"
-        ):
+        ) and is_zip:
             return _extract_pptx(file_path)
         elif ext == ".xlsb":
             return _extract_xlsb(file_path)
@@ -173,7 +178,7 @@ def _extract_by_type(
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
             or ext == ".xlsx"
-        ):
+        ) and (is_zip or magic == b"\xd0\xcf\x11\xe0"):
             # Sniff, do not trust the extension. 993 attachments on the live
             # corpus are named .xlsx and are legacy OLE2 .xls: Excel keeps the
             # name when a user saves an old workbook, and mail systems relabel
@@ -181,7 +186,7 @@ def _extract_by_type(
             # failed, and nothing retries it, so their content was simply absent
             # from the brain. The same two-magic-number check already guards
             # _extract_xlsb below; this is the branch it was missing.
-            if _magic(file_path) == b"\xd0\xcf\x11\xe0":
+            if magic == b"\xd0\xcf\x11\xe0":
                 return _extract_xls(file_path)
             return _extract_excel(file_path)
         elif (
@@ -273,10 +278,19 @@ def _extract_pdf(path: str, ocr_seconds: float | None = None) -> dict:
 
 
 def _extract_docx(path: str) -> dict:
-    """Extract text from .docx using python-docx."""
+    """Extract text from .docx using python-docx, or from its XML when python-docx refuses it."""
     from docx import Document
 
-    doc = Document(path)
+    try:
+        doc = Document(path)
+    except Exception:
+        # python-docx loads every relationship target, and Word writes some footer
+        # relationships with Target="NULL": Document() raised KeyError ("There is no item
+        # named 'word/NULL' in the archive") on 9 files whose body was intact.
+        fallback = _read_xml_fallback(path, _docx_xml_text, "docx-xml")
+        if fallback is None:
+            raise
+        return fallback
     parts = []
 
     for para in doc.paragraphs:
@@ -376,10 +390,19 @@ def _collect_shape_text(shapes, out: list[str]) -> None:
 
 
 def _extract_pptx(path: str) -> dict:
-    """Extract text from PowerPoint using python-pptx."""
+    """Extract text from PowerPoint using python-pptx, or from its XML when python-pptx refuses."""
     from pptx import Presentation
 
-    prs = Presentation(path)
+    try:
+        prs = Presentation(path)
+    except Exception:
+        # python-pptx reads every part, so one media member with a bad CRC
+        # ("BadZipFile: Bad CRC-32 for file 'ppt/media/image5.svg'") failed 4 decks whose
+        # slides were intact. A truncated deck has no readable zip and stays a failure.
+        fallback = _read_xml_fallback(path, _pptx_xml_text, "pptx-xml")
+        if fallback is None:
+            raise
+        return fallback
     parts = []
 
     for i, slide in enumerate(prs.slides, 1):
@@ -403,6 +426,109 @@ def _extract_pptx(path: str) -> dict:
             "error": "Insufficient text extracted",
         }
     return {"text": text, "method": "python-pptx", "status": "extracted", "error": None}
+
+
+# Text runs, tabs and line breaks of WordprocessingML (w:) and DrawingML (a:) parts. Read with a
+# pattern rather than a parser: these fallbacks exist for files a strict reader rejects, and a
+# pattern expands no entities.
+_XML_RUNS = {
+    ns: re.compile(rf"<{ns}:t(?:\s[^>]*)?>([^<]*)</{ns}:t>|<{ns}:(tab|br|cr)\b[^>]*/>")
+    for ns in ("w", "a")
+}
+
+
+def _xml_paragraphs(xml: str, ns: str) -> list[str]:
+    """The text of each paragraph of one Office XML part, empty paragraphs dropped."""
+    out = []
+    for chunk in xml.split(f"</{ns}:p>"):
+        runs = [
+            text if not mark else ("\t" if mark == "tab" else "\n")
+            for text, mark in _XML_RUNS[ns].findall(chunk)
+        ]
+        line = html.unescape("".join(runs)).strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def _member_paragraphs(zf, name: str, ns: str) -> list[str]:
+    """A member's paragraphs; nothing when it cannot be read (a bad CRC, a bad deflate)."""
+    try:
+        return _xml_paragraphs(zf.read(name).decode("utf-8", "replace"), ns)
+    except Exception:
+        return []
+
+
+def _docx_xml_text(path: str) -> str:
+    """The body, then the headers and footers, of a .docx read from its XML parts."""
+    import zipfile
+
+    with zipfile.ZipFile(path) as zf:
+        names = set(zf.namelist())
+        ordered = ["word/document.xml"] + sorted(
+            n for n in names if re.fullmatch(r"word/(?:header|footer)\d*\.xml", n)
+        )
+        lines = [line for n in ordered if n in names for line in _member_paragraphs(zf, n, "w")]
+    return "\n".join(lines)
+
+
+def _pptx_xml_text(path: str) -> str:
+    """Each slide's text and its speaker notes, read from a .pptx's XML parts.
+
+    Same shape as _extract_pptx. Slides go by the number in their part name. A slide's notes
+    are the notes part its relationships name, and of that part only the body placeholder,
+    which is what python-pptx calls the notes text.
+    """
+    import posixpath
+    import zipfile
+
+    parts = []
+    with zipfile.ZipFile(path) as zf:
+        names = set(zf.namelist())
+        slides = sorted(
+            (int(m.group(1)), n)
+            for n in names
+            if (m := re.fullmatch(r"ppt/slides/slide(\d+)\.xml", n))
+        )
+        for number, name in slides:
+            lines = _member_paragraphs(zf, name, "a")
+            if lines:
+                parts.append(f"--- Slide {number} ---\n" + "\n".join(lines))
+            rels = f"ppt/slides/_rels/slide{number}.xml.rels"
+            try:
+                targets = re.findall(r'Target="([^"]*notesSlide[^"]*)"', zf.read(rels).decode())
+            except Exception:
+                targets = []
+            for target in targets[:1]:
+                notes = posixpath.normpath(posixpath.join("ppt/slides", target))
+                try:
+                    xml = zf.read(notes).decode("utf-8", "replace")
+                except Exception:
+                    continue
+                body = [
+                    line
+                    for shape in re.findall(r"<p:sp\b.*?</p:sp>", xml, flags=re.DOTALL)
+                    if 'type="body"' in shape
+                    for line in _xml_paragraphs(shape, "a")
+                ]
+                if body:
+                    parts.append("[Notes] " + "\n".join(body))
+    return "\n\n".join(parts)
+
+
+def _read_xml_fallback(path: str, read, method: str) -> dict | None:
+    """The text `read` finds in an Office zip's XML, or None when it finds too little.
+
+    For a file the library reader refused: None hands the reader's own error back to the
+    caller, which records it, so a file with no readable text stays a failure that says why.
+    """
+    try:
+        text = _truncate(read(path))
+    except Exception:
+        return None
+    if _apply_noise_filter(text):
+        return None
+    return {"text": text, "method": method, "status": "extracted", "error": None}
 
 
 def _magic(path: str, n: int = 4) -> bytes:

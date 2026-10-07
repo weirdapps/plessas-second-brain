@@ -1,16 +1,26 @@
 import sqlite3
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from src.extract.image_classifier import (
+    IMAGE_PIXEL_LIMIT,
+    MIN_BYTES,
     MIN_SIGNATURE_OCCURRENCES,
     Classification,
+    admit_large_images,
     classify_stage1,
     is_known_signature,
     sha256_of_file,
 )
 from src.store.schema import create_database, run_migrations
+
+REPO = Path(__file__).resolve().parent.parent.parent
 
 
 def _setup_db(tmp_path: Path) -> sqlite3.Connection:
@@ -183,3 +193,121 @@ def test_occurrence_floor_boundary(tmp_path):
     )
     assert is_known_signature(db, "thin@example.com", below) is False
     assert is_known_signature(db, "thin@example.com", at) is True
+
+
+# Stage 1 alone, in a fresh interpreter, as the loader hook runs it: no image_vision import.
+_STAGE1_ALONE = """
+import sys
+from pathlib import Path
+
+from PIL import Image
+
+default = Image.MAX_IMAGE_PIXELS
+from src.extract.image_classifier import classify_stage1
+from src.store.schema import create_database
+
+assert "src.extract.image_vision" not in sys.modules
+conn = create_database(sys.argv[2])
+label = classify_stage1(Path(sys.argv[1]), "a@example.com", 0.5, conn)
+row = conn.execute("SELECT width, height, classification_method FROM inline_images").fetchone()
+print(label.value, row[0], row[1], row[2], Image.MAX_IMAGE_PIXELS == default)
+"""
+
+
+def test_a_large_screenshot_is_not_noise_where_vision_was_never_imported(tmp_path):
+    # A full-page report screenshot runs to hundreds of megapixels. Pillow's default guard
+    # refuses anything over 2 x 89,478,485 px, and Stage 1 filed five such screenshots as
+    # noise/decode_failed, so vision never saw them, though vision admits up to 550 M px.
+    big = tmp_path / "report.png"
+    # 200 M px, between the two limits. Mode "1" keeps it ~25 MB in memory and ~25 KB on disk,
+    # and Stage 1 reads only the header.
+    Image.new("1", (20_000, 10_000)).save(big)
+    assert big.stat().st_size >= MIN_BYTES
+
+    out = subprocess.run(
+        [sys.executable, "-c", _STAGE1_ALONE, str(big), str(tmp_path / "brain.db")],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    )
+
+    # Classified from its header, and the process-wide guard is Pillow's own afterwards.
+    assert out.stdout.split() == ["unclassified", "20000", "10000", "stage1_passed", "True"]
+
+
+# Importing the image stages, or Phase 1 (which reaches image_classifier through
+# file_hashes), must leave Pillow's guard for the process as Pillow set it: OCR and every
+# other caller keep the default, and only the pipeline's own opens are admitted higher.
+_IMPORT_ONLY = """
+from PIL import Image
+
+default = Image.MAX_IMAGE_PIXELS
+import src.extract.attachment_pipeline
+import src.extract.image_pipeline
+import src.extract.image_vision
+
+print(Image.MAX_IMAGE_PIXELS == default)
+"""
+
+
+def test_importing_the_image_stages_leaves_the_process_guard_alone(tmp_path):
+    out = subprocess.run(
+        [sys.executable, "-c", _IMPORT_ONLY],
+        cwd=REPO,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    )
+
+    assert out.stdout.strip() == "True"
+
+
+def test_the_pipeline_limit_holds_only_inside_its_scope(monkeypatch):
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1_000)
+
+    with admit_large_images():
+        assert Image.MAX_IMAGE_PIXELS == IMAGE_PIXEL_LIMIT
+    assert Image.MAX_IMAGE_PIXELS == 1_000
+
+    with pytest.raises(ValueError), admit_large_images():
+        raise ValueError("the open failed")
+    assert Image.MAX_IMAGE_PIXELS == 1_000
+
+
+def test_the_scope_never_lowers_a_higher_or_absent_limit(monkeypatch):
+    for value in (IMAGE_PIXEL_LIMIT * 4, None):
+        monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", value)
+        with admit_large_images():
+            assert Image.MAX_IMAGE_PIXELS == value
+
+
+def test_two_threads_cannot_interleave_their_scopes(monkeypatch):
+    # Interleaved, the second scope would save the first one's raised value as "previous"
+    # and put it back last, leaving the whole process raised.
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", 1_000)
+    inside, release, order = threading.Event(), threading.Event(), []
+
+    def first():
+        with admit_large_images():
+            inside.set()
+            release.wait(5)
+            order.append("first out")
+
+    def second():
+        inside.wait(5)
+        with admit_large_images():
+            order.append("second in")
+
+    threads = [threading.Thread(target=first), threading.Thread(target=second)]
+    for t in threads:
+        t.start()
+    time.sleep(0.05)  # the second thread would be inside by now if nothing held it out
+    release.set()
+    for t in threads:
+        t.join(5)
+
+    assert order == ["first out", "second in"]
+    assert Image.MAX_IMAGE_PIXELS == 1_000

@@ -10,7 +10,12 @@ from pathlib import Path
 
 from PIL import Image
 
-from src.extract.image_classifier import Classification, sha256_of_file
+from src.extract.image_classifier import (
+    IMAGE_PIXEL_LIMIT,
+    Classification,
+    admit_large_images,
+    sha256_of_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,18 +35,14 @@ VISION_IMAGE_MAX_B64 = 5_000_000
 # compresses to a tiny PNG, clears the byte cap untouched, and still 400s.
 VISION_IMAGE_MAX_DIMENSION = 8000
 
-# Deliberate, bounded raise of Pillow's decompression-bomb guard, whose ~89 M px
-# default hard-refuses the report screenshots this pipeline exists to read
-# (measured on prod: 10610x32768 = 348 M px and 16237x32768 = 532 M px).
-#
-# Pillow WARNS above this value and only RAISES above 2x it, so the effective
-# admission ceiling is 550 M px. Decoding measured ~8.1 bytes/px, putting the
-# largest admitted image at ~4.5 GB peak — survivable on the 7 GB host because
+# Pillow's decompression-bomb guard for both stages, raised only around their own
+# opens (image_classifier.admit_large_images), never for the process. The
+# effective admission ceiling is 2x this, 550 M px; the largest admitted image
+# peaks at ~4.5 GB to decode, survivable on the 7 GB host because
 # `process-images` runs sequentially (--workers defaults to 1). Beyond that
 # Pillow raises DecompressionBombError, which the caller records as a visible
 # failure rather than an image that quietly never gets described.
-VISION_IMAGE_BOMB_LIMIT = 275_000_000
-Image.MAX_IMAGE_PIXELS = VISION_IMAGE_BOMB_LIMIT
+VISION_IMAGE_BOMB_LIMIT = IMAGE_PIXEL_LIMIT
 
 # Measured peak RSS while decoding and downscaling a 532 M px PNG: 4.33 GB.
 VISION_DECODE_BYTES_PER_PIXEL = 8.1
@@ -135,7 +136,7 @@ def _encode_image_for_vision(img_path: Path) -> tuple[str, str]:
     """
     raw = img_path.read_bytes()
 
-    with Image.open(io.BytesIO(raw)) as probe:
+    with admit_large_images(), Image.open(io.BytesIO(raw)) as probe:
         width, height = probe.size
         media_type = _media_type_for(probe.format)
         oversized_px = max(width, height) > VISION_IMAGE_MAX_DIMENSION
@@ -153,7 +154,11 @@ def _encode_image_for_vision(img_path: Path) -> tuple[str, str]:
             "deferring until the host has room"
         )
 
-    im: Image.Image = Image.open(io.BytesIO(raw))
+    # Admitted at the open, where Pillow checks the size; the decode below runs
+    # outside the scope, so the process-wide guard is back before it starts. A JPEG
+    # still decodes at a fraction of its size: thumbnail() drafts it first.
+    with admit_large_images():
+        im: Image.Image = Image.open(io.BytesIO(raw))
     if im.mode not in ("RGB", "L"):
         im = im.convert("RGB")
 

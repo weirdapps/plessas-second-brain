@@ -27,7 +27,7 @@ graph TD
     T[MS Teams<br/>teams-cli] --> S
     A[Attachments<br/>PDF, DOCX, XLSX, PPTX, images, RPMSG] --> S
     P[SharePoint links] --> S
-    L[Local documents<br/>reverse-ingest] --> S
+    L[Local documents<br/>ingest, reverse-ingest --root] --> S
     W[URLs and YouTube] --> S
     N[News digests<br/>news-reader DB] --> S
     K[Claude Code<br/>~/.claude/projects] --> S
@@ -48,7 +48,7 @@ graph TD
 | MS Teams | `src/export/teams_cli.py`, `teams_export.py`, `src/extract/teams_pipeline.py` | Chats, threads, messages, MRI resolution. |
 | WhatsApp | `scripts/whatsapp_snapshot.py`, `src/export/whatsapp_export.py`, `src/extract/whatsapp_pipeline.py` | A minimized snapshot pushed hourly from the Mac that runs a WhatsApp bridge; sessions extracted and embedded like Teams threads. See [WhatsApp](#whatsapp). |
 | SharePoint links | `src/extract/sharepoint_url_scanner.py`, `src/export/sharepoint_fetcher.py` | Managed host defaults to `contoso.sharepoint.com` (override via `SHAREPOINT_HOST`). |
-| Standalone documents | `src/cli.py ingest`, `reverse-ingest`, `src/ingest/reverse_scan.py` | Latest-version-per-logical-name dedup. |
+| Standalone documents | `src/cli.py ingest`, `reverse-ingest`, `src/ingest/reverse_scan.py` | Latest-version-per-logical-name dedup. `reverse-ingest` scans only the directories you name with `--root`; nothing schedules a scan. |
 | Web and YouTube | `src/extract/web_ingest.py` | URL fetch plus transcript pull via `youtube-transcript-api`. |
 | News digests | `src/export/news_export.py` | Reads an external news-reader SQLite DB (`BRAIN_NEWS_DB`) read-only. Digest syntheses plus articles at or above `--relevance`. Landed under `mailbox_name = 'News'`, so mail counts exclude them. Not sent to the model: the summary is the synthesis's brief or the article's opening, the topics its section categories or the article's categories (`src/extract/news_extract.py`). |
 | Claude Code sessions | `src/export/conversation_export.py` | Reads `~/.claude/projects`. |
@@ -362,7 +362,7 @@ python -m src.cli process-attachments --phase 2 --workers 2
 python -m src.cli process-images --limit 500
 python -m src.cli process-sharepoint --since 2026-06-01   # a rescan by date; the nightly run continues past the last email id it scanned, fetching at most --max-fetches (100)
 python -m src.cli split-html                # after v23, on the producer: HTML bodies loaded before it (see DEPLOY)
-python -m src.cli reverse-ingest --root ~/Documents --workers 4
+python -m src.cli reverse-ingest --root ~/path/to/documents --workers 4   # only the directories you name
 python -m src.cli ingest ~/Downloads/report.pdf --source "Q2 report"
 python -m src.cli ingest --url https://example.com/article
 
@@ -555,7 +555,7 @@ The pipeline is just CLI commands, so schedule them however you like. Examples:
 - **cron** (hourly staging and sync): `5 * * * * cd /path/to/repo && .venv/bin/python -m src.export.outlook_export --folder Inbox >> ~/second-brain.log 2>&1`, then `7 * * * * cd /path/to/repo && .venv/bin/python -m src.cli sync >> ~/second-brain.log 2>&1`
 - **macOS launchd** / **systemd timers**: wrap the same two commands (and `embed`) in a service unit pointing at your checkout and venv.
 
-Typical cadence: staging and `sync` hourly, `embed` daily. `sync` stages no mail itself: it extracts and loads what `outlook_export` (or your own exporter) staged. Nor does it cover every source: `calendar-sync`, `teams-sync`, `whatsapp-sync`, `news-sync`, `process-sharepoint` and `reverse-ingest` each want their own schedule.
+Typical cadence: staging and `sync` hourly, `embed` daily. `sync` stages no mail itself: it extracts and loads what `outlook_export` (or your own exporter) staged. Nor does it cover every source: `calendar-sync`, `teams-sync`, `whatsapp-sync`, `news-sync` and `process-sharepoint` each want their own schedule.
 
 [`docs/DEPLOY.md`](docs/DEPLOY.md) has the full recipe, including the two-host shape (one producer that ingests, workstations that read an rsync'd replica) and the `loginctl enable-linger` without which `systemd --user` timers die at logout.
 

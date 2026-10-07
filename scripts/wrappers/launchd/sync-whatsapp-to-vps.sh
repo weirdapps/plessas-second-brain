@@ -17,9 +17,10 @@
 #     the only copies are the bridge's own store and the producer's.
 #   - the log carries counts, never a message, a name or a number.
 #
-# Liveness follows sync-documents-to-vps.sh: a stamp on both hosts after every
-# successful push, a failure marker on both hosts when a run fails, and an
-# unreachable producer skipped quietly until the gap outlives either threshold.
+# Liveness follows the contract the document push used until it was retired
+# (2026-10-07): a stamp on both hosts after every successful push, a failure marker on
+# both hosts when a run fails, and an unreachable producer skipped quietly until the
+# gap outlives either threshold.
 
 set -uo pipefail
 umask 077

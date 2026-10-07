@@ -5,6 +5,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from src.cli import cmd_reverse_ingest
 
 
@@ -108,3 +110,25 @@ def test_reverse_ingest_skips_missing_root_silently(tmp_path):
         },
     )()
     cmd_reverse_ingest(args)  # should not raise
+
+
+def test_reverse_ingest_without_a_root_is_refused(tmp_path, capsys):
+    """The scheduled scan of the document trees is retired: a bare run names no directory,
+    so it stops with a usage error instead of scanning a default tree."""
+    args = type(
+        "Args",
+        (),
+        {
+            "root": None,
+            "workers": 1,
+            "dry_run": False,
+            "verbose": False,
+            "db": tmp_path / "brain.db",
+        },
+    )()
+
+    with pytest.raises(SystemExit) as stopped:
+        cmd_reverse_ingest(args)
+
+    assert stopped.value.code == 2
+    assert "--root" in capsys.readouterr().err

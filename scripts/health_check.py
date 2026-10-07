@@ -33,7 +33,6 @@ from src.config import (  # noqa: E402
     SHAREPOINT_DATA_DIR,
     SHAREPOINT_HOST,
     WHATSAPP_SNAPSHOT,
-    document_roots,
 )
 from src.export.outlook_attachments import (  # noqa: E402
     ORPHAN_GRACE_DAYS,
@@ -47,33 +46,17 @@ STATE_DIR = Path.home() / ".second-brain"
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 SHAREPOINT_SESSION = Path.home() / ".sharepoint-cli" / "session.json"
 
-# Reverse-ingest input side: the roots cmd_reverse_ingest scans and the
-# extensions it ingests. Both sides call the same resolver, so the check cannot
-# end up watching a directory the job does not scan.
-DOCUMENT_ROOTS = document_roots()
-INGESTABLE_EXTENSIONS = {".pdf", ".pptx", ".xlsx", ".docx", ".md", ".txt"}
-
-# Heartbeat written by the laptop-side push job after every successful push
-# (one ISO-8601 UTC line). Authoritative liveness signal for the document roots:
-# our own curate-docs job (retired 2026-10-07) wrote files into those same roots, so a
-# fresh mtime could be self-manufactured while the organic source was frozen.
-DOCUMENT_SYNC_STAMP = STATE_DIR / "document-sync.stamp"
-
 # Written by sb-db-pull.sh after a copy passes its integrity check, and only
 # then. Present on a host that RECEIVES brain.db, absent on the one that writes
 # it, which is what makes it a reliable discriminator between the two. See
 # corpus_lag for why brain.db's own mtime cannot serve here.
 DB_PULL_STAMP = STATE_DIR / "db-pull.stamp"
 
-# Counterpart to the heartbeat: written by the push job when a run FAILS (line 1
-# ISO-8601 UTC, line 2 the reason), removed when one succeeds. The stamp alone
-# records only successes and is judged against a 14-day window, so a job failing
-# on every run emits no signal until that window expires.
-DOCUMENT_SYNC_FAIL = STATE_DIR / "document-sync.fail"
-
 # The WhatsApp push from the bridge's Mac (sync-whatsapp-to-vps.sh): a stamp per
-# successful push and a failure marker per failed one, on both hosts, and the
-# snapshot it delivers. Same shape as the document push above.
+# successful push and a failure marker per failed one, on both hosts (the failure marker
+# is written when a run FAILS: line 1 ISO-8601 UTC, line 2 the reason, removed when one
+# succeeds), and the snapshot it delivers. The stamp alone records only successes, so a
+# job failing on every run would emit no signal until its window expired.
 WHATSAPP_SYNC_STAMP = STATE_DIR / "whatsapp-sync.stamp"
 WHATSAPP_SYNC_FAIL = STATE_DIR / "whatsapp-sync.fail"
 WHATSAPP_SNAPSHOT_PATH = WHATSAPP_SNAPSHOT
@@ -92,7 +75,6 @@ _DISCOVERY_JOB_SUFFIXES = (
     ".noon-catchup",
     ".attachments",
     ".auth-watch",
-    ".reverse-ingest",
     # The only one of these a MIGRATED Mac still has, and therefore the only one
     # left to read the prefix off once ingestion has moved. Without it discovery
     # found nothing on this host, fell back to the generic literal, and every
@@ -158,7 +140,6 @@ STALE_THRESHOLDS = {
     "whatsapp_push_warn": timedelta(hours=24),
     "whatsapp_push": timedelta(days=7),
     "attachments_llm": timedelta(days=3),
-    "document_roots": timedelta(days=14),
     # The Mac's own pull. The plist fires 16x/day from 07:45 to 22:45, so the
     # widest legitimate gap is the 22:45 -> 07:45 overnight window; eleven hours
     # leaves two of slack. Under nine would report a false stale log every night.
@@ -235,7 +216,6 @@ LAUNCHD_MIGRATED_JOBS = {
     f"{LABEL_PREFIX}.calendar-sync": "Calendar sync",
     f"{LABEL_PREFIX}.attachments": "Attachment processing",
     f"{LABEL_PREFIX}.auth-watch": "Auth watcher",
-    f"{LABEL_PREFIX}.reverse-ingest": "Reverse ingest",
 }
 
 # What the Mac still owns after the migration, and therefore what a Mac-side run
@@ -246,7 +226,6 @@ LAUNCHD_MIGRATED_JOBS = {
 # while twelve pre-migration relic logs produced twelve false issues every run.
 LAUNCHD_LOCAL_JOBS = {
     f"{LABEL_PREFIX}.db-pull": "DB pull from VPS",
-    "com.plessas.document-sync-vps": "Document push to VPS",
 }
 
 LAUNCHD_JOBS = {**LAUNCHD_MIGRATED_JOBS, **LAUNCHD_LOCAL_JOBS}
@@ -265,8 +244,7 @@ SYSTEMD_UNITS = {
     "sb-calendar-sync.service": "Calendar sync",
     "sb-attachments.service": "Attachment processing",
     "sb-auth-watch.service": "Auth watcher",
-    "sb-reverse-ingest.service": "Reverse ingest",
-    # Registered late. The VPS runs eleven sb-* units but only the eight above
+    # Registered late. The VPS runs ten sb-* units but only the seven above
     # were listed, so these three had neither a job status nor a log-age signal
     # — the same hand-listed-subset gap that hid http-error from the SharePoint
     # tally. This dict is the source both check_jobs and check_sync_logs read,
@@ -1261,12 +1239,11 @@ def check_documents(db):
         "total": total,
         "latest": latest,
         "age": _age(latest),
-        # Deliberately not a staleness gate. These roots go months without a new
-        # file — 0 added in the 14 days to 2026-08-22 — so ageing the newest
-        # ingested document would page on the normal state of the source.
-        # Liveness for reverse-ingest is asserted by check_document_roots, which
-        # watches the sync stamp (job ran) and its failure marker (job failed)
-        # rather than the data. The age is exposed here for the report only.
+        # Deliberately not a staleness gate. OneDrive ingestion (the reverse-ingest scan
+        # and the laptop push) was retired on 2026-10-07, so what is left here is the
+        # frozen OneDrive documents plus the session notes and web imports that still
+        # arrive, and none of them has a cadence worth paging on. The age is exposed
+        # for the report only.
         "status": "OK",
     }
 
@@ -1295,119 +1272,6 @@ def _read_push_failure(marker: Path, last_success):
     return True, reason
 
 
-def check_document_roots(
-    roots=None,
-    now=None,
-    stamp: Path = DOCUMENT_SYNC_STAMP,
-    fail_marker: Path = DOCUMENT_SYNC_FAIL,
-):
-    """Freshness of the reverse-ingest *input*, not its output.
-
-    check_documents only proves the job wrote rows; it stays green when the
-    document roots are a frozen copy (a disconnected mirror whose newest file
-    is months old) because the job still runs and still writes. This looks at
-    the source.
-
-    Liveness comes from DOCUMENT_SYNC_STAMP when it is readable: newest mtime
-    alone could be manufactured by our own curate-docs job (retired 2026-10-07),
-    which mirrored attachments into these very roots (filename is no
-    discriminator — the operator uses the same naming convention). The files it
-    placed keep their mtimes, so the fallback stays unreliable until they age out.
-    Without a usable stamp we fall back to the newest mtime among ingestable
-    files and say so in the report.
-    """
-    roots = DOCUMENT_ROOTS if roots is None else [Path(r) for r in roots]
-    now = now or datetime.now(UTC)
-
-    per_root = []
-    missing = []
-    total = 0
-    newest = None
-    for root in roots:
-        if not root.is_dir():
-            missing.append(root.name)
-            per_root.append({"name": root.name, "files": 0, "age": None, "missing": True})
-            continue
-        files = 0
-        root_newest = None
-        for path in root.rglob("*"):
-            if path.suffix.lower() not in INGESTABLE_EXTENSIONS:
-                continue
-            try:
-                if not path.is_file():
-                    continue
-                mtime = datetime.fromtimestamp(path.stat().st_mtime, UTC)
-            except OSError:
-                continue
-            files += 1
-            # Clamp to `now`, like check_news does with published_at: one
-            # clock-skewed file dated in the future would otherwise become the
-            # "newest input", making the age negative and the check OK forever.
-            if mtime > now:
-                continue
-            if root_newest is None or mtime > root_newest:
-                root_newest = mtime
-        total += files
-        if root_newest is not None and (newest is None or root_newest > newest):
-            newest = root_newest
-        per_root.append(
-            {
-                "name": root.name,
-                "files": files,
-                "age": None if root_newest is None else now - root_newest,
-                "missing": False,
-            }
-        )
-
-    age = None if newest is None else now - newest
-
-    stamp_at = None
-    if stamp is not None:
-        try:
-            # errors="replace": a clobbered/binary stamp must not raise —
-            # main() runs the checks unguarded, so one bad byte here would kill
-            # the whole nightly report and send no email at all.
-            stamp_at = _utc(Path(stamp).read_text(errors="replace").strip())
-        except OSError:
-            stamp_at = None
-    stamp_age = None if stamp_at is None else now - stamp_at
-    # A stamp dated in the future is a clock-skewed write, not evidence of a
-    # live source. Same clamp as the mtime scan above; without it one bad write
-    # pins this check to OK forever.
-    if stamp_age is not None and stamp_age < timedelta(0):
-        stamp_age = None
-
-    if stamp_age is None:
-        note = "no sync stamp — using file mtimes"
-        stale = age is not None and age > STALE_THRESHOLDS["document_roots"]
-    else:
-        note = None
-        stale = stamp_age > STALE_THRESHOLDS["document_roots"]
-
-    # A failing push outranks both signals above. The stamp records only
-    # successes and is judged against a 14-day window, so a run that fails every
-    # time emits nothing until that window expires — 56 consecutive TCC denials
-    # reported OK for 8 days on exactly this path.
-    push_failing, fail_reason = _read_push_failure(fail_marker, stamp_at)
-    if push_failing:
-        stale = True
-        note = f"push FAILING: {fail_reason}" if fail_reason else "push FAILING"
-
-    return {
-        "name": "Doc Roots",
-        "total": total,
-        "latest": None if newest is None else newest.isoformat(),
-        "age": age,
-        "stamp_age": stamp_age,
-        "roots": per_root,
-        "missing": missing,
-        "note": note,
-        "stale": stale,
-        "push_failing": push_failing,
-        "status": "STALE" if stale else ("WARN" if missing or age is None else "OK"),
-    }
-
-
 def check_whatsapp(
     db,
     snapshot: Path | None = None,
@@ -1417,8 +1281,8 @@ def check_whatsapp(
 ):
     """Is the WhatsApp push from the bridge's Mac alive, and what does the store hold.
 
-    Judged by the push's own stamp, as check_document_roots judges the document
-    push, falling back to the delivered snapshot's mtime: message recency only
+    Judged by the push's own stamp, as the document push was until it was retired,
+    falling back to the delivered snapshot's mtime: message recency only
     says whether anyone wrote, which on a quiet week is nobody. A failure marker
     newer than the last success outranks both.
     """
@@ -1474,9 +1338,9 @@ def check_whatsapp(
 def check_news(db, news_db=None, now=None):
     """Upstream news database vs. what actually reached the brain.
 
-    Same question as check_document_roots, other source: the news pipeline can
-    keep publishing while ingestion silently stops, and every downstream check
-    still passes. STALE means the source moved on and we did not. Never raises
+    The source-side question, for the news pipeline: it can keep publishing while
+    ingestion silently stops, and every downstream check still passes. STALE means
+    the source moved on and we did not. Never raises
     — an absent upstream or a brain not backfilled yet is informational (N/A,
     like SharePoint without a session file), since those are steady states that
     would otherwise make every nightly report unhealthy. Only a corrupt/
@@ -1947,28 +1811,6 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
             # many, or the line stops adding up to the table.
             if not_content:
                 extra = extra[:-1] + f"; {not_content} not content)"
-        elif c["name"] == "Doc Roots":
-            if c.get("push_failing"):
-                # The marker names the cause; hedging about a disconnected
-                # source on top of it would only bury the actual reason.
-                extra = (
-                    f" (last success {format_age(c['stamp_age'])} ago)"
-                    if c.get("stamp_age") is not None
-                    else ""
-                )
-            elif c.get("stale"):
-                signal = (
-                    f"last push {format_age(c['stamp_age'])} ago"
-                    if c.get("stamp_age") is not None
-                    else f"newest input {format_age(c.get('age'))} old"
-                )
-                extra = f" ({signal} — source may be disconnected)"
-            elif c.get("missing"):
-                extra = f" (missing: {', '.join(c['missing'])})"
-            else:
-                extra = " (" + ", ".join(f"{r['name']} {r['files']:,}" for r in c["roots"]) + ")"
-            if c.get("note"):
-                extra += f" ({c['note']})"
         elif c["name"] == "News":
             if c.get("stale"):
                 extra = f" (upstream {format_age(c.get('lag'))} ahead of last ingested)"
@@ -2286,7 +2128,6 @@ def main():
         check_conversations(db),
         check_embeddings(db),
         check_documents(db),
-        check_document_roots(),
         check_whatsapp(db),
         check_news(db),
         check_sharepoint(db),

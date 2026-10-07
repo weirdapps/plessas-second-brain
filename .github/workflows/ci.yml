@@ -53,11 +53,6 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --frozen --no-build --extra dev
-      # zsh is a real test dependency: 8 of the 15 document-sync wrapper tests
-      # skip without it, and the wrapper is run by /bin/zsh in production. The
-      # `wrappers` job below already installs zsh for exactly this reason.
-      - name: Install zsh
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
       # -rs lists every skipped test with its reason. A skip in CI is a test that
       # runs NOWHERE, because the developer machine has the tool and never sees
       # the skip; printing them keeps that visible instead of silent.
@@ -99,9 +94,10 @@ jobs:
         run: bash scripts/pii-gauntlet.sh --mode=ci
   wrappers:
     # Syntax-only gate over the archived scheduler wrappers. Parses each script
-    # with the interpreter its shebang names — sync-documents-to-vps.sh is run by
-    # /bin/zsh in production (the only shell holding Full Disk Access on that
-    # Mac), so checking it with bash would validate a shell that never runs it.
+    # with the interpreter its shebang names. All of them are bash since the document
+    # push (run by /bin/zsh, the only shell holding Full Disk Access on that Mac) was
+    # retired on 2026-10-07; the zsh branch stays so one that returns is checked by
+    # the shell that runs it, not by bash.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

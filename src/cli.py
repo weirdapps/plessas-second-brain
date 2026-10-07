@@ -16,7 +16,6 @@ from src.config import (
     IMAGE_CLASSIFY_BUDGET_S,
     NEWS_DB_PATH,
     SHAREPOINT_DATA_DIR,
-    document_roots,
 )
 from src.llm_deadline import install_llm_deadline_for_this_process
 from src.store.file_sweep import SWEEP_POLICY_FILE
@@ -1293,7 +1292,12 @@ def cmd_sharepoint_refused(args):
 
 
 def cmd_reverse_ingest(args):
-    """Scan filesystem roots, dedup latest-version-per-logical-name, ingest survivors."""
+    """Scan the directories you name, dedup latest-version-per-logical-name, ingest survivors.
+
+    Explicit paths only. The scheduled scan of the OneDrive document trees was retired on
+    2026-10-07: document text comes from mail, and a file saved from mail into those trees
+    was ingested a second time as a twin of its attachment.
+    """
     from src.extract.attachment_pipeline import ingest_document, run_phase1, run_phase2
     from src.ingest.reverse_scan import scan_roots, select_files_to_ingest, topic_label
 
@@ -1301,7 +1305,12 @@ def cmd_reverse_ingest(args):
 
     roots = [Path(r).expanduser().resolve() for r in (args.root or [])]
     if not roots:
-        roots = document_roots()
+        print(
+            "Error: name the directories to scan with --root (repeatable). The scheduled "
+            "scan of the document trees was retired on 2026-10-07.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     print(f"Scanning {len(roots)} root(s):")
     for r in roots:
@@ -3563,13 +3572,13 @@ def main():
     # reverse-ingest command
     parser_reverse = subparsers.add_parser(
         "reverse-ingest",
-        help="Scan ~/Documents and ingest the latest version of each logical document",
+        help="Scan the directories you name and ingest the latest version of each logical document",
     )
     parser_reverse.add_argument(
         "--root",
         action="append",
         type=Path,
-        help="Directory to scan (repeatable; defaults to the National + Personal trees under the resolved document root)",
+        help="Directory to scan (repeatable; required, there is no default tree)",
     )
     parser_reverse.add_argument(
         "--workers",

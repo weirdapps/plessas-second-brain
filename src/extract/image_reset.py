@@ -31,6 +31,7 @@ from src.extract.image_classifier import (
     SIGNATURE_FREQUENCY_THRESHOLD,
     admit_large_images,
 )
+from src.extract.image_pipeline import file_on_disk
 
 # When MIN_SIGNATURE_OCCURRENCES landed (commit 3fafcef). A frequency verdict filed after it
 # met the floor when it was made.
@@ -76,18 +77,6 @@ class ResetPlan:
     attachment_rows: int = 0
 
 
-def _file_on_disk(conn: sqlite3.Connection, sha256: str) -> Path | None:
-    for (file_path,) in conn.execute(
-        "SELECT file_path FROM attachments WHERE sha256 = ? AND file_path IS NOT NULL"
-        " AND file_path NOT LIKE 'text:%' ORDER BY id",
-        (sha256,),
-    ):
-        path = Path(file_path)
-        if path.exists():
-            return path
-    return None
-
-
 def _opens(path: Path) -> bool:
     """Whether Stage 1 can read the size of this file now. Nothing is decoded."""
     try:
@@ -104,14 +93,14 @@ def find_misfiled(conn: sqlite3.Connection) -> ResetPlan:
         _FREQUENCY_SQL,
         (SIGNATURE_FLOOR_LANDED, SIGNATURE_FREQUENCY_THRESHOLD, MIN_SIGNATURE_OCCURRENCES),
     ).fetchall():
-        if _file_on_disk(conn, sha256) is None:
+        if file_on_disk(conn, sha256) is None:
             plan.frequency_no_file += 1
             continue
         plan.frequency.append(sha256)
         if seen < MIN_SIGNATURE_OCCURRENCES:
             plan.seen_under_floor += 1
     for (sha256,) in conn.execute(_DECODE_FAILED_SQL).fetchall():
-        path = _file_on_disk(conn, sha256)
+        path = file_on_disk(conn, sha256)
         if path is None:
             plan.decode_failed_no_file += 1
         elif _opens(path):

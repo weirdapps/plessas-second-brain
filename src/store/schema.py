@@ -493,6 +493,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_calendar_extraction_hash(conn)
     if current < 30:
         migrate_add_email_aliases(conn)
+    if current < 31:
+        migrate_add_image_transcription(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -634,6 +636,29 @@ def migrate_add_file_hashes(conn: sqlite3.Connection) -> None:
     if image_cols and "vision_attempts" not in image_cols:
         conn.execute(
             "ALTER TABLE inline_images ADD COLUMN vision_attempts INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.commit()
+
+
+def migrate_add_image_transcription(conn: sqlite3.Connection) -> None:
+    """v31: the text a content image shows, transcribed beside its one-line description.
+
+    The description lost the figures, labels and table cells of a chart or a screenshot.
+    vision_transcription holds them ('' when the image shows no text) and transcribed_at says
+    when. transcription_attempts counts failed calls, so an image the model keeps failing on is
+    given up after VISION_ATTEMPTS_LIMIT instead of being sent every night
+    (src/extract/image_pipeline.py run_transcription).
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(inline_images)")}
+    if not cols:
+        return
+    if "vision_transcription" not in cols:
+        conn.execute("ALTER TABLE inline_images ADD COLUMN vision_transcription TEXT")
+    if "transcribed_at" not in cols:
+        conn.execute("ALTER TABLE inline_images ADD COLUMN transcribed_at TIMESTAMP")
+    if "transcription_attempts" not in cols:
+        conn.execute(
+            "ALTER TABLE inline_images ADD COLUMN transcription_attempts INTEGER NOT NULL DEFAULT 0"
         )
     conn.commit()
 

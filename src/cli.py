@@ -647,9 +647,58 @@ def cmd_sweep_files(args):
     return 0
 
 
+# process-images transcribes the content images it leaves without text, inside the nightly
+# attachment pass's hour: a few a day in steady state (~5% of content images have no OCR text),
+# so a small slice keeps them current. A backlog is for `transcribe-images`.
+TRANSCRIBE_NIGHTLY_LIMIT = 50
+TRANSCRIBE_NIGHTLY_BUDGET_S = 300.0
+
+
+def _print_transcription(stats: dict) -> None:
+    print(f"  Transcribed: {stats['transcribed']} ({stats['empty']} showed no text)")
+    print(f"  Failed: {stats['failed']}, deferred (out of time): {stats['deferred']}")
+    print(f"  Missing files: {stats['missing']}")
+    print(f"  Attachment rows written: {stats['projected']}")
+
+
+def cmd_transcribe_images(args) -> int:
+    """Transcribe content images whose attachments hold no text from their file."""
+    from src.extract.image_pipeline import run_transcription
+    from src.store.schema import get_connection, run_migrations
+
+    db_path = str(args.db)
+    if not Path(db_path).exists():
+        print("Error: Database not found. Run 'brain load' first.")
+        return 1
+    conn = get_connection(db_path)
+    try:
+        run_migrations(conn)
+        stats = run_transcription(
+            conn,
+            limit=args.limit or None,
+            workers=args.workers,
+            dry_run=args.dry_run,
+            deadline_s=args.deadline_s,
+        )
+    finally:
+        conn.close()
+
+    print(f"Content images to transcribe (a file on disk): {stats['candidates']}")
+    if args.dry_run:
+        todo = min(stats["candidates"], args.limit) if args.limit else stats["candidates"]
+        print(f"  Missing files: {stats['missing']}")
+        print(f"  Would transcribe: {todo} (one vision call each)")
+        return 0
+    _print_transcription(stats)
+    # Every call failed: a dead stage must not read as a quiet night.
+    if stats["failed"] and not (stats["transcribed"] or stats["empty"]):
+        return 1
+    return 0
+
+
 def cmd_process_images(args):
     """Backfill image classification pipeline."""
-    from src.extract.image_pipeline import run_backfill
+    from src.extract.image_pipeline import run_backfill, run_transcription
     from src.store.schema import get_connection, run_migrations
 
     db_path = str(args.db)
@@ -684,6 +733,14 @@ def cmd_process_images(args):
         workers=args.workers,
         unprocessed_only=not args.reprocess,
     )
+    transcription = None
+    if not args.dry_run and not args.no_vision:
+        transcription = run_transcription(
+            conn,
+            limit=TRANSCRIBE_NIGHTLY_LIMIT,
+            workers=args.workers,
+            deadline_s=TRANSCRIBE_NIGHTLY_BUDGET_S,
+        )
 
     conn.close()
 
@@ -694,6 +751,10 @@ def cmd_process_images(args):
         print(f"  Recorded from the hash (file gone): {stats['recorded']}")
     print(f"  Missing: {stats['missing']}")
     print(f"  Failed: {stats['failed']}")
+    print(f"  Attachment rows given a description: {stats['projected']}")
+    if transcription is not None:
+        print("\nTranscription of content images:")
+        _print_transcription(transcription)
 
 
 # split-html holds a batch in memory until it writes it, so a batch ends at about
@@ -3319,6 +3380,28 @@ def main():
         help="Concurrent vision workers (default 1; >1 parallelizes the slow LLM calls)",
     )
     parser_process_img.set_defaults(func=cmd_process_images)
+
+    parser_transcribe = subparsers.add_parser(
+        "transcribe-images",
+        help="Transcribe the text, figures and table cells of content images whose"
+        " attachments hold no text, into searchable attachment text",
+    )
+    parser_transcribe.add_argument(
+        "--limit", type=int, default=100, help="Max images (default 100; 0 = all)"
+    )
+    parser_transcribe.add_argument(
+        "--workers", type=int, default=1, help="Concurrent vision workers (default 1)"
+    )
+    parser_transcribe.add_argument(
+        "--deadline-s",
+        type=float,
+        default=None,
+        help="Start no image after this many seconds; the rest wait for the next run",
+    )
+    parser_transcribe.add_argument(
+        "--dry-run", action="store_true", help="Count only, no vision calls"
+    )
+    parser_transcribe.set_defaults(func=cmd_transcribe_images)
 
     # Process SharePoint command
     parser_process_sp = subparsers.add_parser(

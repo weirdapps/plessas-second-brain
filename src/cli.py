@@ -491,6 +491,38 @@ def cmd_mail_reconcile(args):
     return 0
 
 
+def cmd_retry_stubs(args):
+    """Extract again the emails loaded as stubs, and replace each stub in place.
+
+    See src/extract/stub_retry.py. Exits 1 when an email failed again, 75 when
+    quota or an expired credential ended the run.
+    """
+    from src.extract.stub_retry import retry_stubs, select_stubs
+    from src.store.schema import get_connection as get_conn
+
+    conn = get_conn(str(args.db))
+    try:
+        if args.dry_run:
+            stubs = select_stubs(conn, args.since, args.limit)
+            print(f"{len(stubs):,} stub(s) would be extracted again")
+            for email_id, message_id in stubs[:20]:
+                print(f"  email {email_id}: {message_id}")
+            return 0
+        stats = retry_stubs(
+            conn, DATA_ROOT / "extracted", args.engine or EXTRACT_ENGINE, args.since, args.limit
+        )
+    finally:
+        conn.close()
+    print(
+        f"{stats['stubs']:,} stub(s): {stats['replaced']:,} extracted and replaced,"
+        f" {stats['failed']:,} failed"
+        + (" (stopped: quota or credentials)" if stats["stopped"] else "")
+    )
+    if stats["stopped"]:
+        return 75
+    return 1 if stats["failed"] else 0
+
+
 def _print_reconcile(report) -> None:
     from collections import Counter
 
@@ -3181,6 +3213,16 @@ def main():
         "--concurrency", type=int, default=2, help="get-mail calls at once (at most 2)"
     )
     parser_reconcile.set_defaults(func=cmd_mail_reconcile)
+
+    parser_stubs = subparsers.add_parser(
+        "retry-stubs",
+        help="Extract again the emails loaded without an extraction, replacing each stub",
+    )
+    parser_stubs.add_argument("--since", default=None, help="Only mail received from this date")
+    parser_stubs.add_argument("--limit", type=int, default=0, help="At most this many (0 = all)")
+    parser_stubs.add_argument("--engine", default=None, help="claude or gemini (default: config)")
+    parser_stubs.add_argument("--dry-run", action="store_true", help="List them; ask nothing")
+    parser_stubs.set_defaults(func=cmd_retry_stubs)
 
     parser_sweep = subparsers.add_parser(
         "sweep-files",

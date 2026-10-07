@@ -105,6 +105,33 @@ def test_a_failed_description_counts_and_stops_after_the_limit(conn, tmp_path, m
     )
 
 
+@pytest.mark.parametrize("failure", ["too large", "APIConnectionError"])
+def test_a_deferral_for_memory_or_an_outage_costs_no_attempt(conn, tmp_path, monkeypatch, failure):
+    """A giant screenshot is deferred while the host is short of memory, to be described when
+    it is quiet. Counted as an attempt, three busy runs gave it up unseen, and an outage did
+    the same to every image it met."""
+    from src.extract import policy_bridge
+    from src.extract.image_vision import VisionDecodeTooLarge
+
+    if failure == "too large":
+        error: Exception = VisionDecodeTooLarge("deferring until the host has room")
+    else:
+        cls = getattr(policy_bridge.anthropic, failure)
+        error = cls.__new__(cls)
+
+    def deferred(img_path, c):
+        raise error
+
+    _image(conn, _email(conn), "AAMk-1", _png(tmp_path / "a" / "giant.png", 9))
+    monkeypatch.setattr("src.extract.image_vision.classify_with_vision", deferred)
+
+    for _ in range(VISION_ATTEMPTS_LIMIT + 1):
+        stats = run_backfill(conn, unprocessed_only=True)
+        assert stats["failed"] == 1  # still reported, and still owed
+
+    assert conn.execute("SELECT vision_attempts FROM inline_images").fetchone()[0] == 0
+
+
 def test_stage1_again_keeps_the_attempts_and_the_occurrences(conn, tmp_path, monkeypatch):
     img = _png(tmp_path / "a" / "again.png", 5)
     _image(conn, _email(conn), "AAMk-1", img)

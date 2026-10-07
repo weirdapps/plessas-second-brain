@@ -306,11 +306,16 @@ def process_single_image(
             logger.error(f"Vision classification failed for {img_path}: {e}")
             # Counted, so an image the model keeps failing on is given up after
             # VISION_ATTEMPTS_LIMIT tries instead of being offered every run for ever.
-            conn.execute(
-                "UPDATE inline_images SET vision_attempts = vision_attempts + 1 WHERE sha256 = ?",
-                (sha256,),
-            )
-            conn.commit()
+            # Not when the service or the host failed rather than the image: a giant
+            # deferred for memory waits for a quiet run, and an outage must not give up
+            # every image it meets.
+            if not _service_failed(e):
+                conn.execute(
+                    "UPDATE inline_images SET vision_attempts = vision_attempts + 1"
+                    " WHERE sha256 = ?",
+                    (sha256,),
+                )
+                conn.commit()
             # The Stage-1 row and its occurrence stay — they are real
             # observations and the signature index is built from them. But the
             # image did NOT get described, and reporting that as success is how

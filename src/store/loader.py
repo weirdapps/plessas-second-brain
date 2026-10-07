@@ -216,8 +216,9 @@ def _moved(stored: str | None, staged: str | None) -> bool:
     return bool(staged) and staged != stored and (staged != "Inbox" or not stored)
 
 
-def _record_alias(conn: sqlite3.Connection, alias: str, email_id: int) -> None:
-    """Note that the stored email `email_id` also went by the Graph id `alias`.
+def record_alias(conn: sqlite3.Connection, alias: str, email_id: int) -> bool:
+    """Note that the stored email `email_id` also went by the Graph id `alias`;
+    whether it was new.
 
     A move to another folder mints a new id, and the attachment registrar resolves
     a directory named by it through this (src/export/outlook_attachments.py).
@@ -226,12 +227,14 @@ def _record_alias(conn: sqlite3.Connection, alias: str, email_id: int) -> None:
     known = conn.execute(
         "SELECT 1 FROM email_aliases WHERE message_id = ?", (str(alias),)
     ).fetchone()
-    if not known:
-        conn.execute(
-            "INSERT OR IGNORE INTO email_aliases (message_id, email_id, recorded_at)"
-            " VALUES (?, ?, datetime('now'))",
-            (str(alias), email_id),
-        )
+    if known:
+        return False
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO email_aliases (message_id, email_id, recorded_at)"
+        " VALUES (?, ?, datetime('now'))",
+        (str(alias), email_id),
+    )
+    return cur.rowcount > 0
 
 
 def _note_stored(conn: sqlite3.Connection, metadata: dict) -> bool:
@@ -256,7 +259,7 @@ def _note_stored(conn: sqlite3.Connection, metadata: dict) -> bool:
             (internet_message_id,),
         ).fetchone()
         if row is not None:
-            _record_alias(conn, message_id, row[0])
+            record_alias(conn, message_id, row[0])
     if row is None:
         return False
     if _moved(row[1], new_mailbox):

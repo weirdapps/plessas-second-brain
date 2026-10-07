@@ -237,13 +237,13 @@ def test_dispatcher_routes_xlsb_to_extract_xlsb(tmp_path):
 
 
 def test_dispatcher_still_routes_xlsx_to_extract_excel(tmp_path):
-    """Regression: .xlsx must still go to _extract_excel (openpyxl)."""
+    """Regression: .xlsx must still go to _extract_excel (openpyxl), when it is a zip."""
     from unittest.mock import patch
 
     from src.extract.attachment_extractors import extract_text_from_file
 
     f = tmp_path / "report.xlsx"
-    f.write_bytes(b"placeholder")
+    f.write_bytes(b"PK\x03\x04placeholder")
 
     with patch("src.extract.attachment_extractors._extract_excel") as mock_excel:
         mock_excel.return_value = {

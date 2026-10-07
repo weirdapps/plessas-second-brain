@@ -142,6 +142,21 @@ def test_a_run_where_no_get_mail_succeeds_uses_up_no_attempts(export):
     assert state.fetch_gave_up == []
 
 
+def test_a_staging_failure_keeps_the_retry_record(export, monkeypatch):
+    """Fetched but not staged, a retried message must stay on the list."""
+
+    def fail(messages, folder):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(outlook_export, "commit_messages_to_db", fail)
+    seed = {"b": {"received": "2026-10-01T01:00:00Z", "attempts": 1}}
+
+    with pytest.raises(OSError):
+        export(["a"], {"a": "upstream"}, retries=seed)
+
+    assert export.state().fetch_retries == seed
+
+
 def test_an_auth_loss_records_nothing_and_keeps_the_cursor(export):
     with pytest.raises(OutlookCliAuthRequired):
         export(["a", "b"], {"b": "auth"})

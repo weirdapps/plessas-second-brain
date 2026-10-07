@@ -27,6 +27,8 @@ SECOND_LARGEST_OBSERVED_PX = 10610 * 32768
 
 # Pillow warns above MAX_IMAGE_PIXELS and only raises above 2x it.
 PILLOW_HARD_REFUSAL_MULTIPLIER = 2
+# Pillow's own MAX_IMAGE_PIXELS, which every caller outside the image pipeline keeps.
+PILLOW_DEFAULT_LIMIT = int(1024 * 1024 * 1024 // 4 // 3)
 
 
 def test_small_image_passes_through_unchanged(tmp_path):
@@ -125,6 +127,26 @@ def test_bomb_limit_keeps_the_largest_admitted_image_within_host_memory():
     peak_gb = PILLOW_HARD_REFUSAL_MULTIPLIER * VISION_IMAGE_BOMB_LIMIT * 8.1 / 1e9
 
     assert peak_gb < 5.0, f"largest admitted image would peak at {peak_gb:.1f} GB"
+
+
+def test_a_giant_screenshot_reaches_the_memory_gate_under_the_default_process_guard(
+    tmp_path, monkeypatch
+):
+    """Vision admits the giant at its own open, not by raising Pillow's guard for the process.
+
+    The process keeps Pillow's default here, which refuses this 200 M px image outright. It
+    must still get past the open and stop where the decode cost is judged.
+    """
+    import src.extract.image_vision as image_vision
+
+    big = tmp_path / "report.png"
+    Image.new("1", (20_000, 10_000)).save(big)
+    monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", PILLOW_DEFAULT_LIMIT)
+    monkeypatch.setattr(image_vision, "_decode_fits_in_memory", lambda pixels: False)
+
+    with pytest.raises(VisionDecodeTooLarge):
+        _encode_image_for_vision(big)
+    assert Image.MAX_IMAGE_PIXELS == PILLOW_DEFAULT_LIMIT
 
 
 # Reading the answer out of the response. `resp.content[0].text` held only while

@@ -57,6 +57,12 @@ os.environ["BRAIN_CONFIG_FILE"] = os.path.join(
     tempfile.mkdtemp(prefix="brain-test-config-"), "absent"
 )
 os.environ.pop("SHAREPOINT_HOST", None)
+# The file sweep keeps the originals document curation has deferred, read from curation's
+# state under the home directory (src/store/file_sweep.py curate_state_file). A test must
+# not read this machine's, so point it at a path that cannot exist.
+os.environ["BRAIN_CURATE_STATE"] = os.path.join(
+    tempfile.mkdtemp(prefix="brain-test-curate-"), "absent.json"
+)
 # A replica's pull job stamps ~/.second-brain/db-pull.stamp, and write commands
 # refuse to run where it exists. CI has no stamp, so a test driving a write
 # command would pass there and exit 2 on a replica. tests/test_replica_guard.py

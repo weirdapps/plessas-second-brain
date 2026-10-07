@@ -8,6 +8,7 @@ import html
 import io
 import os
 import re
+import struct
 import time
 import zlib
 from email import policy
@@ -35,11 +36,11 @@ SKIP_MIME_TYPES = {
     "application/gzip",
 }
 
-SKIP_EXTENSIONS = {".mp4", ".mp3", ".wav", ".rar", ".7z", ".gz", ".wmz"}
+SKIP_EXTENSIONS = {".mp4", ".mp3", ".wav", ".rar", ".7z", ".gz"}
 
 # Formats with a reader of their own, chosen by the name: their bytes have no magic a sniff
 # knows, and senders declare them as anything (image/g3fax, application/gzip, x-coff).
-OWN_READER_EXTENSIONS = frozenset({".mso"})
+OWN_READER_EXTENSIONS = frozenset({".mso", ".wmz", ".emz"})
 # What one file may inflate to, all of its compressed layers together (an .mso container and
 # every object in it; a .wmz or .emz drawing). The largest .mso on the producer inflates to
 # 1.6 MB and the largest .wmz to 1.9 MB, and the VPS that reads them has 7 GB shared with the
@@ -49,6 +50,9 @@ INFLATE_MAX_BYTES = 64 << 20
 # An Office part the XML fallbacks read: refused past this size or past ZIP_MAX_RATIO, and the
 # read itself stops here whatever the zip header claims.
 XML_PART_MAX_BYTES = 64 << 20
+# Records a drawing's parser reads before it stops; the largest .wmz on the producer inflates to
+# 1.9 MB, a few tens of thousands of records.
+METAFILE_MAX_RECORDS = 500_000
 
 # A zip is unpacked into a temporary directory and every member extracted; nothing is kept.
 # The guards stop a hostile archive: too many members, too many bytes, a member compressed
@@ -155,6 +159,8 @@ def _extract_by_type(
             return protected
         if ext == ".mso":
             return _extract_mso(file_path, _depth, zip_seconds, ocr_seconds)
+        if ext in (".wmz", ".emz"):
+            return _extract_metafile(file_path)
         if ext == ".zip" or mime_type in ZIP_MIME_TYPES:
             sniffed = sniff_mime_type(file_path)
             if sniffed == "application/zip":
@@ -1167,6 +1173,179 @@ def _extract_rpmsg(path: str) -> dict:
         "status": "skipped",
         "error": f"unrecognised .rpmsg container (magic {magic.hex()}); not MSIPC",
     }
+
+
+# Windows charsets (a font's lfCharSet) and the code page WMF text drawn in that font is in.
+# SYMBOL_CHARSET (2) draws glyphs (bullets, arrows), not text, so it is left out.
+_CHARSET_CODEPAGES = {
+    0: "cp1252",
+    1: "cp1252",
+    77: "mac_roman",
+    128: "cp932",
+    129: "cp949",
+    134: "gbk",
+    136: "big5",
+    161: "cp1253",
+    162: "cp1254",
+    163: "cp1258",
+    177: "cp1255",
+    178: "cp1256",
+    186: "cp1257",
+    204: "cp1251",
+    222: "cp874",
+    238: "cp1250",
+    255: "cp437",
+}
+_SYMBOL_CHARSET = 2
+# WMF records that create an object, which takes the lowest free slot of the object table.
+_WMF_CREATES_OBJECT = frozenset({0x00F7, 0x0142, 0x01F9, 0x02FA, 0x02FB, 0x02FC, 0x06FF})
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def _drawing_note(kind: str, count: int) -> str:
+    if kind == "bound":
+        return f"stopped at the record bound ({METAFILE_MAX_RECORDS:,}); the rest unread, file kept"
+    return f"record {count:,} is malformed; the rest unread, file kept"
+
+
+def _wmf_runs(body: bytes) -> tuple[list[tuple[int, str]], str | None]:
+    """(baseline, text) of each text record of a WMF, and a note when the parse stopped early.
+
+    WMF text is 8-bit in the code page of the font selected when it is drawn, so the object
+    table is kept: a font takes the lowest free slot when created, SelectObject makes it
+    current, DeleteObject frees its slot.
+    """
+    runs: list[tuple[int, str]] = []
+    if len(body) < 18:
+        return runs, None
+    off = struct.unpack_from("<H", body, 2)[0] * 2
+    objects: list[int | None] = []
+    codepage: str | None = "cp1252"
+    count = 0
+    while off + 6 <= len(body):
+        if count >= METAFILE_MAX_RECORDS:
+            return runs, _drawing_note("bound", count)
+        count += 1
+        words, function = struct.unpack_from("<IH", body, off)
+        size = words * 2
+        if words < 3 or off + size > len(body):
+            return runs, _drawing_note("malformed", count)
+        if function == 0x0000:  # META_EOF
+            break
+        if function in _WMF_CREATES_OBJECT:
+            charset = body[off + 19] if function == 0x02FB and size >= 20 else -1
+            slot = objects.index(None) if None in objects else len(objects)
+            objects[slot : slot + 1] = [charset]
+        elif function in (0x012D, 0x01F0) and size >= 8:  # SelectObject, DeleteObject
+            (index,) = struct.unpack_from("<H", body, off + 6)
+            if index < len(objects):
+                if function == 0x01F0:
+                    objects[index] = None
+                elif (charset := objects[index]) is not None and charset >= 0:
+                    codepage = (
+                        None
+                        if charset == _SYMBOL_CHARSET
+                        else _CHARSET_CODEPAGES.get(charset, "cp1252")
+                    )
+        elif function in (0x0A32, 0x0521) and size >= 10:  # ExtTextOut, TextOut
+            if function == 0x0A32 and size >= 14:
+                y, _x, length, options = struct.unpack_from("<hhHH", body, off + 6)
+                start = off + 14 + (8 if options & 0x0006 else 0)
+            else:
+                (length,) = struct.unpack_from("<H", body, off + 6)
+                start = off + 8
+                after = start + length + length % 2
+                y = struct.unpack_from("<h", body, after)[0] if after + 2 <= off + size else 0
+            if codepage and start + length <= off + size:
+                text = body[start : start + length].decode(codepage, "replace")
+                text = _CONTROL_CHARS.sub("", text).strip()
+                if text:
+                    runs.append((y, text))
+        off += size
+    return runs, None
+
+
+def _emf_runs(raw: bytes) -> tuple[list[tuple[int, str]], str | None]:
+    """(baseline, text) of each EMR_EXTTEXTOUTW record of an EMF; its text is UTF-16."""
+    runs: list[tuple[int, str]] = []
+    off = count = 0
+    while off + 8 <= len(raw):
+        if count >= METAFILE_MAX_RECORDS:
+            return runs, _drawing_note("bound", count)
+        count += 1
+        kind, size = struct.unpack_from("<II", raw, off)
+        if size < 8 or size % 4 or off + size > len(raw):
+            return runs, _drawing_note("malformed", count)
+        if kind == 84 and size >= 76:  # EMR_EXTTEXTOUTW: an EmrText at offset 36
+            _x, y, chars, at = struct.unpack_from("<iiII", raw, off + 36)
+            if 76 <= at and at + 2 * chars <= size:
+                text = raw[off + at : off + at + 2 * chars].decode("utf-16-le", "replace")
+                text = _CONTROL_CHARS.sub("", text).strip()
+                if text:
+                    runs.append((y, text))
+        elif kind == 14:  # EMR_EOF
+            break
+        off += size
+    return runs, None
+
+
+def _join_runs(runs: list[tuple[int, str]]) -> str:
+    """Runs drawn one after another on one baseline make a line; a new baseline, a new line."""
+    lines: list[str] = []
+    line: list[str] = []
+    baseline = None
+    for y, text in runs:
+        if line and y != baseline:
+            lines.append(" ".join(line))
+            line = []
+        line.append(text)
+        baseline = y
+    if line:
+        lines.append(" ".join(line))
+    return "\n".join(lines)
+
+
+def _extract_metafile(path: str) -> dict:
+    """The text a gzip-wrapped drawing draws: a .wmz (WMF) or an .emz (EMF).
+
+    Office keeps the diagrams and charts of an HTML mail as these. On the producer 235 .wmz and
+    18 .emz were skipped unread, though the text records of 189 hold 50 characters or more.
+    The gzip layer inflates under the file's budget (INFLATE_MAX_BYTES), and the records are
+    walked with bounds: a record of size zero or one that runs past the end ends the walk, as
+    does METAFILE_MAX_RECORDS, and the text read before it is kept.
+    """
+    method = "emf" if path.lower().endswith(".emz") else "wmf"
+
+    def skipped(reason: str) -> dict:
+        return {"text": None, "method": method, "status": "skipped", "error": reason}
+
+    budget = _InflateBudget()
+    with open(path, "rb") as f:
+        data = f.read(budget.limit + 1)
+    if not data.startswith(b"\x1f\x8b"):
+        return skipped("not a gzip-compressed drawing")
+    try:
+        raw = budget.inflate(data, 16 + zlib.MAX_WBITS)
+    except _InflatesTooFar as e:
+        return skipped(f"drawing {e}; unread, file kept")
+    except zlib.error as e:
+        return {"text": None, "method": method, "status": "failed", "error": f"gzip: {e}"}
+    if raw.startswith(b"\xd7\xcd\xc6\x9a"):  # a placeable WMF: a 22-byte header first
+        method, (runs, note) = "wmf", _wmf_runs(raw[22:])
+    elif len(raw) >= 44 and raw[:4] == b"\x01\x00\x00\x00" and raw[40:44] == b" EMF":
+        method, (runs, note) = "emf", _emf_runs(raw)
+    elif raw[:4] in (b"\x01\x00\x09\x00", b"\x02\x00\x09\x00"):
+        method, (runs, note) = "wmf", _wmf_runs(raw)
+    else:
+        return skipped("not a Windows metafile")
+    text = _truncate(_join_runs(runs))
+    if not text:
+        return skipped(f"no text in the drawing; {note}" if note else "no text in the drawing")
+    if _apply_noise_filter(text):
+        return skipped(
+            f"Insufficient text extracted; {note}" if note else "Insufficient text extracted"
+        )
+    return {"text": text, "method": method, "status": "extracted", "error": note}
 
 
 def _copy_at_most(src, dst, limit: int) -> int | None:

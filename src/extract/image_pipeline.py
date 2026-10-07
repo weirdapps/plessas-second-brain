@@ -107,7 +107,7 @@ def project_vision_text(conn: sqlite3.Connection) -> int:
     written = 0
     for ac_id, description, transcription, stored_text, stored_summary, method in rows:
         summary = redact_secrets(description)
-        text = f"{summary}\n\n{transcription}" if transcription else summary
+        text = "\n\n".join(part for part in (summary, transcription) if part)
         if method == "vision" and stored_text == text and stored_summary == summary:
             continue
         conn.execute(

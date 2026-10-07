@@ -151,6 +151,26 @@ def test_v31_gives_images_a_transcription_beside_the_description(conn):
     assert TRANSCRIPTION_COLUMNS <= _cols(conn)
 
 
+def test_v31_loses_a_race_cleanly(tmp_path):
+    """Units start together after a deploy: the loser reads the columns as missing, then
+    finds them there when it ALTERs. That must be a no-op, not a failed run."""
+    import sqlite3
+
+    class StaleRead(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if sql.startswith("PRAGMA table_info(inline_images)"):
+                return super().execute("SELECT 0, 'sha256' UNION ALL SELECT 1, 'width'")
+            return super().execute(sql, *args)
+
+    path = tmp_path / "raced.db"
+    create_database(str(path)).close()
+    racer = sqlite3.connect(path, factory=StaleRead)
+
+    migrate_add_image_transcription(racer)  # must not raise
+
+    racer.close()
+
+
 # --- the transcription call ------------------------------------------------------------------
 
 
@@ -319,6 +339,21 @@ def test_the_projection_writes_each_row_once(conn, tmp_path):
 
     assert project_vision_text(conn) == 1
     assert project_vision_text(conn) == 0
+
+
+def test_an_image_described_with_nothing_keeps_just_its_text(conn, tmp_path):
+    # parse_vision_response files "CONTENT:" with nothing after it as content, described "".
+    sha, att_id = _image(conn, tmp_path)
+    conn.execute(
+        "UPDATE inline_images SET vision_description = '', vision_transcription = ?"
+        " WHERE sha256 = ?",
+        (TRANSCRIPTION, sha),
+    )
+    conn.commit()
+
+    project_vision_text(conn)
+
+    assert _content_row(conn, att_id)[0] == TRANSCRIPTION
 
 
 def test_the_image_pass_makes_a_new_description_searchable(conn, tmp_path, monkeypatch):

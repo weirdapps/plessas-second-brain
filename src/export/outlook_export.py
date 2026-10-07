@@ -7,6 +7,7 @@ path. Forward-only: historical data stays in the existing DB untouched.
 
 import logging
 import re
+import subprocess
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -31,6 +32,15 @@ DEFAULT_SELECT_FIELDS = (
     "Id,Subject,From,ToRecipients,CcRecipients,ReceivedDateTime,"
     "HasAttachments,IsRead,WebLink,ConversationId,InternetMessageId"
 )
+
+# A listed message whose get-mail fails is fetched again by its id on later runs
+# (the cursor has moved past it), at most this many runs. Only a run in which some
+# get-mail succeeded counts one, so an outage uses up no attempts. A run takes on
+# at most FETCH_RETRIES_PER_RUN of them, and the last FETCH_GAVE_UP_KEPT given up
+# stay in the cursor file; `mail-reconcile` lists whatever is still missing.
+FETCH_MAX_ATTEMPTS = 5
+FETCH_RETRIES_PER_RUN = 50
+FETCH_GAVE_UP_KEPT = 200
 
 
 def parse_received_dt(iso: str) -> datetime:
@@ -87,14 +97,21 @@ def get_one_message_body(message_id: str, body_mode: str = "html") -> dict | Non
     """Fetch a single message's full body via outlook-cli get-mail.
 
     Returns None (logged) when the response can't be parsed or is missing the
-    fields the sync relies on. A single malformed message must not crash the
-    whole run — otherwise it wedges the cursor and the mailbox goes stale.
+    fields the sync relies on, or when the call fails for this message alone (an
+    upstream error such as a 404 or a throttle, or a timeout). A single bad
+    message must not crash the whole run, or it wedges the cursor and the mailbox
+    goes stale; run_hourly_sync records it and fetches it again on a later run.
     OutlookCliAuthRequired is left to propagate (the batch aborts on auth loss).
     """
     try:
         msg = run_outlook_cli(["get-mail", message_id, "--body", body_mode])
     except ValueError as e:  # json.JSONDecodeError is a ValueError subclass
         logger.warning("get-mail unparseable for %s — skipping: %s", message_id, e)
+        return None
+    except OutlookCliAuthRequired:
+        raise
+    except (OutlookCliError, subprocess.TimeoutExpired) as e:
+        logger.warning("get-mail failed for %s: %s", message_id, e)
         return None
     if not isinstance(msg, dict) or not msg.get("Id") or not msg.get("ReceivedDateTime"):
         keys = list(msg)[:6] if isinstance(msg, dict) else type(msg).__name__
@@ -319,28 +336,33 @@ def run_hourly_sync(
                 "Cannot safely advance cursor — older messages would be silently lost. "
                 "Re-run with --max larger than the actual backlog, or backfill explicitly."
             )
-        if not summaries:
+        listed = {s["Id"] for s in summaries}
+        retry_ids = [i for i in state.fetch_retries if i not in listed][:FETCH_RETRIES_PER_RUN]
+        if not summaries and not retry_ids:
             state.last_sync_completed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
             state.messages_in_last_run = 0
             state.consecutive_failures = 0
             save_outlook_sync_state(state_path, state)
             return {"messages": 0, "status": "ok"}
 
-        # 3. Fetch full bodies concurrently. Malformed/incomplete responses come
-        # back as None (logged) and are dropped — one bad message must not crash
-        # the run, or the cursor wedges and the whole mailbox goes stale.
-        ids = [m["Id"] for m in summaries]
+        # 3. Fetch full bodies concurrently, with the messages earlier runs could
+        # not fetch. A failure comes back as None (logged): one bad message must
+        # not crash the run, or the cursor wedges and the whole mailbox goes stale.
+        # It is recorded instead, and fetched by its id on a later run.
+        ids = [m["Id"] for m in summaries] + retry_ids
         full_messages = [
             m for m in fetch_bodies_concurrent(ids, concurrency=concurrency) if m is not None
         ]
-        skipped = len(ids) - len(full_messages)
-        if skipped:
+        fetched = {m["Id"] for m in full_messages}
+        failed = [i for i in ids if i not in fetched]
+        if failed:
             logger.warning(
-                "%s: skipped %d/%d messages with unparseable get-mail output",
+                "%s: %d/%d get-mail calls failed; recorded to fetch again on a later run",
                 folder,
-                skipped,
+                len(failed),
                 len(ids),
             )
+        _note_fetch_failures(state, summaries, fetched, failed, counted=bool(full_messages))
 
         # 4. Commit to DB (staging). Skip when everything in the window was dropped.
         if full_messages:
@@ -366,21 +388,25 @@ def run_hourly_sync(
 
         # 5. Update state cursor — advance over the full SEEN window (summaries
         # always carry ReceivedDateTime), not just the bodies we fetched, so a
-        # skipped/malformed message can't wedge the cursor and stall the mailbox.
-        latest_received = max(parse_received_dt(s["ReceivedDateTime"]) for s in summaries)
-        latest_id = next(
-            s["Id"]
-            for s in summaries
-            if parse_received_dt(s["ReceivedDateTime"]) == latest_received
-        )
-        state.last_seen_received_at = latest_received.isoformat().replace("+00:00", "Z")
-        state.last_seen_message_id = latest_id
+        # failed message can't wedge the cursor and stall the mailbox: it is in
+        # state.fetch_retries. A run that only fetched retries leaves it alone.
+        if summaries:
+            latest_received = max(parse_received_dt(s["ReceivedDateTime"]) for s in summaries)
+            latest_id = next(
+                s["Id"]
+                for s in summaries
+                if parse_received_dt(s["ReceivedDateTime"]) == latest_received
+            )
+            state.last_seen_received_at = latest_received.isoformat().replace("+00:00", "Z")
+            state.last_seen_message_id = latest_id
         state.messages_in_last_run = len(full_messages)
         state.last_sync_completed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         state.consecutive_failures = 0
         save_outlook_sync_state(state_path, state)
         return {
             "messages": len(full_messages),
+            "failed": len(failed),
+            "retried": len(retry_ids),
             "attachments": attachment_summary,
             "status": "ok",
         }
@@ -393,6 +419,43 @@ def run_hourly_sync(
         state.consecutive_failures += 1
         save_outlook_sync_state(state_path, state)
         raise
+
+
+def _note_fetch_failures(
+    state: OutlookSyncState,
+    summaries: list[dict],
+    fetched: set[str],
+    failed: list[str],
+    counted: bool,
+) -> None:
+    """Record the messages whose get-mail failed, to be fetched by id on later runs.
+
+    A failure counts toward FETCH_MAX_ATTEMPTS only when `counted`, a run in which
+    some get-mail succeeded: an outage says nothing about the messages. One that
+    reaches the cap is given up, logged, and kept at the end of fetch_gave_up.
+    """
+    received = {s["Id"]: s.get("ReceivedDateTime") for s in summaries}
+    for message_id in fetched:
+        state.fetch_retries.pop(message_id, None)
+    for message_id in failed:
+        entry = state.fetch_retries.setdefault(
+            message_id, {"received": received.get(message_id), "attempts": 0}
+        )
+        if counted:
+            entry["attempts"] += 1
+        if entry["attempts"] >= FETCH_MAX_ATTEMPTS:
+            del state.fetch_retries[message_id]
+            state.fetch_gave_up = [*state.fetch_gave_up, {"id": message_id, **entry}][
+                -FETCH_GAVE_UP_KEPT:
+            ]
+            logger.error(
+                "%s: gave up fetching %s (received %s) after %d runs; "
+                "`python -m src.cli mail-reconcile` lists the messages the store lacks",
+                state.folder,
+                message_id,
+                entry["received"],
+                entry["attempts"],
+            )
 
 
 # The names the production wrapper has always passed, so a run that takes the

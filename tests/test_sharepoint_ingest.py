@@ -395,13 +395,40 @@ def test_a_page_linked_from_two_emails_is_one_document(conn, monkeypatch):
     assert conn.execute("SELECT COUNT(*) FROM attachments").fetchone()[0] == 1
 
 
-def test_a_page_with_no_text_makes_no_document(conn, monkeypatch):
+def test_a_page_whose_body_holds_no_text_is_stored_by_its_title(conn, monkeypatch):
+    """A news page that is a banner and a picture has a title and nothing else to read. It
+    used to make no document while its link was recorded 'ok', so it was never offered again:
+    43 links to 15 such pages on the producer held nothing. Its title is its text."""
     _fake_page(monkeypatch, html="<div><img src='banner.png'></div>")
 
     result, document = fetch_and_ingest(conn, PAGE, "AAMk-1")
 
-    assert (result.status, document) == ("ok", None)
+    assert result.status == "ok" and document
+    assert _text_of(conn, document) == "Launch"
+    method = conn.execute(
+        "SELECT ac.extraction_method FROM attachment_content ac"
+        " JOIN attachments a ON a.id = ac.attachment_id WHERE a.message_id = ?",
+        (document,),
+    ).fetchone()[0]
+    assert method == "sharepoint-page-title"
+
+
+def test_a_page_with_neither_text_nor_title_is_not_settled(conn, monkeypatch):
+    """Nothing came back to store, so the link must stay in the retry pool rather than be
+    recorded done with no document."""
+    from src.export.sharepoint_fetcher import retry_candidates
+
+    _fake_page(monkeypatch, html="<div><img src='banner.png'></div>", title="")
+
+    result, document = fetch_and_ingest(conn, PAGE, "AAMk-1")
+    record_link_in_db(
+        conn, url=PAGE, message_id="AAMk-1", status=result.status, document_message_id=document
+    )
+
+    assert (result.status, document) == ("no-text", None)
+    assert result.error_message
     assert conn.execute("SELECT COUNT(*) FROM attachments").fetchone()[0] == 0
+    assert [u for u, _m in retry_candidates(conn)] == [PAGE]
 
 
 def test_a_page_that_fails_to_read_carries_its_status(conn, monkeypatch):

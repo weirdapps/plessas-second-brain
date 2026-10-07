@@ -495,6 +495,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_email_aliases(conn)
     if current < 31:
         migrate_add_image_transcription(conn)
+    if current < 32:
+        migrate_add_attachment_content_indexes(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -666,6 +668,51 @@ def migrate_add_image_transcription(conn: sqlite3.Connection) -> None:
             if "duplicate column name" not in str(e):
                 raise
     conn.commit()
+
+
+# The indexes v32 builds. Each holds exactly the columns one query needs, so SQLite answers that
+# query from the index and never walks the overflow pages of extracted_text, which sits ahead of
+# every column behind it. The expressions are the queries' own, so the planner matches them.
+ATTACHMENT_CONTENT_INDEXES = (
+    # src/store/file_sweep.py REGISTERED_SQL: every attachment joined to its content row.
+    (
+        "idx_attachment_content_sweep",
+        "attachment_id, extraction_status, extraction_method, extraction_error,"
+        " extracted_at, length(extracted_text)",
+    ),
+    # scripts/health_check.py LATEST_LLM_EXTRACTION_SQL.
+    ("idx_attachment_content_llm_extracted", "llm_status, llm_extracted_at"),
+    # scripts/health_check.py SUMMARISED_ATTACHMENT_IDS_SQL; attachment_id for its join.
+    ("idx_attachment_content_summary_length", "llm_status, length(summary), attachment_id"),
+)
+
+
+def migrate_add_attachment_content_indexes(conn: sqlite3.Connection) -> None:
+    """v32: covering indexes for the sweep and the health check on attachment_content.
+
+    extracted_text sits ahead of the columns those queries read, and a column behind a long
+    text is reached through the text's overflow pages. On the producer the text is 3 GB, so the
+    sweep's classification read all of it every hour (160 s with a cold cache, inside the sync's
+    time budget) and the nightly check read it three times (8.5 min against a 300 s unit limit,
+    killed twice).
+
+    Each index is built by reading the table once, a few minutes on the producer, with the
+    write lock held, so the wait for the lock is raised to thirty minutes, as v22 does. On the
+    producer run `python -m src.cli migrate` with the timers stopped; this is quick once the
+    indexes exist, and safe to repeat.
+    """
+    if not _table_exists(conn, "attachment_content"):
+        return
+    if conn.in_transaction:
+        conn.commit()
+    busy_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    conn.execute("PRAGMA busy_timeout = 1800000")
+    try:
+        for name, columns in ATTACHMENT_CONTENT_INDEXES:
+            conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON attachment_content({columns})")
+        conn.commit()
+    finally:
+        conn.execute(f"PRAGMA busy_timeout = {int(busy_ms)}")
 
 
 def migrate_add_text_documents(conn: sqlite3.Connection) -> None:

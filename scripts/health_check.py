@@ -639,6 +639,20 @@ def _holds_only_copies(directory: Path, held: set[str], sizes: set[int] | None) 
     return True
 
 
+# Two attachment_content queries served by covering indexes (schema v32, src/store/schema.py
+# ATTACHMENT_CONTENT_INDEXES). Neither may touch a column its index lacks: extracted_text sits
+# ahead of every column behind it, so one more column and every stored text is read again.
+LATEST_LLM_EXTRACTION_SQL = (
+    "SELECT MAX(llm_extracted_at) FROM attachment_content WHERE llm_status = 'extracted'"
+)
+# length(summary) > 0 is `summary IS NOT NULL AND summary != ''`, in the form the index holds.
+SUMMARISED_ATTACHMENT_IDS_SQL = (
+    "SELECT ac.id FROM attachment_content ac JOIN attachments a "
+    "ON a.id = ac.attachment_id WHERE ac.llm_status = 'extracted' "
+    "AND length(ac.summary) > 0"
+)
+
+
 def check_attachments(db):
     total = db.execute("SELECT COUNT(*) FROM attachment_content").fetchone()[0]
     extracted = db.execute(
@@ -671,9 +685,7 @@ def check_attachments(db):
     llm_failed = db.execute(
         "SELECT COUNT(*) FROM attachment_content WHERE llm_status = 'failed'"
     ).fetchone()[0]
-    latest_llm = db.execute(
-        "SELECT MAX(llm_extracted_at) FROM attachment_content WHERE llm_status = 'extracted'"
-    ).fetchone()[0]
+    latest_llm = db.execute(LATEST_LLM_EXTRACTION_SQL).fetchone()[0]
 
     age = _age(latest_llm)
 
@@ -982,12 +994,7 @@ def _embedding_coverage(db, ids) -> dict[str, tuple[int, int]]:
             "SELECT id FROM emails WHERE summary IS NOT NULL AND summary != ''",
             lambda i: i,
         ),
-        "attachments": (
-            "SELECT ac.id FROM attachment_content ac JOIN attachments a "
-            "ON a.id = ac.attachment_id WHERE ac.llm_status = 'extracted' "
-            "AND ac.summary IS NOT NULL AND ac.summary != ''",
-            lambda i: -i,
-        ),
+        "attachments": (SUMMARISED_ATTACHMENT_IDS_SQL, lambda i: -i),
         "conversations": (
             "SELECT id FROM conversations WHERE summary IS NOT NULL AND summary != ''",
             lambda i: CONVERSATION_ID_OFFSET - i,

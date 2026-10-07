@@ -6,7 +6,7 @@ Uses atomic writes (temp file + rename) to prevent corruption.
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
@@ -96,6 +96,11 @@ class OutlookSyncState:
     # The folder this cursor walks. None in every file written before the field
     # existed; such a cursor adopts the folder of its next run.
     folder: str | None = None
+    # Listed messages whose get-mail failed: Graph id -> {"received", "attempts"}.
+    # The cursor moves past them, so later runs fetch them by id
+    # (src/export/outlook_export.py), and those given up are kept, newest last.
+    fetch_retries: dict = field(default_factory=dict)
+    fetch_gave_up: list = field(default_factory=list)
 
 
 def load_outlook_sync_state(path: Path) -> OutlookSyncState:

@@ -38,6 +38,25 @@ SKIP_MIME_TYPES = {
 
 SKIP_EXTENSIONS = {".mp4", ".mp3", ".wav", ".rar", ".7z", ".gz"}
 
+# Why a skipped format is not read, by extension and by declared type. Every skip records a
+# reason: 564 producer rows were skipped with none, which cannot be told from a bug.
+_VIDEO, _AUDIO = "video: no text to read", "audio: no text to read"
+SKIP_REASONS = {
+    ".mp4": _VIDEO,
+    ".mp3": _AUDIO,
+    ".wav": _AUDIO,
+    ".rar": "RAR archive: no reader for this format",
+    ".7z": "7-Zip archive: no reader for this format",
+    ".gz": "gzip archive: no reader for this format",
+    "video/mp4": _VIDEO,
+    "audio/mpeg": _AUDIO,
+    "audio/x-wav": _AUDIO,
+    "audio/wav": _AUDIO,
+    "application/x-rar-compressed": "RAR archive: no reader for this format",
+    "application/x-7z-compressed": "7-Zip archive: no reader for this format",
+    "application/gzip": "gzip archive: no reader for this format",
+}
+
 # Formats with a reader of their own, chosen by the name: their bytes have no magic a sniff
 # knows, and senders declare them as anything (image/g3fax, application/gzip, x-coff).
 OWN_READER_EXTENSIONS = frozenset({".mso", ".wmz", ".emz"})
@@ -118,7 +137,8 @@ def _extract_by_type(
 
     # Skip unsupported types
     if ext in SKIP_EXTENSIONS:
-        return {"text": None, "method": None, "status": "skipped", "error": None}
+        reason = SKIP_REASONS.get(ext, f"{ext}: no reader for this format")
+        return {"text": None, "method": None, "status": "skipped", "error": reason}
 
     # A declared archive or media type is a claim, and senders make it wrongly:
     # 60 .docx and 15 .pptx on the replica arrived labelled application/zip and
@@ -128,7 +148,8 @@ def _extract_by_type(
     if mime_type in SKIP_MIME_TYPES and ext not in OWN_READER_EXTENSIONS:
         sniffed = sniff_mime_type(file_path)
         if sniffed is None or sniffed in SKIP_MIME_TYPES:
-            return {"text": None, "method": None, "status": "skipped", "error": None}
+            reason = SKIP_REASONS.get(mime_type, f"{mime_type}: no reader for this format")
+            return {"text": None, "method": None, "status": "skipped", "error": reason}
         mime_type = sniffed
 
     # Check file exists
@@ -167,7 +188,12 @@ def _extract_by_type(
                 seconds = ZIP_MAX_SECONDS if zip_seconds is None else zip_seconds
                 return _extract_zip(file_path, _depth, seconds, ocr_seconds)
             if sniffed is None:
-                return {"text": None, "method": None, "status": "skipped", "error": None}
+                return {
+                    "text": None,
+                    "method": None,
+                    "status": "skipped",
+                    "error": "declared a zip archive, but the bytes are not one",
+                }
             mime_type = sniffed  # an Office document sent as a zip
         # The Office 2007+ readers open a zip, so a file named or labelled as one is sent to them
         # only when it is one. Anything else goes by its bytes (the else branch below): a legacy

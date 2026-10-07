@@ -491,6 +491,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_text_documents(conn)
     if current < 29:
         migrate_add_calendar_extraction_hash(conn)
+    if current < 30:
+        migrate_add_email_aliases(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -861,6 +863,26 @@ def migrate_add_calendar_extraction_hash(conn: sqlite3.Connection) -> None:
             if "duplicate column name" not in str(e):
                 raise
         conn.commit()
+
+
+def migrate_add_email_aliases(conn: sqlite3.Connection) -> None:
+    """v30: the other Graph ids a stored email went by.
+
+    Moving a message to another folder gives it a new Graph id. The Archive export
+    stages the moved copy under that id, and the loader dropped it as a duplicate of
+    the email it held (same RFC822 Message-ID) without noting the id, so the
+    attachment directory downloaded under it never matched an email: 858 of 885
+    orphan directories on 2026-10-07. An alias goes with its email.
+    """
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS email_aliases (
+            message_id TEXT PRIMARY KEY,
+            email_id INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+            recorded_at TEXT NOT NULL
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_email_aliases_email_id ON email_aliases(email_id)")
+    conn.commit()
 
 
 def migrate_teams_call_records_are_system(conn: sqlite3.Connection) -> None:

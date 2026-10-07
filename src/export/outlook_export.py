@@ -362,11 +362,12 @@ def run_hourly_sync(
                 len(failed),
                 len(ids),
             )
-        _note_fetch_failures(state, summaries, fetched, failed, counted=bool(full_messages))
 
         # 4. Commit to DB (staging). Skip when everything in the window was dropped.
         if full_messages:
             commit_messages_to_db(full_messages, folder=folder)
+        # Once staged: a run that fails before this leaves the record as it was.
+        _note_fetch_failures(state, summaries, fetched, failed, counted=bool(full_messages))
 
         # 4b. Download attachments for messages that have them.
         # This is post-commit because attachment availability is best-effort —

@@ -358,6 +358,8 @@ def cmd_process_attachments(args):
         print(f"  Extracted: {stats['extracted']}")
         print(f"  Failed: {stats['failed']}")
         print(f"  Skipped: {stats['skipped']}")
+        if stats.get("encrypted"):
+            print(f"  Encrypted (no text without a key): {stats['encrypted']}")
         if stats.get("reused"):
             print(f"  Reused (same file): {stats['reused']}")
         if stats.get("deferred"):
@@ -2037,9 +2039,11 @@ def cmd_sync(args):
     p1_stats = run_phase1(db_path, deadline_s=PHASE1_SYNC_DEADLINE_S)
     if p1_stats["processed"] > 0:
         deferred = p1_stats.get("deferred", 0)
+        encrypted = p1_stats.get("encrypted", 0)
         print(
             f"  Phase 1: {p1_stats['extracted']} text extracted, "
             f"{p1_stats['failed']} failed, {p1_stats['skipped']} skipped"
+            + (f", {encrypted} encrypted" if encrypted else "")
             + (f", {deferred} deferred (out of time)" if deferred else "")
         )
         p2_stats = run_phase2(

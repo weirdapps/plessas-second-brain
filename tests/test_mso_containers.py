@@ -87,7 +87,7 @@ def test_bytes_that_are_not_a_container_are_skipped_with_the_reason(tmp_path):
 
 
 def test_a_container_that_inflates_past_the_ceiling_is_skipped(tmp_path, monkeypatch):
-    monkeypatch.setattr(ax, "MSO_MAX_INFLATED", 1024)
+    monkeypatch.setattr(ax, "INFLATE_MAX_BYTES", 1024)
     data = packed(ole_file([("_1", STREAM, b"\x00" * 8192)]))
 
     out = extract_text_from_file(_write(tmp_path, "oledata.mso", data), "")

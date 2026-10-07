@@ -129,6 +129,60 @@ def test_an_already_unescaped_url_is_left_alone():
     assert urls == ["https://contoso.sharepoint.com/sites/Team/SitePages/Economy-&-Markets.aspx"]
 
 
+# --- Safe Links keeps a second copy of the URL, outside the href ----------------
+# Outlook's Safe Links leaves the address it rewrote in originalsrc="...". The scan
+# anchored on href= alone, so that copy fell through to the bare scan, which ends a
+# URL at an apostrophe: beside the full page link it recorded "...Sales-Rally-Q2-",
+# a link that 404s for ever, and link_kind reads such a stub as no content at all.
+# Four of the 45 links given up on the producer on 2026-10-07 were made this way.
+
+
+def test_a_url_in_any_quoted_attribute_is_read_to_its_closing_quote():
+    page = "https://contoso.sharepoint.com/sites/Team/SitePages/Sales-Rally-Q2-'2025.aspx"
+    html = f'<a href="{page}?xsdata=abc" originalsrc="{page}">here</a>'
+
+    urls = extract_sharepoint_urls(html)
+
+    assert urls == [page, f"{page}?xsdata=abc"]
+
+
+def test_a_bare_url_keeps_an_apostrophe_inside_its_path():
+    """A plain-text body or the visible text of a link has no quote to stop on."""
+    text = "Agenda: https://contoso.sharepoint.com/sites/Team/SitePages/Q2-'2025.aspx today"
+
+    urls = extract_sharepoint_urls(text)
+
+    assert urls == ["https://contoso.sharepoint.com/sites/Team/SitePages/Q2-'2025.aspx"]
+
+
+def test_a_bare_url_in_apostrophes_still_ends_at_the_closing_one():
+    text = (
+        "open 'https://contoso.sharepoint.com/sites/Team/a.aspx', then"
+        " 'https://contoso.sharepoint.com/sites/Team/b.aspx' too"
+    )
+
+    urls = extract_sharepoint_urls(text)
+
+    assert urls == [
+        "https://contoso.sharepoint.com/sites/Team/a.aspx",
+        "https://contoso.sharepoint.com/sites/Team/b.aspx",
+    ]
+
+
+def test_markup_escaped_twice_is_unescaped_until_it_is_plain():
+    """An href inside markup that was itself escaped carries "&amp;amp;". Unescaped
+    once, the query keeps "amp;" in its keys ("?amp%3Bat=..."), a spelling no
+    working link to the same page shares."""
+    html = (
+        "&lt;a href=&quot;https://contoso.sharepoint.com/sites/Team/SitePages/News.aspx"
+        "?at=9&amp;amp;id=4&quot;&gt;news&lt;/a&gt;"
+    )
+
+    urls = extract_sharepoint_urls(html)
+
+    assert urls == ["https://contoso.sharepoint.com/sites/Team/SitePages/News.aspx?at=9&id=4"]
+
+
 # --- Abandoned links must get a second chance --------------------------------
 # The retry pass filters on `attempts < MAX_SHAREPOINT_ATTEMPTS`, which makes the
 # cap an ABANDONMENT rather than a throttle. Between 2026-07-30 and 2026-08-10

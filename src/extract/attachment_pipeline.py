@@ -175,7 +175,8 @@ def run_phase1(
             SIGTERMed mid-file. Same contract as run_backfill(deadline_s=...).
 
     Returns:
-        Dict with processing stats: processed, extracted, failed, skipped, deferred.
+        Dict with processing stats: processed, extracted, failed, skipped, encrypted (no text
+        without a key, src/extract/attachment_extractors.encrypted_result), deferred, reused.
     """
     db_path = db_path or str(DEFAULT_DB)
     conn = _connect(db_path)
@@ -218,6 +219,7 @@ def run_phase1(
         "extracted": 0,
         "failed": 0,
         "skipped": 0,
+        "encrypted": 0,
         "deferred": 0,
         "reused": 0,
     }

@@ -68,7 +68,8 @@ def extract_text_from_file(
     """Extract text from a file based on its MIME type.
 
     Returns dict with keys: text, method, status, error.
-    status is one of: 'extracted', 'partial', 'failed', 'skipped'.
+    status is one of: 'extracted', 'partial', 'failed', 'skipped', 'encrypted' (the bytes are
+    ciphertext; method 'rms', 'rms-message' or 'password', see encrypted_result).
     _depth is how deep inside archives this file sits; only _extract_zip passes it.
     zip_seconds is how long an archive may spend reading members, ZIP_MAX_SECONDS when None;
     ocr_seconds how long a scan may spend on its pages, OCR_MAX_SECONDS when None. reextract
@@ -120,21 +121,6 @@ def _extract_by_type(
             "error": f"File not found: {file_path}",
         }
 
-    # IRM/RMS-protected content arrives with mime application/encrypted but an
-    # ordinary .xlsx/.docx/.pptx name, so the extension branches below claimed
-    # it first and the zip-based readers logged "BadZipFile: File is not a zip
-    # file" as a hard FAILURE — 750 rows on the live DB. The bytes are encrypted
-    # at rest: no parser reads them without IRM rights, so this is a permanent
-    # skip, not a fault worth re-counting. .rpmsg still falls through to
-    # _extract_rpmsg, which recovers best-effort metadata from the OLE wrapper.
-    if mime_type == "application/encrypted" and ext != ".rpmsg":
-        return {
-            "text": None,
-            "method": None,
-            "status": "skipped",
-            "error": f"IRM-protected {ext or 'file'}: no extractable text without rights",
-        }
-
     try:
         # A zero-byte file holds nothing to read. Parsers raise on it (PyMuPDF: EmptyFileError),
         # which used to be recorded as a failure and counted as a parser fault.
@@ -145,22 +131,13 @@ def _extract_by_type(
                 "status": "skipped",
                 "error": "empty file (0 bytes)",
             }
-        # Rights protection is also stored as an OLE2 container holding \x06DataSpaces, whatever
-        # the declared type says; the check above sees only application/encrypted. Sent to the
-        # legacy readers, such a workbook was recorded as failed ("Can't find workbook in OLE2
-        # compound document"). \x06DataSpaces sits in the first directory sector, where
-        # _ole_stream_names reads; EncryptedPackage often does not.
-        if (
-            ext != ".rpmsg"
-            and _magic(file_path) == b"\xd0\xcf\x11\xe0"
-            and "\x06DataSpaces" in _ole_stream_names(file_path)
-        ):
-            return {
-                "text": None,
-                "method": None,
-                "status": "skipped",
-                "error": f"IRM-protected {ext or 'file'}: no extractable text without rights",
-            }
+        # Encrypted at rest, whatever the name or the declared type says: rights-protected
+        # Office files and messages, password-protected ones. Sent to the readers they were
+        # recorded as failures (BadZipFile, "Can't find workbook in OLE2 compound document",
+        # CompoundFileInvalidMagicError), or as skips blaming a custom export format.
+        protected = encryption_of(file_path)
+        if protected:
+            return protected
         if ext == ".zip" or mime_type in ZIP_MIME_TYPES:
             sniffed = sniff_mime_type(file_path)
             if sniffed == "application/zip":
@@ -215,7 +192,8 @@ def _extract_by_type(
             return _extract_image_ocr(file_path, ocr_seconds)
         elif mime_type == "message/rfc822" or ext == ".eml":
             return _extract_eml(file_path)
-        elif mime_type == "application/encrypted" or ext == ".rpmsg":
+        elif ext == ".rpmsg":
+            # An MSIPC one was recorded as encrypted above; this is a container that is not.
             return _extract_rpmsg(file_path)
         elif mime_type in ("text/plain", "text/csv", "text/markdown") or ext in (
             ".txt",
@@ -255,6 +233,11 @@ def _extract_pdf(path: str, ocr_seconds: float | None = None) -> dict:
     import fitz
 
     doc = fitz.open(path)
+    # Reading pages of a PDF that needs a password raises "document closed or encrypted", which
+    # was recorded as a failure (14 rows). The dispatcher records it first (encryption_of).
+    if doc.needs_pass:
+        doc.close()
+        return encrypted_result("password", ".pdf")
     pages = []
     for page in doc:
         pages.append(page.get_text())
@@ -496,36 +479,163 @@ def sniff_mime_type(path: str) -> str | None:
     return None
 
 
-def _ole_stream_names(path: str) -> set[str]:
-    """Names in the first directory sector of an OLE2 file, or an empty set.
+# Sector numbers above this are markers (end of chain, free, FAT, DIFAT), not sectors.
+_OLE_MAXREGSECT = 0xFFFFFFFA
+_OLE_ENDOFCHAIN = 0xFFFFFFFE
+# A real directory is a few sectors long; a chain longer than this is damaged or hostile.
+_OLE_MAX_DIRECTORY_SECTORS = 20_000
 
-    The header fixes the sector size (a power of two at offset 30) and the
-    first directory sector (offset 48), and each 128-byte directory entry holds
-    a UTF-16LE name whose byte length sits at offset 64. The streams that say
-    which application wrote the file are children of the root entry, so they
-    sit in that first sector; reading one sector avoids a parser dependency.
+
+def _ole_stream_names(path: str) -> set[str]:
+    """Every name in an OLE2 file's directory, or an empty set when it cannot be read.
+
+    The header fixes the sector size (a power of two at offset 30), the number of FAT sectors
+    (offset 44), the first directory sector (offset 48) and where the FAT sectors are: the first
+    109 at offset 76, any more in the DIFAT chain that starts at offset 68. The directory is a
+    chain of sectors linked through the FAT, and each 128-byte entry holds a UTF-16LE name whose
+    byte length sits at offset 64. The whole chain is read. Until 2026-10 only its first sector
+    was, which holds four entries in a 512-byte file: the names that say a file is encrypted
+    and how (DRMEncryptedDataSpace, EncryptionInfo, EncryptedPackage) sit deeper, so 1,436
+    encrypted files reached the readers and were recorded as failures. A broken chain ends the
+    walk with the names read so far, and a chain that loops ends where it repeats.
     """
     import struct
 
+    names: set[str] = set()
     try:
         with open(path, "rb") as f:
             header = f.read(512)
             if len(header) < 512:
-                return set()
+                return names
             (shift,) = struct.unpack_from("<H", header, 30)
-            (first_dir,) = struct.unpack_from("<I", header, 48)
             if shift not in (9, 12):
-                return set()
-            f.seek((first_dir + 1) << shift)
-            sector = f.read(1 << shift)
+                return names
+            size, per = 1 << shift, (1 << shift) // 4
+            fat_count, first_dir = struct.unpack_from("<II", header, 44)
+            difat_sector, difat_count = struct.unpack_from("<II", header, 68)
+            fat_sectors = list(struct.unpack_from("<109I", header, 76))
+            seen: set[int] = set()
+            while (
+                len(fat_sectors) < fat_count
+                and len(seen) < difat_count
+                and difat_sector <= _OLE_MAXREGSECT
+                and difat_sector not in seen
+            ):
+                seen.add(difat_sector)
+                f.seek((difat_sector + 1) << shift)
+                block = f.read(size)
+                if len(block) < size:
+                    break
+                entries = struct.unpack(f"<{per}I", block)
+                fat_sectors.extend(entries[:-1])
+                difat_sector = entries[-1]
+            fat_sectors = fat_sectors[:fat_count]
+            fat_cache: dict[int, tuple[int, ...]] = {}
+
+            def next_sector(sector: int) -> int:
+                index, slot = divmod(sector, per)
+                if index >= len(fat_sectors) or fat_sectors[index] > _OLE_MAXREGSECT:
+                    return _OLE_ENDOFCHAIN
+                if index not in fat_cache:
+                    f.seek((fat_sectors[index] + 1) << shift)
+                    block = f.read(size)
+                    if len(block) < size:
+                        return _OLE_ENDOFCHAIN
+                    fat_cache[index] = struct.unpack(f"<{per}I", block)
+                return fat_cache[index][slot]
+
+            sector, visited = first_dir, set[int]()
+            while (
+                sector <= _OLE_MAXREGSECT
+                and sector not in visited
+                and len(visited) < _OLE_MAX_DIRECTORY_SECTORS
+            ):
+                visited.add(sector)
+                f.seek((sector + 1) << shift)
+                block = f.read(size)
+                for offset in range(0, len(block) - 127, 128):
+                    (length,) = struct.unpack_from("<H", block, offset + 64)
+                    if 2 <= length <= 64:
+                        names.add(
+                            block[offset : offset + length - 2].decode("utf-16-le", "replace")
+                        )
+                if len(block) < size:
+                    break
+                sector = next_sector(sector)
     except OSError:
-        return set()
-    names = set()
-    for offset in range(0, len(sector) - 127, 128):
-        (length,) = struct.unpack_from("<H", sector, offset + 64)
-        if 2 <= length <= 64:
-            names.add(sector[offset : offset + length - 2].decode("utf-16-le", "replace"))
+        return names
     return names
+
+
+# Directory names that say an Office file is encrypted, and how ([MS-OFFCRYPTO] 2.2.11, 2.3.4).
+# Rights Management keeps an Office 2007+ file as EncryptedPackage under a DRMEncrypted data
+# space, and a 97-2003 one as \tDRMContent under a \tDRMDataSpace. Password encryption keeps
+# EncryptionInfo beside EncryptedPackage, which rights management never writes.
+_RMS_NAMES = frozenset(
+    {
+        "DRMEncryptedDataSpace",
+        "DRMEncryptedTransform",
+        "\tDRMDataSpace",
+        "\tDRMTransform",
+        "\tDRMContent",
+    }
+)
+_ENCRYPTED_PAYLOAD_NAMES = frozenset({"EncryptedPackage", "\x06DataSpaces"})
+
+
+def encrypted_result(method: str, ext: str) -> dict:
+    """The verdict for a file encrypted at rest. method: 'rms', 'rms-message' or 'password'.
+
+    status 'encrypted' is a contract: the sweep keeps such a file, the health check counts it
+    apart from failures, and Phase 2 never sees it, since it selects 'extracted' rows only. The
+    error names the kind and carries none of the markers (file_sweep.UNREAD_SQL) that mean the
+    bytes were never read: they were, and they are ciphertext.
+    """
+    what = ext or "file"
+    reasons = {
+        "rms": f"Rights-protected (RMS) {what}: encrypted at rest, "
+        "cannot be read without the issuer's rights",
+        "rms-message": "Rights-protected message (.rpmsg, MSIPC): encrypted at rest, "
+        "cannot be read without the sender's rights",
+        "password": f"Password-protected {what}: encrypted, cannot be read without its password",
+    }
+    return {"text": None, "method": method, "status": "encrypted", "error": reasons[method]}
+
+
+def encryption_of(path: str) -> dict | None:
+    """The 'encrypted' verdict for a file whose bytes are encrypted at rest, or None.
+
+    Decided by the bytes alone, never by the name or the declared type: senders label these
+    files application/encrypted, octet-stream or an ordinary Office type, and name them .xlsx
+    whatever they hold. An MSIPC container is a protected message; an OLE2 container is
+    encrypted when its directory says so; a PDF when it cannot be opened without a password (an
+    owner password alone only restricts printing and copying, and the text reads). A legacy
+    workbook's password sits inside its BIFF stream, so _extract_xls reports that one.
+    """
+    ext = Path(path).suffix.lower()
+    magic = _magic(path, 8)
+    if magic.startswith(_RPMSG_MAGIC):
+        return encrypted_result("rms-message", ext)
+    if magic.startswith(b"\xd0\xcf\x11\xe0"):
+        names = _ole_stream_names(path)
+        if names & _RMS_NAMES:
+            return encrypted_result("rms", ext)
+        if "EncryptionInfo" in names and names & _ENCRYPTED_PAYLOAD_NAMES:
+            return encrypted_result("password", ext)
+        if names & _ENCRYPTED_PAYLOAD_NAMES:
+            return encrypted_result("rms", ext)
+        return None
+    if magic.startswith(b"%PDF"):
+        import fitz
+
+        try:
+            doc = fitz.open(path)
+            locked = bool(doc.needs_pass)
+            doc.close()
+        except Exception:
+            return None  # a damaged PDF is the reader's to report
+        return encrypted_result("password", ext) if locked else None
+    return None
 
 
 def _extract_excel(path: str) -> dict:
@@ -581,6 +691,10 @@ def _extract_xls(path: str) -> dict:
     try:
         wb = xlrd.open_workbook(path)
     except Exception as e:
+        # A FILEPASS record after the workbook's BOF: the sheets are RC4-encrypted under a
+        # password (Excel's default one included), which xlrd does not decrypt. 6 rows.
+        if str(e) == "Workbook is encrypted":
+            return encrypted_result("password", Path(path).suffix.lower())
         return {
             "text": None,
             "method": "xlrd",
@@ -643,6 +757,8 @@ def _extract_xlsb(path: str) -> dict:
             if xls_result["status"] == "extracted":
                 # Tag method so downstream debugging can see the extension/format mismatch.
                 xls_result["method"] = "xlrd (fallback from .xlsb)"
+                return xls_result
+            if xls_result["status"] == "encrypted":
                 return xls_result
             # OLE compound document with no Excel workbook stream — likely a
             # custom export format (ACME financial tools, etc.) that wraps
@@ -860,11 +976,11 @@ def _extract_rpmsg(path: str) -> dict:
     from setup.py on every install on every host. Removing it is what lets the
     dependency install refuse to build source distributions at all.
 
-    The honest verdict is a skip, matching how the dispatcher already treats
-    other IRM-protected content: the payload is encrypted, and no parser reads
-    it without rights. Marking it 'skipped' rather than 'failed' also stops it
-    counting against the extraction failure rate, which is what a fault should
-    mean.
+    The honest verdict is 'encrypted' (method 'rms-message'), the one every
+    rights-protected file gets: the payload is encrypted, and no parser reads it
+    without rights. It is not a fault, so it does not count against the
+    extraction failure rate. The dispatcher records it from the magic before it
+    gets here (encryption_of); this answers the same when called directly.
     """
     try:
         with open(path, "rb") as f:
@@ -878,12 +994,7 @@ def _extract_rpmsg(path: str) -> dict:
         }
 
     if magic == _RPMSG_MAGIC:
-        return {
-            "text": None,
-            "method": "rpmsg",
-            "status": "skipped",
-            "error": "IRM-protected message (MSIPC): encrypted, no extractable text without rights",
-        }
+        return encrypted_result("rms-message", ".rpmsg")
     return {
         "text": None,
         "method": "rpmsg",

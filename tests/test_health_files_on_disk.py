@@ -122,35 +122,20 @@ def test_an_unreadable_policy_file_warns(db, tmp_path):
     assert "unreadable" in hc.files_on_disk_detail(row)
 
 
-def test_files_kept_for_their_content_or_for_curation_are_named(db, tmp_path, monkeypatch):
+def test_files_kept_for_their_content_are_named(db, tmp_path):
     _stored(db, tmp_path / "att", "locked.xlsx", hours_old=1)
-    _stored(db, tmp_path / "att", "deck.pptx", hours_old=1)
     db.execute(
         "UPDATE attachment_content SET extraction_status = 'encrypted',"
         " extraction_method = 'password' WHERE attachment_id = 1"
     )
     db.commit()
-    state = tmp_path / "curate-state.json"
-    state.write_text(json.dumps({"deferred": {"2": {"folder": "x", "attempts": 1}}}))
-    monkeypatch.setenv("BRAIN_CURATE_STATE", str(state))
 
     row = hc.check_files_on_disk(db)
     line = hc.files_on_disk_detail(row)
 
-    assert row["counts"]["not-held"] == 1 and row["counts"]["curation"] == 1
-    assert "1 content not held" in line and "1 awaiting curation" in line
-
-
-def test_an_unreadable_curation_state_warns(db, tmp_path, monkeypatch):
-    """The sweep deletes nothing while it cannot tell which originals curation needs."""
-    state = tmp_path / "curate-state.json"
-    state.write_text('{"deferred": ')
-    monkeypatch.setenv("BRAIN_CURATE_STATE", str(state))
-
-    row = hc.check_files_on_disk(db)
-
-    assert row["status"] == "WARN"
-    assert "deleted nothing" in hc.files_on_disk_detail(row)
+    assert row["counts"]["not-held"] == 1
+    assert "1 content not held" in line
+    assert "curation" not in line
 
 
 def test_files_phase_1_could_not_read_are_counted(db, tmp_path):

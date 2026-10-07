@@ -15,6 +15,9 @@ TimeoutStopUSec`:
 
 Re-read on 2026-09-23, after three drop-ins: sb-outlook-sync 20min, sb-calendar-sync
 15min, sb-conversation-sync 15min. The other seven are unchanged.
+
+sb-curate-docs, in the first table, was retired on 2026-10-07: that table is the record
+of the 2026-08-11 reading, and nine units remain.
 """
 
 import logging
@@ -38,7 +41,6 @@ UNIT_TIMEOUT_AND_BUDGET = {
     "sb-attachments": (3600, 3390),
     "sb-calendar-sync": (900, 690),
     "sb-conversation-sync": (900, 690),
-    "sb-curate-docs": (1800, 1590),
     "sb-daily-sync": (1800, 1590),
     "sb-news-sync": (1800, 1590),
     "sb-noon-catchup": (1800, 1590),
@@ -50,13 +52,6 @@ UNIT_TIMEOUT_AND_BUDGET = {
 # PUSH_WAIT_SECONDS (900 + 120) plus one worst-case call (120). decide() grants a
 # token-push wait only to a budget at or above this.
 WAIT_NEEDS_SECONDS = 1140
-
-# Units whose wrapper never invokes src.cli, so install_llm_deadline_for_this_process never
-# runs for them and the policy keeps its own flat 900s default however generous their
-# TimeoutStartSec is. sb-curate-docs runs scripts/curate_documents_daily.py directly.
-# Read off the VPS on 2026-08-11 with `grep -c src.cli ~/.local/bin/sb-*.sh`: this is the
-# only one of the ten that returns 0.
-UNITS_NOT_ON_THE_CLI = {"sb-curate-docs"}
 
 # The module logger's level before any test in this file has run. Captured at import,
 # which pytest does for every module during collection, i.e. before the first test.
@@ -156,11 +151,11 @@ def test_the_reserve_excludes_the_largest_backoff():
     ("unit", "timeout", "budget"), [(u, t, b) for u, (t, b) in UNIT_TIMEOUT_AND_BUDGET.items()]
 )
 def test_each_unit_gets_its_own_budget(unit, timeout, budget):
-    """Ten units, ten budgets, each an exact literal.
+    """Nine units, nine budgets, each an exact literal.
 
     Would this pass with the behaviour removed? No. Returning the flat
     DEFAULT_BUDGET_SECONDS of 900 that the estate falls back to today — the exact
-    status quo this task exists to replace — matches none of the ten.
+    status quo this task exists to replace — matches none of the nine.
     """
     assert llm_deadline._llm_budget_seconds(unit, 120.0, unit_timeout_seconds=timeout) == budget
 
@@ -169,24 +164,24 @@ def test_each_unit_gets_its_own_budget(unit, timeout, budget):
     ("unit", "budget"), [(u, b) for u, (_, b) in UNIT_TIMEOUT_AND_BUDGET.items()]
 )
 def test_the_checked_in_timeout_table_is_what_production_actually_reads(unit, budget):
-    """Same ten budgets, but with the timeout coming from _UNIT_TIMEOUT_SECONDS itself.
+    """Same nine budgets, but with the timeout coming from _UNIT_TIMEOUT_SECONDS itself.
 
     NO ``unit_timeout_seconds`` OVERRIDE, and that omission is the entire test. The
     parametrised test above feeds the timeout in from this file's own table, so it
     exercises the subtraction and never once reads the module's table — which is the only
-    checked-in record of what the ten production units are actually configured with, and
+    checked-in record of what the nine production units are actually configured with, and
     is what the no-override path in ``install_llm_deadline`` reads on the VPS.
 
     Would this pass with the behaviour removed? No, and it was a measured gap: mutating
-    each of the ten entries to 999 in turn left SIX green — sb-calendar-sync,
-    sb-conversation-sync, sb-curate-docs, sb-news-sync, sb-reverse-ingest and
-    sb-teams-sync, every unit not separately named in another test. Under this test any
-    one of those mutations yields 789 against its literal and fails.
+    each of the then ten entries to 999 in turn left SIX green — sb-calendar-sync,
+    sb-conversation-sync, sb-curate-docs (retired 2026-10-07), sb-news-sync,
+    sb-reverse-ingest and sb-teams-sync, every unit not separately named in another test.
+    Under this test any one of those mutations yields 789 against its literal and fails.
     """
     assert llm_deadline._llm_budget_seconds(unit, 120.0) == budget
 
 
-def test_the_timeout_table_holds_exactly_the_ten_scheduled_units():
+def test_the_timeout_table_holds_exactly_the_nine_scheduled_units():
     """Set equality, so an ADDED key is caught as well as a changed or renamed one.
 
     The per-unit test above cannot see a spurious eleventh entry: nothing asks about a
@@ -221,20 +216,21 @@ def test_every_scheduled_unit_has_a_positive_margin():
 
 
 def test_only_the_long_units_can_fund_a_token_push_wait():
-    """Six units can afford the wait, four cannot. The split is the point of the port.
+    """Five units can afford the wait, four cannot. The split is the point of the port.
 
-    CAPABILITY, NOT PRACTICE. This is the set whose BUDGET clears the bar. One of the six,
-    sb-curate-docs, never gets that budget in production: its wrapper runs
-    scripts/curate_documents_daily.py and never touches src.cli, so the hook that installs
-    PTS_LLM_DEADLINE does not run and the policy applies its own flat 900s default.
-    Verified on the VPS on 2026-08-11 — `grep -c src.cli ~/.local/bin/sb-curate-docs.sh`
-    returns 0, while the other nine wrappers return 1, 2 or 3. Six is what the table
-    permits; five is what the estate actually does. Keeping the two apart here is what
-    stops the table quietly becoming a claim about production that nobody checked.
+    CAPABILITY, NOT PRACTICE. This is the set whose BUDGET clears the bar. Each of the five
+    has a wrapper that runs src.cli (`grep -c src.cli scripts/wrappers/systemd/<wrapper>`
+    returns 6, 2, 1, 2 and 3 for sb-attachment-pass, sb-daily-sync, sb-news-sync,
+    sb-noon-catchup and sb-reverse-ingest), so the hook that installs PTS_LLM_DEADLINE runs
+    for every one of them and the table is not a claim about production that nobody
+    checked. Until 2026-10-07 a sixth unit, sb-curate-docs, cleared the bar on paper and
+    never got that budget: its wrapper called scripts/curate_documents_daily.py directly
+    and never touched src.cli, so it kept the flat 900s default. The unit is retired and
+    that gap went with it.
 
     Would this pass with the behaviour removed? No. Under today's flat 900s default,
     900 < 1140, so NO unit funds a wait and the qualifying set is empty rather than
-    these six. Under a per-unit budget it is exactly these six.
+    these five. Under a per-unit budget it is exactly these five.
     """
     funds_wait = {
         unit
@@ -243,14 +239,6 @@ def test_only_the_long_units_can_fund_a_token_push_wait():
         >= WAIT_NEEDS_SECONDS
     }
     assert funds_wait == {
-        "sb-attachments",
-        "sb-curate-docs",
-        "sb-daily-sync",
-        "sb-news-sync",
-        "sb-noon-catchup",
-        "sb-reverse-ingest",
-    }
-    assert funds_wait - UNITS_NOT_ON_THE_CLI == {
         "sb-attachments",
         "sb-daily-sync",
         "sb-news-sync",
@@ -954,9 +942,9 @@ def test_max_call_seconds_matches_every_call_site():
 
     news reads this per profile from config; here it is one constant, so nothing but
     this test connects it to reality. Every call site (extract_one and
-    extract_conversation, attachment_pipeline, image_vision, calendar_extractor,
-    teams_pipeline and the curate job) sends through claude_extract.complete, the one
-    place that calls the policy, with 120.0.
+    extract_conversation, attachment_pipeline, image_vision, calendar_extractor and
+    teams_pipeline) sends through claude_extract.complete, the one place that calls the
+    policy, with 120.0.
 
     THE COUNT IS AS LOAD-BEARING AS THE VALUE. It was six, one per call site, until
     they shared complete(); before that it was five, and the sixth was

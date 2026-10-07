@@ -615,61 +615,6 @@ def test_deletes_an_image_whose_text_is_held_once_vision_is_done(db, tmp_path):
     assert not f.exists()
 
 
-def _curation(tmp_path: Path, *deferred_ids: int) -> Path:
-    state = tmp_path / "curate-state.json"
-    state.write_text(
-        json.dumps(
-            {
-                "processed_ids": [],
-                "deferred": {
-                    str(i): {"folder": "x", "attempts": 1, "last_attempt": "2026-10-01"}
-                    for i in deferred_ids
-                },
-            }
-        )
-    )
-    return state
-
-
-def test_keeps_the_source_of_a_deferred_curation(db, tmp_path):
-    """Curation copies the original into a document folder once the folder has room; 470
-    such sources on the producer were marked removable while they waited."""
-    parked, parked_id = _att(db, tmp_path / "att", "AAMk-1", "deck.pptx", b"deck")
-    done, _ = _att(db, tmp_path / "att", "AAMk-2", "memo.pdf", b"memo")
-
-    stats = sweep_files(
-        db, tmp_path / "att", APPLY, curate_state=_curation(tmp_path, parked_id, 999)
-    )
-
-    assert parked.exists() and not done.exists()
-    assert stats["curation"] == 1
-
-
-def test_an_unreadable_curation_state_deletes_nothing(db, tmp_path):
-    """Half-written while curation saves it, it cannot say which files curation still needs."""
-    f, _ = _att(db, tmp_path / "att", "AAMk-1", "memo.pdf")
-    state = tmp_path / "curate-state.json"
-    state.write_text('{"deferred": {"1": {"folder"')
-
-    stats = sweep_files(db, tmp_path / "att", APPLY, curate_state=state)
-
-    assert f.exists()
-    assert stats["deleted"] == 0 and stats["applied"] is False
-    assert stats["curation_problem"]
-
-
-def test_the_curation_state_path_is_the_one_curation_writes(monkeypatch):
-    import re
-
-    from src.store import file_sweep
-
-    src = (Path(__file__).resolve().parent.parent / "scripts/curate_documents_daily.py").read_text()
-    m = re.search(r'^STATE = Path\.home\(\) / "([^"]+)"', src, re.MULTILINE)
-    assert m, "could not find STATE in curate_documents_daily.py"
-    monkeypatch.delenv("BRAIN_CURATE_STATE")
-    assert Path.home() / m.group(1) == file_sweep.curate_state_file()
-
-
 def test_a_sharepoint_fetch_leftover_goes_once_its_document_is_recorded(db, tmp_path):
     """A file an old SharePoint fetch left on disk is a copy of a document SharePoint still
     serves: once its row records what it holds (here a page shell with no text), it may go.
@@ -734,4 +679,4 @@ def test_the_cli_reports_the_new_states(tmp_path, capsys):
 
     out = capsys.readouterr().out
     assert "content not held (kept)        : 1" in out
-    assert "awaiting curation              : 0" in out
+    assert "curation" not in out

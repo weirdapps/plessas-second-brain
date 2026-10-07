@@ -55,8 +55,8 @@ INGESTABLE_EXTENSIONS = {".pdf", ".pptx", ".xlsx", ".docx", ".md", ".txt"}
 
 # Heartbeat written by the laptop-side push job after every successful push
 # (one ISO-8601 UTC line). Authoritative liveness signal for the document roots:
-# our own curate-docs job writes files into those same roots, so a fresh mtime
-# can be self-manufactured while the organic source is frozen.
+# our own curate-docs job (retired 2026-10-07) wrote files into those same roots, so a
+# fresh mtime could be self-manufactured while the organic source was frozen.
 DOCUMENT_SYNC_STAMP = STATE_DIR / "document-sync.stamp"
 
 # Written by sb-db-pull.sh after a copy passes its integrity check, and only
@@ -64,19 +64,6 @@ DOCUMENT_SYNC_STAMP = STATE_DIR / "document-sync.stamp"
 # it, which is what makes it a reliable discriminator between the two. See
 # corpus_lag for why brain.db's own mtime cannot serve here.
 DB_PULL_STAMP = STATE_DIR / "db-pull.stamp"
-
-# curate-docs' own bookkeeping: which candidates it has placed, and which the
-# per-folder soft caps turned away. See check_curation.
-CURATE_STATE = STATE_DIR / "curate-state.json"
-# Mirrors MAX_DEFER_ATTEMPTS in scripts/curate_documents_daily.py, which is the
-# source of truth; duplicated because this script is loaded standalone, and
-# pinned by a test that reads the real one.
-CURATE_MAX_DEFER_ATTEMPTS = 5
-# How long candidates may sit deferred, or placements stop, before check_curation
-# calls the stall. A deferral cannot age out through retries: a parked candidate
-# is only offered again once its folder has room, so while every folder stays at
-# its cap `attempts` never passes 1 and only time can show the queue is stuck.
-CURATE_STALL_AGE = timedelta(days=7)
 
 # Counterpart to the heartbeat: written by the push job when a run FAILS (line 1
 # ISO-8601 UTC, line 2 the reason), removed when one succeeds. The stamp alone
@@ -105,7 +92,6 @@ _DISCOVERY_JOB_SUFFIXES = (
     ".noon-catchup",
     ".attachments",
     ".auth-watch",
-    ".curate-docs",
     ".reverse-ingest",
     # The only one of these a MIGRATED Mac still has, and therefore the only one
     # left to read the prefix off once ingestion has moved. Without it discovery
@@ -249,7 +235,6 @@ LAUNCHD_MIGRATED_JOBS = {
     f"{LABEL_PREFIX}.calendar-sync": "Calendar sync",
     f"{LABEL_PREFIX}.attachments": "Attachment processing",
     f"{LABEL_PREFIX}.auth-watch": "Auth watcher",
-    f"{LABEL_PREFIX}.curate-docs": "Document curation",
     f"{LABEL_PREFIX}.reverse-ingest": "Reverse ingest",
 }
 
@@ -280,9 +265,8 @@ SYSTEMD_UNITS = {
     "sb-calendar-sync.service": "Calendar sync",
     "sb-attachments.service": "Attachment processing",
     "sb-auth-watch.service": "Auth watcher",
-    "sb-curate-docs.service": "Document curation",
     "sb-reverse-ingest.service": "Reverse ingest",
-    # Registered late. The VPS runs twelve sb-* units but only the nine above
+    # Registered late. The VPS runs eleven sb-* units but only the eight above
     # were listed, so these three had neither a job status nor a log-age signal
     # — the same hand-listed-subset gap that hid http-error from the SharePoint
     # tally. This dict is the source both check_jobs and check_sync_logs read,
@@ -761,8 +745,6 @@ def check_files_on_disk(db):
         return {"name": "Files on disk", "status": "WARN", "error": str(e)}
     policy = file_sweep.load_policy()
     problem = file_sweep.policy_problem()
-    # The sweep deletes nothing while curation's state cannot be read (file_sweep.sweep_files).
-    curation_problem = file_sweep.curation_sources()[1]
     cutoff = policy.only_newer_than.timestamp() if policy.only_newer_than else None
     now = time.time()
     counts = dict.fromkeys(file_sweep.STATES, 0)
@@ -785,8 +767,7 @@ def check_files_on_disk(db):
         "image_late": image_late,
         "mode": "apply" if policy.apply else "report-only",
         "policy_problem": problem,
-        "curation_problem": curation_problem,
-        "status": "WARN" if stalled or image_late or problem or curation_problem else "OK",
+        "status": "WARN" if stalled or image_late or problem else "OK",
     }
 
 
@@ -801,13 +782,10 @@ def files_on_disk_detail(c: dict) -> str:
         f" ({c.get('bytes', 0) / 2**30:.1f} GB; {k.get('deletable', 0):,} stored and removable,"
         f" {k.get('pending-text', 0):,} awaiting text, {k.get('unread', 0):,} unread,"
         f" {k.get('not-held', 0):,} content not held, {k.get('pending-image', 0):,} awaiting"
-        f" vision, {k.get('curation', 0):,} awaiting curation, {k.get('unregistered', 0):,}"
-        f" unregistered; sweep {c.get('mode')})"
+        f" vision, {k.get('unregistered', 0):,} unregistered; sweep {c.get('mode')})"
     )
     if c.get("policy_problem"):
         extra += f"; {c['policy_problem']}"
-    if c.get("curation_problem"):
-        extra += f"; {c['curation_problem']}"
     if c.get("stalled"):
         extra += (
             f"; {c['stalled']:,} stored files older than {file_sweep.STALL_HOURS}h:"
@@ -1275,72 +1253,6 @@ def check_sharepoint_token(path: Path = SHAREPOINT_SESSION, now: datetime | None
     }
 
 
-def check_curation(state_path: Path | None = None):
-    """Whether curate-docs is still PLACING documents, not merely running.
-
-    The blind spot this closes: curate classifies email attachments and copies
-    the good ones into the document roots, but every placement is gated on a
-    per-folder soft cap. Once all 17 National folders were at or over cap, 40 of
-    the last 44 runs placed exactly zero documents, and every existing signal
-    stayed green throughout. The job ran, exited 0, and wrote its log;
-    check_documents counts rows the reverse-ingest wrote; check_document_roots
-    watches the Mac push heartbeat. None of them asks whether anything actually
-    arrived, so a job consuming thirty candidates a run and discarding all
-    thirty was indistinguishable from a healthy one.
-
-    `deferred` is the purpose-built signal: candidates the cap turned away, held
-    for retry instead of being silently marked done. Non-empty means the
-    destination is full. Entries at MAX_DEFER_ATTEMPTS have exhausted their
-    retries and will not be offered again, so those are the ones that mean work
-    is being dropped rather than delayed.
-
-    Exhausted retries alone never fired in production, though. A parked
-    candidate is only re-offered once its folder has headroom, so while every
-    folder stays full no entry passes attempts=1, and the check read OK with 376
-    candidates parked and nothing placed for a week. So the queue is also aged:
-    the oldest deferral, and the latest placement while anything is deferred,
-    each past CURATE_STALL_AGE means the folders are not freeing up by themselves.
-    """
-    path = CURATE_STATE if state_path is None else Path(state_path)
-    try:
-        state = json.loads(path.read_text())
-    except FileNotFoundError:
-        return {"name": "Curation", "status": "N/A"}
-    except (json.JSONDecodeError, OSError) as e:
-        return {"name": "Curation", "status": "WARN", "error": str(e)}
-
-    deferred = state.get("deferred") or {}
-    copied = state.get("copied") or []
-    blocked = sum(1 for v in deferred.values() if v.get("attempts", 0) >= CURATE_MAX_DEFER_ATTEMPTS)
-    latest = max((c.get("classified_at") for c in copied if c.get("classified_at")), default=None)
-    # last_attempt is rewritten only when a candidate is deferred again, which
-    # needs headroom first, so on a full folder it stays frozen at the first
-    # deferral and its age is how long the destination has been full.
-    oldest = min(
-        (v.get("last_attempt") for v in deferred.values() if v.get("last_attempt")), default=None
-    )
-    age = _age(latest)
-    deferral_age = _age(oldest)
-    stalled = bool(deferred) and any(
-        a is not None and a > CURATE_STALL_AGE for a in (deferral_age, age)
-    )
-    return {
-        "name": "Curation",
-        "total": len(copied),
-        "deferred": len(deferred),
-        "blocked": blocked,
-        "stalled": stalled,
-        "latest": latest,
-        "age": age,
-        "deferral_age": deferral_age,
-        # Fresh deferrals are ordinary back-pressure: an operator pruning a
-        # folder lets them through. Nothing frees a folder automatically, so a
-        # week of it, or exhausted retries, is the document not arriving, which
-        # is the condition that went unnoticed for a month.
-        "status": "WARN" if blocked or stalled else "OK",
-    }
-
-
 def check_documents(db):
     total = db.execute("SELECT COUNT(*) FROM emails WHERE message_id < 0").fetchone()[0]
     latest = db.execute("SELECT MAX(date_received) FROM emails WHERE message_id < 0").fetchone()[0]
@@ -1397,10 +1309,12 @@ def check_document_roots(
     the source.
 
     Liveness comes from DOCUMENT_SYNC_STAMP when it is readable: newest mtime
-    alone can be manufactured by our own curate-docs job, which mirrors
-    attachments into these very roots (filename is no discriminator — the
-    operator uses the same naming convention). Without a usable stamp we fall
-    back to the newest mtime among ingestable files and say so in the report.
+    alone could be manufactured by our own curate-docs job (retired 2026-10-07),
+    which mirrored attachments into these very roots (filename is no
+    discriminator — the operator uses the same naming convention). The files it
+    placed keep their mtimes, so the fallback stays unreliable until they age out.
+    Without a usable stamp we fall back to the newest mtime among ingestable
+    files and say so in the report.
     """
     roots = DOCUMENT_ROOTS if roots is None else [Path(r) for r in roots]
     now = now or datetime.now(UTC)
@@ -2014,25 +1928,6 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
                 # The date is what separates one bad sweep from slow attrition.
                 if c.get("disabled_at"):
                     extra += f" (latest {str(c['disabled_at'])[:19]})"
-        elif c["name"] == "Curation":
-            # Both ages, because either one alone is ambiguous: an old deferral
-            # with a fresh placement is one full folder among several with room,
-            # and an old placement with fresh deferrals is every folder full.
-            ages = (
-                f"oldest deferral {format_age(c.get('deferral_age'))} ago,"
-                f" last placement {format_age(c.get('age'))} ago"
-            )
-            if c.get("blocked"):
-                extra = (
-                    f" ({c.get('deferred', 0)} deferred, {c['blocked']} out of retries, {ages}:"
-                    " destination folders are full)"
-                )
-            elif c.get("stalled"):
-                extra = f" ({c['deferred']} deferred, {ages}: destination folders are full)"
-            elif c.get("deferred"):
-                extra = f" ({c['deferred']} deferred, {ages}; awaiting folder headroom)"
-            else:
-                extra = " (nothing blocked)"
         elif c["name"] == "SharePoint":
             not_content = c.get("not_content", 0)
             count = f"{c.get('ok', 0)}/{c.get('total', 0) - not_content}"
@@ -2391,7 +2286,6 @@ def main():
         check_conversations(db),
         check_embeddings(db),
         check_documents(db),
-        check_curation(),
         check_document_roots(),
         check_whatsapp(db),
         check_news(db),

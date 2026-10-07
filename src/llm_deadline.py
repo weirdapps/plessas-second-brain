@@ -58,7 +58,8 @@ from src.llm_policy import MAX_ATTEMPTS, ROW_CAPS, backoff
 
 # Effective TimeoutStartSec of each scheduled second-brain unit, read live from the VPS
 # on 2026-08-11 with `systemctl --user show sb-<name>.service -p TimeoutStartUSec`.
-# These ten are the whole scheduled set. A unit missing from this map gets no deadline
+# These nine are the whole scheduled set (sb-curate-docs, the tenth, was retired on
+# 2026-10-07 and its entry removed). A unit missing from this map gets no deadline
 # rather than a guessed one.
 #
 # Re-read 2026-09-23. Three drop-ins had raised units since, each an owner decision
@@ -71,7 +72,6 @@ _UNIT_TIMEOUT_SECONDS: dict[str, int] = {
     "sb-attachments": 3600,
     "sb-calendar-sync": 900,
     "sb-conversation-sync": 900,
-    "sb-curate-docs": 1800,
     "sb-daily-sync": 1800,
     "sb-news-sync": 1800,
     "sb-noon-catchup": 1800,
@@ -80,15 +80,15 @@ _UNIT_TIMEOUT_SECONDS: dict[str, int] = {
     "sb-teams-sync": 600,
 }
 
-# TimeoutStopSec on all ten units, which is also the user manager's
+# TimeoutStopSec on all nine units, which is also the user manager's
 # DefaultTimeoutStopUSec. Held back from the budget so a terminal GIVE_UP still has room
 # to finish its bookkeeping and flush its logs before systemd's SIGTERM.
 _SHUTDOWN_GRACE_SECONDS = 90
 
 # call_with_policy has one caller, claude_extract.complete(), which every Claude call
-# site goes through (the curate job included) with 120.0. news reads the equivalent per
-# profile from config; here it is uniform, and test_max_call_seconds_matches_every_call_site
-# fails if the two diverge.
+# site goes through with 120.0. news reads the equivalent per profile from config; here
+# it is uniform, and test_max_call_seconds_matches_every_call_site fails if the two
+# diverge.
 MAX_CALL_SECONDS = 120.0
 
 # Largest single backoff decide() can actually emit: RATE_LIMIT at n=3, so 240s.

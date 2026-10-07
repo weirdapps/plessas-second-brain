@@ -303,7 +303,6 @@ def _install_migrated_jobs(agents_dir, prefix):
         ".calendar-sync",
         ".attachments",
         ".auth-watch",
-        ".curate-docs",
         ".reverse-ingest",
     ):
         (agents_dir / f"{prefix}{suffix}.plist.disabled-migrated-to-vps").write_text("x")
@@ -829,10 +828,11 @@ def test_check_document_roots_defaults_are_not_pinned_to_legacy_documents(hc):
 
 
 # --- Document sync heartbeat -------------------------------------------------
-# Newest-mtime alone can be manufactured by our own jobs: curate-docs writes
-# files INTO the same roots, so the organic source (the laptop push) can freeze
-# while the newest mtime stays fresh. The push job now writes a stamp file after
-# every successful push; when present it is the authoritative liveness signal.
+# Newest-mtime alone can be manufactured by our own jobs: curate-docs (retired
+# 2026-10-07) wrote files INTO the same roots, so the organic source (the laptop
+# push) could freeze while the newest mtime stayed fresh. The push job now writes a
+# stamp file after every successful push; when present it is the authoritative
+# liveness signal.
 
 
 def _write_stamp(path, now, **delta):
@@ -863,8 +863,8 @@ def test_check_document_roots_fresh_stamp_beats_frozen_mtimes(hc, tmp_path):
 
 
 def test_check_document_roots_stale_stamp_beats_fresh_mtimes(hc, tmp_path):
-    """The defect: curate-docs refreshes files under the roots, so a fresh mtime
-    proves nothing. A 20-day-old push is STALE regardless."""
+    """The defect: curate-docs refreshed files under the roots, so a fresh mtime
+    proved nothing. A 20-day-old push is STALE regardless."""
     from datetime import datetime
 
     root = tmp_path / "docs"
@@ -1900,8 +1900,9 @@ def test_check_sync_logs_covers_every_scheduled_job(hc, tmp_path):
     raised nothing here because its log was simply not in the dict."""
     r = hc.check_sync_logs(log_dir=tmp_path)
 
-    for expected in ("attachments", "calendar_sync", "reverse_ingest", "curate_docs"):
+    for expected in ("attachments", "calendar_sync", "reverse_ingest"):
         assert expected in r, f"{expected} log is unwatched"
+    assert "curate_docs" not in r, "the retired curation job's log must not be watched"
 
 
 # --- Inline images: the measured age was never asserted on -------------------
@@ -2548,102 +2549,6 @@ def test_format_age_distinguishes_unknown_from_zero(hc):
     freshest possible answer rendered identically to a blind check."""
     assert hc.format_age(None) == "?"
     assert hc.format_age(timedelta(0)) == "0m"
-
-
-# --- Curation runs, exits 0, and places nothing ------------------------------
-# Every folder hit its soft cap, so 40 of the last 44 runs placed zero documents
-# while the job ran cleanly and wrote its log. check_documents counts rows the
-# reverse-ingest wrote and check_document_roots watches the push heartbeat, so
-# nothing anywhere asked whether a document actually arrived. `deferred` is the
-# signal: candidates the cap turned away rather than silently marked done.
-
-
-def _curate_state(tmp_path, deferred=None, copied=None):
-    import json
-
-    p = tmp_path / "curate-state.json"
-    p.write_text(json.dumps({"deferred": deferred or {}, "copied": copied or []}))
-    return p
-
-
-def test_check_curation_is_quiet_when_nothing_is_blocked(hc, tmp_path):
-    state = _curate_state(tmp_path, copied=[{"id": 1, "classified_at": "2026-08-29T10:00:00Z"}])
-
-    r = hc.check_curation(state_path=state)
-
-    assert r["deferred"] == 0
-    assert r["blocked"] == 0
-    assert r["status"] == "OK"
-
-
-def test_check_curation_tolerates_ordinary_back_pressure(hc, tmp_path):
-    """A candidate deferred recently, with retries left, is ordinary back-pressure
-    and stays OK. Only a deferral older than a week warns."""
-    state = _curate_state(tmp_path, deferred={"7": {"folder": "retail", "attempts": 1}})
-
-    r = hc.check_curation(state_path=state)
-
-    assert r["deferred"] == 1
-    assert r["status"] == "OK"
-
-
-def test_check_curation_warns_once_candidates_sit_deferred_for_a_week(hc, tmp_path):
-    """A full folder never re-offers its parked candidates, so attempts stays at
-    1 in production and exhausted retries cannot fire. The age of the oldest
-    deferral is what shows the document is not arriving."""
-    from datetime import datetime
-
-    old = (datetime.now() - timedelta(days=10)).isoformat()
-    state = _curate_state(
-        tmp_path,
-        deferred={
-            "7": {"folder": "retail", "attempts": 1, "last_attempt": old},
-            "8": {"folder": "retail", "attempts": 1, "last_attempt": old},
-        },
-    )
-
-    r = hc.check_curation(state_path=state)
-
-    assert r["blocked"] == 0
-    assert r["status"] == "WARN"
-
-
-def test_check_curation_is_na_without_a_state_file(hc, tmp_path):
-    """The VPS has one; a machine that never runs curate must not invent a fault."""
-    assert hc.check_curation(state_path=tmp_path / "absent.json")["status"] == "N/A"
-
-
-def test_check_curation_survives_a_corrupt_state_file(hc, tmp_path):
-    """main() runs the checks unguarded, so one bad byte here would kill the
-    whole nightly report and send no email at all."""
-    p = tmp_path / "curate-state.json"
-    p.write_text("{not json")
-
-    assert hc.check_curation(state_path=p)["status"] == "WARN"
-
-
-def test_curate_defer_cap_matches_the_real_one(hc):
-    """Duplicated because health_check.py is loaded standalone. Pin it to the
-    source of truth so the two cannot drift into disagreeing about what
-    "out of retries" means."""
-    import re
-    from pathlib import Path
-
-    src = (Path(hc.__file__).parent / "curate_documents_daily.py").read_text()
-    m = re.search(r"^MAX_DEFER_ATTEMPTS\s*=\s*(\d+)", src, re.MULTILINE)
-    assert m, "could not find MAX_DEFER_ATTEMPTS in curate_documents_daily.py"
-    assert hc.CURATE_MAX_DEFER_ATTEMPTS == int(m.group(1))
-
-
-def test_report_names_the_curation_blockage(hc, tmp_path):
-    state = _curate_state(
-        tmp_path, deferred={"7": {"folder": "retail", "attempts": hc.CURATE_MAX_DEFER_ATTEMPTS}}
-    )
-
-    report, issues = hc.build_report([hc.check_curation(state_path=state)], {}, {}, {}, [])
-
-    assert "out of retries" in report
-    assert any("Curation" in str(i) for i in issues)
 
 
 # --- Downloaded is not the same as registered --------------------------------

@@ -4,7 +4,7 @@ On 2026-09-02 13:19 the M365 session died and `~/.second-brain/needs_reauth`
 was set. `sb-outlook-sync.sh` then took its sentinel branch and exited 0 once an
 hour for the next 24 hours. systemd recorded SUCCESS every time, fired
 `OnSuccess=hc-success@`, and the dead-man's switch stayed green while Inbox,
-Archive, Sent, calendar and document curation were all frozen. The mailbox was
+Archive, Sent, calendar and document curation (since retired) were all frozen. The mailbox was
 a full working day stale before anyone noticed, and what finally surfaced it was
 a human asking how fresh the database was, not the monitoring.
 
@@ -114,32 +114,3 @@ def test_sentinel_skip_is_recorded_in_the_log(wrapper_name, sentinel_name, tmp_p
     assert any("skip" in log.read_text().lower() for log in logs), (
         f"{wrapper_name} skipped without saying so in its log"
     )
-
-
-def test_curate_docs_does_not_gate_on_the_outlook_sentinel(tmp_path):
-    """Document curation has no Outlook dependency, so needs_reauth must not stop it.
-
-    `curate_documents_daily.py` reads brain.db and calls Vertex. It contains no
-    reference to outlook-cli or sharepoint-cli, and it already has the gate for
-    the dependency it does have (needs_gcloud_reauth, checked immediately after).
-    The needs_reauth check was copied from the mail wrappers ("mirrors other
-    second-brain wrappers") and gated curation on an unrelated subsystem.
-
-    Cost, measured 2026-09-03: the Outlook session died on 09-02 and curation
-    skipped for six days' worth of runs while its own SharePoint session was
-    healthy the whole time (all probes ok, renewed that morning).
-    """
-    wrapper = _WRAPPERS / "sb-curate-docs.sh"
-    assert wrapper.is_file()
-
-    result = _run_with_sentinel(wrapper, "needs_reauth", tmp_path)
-
-    log = tmp_path / ".second-brain" / "logs" / "curate-docs.log"
-    assert log.is_file(), "curate-docs wrote no log"
-    assert "needs_reauth sentinel present" not in log.read_text(), (
-        "curate-docs still refuses to run because of the Outlook sentinel, "
-        "though it never touches Outlook."
-    )
-    # It should fall through to its real guard instead (no Vertex creds in the
-    # temp env), which is a legitimate skip.
-    assert result.returncode == 0

@@ -369,8 +369,8 @@ def complete(*, max_tokens: int, messages: list, model: str | None = None, **kwa
     """Send one Claude request, the way every extraction call site does.
 
     The call sites used to build this themselves, and drifted: attachments,
-    images and calendar had no refusal fallback, and the curate job had no
-    retry policy. Here each gets all of it: the shared client, fetched again on
+    images and calendar had no refusal fallback, and the curate job (since
+    retired) had no retry policy. Here each gets all of it: the shared client, fetched again on
     every attempt so that a re-auth (which drops the cached client) reaches the
     retry; the retry and re-auth policy; and one retry on the fallback tier when
     the model refuses. `model` overrides the configured model (Teams has its
@@ -383,9 +383,9 @@ def complete(*, max_tokens: int, messages: list, model: str | None = None, **kwa
     pair cannot change its answer. A refused attempt can take two calls,
     primary then fallback. When the
     attempt was checked against the deadline first (a retry decide() allowed,
-    or a caller that checks before starting, like the curate job) the reserve
-    holds room for the second; an unchecked first call refused near the
-    deadline can run into the shutdown grace.
+    or a caller that checks before starting) the reserve holds room for the
+    second; an unchecked first call refused near the deadline can run into the
+    shutdown grace.
     """
     # Imported here, not at the top, so tests that patch it in vertex_fallback
     # reach this call.

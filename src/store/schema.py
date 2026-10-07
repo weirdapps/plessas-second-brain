@@ -1961,8 +1961,8 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     register_sql_functions(conn)
     conn.execute("PRAGMA foreign_keys = ON")
-    # Multiple launchd jobs (daily-sync, calendar-sync, teams-sync, outlook-sync,
-    # curate-docs) can hit brain.db concurrently after a missed-fire wake-up.
+    # Multiple launchd jobs (daily-sync, calendar-sync, teams-sync, outlook-sync)
+    # can hit brain.db concurrently after a missed-fire wake-up.
     # Without a busy timeout, the second writer fails immediately with
     # "database is locked" (observed: calendar-sync at 19:00 after auth-watch
     # restoration trigger). 60s is long enough to outlast any single transaction.

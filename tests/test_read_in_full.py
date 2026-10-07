@@ -124,8 +124,8 @@ def test_the_ocr_budget_reaches_a_scanned_pdf(tmp_path, monkeypatch):
     monkeypatch.setattr(
         ax,
         "_ocr_pdf_pages",
-        lambda path, seconds=None: (
-            seen.append(seconds)
+        lambda path, seconds=None, gray=False: (
+            (None if gray else seen.append(seconds))
             or {"text": None, "method": "pymupdf+tesseract", "status": "skipped", "error": "x"}
         ),
     )

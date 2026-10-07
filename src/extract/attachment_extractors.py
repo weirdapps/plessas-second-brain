@@ -95,6 +95,10 @@ OCR_MAX_SECONDS = 120
 # Tesseract's languages, and what a scan with too little text says.
 OCR_LANGS = "eng+ell"
 OCR_INSUFFICIENT = "OCR returned insufficient text"
+# Pillow's own decompression-bomb threshold, twice its default MAX_IMAGE_PIXELS. An image past it
+# is not OCR'd, whatever limit another module sets for its own Image.open calls: tesseract on a
+# 342-megapixel page needs gigabytes and minutes, and Phase 1 cannot stop an item mid-file.
+OCR_MAX_PIXELS = 178_956_970
 ZIP_MIME_TYPES = frozenset({"application/zip", "application/x-zip-compressed"})
 
 
@@ -323,7 +327,14 @@ def _extract_pdf(path: str, ocr_seconds: float | None = None) -> dict:
     # renders each page via fitz.get_pixmap before OCR-ing. See B3 spec.
     if len(text.strip()) < MIN_TEXT_CHARS:
         budget = OCR_MAX_SECONDS if ocr_seconds is None else ocr_seconds
+        started = time.monotonic()
         ocr_result = _ocr_pdf_pages(path, seconds=budget)
+        if ocr_result["status"] == "skipped" and "left unread" not in (ocr_result["error"] or ""):
+            # Too little in colour: once more in grayscale, in what is left of the budget.
+            left = max(budget - (time.monotonic() - started), 0)
+            gray = _ocr_pdf_pages(path, seconds=left, gray=True)
+            if gray["status"] == "extracted":
+                ocr_result = gray
         if ocr_result["status"] == "extracted" and len(ocr_result["text"] or "") > len(
             text.strip()
         ):
@@ -1006,20 +1017,51 @@ def _extract_xlsb(path: str) -> dict:
     return {"text": text, "method": "pyxlsb", "status": "extracted", "error": None}
 
 
+def _too_large_to_ocr(img) -> str | None:
+    """Why an image is not OCR'd for its size, or None. Read from the header, before decoding."""
+    pixels = img.width * img.height
+    if pixels > OCR_MAX_PIXELS:
+        return f"{pixels:,} pixels, over the {OCR_MAX_PIXELS:,} limit"
+    return None
+
+
+def _grayscale(img):
+    """The image in grayscale for a second OCR pass, transparency flattened onto white first.
+
+    Tesseract thresholds a colour image channel by channel, which reads most images best: on 40
+    producer screenshots a grayscale read found 2% more words in all, but fewer on 5 of them.
+    Where the colour read comes back with too little text, a grayscale read recovered 4 of 44
+    scanned PDFs and about 12% of content images, so it is a second pass for those only.
+    Converted straight to grayscale, a transparent background over black pixels turns black and
+    hides black text, so an image with transparency is laid on white paper first.
+    """
+    from PIL import Image
+
+    if img.mode in ("RGBA", "LA", "PA") or (img.mode == "P" and "transparency" in img.info):
+        rgba = img.convert("RGBA")
+        img = Image.alpha_composite(Image.new("RGBA", rgba.size, (255, 255, 255, 255)), rgba)
+    return img.convert("L")
+
+
 def _ocr_frames(img, budget: float) -> dict:
     """OCR every page of a multi-page TIFF, inside the scan budget, like _ocr_pdf_pages."""
     import pytesseract
     from PIL import ImageSequence
 
-    pages, note = [], None
+    pages, notes = [], []
     started = time.monotonic()
     for i, frame in enumerate(ImageSequence.Iterator(img)):
         if i and time.monotonic() - started > budget:
-            note = f"time budget spent, {img.n_frames - i} pages left unread"
+            notes.append(f"time budget spent, {img.n_frames - i} pages left unread")
             break
+        too_large = _too_large_to_ocr(frame)
+        if too_large:
+            notes.append(f"page {i + 1} too large to OCR: {too_large}; unread, file kept")
+            continue
         page = pytesseract.image_to_string(frame.convert("RGB"), lang=OCR_LANGS)
         if page.strip():
             pages.append(page.strip())
+    note = "; ".join(notes) or None
     text = _truncate("\n\n".join(pages))
     if _apply_noise_filter(text):
         return {
@@ -1055,6 +1097,14 @@ def _extract_image_ocr(path: str, ocr_seconds: float | None = None) -> dict:
 
     try:
         img = Image.open(path)
+        too_large = _too_large_to_ocr(img)
+        if too_large:
+            return {
+                "text": None,
+                "method": "ocr",
+                "status": "skipped",
+                "error": f"image too large to OCR: {too_large}",
+            }
         if img.format == "TIFF" and getattr(img, "n_frames", 1) > 1:
             return _ocr_frames(img, OCR_MAX_SECONDS if ocr_seconds is None else ocr_seconds)
         if img.format not in _TESSERACT_SAFE_FORMATS:
@@ -1064,6 +1114,11 @@ def _extract_image_ocr(path: str, ocr_seconds: float | None = None) -> dict:
             img = Image.open(buf)
         text = pytesseract.image_to_string(img, lang=OCR_LANGS)
         text = _truncate(text)
+        if _apply_noise_filter(text):
+            # Too little in colour: once more in grayscale, kept only when it reads.
+            gray = _truncate(pytesseract.image_to_string(_grayscale(img), lang=OCR_LANGS))
+            if not _apply_noise_filter(gray):
+                text = gray
 
         if _apply_noise_filter(text):
             return {
@@ -1073,6 +1128,14 @@ def _extract_image_ocr(path: str, ocr_seconds: float | None = None) -> dict:
                 "error": OCR_INSUFFICIENT,
             }
         return {"text": text, "method": "ocr", "status": "extracted", "error": None}
+    except Image.DecompressionBombError as e:
+        # Pillow refuses it before decoding: a size limit, not a fault in the file.
+        return {
+            "text": None,
+            "method": "ocr",
+            "status": "skipped",
+            "error": f"image too large to OCR: {str(e)[:200]}",
+        }
     except Exception as e:
         return {
             "text": None,
@@ -1082,7 +1145,7 @@ def _extract_image_ocr(path: str, ocr_seconds: float | None = None) -> dict:
         }
 
 
-def _ocr_pdf_pages(path: str, seconds: float | None = None) -> dict:
+def _ocr_pdf_pages(path: str, seconds: float | None = None, gray: bool = False) -> dict:
     """Render each PDF page to a PIL image and OCR it. Used as fallback for
     scanned PDFs when PyMuPDF text extraction yields too little content.
 
@@ -1090,7 +1153,9 @@ def _ocr_pdf_pages(path: str, seconds: float | None = None) -> dict:
     Tesseract to recognize Greek + English glyphs reliably, low enough that
     a typical 2-page scan completes in 3-10 seconds. Every page is read until
     `seconds` (OCR_MAX_SECONDS when None) is spent; then the pages read are kept
-    and the error says how many were left unread.
+    and the error says how many were left unread. With `gray` each page is read
+    in grayscale (_grayscale), the second pass for a scan the colour read found
+    too little in.
     """
     import io
 
@@ -1110,6 +1175,8 @@ def _ocr_pdf_pages(path: str, seconds: float | None = None) -> dict:
                 break
             pix = page.get_pixmap(dpi=200)
             img = Image.open(io.BytesIO(pix.tobytes("png")))
+            if gray:
+                img = _grayscale(img)
             page_text = pytesseract.image_to_string(img, lang=OCR_LANGS)
             if page_text.strip():
                 pages_text.append(page_text.strip())

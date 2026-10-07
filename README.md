@@ -475,7 +475,6 @@ scripts/
   reap_orphan_attachments.py   Resolves attachment dirs the registrar can never claim
   scrub_secrets.py             Redacts credentials already in the DB (dry run by default)
   repair_people.py             Mends garbled people names and unsaved sender addresses (dry run by default)
-  curate_documents_daily.py    Classifies new attachments into ~/Documents sub-folders
   backfill-all.sh              One-shot backfill across all sources
   conversation-capture.sh      Helper to snapshot Claude Code sessions
   pii-gauntlet.sh              Guards tracked files (and, with --mode=history, published history) against personal-data leaks

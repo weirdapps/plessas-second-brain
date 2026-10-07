@@ -498,7 +498,6 @@ trigger_job() {
   case "$script" in
     sb-daily-sync.sh)       label="com.plessas.second-brain-sync"          unit="sb-daily-sync.service" ;;
     sb-calendar-sync.sh)    label="com.plessas.second-brain.calendar-sync" unit="sb-calendar-sync.service" ;;
-    sb-curate-docs.sh)      label="com.plessas.second-brain.curate-docs"   unit="sb-curate-docs.service" ;;
     sb-teams-sync.sh)       label="com.plessas.second-brain.teams-sync"    unit="sb-teams-sync.service" ;;
     sb-reverse-ingest.sh)   label="com.plessas.second-brain.reverse-ingest" unit="sb-reverse-ingest.service" ;;
     sb-attachment-pass.sh)  label="com.plessas.second-brain.attachments"   unit="sb-attachments.service" ;;
@@ -562,7 +561,6 @@ trigger_job() {
 # tick even if multiple sentinels were restored.
 fire_daily=0
 fire_calendar=0
-fire_curate=0
 fire_teams=0
 fire_reverse=0
 fire_attachments=0
@@ -574,23 +572,22 @@ fire_outlook_sync=0
 
 if [ "$GCLOUD_WAS_BLOCKED" = "1" ] && [ ! -f "$GCLOUD_SENTINEL" ]; then
   log "auth-trigger: gcloud ADC restored — queueing all gcloud-gated jobs"
-  fire_daily=1; fire_calendar=1; fire_curate=1; fire_teams=1; fire_reverse=1; fire_attachments=1
+  fire_daily=1; fire_calendar=1; fire_teams=1; fire_reverse=1; fire_attachments=1
   fire_outlook_sync=1
 fi
 if [ "$OUTLOOK_WAS_BLOCKED" = "1" ] && [ ! -f "$SENTINEL" ]; then
   log "auth-trigger: outlook auth restored — queueing outlook-gated jobs"
-  fire_calendar=1; fire_curate=1; fire_reverse=1; fire_attachments=1; fire_outlook_sync=1
+  fire_calendar=1; fire_reverse=1; fire_attachments=1; fire_outlook_sync=1
 fi
 if [ "$TEAMS_WAS_BLOCKED" = "1" ] && [ ! -f "$TEAMS_SENTINEL" ]; then
   log "auth-trigger: teams auth restored — queueing teams-sync"
   fire_teams=1
 fi
 
-if [ "$fire_daily$fire_calendar$fire_curate$fire_teams$fire_reverse$fire_attachments$fire_outlook_sync" != "0000000" ]; then
+if [ "$fire_daily$fire_calendar$fire_teams$fire_reverse$fire_attachments$fire_outlook_sync" != "000000" ]; then
   echo "$(ts) — === auth-watch restoration trigger ===" >> "$TRIGGERED_LOG"
   [ "$fire_daily" = "1" ]       && trigger_job sb-daily-sync.sh        gcloud
   [ "$fire_calendar" = "1" ]    && trigger_job sb-calendar-sync.sh     gcloud_or_outlook
-  [ "$fire_curate" = "1" ]      && trigger_job sb-curate-docs.sh       gcloud_or_outlook
   [ "$fire_teams" = "1" ]       && trigger_job sb-teams-sync.sh        gcloud_or_teams
   [ "$fire_reverse" = "1" ]     && trigger_job sb-reverse-ingest.sh    gcloud_or_outlook
   [ "$fire_attachments" = "1" ] && trigger_job sb-attachment-pass.sh   gcloud_or_outlook

@@ -77,6 +77,9 @@ FetchStatus = Literal[
     "ok",
     "not-content",
     "not-a-file",
+    # A page read with neither text nor a title (src/extract/sharepoint_ingest.py): a failure,
+    # retried and shown, never settled with nothing held.
+    "no-text",
     "stale",
     "auth-required",
     "http-error",

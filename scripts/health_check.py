@@ -39,6 +39,7 @@ from src.export.outlook_attachments import (  # noqa: E402
     ORPHAN_GRACE_DAYS,
     is_abandoned_orphan,
 )
+from src.store.file_hashes import sha256_of_file  # noqa: E402
 
 DB_PATH = DEFAULT_DB
 LOG_DIR = Path.home() / ".second-brain/logs"
@@ -596,8 +597,8 @@ def count_unregistered_attachment_dirs(db, root: Path | None = None) -> int:
 
 def split_unregistered_attachment_dirs(
     db, root: Path | None = None, grace_days: float = ORPHAN_GRACE_DAYS, now: float | None = None
-) -> tuple[int, int]:
-    """Unregistered directories, split into (pending, abandoned).
+) -> tuple[int, int, int]:
+    """Unregistered directories, split into (pending, abandoned, copies).
 
     `pending` is a real backlog: the registrar has not caught up, or has stopped
     running, and a future run will clear it. That is worth a WARN.
@@ -611,14 +612,23 @@ def split_unregistered_attachment_dirs(
     3.88 GiB, accrued between April and August 2026 at roughly 400 a month.
 
     Reported, not hidden, and in check_sharepoint's words: "no longer retried".
+
+    `copies` holds nothing but byte copies of files the table already registers
+    (_holds_only_copies): the moved message's attachments were downloaded again
+    under its new id and registered there. Nothing in such a directory is missing
+    from search, and the orphan reaper deletes it once the sweep policy says
+    apply. 921 of the 946 unregistered directories on the producer on 2026-10-07
+    were copies; counted as pending or abandoned they kept the row at WARN for
+    good. A directory with one file found nowhere else, or with no file, is
+    pending or abandoned as before.
     """
     root = ATTACHMENTS_DIR if root is None else Path(root)
     try:
         on_disk = {e.name for e in os.scandir(root) if e.is_dir()}
     except OSError:
-        return 0, 0
+        return 0, 0, 0
     if not on_disk:
-        return 0, 0
+        return 0, 0, 0
     try:
         referenced = {
             os.path.basename(os.path.dirname(fp))
@@ -628,14 +638,43 @@ def split_unregistered_attachment_dirs(
         # Same posture as check_sharepoint: main() runs the checks unguarded, so
         # a missing table here would take down the whole nightly report over a
         # secondary count. Its absence would be loud everywhere else anyway.
-        return 0, 0
-    pending = abandoned = 0
+        return 0, 0, 0
+    try:
+        hashed = db.execute(
+            "SELECT sha256, file_size FROM attachments WHERE sha256 IS NOT NULL"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        hashed = []  # a store from before the hash column: nothing can be proved a copy
+    held = {sha for sha, _size in hashed}
+    # Hash only a file whose size some registered copy has, unless a row's size is unknown.
+    sizes = None if any(size is None for _sha, size in hashed) else {s for _h, s in hashed}
+    pending = abandoned = copies = 0
     for name in on_disk - referenced:
-        if is_abandoned_orphan(root / name, grace_days, now):
+        if _holds_only_copies(root / name, held, sizes):
+            copies += 1
+        elif is_abandoned_orphan(root / name, grace_days, now):
             abandoned += 1
         else:
             pending += 1
-    return pending, abandoned
+    return pending, abandoned, copies
+
+
+def _holds_only_copies(directory: Path, held: set[str], sizes: set[int] | None) -> bool:
+    """Whether the directory has files and every one is byte-identical to a registered one."""
+    if not held:
+        return False
+    try:
+        files = [e for e in os.scandir(directory) if e.is_file(follow_symlinks=False)]
+        if not files:
+            return False
+        for e in files:
+            if sizes is not None and e.stat(follow_symlinks=False).st_size not in sizes:
+                return False
+            if sha256_of_file(Path(e.path)) not in held:
+                return False
+    except OSError:
+        return False  # vanished or unreadable mid-check: not proved a copy
+    return True
 
 
 def check_attachments(db):
@@ -661,6 +700,12 @@ def check_attachments(db):
         "SELECT COUNT(*) FROM attachment_content "
         "WHERE extraction_status IN ('skipped', 'failed') AND llm_status = 'pending'"
     ).fetchone()[0]
+    # Rights- or password-protected originals: their text exists and needs rights, so they
+    # are neither a reader's failure nor a file with nothing to read, and counted with either
+    # they would read as one. Phase 1 records them as 'encrypted'.
+    encrypted = db.execute(
+        "SELECT COUNT(*) FROM attachment_content WHERE extraction_status = 'encrypted'"
+    ).fetchone()[0]
     llm_failed = db.execute(
         "SELECT COUNT(*) FROM attachment_content WHERE llm_status = 'failed'"
     ).fetchone()[0]
@@ -672,15 +717,17 @@ def check_attachments(db):
 
     stale = age and age > STALE_THRESHOLDS["attachments_llm"]
     pct = (extracted * 100 / total) if total > 0 else 0
-    unregistered, abandoned = split_unregistered_attachment_dirs(db)
+    unregistered, abandoned, copies = split_unregistered_attachment_dirs(db)
     return {
         "name": "Attachments",
         "total": total,
         "unregistered": unregistered,
         "abandoned": abandoned,
+        "copies": copies,
         "text_extracted": extracted,
         "text_failed": failed,
         "text_pct": pct,
+        "encrypted": encrypted,
         "llm_done": llm_done,
         "llm_pending": llm_pending,
         "llm_no_text": llm_no_text,
@@ -1910,7 +1957,7 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
         if c["name"] == "Attachments":
             extra = (
                 f" (LLM: {c.get('llm_done', 0):,} done, {c.get('llm_pending', 0):,} pending"
-                f", {c.get('llm_no_text', 0):,} no-text)"
+                f", {c.get('llm_no_text', 0):,} no-text, {c.get('encrypted', 0):,} encrypted)"
             )
             # Downloaded but never registered, so invisible to every search. The
             # count belongs on this row because this row is what a reader checks
@@ -1922,6 +1969,9 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
             # operator waits for a number that will never move on its own.
             if c.get("abandoned"):
                 extra = extra[:-1] + f"; {c['abandoned']:,} abandoned, no longer retried)"
+            # Missing nothing from search, so counted apart and never warned on.
+            if c.get("copies"):
+                extra = extra[:-1] + f"; {c['copies']:,} only copies of held files)"
         elif c["name"] == "Files on disk":
             extra = files_on_disk_detail(c)
         elif c["name"] == "Inline Images":

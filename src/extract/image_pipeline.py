@@ -16,7 +16,11 @@ from src.extract.image_classifier import (
 )
 from src.redact import redact_secrets
 from src.store.email_html import markup_or_text
-from src.store.file_sweep import VISION_ATTEMPTS_LIMIT
+from src.store.file_sweep import (
+    TRANSCRIPTION_OWED_SQL,
+    VISION_ATTEMPTS_LIMIT,
+    VISION_FILLABLE_SQL,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,29 +40,6 @@ IMAGE_OWED_SQL = (
     " WHERE o.sha256 = a.sha256 AND o.message_id = a.message_id)"
     " OR NOT EXISTS (SELECT 1 FROM inline_images ii"
     f" WHERE ii.sha256 = a.sha256 AND {IMAGE_DONE_SQL}))"
-)
-
-
-# An attachment_content row (alias ac) that an image's vision text may fill: it holds no text
-# read from the file (OCR found too little, or failed), or it is vision's own. A row with text
-# from the file is never overwritten, and none is inserted: Phase 1 stays the first writer, so
-# an image Phase 1 has not reached yet is filled once it has.
-VISION_FILLABLE_SQL = (
-    "(COALESCE(trim(ac.extracted_text, char(32, 9, 10, 11, 12, 13)), '') = ''"
-    " OR ac.extraction_method = 'vision')"
-)
-
-# A content image (alias ii) that still owes its transcription: described, not transcribed,
-# under VISION_ATTEMPTS_LIMIT failed attempts, and with an attachment row its text may fill
-# (an image whose rows all hold OCR text is searchable by it already). run_transcription takes
-# these, and it reads the file, so the sweep must keep the file of such an image.
-TRANSCRIPTION_OWED_SQL = (
-    "(ii.classification = 'content' AND ii.vision_description IS NOT NULL"
-    " AND ii.transcribed_at IS NULL"
-    f" AND ii.transcription_attempts < {VISION_ATTEMPTS_LIMIT}"
-    " AND EXISTS (SELECT 1 FROM attachments ta"
-    " JOIN attachment_content ac ON ac.attachment_id = ta.id"
-    f" WHERE ta.sha256 = ii.sha256 AND {VISION_FILLABLE_SQL}))"
 )
 
 

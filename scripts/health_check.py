@@ -714,6 +714,8 @@ def check_files_on_disk(db):
         return {"name": "Files on disk", "status": "WARN", "error": str(e)}
     policy = file_sweep.load_policy()
     problem = file_sweep.policy_problem()
+    # The sweep deletes nothing while curation's state cannot be read (file_sweep.sweep_files).
+    curation_problem = file_sweep.curation_sources()[1]
     cutoff = policy.only_newer_than.timestamp() if policy.only_newer_than else None
     now = time.time()
     counts = dict.fromkeys(file_sweep.STATES, 0)
@@ -736,7 +738,8 @@ def check_files_on_disk(db):
         "image_late": image_late,
         "mode": "apply" if policy.apply else "report-only",
         "policy_problem": problem,
-        "status": "WARN" if stalled or image_late or problem else "OK",
+        "curation_problem": curation_problem,
+        "status": "WARN" if stalled or image_late or problem or curation_problem else "OK",
     }
 
 
@@ -750,11 +753,14 @@ def files_on_disk_detail(c: dict) -> str:
     extra = (
         f" ({c.get('bytes', 0) / 2**30:.1f} GB; {k.get('deletable', 0):,} stored and removable,"
         f" {k.get('pending-text', 0):,} awaiting text, {k.get('unread', 0):,} unread,"
-        f" {k.get('pending-image', 0):,} awaiting vision, {k.get('unregistered', 0):,}"
+        f" {k.get('not-held', 0):,} content not held, {k.get('pending-image', 0):,} awaiting"
+        f" vision, {k.get('curation', 0):,} awaiting curation, {k.get('unregistered', 0):,}"
         f" unregistered; sweep {c.get('mode')})"
     )
     if c.get("policy_problem"):
         extra += f"; {c['policy_problem']}"
+    if c.get("curation_problem"):
+        extra += f"; {c['curation_problem']}"
     if c.get("stalled"):
         extra += (
             f"; {c['stalled']:,} stored files older than {file_sweep.STALL_HOURS}h:"

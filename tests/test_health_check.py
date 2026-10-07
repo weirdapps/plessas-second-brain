@@ -303,7 +303,6 @@ def _install_migrated_jobs(agents_dir, prefix):
         ".calendar-sync",
         ".attachments",
         ".auth-watch",
-        ".reverse-ingest",
     ):
         (agents_dir / f"{prefix}{suffix}.plist.disabled-migrated-to-vps").write_text("x")
 
@@ -685,373 +684,18 @@ def test_check_images_still_counts_eligible_work_as_owed(hc):
 
 
 # --- Source-side freshness ---------------------------------------------------
-# The daily reverse-ingest job reported OK every day while its document roots
-# were a frozen copy (newest real document two months old). Every check passed:
-# the job ran, and the rows it wrote were recent. Monitoring asked "did the job
-# run?" and "is the newest DB row recent?" — never "is the SOURCE still
-# receiving new material?". check_document_roots and check_news ask that.
-
-
-def _touch(path, days_old):
-    """Create a file whose mtime is `days_old` days in the past.
-    A negative `days_old` puts the mtime in the future (clock skew)."""
-    from datetime import datetime, timedelta
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("x")
-    ts = (datetime.now() - timedelta(days=days_old)).timestamp()
-    os.utime(path, (ts, ts))
-    return path
-
-
-def _no_stamp(tmp_path):
-    """A stamp path that does not exist → forces the mtime fallback, so these
-    tests never depend on the real ~/.second-brain/document-sync.stamp."""
-    return tmp_path / "absent-document-sync.stamp"
-
-
-def _no_fail(tmp_path):
-    """Same isolation for the failure marker: a real ~/.second-brain/
-    document-sync.fail on the developer's machine would otherwise turn every
-    stamp test STALE."""
-    return tmp_path / "absent-document-sync.fail"
+# A job can report OK every day while its source is a frozen copy: the job ran, and
+# the rows it wrote were recent. Monitoring asked "did the job run?" and "is the
+# newest DB row recent?", never "is the SOURCE still receiving new material?".
+# check_news asks that. (check_document_roots asked it for the OneDrive documents
+# until the scan and the push were retired on 2026-10-07.)
 
 
 def test_source_freshness_thresholds_are_registered(hc):
     from datetime import timedelta
 
-    assert hc.STALE_THRESHOLDS["document_roots"] == timedelta(days=14)
     assert hc.STALE_THRESHOLDS["news"] == timedelta(hours=12)
-
-
-def test_check_document_roots_flags_frozen_source(hc, tmp_path):
-    """The defect: newest input is two months old while the job keeps running."""
-    root = tmp_path / "docs"
-    _touch(root / "units" / "old.pdf", 61)
-    r = hc.check_document_roots(
-        roots=[root], stamp=_no_stamp(tmp_path), fail_marker=_no_fail(tmp_path)
-    )
-    assert r["status"] == "STALE"
-    assert r["total"] == 1
-    assert 60 < r["age"].days < 62
-
-
-def test_check_document_roots_fresh_is_ok(hc, tmp_path):
-    root = tmp_path / "docs"
-    _touch(root / "new.docx", 1)
-    _touch(root / "sub" / "ancient.pdf", 400)
-    r = hc.check_document_roots(
-        roots=[root], stamp=_no_stamp(tmp_path), fail_marker=_no_fail(tmp_path)
-    )
-    assert r["status"] == "OK"
-    assert r["total"] == 2
-    assert r["age"].days == 1
-
-
-def test_check_document_roots_ignores_non_ingestable_files(hc, tmp_path):
-    """A fresh .png/.json must not mask a frozen source — only the extensions
-    cmd_reverse_ingest actually ingests count as input."""
-    root = tmp_path / "docs"
-    _touch(root / "old.pdf", 61)
-    _touch(root / "fresh.png", 0)
-    _touch(root / "fresh.json", 0)
-    r = hc.check_document_roots(
-        roots=[root], stamp=_no_stamp(tmp_path), fail_marker=_no_fail(tmp_path)
-    )
-    assert r["total"] == 1
-    assert r["status"] == "STALE"
-
-
-def test_check_document_roots_ignores_future_mtimes(hc, tmp_path):
-    """A clock-skewed file dated in the future must not mask a frozen source.
-    Without the guard its negative age becomes the "newest input" and the check
-    reports OK forever — exactly the condition it exists to detect."""
-    root = tmp_path / "docs"
-    _touch(root / "old.pdf", 61)
-    _touch(root / "skewed.pdf", -30)  # mtime 30 days ahead
-    r = hc.check_document_roots(
-        roots=[root], stamp=_no_stamp(tmp_path), fail_marker=_no_fail(tmp_path)
-    )
-    assert r["total"] == 2, "the skewed file is still a countable input"
-    assert 60 < r["age"].days < 62, "newest usable input is still two months old"
-    assert r["status"] == "STALE"
-
-
-def test_check_document_roots_missing_root_is_warn(hc, tmp_path):
-    present = tmp_path / "present"
-    _touch(present / "fresh.md", 0)
-    r = hc.check_document_roots(
-        roots=[present, tmp_path / "gone"],
-        stamp=_no_stamp(tmp_path),
-        fail_marker=_no_fail(tmp_path),
-    )
-    assert r["status"] == "WARN"
-    assert r["missing"] == ["gone"]
-    per_root = {x["name"]: x for x in r["roots"]}
-    assert per_root["present"]["files"] == 1
-    assert per_root["gone"]["files"] == 0
-
-
-def test_check_document_roots_empty_root_is_warn(hc, tmp_path):
-    root = tmp_path / "docs"
-    root.mkdir()
-    r = hc.check_document_roots(
-        roots=[root], stamp=_no_stamp(tmp_path), fail_marker=_no_fail(tmp_path)
-    )
-    assert r["status"] == "WARN"
-    assert r["total"] == 0
-    assert r["age"] is None
-
-
-def test_check_document_roots_defaults_match_reverse_ingest(hc):
-    """Defaults must be the roots cmd_reverse_ingest scans, else the check
-    watches a different source than the job it is meant to police. Both sides
-    now go through one resolver, because the two layouts (OneDrive CloudStorage
-    on the Mac, plain ~/Documents on the VPS) cannot both be hardcoded."""
-    from src.config import document_roots
-
-    assert [p.name for p in hc.DOCUMENT_ROOTS] == ["National", "Personal"]
-    assert hc.DOCUMENT_ROOTS == document_roots()
-
-
-def test_check_document_roots_defaults_are_not_pinned_to_legacy_documents(hc):
-    """Regression for 2026-09-08: ~/Documents stopped reaching OneDrive on this
-    Mac, and the hardcoded default made the check report MISSING for two weeks
-    while the push job, which resolves the path, was working fine."""
-    import sys
-
-    from src.config import DOCUMENT_ROOT_CANDIDATES
-
-    assert all(p.parent in DOCUMENT_ROOT_CANDIDATES for p in hc.DOCUMENT_ROOTS)
-    if sys.platform == "darwin" and (DOCUMENT_ROOT_CANDIDATES[0] / "National").is_dir():
-        assert hc.DOCUMENT_ROOTS[0].parent == DOCUMENT_ROOT_CANDIDATES[0]
-
-
-# --- Document sync heartbeat -------------------------------------------------
-# Newest-mtime alone can be manufactured by our own jobs: curate-docs (retired
-# 2026-10-07) wrote files INTO the same roots, so the organic source (the laptop
-# push) could freeze while the newest mtime stayed fresh. The push job now writes a
-# stamp file after every successful push; when present it is the authoritative
-# liveness signal.
-
-
-def _write_stamp(path, now, **delta):
-    from datetime import timedelta
-
-    path.write_text((now - timedelta(**delta)).isoformat() + "\n")
-    return path
-
-
-def test_document_sync_stamp_path_is_registered(hc):
-    assert hc.DOCUMENT_SYNC_STAMP == Path.home() / ".second-brain" / "document-sync.stamp"
-
-
-def test_check_document_roots_fresh_stamp_beats_frozen_mtimes(hc, tmp_path):
-    """Not the point of the stamp, but the inverse must hold too: a genuinely
-    recent push keeps the check OK even if no ingestable file changed."""
-    from datetime import datetime
-
-    root = tmp_path / "docs"
-    _touch(root / "old.pdf", 61)
-    now = datetime.now(UTC)  # after the touches, so no mtime lands in the future
-    stamp = _write_stamp(tmp_path / "document-sync.stamp", now, hours=2)
-    r = hc.check_document_roots(roots=[root], now=now, stamp=stamp, fail_marker=_no_fail(tmp_path))
-    assert r["status"] == "OK"
-    assert r["total"] == 1, "file counts stay reported"
-    assert 60 < r["age"].days < 62, "newest-input age stays reported"
-    assert r["stamp_age"].total_seconds() < 3 * 3600
-
-
-def test_check_document_roots_stale_stamp_beats_fresh_mtimes(hc, tmp_path):
-    """The defect: curate-docs refreshed files under the roots, so a fresh mtime
-    proved nothing. A 20-day-old push is STALE regardless."""
-    from datetime import datetime
-
-    root = tmp_path / "docs"
-    _touch(root / "202608061200_curated.md", 0)
-    now = datetime.now(UTC)  # after the touches, so no mtime lands in the future
-    stamp = _write_stamp(tmp_path / "document-sync.stamp", now, days=20)
-    r = hc.check_document_roots(roots=[root], now=now, stamp=stamp, fail_marker=_no_fail(tmp_path))
-    assert r["status"] == "STALE"
-    assert r["stale"] is True
-    assert r["stamp_age"].days == 20
-    assert r["age"].days == 0, "newest-input age stays reported"
-
-
-def test_check_document_roots_missing_stamp_falls_back_to_mtimes(hc, tmp_path):
-    root = tmp_path / "docs"
-    _touch(root / "old.pdf", 61)
-    r = hc.check_document_roots(
-        roots=[root], stamp=_no_stamp(tmp_path), fail_marker=_no_fail(tmp_path)
-    )
-    assert r["status"] == "STALE"
-    assert r["stamp_age"] is None
-    assert "mtime" in r["note"], "the report must say the stamp is missing"
-
-    _touch(root / "new.pdf", 0)
-    r2 = hc.check_document_roots(
-        roots=[root], stamp=_no_stamp(tmp_path), fail_marker=_no_fail(tmp_path)
-    )
-    assert r2["status"] == "OK"
-
-
-def test_check_document_roots_unparseable_stamp_falls_back_to_mtimes(hc, tmp_path):
-    root = tmp_path / "docs"
-    _touch(root / "old.pdf", 61)
-    stamp = tmp_path / "document-sync.stamp"
-    stamp.write_text("not a timestamp\n")
-    r = hc.check_document_roots(roots=[root], stamp=stamp, fail_marker=_no_fail(tmp_path))
-    assert r["status"] == "STALE"
-    assert r["stamp_age"] is None
-    assert "mtime" in r["note"]
-
-
-# --- Failing push is visible immediately -------------------------------------
-# The stamp only proves when the push last SUCCEEDED, and it is judged against a
-# 14-day window. On 2026-08-06 the push started failing every run (macOS TCC
-# denied the launchd-spawned bash read access to ~/Documents) and 56 consecutive
-# failures produced no signal at all: the stamp simply sat there aging, and the
-# check reported OK for 8 days. A run that fails must say so on the next report,
-# not a fortnight later. The push job records failures alongside the heartbeat.
-
-
-def _write_fail(path, now, reason="DENIED reading roots", **delta):
-    from datetime import timedelta
-
-    path.write_text((now - timedelta(**delta)).isoformat() + "\n" + reason + "\n")
-    return path
-
-
-def test_document_sync_fail_path_is_registered(hc):
-    assert hc.DOCUMENT_SYNC_FAIL == Path.home() / ".second-brain" / "document-sync.fail"
-
-
-def test_check_document_roots_failing_push_caught_inside_the_stamp_window(hc, tmp_path):
-    """The 8-day blind spot: stamp still inside the 14-day window, push dead."""
-    from datetime import datetime
-
-    root = tmp_path / "docs"
-    _touch(root / "202608061200_curated.md", 0)
-    now = datetime.now(UTC)
-    stamp = _write_stamp(tmp_path / "document-sync.stamp", now, days=8)
-    fail = _write_fail(tmp_path / "document-sync.fail", now, hours=2)
-
-    r = hc.check_document_roots(roots=[root], now=now, stamp=stamp, fail_marker=fail)
-
-    assert r["status"] != "OK", "a push failing every run must not report OK"
-    assert r["stale"] is True
-    assert r["push_failing"] is True
-
-
-def test_check_document_roots_failure_reason_is_reported(hc, tmp_path):
-    from datetime import datetime
-
-    root = tmp_path / "docs"
-    _touch(root / "doc.pdf", 0)
-    now = datetime.now(UTC)
-    stamp = _write_stamp(tmp_path / "document-sync.stamp", now, days=1)
-    fail = _write_fail(
-        tmp_path / "document-sync.fail", now, reason="DENIED reading National", hours=1
-    )
-
-    r = hc.check_document_roots(roots=[root], now=now, stamp=stamp, fail_marker=fail)
-
-    assert "DENIED reading National" in r["note"], "the report must name the cause"
-
-
-def test_check_document_roots_failure_superseded_by_later_success_is_ignored(hc, tmp_path):
-    """A stale marker from a failure that a later run fixed must not stick."""
-    from datetime import datetime
-
-    root = tmp_path / "docs"
-    _touch(root / "doc.pdf", 0)
-    now = datetime.now(UTC)
-    stamp = _write_stamp(tmp_path / "document-sync.stamp", now, hours=1)
-    fail = _write_fail(tmp_path / "document-sync.fail", now, days=3)
-
-    r = hc.check_document_roots(roots=[root], now=now, stamp=stamp, fail_marker=fail)
-
-    assert r["status"] == "OK"
-    assert r["push_failing"] is False
-
-
-def test_check_document_roots_absent_failure_marker_keeps_stamp_behaviour(hc, tmp_path):
-    from datetime import datetime
-
-    root = tmp_path / "docs"
-    _touch(root / "doc.pdf", 0)
-    now = datetime.now(UTC)
-    stamp = _write_stamp(tmp_path / "document-sync.stamp", now, days=2)
-
-    r = hc.check_document_roots(
-        roots=[root], now=now, stamp=stamp, fail_marker=tmp_path / "absent.fail"
-    )
-
-    assert r["status"] == "OK"
-    assert r["push_failing"] is False
-
-
-def test_check_document_roots_unparseable_failure_marker_still_flags(hc, tmp_path):
-    """A clobbered marker is evidence a run failed; it must not be swallowed."""
-    from datetime import datetime
-
-    root = tmp_path / "docs"
-    _touch(root / "doc.pdf", 0)
-    now = datetime.now(UTC)
-    stamp = _write_stamp(tmp_path / "document-sync.stamp", now, days=2)
-    fail = tmp_path / "document-sync.fail"
-    fail.write_text("\x00not a timestamp\n")
-
-    r = hc.check_document_roots(roots=[root], now=now, stamp=stamp, fail_marker=fail)
-
-    assert r["push_failing"] is True
-
-
-def test_report_names_the_liveness_signal(hc):
-    from datetime import timedelta
-
-    stale_by_stamp = {
-        "name": "Doc Roots",
-        "total": 860,
-        "age": timedelta(minutes=5),
-        "stamp_age": timedelta(days=20),
-        "stale": True,
-        "missing": [],
-        "roots": [{"name": "docs", "files": 860, "age": timedelta(minutes=5)}],
-        "status": "STALE",
-    }
-    text, issues = hc.build_report([stale_by_stamp], {}, {}, {}, [])
-    assert "20d" in text, "the stamp age, not the manufactured mtime, explains STALE"
-    assert "source may be disconnected" in text
-    assert "Doc Roots: STALE" in issues
-
-    no_stamp = dict(stale_by_stamp, stamp_age=None, note="no sync stamp — using file mtimes")
-    text2, _ = hc.build_report([no_stamp], {}, {}, {}, [])
-    assert "no sync stamp" in text2
-
-
-def test_report_states_a_failing_push_instead_of_speculating(hc):
-    """When the marker says the push failed we know the cause, so the report
-    must say it — not hedge with 'source may be disconnected'."""
-    from datetime import timedelta
-
-    failing = {
-        "name": "Doc Roots",
-        "total": 1463,
-        "age": timedelta(minutes=5),
-        "stamp_age": timedelta(days=8),
-        "stale": True,
-        "push_failing": True,
-        "note": "push FAILING: DENIED reading National",
-        "missing": [],
-        "roots": [{"name": "docs", "files": 1463, "age": timedelta(minutes=5)}],
-        "status": "STALE",
-    }
-    text, issues = hc.build_report([failing], {}, {}, {}, [])
-    assert "push FAILING" in text
-    assert "DENIED reading National" in text
-    assert "source may be disconnected" not in text, "we know the cause; do not speculate"
-    assert "Doc Roots: STALE" in issues
+    assert "document_roots" not in hc.STALE_THRESHOLDS
 
 
 def _news_db(path, articles=(), digests=()):
@@ -1273,19 +917,10 @@ def test_check_news_reads_the_configured_news_db(monkeypatch, tmp_path):
     assert r["note"] == "news db not found"
 
 
-def test_report_surfaces_frozen_source_and_news_lag(hc):
+def test_report_surfaces_news_lag(hc):
     from datetime import timedelta
 
     checks = [
-        {
-            "name": "Doc Roots",
-            "total": 4321,
-            "age": timedelta(days=61),
-            "stale": True,
-            "missing": [],
-            "roots": [{"name": "docs", "files": 4321, "age": timedelta(days=61)}],
-            "status": "STALE",
-        },
         {
             "name": "News",
             "total": 120,
@@ -1296,19 +931,16 @@ def test_report_surfaces_frozen_source_and_news_lag(hc):
         },
     ]
     text, issues = hc.build_report(checks, {}, {}, {}, [])
-    assert "Doc Roots" in text
-    assert "source may be disconnected" in text
-    assert "61d" in text
-    assert "18h" in text
-    assert "Doc Roots: STALE" in issues
+    assert "upstream" in text and "18h" in text
     assert "News: STALE" in issues
 
 
-def test_new_source_checks_are_registered_in_main():
-    """Both checks must run in the nightly report, not just exist."""
+def test_source_checks_are_registered_in_main():
+    """The news check must run in the nightly report, not just exist, and the retired
+    document-roots check must not come back."""
     src = HEALTH_CHECK_PATH.read_text()
-    assert "check_document_roots()," in src
     assert "check_news(db)," in src
+    assert "check_document_roots" not in src
 
 
 def _emails_db(rows):
@@ -1356,47 +988,6 @@ def test_check_emails_ignores_news_rows(hc):
     assert with_news["status"] == "STALE", "a fresh news row must not mask stale mail"
     assert with_news["total"] == without_news["total"], "news rows must not inflate the count"
     assert with_news["recent_24h"] == 0
-
-
-def test_check_document_roots_ignores_future_stamp(hc, tmp_path):
-    """A clock-skewed stamp must not pin the check to OK.
-
-    Same hole the mtime branch already clamps: one bad write from the push job
-    would silently disable the liveness signal it exists to provide.
-    """
-    from datetime import datetime, timedelta
-
-    now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
-    root = tmp_path / "National"
-    root.mkdir()
-    old = root / "frozen.pdf"
-    old.write_text("x")
-    os.utime(old, ((now - timedelta(days=90)).timestamp(),) * 2)
-
-    stamp = tmp_path / "document-sync.stamp"
-    stamp.write_text((now + timedelta(days=5)).isoformat())
-
-    r = hc.check_document_roots(roots=[root], now=now, stamp=stamp, fail_marker=_no_fail(tmp_path))
-    assert r["status"] == "STALE", "future stamp is unusable — fall back to the 90d-old mtime"
-
-
-def test_check_document_roots_survives_unreadable_stamp_bytes(hc, tmp_path):
-    """main() has no try/except around the checks, so an exception here kills
-    the whole nightly report and no email goes out."""
-    from datetime import datetime, timedelta
-
-    now = datetime(2026, 8, 6, 12, 0, tzinfo=UTC)
-    root = tmp_path / "National"
-    root.mkdir()
-    fresh = root / "doc.pdf"
-    fresh.write_text("x")
-    os.utime(fresh, ((now - timedelta(days=1)).timestamp(),) * 2)
-
-    stamp = tmp_path / "document-sync.stamp"
-    stamp.write_bytes(b"\xff\xfe not utf-8")
-
-    r = hc.check_document_roots(roots=[root], now=now, stamp=stamp, fail_marker=_no_fail(tmp_path))
-    assert r["status"] == "OK", "undecodable stamp falls back to mtimes, never raises"
 
 
 # --- Teams chats silently dropped from ingestion -----------------------------
@@ -1900,9 +1491,10 @@ def test_check_sync_logs_covers_every_scheduled_job(hc, tmp_path):
     raised nothing here because its log was simply not in the dict."""
     r = hc.check_sync_logs(log_dir=tmp_path)
 
-    for expected in ("attachments", "calendar_sync", "reverse_ingest"):
+    for expected in ("attachments", "calendar_sync"):
         assert expected in r, f"{expected} log is unwatched"
-    assert "curate_docs" not in r, "the retired curation job's log must not be watched"
+    for retired in ("curate_docs", "reverse_ingest"):
+        assert retired not in r, f"the retired {retired} job's log must not be watched"
 
 
 # --- Inline images: the measured age was never asserted on -------------------
@@ -2404,7 +1996,8 @@ def test_detect_label_prefix_reads_the_plist_a_migrated_mac_keeps(hc, tmp_path, 
 
 
 def test_mac_registry_asserts_on_the_jobs_the_mac_owns(hc):
-    assert hc.LAUNCHD_LOCAL_JOBS, "the Mac still owns db-pull and the document push"
+    assert hc.LAUNCHD_LOCAL_JOBS, "the Mac still owns db-pull"
+    assert not any("document" in label for label in hc.LAUNCHD_LOCAL_JOBS), "the push is retired"
     assert set(hc.LAUNCHD_LOCAL_JOBS) <= set(hc.LAUNCHD_JOBS)
     assert set(hc.LAUNCHD_MIGRATED_JOBS).isdisjoint(hc.LAUNCHD_LOCAL_JOBS)
 

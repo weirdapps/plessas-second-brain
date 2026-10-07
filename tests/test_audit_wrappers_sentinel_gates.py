@@ -69,22 +69,10 @@ def test_the_attachment_pass_runs_while_the_outlook_session_is_dead(tmp_path):
     assert result.returncode == 0
 
 
-def test_reverse_ingest_does_not_gate_on_the_outlook_sentinel(tmp_path):
-    home = _home(tmp_path, "needs_reauth")
-
-    _run("sb-reverse-ingest.sh", home)
-
-    log = (home / ".second-brain" / "logs" / "reverse-ingest.log").read_text()
-    assert "needs_reauth sentinel present" not in log, log
-    # With no Vertex project in the throwaway env it stops at its real guard.
-    assert "no Vertex project" in log, log
-
-
 @pytest.mark.parametrize(
     ("wrapper", "sentinel"),
     [
         ("sb-attachment-pass.sh", "needs_gcloud_reauth"),
-        ("sb-reverse-ingest.sh", "needs_gcloud_reauth"),
         ("sb-calendar-sync.sh", "needs_gcloud_reauth"),
         ("sb-calendar-sync.sh", "needs_reauth"),
         ("sb-conversation-sync.sh", "needs_gcloud_reauth"),

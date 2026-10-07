@@ -5,9 +5,11 @@ Extracts text from PDF, Word, PowerPoint, Excel, images (OCR),
 """
 
 import html
+import io
 import os
 import re
 import time
+import zlib
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
@@ -33,7 +35,14 @@ SKIP_MIME_TYPES = {
     "application/gzip",
 }
 
-SKIP_EXTENSIONS = {".mp4", ".mp3", ".wav", ".rar", ".7z", ".gz", ".mso", ".wmz"}
+SKIP_EXTENSIONS = {".mp4", ".mp3", ".wav", ".rar", ".7z", ".gz", ".wmz"}
+
+# Formats with a reader of their own, chosen by the name: their bytes have no magic a sniff
+# knows, and senders declare them as anything (image/g3fax, application/gzip, x-coff).
+OWN_READER_EXTENSIONS = frozenset({".mso"})
+# An .mso part inflates to an OLE2 file, and each object in it inflates again. The largest of
+# 255 on the producer inflates to 1.6 MB; past this a container is taken for a zlib bomb.
+MSO_MAX_INFLATED = 64 << 20
 
 # A zip is unpacked into a temporary directory and every member extracted; nothing is kept.
 # The guards stop a hostile archive: too many members, too many bytes, a member compressed
@@ -106,7 +115,7 @@ def _extract_by_type(
     # were skipped here unread, although every one of them opens. So the bytes
     # get the last word. A genuine archive still sniffs as application/zip (or
     # as nothing) and is skipped exactly as before.
-    if mime_type in SKIP_MIME_TYPES:
+    if mime_type in SKIP_MIME_TYPES and ext not in OWN_READER_EXTENSIONS:
         sniffed = sniff_mime_type(file_path)
         if sniffed is None or sniffed in SKIP_MIME_TYPES:
             return {"text": None, "method": None, "status": "skipped", "error": None}
@@ -138,6 +147,8 @@ def _extract_by_type(
         protected = encryption_of(file_path)
         if protected:
             return protected
+        if ext == ".mso":
+            return _extract_mso(file_path, _depth, zip_seconds, ocr_seconds)
         if ext == ".zip" or mime_type in ZIP_MIME_TYPES:
             sniffed = sniff_mime_type(file_path)
             if sniffed == "application/zip":
@@ -1234,6 +1245,123 @@ def _extract_zip(path: str, depth: int, seconds: float, ocr_seconds: float | Non
     return {
         "text": _truncate("\n\n".join(parts)),
         "method": "zip",
+        "status": "extracted",
+        "error": error,
+    }
+
+
+class _InflatesTooFar(ValueError):
+    pass
+
+
+def _unpack(data: bytes) -> bytes | None:
+    """The OLE2 file in a part packed as a 4-byte length and a zlib stream, or None."""
+    if len(data) < 6 or data[4] != 0x78:
+        return None
+    try:
+        inflated = zlib.decompressobj().decompress(data[4:], MSO_MAX_INFLATED + 1)
+    except zlib.error:
+        return None
+    if len(inflated) > MSO_MAX_INFLATED:
+        raise _InflatesTooFar(f"inflates past {MSO_MAX_INFLATED:,} bytes")
+    return inflated if inflated.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1") else None
+
+
+def _root_streams(ole: bytes):
+    """(xlrd compound document, names of the streams directly under its root)."""
+    from xlrd import compdoc
+
+    doc = compdoc.CompDoc(ole, logfile=io.StringIO())
+    return doc, [doc.dirlist[i].name for i in doc.dirlist[0].children if doc.dirlist[i].etype == 2]
+
+
+def _read_embedded_object(
+    ole: bytes, stem: Path, depth: int, zip_seconds: float | None, ocr_seconds: float | None
+) -> dict:
+    """One embedded object, read by the reader its payload calls for.
+
+    A Package stream is an Office 2007+ file, written out whole and read by its bytes. A
+    Workbook (or Book) stream is a BIFF workbook, which xlrd finds inside the object's own
+    OLE2 file, so the object is written out as it is.
+    """
+    doc, names = _root_streams(ole)
+    if "Package" in names:
+        stem.write_bytes(doc.get_named_stream("Package"))
+        mime = ""
+    elif "Workbook" in names or "Book" in names:
+        stem = stem.with_suffix(".xls")
+        stem.write_bytes(ole)
+        mime = "application/vnd.ms-excel"
+    else:
+        return {
+            "text": None,
+            "method": None,
+            "status": "skipped",
+            "error": "no workbook or package inside",
+        }
+    return extract_text_from_file(
+        str(stem), mime, depth + 1, zip_seconds=zip_seconds, ocr_seconds=ocr_seconds
+    )
+
+
+def _extract_mso(
+    path: str, depth: int, zip_seconds: float | None = None, ocr_seconds: float | None = None
+) -> dict:
+    """Read the objects in an Office object container (.mso), each with its own reader.
+
+    Outlook keeps the objects pasted into an HTML mail, most often Excel charts, in an
+    oledata.mso part: a 4-byte length and a zlib stream holding an OLE2 file, whose root
+    streams each hold one object packed the same way. On the producer all 255 had that shape,
+    and their 349 objects were BIFF chart workbooks or Office 2007+ packages. Each object is
+    read like an archive member, in a temporary directory nothing outlives; one that cannot be
+    read is named in the error and the rest are kept.
+    """
+    import tempfile
+
+    with open(path, "rb") as f:
+        data = f.read(MSO_MAX_INFLATED + 1)
+    try:
+        container = _unpack(data)
+    except _InflatesTooFar as e:
+        return {"text": None, "method": "mso", "status": "skipped", "error": f"container {e}"}
+    if container is None:
+        return {
+            "text": None,
+            "method": "mso",
+            "status": "skipped",
+            "error": "not an Office object container: no packed OLE2 file inside",
+        }
+    doc, streams = _root_streams(container)
+    parts: list[str] = []
+    notes: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="sb-mso-") as tmp:
+        for n, name in enumerate(streams, 1):
+            label = f"embedded object {n}"
+            try:
+                obj = _unpack(doc.get_named_stream(name))
+                if obj is None:
+                    notes.append(f"{label}: not a packed OLE2 object")
+                    continue
+                result = _read_embedded_object(
+                    obj, Path(tmp) / str(n), depth, zip_seconds, ocr_seconds
+                )
+            except Exception as e:
+                notes.append(f"{label}: {type(e).__name__}: {str(e)[:200]}")
+                continue
+            text, said = _member_outcome(label, result)
+            parts.extend(text)
+            notes.extend(said)
+    error = "; ".join(notes) or None
+    if not parts:
+        return {
+            "text": None,
+            "method": "mso",
+            "status": "skipped",
+            "error": error or "no embedded objects",
+        }
+    return {
+        "text": _truncate("\n\n".join(parts)),
+        "method": "mso",
         "status": "extracted",
         "error": error,
     }

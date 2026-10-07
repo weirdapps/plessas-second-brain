@@ -643,7 +643,7 @@ def cmd_sweep_files(args):
     print(f"  awaiting text extraction       : {stats['pending-text']:,}")
     print(f"  unread (Phase 1 could not read) : {stats['unread']:,}")
     print(f"  content not held (kept)        : {stats['not-held']:,}")
-    print(f"  images awaiting vision         : {stats['pending-image']:,}")
+    print(f"  images awaiting vision or text : {stats['pending-image']:,}")
     print(f"  unregistered (orphan reaper)   : {stats['unregistered']:,}")
     print(f"  directories removed            : {stats['dirs_removed']:,}")
     print(f"  delete errors                  : {stats['errors']:,}")

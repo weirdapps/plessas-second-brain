@@ -19,6 +19,11 @@ from pathlib import Path
 import numpy as np
 
 from src.config import DATA_ROOT
+from src.store.schema import SUMMARISED_ATTACHMENT_IDS_SQL
+
+# Summaries fetched per query for the attachments missing from the index; under SQLite's
+# 999-variable limit on older builds.
+ATTACHMENT_FETCH_CHUNK = 500
 
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_DIM = 3072
@@ -371,22 +376,32 @@ def build_index(conn: sqlite3.Connection, force: bool = False) -> int:
     else:
         to_embed = [(r["id"], _email_text(r)) for r in email_rows if r["id"] not in existing_ids]
 
-    # Get attachment summaries needing embeddings (negative IDs to avoid collision)
+    # Get attachment summaries needing embeddings (negative IDs to avoid collision).
+    # The ids come first, from the index that holds them (schema v32), and only the missing
+    # ones are fetched. A row keeps its stored text ahead of its summary, so fetching the
+    # summary of all 39k attachments to keep the few that are new read about 3 GB: a minute
+    # and more with a cold cache, on every pass, twice in each sync.
     try:
-        att_rows = conn.execute("""
-            SELECT ac.id, ac.summary, a.filename
-            FROM attachment_content ac
-            JOIN attachments a ON a.id = ac.attachment_id
-            WHERE ac.llm_status = 'extracted'
-              AND ac.summary IS NOT NULL AND ac.summary != ''
-        """).fetchall()
-
-        for r in att_rows:
-            att_id = -r["id"]  # negative namespace
-            if force or att_id not in existing_ids:
+        att_ids = [r[0] for r in conn.execute(SUMMARISED_ATTACHMENT_IDS_SQL)]
+        wanted = sorted(att_ids if force else (i for i in att_ids if -i not in existing_ids))
+        for start in range(0, len(wanted), ATTACHMENT_FETCH_CHUNK):
+            chunk = wanted[start : start + ATTACHMENT_FETCH_CHUNK]
+            att_rows = conn.execute(
+                f"""
+                SELECT ac.id, ac.summary, a.filename
+                FROM attachment_content ac
+                JOIN attachments a ON a.id = ac.attachment_id
+                WHERE ac.id IN ({",".join("?" * len(chunk))})
+                  AND ac.llm_status = 'extracted'
+                  AND ac.summary IS NOT NULL AND ac.summary != ''
+                ORDER BY ac.id
+                """,
+                chunk,
+            ).fetchall()
+            for r in att_rows:
                 # Prefix with filename for better context
                 text = f"[Attachment: {r['filename']}] {r['summary']}"
-                to_embed.append((att_id, text))
+                to_embed.append((-r["id"], text))  # negative namespace
     except Exception:
         # attachment tables may not exist in older schemas
         pass

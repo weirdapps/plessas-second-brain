@@ -687,6 +687,18 @@ ATTACHMENT_CONTENT_INDEXES = (
 )
 
 
+# Ids of the attachment_content rows that have a finished summary, answered from the third index
+# above without reading any stored text. length(summary) > 0 is `summary IS NOT NULL AND summary
+# != ''`, in the form the index holds. Read by scripts/health_check.py (embedding coverage) and by
+# src/store/embeddings.py build_index (which attachments are new), neither of which may fetch the
+# summaries of all of them: that reads every stored text, 3 GB on the producer.
+SUMMARISED_ATTACHMENT_IDS_SQL = (
+    "SELECT ac.id FROM attachment_content ac JOIN attachments a "
+    "ON a.id = ac.attachment_id WHERE ac.llm_status = 'extracted' "
+    "AND length(ac.summary) > 0"
+)
+
+
 def migrate_add_attachment_content_indexes(conn: sqlite3.Connection) -> None:
     """v32: covering indexes for the sweep and the health check on attachment_content.
 

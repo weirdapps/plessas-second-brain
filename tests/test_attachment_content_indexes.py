@@ -11,12 +11,14 @@ import importlib.util
 import sqlite3
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from src.config import CURRENT_SCHEMA_VERSION
-from src.store import file_sweep
+from src.store import embeddings, file_sweep
 from src.store.schema import (
     create_database,
+    get_connection,
     get_schema_version,
     migrate_add_attachment_content_indexes,
 )
@@ -266,3 +268,114 @@ def test_the_summarised_attachment_query_selects_what_the_old_condition_did(db, 
     }
     new = {r[0] for r in db.execute(hc.SUMMARISED_ATTACHMENT_IDS_SQL)}
     assert new == old and len(new) == 3
+
+
+# --- the embed pass -------------------------------------------------------------------------
+
+DIM = 4
+
+
+@pytest.fixture
+def embedded(tmp_path, monkeypatch):
+    """build_index with the embedding API stubbed; `seen` collects the texts it was asked for."""
+    path = tmp_path / "embeddings.npz"
+    monkeypatch.setattr(embeddings, "EMBEDDINGS_FILE", path)
+    monkeypatch.setattr(embeddings, "_get_client", lambda: None)
+    seen: list[str] = []
+
+    def fake(texts, client=None):
+        seen.extend(texts)
+        return np.ones((len(texts), DIM), dtype=np.float32)
+
+    monkeypatch.setattr(embeddings, "generate_embeddings", fake)
+    return path, seen
+
+
+def _content_id(conn, attachment_id: int) -> int:
+    row = conn.execute(
+        "SELECT id FROM attachment_content WHERE attachment_id = ?", (attachment_id,)
+    ).fetchone()
+    return row[0]
+
+
+def _index(path: Path, vector_ids: list[int]) -> None:
+    np.savez(
+        str(path),
+        ids=np.array(vector_ids, dtype=np.int64),
+        vectors=np.ones((len(vector_ids), DIM), np.float32),
+    )
+
+
+def test_an_embed_pass_reads_only_the_summaries_that_are_new(tmp_path, embedded):
+    """Finding the new attachments must not read the stored text of the old ones.
+
+    The old pass fetched every summary, which walks every stored text, to keep the few not yet
+    in the index. Here the texts of the indexed attachments are destroyed: only a pass that
+    leaves them alone still embeds the one new attachment (the pass swallows a read error as
+    "no attachment tables", so a pass that reads them embeds nothing and returns 0).
+    """
+    index_path, seen = embedded
+    path = tmp_path / "poisoned.db"
+    conn = create_database(str(path))
+    indexed = []
+    for i in range(20):
+        att = _attachment(
+            conn, f"d{i}", f"old{i}.pdf", text="x" * 50_000, summary="old", llm_status="extracted"
+        )
+        indexed.append(-_content_id(conn, att))
+    _attachment(
+        conn, "dn", "new.pdf", text="short", summary="a brand new summary", llm_status="extracted"
+    )
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+    _index(index_path, indexed)
+    assert _poison_the_stored_text(path) > 0
+
+    conn = get_connection(str(path))
+    assert embeddings.build_index(conn) == 1
+    conn.close()
+
+    assert seen == ["[Attachment: new.pdf] a brand new summary"]
+
+
+def _summaries_fixture(conn):
+    """Rows covering every branch of the eligibility rule; returns (content id, filename) pairs."""
+    rows = [
+        ("a.pdf", None, "extracted"),
+        ("b.pdf", "", "extracted"),
+        ("c.pdf", " ", "extracted"),
+        ("d.pdf", "kept", "extracted"),
+        ("e.pdf", "pending one", "pending"),
+        ("f.pdf", "é", "extracted"),
+        ("g.pdf", "failed one", "failed"),
+    ]
+    out = []
+    for i, (name, summary, llm) in enumerate(rows):
+        att = _attachment(conn, f"d{i}", name, summary=summary, llm_status=llm)
+        out.append((_content_id(conn, att), name, summary, llm))
+    return out
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_the_embed_pass_selects_the_attachments_it_always_did(db, embedded, force):
+    index_path, seen = embedded
+    rows = _summaries_fixture(db)
+    eligible = [(cid, n, s) for cid, n, s, llm in rows if llm == "extracted" and s]
+    already = {-eligible[0][0]}  # the first eligible attachment is in the index
+    _index(index_path, sorted(already))
+
+    embeddings.build_index(db, force=force)
+
+    expected = [f"[Attachment: {n}] {s}" for cid, n, s in eligible if force or -cid not in already]
+    assert sorted(seen) == sorted(expected)  # the old query promised no order
+    assert expected  # the fixture must leave something to embed
+
+
+def test_a_large_batch_of_new_attachments_is_fetched_in_chunks(db, embedded):
+    """Past SQLite's variable limit on older builds, and in id order."""
+    _, seen = embedded
+    for i in range(1_200):
+        _attachment(db, f"d{i}", f"f{i}.pdf", summary=f"s{i}", llm_status="extracted")
+
+    assert embeddings.build_index(db) == 1_200
+    assert seen == [f"[Attachment: f{i}.pdf] s{i}" for i in range(1_200)]

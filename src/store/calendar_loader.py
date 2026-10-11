@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from src.redact import redact_secrets
+from src.store.owner import is_owner_address
 
 logger = logging.getLogger(__name__)
 
@@ -74,13 +75,13 @@ def _iso_date_or_none(value) -> str | None:
 
 
 def _is_self_email(email: str, user_email_pattern: str) -> bool:
-    """Whether ``email`` is the owner's, by case-insensitive substring.
+    """Whether ``email`` is the owner's (src/store/owner.py).
 
     An empty pattern matches nobody. '' is a substring of every string, so with
     BRAIN_USER_EMAIL_PATTERN unset on the producer every event was stored as
     self-organized and every one of 31,588 attendees as the owner.
     """
-    return bool(user_email_pattern) and user_email_pattern.lower() in (email or "").lower()
+    return is_owner_address(email, user_email_pattern)
 
 
 def _is_self_organized(
@@ -93,7 +94,7 @@ def _is_self_organized(
 
     Args:
         organizer_email: Event organizer email
-        user_email_pattern: User email pattern (case-insensitive substring match)
+        user_email_pattern: User email pattern (matched as src/store/owner.py says)
         proxy_emails: Optional set of proxy emails (lowercase)
 
     Returns:

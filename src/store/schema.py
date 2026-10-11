@@ -735,10 +735,11 @@ def migrate_add_source_class(conn: sqlite3.Connection) -> None:
     loader and the document writers set it on every new row.
 
     NOT NULL DEFAULT 'mail' rewrites nothing: a row stored before the column reads the default.
-    Then only the rows of another class are written, by reclassify, with the full-text trigger
-    set aside. On a copy of the replica (6.5 GB, 96K emails) that wrote 26K rows in 7 s, with
-    182 MB of WAL. Measured with plain UPDATEs on the same copy, writing every row cost 23 s and
-    838 MB, and keeping the trigger for the 26K rows 19 s and 279 MB.
+    Then reclassify runs classify(), the one implementation of the rules, over every row in
+    chunks, and writes only the rows of another class, with the full-text trigger set aside. On
+    a copy of the replica (6.5 GB, 96K emails) that wrote 26K rows in 6 s, with 182 MB of WAL;
+    on a seeded store of 96K emails, 5 s. Measured with plain UPDATEs on the same copy, writing
+    every row cost 23 s and 838 MB, and keeping the trigger for the 26K rows 19 s and 279 MB.
 
     One immediate transaction, checked inside it, as v22: two units can start together after a
     deploy, and a failure leaves the store as it was. The wait for the lock is raised to ten

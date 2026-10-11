@@ -56,13 +56,10 @@ def _day(days: int) -> str:
             "",
             "document",
         ),
-        # The automation tags, from anyone, at the start of the subject only
-        ("Inbox", "ops@example.net", "[VPS] nightly backup", [COLLEAGUE], "", "automation"),
-        ("Archive", "ops@example.net", "  [alert] disk almost full", [OWNER], "", "automation"),
-        ("Inbox", COLLEAGUE, "Re: [VPS] nightly backup", [OWNER], OWNER, "mail"),
-        ("Inbox", COLLEAGUE, "Budget [VPS] figures", [OWNER], OWNER, "mail"),
         # The owner's mail to himself alone, stamped by a job
         ("Sent Items", OWNER, "[nightly] health: 3 warnings", [OWNER], OWNER, "automation"),
+        ("Sent Items", OWNER, "[vps] nightly backup", [OWNER], OWNER, "automation"),
+        ("Archive", OWNER, "[ALERT] disk almost full", [OWNER], OWNER, "automation"),
         ("Sent Items", OWNER, "health report 2026-05-28", [OWNER], OWNER, "automation"),
         (
             "Archive",
@@ -72,7 +69,12 @@ def _day(days: int) -> str:
             OWNER,
             "automation",
         ),
-        # ... and what stays mail: when unsure, mail
+        # A tag alone proves nothing: from anyone else, or to anyone else, it is mail
+        ("Inbox", "ops@example.net", "[ALERT] disk almost full", [OWNER], OWNER, "mail"),
+        ("Inbox", "ops@example.net", "[VPS] nightly backup", [COLLEAGUE], OWNER, "mail"),
+        ("Sent Items", OWNER, "[VPS] nightly backup", [OWNER, COLLEAGUE], OWNER, "mail"),
+        ("Inbox", COLLEAGUE, "Re: [VPS] nightly backup", [OWNER], OWNER, "mail"),
+        # ... and what else stays mail: when unsure, mail
         ("Sent Items", OWNER, "notes for the Monday call", [OWNER], OWNER, "mail"),
         ("Sent Items", OWNER, "Re: health report 2026-05-28", [OWNER], OWNER, "mail"),
         ("Sent Items", OWNER, "FW: [nightly] health", [OWNER], OWNER, "mail"),
@@ -88,6 +90,64 @@ def _day(days: int) -> str:
 )
 def test_the_rules(mailbox, sender, subject, recipients, pattern, expected):
     assert sc.classify(mailbox, sender, subject, recipients, owner_pattern=pattern) == expected
+
+
+@pytest.mark.parametrize(
+    ("subject", "expected"),
+    [
+        ("\t[nightly] health report", "automation"),  # a leading tab
+        ("\u00a0[nightly] health report", "automation"),  # a leading no-break space
+        ("[nightly] health report\u00a0", "automation"),  # and a trailing one
+        ("[vps] nightly backup", "automation"),  # a tag in lower case
+        ("[VPS] nightly backup", "automation"),
+        ("Re: [VPS] nightly backup", "mail"),  # a reply prefix before the tag
+        ("\u00a0RE: [nightly] health report", "mail"),
+        ("2026-05-28", "mail"),  # only a date: a person titles a note so as easily
+        ("[nightly]", "mail"),  # only a tag
+        ("[VPS] 2026-05-28", "mail"),  # only stamps
+        ("[nightly] 2026-05-28 run", "automation"),
+        ("", "mail"),
+    ],
+)
+def test_edge_cases_of_the_stamp(subject, expected):
+    assert sc.classify("Sent Items", OWNER, subject, [OWNER], owner_pattern=OWNER) == expected
+
+
+@pytest.mark.parametrize(
+    ("address", "pattern", "expected"),
+    [
+        ("owner@example.com", "owner@example.com", True),
+        ("first.owner@example.com", "owner@example.com", True),
+        ("OWNER@EXAMPLE.COM", "owner@example.com", True),
+        (" owner@example.com ", "Owner@Example.com", True),
+        ("nikos.owner@example.com", "owner", True),  # a pattern without a domain: the local part
+        ("owner@example.com", "owner", True),
+        ("owner@example.org", "owner@", True),
+        ("someone@example.com", "@example.com", True),  # a domain alone: all of it, as before
+        ("someone@example.com.example.net", "@example.com", False),
+        # The pattern inside someone else's address is not the owner
+        ("owner@example.com.example.net", "owner@example.com", False),
+        ("notowner@example.com", "owner@example.com", False),
+        ("owner.someone@example.com", "owner", False),
+        ("notowner@example.com", "owner", False),
+        ("owner@example.com", "", False),  # an empty pattern matches no one
+        (None, "owner@example.com", False),
+    ],
+)
+def test_the_owner_is_matched_at_the_end_of_his_address(address, pattern, expected):
+    """The same rule decides the calendar's 'self' flags and the owner's automation mail."""
+    from src.store.calendar_loader import _is_self_email
+    from src.store.owner import is_owner_address
+
+    assert is_owner_address(address, pattern) is expected
+    assert _is_self_email(address or "", pattern) is expected
+
+
+def test_mail_from_an_address_that_holds_the_owner_pattern_is_mail():
+    """'owner@example.com.example.net' held the pattern as a substring, so its stamped mail to
+    itself passed for the owner's automation and was hidden from every default read."""
+    lookalike = "owner@example.com.example.net"
+    assert sc.classify("Inbox", lookalike, "[ALERT] wire the funds", [lookalike], OWNER) == "mail"
 
 
 def test_the_owner_is_the_configured_one_by_default(monkeypatch):
@@ -434,7 +494,7 @@ def test_the_migration_is_idempotent(tmp_path, monkeypatch):
 
 def test_the_migration_reads_a_store_older_than_its_columns(tmp_path, monkeypatch):
     """A store from before senders, mailboxes and people were recorded still migrates: what it
-    has is classified, and what it lacks reads as nothing."""
+    lacks reads as nothing, and with no sender nothing is the owner's, so it is all mail."""
     monkeypatch.setattr("src.config.USER_EMAIL_PATTERN", OWNER)
     path = tmp_path / "old.db"
     conn = sqlite3.connect(str(path))
@@ -456,8 +516,24 @@ def test_the_migration_reads_a_store_older_than_its_columns(tmp_path, monkeypatc
 
     assert dict(conn.execute("SELECT message_id, source_class FROM emails").fetchall()) == {
         1: "mail",
-        2: "automation",
+        2: "mail",
     }
+    conn.close()
+
+
+def test_the_backfill_reads_and_writes_in_chunks(tmp_path, monkeypatch):
+    """Rows are classified BACKFILL_CHUNK at a time; a chunk boundary changes nothing."""
+    monkeypatch.setattr("src.config.USER_EMAIL_PATTERN", OWNER)
+    monkeypatch.setattr(sc, "BACKFILL_CHUNK", 2)
+    conn = _as_v32(tmp_path / "brain.db")
+    expected = _seed_v32(conn)
+    trigger = _au(conn)
+
+    run_migrations(conn)
+
+    assert dict(conn.execute("SELECT id, source_class FROM emails").fetchall()) == expected
+    assert _au(conn) == trigger
+    conn.execute("INSERT INTO emails_fts(emails_fts) VALUES('integrity-check')")
     conn.close()
 
 
@@ -495,7 +571,7 @@ def test_without_the_owner_pattern_his_reports_stay_mail_until_classified(
     run_migrations(conn)
     stored = dict(conn.execute("SELECT id, source_class FROM emails").fetchall())
     conn.close()
-    assert stored == {**expected, 4: "mail"}
+    assert stored == {**expected, 3: "mail", 4: "mail"}  # without the owner, no automation
     assert "BRAIN_USER_EMAIL_PATTERN is unset" in capsys.readouterr().err
 
     monkeypatch.setattr("src.config.USER_EMAIL_PATTERN", OWNER)
@@ -628,10 +704,13 @@ def test_stale_threads(store, monkeypatch):
         )
     conn.commit()
 
+    # A tagged mail the owner sent to someone else is mail someone may answer: both wait.
     rows = query.find_stale_threads(conn, days=5)
-    assert [r["subject"] for r in rows] == [f"{WORD} follow-up"]
+    assert sorted(r["subject"] for r in rows) == sorted(
+        [f"[VPS] {WORD} backup", f"{WORD} follow-up"]
+    )
     assert _classes(rows) == {"mail"}
-    assert query.count_stale_threads(conn, days=5) == 1
+    assert query.count_stale_threads(conn, days=5) == 2
     assert query.count_stale_threads(conn, days=5, include_automation=True) == 2
 
 
@@ -709,9 +788,9 @@ def test_semantic_search(store, tmp_path):
     assert set(candidates(include_news=True, include_automation=True)) == set(expected)
 
 
-def test_a_store_from_before_v33_is_read_by_the_same_rules(store):
-    """A replica runs new code on the store it last pulled: news and tagged automation are
-    still left out, read off the rows; only the owner's stamped mail to himself is not."""
+def test_a_store_without_the_class_is_refused_with_a_clear_error(store):
+    """One implementation: a read never works the class out a second way. A store without the
+    column says what to run, rather than answer by other rules."""
     from src.store.query import query_by_keyword, query_decisions
 
     conn, _, _ = store
@@ -719,12 +798,13 @@ def test_a_store_from_before_v33_is_read_by_the_same_rules(store):
     conn.execute("ALTER TABLE emails DROP COLUMN source_class")
     conn.commit()
 
-    rows = query_by_keyword(conn, WORD, limit=50)
-    assert _classes(rows) == DEFAULT
-    assert len(rows) == 4  # the stamped report reads as mail without its column
-    full = query_by_keyword(conn, WORD, limit=50, include_news=True, include_automation=True)
-    assert _classes(full) == DEFAULT | {"news", "automation"}
-    assert "news" not in _classes(query_decisions(conn, limit=50))
+    for read in (
+        lambda: query_by_keyword(conn, WORD, limit=50),
+        lambda: query_decisions(conn, limit=50),
+        lambda: query_by_keyword(conn, WORD, include_news=True, include_automation=True),
+    ):
+        with pytest.raises(sc.SourceClassMissing, match="schema v33"):
+            read()
 
 
 # --- the MCP tools pass the switches through ------------------------------------------------

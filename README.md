@@ -537,10 +537,10 @@ skill/
   | `news` | `mailbox_name = 'News'` |
   | `session_note` | `mailbox_name = 'External'` from `session-note@documents.local` |
   | `document` | any other `mailbox_name = 'External'` row |
-  | `automation` | a subject starting with `[VPS]` or `[ALERT]` (any case); or mail sent by the owner (`BRAIN_USER_EMAIL_PATTERN`) to no one but himself, not a reply or forward, whose subject starts with a bracketed tag (`[nightly] ...`) or holds an ISO date |
+  | `automation` | mail the owner (`BRAIN_USER_EMAIL_PATTERN`) sent to no one but himself, not a reply or forward, whose subject starts with a bracketed tag (`[VPS] ...`, `[nightly] ...`) or holds an ISO date, and names something besides that stamp. A tag alone is not enough: from anyone else, or also sent to someone else, it is `mail` |
   | `mail` | everything else, including whatever the rules are unsure of |
 
-  The v33 migration classifies existing rows in one transaction, writing only the rows that are not `mail`. The owner rule needs `BRAIN_USER_EMAIL_PATTERN`; if it was unset when the migration ran, set it and run `python -m src.cli classify-sources`, which sets every row's class again by today's rules and writes only the rows that change. A replica on newer code than its pulled store reads the class off `mailbox_name`, the sender and the subject until the store is migrated (everything but the owner rule).
+  The v33 migration classifies existing rows in one transaction, writing only the rows that are not `mail`. The owner rule needs `BRAIN_USER_EMAIL_PATTERN`, matched case-blind at the end of the address (its domain whole, its local part after a separator: `owner@example.com` matches `first.owner@example.com` but not `owner@example.com.example.net`), the same rule the calendar's self flags use. If it was unset when the migration ran, set it and run `python -m src.cli classify-sources`, which sets every row's class again by today's rules and writes only the rows that change. Reads use the stored class only: a store without the column (older than v33) is refused with an error that says to run `migrate`, and a replica gets the column with its next pull.
 - **Attachments and images**: `attachments`, `attachment_content`, `inline_images`, `inline_image_occurrences`, `sender_signature_index`
 - **Calendar**: `calendar_events`, `event_attendees`
 - **Teams**: `teams_chats`, `teams_threads`, `teams_messages`, `teams_mri_resolution`

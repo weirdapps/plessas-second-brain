@@ -74,8 +74,6 @@ def test_healthchecks_ping_urls_lose_their_check_id(url):
     "text",
     [
         "Καλησπέρα, στείλε μου το αρχείο με τα αποτελέσματα του τριμήνου.",
-        "ΙΒΑΝ: GR16 0110 1250 0000 0001 2300 695",
-        "IBAN GR1601101250000000012300695 για την πληρωμή",
         "sha256 " + "0123456789abcdef" * 4,
         "message id 0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d outside any ping URL",
         "https://hc-ping.com/ is the service, with no check id",

@@ -12,6 +12,7 @@ from pathlib import Path
 from src.export.state import load_json_or_quarantine
 from src.extract.extraction_files import read_extraction
 from src.extract.parser import _as_string_list
+from src.redact import redact_secrets
 
 from .email_html import save_html, split_body
 from .normalizer import find_or_create_person, find_or_create_topic, normalize_topic
@@ -429,7 +430,11 @@ def _write_extraction(
 ) -> None:
     """Write the rows an extraction gives a stored email: its topics, decisions,
     action items, commitments, the people the model named with their roles, and
-    its key facts. The header people (sender, recipients) are the caller's."""
+    its key facts. The header people (sender, recipients) are the caller's.
+
+    The texts of decisions, action items, commitments and key facts are masked
+    (src/redact.py) as they are stored: the model may copy a card number, an IBAN
+    or a password out of text read before the masking, or despite its prompt."""
     # Load topics
     for topic_name in extraction.get("topics", []):
         topic_id = find_or_create_topic(conn, topic_name)
@@ -455,12 +460,12 @@ def _write_extraction(
                 INSERT INTO decisions (email_id, decision, decided_by, decision_date)
                 VALUES (?, ?, ?, ?)
                 """,
-                (email_id, decision_text, decided_by, decision_date),
+                (email_id, redact_secrets(decision_text), decided_by, decision_date),
             )
         elif decision:
             conn.execute(
                 "INSERT INTO decisions (email_id, decision) VALUES (?, ?)",
-                (email_id, decision),
+                (email_id, redact_secrets(decision)),
             )
 
     # Load action items
@@ -483,12 +488,12 @@ def _write_extraction(
                 INSERT INTO action_items (email_id, task, owner, deadline, status)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (email_id, task_text, owner, deadline, status),
+                (email_id, redact_secrets(task_text), owner, deadline, status),
             )
         elif action:
             conn.execute(
                 "INSERT INTO action_items (email_id, task) VALUES (?, ?)",
-                (email_id, action),
+                (email_id, redact_secrets(action)),
             )
 
     # Load commitments (extracted by the LLM; previously parsed then dropped)
@@ -508,12 +513,12 @@ def _write_extraction(
                 INSERT INTO commitments (email_id, commitment, by_person, to_person)
                 VALUES (?, ?, ?, ?)
                 """,
-                (email_id, commitment_text, by_person, to_person),
+                (email_id, redact_secrets(commitment_text), by_person, to_person),
             )
         elif commitment:
             conn.execute(
                 "INSERT INTO commitments (email_id, commitment) VALUES (?, ?)",
-                (email_id, commitment),
+                (email_id, redact_secrets(commitment)),
             )
 
     # Load people and their roles
@@ -544,16 +549,23 @@ def _write_extraction(
     # Load key facts
     for fact in extraction.get("key_facts", []):
         if fact:
-            conn.execute("INSERT INTO key_facts (email_id, fact) VALUES (?, ?)", (email_id, fact))
+            conn.execute(
+                "INSERT INTO key_facts (email_id, fact) VALUES (?, ?)",
+                (email_id, redact_secrets(fact)),
+            )
 
 
 def _stored_texts(items, key: str | None) -> list:
-    """The text _write_extraction stores for each item: a dict's `key`, or the item."""
+    """The text _write_extraction stores for each item: a dict's `key`, or the item,
+    masked; and the text as it was, which rows stored before the masking hold."""
     texts = []
     for item in items or []:
         text = item.get(key) if isinstance(item, dict) else item
         if text:
             texts.append(text)
+            masked = redact_secrets(text)
+            if masked != text:
+                texts.append(masked)
     return texts
 
 
@@ -848,7 +860,7 @@ def load_single_conversation(
                 VALUES (?, ?, (SELECT id FROM conversation_turns
                               WHERE conversation_id = ? ORDER BY turn_index DESC LIMIT 1))
                 """,
-                (decision["decision"], decided_by, conversation_id),
+                (redact_secrets(decision["decision"]), decided_by, conversation_id),
             )
 
     # Load action items
@@ -864,7 +876,7 @@ def load_single_conversation(
                         (SELECT id FROM conversation_turns
                          WHERE conversation_id = ? ORDER BY turn_index DESC LIMIT 1))
                 """,
-                (action["task"], owner, action.get("deadline"), conversation_id),
+                (redact_secrets(action["task"]), owner, action.get("deadline"), conversation_id),
             )
 
     # Load key facts
@@ -876,7 +888,7 @@ def load_single_conversation(
                 VALUES (?, (SELECT id FROM conversation_turns
                            WHERE conversation_id = ? ORDER BY turn_index DESC LIMIT 1))
                 """,
-                (fact, conversation_id),
+                (redact_secrets(fact), conversation_id),
             )
 
     # Store preferences and technical decisions as key_facts with prefix
@@ -891,7 +903,7 @@ def load_single_conversation(
                 VALUES (?, (SELECT id FROM conversation_turns
                            WHERE conversation_id = ? ORDER BY turn_index DESC LIMIT 1))
                 """,
-                (f"[PREFERENCE] {pref}", conversation_id),
+                (redact_secrets(f"[PREFERENCE] {pref}"), conversation_id),
             )
 
     for tech in _as_string_list(extraction.get("technical_decisions")):
@@ -902,7 +914,7 @@ def load_single_conversation(
                 VALUES (?, (SELECT id FROM conversation_turns
                            WHERE conversation_id = ? ORDER BY turn_index DESC LIMIT 1))
                 """,
-                (f"[TECHNICAL] {tech}", conversation_id),
+                (redact_secrets(f"[TECHNICAL] {tech}"), conversation_id),
             )
 
     return True

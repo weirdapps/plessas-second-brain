@@ -7,6 +7,8 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+from src.redact import redact_secrets
+
 logger = logging.getLogger(__name__)
 
 # The calendar_events.llm_status vocabulary. Defined here, next to the only writer, so
@@ -297,7 +299,8 @@ def load_event(
         conn.execute("DELETE FROM decisions WHERE event_id = ?", (event_id,))
         conn.execute("DELETE FROM action_items WHERE event_id = ?", (event_id,))
 
-    # Insert decisions
+    # Insert decisions. Their texts and the action items' are masked as the loader
+    # masks an email's (src/store/loader.py).
     for decision in extraction.get("decisions", []):
         conn.execute(
             """
@@ -305,7 +308,7 @@ def load_event(
             VALUES (?, ?, ?, ?)
             """,
             (
-                decision.get("decision"),
+                redact_secrets(decision.get("decision")),
                 decision.get("decided_by"),
                 _iso_date_or_none(decision.get("decision_date")),
                 event_id,
@@ -320,7 +323,7 @@ def load_event(
             VALUES (?, ?, ?, ?, ?)
             """,
             (
-                action.get("task"),
+                redact_secrets(action.get("task")),
                 action.get("owner"),
                 action.get("deadline"),
                 "open",

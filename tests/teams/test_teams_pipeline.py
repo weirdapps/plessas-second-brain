@@ -1,5 +1,6 @@
 """Tests for teams_pipeline.extract_threads — Vertex Claude mocked."""
 
+import json
 from unittest.mock import patch
 
 import pytest
@@ -814,3 +815,38 @@ def test_a_recent_failed_thread_waits_behind_pending_ones(db, monkeypatch):
         db.execute("SELECT anchor_message_id, extraction_status FROM teams_threads").fetchall()
     )
     assert statuses == {"P-pending-old": "extracted", "P-failed-recent": "failed"}
+
+
+def test_the_rows_the_model_writes_are_masked(db, monkeypatch):
+    """A card number, an IBAN or a password the model copies into a row is masked
+    as the row is stored (security-privacy-01 and -07)."""
+    from tests.payment_data import card, digits, iban, masked
+
+    monkeypatch.setenv("ANTHROPIC_VERTEX_PROJECT_ID", "test-project")
+    _seed_thread(db)
+    visa, account = card("4", 16), iban("GR", digits(23, 1))
+    reply = {
+        "summary": "s",
+        "decisions": [{"decision": f"refund to {account}", "decided_by": "Alice"}],
+        "action_items": [{"task": "Password: letmein", "owner": "Bob"}],
+        "key_facts": [{"fact": f"card {visa}"}],
+        "sentiment": "neutral",
+        "language": "en",
+    }
+
+    with patch("src.extract.teams_pipeline._call_llm", return_value=json.dumps(reply)):
+        extract_threads(db, workers=1)
+
+    rows = [
+        db.execute(f"SELECT {column} FROM {table}").fetchone()[0]
+        for table, column in (
+            ("decisions", "decision"),
+            ("action_items", "task"),
+            ("key_facts", "fact"),
+        )
+    ]
+    assert rows == [
+        f"refund to GR[REDACTED:iban]{account[-4:]}",
+        "Password: [REDACTED:password]",
+        f"card {masked(visa)}",
+    ]

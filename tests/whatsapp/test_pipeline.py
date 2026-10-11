@@ -140,3 +140,35 @@ def test_extraction_refuses_to_start_without_a_vertex_project(db, tmp_path, monk
     _chat(tmp_path, db)
     with pytest.raises(RuntimeError):
         extract_threads(db)
+
+
+def test_the_rows_the_model_writes_are_masked(db, tmp_path):
+    """A card number, an IBAN or a password the model copies into a row is masked
+    as the row is stored (security-privacy-01 and -07)."""
+    from tests.payment_data import card, digits, iban, masked
+
+    _chat(tmp_path, db)
+    visa, account = card("4", 16), iban("GR", digits(23, 1))
+    reply = {
+        **json.loads(REPLY),
+        "decisions": [{"decision": f"pay the rent to {account}"}],
+        "action_items": [{"task": "κωδικός πρόσβασης: abc123"}],
+        "key_facts": [{"fact": f"her card is {visa}"}],
+    }
+
+    with patch("src.extract.whatsapp_pipeline._call_llm", return_value=json.dumps(reply)):
+        extract_threads(db)
+
+    rows = [
+        db.execute(f"SELECT {column} FROM {table}").fetchone()[0]
+        for table, column in (
+            ("decisions", "decision"),
+            ("action_items", "task"),
+            ("key_facts", "fact"),
+        )
+    ]
+    assert rows == [
+        f"pay the rent to GR[REDACTED:iban]{account[-4:]}",
+        "κωδικός πρόσβασης: [REDACTED:password]",
+        f"her card is {masked(visa)}",
+    ]

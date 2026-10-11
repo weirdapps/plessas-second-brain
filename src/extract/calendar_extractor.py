@@ -5,7 +5,7 @@ import json
 
 from src.extract.claude_extract import _response_text, complete
 from src.extract.untrusted import fence
-from src.redact import redact_secrets
+from src.redact import PROMPT_RULE, redact_secrets
 
 
 def parse_extraction_response(raw: str) -> dict:
@@ -64,7 +64,8 @@ def parse_extraction_response(raw: str) -> dict:
 
 # The prompt around the invite. Its text is part of event_prompt_hash, so an edit
 # here re-extracts every event once, as a changed prompt should.
-_PROMPT_TEMPLATE = """You are analyzing a calendar event from a corporate email system.
+_PROMPT_TEMPLATE = (
+    """You are analyzing a calendar event from a corporate email system.
 
 {invite}
 
@@ -81,7 +82,11 @@ Extract the following as JSON:
 
 Set decision_date to the date the text states for the decision, as YYYY-MM-DD, or to JSON null when it states none.
 If the body is empty or contains only a Teams link with no agenda, return empty summary and empty arrays.
+"""
+    + PROMPT_RULE
+    + """
 Respond with ONLY the JSON object, no other text."""
+)
 
 
 def event_prompt_hash(event: dict, body: str | None) -> str | None:

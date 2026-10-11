@@ -11,10 +11,11 @@ Rewriting the row is not enough on its own. The old bytes survive in freed pages
 unless secure_delete is on, and the full-text index keeps every term of a deleted
 document in its old segments until they are merged. So --apply:
 
-  1. scans every TEXT column of every content table with the src/redact.py
-     patterns (generated columns and FTS shadow tables are derived, not stored
-     input, and are skipped), and the HTML kept in email_html, decompressed
-     first: compressed, a key is invisible to a column scan and to a grep,
+  1. scans every TEXT column of every content table with src/redact.py
+     (generated columns and FTS shadow tables are derived, not stored input, and
+     are skipped, and so are attachment file names and paths, which name files
+     on disk), and the HTML kept in email_html, decompressed first: compressed, a
+     key is invisible to a column scan and to a grep,
   2. rewrites each hit with redact_secrets under PRAGMA secure_delete=ON, in one
      transaction, re-reading the row inside it,
   3. runs FTS5 'optimize' on EVERY full-text index, hits or not, which merges its
@@ -39,18 +40,40 @@ database is clean. On a replica --apply is refused
 with exit 3, since the next pull replaces the file. Snapshots taken before the scrub
 still hold the old rows: the encrypted offsite ones, and the plaintext local
 ones in data/backups/, both of which age out under the retention policy.
+
+src/redact.py masks card numbers, IBANs and password values as well since
+2026-10-11, and this scrub masks whatever it masks. A row counts as a hit when
+redact_secrets would change it, never because a pattern matched: the card
+pattern matches every long number, and only the checks behind it say which are
+cards.
+
+--files DIR [DIR ...] scrubs files instead of the database: the staged batches,
+the extracted outputs and notes kept beside it hold the same text. Every .json
+file under each DIR is masked as JSON (values only, as staging is), every .md,
+.txt and .csv file as text; symbolic links are not followed. Each file is
+rewritten whole (written beside itself, flushed, then renamed over itself, its
+permissions kept) or not at all. A file with other hard links is not rewritten,
+since the other links would keep the old text. Stop the jobs that write the
+directories first. The dry run is the default here too, and the exit codes are
+the same: 1 for values found or left, 2 for a file that could not be read or
+written, 3 for --apply on a replica.
 """
 
 import argparse
+import contextlib
+import json
+import os
 import shutil
 import sqlite3
+import stat
 import sys
+import tempfile
 import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import DEFAULT_DB, is_replica, replica_refusal  # noqa: E402
-from src.redact import _PATTERNS, redact_secrets  # noqa: E402
+from src.redact import redact_payload, redact_secrets  # noqa: E402
 from src.store.email_html import pack, unpack  # noqa: E402
 
 _FTS_SHADOW_SUFFIXES = ("_data", "_idx", "_content", "_docsize", "_config")
@@ -61,6 +84,15 @@ BUSY_TIMEOUT_MS = 60000
 # Columns holding zlib-compressed text (schema v23 keeps an HTML body's markup
 # in email_html), read and written through src.store.email_html.
 _PACKED = (("email_html", "html"),)
+
+# Columns that name a file on disk. The attachment registrar knows a file by its
+# name, so a masked name no longer matches the file, which is registered and read
+# again, and a masked path loses it. The file keeps its name either way.
+_FILE_NAMES = (("attachments", "filename"), ("attachments", "file_path"))
+
+# What --files rewrites, JSON as JSON and the rest as text, all UTF-8.
+_FILE_SUFFIXES = (".json", ".md", ".txt", ".csv")
+_MARK = "[REDACTED:"
 
 
 def _virtual_tables(conn: sqlite3.Connection) -> dict[str, str]:
@@ -89,7 +121,8 @@ def _text_columns(conn: sqlite3.Connection) -> list[tuple[str, str]]:
         ):
             declared = (decl or "").upper()
             is_text = declared in ("", "TEXT") or "CHAR" in declared or "CLOB" in declared
-            if hidden == 0 and is_text:  # hidden != 0: generated, not stored input
+            # hidden != 0: generated, not stored input
+            if hidden == 0 and is_text and (table, column) not in _FILE_NAMES:
                 targets.append((table, column))
     return targets
 
@@ -103,7 +136,7 @@ def _packed_columns(conn: sqlite3.Connection) -> list[tuple[str, str]]:
 
 
 def _has_secret(value) -> bool:
-    return isinstance(value, str) and any(p.search(value) for _n, p in _PATTERNS)
+    return isinstance(value, str) and redact_secrets(value) != value
 
 
 def _unpacked(value) -> str | None:
@@ -202,9 +235,9 @@ def _apply(conn: sqlite3.Connection, found: dict[tuple[str, str], list[int]]) ->
                     f'SELECT "{column}" FROM "{table}" WHERE rowid = ?', (rowid,)
                 ).fetchone()
                 value = None if row is None else _unpacked(row[0]) if packed else row[0]
-                if value is None or not _has_secret(value):
+                clean = None if value is None else redact_secrets(value)
+                if clean is None or clean == value:
                     continue  # changed since the scan
-                clean = redact_secrets(value)
                 conn.execute(
                     f'UPDATE "{table}" SET "{column}" = ? WHERE rowid = ?',
                     (pack(clean) if packed else clean, rowid),
@@ -217,26 +250,193 @@ def _apply(conn: sqlite3.Connection, found: dict[tuple[str, str], list[int]]) ->
     return changed
 
 
+class _Unreadable(Exception):
+    """A file that is not UTF-8, or not JSON where its name says it is."""
+
+
+def _counted(n: int, noun: str) -> str:
+    return f"{n} {noun}" + ("" if n == 1 else "s")
+
+
+def _listed(paths: list[Path]) -> str:
+    """Up to twenty paths: a name is no secret, and says which file to fix."""
+    return ", ".join(str(p) for p in paths[:20]) + (" ..." if len(paths) > 20 else "")
+
+
+def _files_under(directory: Path, unreadable: list[Path]) -> list[Path]:
+    """The files --files reads under `directory`, symbolic links left out. A
+    directory that cannot be listed goes on `unreadable`, not unnoticed."""
+    found = []
+    for parent, _dirs, names in os.walk(
+        directory, onerror=lambda e: unreadable.append(Path(e.filename))
+    ):
+        for name in names:
+            path = Path(parent) / name
+            if path.suffix.lower() in _FILE_SUFFIXES and not path.is_symlink():
+                found.append(path)
+    return sorted(found)
+
+
+def _masked_file(path: Path) -> tuple[str, int] | None:
+    """The file's text with every value masked, and how many were, or None when it
+    holds none. A JSON file is masked value by value and written back in the
+    layout it had, so it stays JSON. Raises _Unreadable."""
+    try:
+        with open(path, encoding="utf-8", newline="") as f:
+            raw = f.read()
+        if path.suffix.lower() != ".json":
+            before, clean = raw, redact_secrets(raw)
+            text = clean
+        else:
+            data = json.loads(raw)
+            before = json.dumps(data, ensure_ascii=False)
+            masked = redact_payload(data)
+            clean = json.dumps(masked, ensure_ascii=False)
+            indent = 2 if "\n" in raw.strip() else None
+            text = json.dumps(masked, ensure_ascii=False, indent=indent)
+            text += "\n" if raw.endswith("\n") else ""
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as e:
+        raise _Unreadable(path) from e
+    if clean == before:
+        return None
+    # One marker per value masked; a password value that held a marker swaps one.
+    return text, max(clean.count(_MARK) - before.count(_MARK), 1)
+
+
+def _write_atomically(path: Path, text: str) -> None:
+    """Replace the file with `text` as write_json_atomic does: written beside it,
+    flushed to disk, then renamed over it, so a reader sees the old file or the
+    new one. Its permission bits are kept, since a new file would take the umask."""
+    mode = stat.S_IMODE(path.stat().st_mode)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _scan_files(
+    directories: list[Path], apply: bool
+) -> tuple[dict[Path, tuple[int, int]], dict[str, list[Path]]]:
+    """Per directory, (files, values) found, or rewritten with apply; and the files
+    that could not be read, written, or were left for their other hard links."""
+    found: dict[Path, tuple[int, int]] = {}
+    problems: dict[str, list[Path]] = {"unreadable": [], "unwritable": [], "linked": []}
+    for directory in directories:
+        files = values = 0
+        for path in _files_under(directory, problems["unreadable"]):
+            try:
+                result = _masked_file(path)
+            except _Unreadable:
+                problems["unreadable"].append(path)
+                continue
+            if result is None:
+                continue
+            if apply:
+                try:
+                    if path.stat().st_nlink > 1:
+                        problems["linked"].append(path)
+                        continue
+                    _write_atomically(path, result[0])
+                except OSError:
+                    problems["unwritable"].append(path)
+                    continue
+            files += 1
+            values += result[1]
+        if files:
+            found[directory] = (files, values)
+    return found, problems
+
+
+def _report_files(found: dict[Path, tuple[int, int]], file=None) -> None:
+    for directory, (files, values) in found.items():
+        print(f"  {directory}: {_counted(files, 'file')}, {_counted(values, 'value')}", file=file)
+
+
+def _scrub_files(directories: list[Path], apply: bool) -> int:
+    """--files: the dry run, or the rewrite and a scan after it. Counts and file
+    names only are printed, never a value."""
+    missing = [d for d in directories if not d.is_dir()]
+    for d in missing:
+        print(f"Error: no directory at {d}", file=sys.stderr)
+    if missing:
+        return 2
+    found, problems = _scan_files(directories, apply)
+    _report_files(found)
+    if apply:
+        files = sum(f for f, _ in found.values())
+        values = sum(v for _, v in found.values())
+        print(f"{_counted(files, 'file')} rewritten, {_counted(values, 'value')} masked")
+        found, rescan = _scan_files(directories, apply=False)
+        problems["unreadable"] = rescan["unreadable"]
+        if found:
+            print("Credential-shaped values remain:", file=sys.stderr)
+            _report_files(found, file=sys.stderr)
+    elif not found and not problems["unreadable"]:
+        print("No credential-shaped values found.")
+    for kind, one, many in (
+        (
+            "linked",
+            "file has other hard links, so was not rewritten",
+            "files have other hard links, so were not rewritten",
+        ),
+        ("unwritable", "file could not be written", "files could not be written"),
+        (
+            "unreadable",
+            "file could not be read, so was not checked",
+            "files could not be read, so were not checked",
+        ),
+    ):
+        paths = problems[kind]
+        if paths:
+            what = one if len(paths) == 1 else many
+            print(f"  {len(paths)} {what} ({_listed(paths)})", file=sys.stderr)
+    if problems["unreadable"] or problems["unwritable"]:
+        return 2
+    return 1 if found else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     # No --db flag on purpose: the database is the configured one (BRAIN_DATA_DIR,
     # else <repo>/data), so no command-line string ever reaches sqlite3.connect.
     # To rehearse on a copy, point BRAIN_DATA_DIR at the copy's directory.
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n\n")[0])
     parser.add_argument("--apply", action="store_true", help="rewrite the rows (default: dry run)")
+    parser.add_argument("--dry-run", action="store_true", help="count only, the default")
     parser.add_argument(
         "--vacuum",
         action="store_true",
         help="with --apply, VACUUM afterwards to drop copies freed before the scrub",
     )
+    parser.add_argument(
+        "--files",
+        nargs="+",
+        type=Path,
+        metavar="DIR",
+        help="scrub the .json, .md, .txt and .csv files under each DIR, not the database",
+    )
     args = parser.parse_args(argv)
     if args.vacuum and not args.apply:
         parser.error("--vacuum requires --apply")
+    if args.apply and args.dry_run:
+        parser.error("--dry-run and --apply exclude each other")
+    if args.files and args.vacuum:
+        parser.error("--vacuum is for the database, not --files")
     if args.apply and is_replica():
         # The dry run reads only; the scrub rewrites rows, and a replica's copy
         # is replaced by the next pull (see src/config.py). 3, since 1 and 2
         # already mean "found some" and "cannot run".
         print(replica_refusal("the secret scrub"), file=sys.stderr)
         return 3
+    if args.files:
+        return _scrub_files(args.files, args.apply)
 
     db = Path(DEFAULT_DB)
     if not db.exists():

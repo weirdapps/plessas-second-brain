@@ -24,6 +24,7 @@ from src.llm_cost import (
     rates_for,
     usage_for_day,
 )
+from tests.patching import unset_env
 
 
 class _Usage:
@@ -75,7 +76,7 @@ def test_a_model_without_a_rate_is_unpriced(model):
 
 
 def test_characters_per_token_default_and_override(monkeypatch):
-    monkeypatch.delenv("BRAIN_CHARS_PER_TOKEN", raising=False)
+    unset_env(monkeypatch, "BRAIN_CHARS_PER_TOKEN")
     assert configured_chars_per_token() == DEFAULT_CHARS_PER_TOKEN == 1.6
     monkeypatch.setenv("BRAIN_CHARS_PER_TOKEN", "2.5")
     assert configured_chars_per_token() == 2.5

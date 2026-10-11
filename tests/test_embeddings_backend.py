@@ -8,6 +8,8 @@ Claude calls, which is every host this runs on.
 
 import pytest
 
+from tests.patching import unset_env
+
 
 class _Client:
     """Stands in for google.genai.Client and keeps what it was built with."""
@@ -20,10 +22,13 @@ class _Client:
 def env(monkeypatch):
     monkeypatch.setattr("google.genai.Client", _Client)
     monkeypatch.setenv("VERTEX_SDK_PROJECT", "proj")
-    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
-    monkeypatch.delenv("VERTEX_REGION_EMBED", raising=False)
-    monkeypatch.delenv("BRAIN_EMBED_BACKEND", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    unset_env(
+        monkeypatch,
+        "ANTHROPIC_VERTEX_PROJECT_ID",
+        "VERTEX_REGION_EMBED",
+        "BRAIN_EMBED_BACKEND",
+        "GEMINI_API_KEY",
+    )
     return monkeypatch
 
 

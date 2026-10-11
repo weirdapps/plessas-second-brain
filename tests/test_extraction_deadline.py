@@ -17,6 +17,7 @@ from unittest.mock import patch
 import pytest
 
 from src.extract import local
+from tests.patching import unset_env
 
 
 @pytest.fixture
@@ -180,8 +181,8 @@ def test_cmd_sync_gives_extraction_the_deadline_of_its_unit(tmp_path, monkeypatc
     """The 30-minute units drain backlogs, so they must not inherit the hourly
     slice. No unit is cron, launchd or a unit off the table (the docs describe
     all three), so it gets the hourly slice, not an unbounded run."""
-    monkeypatch.delenv("PTS_LLM_DEADLINE", raising=False)
-    monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
+    unset_env(monkeypatch, "PTS_LLM_DEADLINE")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     ok = {"extracted": 0, "failed": 0, "quota_paused": False}
 
     assert _sync(tmp_path, monkeypatch, unit, ok) == (0, deadline)
@@ -202,8 +203,8 @@ def test_a_person_at_a_terminal_keeps_the_unbounded_run(monkeypatch):
     from src.pipeline import sync
 
     monkeypatch.setattr(llm_deadline, "_detect_systemd_unit", lambda: None)
-    monkeypatch.delenv("PTS_LLM_DEADLINE", raising=False)
-    monkeypatch.setattr(sync.sys.stdin, "isatty", lambda: True, raising=False)
+    unset_env(monkeypatch, "PTS_LLM_DEADLINE")
+    monkeypatch.setattr(sync.sys.stdin, "isatty", lambda: True)
 
     assert sync._extract_deadline_s() is None
 

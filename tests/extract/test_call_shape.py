@@ -9,12 +9,13 @@ import pytest
 
 from src.extract import call_shape
 from src.extract.claude_extract import ClaudeNotConfigured
+from tests.patching import unset_env
 
 
 @pytest.mark.parametrize("value", [None, "", "  ", "v1", "V1"])
 def test_v1_is_the_default(monkeypatch, value):
     if value is None:
-        monkeypatch.delenv("BRAIN_EXTRACT_CALL_SHAPE", raising=False)
+        unset_env(monkeypatch, "BRAIN_EXTRACT_CALL_SHAPE")
     else:
         monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", value)
 

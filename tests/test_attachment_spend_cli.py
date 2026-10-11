@@ -16,6 +16,7 @@ from src import cli
 from src.extract import claude_extract
 from src.llm_cost import TokenBudget
 from src.store.schema import create_database
+from tests.patching import unset_env
 
 
 @pytest.fixture
@@ -34,7 +35,7 @@ def phase2(tmp_path, monkeypatch):
 
     monkeypatch.setattr("src.extract.attachment_pipeline.run_phase1", _phase1)
     monkeypatch.setattr("src.extract.attachment_pipeline.run_phase2", _phase2)
-    monkeypatch.delenv("BRAIN_ATTACHMENT_TOKEN_BUDGET", raising=False)
+    unset_env(monkeypatch, "BRAIN_ATTACHMENT_TOKEN_BUDGET")
     args = argparse.Namespace(
         db=db_path,
         phase=2,
@@ -181,7 +182,7 @@ def test_the_flags_reach_the_command(monkeypatch):
 
 @pytest.fixture
 def rx_args(tmp_path, monkeypatch):
-    monkeypatch.delenv("BRAIN_ATTACHMENT_TOKEN_BUDGET", raising=False)
+    unset_env(monkeypatch, "BRAIN_ATTACHMENT_TOKEN_BUDGET")
     return argparse.Namespace(
         db=str(tmp_path / "brain.db"),
         capped=False,

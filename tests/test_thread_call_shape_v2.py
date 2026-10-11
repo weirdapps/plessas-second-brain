@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.extract import call_shape, claude_extract, teams_pipeline, whatsapp_pipeline
+from tests.patching import unset_env
 
 ROUTES = [(teams_pipeline, "teams"), (whatsapp_pipeline, "whatsapp")]
 
@@ -36,14 +37,13 @@ def model(monkeypatch, tmp_path):
     monkeypatch.setattr(claude_extract, "_get_client_and_model", lambda: (object(), "m"))
     monkeypatch.setattr("src.extract.vertex_fallback.create_with_refusal_fallback", create)
     monkeypatch.setattr(claude_extract, "USAGE_LOG_DIR", tmp_path)
-    monkeypatch.delenv("BRAIN_TEAMS_MODEL", raising=False)
-    monkeypatch.delenv("BRAIN_WHATSAPP_MODEL", raising=False)
+    unset_env(monkeypatch, "BRAIN_TEAMS_MODEL", "BRAIN_WHATSAPP_MODEL")
     return stub
 
 
 @pytest.mark.parametrize(("pipeline", "_route"), ROUTES)
 def test_v1_sends_what_it_always_sent(monkeypatch, model, pipeline, _route):
-    monkeypatch.delenv("BRAIN_EXTRACT_CALL_SHAPE", raising=False)
+    unset_env(monkeypatch, "BRAIN_EXTRACT_CALL_SHAPE")
     model.replies = [response('{"summary": "s"}')]
 
     assert pipeline._call_llm("the system prompt", "the thread") == '{"summary": "s"}'

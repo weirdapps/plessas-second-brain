@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.patching import unset_env
+
 HEALTH_CHECK_PATH = Path(__file__).parent.parent / "scripts" / "health_check.py"
 
 
@@ -313,7 +315,7 @@ def _install_migrated_jobs(agents_dir, prefix):
 
 
 def test_detect_label_prefix_discovers_installed_prefix(hc, tmp_path, monkeypatch):
-    monkeypatch.delenv("BRAIN_LABEL_PREFIX", raising=False)
+    unset_env(monkeypatch, "BRAIN_LABEL_PREFIX")
     _install_migrated_jobs(tmp_path, "com.example.brain")
     assert hc.detect_label_prefix(agents_dir=tmp_path) == "com.example.brain"
 
@@ -321,7 +323,7 @@ def test_detect_label_prefix_discovers_installed_prefix(hc, tmp_path, monkeypatc
 def test_detect_label_prefix_not_truncated_by_ambiguous_sync_suffix(hc, tmp_path, monkeypatch):
     """'.teams-sync' and '.calendar-sync' also end in '-sync'. Keying discovery
     on that suffix would yield 'com.example.brain.teams' as the prefix."""
-    monkeypatch.delenv("BRAIN_LABEL_PREFIX", raising=False)
+    unset_env(monkeypatch, "BRAIN_LABEL_PREFIX")
     _install_migrated_jobs(tmp_path, "com.example.brain")
     prefix = hc.detect_label_prefix(agents_dir=tmp_path)
     assert not prefix.endswith(".teams")
@@ -335,13 +337,13 @@ def test_detect_label_prefix_env_overrides_discovery(hc, tmp_path, monkeypatch):
 
 
 def test_detect_label_prefix_falls_back_when_nothing_installed(hc, tmp_path, monkeypatch):
-    monkeypatch.delenv("BRAIN_LABEL_PREFIX", raising=False)
+    unset_env(monkeypatch, "BRAIN_LABEL_PREFIX")
     assert hc.detect_label_prefix(agents_dir=tmp_path) == hc.DEFAULT_LABEL_PREFIX
 
 
 def test_detect_label_prefix_finds_active_plists_too(hc, tmp_path, monkeypatch):
     """A Mac that still runs the jobs locally has plain .plist files."""
-    monkeypatch.delenv("BRAIN_LABEL_PREFIX", raising=False)
+    unset_env(monkeypatch, "BRAIN_LABEL_PREFIX")
     (tmp_path / "com.example.brain.noon-catchup.plist").write_text("x")
     (tmp_path / "com.example.brain.auth-watch.plist").write_text("x")
     assert hc.detect_label_prefix(agents_dir=tmp_path) == "com.example.brain"
@@ -897,7 +899,7 @@ def _reload_hc(monkeypatch, **env):
     # sys.modules left the two pointing at different modules, so a later test that
     # patched src.config.X patched a module the code no longer read.
     monkeypatch.setattr(src, "config", sys.modules["src.config"])
-    monkeypatch.delitem(sys.modules, "src.config", raising=False)
+    monkeypatch.delitem(sys.modules, "src.config")
     spec = importlib.util.spec_from_file_location("health_check_reloaded", HEALTH_CHECK_PATH)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -1831,7 +1833,7 @@ def test_a_blocking_sentinel_alone_is_not_a_freshness_failure(hc):
 
 def test_ping_freshness_is_a_no_op_without_hc_ping_url(hc, monkeypatch):
     """The Mac runs this script too, and CI runs the tests. Neither may ping."""
-    monkeypatch.delenv("HC_PING_URL", raising=False)
+    unset_env(monkeypatch, "HC_PING_URL")
     called = []
     monkeypatch.setattr(hc.subprocess, "run", lambda *a, **k: called.append(a))
 
@@ -1994,7 +1996,7 @@ def test_detect_label_prefix_reads_the_plist_a_migrated_mac_keeps(hc, tmp_path, 
     only thing to read the prefix off. Discovery missed it, LABEL_PREFIX fell
     back to the generic literal, and every derived label named a job that had
     never existed on this machine."""
-    monkeypatch.delenv("BRAIN_LABEL_PREFIX", raising=False)
+    unset_env(monkeypatch, "BRAIN_LABEL_PREFIX")
     (tmp_path / "com.example.brain.db-pull.plist").write_text("x")
 
     assert hc.detect_label_prefix(agents_dir=tmp_path) == "com.example.brain"

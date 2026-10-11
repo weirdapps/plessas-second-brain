@@ -14,6 +14,7 @@ import anyio
 import pytest
 
 from src import mcp_http, mcp_server
+from tests.patching import unset_env
 
 TOKEN = "t" * 40
 REPO = Path(__file__).resolve().parents[1]
@@ -195,7 +196,7 @@ def test_no_arguments_serves_stdio_as_before():
 
 
 def test_http_without_token_file_refuses(monkeypatch, capsys):
-    monkeypatch.delenv("BRAIN_MCP_TOKEN_FILE", raising=False)
+    unset_env(monkeypatch, "BRAIN_MCP_TOKEN_FILE")
     with patch("uvicorn.run") as run:
         assert mcp_server.main(["--http", "127.0.0.1:8765"]) == 2
     run.assert_not_called()

@@ -11,6 +11,7 @@ import json
 from datetime import UTC, datetime
 
 from src.extract import claude_extract
+from tests.patching import unset_env
 
 
 class _Usage:
@@ -145,7 +146,7 @@ def test_a_line_carries_thinking_cache_ttl_ids_effort_budget_and_prompt_hash(mon
 
 def test_a_refusal_logs_its_category(monkeypatch, tmp_path):
     monkeypatch.setattr(claude_extract, "USAGE_LOG_DIR", tmp_path)
-    monkeypatch.delenv("VERTEX_MODEL_FALLBACK_SDK", raising=False)
+    unset_env(monkeypatch, "VERTEX_MODEL_FALLBACK_SDK")
     _patch_client(monkeypatch, _FullResponse(stop_reason="refusal"))
 
     claude_extract.complete(max_tokens=10, messages=[{"role": "user", "content": "x"}])

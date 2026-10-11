@@ -23,6 +23,7 @@ from src.extract import claude_extract, untrusted, vertex_batch
 from src.extract.attachment_prompt import split_text
 from src.llm_cost import TokenBudget
 from src.store.schema import create_database
+from tests.patching import unset_env
 
 SHORT = "Payments above 50,000 euros need two signatories. The board decided it in May. " * 4
 # Over LONG_TEXT_CHARS, so it goes in parts.
@@ -139,7 +140,8 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
     monkeypatch.setenv("VERTEX_SDK_REGION", "eu")
     monkeypatch.setenv("CLAUDE_EXTRACT_MODEL", "claude-sonnet-5-5")
-    for name in (
+    unset_env(
+        monkeypatch,
         "BRAIN_BATCH_LOCATION",
         "BRAIN_EXTRACT_CALL_SHAPE",
         "ANTHROPIC_VERTEX_PROJECT_ID",
@@ -147,8 +149,7 @@ def env(monkeypatch, tmp_path):
         "VERTEX_MODEL_EXTRACT",
         "BRAIN_ATTACHMENT_TOKEN_BUDGET",
         "BRAIN_CHARS_PER_TOKEN",
-    ):
-        monkeypatch.delenv(name, raising=False)
+    )
     monkeypatch.setattr(claude_extract, "USAGE_LOG_DIR", tmp_path)
     return tmp_path
 

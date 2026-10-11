@@ -22,6 +22,7 @@ import pytest
 from src.evals import extraction as ev
 from src.evals import read_jsonl
 from src.extract import call_shape, claude_extract, schema_v2
+from tests.patching import unset_env
 
 NOW = datetime(2026, 10, 11, 9, 0, tzinfo=UTC)
 MODEL = "claude-sonnet-5-5"
@@ -113,7 +114,7 @@ def files(tmp_path):
 @pytest.fixture
 def model(monkeypatch):
     monkeypatch.setenv("CLAUDE_EXTRACT_MODEL", MODEL)
-    monkeypatch.delenv("BRAIN_EXTRACT_CALL_SHAPE", raising=False)
+    unset_env(monkeypatch, "BRAIN_EXTRACT_CALL_SHAPE")
 
     def install(cases, first=None):
         fake = FakeModel(cases, first)

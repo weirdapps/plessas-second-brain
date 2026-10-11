@@ -2,6 +2,8 @@
 
 import importlib
 
+from tests.patching import unset_env
+
 
 def test_data_dir_env_override(monkeypatch, tmp_path):
     monkeypatch.setenv("BRAIN_DATA_DIR", str(tmp_path))
@@ -28,7 +30,7 @@ def _restore_config(monkeypatch, cfg):
 
 
 def test_data_dir_default(monkeypatch):
-    monkeypatch.delenv("BRAIN_DATA_DIR", raising=False)
+    unset_env(monkeypatch, "BRAIN_DATA_DIR")
     import src.config as cfg
 
     importlib.reload(cfg)

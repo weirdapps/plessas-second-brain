@@ -111,6 +111,4 @@ def _own_attachment_parts(tmp_path, monkeypatch):
     test that uses the same id and text, so each test gets a directory of its own."""
     from src.extract import attachment_pipeline
 
-    monkeypatch.setattr(
-        attachment_pipeline, "PARTS_DIR", tmp_path / "attachment_parts", raising=False
-    )
+    monkeypatch.setattr(attachment_pipeline, "PARTS_DIR", tmp_path / "attachment_parts")

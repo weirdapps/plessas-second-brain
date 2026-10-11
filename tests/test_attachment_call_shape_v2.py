@@ -17,6 +17,7 @@ import pytest
 from src.extract import attachment_pipeline as ap
 from src.extract import attachment_prompt, call_shape, claude_extract, schema_v2
 from src.llm_cost import TokenBudget
+from tests.patching import unset_env
 
 _TAG = re.compile(r"untrusted_[0-9a-f]+")
 
@@ -95,7 +96,7 @@ def _fenced(turn):
 
 
 def test_v1_sends_the_v1_attachment_prompt_alone(monkeypatch, model):
-    monkeypatch.delenv("BRAIN_EXTRACT_CALL_SHAPE", raising=False)
+    unset_env(monkeypatch, "BRAIN_EXTRACT_CALL_SHAPE")
 
     ap._extract_one_attachment(_row())
 
@@ -206,7 +207,7 @@ def test_parts_saved_under_v1_are_not_reused_under_v2(model, monkeypatch):
     """A run cut short keeps its finished parts for the next; the next, in the other
     shape, asks for them again rather than merge extractions of two schemas."""
     text = _long_text()
-    monkeypatch.delenv("BRAIN_EXTRACT_CALL_SHAPE", raising=False)
+    unset_env(monkeypatch, "BRAIN_EXTRACT_CALL_SHAPE")
     stops = iter([False, False, True])  # time runs out after two parts
 
     assert (
@@ -226,7 +227,7 @@ def test_the_estimate_counts_a_v2_call_with_its_system_prompt(monkeypatch):
     """--estimate sizes the calls the run would send: under v2 that includes the system
     prompt, an upper bound once the cache serves it."""
     row = ap._Phase2Row(*_row())
-    monkeypatch.delenv("BRAIN_EXTRACT_CALL_SHAPE", raising=False)
+    unset_env(monkeypatch, "BRAIN_EXTRACT_CALL_SHAPE")
     v1 = ap.estimate_rows([row], chars_per_token=1.0)
     monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", "v2")
     v2 = ap.estimate_rows([row], chars_per_token=1.0)

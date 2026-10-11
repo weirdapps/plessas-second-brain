@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.extract.vertex_fallback import create_with_refusal_fallback
+from tests.patching import unset_env
 
 
 def _resp(text, stop_reason="end_turn"):
@@ -144,8 +145,7 @@ def test_without_a_project_it_logs_no_downgrade_it_cannot_make(monkeypatch, capl
     """On the direct API the log said 'downgrading to fallback' and then that no
     project existed: a Vertex call that never happened, in the record of where
     content went."""
-    monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
-    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    unset_env(monkeypatch, "VERTEX_SDK_PROJECT", "ANTHROPIC_VERTEX_PROJECT_ID")
     primary = MagicMock()
     primary.messages.create.return_value = _resp("refused", stop_reason="refusal")
 

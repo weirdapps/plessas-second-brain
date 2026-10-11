@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.patching import unset_env
+
 REPO = Path(__file__).resolve().parents[1]
 FAKE_PYTHON = """#!/bin/sh
 echo "backend=${BRAIN_EMBED_BACKEND:-unset}"
@@ -115,8 +117,7 @@ def test_the_env_file_is_read_through_a_symlink_to_an_owner_only_file(tmp_path):
 
 @pytest.fixture
 def clean_env(monkeypatch):
-    monkeypatch.delenv("BRAIN_EMBED_BACKEND", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    unset_env(monkeypatch, "BRAIN_EMBED_BACKEND", "GEMINI_API_KEY")
     return monkeypatch
 
 

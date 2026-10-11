@@ -221,110 +221,6 @@ WHATSAPP_UNIT_TIMEOUT_S = 600.0
 WHATSAPP_EMBED_LIMIT = 500
 
 
-def format_email_result(email: dict, show_full: bool = False) -> str:
-    """Format a single email result for display.
-
-    Args:
-        email: Email dict with date, subject, summary, etc.
-        show_full: If True, show full details; otherwise show one-line summary
-
-    Returns:
-        Formatted string
-    """
-    if show_full:
-        lines = [
-            f"ID: {email.get('email_id', 'N/A')}",
-            f"Date: {email.get('date', 'N/A')}",
-            f"Subject: {email.get('subject', '(no subject)')}",
-        ]
-
-        if "sender" in email:
-            lines.append(f"From: {email['sender']}")
-
-        if "person_role" in email:
-            lines.append(f"Role: {email['person_role']}")
-
-        if "topic" in email:
-            lines.append(f"Topic: {email['topic']}")
-
-        if "topics" in email and email["topics"]:
-            lines.append(f"Topics: {email['topics']}")
-
-        if "summary" in email and email["summary"]:
-            lines.append(f"Summary: {email['summary']}")
-
-        if "snippet" in email and email["snippet"] != email.get("summary"):
-            lines.append(f"Match: {email['snippet'][:200]}...")
-
-        if "source" in email:
-            lines.append(f"Source: {email['source']}")
-
-        return "\n".join(lines)
-    else:
-        # One-line format
-        date = email.get("date", "N/A")[:10]  # Just the date part
-        subject = email.get("subject", "(no subject)")[:60]
-        return f"[{date}] {subject}"
-
-
-def format_decision_result(decision: dict) -> str:
-    """Format a decision result for display.
-
-    Args:
-        decision: Decision dict with decision, decided_by, date, etc.
-
-    Returns:
-        Formatted string
-    """
-    lines = [
-        f"ID: {decision.get('decision_id', 'N/A')}",
-        f"Decision: {decision.get('decision', 'N/A')}",
-    ]
-
-    if decision.get("decided_by"):
-        lines.append(f"Decided by: {decision['decided_by']}")
-
-    lines.append(f"Date: {decision.get('date', 'N/A')}")
-
-    if decision.get("email_subject"):
-        lines.append(f"Email: {decision['email_subject']}")
-
-    if decision.get("topics"):
-        lines.append(f"Topics: {decision['topics']}")
-
-    return "\n".join(lines)
-
-
-def format_action_result(action: dict) -> str:
-    """Format an action item result for display.
-
-    Args:
-        action: Action dict with task, owner, deadline, etc.
-
-    Returns:
-        Formatted string
-    """
-    lines = [
-        f"ID: {action.get('action_id', 'N/A')}",
-        f"Task: {action.get('task', 'N/A')}",
-    ]
-
-    if action.get("owner"):
-        lines.append(f"Owner: {action['owner']}")
-
-    if action.get("deadline"):
-        lines.append(f"Deadline: {action['deadline']}")
-
-    lines.append(f"Status: {action.get('status', 'open')}")
-
-    if action.get("email_subject"):
-        lines.append(f"Email: {action['email_subject']}")
-
-    lines.append(f"Date: {action.get('date', 'N/A')}")
-
-    return "\n".join(lines)
-
-
 def _token_budget(args):
     """The run's token budget: --token-budget, else BRAIN_ATTACHMENT_TOKEN_BUDGET; None for no
     limit (neither set, or 0). ValueError for a value that is not a whole number of 0 or more."""
@@ -1404,42 +1300,10 @@ def cmd_process_sharepoint(args):
 
 
 def cmd_sharepoint_refused(args):
-    """The documents our tenant refuses and the ones on tenants we hold no login for. Read only.
-
-    One entry per document, however many emails link it, with those emails: what to name when
-    asking the owner for access.
-    """
-    from urllib.parse import unquote
-
-    from src.export.sharepoint_repair import refused_links
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    try:
-        sections = [
-            (
-                "Refused by our own tenant (http-error, mostly access denied): ask the owner",
-                refused_links(conn, "http-error"),
-            ),
-            (
-                "On another tenant (unsupported-host): this login cannot fetch them",
-                refused_links(conn, "unsupported-host"),
-            ),
-        ]
-    finally:
-        conn.close()
-    for title, docs in sections:
-        links = sum(d["links"] for d in docs)
-        print(f"{title}: {len(docs)} document(s), {links} link(s)")
-        for d in docs:
-            print(
-                f"  {unquote(d['url'])}\n"
-                f"    {d['links']} link(s), {d['attempts']} attempt(s), last {d['last_attempt'][:10]}"
-            )
-            for e in d["emails"]:
-                print(f"    {(e['date'] or '?')[:10]}  {e['sender'] or '?'}  {e['subject'] or ''}")
-        print()
-    return 0
+    """Deprecated: `brain tool sharepoint_index '{"operation": "list_stale"}'`."""
+    return _deprecated_read(
+        args, "sharepoint-refused", "sharepoint_index", {"operation": "list_stale"}
+    )
 
 
 def cmd_reverse_ingest(args):
@@ -1678,284 +1542,148 @@ def cmd_prune_staged(args):
     print(f"Pruned {pruned} batch files, freed {freed / 1024 / 1024:.1f} MB")
 
 
+def cmd_tool(args):
+    """Call an MCP tool by name with JSON arguments, or list the tools (src/mcp_call.py)."""
+    from src import mcp_call
+
+    return mcp_call.command(args.name, args.arguments, list_tools=args.list, db=args.db)
+
+
+# The read commands that mirrored MCP tools by hand, deprecated on 2026-10-11 for one
+# release (README, "Deprecated read commands"). Each prints one line on stderr naming the
+# `brain tool` call that replaces it and makes that call, so its answer is the tool's JSON.
+# A limit is held to the tools' 1..200, as the server holds a caller that skips the input
+# schema; -v and prep's --limit are accepted and ignored.
+
+# What `brain teams-stats` printed, as the one row of a sql_query: no tool counts these.
+TEAMS_STATS_SQL = (
+    "SELECT (SELECT COUNT(*) FROM teams_chats) AS total_teams_chats, "
+    "(SELECT COUNT(*) FROM teams_threads) AS total_teams_threads, "
+    "(SELECT COUNT(*) FROM teams_messages) AS total_teams_messages, "
+    "(SELECT MIN(composed_at) FROM teams_messages) AS earliest_teams_message, "
+    "(SELECT MAX(composed_at) FROM teams_messages) AS latest_teams_message, "
+    "(SELECT COUNT(*) FROM teams_threads WHERE extraction_status = 'pending') "
+    "AS teams_extraction_pending, "
+    "(SELECT COUNT(*) FROM teams_threads WHERE extraction_status = 'failed') "
+    "AS teams_extraction_failed"
+)
+
+
+def _limit(value: int) -> int:
+    from src.mcp_server import MAX_LIMIT
+
+    return max(1, min(int(value), MAX_LIMIT))
+
+
+def _deprecated_read(args, old: str, tool: str, arguments: dict) -> int:
+    """Answer the deprecated read command `old` with the tool it mirrored, after one line
+    on stderr naming the `brain tool` call that replaces it. Arguments left unset are left
+    out, so the tool's own defaults apply."""
+    import json
+    import shlex
+
+    from src import mcp_call
+
+    given = {key: value for key, value in arguments.items() if value is not None}
+    words = ["brain"]
+    if Path(args.db) != DEFAULT_DB:
+        words += ["--db", str(args.db)]
+    words += ["tool", tool]
+    if given:
+        words.append(json.dumps(given, ensure_ascii=False))
+    print(
+        f"brain {old} is deprecated (removed in the next release): use {shlex.join(words)}",
+        file=sys.stderr,
+    )
+    return mcp_call.run(tool, given, db=args.db)
+
+
 def cmd_query_person(args):
-    """Query emails by person."""
-    from src.store.query import query_by_person
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    results = query_by_person(conn, args.name, limit=args.limit)
-    conn.close()
-
-    if not results:
-        print(f"No emails found for person: {args.name}")
-        return
-
-    print(f"Found {len(results)} emails for {args.name}:\n")
-
-    for i, email in enumerate(results, 1):
-        print(f"{i}. {format_email_result(email)}")
-        if args.verbose:
-            print(format_email_result(email, show_full=True))
-            print()
+    """Deprecated: `brain tool query_emails` with a person."""
+    return _deprecated_read(
+        args, "query person", "query_emails", {"person": args.name, "limit": _limit(args.limit)}
+    )
 
 
 def cmd_query_topic(args):
-    """Query emails by topic."""
-    from src.store.query import query_by_topic
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    results = query_by_topic(conn, args.topic, limit=args.limit)
-    conn.close()
-
-    if not results:
-        print(f"No emails found for topic: {args.topic}")
-        return
-
-    print(f"Found {len(results)} emails tagged with '{args.topic}':\n")
-
-    for i, email in enumerate(results, 1):
-        print(f"{i}. {format_email_result(email)}")
-        if args.verbose:
-            print(format_email_result(email, show_full=True))
-            print()
+    """Deprecated: `brain tool query_emails` with a topic."""
+    return _deprecated_read(
+        args, "query topic", "query_emails", {"topic": args.topic, "limit": _limit(args.limit)}
+    )
 
 
 def cmd_query_keyword(args):
-    """Query emails by keyword (full-text search)."""
-    from src.store.query import query_by_keyword, search_attachments
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    results = query_by_keyword(conn, args.keyword, limit=args.limit)
-
-    if not results:
-        print(f"No emails found matching: {args.keyword}")
-    else:
-        print(f"Found {len(results)} emails matching '{args.keyword}':\n")
-        if results[0].get("partial_match"):
-            print("(No email held every word; these hold some of them.)\n")
-
-        for i, email in enumerate(results, 1):
-            print(f"{i}. {format_email_result(email)}")
-            if args.verbose:
-                print(format_email_result(email, show_full=True))
-                print()
-
-    # Also search attachment content
-    att_results = search_attachments(conn, args.keyword, limit=10)
-    if att_results:
-        print(f"\n--- Attachment Results ({len(att_results)}) ---")
-        for r in att_results:
-            date = (r["email_date"] or "N/A")[:10]
-            print(f"  [{date}] {r['filename']}")
-            if r["email_subject"]:
-                print(f"    Email: {r['email_subject']}")
-            if r["snippet"]:
-                print(f"    ...{r['snippet']}...")
-            print()
-
-    conn.close()
+    """Deprecated: `brain tool search_emails`; attachments are `brain tool search_attachments`."""
+    return _deprecated_read(
+        args, "query keyword", "search_emails", {"query": args.keyword, "limit": _limit(args.limit)}
+    )
 
 
 def cmd_query_date(args):
-    """Query emails by date range."""
-    from src.store.query import query_by_date_range
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    results = query_by_date_range(conn, args.start, args.end, limit=args.limit)
-    conn.close()
-
-    if not results:
-        print(f"No emails found between {args.start} and {args.end}")
-        return
-
-    print(f"Found {len(results)} emails from {args.start} to {args.end}:\n")
-
-    for i, email in enumerate(results, 1):
-        print(f"{i}. {format_email_result(email)}")
-        if args.verbose:
-            print(format_email_result(email, show_full=True))
-            print()
+    """Deprecated: `brain tool query_emails` with a start and an end date."""
+    return _deprecated_read(
+        args,
+        "query date",
+        "query_emails",
+        {"start_date": args.start, "end_date": args.end, "limit": _limit(args.limit)},
+    )
 
 
 def cmd_query_decisions(args):
-    """Query decisions."""
-    from src.store.query import query_decisions
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    results = query_decisions(conn, topic=args.topic, person=args.person, limit=args.limit)
-    conn.close()
-
-    if not results:
-        print("No decisions found")
-        return
-
-    print(f"Found {len(results)} decisions:\n")
-
-    for i, decision in enumerate(results, 1):
-        print(f"{i}. {format_decision_result(decision)}")
-        print()
+    """Deprecated: `brain tool query_decisions`."""
+    return _deprecated_read(
+        args,
+        "query decisions",
+        "query_decisions",
+        {"topic": args.topic, "person": args.person, "limit": _limit(args.limit)},
+    )
 
 
 def cmd_query_actions(args):
-    """Query action items."""
-    from src.store.query import query_action_items
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    results = query_action_items(conn, owner=args.owner, status=args.status, limit=args.limit)
-    conn.close()
-
-    if not results:
-        print("No action items found")
-        return
-
-    print(f"Found {len(results)} action items:\n")
-
-    for i, action in enumerate(results, 1):
-        print(f"{i}. {format_action_result(action)}")
-        print()
+    """Deprecated: `brain tool query_actions`."""
+    return _deprecated_read(
+        args,
+        "query actions",
+        "query_actions",
+        {"owner": args.owner, "status": args.status, "limit": _limit(args.limit)},
+    )
 
 
 def cmd_query_thread(args):
-    """Show conversation thread for an email."""
-    from src.store.query import count_thread, query_thread
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    # At least the email itself: an empty answer means no such email.
-    results = query_thread(conn, args.email_id, limit=max(1, args.limit))
-    total = count_thread(conn, args.email_id)
-    conn.close()
-
-    if not results:
-        print(f"No email with ID: {args.email_id}")
-        return
-
-    if total > len(results):
-        # query_thread returned the part of the thread around this email.
-        print(f"Thread with {total} emails, showing {len(results)} around #{args.email_id}:\n")
-    else:
-        print(f"Thread with {len(results)} emails:\n")
-
-    for i, email in enumerate(results, 1):
-        marker = ">>>" if email["email_id"] == args.email_id else "   "
-        date = (email.get("date") or "N/A")[:16]
-        sender = email.get("sender_name") or "Unknown"
-        subject = (email.get("subject") or "(no subject)")[:60]
-        print(f"{marker} {i}. [{date}] {sender}: {subject}")
-        if args.verbose and email.get("summary"):
-            print(f"       Summary: {email['summary']}")
-            print()
+    """Deprecated: `brain tool email_thread`."""
+    return _deprecated_read(
+        args,
+        "query thread",
+        "email_thread",
+        {"email_id": args.email_id, "limit": _limit(args.limit)},
+    )
 
 
 def cmd_query_combined(args):
-    """Query with combined filters."""
-    from src.store.query import query_combined
-    from src.store.schema import get_connection
-
-    conn = None
-    try:
-        conn = get_connection(str(args.db))
-        results = query_combined(
-            conn,
-            person=args.person,
-            topic=args.topic,
-            keyword=args.keyword,
-            start_date=args.start,
-            end_date=args.end,
-            limit=args.limit,
-        )
-    except ValueError as e:
-        print(f"Error: {e}")
-        return
-    finally:
-        if conn:
-            conn.close()
-
-    if not results:
-        print("No emails found matching the combined criteria")
-        return
-
-    print(f"Found {len(results)} emails:\n")
-
-    for i, email in enumerate(results, 1):
-        print(f"{i}. {format_email_result(email)}")
-        if args.verbose:
-            print(format_email_result(email, show_full=True))
-            print()
+    """Deprecated: `brain tool query_emails` with the filters given."""
+    return _deprecated_read(
+        args,
+        "query combined",
+        "query_emails",
+        {
+            "person": args.person,
+            "topic": args.topic,
+            "keyword": args.keyword,
+            "start_date": args.start,
+            "end_date": args.end,
+            "limit": _limit(args.limit),
+        },
+    )
 
 
 def cmd_prep(args):
-    """Generate meeting prep dossier."""
-    from src.store.query import meeting_prep
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    people_list = [p.strip() for p in args.people.split(",") if p.strip()]
-    result = meeting_prep(
-        conn, people_list, topic=args.topic, days=args.days, limit_per_person=args.limit
+    """Deprecated: `brain tool meeting_prep`."""
+    return _deprecated_read(
+        args,
+        "prep",
+        "meeting_prep",
+        {"people": args.people, "topic": args.topic, "days": args.days},
     )
-    conn.close()
-
-    for dossier in result["attendees"]:
-        print(f"\n{'=' * 50}")
-        print(f"  {dossier['name']}")
-        print(f"{'=' * 50}")
-
-        if dossier["emails"]:
-            print(f"\nRecent emails ({len(dossier['emails'])}):")
-            for e in dossier["emails"]:
-                date = e.get("date", "N/A")[:10]
-                role = e.get("role", "")
-                print(f"  [{date}] ({role}) {e.get('subject', '(no subject)')[:60]}")
-                if args.verbose and e.get("summary"):
-                    print(f"    {e['summary'][:120]}")
-
-        if dossier["topics"]:
-            topics_str = ", ".join(f"{t['topic']} ({t['count']})" for t in dossier["topics"])
-            print(f"\nTop topics: {topics_str}")
-
-        if dossier["sentiment_summary"]:
-            sent_str = ", ".join(f"{k}: {v}" for k, v in dossier["sentiment_summary"].items())
-            print(f"Sentiment: {sent_str}")
-
-        if dossier["decisions"]:
-            print(f"\nDecisions ({len(dossier['decisions'])}):")
-            for d in dossier["decisions"]:
-                print(f"  [{d.get('date', 'N/A')[:10]}] {d['decision'][:80]}")
-
-        if dossier["open_actions"]:
-            print(f"\nOpen actions ({len(dossier['open_actions'])}):")
-            for a in dossier["open_actions"]:
-                deadline = f" (due: {a['deadline']})" if a.get("deadline") else ""
-                print(f"  - {a['task'][:80]}{deadline}")
-
-    if result.get("topic_context"):
-        tc = result["topic_context"]
-        print(f"\n{'=' * 50}")
-        print(f"  Topic: {tc['topic']}")
-        print(f"{'=' * 50}")
-
-        if tc["decisions"]:
-            print(f"\nRelated decisions ({len(tc['decisions'])}):")
-            for d in tc["decisions"]:
-                print(f"  [{d.get('date', 'N/A')[:10]}] {d['decision'][:80]}")
-
-        if tc["key_facts"]:
-            print(f"\nKey facts ({len(tc['key_facts'])}):")
-            for f in tc["key_facts"]:
-                print(f"  - {f['fact'][:100]}")
-
-        if tc["action_items"]:
-            print(f"\nOpen actions ({len(tc['action_items'])}):")
-            for a in tc["action_items"]:
-                deadline = f" (due: {a['deadline']})" if a.get("deadline") else ""
-                print(f"  - {a['task'][:80]}{deadline}")
 
 
 def _holding_the_sync_lock(sync):
@@ -2662,96 +2390,32 @@ def cmd_whatsapp_sync(args):
 
 
 def cmd_teams_search(args):
-    from src.store.schema import get_connection
-    from src.store.teams_query import search_teams
-
-    conn = get_connection(str(args.db))
-    results = search_teams(conn, args.query, kind=args.kind, limit=args.limit)
-    conn.close()
-    if not results:
-        print(f"No teams matches for: {args.query}")
-        return
-    if results[0].get("partial_match"):
-        print("(No thread held every word; these hold some of them.)")
-    for i, r in enumerate(results, 1):
-        print(f"\n{i}. [{r['team_name']} / {r['channel_topic']}] {r['title'] or '(untitled)'}")
-        print(
-            f"   {r['started_at'][:10]}..{r['ended_at'][:10]} ({r['message_count']} msgs, match={r['match']})"
-        )
-        if r.get("snippet"):
-            print(f"   {r['snippet']}")
+    """Deprecated: `brain tool search_teams`."""
+    return _deprecated_read(
+        args,
+        "teams-search",
+        "search_teams",
+        {"query": args.query, "kind": args.kind, "limit": _limit(args.limit)},
+    )
 
 
 def cmd_teams_thread(args):
-    from src.store.schema import get_connection
-    from src.store.teams_query import thread_context
-
-    conn = get_connection(str(args.db))
-    ctx = thread_context(conn, args.thread_id)
-    conn.close()
-    if "error" in ctx:
-        print(ctx["error"])
-        return
-    t = ctx["thread"]
-    print(f"# {t['title']}")
-    print(f"  {t['team_name']} / {t['channel_topic']}  ({t['started_at']} → {t['ended_at']})")
-    print(f"  {t['message_count']} messages\n")
-    if t.get("summary"):
-        print(f"SUMMARY: {t['summary']}\n")
-    print("MESSAGES:")
-    for m in ctx["messages"]:
-        sys_marker = " [system]" if m["is_system"] else ""
-        print(f"  [{m['composed_at']}] {m['sender_display_name']}{sys_marker}: {m['content_text']}")
-    if ctx["decisions"]:
-        print("\nDECISIONS:")
-        for d in ctx["decisions"]:
-            print(f"  - {d['decision']}  ({d['decided_by']}, {d['decision_date']})")
-    if ctx["action_items"]:
-        print("\nACTIONS:")
-        for a in ctx["action_items"]:
-            print(f"  - {a['task']}  (owner: {a['owner']}, due: {a['deadline']}, {a['status']})")
-    if ctx["key_facts"]:
-        print("\nKEY FACTS:")
-        for f in ctx["key_facts"]:
-            print(f"  - {f['fact']}")
+    """Deprecated: `brain tool teams_thread_context`."""
+    return _deprecated_read(
+        args, "teams-thread", "teams_thread_context", {"thread_id": args.thread_id}
+    )
 
 
 def cmd_teams_chat(args):
-    from src.store.schema import get_connection
-    from src.store.teams_query import chat_summary
-
-    conn = get_connection(str(args.db))
-    s = chat_summary(conn, args.chat_id, days=args.days)
-    conn.close()
-    if "error" in s:
-        print(s["error"])
-        return
-    c = s["chat"]
-    print(f"# {c['team_name']} / {c['topic']}  (chat_id={c['id']}, kind={c['chat_kind']})")
-    print(f"  Last activity: {c['last_message_at']}\n")
-    print(f"Recent threads ({len(s['threads'])}):")
-    for t in s["threads"]:
-        print(f"  [{t['ended_at'][:10]}] {t['title']}  ({t['message_count']} msgs)")
-    print(f"\nLast messages ({len(s['last_messages'])}):")
-    for m in s["last_messages"]:
-        snippet = (m["content_text"] or "")[:80]
-        print(f"  [{m['composed_at'][:16]}] {m['sender_display_name']}: {snippet}")
-    print(f"\nOpen actions ({len(s['open_actions'])}):")
-    for a in s["open_actions"]:
-        print(f"  - {a['task']} (owner: {a['owner']}, due: {a['deadline']})")
+    """Deprecated: `brain tool teams_chat_summary`."""
+    return _deprecated_read(
+        args, "teams-chat", "teams_chat_summary", {"chat_id": args.chat_id, "days": args.days}
+    )
 
 
 def cmd_teams_stats(args):
-    from src.store.schema import get_connection
-    from src.store.teams_query import stats
-
-    conn = get_connection(str(args.db))
-    s = stats(conn)
-    conn.close()
-    print("Teams Statistics")
-    print("=" * 40)
-    for k, v in s.items():
-        print(f"{k:30s} {v}")
+    """Deprecated: `brain tool sql_query` with TEAMS_STATS_SQL; no tool counts these."""
+    return _deprecated_read(args, "teams-stats", "sql_query", {"sql": TEAMS_STATS_SQL})
 
 
 # Runs in a row an event may fail get-event and still fail the calendar-sync run.
@@ -3545,34 +3209,13 @@ def cmd_import_people(args):
 
 
 def cmd_stale(args):
-    """Find stale threads and overdue actions."""
-    from src.store.query import count_stale_threads, find_overdue_actions, find_stale_threads
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-
-    stale = find_stale_threads(conn, days=args.days, max_days=args.max_days, limit=args.limit)
-    total = count_stale_threads(conn, days=args.days, max_days=args.max_days)
-    print(f"STALE THREADS (you sent last, no reply): {len(stale)} of {total}")
-    print("=" * 50)
-    if stale:
-        for i, t in enumerate(stale, 1):
-            print(f"{i}. [{t['days_waiting']}d waiting] {t['subject']}")
-    else:
-        print("  No stale threads found.")
-
-    print()
-    print("OVERDUE ACTION ITEMS")
-    print("=" * 50)
-    overdue = find_overdue_actions(conn)
-    if overdue:
-        for i, a in enumerate(overdue, 1):
-            owner = a.get("owner", "unassigned")
-            print(f"{i}. [{a['days_overdue']}d overdue] {a['task'][:80]} (owner: {owner})")
-    else:
-        print("  No overdue actions found.")
-
-    conn.close()
+    """Deprecated: `brain tool stale_threads`."""
+    return _deprecated_read(
+        args,
+        "stale",
+        "stale_threads",
+        {"days": args.days, "max_days": args.max_days, "limit": _limit(args.limit)},
+    )
 
 
 def cmd_embed(args):
@@ -3591,28 +3234,13 @@ def cmd_embed(args):
 
 
 def cmd_query_semantic(args):
-    """Semantic search across email summaries."""
-    from src.store.embeddings import query_semantic
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    results = query_semantic(conn, args.query, limit=args.limit)
-    conn.close()
-
-    if not results:
-        print(f"No results for: {args.query}")
-        return
-
-    print(f"Top {len(results)} semantic matches for '{args.query}':\n")
-
-    for i, email in enumerate(results, 1):
-        sim = email.get("similarity", 0)
-        print(
-            f"{i}. [{email.get('date', 'N/A')[:10]}] (sim: {sim:.3f}) {email.get('subject', '(no subject)')[:60]}"
-        )
-        if args.verbose and email.get("summary"):
-            print(f"   {email['summary'][:120]}")
-            print()
+    """Deprecated: `brain tool search_emails` with search_type semantic."""
+    return _deprecated_read(
+        args,
+        "query semantic",
+        "search_emails",
+        {"query": args.query, "search_type": "semantic", "limit": _limit(args.limit)},
+    )
 
 
 def cmd_ingest(args):
@@ -3691,30 +3319,8 @@ def cmd_ingest(args):
 
 
 def cmd_stats(args):
-    """Show database statistics."""
-    from src.store.query import get_stats
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    stats = get_stats(conn)
-    conn.close()
-
-    print("Second Brain Statistics")
-    print("=" * 50)
-    print()
-    print(f"Total Emails:        {stats['total_emails']:,}")
-    print(f"Total News:          {stats['total_news_articles']:,}")
-    print(f"Total Documents:     {stats['total_documents']:,}")
-    print(f"Total Topics:        {stats['total_topics']:,}")
-    print(f"Total People:        {stats['total_people']:,}")
-    print(f"Total Decisions:     {stats['total_decisions']:,}")
-    print(f"Total Action Items:  {stats['total_action_items']:,}")
-    print()
-
-    if stats["earliest_email"] and stats["latest_email"]:
-        earliest = stats["earliest_email"][:10]
-        latest = stats["latest_email"][:10]
-        print(f"Date Range:          {earliest} to {latest}")
+    """Deprecated: `brain tool stats`, which adds freshness, coverage and every source."""
+    return _deprecated_read(args, "stats", "stats", {})
 
 
 # Subcommands that only read, and so may run on a replica. Everything else
@@ -3722,6 +3328,9 @@ def cmd_stats(args):
 # there until it is added here.
 READ_ONLY_COMMANDS = frozenset(
     {
+        # The MCP tools read through the read-only connection; sharepoint_index's
+        # refetch, the one that writes, refuses on a replica itself, as on the server.
+        "tool",
         "query",
         "prep",
         "stale",
@@ -4164,7 +3773,7 @@ def main():
 
     parser_sp_refused = subparsers.add_parser(
         "sharepoint-refused",
-        help="List the documents our SharePoint tenant refuses, with the emails linking them",
+        help="Deprecated: brain tool sharepoint_index, operation list_stale",
     )
     parser_sp_refused.set_defaults(func=cmd_sharepoint_refused)
 
@@ -4223,55 +3832,87 @@ def main():
     )
     parser_prune_staged.set_defaults(func=cmd_prune_staged)
 
+    # Any MCP tool by name, through the server's own call (src/mcp_call.py)
+    parser_tool = subparsers.add_parser(
+        "tool",
+        help="Call an MCP tool by name with its arguments as JSON; prints its answer as JSON",
+    )
+    parser_tool.add_argument("name", nargs="?", help="The tool, as `brain tool --list` names it")
+    parser_tool.add_argument(
+        "arguments", nargs="?", default=None, help="Its arguments as one JSON object (default {})"
+    )
+    parser_tool.add_argument(
+        "--list",
+        action="store_true",
+        help="List the tools with their descriptions, input schemas and annotations",
+    )
+    parser_tool.set_defaults(func=cmd_tool)
+
     # Query subcommands
-    parser_query = subparsers.add_parser("query", help="Query the knowledge store")
+    parser_query = subparsers.add_parser(
+        "query", help="Deprecated: brain tool (query_emails, search_emails, query_decisions...)"
+    )
     query_subparsers = parser_query.add_subparsers(dest="query_type", help="Query type")
 
     # Common query options
     def add_common_query_args(p):
         p.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
-        p.add_argument("-v", "--verbose", action="store_true", help="Show full details")
+        p.add_argument("-v", "--verbose", action="store_true", help="Ignored: the answer is JSON")
 
     # Query thread
-    parser_query_thread = query_subparsers.add_parser("thread", help="Show conversation thread")
+    parser_query_thread = query_subparsers.add_parser(
+        "thread", help="Deprecated: brain tool email_thread"
+    )
     parser_query_thread.add_argument("email_id", type=int, help="Email ID")
     add_common_query_args(parser_query_thread)
     parser_query_thread.set_defaults(func=cmd_query_thread)
 
     # Query by person
-    parser_query_person = query_subparsers.add_parser("person", help="Query by person")
+    parser_query_person = query_subparsers.add_parser(
+        "person", help="Deprecated: brain tool query_emails"
+    )
     parser_query_person.add_argument("name", help="Person name or email")
     add_common_query_args(parser_query_person)
     parser_query_person.set_defaults(func=cmd_query_person)
 
     # Query by topic
-    parser_query_topic = query_subparsers.add_parser("topic", help="Query by topic")
+    parser_query_topic = query_subparsers.add_parser(
+        "topic", help="Deprecated: brain tool query_emails"
+    )
     parser_query_topic.add_argument("topic", help="Topic name")
     add_common_query_args(parser_query_topic)
     parser_query_topic.set_defaults(func=cmd_query_topic)
 
     # Query by keyword
-    parser_query_keyword = query_subparsers.add_parser("keyword", help="Full-text search")
+    parser_query_keyword = query_subparsers.add_parser(
+        "keyword", help="Deprecated: brain tool search_emails"
+    )
     parser_query_keyword.add_argument("keyword", help="Search keyword")
     add_common_query_args(parser_query_keyword)
     parser_query_keyword.set_defaults(func=cmd_query_keyword)
 
     # Query by date range
-    parser_query_date = query_subparsers.add_parser("date", help="Query by date range")
+    parser_query_date = query_subparsers.add_parser(
+        "date", help="Deprecated: brain tool query_emails"
+    )
     parser_query_date.add_argument("start", help="Start date (YYYY-MM-DD)")
     parser_query_date.add_argument("end", help="End date (YYYY-MM-DD)")
     add_common_query_args(parser_query_date)
     parser_query_date.set_defaults(func=cmd_query_date)
 
     # Query decisions
-    parser_query_decisions = query_subparsers.add_parser("decisions", help="Query decisions")
+    parser_query_decisions = query_subparsers.add_parser(
+        "decisions", help="Deprecated: brain tool query_decisions"
+    )
     parser_query_decisions.add_argument("--topic", help="Filter by topic")
     parser_query_decisions.add_argument("--person", help="Filter by person (decided_by)")
     parser_query_decisions.add_argument("--limit", type=int, default=20, help="Max results")
     parser_query_decisions.set_defaults(func=cmd_query_decisions)
 
     # Query action items
-    parser_query_actions = query_subparsers.add_parser("actions", help="Query action items")
+    parser_query_actions = query_subparsers.add_parser(
+        "actions", help="Deprecated: brain tool query_actions"
+    )
     parser_query_actions.add_argument("--owner", help="Filter by owner")
     parser_query_actions.add_argument(
         "--status", default="open", help="Filter by status (default: open)"
@@ -4281,7 +3922,7 @@ def main():
 
     # Query combined
     parser_query_combined = query_subparsers.add_parser(
-        "combined", help="Query with multiple filters"
+        "combined", help="Deprecated: brain tool query_emails"
     )
     parser_query_combined.add_argument("--person", help="Filter by person")
     parser_query_combined.add_argument("--topic", help="Filter by topic")
@@ -4292,16 +3933,18 @@ def main():
     parser_query_combined.set_defaults(func=cmd_query_combined)
 
     # Prep command (meeting preparation)
-    parser_prep = subparsers.add_parser("prep", help="Generate meeting prep dossier")
+    parser_prep = subparsers.add_parser("prep", help="Deprecated: brain tool meeting_prep")
     parser_prep.add_argument("people", help="Comma-separated list of attendee names or emails")
     parser_prep.add_argument("--topic", help="Meeting topic for focused context")
     parser_prep.add_argument(
         "--days", type=int, default=365, help="Lookback period in days (default: 365)"
     )
     parser_prep.add_argument(
-        "--limit", type=int, default=10, help="Max emails per person (default: 10)"
+        "--limit", type=int, default=10, help="Ignored: meeting_prep takes no limit"
     )
-    parser_prep.add_argument("-v", "--verbose", action="store_true", help="Show email summaries")
+    parser_prep.add_argument(
+        "-v", "--verbose", action="store_true", help="Ignored: the answer is JSON"
+    )
     parser_prep.set_defaults(func=cmd_prep)
 
     # Sync command (incremental)
@@ -4417,7 +4060,9 @@ def main():
     )
     parser_teams_drop_raw.set_defaults(func=cmd_teams_drop_raw_json)
 
-    parser_teams_search = subparsers.add_parser("teams-search", help="Search Teams content")
+    parser_teams_search = subparsers.add_parser(
+        "teams-search", help="Deprecated: brain tool search_teams"
+    )
     parser_teams_search.add_argument("query", help="Search query")
     parser_teams_search.add_argument(
         "--kind", choices=["thread", "message", "both"], default="both"
@@ -4425,18 +4070,22 @@ def main():
     parser_teams_search.add_argument("--limit", type=int, default=20)
     parser_teams_search.set_defaults(func=cmd_teams_search)
 
-    parser_teams_thread = subparsers.add_parser("teams-thread", help="Show full Teams thread")
+    parser_teams_thread = subparsers.add_parser(
+        "teams-thread", help="Deprecated: brain tool teams_thread_context"
+    )
     parser_teams_thread.add_argument("thread_id", type=int)
     parser_teams_thread.set_defaults(func=cmd_teams_thread)
 
     parser_teams_chat = subparsers.add_parser(
-        "teams-chat", help="Recent activity for a Teams chat/channel"
+        "teams-chat", help="Deprecated: brain tool teams_chat_summary"
     )
     parser_teams_chat.add_argument("chat_id", type=int)
     parser_teams_chat.add_argument("--days", type=int, default=30)
     parser_teams_chat.set_defaults(func=cmd_teams_chat)
 
-    parser_teams_stats = subparsers.add_parser("teams-stats", help="Teams ingestion statistics")
+    parser_teams_stats = subparsers.add_parser(
+        "teams-stats", help="Deprecated: brain tool sql_query (README)"
+    )
     parser_teams_stats.set_defaults(func=cmd_teams_stats)
 
     # calendar-sync command
@@ -4517,7 +4166,7 @@ def main():
     parser_import.set_defaults(func=cmd_import_people)
 
     # Stale command
-    parser_stale = subparsers.add_parser("stale", help="Find stale threads and overdue actions")
+    parser_stale = subparsers.add_parser("stale", help="Deprecated: brain tool stale_threads")
     parser_stale.add_argument(
         "--days", type=int, default=5, help="Stale threshold in days (default: 5)"
     )
@@ -4540,7 +4189,9 @@ def main():
     parser_embed.set_defaults(func=cmd_embed)
 
     # Query semantic
-    parser_query_semantic = query_subparsers.add_parser("semantic", help="Semantic search")
+    parser_query_semantic = query_subparsers.add_parser(
+        "semantic", help="Deprecated: brain tool search_emails, search_type semantic"
+    )
     parser_query_semantic.add_argument("query", help="Natural language search query")
     add_common_query_args(parser_query_semantic)
     parser_query_semantic.set_defaults(func=cmd_query_semantic)
@@ -4577,7 +4228,7 @@ def main():
     parser_ingest.set_defaults(func=cmd_ingest)
 
     # Stats command
-    parser_stats = subparsers.add_parser("stats", help="Show database statistics")
+    parser_stats = subparsers.add_parser("stats", help="Deprecated: brain tool stats")
     parser_stats.set_defaults(func=cmd_stats)
 
     # Parse and execute

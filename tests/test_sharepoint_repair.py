@@ -256,10 +256,14 @@ def test_viewer_links_to_two_files_are_two_documents(conn):
 
 
 def test_the_refused_list_runs_on_a_replica(tmp_path, monkeypatch, capsys):
+    """Deprecated for one release, it answers through the sharepoint_index tool, which
+    lists every link whose last fetch did not succeed."""
     import sys
 
     from src.cli import main
+    from tests.mcp_listing import allow_an_event_loop
 
+    allow_an_event_loop(monkeypatch)
     db = tmp_path / "brain.db"
     c = create_database(str(db))
     record_link_in_db(

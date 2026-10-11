@@ -1,8 +1,22 @@
 """The MCP tools as a client lists them, read without an event loop.
 
 The suite blocks sockets, and an asyncio loop needs a socketpair. Listing tools
-never awaits anything, so the coroutine finishes on its first step.
+never awaits anything, so the coroutine finishes on its first step. A test that
+calls a tool the way the server does needs a loop: allow_an_event_loop.
 """
+
+
+def allow_an_event_loop(monkeypatch) -> None:
+    """Let this test run an asyncio event loop, as MCPServer.call_tool needs.
+
+    A loop opens a local socket pair for its self-pipe, and tests/conftest.py blocks
+    every socket. Only socketpair is let through, as the C-level pair, which cannot
+    reach the network: a socket that could is still refused.
+    """
+    import _socket
+    import socket
+
+    monkeypatch.setattr(socket, "socketpair", _socket.socketpair)
 
 
 def listed_tools() -> dict:

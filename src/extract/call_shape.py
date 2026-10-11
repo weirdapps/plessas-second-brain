@@ -109,6 +109,16 @@ def max_tokens_attempts(route: Route) -> tuple[int, int]:
     return route.max_tokens, route.max_tokens * RETRY_FACTOR
 
 
+def thread_call(route_name: str, v1_max_tokens: int) -> tuple[tuple[int, ...], dict]:
+    """The output budgets a call on a route with an unchanged prompt (Teams, WhatsApp) is
+    sent with, and what call shape v2 adds to it: under v1 one call at `v1_max_tokens`
+    and nothing added; under v2 the route's budgets and its output_config."""
+    if call_shape() == "v1":
+        return (v1_max_tokens,), {}
+    route = ROUTES[route_name]
+    return max_tokens_attempts(route), {"output_config": route.output_config()}
+
+
 def system_blocks(instructions: str, examples: str) -> list[dict]:
     """The system prompt as two text blocks, cached at the last: the cache is a prefix,
     so the one marker covers both."""

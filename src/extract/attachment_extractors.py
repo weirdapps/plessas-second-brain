@@ -17,6 +17,13 @@ from email.message import EmailMessage
 from email.parser import BytesParser
 from pathlib import Path
 
+from src.extract.ocr_garble import (
+    GREEK_SHARE_MAX,
+    looks_like_garbled_greek,
+    mark_garbled,
+    script_profile,
+)
+
 # A ceiling against runaway input: text is stored in full up to it, and Phase 2 summarises a
 # long one in parts (src/extract/attachment_pipeline.py). Kept at 2,000,000 after a review
 # measured 50,000,000: 3.3 GB of memory for every write to such a row, and search snippets that
@@ -93,9 +100,21 @@ ZIP_MAX_SECONDS = 120
 # the pages it read; its error then says "pages left unread", like an archive's, and reextract
 # reads it again with no budget.
 OCR_MAX_SECONDS = 120
-# Tesseract's languages, and what a scan with too little text says.
-OCR_LANGS = "eng+ell"
+# Tesseract's languages, Greek first. English first read Greek capitals and many lower-case Greek
+# letters as the Latin letters they resemble ("KAI", "tou", "tnv"): about 800 images and scans
+# became Latin text, and their summaries named the wrong programme and the wrong figure (audit
+# 2026-10-11). Greek first misreads some figures and signs instead ("Q3" as "93", "+2.4%" as
+# "42.48" in a test on rendered pages), so a page whose Greek-first reading is Latin script is read
+# again English first, the order every page was read in before, and that reading is kept unless
+# it is itself Greek in Latin look-alikes (_read_page).
+OCR_LANGS = "ell+eng"
+OCR_LANGS_LATIN = "eng+ell"
+# What a scan with too little text says.
 OCR_INSUFFICIENT = "OCR returned insufficient text"
+# The methods whose text holds an OCR reading: an image, a scan or a text PDF with scanned pages,
+# and an archive, whose members may be either. Only their text is judged for Greek read as Latin
+# look-alikes (extract_text_from_file); a document's own text layer is what its author wrote.
+OCR_TEXT_METHODS = frozenset({"ocr", "pymupdf+tesseract", "zip"})
 # Pillow's own decompression-bomb threshold, twice its default MAX_IMAGE_PIXELS. An image past it
 # is not OCR'd, whatever limit another module sets for its own Image.open calls: tesseract on a
 # 342-megapixel page needs gigabytes and minutes, and Phase 1 cannot stop an item mid-file.
@@ -120,7 +139,9 @@ def extract_text_from_file(
     zip_seconds is how long an archive may spend reading members, ZIP_MAX_SECONDS when None;
     ocr_seconds how long a scan may spend on its pages, OCR_MAX_SECONDS when None. reextract
     passes math.inf for both, since a one-time recovery run has the time. A text cut at
-    MAX_TEXT_CHARS says so in the error.
+    MAX_TEXT_CHARS says so in the error. An OCR reading that is Greek in Latin look-alike letters
+    (src/extract/ocr_garble.py) keeps its text and carries the ocr_garbled mark in the error:
+    Phase 2 does not summarise it and the sweep keeps its file.
     """
     result = _extract_by_type(
         file_path, mime_type, _depth, zip_seconds=zip_seconds, ocr_seconds=ocr_seconds
@@ -130,6 +151,14 @@ def extract_text_from_file(
     if text and len(text) >= MAX_TEXT_CHARS and "file kept" not in error:
         note = f"text cut at {MAX_TEXT_CHARS:,} characters; the rest is unread, file kept"
         result = {**result, "error": f"{error}; {note}" if error else note}
+    # The stored text is judged once, as a whole: an archive's members are judged with it.
+    if (
+        not _depth
+        and result.get("status") == "extracted"
+        and result.get("method") in OCR_TEXT_METHODS
+        and looks_like_garbled_greek(text)
+    ):
+        result = {**result, "error": mark_garbled(result.get("error"))}
     return result
 
 
@@ -329,7 +358,7 @@ def _extract_by_type(
 
 
 def _extract_pdf(path: str, ocr_seconds: float | None = None) -> dict:
-    """Extract text from PDF using PyMuPDF, with OCR fallback."""
+    """Extract text from PDF using PyMuPDF; OCR a scan, and the scanned pages of a text PDF."""
     import fitz
 
     doc = fitz.open(path)
@@ -376,7 +405,59 @@ def _extract_pdf(path: str, ocr_seconds: float | None = None) -> dict:
                 "error": "Insufficient text extracted",
             }
 
-    return {"text": text, "method": "pymupdf", "status": "extracted", "error": None}
+    return _read_scanned_pages(path, pages, OCR_MAX_SECONDS if ocr_seconds is None else ocr_seconds)
+
+
+def _read_scanned_pages(path: str, pages: list[str], seconds: float) -> dict:
+    """A text PDF, its scanned pages OCR'd: an annex or a signed page among pages of text.
+
+    The scan path above runs only when the whole document holds too little text, so a scanned
+    annex inside a text PDF was never read (audit 2026-10-11, code-extract-12). A page whose text
+    layer holds fewer than MIN_TEXT_CHARS characters and that shows an image is read like a page
+    of a scan, and its reading takes the page's place when it is longer. A blank page, or one
+    with only a short heading, shows no image and is not read. The pages share the scan budget,
+    `seconds`: once it is spent the error says "pages left unread", as a scan's does, and
+    reextract with no budget reads the rest. A page this host cannot OCR (no tesseract) says
+    the same, and the text layer is kept as it was.
+    """
+    import fitz
+    from PIL import Image
+
+    read = list(pages)
+    ocrd = 0
+    note = None
+    doc = fitz.open(path)
+    try:
+        scanned = [
+            n
+            for n, text in enumerate(pages)
+            if len(text.strip()) < MIN_TEXT_CHARS and doc[n].get_image_info()
+        ]
+        started = time.monotonic()
+        for i, n in enumerate(scanned):
+            if i and time.monotonic() - started > seconds:
+                note = f"time budget spent, {len(scanned) - i} pages left unread"
+                break
+            try:
+                pix = doc[n].get_pixmap(dpi=200)
+                reading = _read_page(Image.open(io.BytesIO(pix.tobytes("png")))).strip()
+            except Exception as e:
+                note = (
+                    f"{len(scanned) - i} scanned pages left unread: "
+                    f"{type(e).__name__}: {str(e)[:200]}"
+                )
+                break
+            if len(reading) > len(pages[n].strip()):
+                read[n] = reading
+                ocrd += 1
+    finally:
+        doc.close()
+    return {
+        "text": _truncate("\n\n".join(read)),
+        "method": "pymupdf+tesseract" if ocrd else "pymupdf",
+        "status": "extracted",
+        "error": note,
+    }
 
 
 def _extract_docx(path: str) -> dict:
@@ -1041,6 +1122,25 @@ def _extract_xlsb(path: str) -> dict:
     return {"text": text, "method": "pyxlsb", "status": "extracted", "error": None}
 
 
+def _read_page(img) -> str:
+    """One image or page OCR'd: Greek first, and English first when that reads as Latin script.
+
+    Latin script is a reading with letters or digits whose letters are at most GREEK_SHARE_MAX
+    Greek (src/extract/ocr_garble.py), figures alone included. Its English-first reading takes
+    its place unless that is empty or is itself Greek in Latin look-alike letters, which means a
+    Greek page that neither order reads well. See OCR_LANGS.
+    """
+    import pytesseract
+
+    text = pytesseract.image_to_string(img, lang=OCR_LANGS)
+    if not any(c.isalnum() for c in text) or script_profile(text).greek_share > GREEK_SHARE_MAX:
+        return text
+    latin = pytesseract.image_to_string(img, lang=OCR_LANGS_LATIN)
+    if not latin.strip() or looks_like_garbled_greek(latin):
+        return text
+    return latin
+
+
 def _too_large_to_ocr(img) -> str | None:
     """Why an image is not OCR'd for its size, or None. Read from the header, before decoding."""
     pixels = img.width * img.height
@@ -1069,7 +1169,6 @@ def _grayscale(img):
 
 def _ocr_frames(img, budget: float) -> dict:
     """OCR every page of a multi-page TIFF, inside the scan budget, like _ocr_pdf_pages."""
-    import pytesseract
     from PIL import ImageSequence
 
     pages, notes = [], []
@@ -1082,7 +1181,7 @@ def _ocr_frames(img, budget: float) -> dict:
         if too_large:
             notes.append(f"page {i + 1} too large to OCR: {too_large}; unread, file kept")
             continue
-        page = pytesseract.image_to_string(frame.convert("RGB"), lang=OCR_LANGS)
+        page = _read_page(frame.convert("RGB"))
         if page.strip():
             pages.append(page.strip())
     note = "; ".join(notes) or None
@@ -1102,7 +1201,7 @@ def _extract_image_ocr(path: str, ocr_seconds: float | None = None) -> dict:
     try:
         import io
 
-        import pytesseract
+        import pytesseract  # noqa: F401  (the import is the check; _read_page calls it)
         from PIL import Image
     except ImportError:
         return {
@@ -1136,11 +1235,10 @@ def _extract_image_ocr(path: str, ocr_seconds: float | None = None) -> dict:
             img.convert("RGB").save(buf, format="PNG")
             buf.seek(0)
             img = Image.open(buf)
-        text = pytesseract.image_to_string(img, lang=OCR_LANGS)
-        text = _truncate(text)
+        text = _truncate(_read_page(img))
         if _apply_noise_filter(text):
             # Too little in colour: once more in grayscale, kept only when it reads.
-            gray = _truncate(pytesseract.image_to_string(_grayscale(img), lang=OCR_LANGS))
+            gray = _truncate(_read_page(_grayscale(img)))
             if not _apply_noise_filter(gray):
                 text = gray
 
@@ -1184,7 +1282,6 @@ def _ocr_pdf_pages(path: str, seconds: float | None = None, gray: bool = False) 
     import io
 
     import fitz
-    import pytesseract
     from PIL import Image
 
     budget = OCR_MAX_SECONDS if seconds is None else seconds
@@ -1201,7 +1298,7 @@ def _ocr_pdf_pages(path: str, seconds: float | None = None, gray: bool = False) 
             img = Image.open(io.BytesIO(pix.tobytes("png")))
             if gray:
                 img = _grayscale(img)
-            page_text = pytesseract.image_to_string(img, lang=OCR_LANGS)
+            page_text = _read_page(img)
             if page_text.strip():
                 pages_text.append(page_text.strip())
         doc.close()

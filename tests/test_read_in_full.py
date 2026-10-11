@@ -87,15 +87,25 @@ def _scan(pages):
     doc = MagicMock()
     doc.__iter__.return_value = iter([page] * pages)
     doc.page_count = pages
-    numbers = iter(range(1, pages + 1))
     return (
         patch("fitz.open", return_value=doc),
         patch("PIL.Image.open"),
-        patch(
-            "pytesseract.image_to_string",
-            side_effect=lambda img, lang: f"Page {next(numbers)} {WORDS}",
-        ),
+        patch("pytesseract.image_to_string", side_effect=_pages_read(pages)),
     )
+
+
+def _pages_read(pages):
+    """Tesseract reading "Page n" and WORDS, the next page on each Greek-first read. The words
+    are English, so each page is read once more English first, and that read sees the same page."""
+    numbers = iter(range(1, pages + 1))
+    current = [0]
+
+    def read(img, lang):
+        if lang == ax.OCR_LANGS:
+            current[0] = next(numbers)
+        return f"Page {current[0]} {WORDS}"
+
+    return read
 
 
 def test_every_page_of_a_scan_is_read():
@@ -386,10 +396,7 @@ def test_every_page_of_a_multi_page_tiff_is_read(tmp_path):
     tiff = tmp_path / "scan.tiff"
     first, *rest = [Image.new("RGB", (40, 40), color) for color in ("white", "gray", "black")]
     first.save(tiff, save_all=True, append_images=rest)
-    pages = iter(range(1, 4))
-    with patch(
-        "pytesseract.image_to_string", side_effect=lambda img, lang: f"Page {next(pages)} {WORDS}"
-    ):
+    with patch("pytesseract.image_to_string", side_effect=_pages_read(3)):
         result = ax._extract_image_ocr(str(tiff))
 
     assert all(f"Page {n} " in result["text"] for n in (1, 2, 3))

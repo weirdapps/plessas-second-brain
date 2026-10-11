@@ -9,6 +9,7 @@ channel, and short messages with media shown only by their kind.
 
 from src.extract.teams_prompt import THREAD_TEMPLATE, USER_TEMPLATE, parse_response
 from src.extract.untrusted import fence
+from src.redact import PROMPT_RULE
 
 __all__ = ["SYSTEM_PROMPT", "build_prompt", "parse_response"]
 
@@ -21,6 +22,7 @@ SYSTEM_PROMPT = (
     "personal memory. Write summary, decisions, action_items and key_facts in the "
     "same language as the chat (e.g. Greek for Greek chats, English for English "
     "chats); the 'language' field is the ISO 639-1 code for that language."
+    f" {PROMPT_RULE}"
 )
 
 

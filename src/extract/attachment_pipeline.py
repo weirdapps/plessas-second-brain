@@ -854,16 +854,19 @@ def run_phase2(
                         (email_id, topic_id),
                     )
 
+                # The texts are masked as the loader masks an email's
+                # (src/store/loader.py), and compared masked with what the email holds.
                 for decision in extraction.get("decisions", []):
                     if isinstance(decision, dict) and decision.get("decision"):
-                        if _held(conn, "decisions", "decision", email_id, decision["decision"]):
+                        text = redact_secrets(decision["decision"])
+                        if _held(conn, "decisions", "decision", email_id, text):
                             continue
                         conn.execute(
                             "INSERT INTO decisions (email_id, decision, decided_by, attachment_id)"
                             " VALUES (?, ?, ?, ?)",
                             (
                                 email_id,
-                                decision["decision"],
+                                text,
                                 decision.get("decided_by"),
                                 att_id,
                             ),
@@ -871,7 +874,8 @@ def run_phase2(
 
                 for action in extraction.get("action_items", []):
                     if isinstance(action, dict) and action.get("task"):
-                        if _held(conn, "action_items", "task", email_id, action["task"]):
+                        task = redact_secrets(action["task"])
+                        if _held(conn, "action_items", "task", email_id, task):
                             continue
                         conn.execute(
                             "INSERT INTO action_items"
@@ -879,14 +883,14 @@ def run_phase2(
                             " VALUES (?, ?, ?, ?, 'open', ?)",
                             (
                                 email_id,
-                                action["task"],
+                                task,
                                 action.get("owner"),
                                 action.get("deadline"),
                                 att_id,
                             ),
                         )
 
-                for fact in extraction.get("key_facts", []):
+                for fact in map(redact_secrets, extraction.get("key_facts", [])):
                     if fact and not _held(conn, "key_facts", "fact", email_id, fact):
                         conn.execute(
                             "INSERT INTO key_facts (email_id, fact, attachment_id) VALUES (?, ?, ?)",

@@ -48,11 +48,19 @@ _READ_ONLY_PRAGMAS = frozenset(
     }
 )
 _FTS5_SHADOW_SUFFIXES = ("data", "idx", "content", "docsize", "config")
+# Virtual tables that read the file page by page, free pages included: sqlite_dbpage
+# returns each page's bytes where a build compiles it in, dbstat describes every page,
+# and the recovery extension's sqlite_dbdata and sqlite_dbptr decode records from
+# them. Free pages can hold deleted text (secure_delete zeroes only what is freed
+# while it is on), so these are denied by name, whatever this build has.
+_RAW_PAGE_TABLES = frozenset({"sqlite_dbpage", "dbstat", "sqlite_dbdata", "sqlite_dbptr"})
 
 
 def _authorize(
     action: int, arg1: str | None, arg2: str | None, db: str | None, source: str | None
 ) -> int:
+    if action == sqlite3.SQLITE_READ and (arg1 or "").lower() in _RAW_PAGE_TABLES:
+        return sqlite3.SQLITE_DENY
     if action in _READ_ACTIONS:
         return sqlite3.SQLITE_OK
     if action == sqlite3.SQLITE_PRAGMA and (arg1 or "").lower() in _READ_ONLY_PRAGMAS:

@@ -204,6 +204,38 @@ def test_pragma_names_match_in_any_case(db):
     assert "subject" in {row[1] for row in out["rows"]}
 
 
+# Virtual tables that read the file page by page, free pages included.
+RAW_PAGE_TABLES = ["sqlite_dbpage", "dbstat", "sqlite_dbdata", "sqlite_dbptr"]
+
+
+@pytest.mark.parametrize("table", RAW_PAGE_TABLES + [t.upper() for t in RAW_PAGE_TABLES])
+def test_tables_that_read_raw_pages_are_denied_by_name(table):
+    # By name, so a build that compiles one in is held to the same rule as this one.
+    assert (
+        sql_readonly._authorize(sqlite3.SQLITE_READ, table, "data", "main", None)
+        == sqlite3.SQLITE_DENY
+    )
+
+
+def _built_in(table: str) -> bool:
+    probe = sqlite3.connect(":memory:")
+    try:
+        probe.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchall()
+        return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        probe.close()
+
+
+@pytest.mark.parametrize("table", RAW_PAGE_TABLES)
+def test_sql_query_refuses_the_raw_page_tables_this_build_has(db, table):
+    if not _built_in(table):
+        pytest.skip(f"this SQLite build has no {table}")
+    out = sql_readonly.run_query(f"SELECT * FROM {table.upper()}", db_path=db)
+    assert out.get("error", "").startswith("refused: "), out
+
+
 def test_fts_match_works_through_the_authorizer(db):
     out = sql_readonly.run_query(
         "SELECT rowid FROM emails_fts WHERE emails_fts MATCH 'budget'", db_path=db

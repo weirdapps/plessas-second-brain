@@ -386,6 +386,30 @@ def mark_series(conn: sqlite3.Connection) -> int:
     return changed
 
 
+def series_extraction(
+    conn: sqlite3.Connection, event: dict, prompt_hash: str | None
+) -> dict | None:
+    """Another occurrence's extraction, made from this very prompt, or None.
+
+    An occurrence of a series is read as the series' invitation, without its
+    date, so its siblings share one prompt while their invitation stays the
+    same; one daily call was read 296 times. The same prompt gives the same
+    reading, and an invitation has no decisions or action items.
+    """
+    series = event.get("recurrence_master_id")
+    if not series or not prompt_hash:
+        return None
+    row = conn.execute(
+        "SELECT body_summary FROM calendar_events WHERE recurrence_master_id = ? "
+        "AND extraction_hash = ? AND llm_status = 'extracted' AND outlook_event_id <> ? "
+        "LIMIT 1",
+        (series, prompt_hash, event.get("outlook_event_id", "")),
+    ).fetchone()
+    if row is None:
+        return None
+    return {"body_summary": row[0] or "", "decisions": [], "action_items": []}
+
+
 def adopt_reissued_occurrence(conn: sqlite3.Connection, event: dict, listed_ids: set[str]) -> bool:
     """Give a stored occurrence the new id Outlook lists it under. Returns whether it did.
 

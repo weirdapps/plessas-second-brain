@@ -2819,6 +2819,7 @@ def cmd_calendar_sync(args):
         load_proxy_emails,
         mark_series,
         refresh_self_flags,
+        series_extraction,
     )
     from src.store.schema import get_connection, migrate_add_sync_metadata, run_migrations
 
@@ -2845,6 +2846,7 @@ def cmd_calendar_sync(args):
         "loaded": 0,
         "skipped_unchanged": 0,
         "same_input": 0,
+        "series_shared": 0,
         "extracted": 0,
         "failed": 0,
         "deferred": 0,
@@ -3014,9 +3016,11 @@ def cmd_calendar_sync(args):
             body_obj = body_raw.get("Body", {})
             body_html = body_obj.get("Content", "") if isinstance(body_obj, dict) else ""
 
-            # Extract. 'skipped' until something is actually attempted: no body and under the
-            # 50-char floor are "nothing was owed", not "nothing came back", and the fetch
-            # above succeeded so both are authoritative.
+            # Extract. 'skipped' until something is actually attempted: no body, and under
+            # the 50-char floor once the HTML and the online-meeting joining details are
+            # out (calendar_extractor decides, and gives no prompt hash then), are "nothing
+            # was owed", not "nothing came back", and the fetch above succeeded so both
+            # are authoritative.
             #
             # --skip-extraction IS NOT AUTHORITATIVE. A run told not to extract has no basis
             # for discharging a debt, an earlier one or this event's own: a body worth
@@ -3024,7 +3028,8 @@ def cmd_calendar_sync(args):
             # again. Latent today, because sb-calendar-sync.sh runs the command bare.
             extraction = {"body_summary": "", "decisions": [], "action_items": []}
             prior_status = existing["llm_status"] if existing else None
-            long_enough = bool(body_html) and len(body_html.strip()) >= 50
+            prompt_hash = event_prompt_hash(event, body_html)
+            long_enough = prompt_hash is not None
             if args.skip_extraction:
                 llm_status = "pending" if long_enough or prior_status == "pending" else "skipped"
             else:
@@ -3032,16 +3037,24 @@ def cmd_calendar_sync(args):
             # The etag moves on edits the model never sees (an attendee answering, a room
             # change). The same prompt hash means the extraction on record was made from
             # this very prompt, so it stands: keep it and refresh only the facts.
-            prompt_hash = event_prompt_hash(event, body_html) if long_enough else None
             keep_extraction = (
                 not args.skip_extraction
                 and prompt_hash is not None
                 and prior_status == "extracted"
                 and existing["extraction_hash"] == prompt_hash
             )
+            # An occurrence whose series' invitation another occurrence was read from.
+            shared = (
+                None
+                if keep_extraction or args.skip_extraction
+                else series_extraction(conn, event, prompt_hash)
+            )
             if keep_extraction:
                 llm_status = "extracted"
                 stats["same_input"] += 1
+            elif shared is not None:
+                extraction, llm_status = shared, "extracted"
+                stats["series_shared"] += 1
             elif not args.skip_extraction and long_enough:
                 try:
                     extraction = extract_event(event, body_html)
@@ -3183,6 +3196,8 @@ def cmd_calendar_sync(args):
     print(f"  Loaded:     {stats['loaded']}")
     print(f"  Unchanged:  {stats['skipped_unchanged']}")
     print(f"  Same input: {stats['same_input']} (etag moved, extraction kept)")
+    if stats["series_shared"]:
+        print(f"  Series:     {stats['series_shared']} (read from another occurrence)")
     print(f"  Extracted:  {stats['extracted']}")
     print(f"  Failed:     {stats['failed']}")
     print(f"  Deferred:   {stats['deferred']}")

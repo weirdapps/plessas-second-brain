@@ -25,6 +25,7 @@ from src.extract.policy_bridge import classify_exception
 from src.extract.teams_prompt import build_prompt, parse_response
 from src.extract.vertex_auth import touch_sentinel
 from src.llm_policy import Outcome
+from src.redact import redact_secrets
 
 # A "substantive" message is a non-system message above MIN_SUBSTANTIVE_LENGTH chars.
 # Channel posts are commonly single-message announcements (chatsvcagg /posts returns
@@ -215,7 +216,8 @@ def _extract_one_thread(conn: sqlite3.Connection, thread_id: int) -> str:
 
     conn.execute("SAVEPOINT thread_extract")
     try:
-        # Clear prior child rows from any earlier extraction.
+        # Clear prior child rows from any earlier extraction. The new rows' texts
+        # are masked as the loader masks an email's (src/store/loader.py).
         for table in ("decisions", "action_items", "key_facts"):
             conn.execute(f"DELETE FROM {table} WHERE teams_thread_id = ?", (thread_id,))
 
@@ -224,7 +226,7 @@ def _extract_one_thread(conn: sqlite3.Connection, thread_id: int) -> str:
                 "INSERT INTO decisions(decision, decided_by, decision_date, teams_thread_id) "
                 "VALUES (?, ?, ?, ?)",
                 (
-                    d.get("decision", ""),
+                    redact_secrets(d.get("decision", "")),
                     d.get("decided_by"),
                     d.get("decision_date"),
                     thread_id,
@@ -234,12 +236,12 @@ def _extract_one_thread(conn: sqlite3.Connection, thread_id: int) -> str:
             conn.execute(
                 "INSERT INTO action_items(task, owner, deadline, status, teams_thread_id) "
                 "VALUES (?, ?, ?, 'open', ?)",
-                (a.get("task", ""), a.get("owner"), a.get("deadline"), thread_id),
+                (redact_secrets(a.get("task", "")), a.get("owner"), a.get("deadline"), thread_id),
             )
         for f in data.get("key_facts", []):
             conn.execute(
                 "INSERT INTO key_facts(fact, teams_thread_id) VALUES (?, ?)",
-                (f.get("fact", ""), thread_id),
+                (redact_secrets(f.get("fact", "")), thread_id),
             )
 
         title = _generate_title(prompt_thread, prompt_messages)

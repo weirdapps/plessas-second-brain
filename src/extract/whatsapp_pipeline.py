@@ -28,6 +28,7 @@ from src.extract.teams_pipeline import (
 from src.extract.vertex_auth import touch_sentinel
 from src.extract.whatsapp_prompt import build_prompt, parse_response
 from src.llm_policy import Outcome
+from src.redact import redact_secrets
 
 
 def _render(content: str | None, media_type: str | None, filename: str | None) -> str:
@@ -135,24 +136,30 @@ def _extract_one(conn: sqlite3.Connection, thread_id: int) -> str:
 
     conn.execute("SAVEPOINT whatsapp_extract")
     try:
+        # The texts are masked as the loader masks an email's (src/store/loader.py).
         for table in ("decisions", "action_items", "key_facts"):
             conn.execute(f"DELETE FROM {table} WHERE whatsapp_thread_id = ?", (thread_id,))
         for d in data.get("decisions", []):
             conn.execute(
                 "INSERT INTO decisions (decision, decided_by, decision_date, whatsapp_thread_id) "
                 "VALUES (?, ?, ?, ?)",
-                (d.get("decision", ""), d.get("decided_by"), d.get("decision_date"), thread_id),
+                (
+                    redact_secrets(d.get("decision", "")),
+                    d.get("decided_by"),
+                    d.get("decision_date"),
+                    thread_id,
+                ),
             )
         for a in data.get("action_items", []):
             conn.execute(
                 "INSERT INTO action_items (task, owner, deadline, status, whatsapp_thread_id) "
                 "VALUES (?, ?, ?, 'open', ?)",
-                (a.get("task", ""), a.get("owner"), a.get("deadline"), thread_id),
+                (redact_secrets(a.get("task", "")), a.get("owner"), a.get("deadline"), thread_id),
             )
         for f in data.get("key_facts", []):
             conn.execute(
                 "INSERT INTO key_facts (fact, whatsapp_thread_id) VALUES (?, ?)",
-                (f.get("fact", ""), thread_id),
+                (redact_secrets(f.get("fact", "")), thread_id),
             )
         first = next((m["content"] for m in substantive), "").replace("\n", " ")
         preview = first[:50] + ("…" if len(first) > 50 else "")

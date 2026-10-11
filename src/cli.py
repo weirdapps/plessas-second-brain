@@ -2076,7 +2076,11 @@ def cmd_sync(args):
 
     extracted_dir = DATA_ROOT / "extracted"
     staging_dir = DATA_ROOT / "staging"
-    count = load_extractions(db_path, str(extracted_dir), str(staging_dir))
+    # The people rows this load adds or changes, which Step 4 takes.
+    touched_people: set[int] = set()
+    count = load_extractions(
+        db_path, str(extracted_dir), str(staging_dir), touched_people=touched_people
+    )
     print(f"Loaded {count} new emails")
 
     # Step 3b: record the attachments outlook-cli downloaded with the mail.
@@ -2109,12 +2113,15 @@ def cmd_sync(args):
             f" ({reg['deferred']} awaiting their email)"
         )
 
-    # Step 4: Deduplicate people
-    if count > 0:
-        print("\nStep 4: Deduplicating people...")
+    # Step 4: Deduplicate people: the groups of the rows this load added or changed, and of
+    # any added since the last pass (src/store/dedup_people.py run_dedup), not every person.
+    # --full-dedup takes the whole table, and runs whether or not mail loaded.
+    full_dedup = bool(getattr(args, "full_dedup", False))
+    if count > 0 or full_dedup:
+        print("\nStep 4: Deduplicating people" + (" (whole table)" if full_dedup else "") + "...")
         from src.store.dedup_people import run_dedup
 
-        dedup_result = run_dedup(db_path=db_path)
+        dedup_result = run_dedup(db_path=db_path, touched=None if full_dedup else touched_people)
         reduced = dedup_result.get("total_reduced", 0)
         print(f"Dedup: {reduced} duplicates merged")
     else:
@@ -4042,6 +4049,13 @@ def main():
         metavar="SECONDS",
         help="If another sync is running, wait up to this long for it, then skip "
         "with exit 0 (default: 0, skip at once)",
+    )
+    parser_sync.add_argument(
+        "--full-dedup",
+        action="store_true",
+        help="Deduplicate the whole people table, not only the groups of the people this "
+        "run's load wrote, and do it even when no mail loaded (a whole pass also runs on its "
+        "own once a day)",
     )
     parser_sync.set_defaults(func=cmd_sync)
 

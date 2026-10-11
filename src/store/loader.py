@@ -20,7 +20,12 @@ from .schema import normalize_subject
 from .source_class import stored_class
 
 
-def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
+def load_extractions(
+    db_path: str,
+    extracted_dir: str,
+    staging_dir: str,
+    touched_people: set[int] | None = None,
+) -> int:
     """Load all extracted emails from JSON files into the database.
 
     Reads batch files from staging_dir to get email metadata, then loads
@@ -31,6 +36,9 @@ def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
         db_path: Path to SQLite database
         extracted_dir: Directory containing extracted JSON files (see extraction_files.py)
         staging_dir: Directory containing staged batch files (batch-NNNNN.json)
+        touched_people: When given, filled with the ids of the people rows this load
+            added or whose name or address it changed, which the sync's people dedup
+            takes (src/store/dedup_people.py run_dedup).
 
     Returns:
         Number of emails successfully loaded
@@ -52,6 +60,8 @@ def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
 
     conn = get_connection(db_path)
     run_migrations(conn)
+    if touched_people is not None:
+        _record_people_writes(conn)
 
     # Build index of staged emails by message_id.
     # Also remember which message_ids each batch contains, so we can prune
@@ -127,8 +137,27 @@ def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
     if pruned > 0:
         print(f"  Pruned {pruned} fully-loaded batch files ({freed / 1024 / 1024:.1f} MB freed)")
 
+    if touched_people is not None:
+        touched_people.update(row[0] for row in conn.execute("SELECT id FROM temp.people_written"))
     conn.close()
     return loaded_count
+
+
+def _record_people_writes(conn: sqlite3.Connection) -> None:
+    """Note in temp.people_written every people row this connection inserts, or whose name
+    or address it changes, whichever path writes it (find_or_create_person for the sender,
+    the recipients and the model's people). TEMP objects belong to this connection alone
+    and go with it: no other writer pays for them, and the schema does not change."""
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS people_written (id INTEGER PRIMARY KEY)")
+    conn.execute(
+        "CREATE TEMP TRIGGER IF NOT EXISTS people_written_insert AFTER INSERT ON main.people"
+        " BEGIN INSERT OR IGNORE INTO people_written (id) VALUES (NEW.id); END"
+    )
+    conn.execute(
+        "CREATE TEMP TRIGGER IF NOT EXISTS people_written_update"
+        " AFTER UPDATE OF name, email ON main.people"
+        " BEGIN INSERT OR IGNORE INTO people_written (id) VALUES (NEW.id); END"
+    )
 
 
 def _prune_loaded_batches(

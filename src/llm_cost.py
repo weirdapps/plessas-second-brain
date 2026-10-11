@@ -31,6 +31,10 @@ class Rates:
     cache_write: float
     # A one-hour cache write, which call shape v2 asks for (src/extract/call_shape.py).
     cache_write_1h: float
+    # The three cache rates in a batch job (src/extract/vertex_batch.py).
+    batch_cache_read: float
+    batch_cache_write: float
+    batch_cache_write_1h: float
 
 
 # Vertex AI, `eu` multi-region (10% over the global endpoint), from Google's Vertex AI pricing
@@ -45,6 +49,9 @@ RATES: dict[str, Rates] = {
         cache_read=0.11,
         cache_write=2.75,
         cache_write_1h=4.40,
+        batch_cache_read=0.055,
+        batch_cache_write=1.375,
+        batch_cache_write_1h=2.20,
     ),
 }
 # The rates a dry-run estimate is priced at.
@@ -79,13 +86,22 @@ def cost_usd(
 ) -> float:
     """The cost of these tokens at these rates, online or as a batch job.
     `cache_write_tokens` are five-minute writes, `cache_write_1h_tokens` one-hour ones."""
-    i, o = (rates.batch_input, rates.batch_output) if batch else (rates.input, rates.output)
+    if batch:
+        i, o = rates.batch_input, rates.batch_output
+        read, write, write_1h = (
+            rates.batch_cache_read,
+            rates.batch_cache_write,
+            rates.batch_cache_write_1h,
+        )
+    else:
+        i, o = rates.input, rates.output
+        read, write, write_1h = rates.cache_read, rates.cache_write, rates.cache_write_1h
     return (
         input_tokens * i
         + output_tokens * o
-        + cache_read_tokens * rates.cache_read
-        + cache_write_tokens * rates.cache_write
-        + cache_write_1h_tokens * rates.cache_write_1h
+        + cache_read_tokens * read
+        + cache_write_tokens * write
+        + cache_write_1h_tokens * write_1h
     ) / 1_000_000
 
 
@@ -193,7 +209,8 @@ def usage_for_day(log_dir: Path, day: date) -> dict | None:
     `cache_write_tokens` counts every cache write and `cache_write_1h_tokens` the one-hour
     ones among them, priced at their own rate; a line from before the split was logged
     prices its writes as five-minute ones. `thinking_tokens` is the share of the output
-    tokens a line says was thinking.
+    tokens a line says was thinking. A line that names a `batch_job` was answered in a
+    Vertex AI batch job, and is priced at batch rates.
 
     Only lines that mention the day are parsed, so a month of backfill (hundreds of
     thousands of lines) is read in about a second."""
@@ -247,6 +264,7 @@ def usage_for_day(log_dir: Path, day: date) -> dict | None:
                     cache_read_tokens=used["cache_read_tokens"],
                     cache_write_tokens=used["cache_write_tokens"] - one_hour,
                     cache_write_1h_tokens=one_hour,
+                    batch=bool(record.get("batch_job")),
                 )
             site = sites.setdefault(
                 str(record.get("site")),

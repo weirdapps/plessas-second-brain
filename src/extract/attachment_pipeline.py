@@ -71,12 +71,20 @@ DEFERRED = "deferred"
 # is still stored and searchable.
 MAX_SUMMARY_PARTS = 50
 
-# Any other long text is summarised from this many: its first part, its last, and the part
-# richest in headings or table-of-contents lines between them (the middle part when none has
-# any), then the merge. Fifty parts and a merge cost about $3.40 a document at Vertex eu prices,
-# and their key facts were mostly cell and line dumps (audit 2026-10-11). A long spreadsheet
-# takes one call over its digest instead (src/extract/attachment_digest.py).
+# Any other long text of more than full_parts_upto() parts is summarised from this many: its
+# first part, its last, and the part richest in headings or table-of-contents lines between them
+# (the middle part when none has any), then the merge. Fifty parts and a merge cost about $3.40 a
+# document at Vertex eu prices, and their key facts were mostly cell and line dumps (audit
+# 2026-10-11). A long spreadsheet takes one call over its digest instead
+# (src/extract/attachment_digest.py).
 CAPPED_SUMMARY_PARTS = 3
+
+# Up to this many parts a long text is summarised from every one of them: eight parts hold up
+# to 320,000 characters, about 100 pages, and take nine calls with the merge. Three parts alone
+# left the sections between them out of the summary (owner decision 2026-10-11). The variable
+# sets it, read at each call (full_parts_upto); 0 takes three parts from every long text.
+FULL_PARTS_UPTO_VAR = "BRAIN_ATTACHMENT_FULL_PARTS_UPTO"
+DEFAULT_FULL_PARTS_UPTO = 8
 
 # The flag that lifts the cap for one attachment, a sync_metadata key per attachment id, so
 # it needs no schema change: set by reextract --full-parts, it holds for every later summary.
@@ -535,7 +543,8 @@ def _extract_in_parts(
 ):
     """Summarise a long text part by part, then once over the parts. None when time ran out.
 
-    The parts are the ones _choose_parts picks: three, or up to MAX_SUMMARY_PARTS when `full`.
+    The parts are the ones _choose_parts picks: every part up to full_parts_upto() of them and
+    three above it, or up to MAX_SUMMARY_PARTS when `full`.
     With ``ac_id`` every finished part is saved as it lands, and a part saved by an
     earlier run is reused while its text and place are unchanged, so a document the
     budget cut short resumes instead of starting over. A token budget that refuses a
@@ -624,14 +633,40 @@ def _outline_score(text: str) -> int:
     )
 
 
+def full_parts_upto() -> int:
+    """BRAIN_ATTACHMENT_FULL_PARTS_UPTO, a whole number of parts, 0 or more; unset or blank is
+    DEFAULT_FULL_PARTS_UPTO. Read at each call, so a run picks up the environment it was
+    started with.
+
+    Any other value stops the call with ClaudeNotConfigured, which leaves the document pending
+    as a bad BRAIN_EXTRACT_CALL_SHAPE does: a typo, or the inline comment systemd keeps as part
+    of a value, must not summarise at a cost nobody set."""
+    raw = os.environ.get(FULL_PARTS_UPTO_VAR, "").strip()
+    if not raw:
+        return DEFAULT_FULL_PARTS_UPTO
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        from src.extract.claude_extract import ClaudeNotConfigured
+
+        raise ClaudeNotConfigured(
+            f"{FULL_PARTS_UPTO_VAR}={raw!r} is not a number of parts: set it to a whole number,"
+            f" 0 or more, or unset it for {DEFAULT_FULL_PARTS_UPTO}"
+        )
+    return value
+
+
 def _choose_parts(parts: list[str], full: bool) -> list[int]:
     """The parts of a long text that are summarised, by index, in order.
 
-    Flagged (`full`): up to MAX_SUMMARY_PARTS spread evenly. Otherwise CAPPED_SUMMARY_PARTS:
-    the first part, the last, and between them the one richest in headings or contents lines,
-    the earliest on a tie and the middle one when none has any."""
+    Flagged (`full`): up to MAX_SUMMARY_PARTS spread evenly. Otherwise every part while there
+    are at most full_parts_upto() of them, never more than a flag reads, and above that
+    CAPPED_SUMMARY_PARTS: the first part, the last, and between them the one richest in
+    headings or contents lines, the earliest on a tie and the middle one when none has any."""
     n = len(parts)
-    if full:
+    if full or n <= full_parts_upto():
         return _spread(n, MAX_SUMMARY_PARTS)
     if n <= CAPPED_SUMMARY_PARTS:
         return list(range(n))

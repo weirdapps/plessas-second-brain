@@ -444,9 +444,12 @@ line per call site below the table. It warns above `BRAIN_DAILY_SPEND_WARN_USD`
 day but the log holds no call, which fails the freshness ping like any other STALE.
 To cap what one nightly attachment pass can spend, put `BRAIN_ATTACHMENT_TOKEN_BUDGET`
 in the environment its unit starts with: a pass that reaches the budget leaves the
-rest pending and exits 0. `python -m src.cli process-attachments --phase 2 --estimate`
-prices the pending work first. The README's "Attachment summaries and spend" has the
-details.
+rest pending and exits 0. What a long document costs is set the same way:
+`BRAIN_ATTACHMENT_FULL_PARTS_UPTO` (default 8) is how many 40,000-character parts a
+text may have and still be summarised from every one, a call each plus the merge; a
+longer one takes three parts and the merge, and `0` takes three from every long text.
+`python -m src.cli process-attachments --phase 2 --estimate` prices the pending work
+first. The README's "Attachment summaries and spend" has the details.
 
 **Wire up the dead man's switch.** A health check that emails you is worth
 exactly as much as the scheduler that runs it. If the host is off, or the timer

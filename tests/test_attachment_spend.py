@@ -3,8 +3,9 @@
 Until 2026-10-11 a long text was summarised from up to 50 parts plus a merge, a long workbook's
 cell dump included, and no run had a ceiling: one day of attachment summaries cost about $2,680
 (audit 2026-10-11). Now a long spreadsheet goes in one call over its digest, any other long text
-in three parts plus the merge unless the row is flagged for every part, a run can be given a
-token budget it stops before passing, and the pending work can be priced without a call.
+in every part up to BRAIN_ATTACHMENT_FULL_PARTS_UPTO parts (eight by default) and in three above
+it, plus the merge, unless the row is flagged for every part, a run can be given a token budget
+it stops before passing, and the pending work can be priced without a call.
 """
 
 import json
@@ -184,11 +185,42 @@ def test_parts_saved_for_a_spreadsheet_by_an_older_run_are_dropped(db, monkeypat
 
 
 # --- the part cap ----------------------------------------------------------------
+# Up to BRAIN_ATTACHMENT_FULL_PARTS_UPTO parts (eight by default, about 100 pages) a long text
+# is summarised from every part, since three alone left out the sections between them (owner,
+# 2026-10-11); above it from three, the first, the last and the one richest in headings.
+
+UPTO = "BRAIN_ATTACHMENT_FULL_PARTS_UPTO"
 
 
-def test_a_long_text_is_summarised_from_three_parts_and_a_merge(db, monkeypatch):
+@pytest.fixture
+def three_parts(monkeypatch):
+    """The three-part sample for every long text, however few its parts."""
+    monkeypatch.setenv(UPTO, "0")
+
+
+def _plain(n: int) -> list[str]:
+    return ["word " * 100] * n
+
+
+def test_a_text_of_eight_parts_is_summarised_from_every_part_and_a_merge(db, monkeypatch):
     path, conn = db
-    text = _long_text(250_000)
+    text = _long_text(300_000)
+    att = _add(conn, text)
+    calls: list[str] = []
+    _model(monkeypatch, calls)
+
+    ap.run_phase2(str(path))
+
+    assert len(split_text(text)) == 8
+    assert len(calls) == 8 + 1
+    assert all(f"part {i} of 8" in calls[i - 1] for i in range(1, 9))
+    assert "of the document's 8 parts" not in calls[8]  # the merge saw every part
+    assert _status(conn, att) == ("extracted", "the whole document")
+
+
+def test_a_text_of_nine_parts_is_summarised_from_three_parts_and_a_merge(db, monkeypatch):
+    path, conn = db
+    text = _long_text(330_000)
     att = _add(conn, text)
     n = len(split_text(text))
     calls: list[str] = []
@@ -196,14 +228,97 @@ def test_a_long_text_is_summarised_from_three_parts_and_a_merge(db, monkeypatch)
 
     ap.run_phase2(str(path))
 
-    assert n > 3
+    assert n == 9
     assert len(calls) == 3 + 1
     assert f"part 1 of {n}" in calls[0] and f"part {n} of {n}" in calls[2]
     assert f"3 of the document's {n} parts" in calls[3]
     assert _status(conn, att) == ("extracted", "the whole document")
 
 
-def test_the_third_part_is_the_one_richest_in_headings():
+@pytest.mark.parametrize(("n", "covered"), [(8, (8, 8)), (9, (3, 9))])
+def test_the_merge_is_told_how_many_of_the_parts_it_saw(monkeypatch, n, covered):
+    from src.extract import attachment_prompt as prompt
+
+    monkeypatch.setattr(prompt, "split_text", lambda text: _plain(n))
+    merged = []
+    monkeypatch.setattr(prompt, "build_attachment_prompt", lambda **kw: "p")
+    monkeypatch.setattr(
+        prompt, "build_merge_prompt", lambda parts, **kw: merged.append(kw["covered"]) or "m"
+    )
+    monkeypatch.setattr(ap, "_complete_and_parse", lambda _prompt, _budget=None: {"summary": "s"})
+
+    ap._extract_in_parts("x", "doc.txt", "text/plain", None, None, None)
+
+    assert merged == [covered]
+
+
+@pytest.mark.parametrize("n", [5, 8])
+def test_a_text_of_up_to_eight_parts_is_summarised_from_every_part(n):
+    assert ap._choose_parts(_plain(n), full=False) == list(range(n))
+
+
+def test_a_text_of_nine_parts_is_summarised_from_three():
+    assert ap._choose_parts(_plain(9), full=False) == [0, 4, 8]
+
+
+def test_zero_takes_three_parts_from_every_long_text(three_parts):
+    assert ap._choose_parts(_plain(5), full=False) == [0, 2, 4]
+
+
+def test_the_threshold_is_read_at_each_call(monkeypatch):
+    monkeypatch.setenv(UPTO, "12")
+
+    assert ap._choose_parts(_plain(12), full=False) == list(range(12))
+    assert ap._choose_parts(_plain(13), full=False) == [0, 6, 12]
+
+
+@pytest.mark.parametrize("blank", ["", "  "])
+def test_a_blank_threshold_is_the_default(monkeypatch, blank):
+    monkeypatch.setenv(UPTO, blank)
+
+    assert ap._choose_parts(_plain(8), full=False) == list(range(8))
+    assert ap._choose_parts(_plain(9), full=False) == [0, 4, 8]
+
+
+@pytest.mark.parametrize("bad", ["eight", "-1", "2.5", "8  # every part"])
+def test_a_threshold_that_is_not_a_whole_number_stops_the_call(monkeypatch, bad):
+    """As a bad BRAIN_EXTRACT_CALL_SHAPE does, so a typo, or the inline comment systemd keeps
+    in a value, does not summarise at a cost nobody set: the document stays pending."""
+    monkeypatch.setenv(UPTO, bad)
+
+    with pytest.raises(claude_extract.ClaudeNotConfigured, match=UPTO):
+        ap._choose_parts(_plain(5), full=False)
+
+
+def test_an_unusable_threshold_leaves_the_long_text_pending(db, monkeypatch):
+    path, conn = db
+    long_att = _add(conn, _long_text(190_000), name="long.txt")
+    note_att = _add(conn, "A short note about the plan. " * 50, name="note.txt")
+    monkeypatch.setenv(UPTO, "eight")
+    calls: list[str] = []
+    _model(monkeypatch, calls)
+
+    ap.run_phase2(str(path))
+
+    assert len(calls) == 1  # the note's: the long text asked the model nothing
+    assert _status(conn, note_att)[0] == "extracted"
+    status, error = conn.execute(
+        "SELECT llm_status, llm_error FROM attachment_content WHERE attachment_id = ?",
+        (long_att,),
+    ).fetchone()
+    assert status == "pending" and UPTO in error
+
+
+def test_a_threshold_above_fifty_reads_no_more_parts_than_a_flag(monkeypatch):
+    monkeypatch.setenv(UPTO, "1000")
+
+    chosen = ap._choose_parts(_plain(120), full=False)
+
+    assert chosen == ap._choose_parts(_plain(120), full=True)
+    assert len(chosen) == ap.MAX_SUMMARY_PARTS
+
+
+def test_the_third_part_is_the_one_richest_in_headings(three_parts):
     plain = "word " * 100
     outline = "\n".join(
         ["Contents", "1. Scope ........ 3", "2. Findings ........ 7", "3. Actions ........ 12"]
@@ -213,7 +328,7 @@ def test_the_third_part_is_the_one_richest_in_headings():
     assert ap._choose_parts(parts, full=False) == [0, 3, 5]
 
 
-def test_numbered_and_capitalised_headings_count_too():
+def test_numbered_and_capitalised_headings_count_too(three_parts):
     plain = "word " * 100
     headed = "\n".join(["ΕΙΣΑΓΩΓΗ", plain, "2.1 Scope of the review", plain, "## Findings", plain])
     parts = [plain, plain, headed, plain, plain]
@@ -221,11 +336,11 @@ def test_numbered_and_capitalised_headings_count_too():
     assert ap._choose_parts(parts, full=False) == [0, 2, 4]
 
 
-def test_without_headings_the_third_part_is_the_middle_one():
+def test_without_headings_the_third_part_is_the_middle_one(three_parts):
     assert ap._choose_parts(["word " * 100] * 7, full=False) == [0, 3, 6]
 
 
-def test_three_parts_or_fewer_are_all_kept():
+def test_three_parts_or_fewer_are_all_kept(three_parts):
     assert ap._choose_parts(["a", "b", "c"], full=False) == [0, 1, 2]
 
 
@@ -234,6 +349,15 @@ def test_a_flagged_text_keeps_the_spread_of_fifty():
 
     assert len(chosen) == ap.MAX_SUMMARY_PARTS == 50
     assert (chosen[0], chosen[-1]) == (0, 119)
+
+
+@pytest.mark.parametrize("setting", ["0", "100", "eight"])
+def test_a_flagged_text_does_not_read_the_threshold(monkeypatch, setting):
+    monkeypatch.setenv(UPTO, setting)
+
+    assert ap._choose_parts(_plain(9), full=True) == list(range(9))
+    chosen = ap._choose_parts(_plain(120), full=True)
+    assert len(chosen) == ap.MAX_SUMMARY_PARTS and (chosen[0], chosen[-1]) == (0, 119)
 
 
 def test_a_flagged_row_is_summarised_from_every_part(db, monkeypatch):
@@ -318,8 +442,8 @@ def test_a_budget_stop_between_parts_keeps_the_finished_parts(db, monkeypatch):
     text = _long_text(250_000)
     att = _add(conn, text)
     parts = split_text(text)
-    first, middle, _last = ap._choose_parts(parts, full=False)
-    paid = sum(len(_prompt(parts[i], part=(i + 1, len(parts)))) for i in (first, middle))
+    chosen = ap._choose_parts(parts, full=False)
+    paid = sum(len(_prompt(parts[i], part=(i + 1, len(parts)))) for i in chosen[:2])
     calls: list[str] = []
     _model(monkeypatch, calls)
 
@@ -327,12 +451,13 @@ def test_a_budget_stop_between_parts_keeps_the_finished_parts(db, monkeypatch):
         str(path), token_budget=TokenBudget(paid + 10, chars_per_token=1.0, output_tokens=0)
     )
 
+    assert len(chosen) == len(parts) == 7  # every part, and the budget bounds them too
     assert len(calls) == 2 and stats["over_budget"] == 1
     assert _status(conn, att)[0] == "pending"
 
     ap.run_phase2(str(path))  # the next run, no budget
 
-    assert len(calls) == 2 + 2  # the last part and the merge, nothing paid twice
+    assert len(calls) == len(chosen) + 1  # the other parts and the merge, nothing paid twice
     assert _status(conn, att) == ("extracted", "the whole document")
 
 
@@ -352,7 +477,7 @@ def test_no_budget_is_no_limit(db, monkeypatch):
 
 def test_the_estimate_counts_every_call_and_asks_the_model_nothing(db, monkeypatch):
     path, conn = db
-    long_text = _long_text(250_000)
+    long_text = _long_text(400_000)  # eleven parts, over the threshold
     _add(conn, "A short note about the plan. " * 50)  # one call
     _add(conn, _sheet_dump(3_000), method="openpyxl", name="b.xlsx", mime=XLSX)  # its digest
     _add(conn, long_text, name="long.txt")  # three parts and the merge
@@ -393,6 +518,49 @@ def test_the_estimate_honours_the_limit_and_the_type(db, monkeypatch):
 
     assert ap.estimate_phase2(str(path), limit=2)["rows"] == 2
     assert ap.estimate_phase2(str(path), file_type="excel")["rows"] == 1
+
+
+@pytest.mark.parametrize(("chars", "calls"), [(300_000, 8 + 1), (330_000, 3 + 1)])
+def test_the_estimate_counts_the_calls_the_run_makes(db, monkeypatch, chars, calls):
+    """process-attachments --estimate: every part of eight and the merge, three of nine."""
+    path, conn = db
+    _add(conn, _long_text(chars))
+    _no_model(monkeypatch)
+
+    est = ap.estimate_phase2(str(path))
+
+    made: list[str] = []
+    _model(monkeypatch, made)
+    ap.run_phase2(str(path))
+    assert est["calls"] == len(made) == calls
+
+
+def test_an_unusable_threshold_stops_the_estimate_too(db, monkeypatch):
+    path, conn = db
+    _add(conn, _long_text(190_000))
+    monkeypatch.setenv(UPTO, "eight")
+    _no_model(monkeypatch)
+
+    with pytest.raises(claude_extract.ClaudeNotConfigured, match=UPTO):
+        ap.estimate_phase2(str(path))
+
+
+def test_the_reextract_estimate_counts_every_part_up_to_the_threshold(db, monkeypatch):
+    """reextract --estimate prices a row from the text it holds now: here two PDFs whose reader
+    stopped early, of eight parts and of nine."""
+    path, conn = db
+    for chars, name in ((300_000, "eight.pdf"), (330_000, "nine.pdf")):
+        att = _add(conn, _long_text(chars), name=name, mime="application/pdf", llm="extracted")
+        conn.execute(
+            "UPDATE attachment_content SET extraction_error = ? WHERE attachment_id = ?",
+            ("time budget spent, 2 pages left unread", att),
+        )
+    conn.commit()
+    _no_model(monkeypatch)
+
+    est = rx.estimate_reextract(str(path), {"unread"})
+
+    assert (est["rows"], est["calls"]) == (2, (8 + 1) + (3 + 1))
 
 
 # --- reextract --------------------------------------------------------------------

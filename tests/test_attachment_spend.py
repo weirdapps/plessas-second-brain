@@ -535,6 +535,16 @@ def test_the_estimate_counts_the_calls_the_run_makes(db, monkeypatch, chars, cal
     assert est["calls"] == len(made) == calls
 
 
+def test_an_unusable_threshold_stops_the_estimate_too(db, monkeypatch):
+    path, conn = db
+    _add(conn, _long_text(190_000))
+    monkeypatch.setenv(UPTO, "eight")
+    _no_model(monkeypatch)
+
+    with pytest.raises(claude_extract.ClaudeNotConfigured, match=UPTO):
+        ap.estimate_phase2(str(path))
+
+
 def test_the_reextract_estimate_counts_every_part_up_to_the_threshold(db, monkeypatch):
     """reextract --estimate prices a row from the text it holds now: here two PDFs whose reader
     stopped early, of eight parts and of nine."""

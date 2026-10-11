@@ -13,6 +13,7 @@ from datetime import UTC
 from mcp.server import MCPServer
 
 from src.config import DEFAULT_DB, REPLICA_STAMP, embed_backend
+from src.mcp_budget import budget_response
 from src.store.schema import get_connection
 
 # Routing text, not marketing. Under tool search only the tool NAMES and this
@@ -251,7 +252,7 @@ def email_thread(email_id: int, limit: int = 50) -> dict:
 
 
 @mcp.tool()
-def search_emails(query: str, search_type: str = "keyword", limit: int = 20) -> list[dict] | dict:
+def search_emails(query: str, search_type: str = "keyword", limit: int = 20) -> dict:
     """Search emails by keyword (FTS5) or semantic similarity (embeddings).
 
     Keyword mode returns one email per thread (a subject match shows the thread's
@@ -280,19 +281,37 @@ def search_emails(query: str, search_type: str = "keyword", limit: int = 20) -> 
             from src.store.embeddings import SemanticUnavailable, query_semantic
 
             try:
-                return query_semantic(conn, query, limit=limit)
+                rows = query_semantic(conn, query, limit=limit)
             except SemanticUnavailable as e:
                 return {"error": str(e)}
         else:
             from src.store.query import query_by_keyword
 
-            return query_by_keyword(conn, query, limit=limit)
+            rows = query_by_keyword(conn, query, limit=limit)
     finally:
         conn.close()
+    return budget_response({"result": rows})
+
+
+RECALL_MAX_PER_KIND = 10
+_RECALL_KINDS = (
+    "emails",
+    "attachments",
+    "conversations",
+    "decisions",
+    "actions",
+    "commitments",
+    "inline_images",
+    "teams",
+    "whatsapp",
+    "calendar_events",
+)
 
 
 @mcp.tool()
-def recall(query: str, limit_per_kind: int = 5, days: int = 365) -> dict:
+def recall(
+    query: str, limit_per_kind: int = 5, days: int = 365, include_context: bool = False
+) -> dict:
     """Unified search across every text-bearing index. Use this as the default 'tell me everything you know about X' entry point.
 
     Returns ten buckets, keyed exactly as listed: emails (which also covers
@@ -313,34 +332,51 @@ def recall(query: str, limit_per_kind: int = 5, days: int = 365) -> dict:
 
     Args:
         query: Free-text query (keyword, name, topic, etc.)
-        limit_per_kind: Max results per category (default 5)
-        days: Lookback window for the auto-pulled person/topic context (default 365)
+        limit_per_kind: Max results per category, 1 to 10 (default 5)
+        days: Lookback window for the person/topic dossiers (default 365)
+        include_context: Attach the person and topic dossiers the query matches
     """
     from src.store.embeddings import semantic_email_candidates
     from src.store.query import get_freshness
+    from src.store.recall import compact_rows
     from src.store.recall import recall as _recall
 
     conn = _get_conn()
     try:
         # Inject the semantic provider so the emails bucket is a keyword+semantic
         # RRF fusion. recall() degrades to keyword-only if the index/ADC is absent.
-        out = _recall(
+        found = _recall(
             conn,
             query,
-            limit_per_kind=_cap(limit_per_kind),
+            limit_per_kind=_cap(limit_per_kind, hi=RECALL_MAX_PER_KIND),
             days=days,
             semantic_candidates=semantic_email_candidates,
+            include_context=include_context,
         )
-        # This is the documented front door, so it is where a stale replica has
-        # to be visible. Only present when it matters, so a healthy call is
-        # unchanged.
         fresh = get_freshness(conn)
-        if fresh.get("stale"):
-            out["_stale_warning"] = fresh["stale_warning"]
-            out["data_as_of"] = fresh["data_as_of"]
-        return out
     finally:
         conn.close()
+    # Summary and freshness first: a result too big to show inline is saved to a
+    # file whose preview is its first 2 KB, and these were its last keys.
+    out: dict = {
+        "summary": found["summary"],
+        "data_as_of": fresh["data_as_of"],
+        "stale": fresh["stale"],
+    }
+    if fresh["stale"]:
+        out["_stale_warning"] = fresh["stale_warning"]
+    out["query"] = found["query"]
+    for kind in _RECALL_KINDS:
+        out[kind] = compact_rows(found[kind])
+    for dossier in ("person_context", "topic_context"):
+        if dossier in found:
+            out[dossier] = found[dossier]
+    out = budget_response(out)
+    if "truncated" in out:
+        # Next to the header, not at the end where a preview cannot see it.
+        head = [k for k in ("summary", "data_as_of", "stale", "_stale_warning") if k in out]
+        out = {**{k: out[k] for k in head}, "truncated": out["truncated"], **out}
+    return out
 
 
 @mcp.tool()
@@ -351,7 +387,7 @@ def query_emails(
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 20,
-) -> list[dict] | dict:
+) -> dict:
     """Query emails with combined filters: person, topic, keyword, date range.
 
     Args:
@@ -370,7 +406,7 @@ def query_emails(
             return error
     conn = _get_conn()
     try:
-        return query_combined(
+        rows = query_combined(
             conn,
             person=person,
             topic=topic,
@@ -381,6 +417,7 @@ def query_emails(
         )
     finally:
         conn.close()
+    return budget_response({"result": rows})
 
 
 @mcp.tool()
@@ -390,7 +427,7 @@ def query_decisions(
     days: int = 365,
     limit: int = 20,
     include_news: bool = False,
-) -> list[dict]:
+) -> dict:
     """Query recent decisions, optionally filtered by topic or person.
 
     Covers decisions taken in email, Teams threads, calendar events and past
@@ -412,7 +449,7 @@ def query_decisions(
         # One path. With no filter this used get_recent_decisions, which joined
         # emails (dropping every Teams, calendar and conversation decision) and
         # ignored include_news; with a filter it dropped `days`.
-        return _qd(
+        rows = _qd(
             conn,
             topic=topic,
             person=person,
@@ -422,6 +459,7 @@ def query_decisions(
         )
     finally:
         conn.close()
+    return budget_response({"result": rows})
 
 
 @mcp.tool()
@@ -524,7 +562,7 @@ def meeting_prep(people: str, topic: str | None = None, days: int = 365) -> dict
 
 
 @mcp.tool()
-def search_attachments(query: str, limit: int = 20) -> list[dict]:
+def search_attachments(query: str, limit: int = 20) -> dict:
     """Search attachment content (PDFs, Word, Excel, PowerPoint) using full-text search.
 
     Searches both extracted text and LLM-generated summaries from email attachments.
@@ -539,9 +577,13 @@ def search_attachments(query: str, limit: int = 20) -> list[dict]:
 
     conn = _get_conn()
     try:
-        return _search(conn, query, limit=_cap(limit))
+        rows = _search(conn, query, limit=_cap(limit))
     finally:
         conn.close()
+    return budget_response({"result": rows})
+
+
+ATTENDEES_SHOWN = 10
 
 
 @mcp.tool()
@@ -558,7 +600,9 @@ def query_calendar_events(
     are the same times in Europe/Athens with their offset, e.g.
     2026-10-01T16:00:00+03:00: quote those to the user. A bare date in since or
     until is an Athens calendar day, so a meeting at 00:30 Athens time falls on its
-    own day, not the one before.
+    own day, not the one before. Each event lists its first 10 attendees, the ones
+    `person` matched first, and `attendees_total` counts them all;
+    `response_status` is the user's own response.
 
     Args:
         person: Filter by attendee name or email (partial match, case and accent blind)
@@ -675,9 +719,18 @@ def query_calendar_events(
         events = []
         for row in rows:
             event_id = row["id"]
+            # The ones `person` matched first, so a cut list still shows them.
+            # Events average 48 attendees and reach 500: listed in full, 40
+            # events came to 272,000 characters.
             attendees = conn.execute(
-                "SELECT name, email, response_status, is_self FROM event_attendees WHERE event_id = ?",
-                (event_id,),
+                "SELECT name, email, response_status FROM event_attendees WHERE event_id = ? "
+                "ORDER BY (? <> '' AND (sb_fold(name) LIKE ? OR LOWER(email) LIKE ?)) DESC, id",
+                (
+                    event_id,
+                    person,
+                    f"%{search_fold(person)}%",
+                    f"%{person.strip().lower()}%",
+                ),
             ).fetchall()
             events.append(
                 {
@@ -692,21 +745,24 @@ def query_calendar_events(
                     "body_summary": row["body_summary"],
                     "is_self_organized": bool(row["is_self_organized"]),
                     "response_status": row["response_status"],
+                    "attendees_total": len(attendees),
                     "attendees": [
                         {
                             "name": a["name"],
                             "email": a["email"],
                             "status": a["response_status"],
                         }
-                        for a in attendees
+                        for a in attendees[:ATTENDEES_SHOWN]
                     ],
                 }
             )
             if partial:
                 events[-1]["partial_match"] = True
-        return {"events": events, "count": len(events)}
     finally:
         conn.close()
+    out = budget_response({"events": events, "count": len(events)})
+    out["count"] = len(out["events"])
+    return out
 
 
 @mcp.tool()
@@ -781,7 +837,7 @@ def search_conversations(
     search_type: str = "keyword",
     workspace: str | None = None,
     limit: int = 20,
-) -> list[dict] | dict:
+) -> dict:
     """Search past Claude Code conversations by keyword (FTS5) or semantic similarity.
 
     When the query cannot be embedded, semantic mode behaves as search_emails
@@ -818,9 +874,9 @@ def search_conversations(
                     for cid in conversation_ids_in_workspace(conn, workspace)
                 }
                 if not allowed:
-                    return []
+                    return {"result": []}
             try:
-                return query_semantic(
+                rows = query_semantic(
                     conn, query, limit=limit, kinds={"conversation"}, allowed_ids=allowed
                 )
             except SemanticUnavailable as e:
@@ -828,9 +884,10 @@ def search_conversations(
         else:
             from src.store.conversation_query import search_conversations_keyword
 
-            return search_conversations_keyword(conn, query, workspace=workspace, limit=limit)
+            rows = search_conversations_keyword(conn, query, workspace=workspace, limit=limit)
     finally:
         conn.close()
+    return budget_response({"result": rows})
 
 
 @mcp.tool()
@@ -1143,9 +1200,10 @@ def search_teams(query: str, kind: str = "both", limit: int = 20) -> dict:
         return _unknown("kind", kind, kinds)
     conn = _get_conn()
     try:
-        return {"results": q(conn, query, kind=kind, limit=_cap(limit))}
+        rows = q(conn, query, kind=kind, limit=_cap(limit))
     finally:
         conn.close()
+    return budget_response({"results": rows})
 
 
 @mcp.tool()

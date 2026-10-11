@@ -498,7 +498,7 @@ def test_semantic_search_conversations_returns_only_conversations(tmp_path, monk
     monkeypatch.setattr(embeddings, "embed_query", _fake_embedder([0.0, 1.0, 0.0]))
     monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
 
-    out = mcp_server.search_conversations("q", search_type="semantic", limit=2)
+    out = mcp_server.search_conversations("q", search_type="semantic", limit=2)["result"]
 
     assert [r["type"] for r in out] == ["conversation"]
     assert out[0]["session_id"] == "s3"

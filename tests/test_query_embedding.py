@@ -131,13 +131,14 @@ def test_a_throttled_model_falls_back_to_the_keyword_seed_within_the_budget(
     started = time.monotonic()
 
     if tool == "search_emails":
-        rows = mcp_server.search_emails("lighthouse", search_type="semantic", limit=2)
+        rows = mcp_server.search_emails("lighthouse", search_type="semantic", limit=2)["result"]
         assert [r["email_id"] for r in rows] == [1, 2]
         assert {r["semantic"] for r in rows} == {"keyword_seeded: _RateLimited"}
     else:
         # No conversation vector exists, so the fallback ranks nothing: an
         # empty answer, returned at once rather than after two minutes.
-        assert mcp_server.search_conversations("lighthouse", search_type="semantic") == []
+        out = mcp_server.search_conversations("lighthouse", search_type="semantic")
+        assert out["result"] == []
 
     assert len(client.calls) <= 2
     assert time.monotonic() - started < 2.0

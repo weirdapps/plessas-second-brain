@@ -195,7 +195,9 @@ def test_the_limit_is_clamped(mcp):
 
     assert mcp_server.query_calendar_events(limit=0)["count"] == 1
     assert mcp_server.query_calendar_events(limit=-3)["count"] == 1
-    assert mcp_server.query_calendar_events(limit=10_000)["count"] == 200
+    # 200 events are found; the character budget may show fewer, and says so.
+    out = mcp_server.query_calendar_events(limit=10_000)
+    assert out.get("truncated", {}).get("events", {}).get("total", out["count"]) == 200
 
 
 def test_the_docstring_says_the_times_are_utc():

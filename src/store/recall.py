@@ -8,6 +8,7 @@ by other agents through the MCP `recall` tool.
 """
 
 import logging
+import re
 import sqlite3
 
 from src.store.context import get_person_context, get_topic_context
@@ -16,6 +17,7 @@ from src.store.fusion import reciprocal_rank_fusion
 from src.store.greek import (
     PHRASE_MATCH,
     register_sql_functions,
+    search_fold,
     search_phrase,
     search_tokens,
     search_words,
@@ -356,6 +358,7 @@ def recall(
     limit_per_kind: int = 5,
     days: int = 365,
     semantic_candidates=None,
+    include_context: bool = False,
 ) -> dict:
     """Unified search across every text-bearing index in the brain.
 
@@ -364,6 +367,10 @@ def recall(
         query: Free-text query
         limit_per_kind: Max results per category (default 5)
         days: Lookback window for person/topic context (default 365)
+        include_context: Attach the person and topic dossiers the query matches
+            (default False). They were always attached, as 27% of an average
+            payload, and often for the wrong entity: a topic word resolved to a
+            person.
         semantic_candidates: Optional callable (conn, query, limit) -> ranked
             email ids. When provided, the emails bucket becomes a keyword+semantic
             RRF fusion; when None (default) it stays keyword-only. Injected by the
@@ -377,11 +384,10 @@ def recall(
     Returns:
         Dict with categorized hits across emails (incl. standalone docs),
         attachments, conversations, decisions, actions, inline_images, teams
-        threads and WhatsApp sessions, plus optional person_context and
-        topic_context populated when
-        the query matches a known person or topic. Always includes every kind
-        key (empty list if no matches) so callers don't have to handle missing
-        keys.
+        threads and WhatsApp sessions, plus, with include_context, person_context
+        and topic_context (None when the query matches no known person or topic).
+        Always includes every kind key (empty list if no matches) so callers
+        don't have to handle missing keys.
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
     # Emails (incl. attachments + standalone docs — query_by_keyword spans
@@ -418,9 +424,6 @@ def recall(
     whatsapp = _search_whatsapp(conn, query, limit_per_kind)
     calendar_events = _search_calendar_events(conn, query, limit_per_kind)
 
-    person_context = _maybe_person_context(conn, query, days=days)
-    topic_context = _maybe_topic_context(conn, query, days=days)
-
     text_kinds = {
         "emails": emails,
         "attachments": attachments,
@@ -447,19 +450,69 @@ def recall(
         and all(r.get("partial_match") or r.get("source") == "semantic" for r in v)
     ]
 
-    summary = {
-        "total_hits": total_hits,
-        "kinds_with_results": kinds_with_results,
-        "partial_kinds": partial_kinds,
-        "has_person_context": person_context is not None,
-        "has_topic_context": topic_context is not None,
-    }
-    if semantic is not None:
-        summary["semantic"] = semantic
-    return {
-        "query": query,
-        **text_kinds,
-        "person_context": person_context,
-        "topic_context": topic_context,
-        "summary": summary,
-    }
+    # The semantic status leads: it says how far to trust everything after it.
+    summary: dict = {} if semantic is None else {"semantic": semantic}
+    summary.update(
+        total_hits=total_hits,
+        kinds_with_results=kinds_with_results,
+        partial_kinds=partial_kinds,
+    )
+    out: dict = {"query": query, **text_kinds}
+    if include_context:
+        person_context = _maybe_person_context(conn, query, days=days)
+        topic_context = _maybe_topic_context(conn, query, days=days)
+        summary["has_person_context"] = person_context is not None
+        summary["has_topic_context"] = topic_context is not None
+        out["person_context"] = person_context
+        out["topic_context"] = topic_context
+    out["summary"] = summary
+    return out
+
+
+# How the MCP tool sends recall's rows. A summary is cut to about this many
+# characters, enough to judge a hit by: the whole text is one search or one read
+# away, and uncut summaries made every bucket heavy.
+SUMMARY_CHARS = 300
+_CUT_KEYS = ("summary", "body_summary", "vision_description")
+# The match markers and ellipses the full-text snippet() calls add.
+_SNIPPET_MARKS = re.compile(r">>>|<<<|\.\.\.|…|[\[\]]")
+
+
+def _cut(text: str, limit: int = SUMMARY_CHARS) -> str:
+    """`text` cut to about `limit` characters, at a word boundary when one is near."""
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    space = head.rfind(" ")
+    if space > limit * 0.8:
+        head = head[:space]
+    return head.rstrip() + "…"
+
+
+def _plain(text) -> str:
+    """Snippet or field text without match markers, folded and with single spaces."""
+    return " ".join(search_fold(_SNIPPET_MARKS.sub(" ", str(text or ""))).split())
+
+
+def compact_rows(rows: list[dict]) -> list[dict]:
+    """Rows as recall sends them: summaries cut to about SUMMARY_CHARS characters,
+    and a snippet left out when it only repeats the row's subject, title or summary.
+
+    A keyword match on the subject carried the subject again as its snippet, a
+    match on the summary the whole summary: 16% of an email row's characters.
+    """
+    out = []
+    for row in rows:
+        row = dict(row)
+        snippet = row.get("snippet")
+        if isinstance(snippet, str):
+            plain = _plain(snippet)
+            if not plain or any(
+                plain in _plain(row.get(key)) for key in ("subject", "title", "summary")
+            ):
+                del row["snippet"]
+        for key in _CUT_KEYS:
+            if isinstance(row.get(key), str):
+                row[key] = _cut(row[key])
+        out.append(row)
+    return out

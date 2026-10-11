@@ -13,7 +13,8 @@ document in its old segments until they are merged. So --apply:
 
   1. scans every TEXT column of every content table with src/redact.py
      (generated columns and FTS shadow tables are derived, not stored input, and
-     are skipped, and so are attachment file names and paths, which name files
+     are skipped, and so are identifier columns, ids, hashes and links, which other
+     rows point at, and attachment file names and paths, which name files
      on disk), and the HTML kept in email_html, decompressed first: compressed, a
      key is invisible to a column scan and to a grep,
   2. rewrites each hit with redact_secrets under PRAGMA secure_delete=ON, in one
@@ -90,6 +91,36 @@ _PACKED = (("email_html", "html"),)
 # again, and a masked path loses it. The file keeps its name either way.
 _FILE_NAMES = (("attachments", "filename"), ("attachments", "file_path"))
 
+# Identifier columns: keys other rows point at, hashes, links. A message id or a
+# conversation id that happens to be sixteen Luhn-valid digits is still an id, and
+# masking it would orphan every row that references it (seen on 2026-10-11: one
+# emails.conversation_id, one inline_image_occurrences.message_id and one
+# whatsapp_messages.message_id matched the card rule in a dry run).
+_IDENTIFIER_EXACT = {
+    "id",
+    "message_id",
+    "internet_message_id",
+    "in_reply_to",
+    "references",
+    "conversation_id",
+    "chat_jid",
+    "etag",
+    "change_key",
+    "sha256",
+}
+_IDENTIFIER_SUFFIXES = ("_id", "_ids", "_key", "_hash", "hash", "sha256", "_jid", "_url", "_link")
+_IDENTIFIER_SUBSTRINGS = ("url",)
+
+
+def _is_identifier(column: str) -> bool:
+    name = column.lower()
+    return (
+        name in _IDENTIFIER_EXACT
+        or name.endswith(_IDENTIFIER_SUFFIXES)
+        or any(s in name for s in _IDENTIFIER_SUBSTRINGS)
+    )
+
+
 # What --files rewrites, JSON as JSON and the rest as text, all UTF-8.
 _FILE_SUFFIXES = (".json", ".md", ".txt", ".csv")
 _MARK = "[REDACTED:"
@@ -122,7 +153,12 @@ def _text_columns(conn: sqlite3.Connection) -> list[tuple[str, str]]:
             declared = (decl or "").upper()
             is_text = declared in ("", "TEXT") or "CHAR" in declared or "CLOB" in declared
             # hidden != 0: generated, not stored input
-            if hidden == 0 and is_text and (table, column) not in _FILE_NAMES:
+            if (
+                hidden == 0
+                and is_text
+                and (table, column) not in _FILE_NAMES
+                and not _is_identifier(column)
+            ):
                 targets.append((table, column))
     return targets
 

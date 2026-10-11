@@ -593,3 +593,113 @@ def test_ingest_document_reports_the_path_it_already_holds_when_skipping(tmp_pat
 
     assert again["skipped"]
     assert again["file_path"] == first["file_path"]
+
+
+# --- --type together with an id list (issue #199) -------------------------------
+# Either filter given alone bound its values correctly. Given together, the type's values were
+# bound first while the id list's placeholders come first in the query, so the ids were compared
+# with MIME types and the type with an id, and no row matched. Each store below holds a row both
+# filters take, one only the id list takes and one only the type takes: only the first is selected.
+
+_BOTH_FILTERS = pytest.mark.parametrize(
+    ("file_type", "mime", "other_mime"),
+    [
+        ("pdf", "application/pdf", "text/plain"),  # one type value to bind
+        ("word", "application/msword", "application/pdf"),  # two
+    ],
+)
+
+
+def _filtered_store(tmp_path, mime, other_mime):
+    """A store with three attachments, 'wanted' (`mime`, listed), 'wrong-type' (`other_mime`,
+    listed) and 'unlisted' (`mime`). Returns the db path and the id list."""
+    from src.store.schema import create_database
+
+    db_path = str(tmp_path / "brain.db")
+    conn = create_database(db_path)
+    email_id = conn.execute(
+        "INSERT INTO emails (message_id, date_received, subject) VALUES ('m1', '2026-01-01', 'T')"
+    ).lastrowid
+    ids = {}
+    for name, kind in (("wanted", mime), ("wrong-type", other_mime), ("unlisted", mime)):
+        f = tmp_path / name
+        f.write_text(f"The text of {name}, long enough to clear the extraction threshold.")
+        ids[name] = conn.execute(
+            "INSERT INTO attachments (email_id, message_id, filename, mime_type, file_size,"
+            " file_path, exported_at) VALUES (?, 'm1', ?, ?, 1, ?, '2026-01-01')",
+            (email_id, name, kind, str(f)),
+        ).lastrowid
+    conn.commit()
+    conn.close()
+    return db_path, [ids["wanted"], ids["wrong-type"]]
+
+
+def _pending_texts(db_path):
+    """Give every attachment extracted text awaiting its summary."""
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO attachment_content (attachment_id, extracted_text, extraction_method,"
+        " extraction_status, extracted_at, llm_status)"
+        " SELECT id, 'The text of ' || filename, 'fake', 'extracted', '2026-01-01', 'pending'"
+        " FROM attachments"
+    )
+    conn.commit()
+    conn.close()
+
+
+@_BOTH_FILTERS
+def test_phase1_reads_only_the_listed_attachments_of_the_type(
+    tmp_path, monkeypatch, file_type, mime, other_mime
+):
+    from src.extract import attachment_pipeline
+
+    db_path, listed = _filtered_store(tmp_path, mime, other_mime)
+    read = []
+
+    def extract(file_path, mime_type, *args, **kwargs):
+        read.append(Path(file_path).name)
+        return {"text": "Some text. " * 10, "method": "fake", "status": "extracted", "error": None}
+
+    monkeypatch.setattr(attachment_pipeline, "extract_text_from_file", extract)
+
+    stats = attachment_pipeline.run_phase1(db_path, file_type=file_type, attachment_ids=listed)
+
+    assert read == ["wanted"]
+    assert stats["ids"] == listed[:1]
+
+
+@_BOTH_FILTERS
+def test_phase2_summarises_only_the_listed_attachments_of_the_type(
+    tmp_path, monkeypatch, file_type, mime, other_mime
+):
+    from src.extract import attachment_pipeline
+
+    db_path, listed = _filtered_store(tmp_path, mime, other_mime)
+    _pending_texts(db_path)
+    asked = []
+
+    def summarise(row, *args, **kwargs):
+        asked.append(row[3])
+        return (row[0], row[5], {"summary": f"summary of {row[3]}"}, None, False)
+
+    monkeypatch.setattr(attachment_pipeline, "_extract_one_attachment", summarise)
+
+    stats = attachment_pipeline.run_phase2(db_path, file_type=file_type, attachment_ids=listed)
+
+    assert asked == ["wanted"]
+    assert stats["extracted"] == 1
+
+
+@_BOTH_FILTERS
+def test_the_estimate_counts_only_the_listed_attachments_of_the_type(
+    tmp_path, file_type, mime, other_mime
+):
+    from src.extract.attachment_pipeline import estimate_phase2
+
+    db_path, listed = _filtered_store(tmp_path, mime, other_mime)
+    _pending_texts(db_path)
+
+    est = estimate_phase2(db_path, file_type=file_type, attachment_ids=listed)
+
+    assert est["rows"] == 1
+    assert est == estimate_phase2(db_path, attachment_ids=listed[:1])

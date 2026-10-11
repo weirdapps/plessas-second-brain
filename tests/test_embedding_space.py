@@ -124,6 +124,24 @@ def test_a_saved_index_records_its_space_and_the_store_does_too(index):
     assert _recorded(conn) == embedding_space(DIM)
 
 
+def test_the_store_is_written_only_when_the_space_changes(index):
+    """Every hourly save would otherwise write a row that says the same thing, and commit
+    whatever the caller had not committed yet."""
+    conn = _store()
+    embeddings.build_index(conn)
+    conn.execute(
+        "INSERT INTO emails (id, message_id, date_received, subject, summary) "
+        "VALUES (6, 6, '2026-01-02', 'Beacon', 'coastal beacon maintenance')"
+    )
+    before = conn.total_changes
+
+    assert embeddings.build_index(conn) == 1
+
+    assert conn.total_changes == before
+    assert conn.in_transaction, "the caller's own write was committed for it"
+    conn.rollback()
+
+
 def test_the_teams_and_whatsapp_writers_record_it_as_well(index):
     path, _calls = index
     conn = _store()

@@ -153,10 +153,9 @@ def _merge_space(held: dict | None, width: int, offered: dict) -> None:
 
 def _record_space(conn: sqlite3.Connection, space: dict) -> None:
     """Keep the space of the index just saved in sync_metadata too, where SQL can read it with
-    no index at hand. Written only when it changed, so an hourly save adds no write."""
-    from src.store.schema import migrate_add_sync_metadata
-
-    migrate_add_sync_metadata(conn)
+    no index at hand. Written and committed only when it changed, so an hourly save neither
+    writes nor commits anything the caller left pending."""
+    conn.execute("CREATE TABLE IF NOT EXISTS sync_metadata (key TEXT PRIMARY KEY, value TEXT)")
     value = json.dumps(space, sort_keys=True)
     row = conn.execute(
         "SELECT value FROM sync_metadata WHERE key = ?", (EMBEDDING_SPACE_KEY,)

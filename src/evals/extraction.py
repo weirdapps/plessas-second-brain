@@ -830,9 +830,14 @@ def prompt_sha() -> str:
 
 
 def _configured_model() -> str:
+    """The Claude model the extraction is configured with, or "" where none is set: a dry
+    estimate then prices as ESTIMATE_MODEL, and a run stops at its first call."""
     from src.extract import claude_extract
 
-    return claude_extract.CLAUDE_MODEL_BASE
+    try:
+        return claude_extract.claude_model()
+    except claude_extract.ClaudeNotConfigured:
+        return ""
 
 
 def _base_model(model: Any) -> str:

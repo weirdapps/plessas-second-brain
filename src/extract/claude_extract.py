@@ -1,5 +1,6 @@
 """
-Claude-based email extraction via Vertex AI or direct Anthropic API.
+Claude-based extraction via Vertex AI, or the direct Anthropic API only when
+BRAIN_ALLOW_DIRECT_API=1 and no Vertex project is set.
 
 Drop-in replacement for the Gemini extractor in local.py.
 """
@@ -26,11 +27,65 @@ from src.llm_policy import (
     running_on_linux,
 )
 
-REPO_ROOT = Path(__file__).parent.parent.parent
-# Default model — Vertex AI requires '@' separator, direct API uses '-'
-CLAUDE_MODEL_BASE = os.environ.get("CLAUDE_EXTRACT_MODEL") or os.environ.get(
-    "VERTEX_MODEL_EXTRACT", "claude-sonnet-4-6"
-)
+# One request's timeout. complete() reserves as much for each attempt (its
+# max_call_seconds, src/llm_deadline.MAX_CALL_SECONDS), which holds only if an attempt
+# is one request (max_retries=0 on the client).
+REQUEST_TIMEOUT_S = 120.0
+
+# The Claude model and the Vertex region of every Claude call. Neither has a default: a
+# model the project's allowlist does not hold answers 400, and a region that does not
+# serve the model answers 429. The defaults this code carried (a 4.6 model in
+# europe-west1) had become the first, and the wrong region for the model the allowlist
+# holds. Read by the first call that needs them, never at import, so the tests and the
+# read-only tools run on a host that sets neither.
+CLAUDE_MODEL_VARS = ("CLAUDE_EXTRACT_MODEL", "VERTEX_MODEL_EXTRACT")
+VERTEX_REGION_VARS = ("VERTEX_SDK_REGION", "CLOUD_ML_REGION")
+_PAIRING_RULE = "Claude 4.7 and later are served from eu, 4.6 and earlier from europe-west1"
+
+
+class ClaudeNotConfigured(RuntimeError):
+    """A setting the Claude calls need is unset: no retry can supply it, and no item is at
+    fault (src/extract/policy_bridge.is_transient leaves the work pending)."""
+
+
+def _first_set(names: tuple[str, ...]) -> str | None:
+    """The value of the first of these variables that holds more than blanks."""
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return None
+
+
+def claude_model() -> str:
+    """The Claude model extraction calls use: CLAUDE_EXTRACT_MODEL, else VERTEX_MODEL_EXTRACT."""
+    model = _first_set(CLAUDE_MODEL_VARS)
+    if model is None:
+        raise ClaudeNotConfigured(
+            "No Claude model is set and there is no default. Set CLAUDE_EXTRACT_MODEL (or "
+            "VERTEX_MODEL_EXTRACT) to a model your Vertex project allows, and VERTEX_SDK_REGION "
+            f"(or CLOUD_ML_REGION) to the region that serves it: {_PAIRING_RULE}."
+        )
+    return model
+
+
+def vertex_region() -> str:
+    """The Vertex region of the Claude calls: VERTEX_SDK_REGION, else CLOUD_ML_REGION."""
+    region = _first_set(VERTEX_REGION_VARS)
+    if region is None:
+        raise ClaudeNotConfigured(
+            "No Vertex region is set and there is no default. Set VERTEX_SDK_REGION (or "
+            f"CLOUD_ML_REGION) to the region that serves the Claude model: {_PAIRING_RULE}."
+        )
+    return region
+
+
+def direct_api_allowed() -> bool:
+    """Whether the direct Anthropic API may carry the Claude calls when no Vertex project is
+    set: BRAIN_ALLOW_DIRECT_API=1 and nothing else. A key alone, left in a shell profile,
+    once sent work mail there."""
+    return os.environ.get("BRAIN_ALLOW_DIRECT_API", "").strip() == "1"
+
 
 # 4096 truncated dense inputs: one news digest synthesis covers ~50 articles, so
 # its extraction JSON legitimately runs long and stopped mid-object.
@@ -106,22 +161,22 @@ _cached_client_and_model = None
 def _build_client_and_model():
     """Build a new Anthropic client + resolved model name (no caching).
 
-    Vertex wins whenever a project is set. ANTHROPIC_API_KEY counts only without
-    one: it used to win, so a key left in a shell profile sent work mail to the
-    direct API instead of Vertex. The backend in use goes to stderr, which the
-    sync logs capture.
+    The model and the region have no default (src/config.py): a host that sets
+    neither stops here, at its first call, with a message naming them. Vertex wins
+    whenever a project is set. The direct Anthropic API is used only without one,
+    and only with BRAIN_ALLOW_DIRECT_API=1: a key alone used to be enough, so a key
+    left in a shell profile sent work mail to the direct API instead of Vertex. The
+    backend in use goes to stderr, which the sync logs capture.
     """
-    model = CLAUDE_MODEL_BASE
+    model = claude_model()
 
     project_id = os.environ.get("VERTEX_SDK_PROJECT") or os.environ.get(
         "ANTHROPIC_VERTEX_PROJECT_ID"
     )
-    region = os.environ.get("VERTEX_SDK_REGION") or os.environ.get(
-        "CLOUD_ML_REGION", "europe-west1"
-    )
     if project_id:
         from anthropic import AnthropicVertex
 
+        region = vertex_region()
         # Vertex AI wants '@' before a date snapshot, e.g.
         # claude-sonnet-4-5-20250929 -> claude-sonnet-4-5@20250929.
         # The len>=8 guard makes this fire ONLY for a trailing YYYYMMDD date;
@@ -138,20 +193,28 @@ def _build_client_and_model():
         # max_call_seconds for each attempt, which holds only if an attempt is
         # one request. The SDK's default, two retries with timeouts among them,
         # made one attempt up to three 120 s requests.
-        client = AnthropicVertex(project_id=project_id, region=region, timeout=120.0, max_retries=0)
+        client = AnthropicVertex(
+            project_id=project_id, region=region, timeout=REQUEST_TIMEOUT_S, max_retries=0
+        )
         return client, model
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if api_key:
+    if api_key and direct_api_allowed():
         from anthropic import Anthropic
 
-        print(f"second-brain: Claude via the direct Anthropic API, model {model}", file=sys.stderr)
-        return Anthropic(api_key=api_key, timeout=60.0, max_retries=0), model  # as above
+        print(
+            f"second-brain: WARNING: Claude via the direct Anthropic API, model {model}: "
+            "BRAIN_ALLOW_DIRECT_API=1 and no Vertex project is set, so extracted text "
+            "leaves Vertex AI",
+            file=sys.stderr,
+        )
+        # One request per attempt, as above.
+        return Anthropic(api_key=api_key, timeout=REQUEST_TIMEOUT_S, max_retries=0), model
 
-    raise RuntimeError(
+    raise ClaudeNotConfigured(
         "No Claude credentials found. For Vertex AI set VERTEX_SDK_PROJECT (or "
-        "ANTHROPIC_VERTEX_PROJECT_ID), with the region in VERTEX_SDK_REGION or "
-        "CLOUD_ML_REGION (default europe-west1); for the direct API set ANTHROPIC_API_KEY."
+        "ANTHROPIC_VERTEX_PROJECT_ID). The direct Anthropic API takes ANTHROPIC_API_KEY "
+        "together with BRAIN_ALLOW_DIRECT_API=1, and only where no Vertex project is set."
     )
 
 
@@ -307,6 +370,8 @@ def call_with_policy(fn, *, max_call_seconds: float, refusal_is_final: bool = Fa
         began = time.monotonic()  # a duration: an NTP step must not bend it
         try:
             last_response = fn()
+        except ClaudeNotConfigured:
+            raise  # an unset model, region or credential: no retry can supply it
         except Exception as exc:
             last_exc = exc
 
@@ -412,7 +477,6 @@ def complete(*, max_tokens: int, messages: list, model: str | None = None, **kwa
 
 def extract_one(email: dict) -> dict | None:
     """Extract structured data from a single email using Claude."""
-    sys.path.insert(0, str(REPO_ROOT))
     from src.extract.parser import parse_extraction
     from src.extract.prompt import build_extraction_prompt
 
@@ -437,7 +501,6 @@ def extract_one(email: dict) -> dict | None:
 
 def extract_conversation(conversation: dict) -> dict | None:
     """Extract structured data from a conversation using Claude."""
-    sys.path.insert(0, str(REPO_ROOT))
     from src.extract.parser import CONVERSATION_SENTIMENT_VALUES, parse_extraction
     from src.extract.prompt import build_conversation_extraction_prompt
 

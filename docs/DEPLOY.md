@@ -79,8 +79,12 @@ cp .env.example .env      # then edit .env
 ```
 
 Required: `BRAIN_USER_NAME`, `BRAIN_USER_ROLE`, `BRAIN_USER_EMAIL_PATTERN`, and one
-extraction path (Vertex ADC, `ANTHROPIC_API_KEY`, or `GEMINI_API_KEY`). See
-`.env.example` for the full list.
+extraction path: Vertex ADC with `VERTEX_SDK_PROJECT`, `CLAUDE_EXTRACT_MODEL` and
+`VERTEX_SDK_REGION` (neither the model nor the region has a default, and the first
+Claude call stops with a message naming them until both are set); `GEMINI_API_KEY`
+with `BRAIN_EXTRACT_ENGINE=gemini`; or the direct Anthropic API, which takes
+`ANTHROPIC_API_KEY` together with `BRAIN_ALLOW_DIRECT_API=1` and is used only where
+no Vertex project is set. See `.env.example` for the full list.
 
 Nothing in the code reads `.env`: the scheduling recipes in section 6 source it
 (`set -a; . ./.env`, `EnvironmentFile=`). The MCP server inherits the

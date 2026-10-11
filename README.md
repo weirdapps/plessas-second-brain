@@ -48,7 +48,7 @@ graph TD
 | MS Teams | `src/export/teams_cli.py`, `teams_export.py`, `src/extract/teams_pipeline.py` | Chats, threads, messages, MRI resolution. |
 | WhatsApp | `scripts/whatsapp_snapshot.py`, `src/export/whatsapp_export.py`, `src/extract/whatsapp_pipeline.py` | A minimized snapshot pushed hourly from the Mac that runs a WhatsApp bridge; sessions extracted and embedded like Teams threads. See [WhatsApp](#whatsapp). |
 | SharePoint links | `src/extract/sharepoint_url_scanner.py`, `src/export/sharepoint_fetcher.py` | Managed host defaults to `contoso.sharepoint.com` (override via `SHAREPOINT_HOST`). |
-| Standalone documents | `src/cli.py ingest`, `reverse-ingest`, `src/ingest/reverse_scan.py` | Latest-version-per-logical-name dedup. `reverse-ingest` scans only the directories you name with `--root`; nothing schedules a scan. |
+| Standalone documents | `src/cli.py ingest`, `reverse-ingest`, `src/ingest/reverse_scan.py` | Latest-version-per-logical-name dedup. `reverse-ingest` scans only the directories you name with `--root`; nothing schedules a scan. A file whose bytes are already stored is skipped with its reason: ingested before, or held by an attachment whose text is stored (`attachments.sha256`), such as a mail attachment saved into a folder. A twin that failed, was skipped, is encrypted or was read in part does not stop it. |
 | Web and YouTube | `src/extract/web_ingest.py` | URL fetch plus transcript pull via `youtube-transcript-api`. |
 | News digests | `src/export/news_export.py` | Reads an external news-reader SQLite DB (`BRAIN_NEWS_DB`) read-only. Digest syntheses plus articles at or above `--relevance`. Landed under `mailbox_name = 'News'`, so mail counts exclude them. Not sent to the model: the summary is the synthesis's brief or the article's opening, the topics its section categories or the article's categories (`src/extract/news_extract.py`). |
 | Claude Code sessions | `src/export/conversation_export.py` | Reads `~/.claude/projects`, sent there from a workstation when each session ends (`scripts/hooks/session-end-push.sh`, see DEPLOY). A turn is the owner's only when he typed it; agent sessions are left out unless `--include-agents`. |
@@ -290,7 +290,7 @@ pip install -e ".[dev]"
 
 ## Configuration
 
-Read from environment variables. Only identity plus one extraction path (Vertex or Gemini) is strictly required.
+Read from environment variables. Only identity plus one extraction path is strictly required: Vertex (a project, a Claude model and its region) or Gemini.
 
 Four identity and tenant settings (`BRAIN_USER_NAME`, `BRAIN_USER_ROLE`, `BRAIN_USER_EMAIL_PATTERN`, `SHAREPOINT_HOST`) can also live in a per-host file, `~/.config/second-brain/env` (override the path with `BRAIN_CONFIG_FILE`), one `KEY=value` per line, `#` comments allowed. `src/config.py` applies it at import, and the environment wins over it. It exists because the processes that need these settings may start without a login shell: Claude Code passes the MCP server the environment `claude` itself was launched with, which from a GUI or an IDE holds no shell profile, and systemd starts the timers with a fixed one. Any other key in the file is ignored, so a credential, a backend switch or a relocated data home pasted into it is never picked up. Nothing reads a `.env` file; the schedulers that want one source it themselves.
 
@@ -305,7 +305,7 @@ Used in extraction prompts and stale-thread detection.
 ### Extraction engine
 
 - `BRAIN_EXTRACT_ENGINE`: `claude` (default) or `gemini`.
-- `CLAUDE_EXTRACT_MODEL` or `VERTEX_MODEL_EXTRACT`: Claude model override (default `claude-sonnet-4-6`).
+- `CLAUDE_EXTRACT_MODEL` or `VERTEX_MODEL_EXTRACT`: the Claude model, required with the `claude` engine, and with no default. A model your Vertex project's allowlist does not hold fails every call, and the old default had become one, so a host that sets none now stops at its first Claude call with a message naming these variables. Work met before that stays pending, and the read-only tools and the tests never need it.
 - `BRAIN_GEMINI_MODEL`: Gemini model override (default `gemini-2.5-flash`).
 - `BRAIN_TEAMS_MODEL`: override for Teams thread extraction.
 
@@ -314,13 +314,13 @@ Used in extraction prompts and stale-thread detection.
 Preferred credential path. Uses Application Default Credentials, no API key required.
 
 - `VERTEX_SDK_PROJECT` or `ANTHROPIC_VERTEX_PROJECT_ID`: GCP project id.
-- `VERTEX_SDK_REGION` or `CLOUD_ML_REGION`: region. Model-region pairing matters. Claude 4.7 and newer requires `eu`; 4.6 and older requires `europe-west1`. A mismatch returns HTTP 429.
-- `VERTEX_MODEL_FALLBACK_SDK` (default `claude-opus-4-6`, no `[1m]` suffix, because the SDK rejects brackets) and `VERTEX_REGION_FALLBACK` (default `europe-west1`): retry target on policy refusals. Set both together, or the retry hits the 429 described above. Since 2026-09-23 this tier differs from the extraction tier (`claude-opus-5-5` @ `eu`), so the same-pair guard in `vertex_fallback.py` no longer short-circuits the retry.
+- `VERTEX_SDK_REGION` or `CLOUD_ML_REGION`: region, required, with no default (it stops the first call as the model does). Model-region pairing matters. Claude 4.7 and newer requires `eu`; 4.6 and older requires `europe-west1`. A mismatch returns HTTP 429.
+- `VERTEX_MODEL_FALLBACK_SDK` (no `[1m]` suffix, because the SDK rejects brackets) and `VERTEX_REGION_FALLBACK`: optional retry target on policy refusals, with no default. Set both together: with neither, or only one, a refusal comes back as it is, and a mismatched pair hits the 429 described above. When the pair equals the extraction pair, as it does where the allowlist holds one model, the same-pair guard in `vertex_fallback.py` returns the refusal without a second call.
 - `VERTEX_REGION_EMBED`: embedding region (default `europe-west1`).
 
 ### Alternative credentials
 
-- `ANTHROPIC_API_KEY`: direct Anthropic API. Used only when no Vertex project is set; a key left in the environment never overrides Vertex. The backend in use is printed on stderr when the client is built.
+- `ANTHROPIC_API_KEY` together with `BRAIN_ALLOW_DIRECT_API=1`: the direct Anthropic API, used only when no Vertex project is set. A key alone does nothing, and a key never overrides Vertex. The backend in use is printed on stderr when the client is built, the direct API as a `WARNING`. Gated, not deleted: the deployment this was built for must never send mail text to the direct API, and a key left in a shell profile once did, because the branch ran whenever a key was present and no Vertex project was. Off unless the switch is set, no stray key can turn it on; kept, because it is a documented path for anyone running this outside Vertex, who now opts in knowingly.
 - `GEMINI_API_KEY`: required when `BRAIN_EXTRACT_ENGINE=gemini` or `BRAIN_EMBED_BACKEND=gemini`.
 - `BRAIN_EMBED_BACKEND`: `vertex` or `gemini`. Unset, it is `gemini` when `GEMINI_API_KEY` is set and `vertex` otherwise; set it to `vertex` to keep embeddings on Vertex on a host that holds a Gemini key for other reasons, such as `BRAIN_EXTRACT_ENGINE=gemini`. `gemini` reaches the same `gemini-embedding-001` through the Gemini API with `GEMINI_API_KEY`, even where a Vertex project is set, so its vectors join the existing index. Use it when the Vertex project refuses the embedding model. On a free-tier key Google may use the submitted text to improve its products; a key on a project with billing enabled is not used that way. The MCP server prints the backend it uses on stderr at startup, and `stats` returns it as `embed_backend`.
 
@@ -449,7 +449,6 @@ python -m src.cli ocr-regarble [--apply]              # find stored OCR text tha
 python -m src.cli reextract --garbled                 # read marked scans again, Greek first, and summarise the ones that now read
 python -m src.cli reextract --long --estimate          # price a re-summary before running it; changes nothing
 python -m src.cli reextract --full-parts 1234 5678     # summarise these attachments from every part, now and on every later summary
-python scripts/relabel_attachment_status.py [--apply]  # give old failed/skipped rows today's unread verdicts: encrypted kinds, skip reasons
 python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents
 python -m src.cli relabel-conversations [--dry-run]    # once, on the producer: stored turns the owner did not type become 'agent' (see DEPLOY)
 python -m src.cli process-sharepoint --ingest-fetched  # store the files earlier SharePoint fetches left on disk
@@ -496,7 +495,7 @@ src/
     extraction_files.py        Where an email's extraction file lives; read back by the exact id
     news_extract.py            News items without the model: the synthesis brief or the article's opening
     parser.py                  Tolerant LLM JSON parser
-    claude_extract.py          Claude via Vertex AI or direct API
+    claude_extract.py          Claude via Vertex AI (model and region required); direct API only with BRAIN_ALLOW_DIRECT_API=1
     vertex_auth.py             Vertex AI credential resolution
     vertex_fallback.py         Model and region fallback on policy refusals
     policy_bridge.py           Maps SDK failures onto the shared policy; wires the re-auth callback
@@ -547,12 +546,9 @@ scripts/
   extraction_eval.py           Extraction eval CLI: build, dry run, run, calibrate (see Evals)
   retrieval_eval.py            Retrieval evals: the known-item guard and the qa set (see Evals)
   backup_db.py                 MVCC-safe encrypted DB snapshot + retention (see docs/RESTORE.md)
-  recover_missing_extractions.py  Backfill emails that staged but never extracted
-  repair_case_twins.py         Gives emails back their own extraction where a case twin's was stored (report by default)
+  forget_duplicate_documents.py  Forgets synced documents byte-identical to a mail attachment that holds their text, stored before ingest checked for such twins (dry run by default)
   reap_orphan_attachments.py   Resolves attachment dirs the registrar can never claim
   scrub_secrets.py             Redacts credentials, card numbers, IBANs and passwords already in the DB or, with --files, in files (dry run by default)
-  repair_people.py             Mends garbled people names and unsaved sender addresses (dry run by default)
-  backfill-all.sh              One-shot backfill across all sources
   hooks/session-end-push.sh    Claude Code SessionEnd hook: sends the ended session's transcript to the producer
   pii-gauntlet.sh              Guards tracked files (and, with --mode=history, published history) against personal-data leaks
   wrappers/                    Archive of the scheduler wrappers each host runs

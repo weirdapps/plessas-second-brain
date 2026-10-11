@@ -1,5 +1,5 @@
 """
-Local streaming extraction using Gemini 2.5 Flash or Claude Haiku.
+Local streaming extraction with Claude (src/extract/claude_extract.py) or Gemini.
 
 Concurrent processing with ThreadPoolExecutor.
 Resumable state tracking.
@@ -10,7 +10,6 @@ import json
 import os
 import signal
 import sqlite3
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -21,8 +20,6 @@ from src.config import DATA_ROOT, EXTRACT_ENGINE, GEMINI_MODEL
 from src.export.state import load_json_or_quarantine, write_json_atomic
 from src.extract.extraction_files import extraction_path
 
-# Repo root
-REPO_ROOT = Path(__file__).parent.parent.parent
 DATA_DIR = DATA_ROOT
 STAGING_DIR = DATA_DIR / "staging"
 EXTRACTED_DIR = DATA_DIR / "extracted"
@@ -30,7 +27,7 @@ STATE_FILE = DATA_DIR / "state" / "extract_state.json"
 LOG_FILE = DATA_DIR / "extract.log"
 
 SAVE_INTERVAL = 50
-CALL_TIMEOUT = 60  # seconds per API call
+CALL_TIMEOUT = 60  # seconds per Gemini call; Claude's is claude_extract.REQUEST_TIMEOUT_S
 # "claude" or "gemini", as config.py stripped, lowercased and checked it. Read
 # here again raw, a value such as 'Claude ' took the Gemini branch below.
 DEFAULT_ENGINE = EXTRACT_ENGINE
@@ -219,7 +216,6 @@ def extract_one(email: dict, api_key: str | None, engine: str = "gemini") -> dic
     from google import genai
     from google.genai import types
 
-    sys.path.insert(0, str(REPO_ROOT))
     from src.extract.parser import parse_extraction
     from src.extract.prompt import build_extraction_prompt
 
@@ -482,7 +478,13 @@ def run_extraction(
     api_key = os.environ.get("GEMINI_API_KEY")
 
     log("=== LOCAL EXTRACTION STARTED ===")
-    log(f"Engine: {engine}, Workers: {workers}, Timeout: {CALL_TIMEOUT}s")
+    if engine == "claude":
+        from src.extract.claude_extract import REQUEST_TIMEOUT_S
+
+        timeout_s = REQUEST_TIMEOUT_S
+    else:
+        timeout_s = CALL_TIMEOUT
+    log(f"Engine: {engine}, Workers: {workers}, Timeout: {timeout_s:g}s")
 
     from src.extract.news_extract import is_news
 

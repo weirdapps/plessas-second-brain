@@ -159,6 +159,18 @@ def _selected(cases: list[dict], wanted: list[str]) -> list[dict] | None:
     return [c for c in cases if c["id"] in wanted]
 
 
+def _model_is_set() -> bool:
+    """Whether a Claude model is configured. Without one every case fails its first call
+    and the run records nothing worth keeping, so --run and --calibrate stop first."""
+    if ev._configured_model():
+        return True
+    print(
+        "No Claude model is set: set CLAUDE_EXTRACT_MODEL (or VERTEX_MODEL_EXTRACT) first.",
+        file=sys.stderr,
+    )
+    return False
+
+
 def _run(args, files: ev.Files, cases: list[dict]) -> int:
     if not _valid(cases):
         return 1
@@ -171,6 +183,8 @@ def _run(args, files: ev.Files, cases: list[dict]) -> int:
     )
     if not args.yes:
         print("Nothing was called. Add --yes to run it.")
+        return 2
+    if not _model_is_set():
         return 2
     record = ev.run(
         files,
@@ -221,6 +235,8 @@ def _calibrate(args, files: ev.Files, cases: list[dict]) -> int:
     print(f"Estimate: at most {calls} judge calls, ${cost:.2f}")
     if not args.yes:
         print("Nothing was called. Add --yes to run it.")
+        return 2
+    if not _model_is_set():
         return 2
     record = ev.calibrate(files, cases, workers=args.workers)
     owner = record["owner"]

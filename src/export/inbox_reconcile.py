@@ -7,9 +7,23 @@ email out of Inbox into Archive (manually or via /triage-inbox), the email's
 labelled `mailbox_name='Inbox'` forever.
 
 Reconciliation: list Outlook's *current* Inbox via the API, then any DB row
-labelled `mailbox_name='Inbox'` whose `message_id` is no longer there has
-been moved out. We assume → Archive (matches the dominant /triage-inbox
-flow). Subfolder routing would mislabel — accept that until it bites.
+labelled `mailbox_name='Inbox'` that is no longer there, by Graph id or by
+RFC822 Message-ID, has been moved out. We assume → Archive (matches the
+dominant /triage-inbox flow). Subfolder routing would mislabel — accept that
+until it bites.
+
+Deletion is not a move to Archive, and assuming it was kept mail the owner
+deleted while calling it archived. So each run also lists Deleted Items and
+Junk Email (one call each) and records, for every stored email found there by
+Graph id or Message-ID (a move mints a new Graph id), where it is and when it
+was first seen deleted: a sync_metadata row keyed `mail_location:<message_id>`
+holding JSON {location, deleted_at, internet_message_id}. Such a row is never
+relabelled Archive, even after the folder purges it, and its record is removed
+once the mail is back in the Inbox. No row is deleted: what to forget is the
+retention policy's decision. Matched by Message-ID, a record says that a copy
+with that Message-ID is there: mail sent with a copy to oneself keeps a second
+copy in Sent Items, which this does not list, so deleting the Inbox copy records
+the email as deleted. A forget policy has to allow for that.
 
 Runs after every hourly Inbox sync (~1s — current Inbox is tiny). Exits 2,
 touching nothing, on a replica (see src.config.is_replica).
@@ -25,12 +39,15 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sqlite3  # for sqlite3.Error exception catch only
+import sqlite3
 import subprocess
 import sys
+from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 from src.config import DEFAULT_DB, is_replica, replica_refusal
+from src.export.mail_reconcile import normalize_imid
 from src.export.outlook_cli import OutlookCliAuthRequired, OutlookCliError, run_outlook_cli
 from src.store.schema import get_connection
 
@@ -38,17 +55,19 @@ from src.store.schema import get_connection
 # which every M365 wrapper here reads as "upstream misbehaved".
 REFUSED_ON_REPLICA = 2
 
+# sync_metadata key prefix of the per-email location record (see the docstring).
+LOCATION_KEY = "mail_location:"
+DELETED_ITEMS = "Deleted Items"
+# Listed beside the Inbox: the well-known alias outlook-cli resolves without a
+# folder lookup, and the name recorded. Later entries win, so mail in both reads
+# as deleted.
+ELSEWHERE_FOLDERS = (("JunkEmail", "Junk Email"), ("DeletedItems", DELETED_ITEMS))
+
 logger = logging.getLogger(__name__)
 
 
-def list_current_inbox_ids(max_results: int = 5000) -> tuple[set[str], set[str]]:
-    """Return (outlook_ids, internet_message_ids) currently in Outlook's Inbox.
-
-    The Outlook REST `Id` is what outlook-cli-sourced rows store in
-    `emails.message_id`. The `InternetMessageId` is the RFC822 Message-ID,
-    which the loader populates in `emails.internet_message_id` regardless
-    of source — so we can cross-match AppleScript-sourced rows too.
-    """
+def list_folder_ids(folder: str, max_results: int = 5000) -> tuple[set[str], set[str]]:
+    """Return (outlook_ids, internet_message_ids) currently in `folder`: one call."""
     # Through the shared adapter, like every other outlook-cli caller: it adds
     # --no-auto-reauth, so a timer never opens an interactive login, honours
     # OUTLOOK_CLI_PATH, and raises OutlookCliAuthRequired on exit 4.
@@ -56,7 +75,7 @@ def list_current_inbox_ids(max_results: int = 5000) -> tuple[set[str], set[str]]
         [
             "list-mail",
             "--folder",
-            "Inbox",
+            folder,
             "--select",
             "Id,InternetMessageId",
             "--all",
@@ -70,20 +89,39 @@ def list_current_inbox_ids(max_results: int = 5000) -> tuple[set[str], set[str]]
     return outlook_ids, internet_ids
 
 
+def list_current_inbox_ids(max_results: int = 5000) -> tuple[set[str], set[str]]:
+    """Return (outlook_ids, internet_message_ids) currently in Outlook's Inbox.
+
+    The Outlook REST `Id` is what outlook-cli-sourced rows store in
+    `emails.message_id`. The `InternetMessageId` is the RFC822 Message-ID,
+    which the loader populates in `emails.internet_message_id` regardless
+    of source — so we can cross-match AppleScript-sourced rows too.
+    """
+    return list_folder_ids("Inbox", max_results=max_results)
+
+
 def reconcile_moves(
     db_path: Path,
     target_mailbox: str = "Archive",
     max_results: int = 5000,
+    track_elsewhere: bool = False,
 ) -> dict:
     """Mark DB rows labelled 'Inbox' that aren't in the live Inbox as moved.
 
     Two passes:
-      1. Match by `message_id` (outlook-cli-sourced rows: AAMk... ids)
+      1. outlook-cli-sourced rows (AAMk... ids), present by `message_id` or,
+         under the new Graph id a move back mints, by RFC822 Message-ID
       2. Match by `internet_message_id` (AppleScript-sourced legacy rows
          that have a numeric message_id but the same RFC822 Message-ID
          as one of the live Outlook entries).
 
-    Returns a summary: {scanned_inbox, by_outlook_id, by_internet_id, moved}.
+    With `track_elsewhere`, which main() passes, Deleted Items and Junk Email
+    are listed as well, and the stored mail found there is recorded where it is
+    instead of being relabelled (see the module docstring).
+
+    Returns a summary: {scanned_inbox, by_outlook_id, by_internet_id, moved},
+    and with `track_elsewhere` {deleted, junk, restored, located}: the records
+    written and removed this run, and how many emails carry one.
     """
     outlook_ids, internet_ids = list_current_inbox_ids(max_results=max_results)
 
@@ -120,13 +158,33 @@ def reconcile_moves(
             ),
         }
 
+    # Listed only once the Inbox listing is known to be usable.
+    elsewhere = (
+        {location: list_folder_ids(folder, max_results) for folder, location in ELSEWHERE_FOLDERS}
+        if track_elsewhere
+        else None
+    )
+    inbox_keys = {normalize_imid(i) for i in internet_ids} - {""}
+
     conn = get_connection(str(db_path))
     try:
+        located: set[str] = set()
+        changes: dict[str, int] = {}
+        if elsewhere is not None:
+            located, changes = _note_locations(conn, outlook_ids, inbox_keys, elsewhere)
+
         # Pass 1 — outlook-cli-sourced rows.
         rows = conn.execute(
-            "SELECT message_id FROM emails WHERE mailbox_name = 'Inbox' AND message_id LIKE 'AAMk%'"
+            "SELECT message_id, internet_message_id FROM emails"
+            " WHERE mailbox_name = 'Inbox' AND message_id LIKE 'AAMk%'"
         ).fetchall()
-        by_outlook_id = [r[0] for r in rows if r[0] not in outlook_ids]
+        by_outlook_id = [
+            r[0]
+            for r in rows
+            if r[0] not in outlook_ids
+            and normalize_imid(r[1]) not in inbox_keys
+            and str(r[0]) not in located
+        ]
 
         # Pass 2 — AppleScript-sourced rows: match on internet_message_id.
         rows = conn.execute(
@@ -136,7 +194,11 @@ def reconcile_moves(
             "AND message_id NOT LIKE '-%' "
             "AND internet_message_id IS NOT NULL"
         ).fetchall()
-        by_internet_id = [r[0] for r in rows if r[1] not in internet_ids]
+        by_internet_id = [
+            r[0]
+            for r in rows
+            if normalize_imid(r[1]) not in inbox_keys and str(r[0]) not in located
+        ]
 
         moved = by_outlook_id + by_internet_id
         if moved:
@@ -149,17 +211,121 @@ def reconcile_moves(
                     f"UPDATE emails SET mailbox_name = ? WHERE message_id IN ({placeholders})",
                     [target_mailbox, *batch],
                 )
-            conn.commit()
+        # The relabel and the location records land together.
+        conn.commit()
     finally:
         conn.close()
 
-    return {
+    summary = {
         "scanned_inbox": len(outlook_ids),
         "by_outlook_id": len(by_outlook_id),
         "by_internet_id": len(by_internet_id),
         "moved": len(moved),
         "status": "ok",
     }
+    if elsewhere is not None:
+        summary.update(changes, located=len(located))
+    return summary
+
+
+def _chunks(values: list, size: int = 500) -> Iterator[list]:
+    for start in range(0, len(values), size):
+        yield values[start : start + size]
+
+
+def _note_locations(
+    conn: sqlite3.Connection,
+    inbox_ids: set[str],
+    inbox_keys: set[str],
+    elsewhere: dict[str, tuple[set[str], set[str]]],
+) -> tuple[set[str], dict[str, int]]:
+    """Record which stored emails sit in Deleted Items or Junk Email, and forget
+    those back in the Inbox.
+
+    A move mints a new Graph id, so a listed message is matched to its row by
+    Graph id, an alias of it, or its RFC822 Message-ID compared without brackets
+    or case. A record is written when an email is first seen in a folder; a
+    message with a copy in the Inbox is where that copy is. Returns the
+    message_ids that carry a record after this run, and what changed.
+    """
+    by_id: dict[str, str] = {}
+    by_key: dict[str, str] = {}
+    for location, (ids, imids) in elsewhere.items():
+        by_id.update(dict.fromkeys(ids, location))
+        by_key.update(dict.fromkeys((normalize_imid(i) for i in imids), location))
+    by_key.pop("", None)
+
+    # Every stored Message-ID, through its covering index: the column sits after
+    # the body, which reading it from the table would page through.
+    key_of: dict[int, str] = {}
+    for email_id, imid in conn.execute(
+        "SELECT id, internet_message_id FROM emails WHERE internet_message_id IS NOT NULL"
+    ):
+        key = normalize_imid(imid)
+        if key:
+            key_of[email_id] = key
+    found = {email_id: by_key[key] for email_id, key in key_of.items() if key in by_key}
+    has_aliases = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'email_aliases'"
+    ).fetchone()
+    for chunk in _chunks(sorted(by_id)):
+        marks = ",".join("?" * len(chunk))
+        for email_id, message_id in conn.execute(
+            f"SELECT id, message_id FROM emails WHERE message_id IN ({marks})", chunk
+        ):
+            found[email_id] = by_id[str(message_id)]
+        if has_aliases:
+            for email_id, alias in conn.execute(
+                f"SELECT email_id, message_id FROM email_aliases WHERE message_id IN ({marks})",
+                chunk,
+            ):
+                found[email_id] = by_id[str(alias)]
+    message_id_of: dict[int, str] = {}
+    for chunk in _chunks(sorted(found)):
+        marks = ",".join("?" * len(chunk))
+        for email_id, message_id in conn.execute(
+            f"SELECT id, message_id FROM emails WHERE id IN ({marks})", chunk
+        ):
+            message_id_of[email_id] = str(message_id)
+
+    records: dict[str, dict] = {}
+    for meta_key, value in conn.execute(
+        "SELECT key, value FROM sync_metadata WHERE key GLOB ?", (LOCATION_KEY + "*",)
+    ):
+        try:
+            loaded = json.loads(value)
+        except ValueError:
+            loaded = None
+        records[meta_key[len(LOCATION_KEY) :]] = loaded if isinstance(loaded, dict) else {}
+
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    changes = {"deleted": 0, "junk": 0, "restored": 0}
+    for email_id, location in found.items():
+        message_id = message_id_of.get(email_id)
+        imid_key = key_of.get(email_id)
+        if message_id is None or message_id in inbox_ids or (imid_key and imid_key in inbox_keys):
+            continue
+        if records.get(message_id, {}).get("location") == location:
+            continue
+        record = {
+            "location": location,
+            "deleted_at": now if location == DELETED_ITEMS else None,
+            "internet_message_id": imid_key,
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES (?, ?)",
+            (LOCATION_KEY + message_id, json.dumps(record)),
+        )
+        records[message_id] = record
+        changes["deleted" if location == DELETED_ITEMS else "junk"] += 1
+
+    # Back in the Inbox, by either id: no longer deleted or junk.
+    for message_id, record in list(records.items()):
+        if message_id in inbox_ids or (record.get("internet_message_id") or "") in inbox_keys:
+            conn.execute("DELETE FROM sync_metadata WHERE key = ?", (LOCATION_KEY + message_id,))
+            del records[message_id]
+            changes["restored"] += 1
+    return set(records), changes
 
 
 def main() -> int:
@@ -192,7 +358,7 @@ def main() -> int:
         return 1
 
     try:
-        result = reconcile_moves(args.db, target_mailbox=args.target_mailbox)
+        result = reconcile_moves(args.db, target_mailbox=args.target_mailbox, track_elsewhere=True)
     # An auth loss used to exit 2 and a locked database 4, so the wrapper
     # reported lock contention as "re-authenticate" and a real auth loss as
     # something else.
@@ -217,6 +383,15 @@ def main() -> int:
         result["by_internet_id"],
         args.target_mailbox,
     )
+    if "located" in result:
+        logger.info(
+            "Deleted Items and Junk: %d newly deleted, %d newly in Junk, %d back in the Inbox;"
+            " %d emails recorded",
+            result["deleted"],
+            result["junk"],
+            result["restored"],
+            result["located"],
+        )
     return 0
 
 

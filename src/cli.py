@@ -503,9 +503,11 @@ def cmd_hash_attachments(args):
 def cmd_mail_reconcile(args):
     """List the Outlook messages the store lacks; on the producer, stage them again.
 
-    The report only reads the store, so it runs on a replica. --record-aliases and
-    --refetch write, and are the producer's (src/export/mail_reconcile.py). Exit
-    codes follow the M365 convention: 4 re-authenticate, 5 outlook-cli misbehaved.
+    The report only reads the store, so it runs on a replica. --record-aliases,
+    --refetch and --health-json write, and are the producer's
+    (src/export/mail_reconcile.py). Exit codes follow the M365 convention: 4
+    re-authenticate, 5 outlook-cli misbehaved. --health-json writes the mail-loss
+    counters whatever the reconcile's outcome, so they stay fresh when it fails.
     """
     import subprocess
     from datetime import UTC
@@ -515,18 +517,31 @@ def cmd_mail_reconcile(args):
     from src.export.outlook_cli import OutlookCliAuthRequired, OutlookCliError
     from src.export.state import write_json_atomic
 
-    if (args.refetch or args.record_aliases) and config.is_replica():
-        print(config.replica_refusal("mail-reconcile --refetch/--record-aliases"), file=sys.stderr)
+    writes = args.refetch or args.record_aliases or args.health_json is not None
+    if writes and config.is_replica():
+        print(
+            config.replica_refusal("mail-reconcile --refetch/--record-aliases/--health-json"),
+            file=sys.stderr,
+        )
         return 2
     if not Path(args.db).exists():
         print(f"Error: database not found: {args.db}", file=sys.stderr)
         return 1
-    since = mr.parse_when(args.since)
-    until = mr.parse_when(args.until) if args.until else datetime.now(UTC)
+    now = datetime.now(UTC)
+    since = mr.parse_since(args.since, now)
+    until = mr.parse_since(args.until, now) if args.until else now
     if since is None or until is None:
-        print("Error: --since and --until take ISO dates, e.g. 2025-03-16", file=sys.stderr)
+        print(
+            "Error: --since and --until take ISO dates, e.g. 2025-03-16, or a time"
+            " before now, e.g. 7d or 36h",
+            file=sys.stderr,
+        )
         return 1
     folders = [name.strip() for name in args.folders.split(",") if name.strip()]
+    report = None
+    stats = None
+    error = None
+    rc = 0
     try:
         report = mr.reconcile(args.db, folders, since, until, DATA_ROOT / "staging")
         _print_reconcile(report)
@@ -552,11 +567,22 @@ def cmd_mail_reconcile(args):
                 print(f"  failed: {message_id}")
     except OutlookCliAuthRequired as e:
         print(f"outlook-cli needs re-authentication: {e.stderr}", file=sys.stderr)
-        return 4
+        rc, error = 4, "outlook-cli needs re-authentication (exit 4)"
     except (OutlookCliError, subprocess.TimeoutExpired, mr.TruncatedListing) as e:
         print(f"outlook-cli failed: {e}", file=sys.stderr)
-        return 5
-    return 0
+        rc, error = 5, f"outlook-cli failed ({type(e).__name__})"
+    if args.health_json is not None:
+        written = mr.write_mail_loss(
+            Path(args.health_json) if args.health_json else None,
+            report=report,
+            refetch_stats=stats,
+            error=error,
+        )
+        print(
+            f"Mail-loss counters: {written['fetch_gave_up']:,} given up,"
+            f" {written['quarantined']:,} quarantined"
+        )
+    return rc
 
 
 def cmd_retry_stubs(args):
@@ -2397,6 +2423,46 @@ def cmd_teams_sync(args):
     return 0
 
 
+def cmd_teams_backfill_replies(args):
+    """Store the replies stored channel posts hold in their payloads; no Teams call.
+
+    Channel replies came with every post and were dropped until #146, so they sit
+    only in the posts' raw_json. One-off, on the producer: it stores them through
+    the pull's own path, redaction included, and the threads that gain replies go
+    back to extraction, which the next teams-sync runs under its deadline.
+    """
+    from src.export.teams_export import backfill_channel_replies
+    from src.extract.teams_threads import bound_threads
+    from src.store.schema import get_connection
+
+    if not Path(args.db).exists():
+        print(f"Error: database not found: {args.db}", file=sys.stderr)
+        return 1
+    conn = get_connection(str(args.db))
+    try:
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'teams_messages'"
+        ).fetchone():
+            print("No Teams tables in this store: nothing to backfill.")
+            return 0
+        c = backfill_channel_replies(conn)
+        print(f"Channel posts read: {c['posts_read']:,} ({c['unreadable']:,} unreadable)")
+        print(
+            f"Replies found: {c['replies_found']:,}; {c['replies_stored']:,} stored, "
+            f"{c['replies_updated']:,} updated to a later version, "
+            f"{c['replies_found'] - c['replies_stored'] - c['replies_updated']:,} already stored"
+        )
+        print(f"Posts dated by their own compose time: {c['posts_redated']:,}")
+        b = bound_threads(conn)
+        print(
+            f"Threads: {b['threads_created']:,} new, {b['threads_updated']:,} queued for "
+            "extraction (the next teams-sync extracts them)"
+        )
+    finally:
+        conn.close()
+    return 0
+
+
 def cmd_whatsapp_sync(args):
     """Ingest the pushed WhatsApp snapshot, then bound, extract and embed sessions.
 
@@ -3472,10 +3538,12 @@ def main():
         help="List Outlook messages the store lacks; --refetch stages them (producer only)",
     )
     parser_reconcile.add_argument(
-        "--since", required=True, help="ISO date: mail received from then on, e.g. 2025-03-16"
+        "--since",
+        required=True,
+        help="Mail received from then on: an ISO date (2025-03-16) or a time before now (7d, 36h)",
     )
     parser_reconcile.add_argument(
-        "--until", default=None, help="ISO date, exclusive (default: now)"
+        "--until", default=None, help="ISO date or a time before now, exclusive (default: now)"
     )
     parser_reconcile.add_argument(
         "--folders", default="Archive,Sent Items,Inbox", help="Comma-separated Outlook folders"
@@ -3494,6 +3562,15 @@ def main():
     )
     parser_reconcile.add_argument(
         "--concurrency", type=int, default=2, help="get-mail calls at once (at most 2)"
+    )
+    parser_reconcile.add_argument(
+        "--health-json",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="Write the mail-loss counters the health check reads, even when the reconcile"
+        " fails (producer only; default path: <data home>/state/mail_loss.json)",
     )
     parser_reconcile.set_defaults(func=cmd_mail_reconcile)
 
@@ -3922,6 +3999,12 @@ def main():
     )
     parser_teams_sync.add_argument("--limit", type=int, help="Max threads to extract this run")
     parser_teams_sync.set_defaults(func=cmd_teams_sync)
+
+    parser_teams_backfill = subparsers.add_parser(
+        "teams-backfill-replies",
+        help="Store the channel replies stored posts hold (one-off, producer only, no Teams call)",
+    )
+    parser_teams_backfill.set_defaults(func=cmd_teams_backfill_replies)
 
     parser_teams_search = subparsers.add_parser("teams-search", help="Search Teams content")
     parser_teams_search.add_argument("query", help="Search query")

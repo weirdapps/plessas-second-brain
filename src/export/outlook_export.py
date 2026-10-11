@@ -7,13 +7,14 @@ path. Forward-only: historical data stays in the existing DB untouched.
 
 import logging
 import re
+import sqlite3
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from src.config import ATTACHMENTS_DIR, DATA_ROOT, REPO_ROOT
+from src.config import ATTACHMENTS_DIR, DATA_ROOT, DEFAULT_DB, REPO_ROOT
 from src.export.outlook_cli import (
     OutlookCliAuthRequired,
     OutlookCliError,
@@ -42,10 +43,33 @@ FETCH_MAX_ATTEMPTS = 5
 FETCH_RETRIES_PER_RUN = 50
 FETCH_GAVE_UP_KEPT = 200
 
+# The cursor is the newest ReceivedDateTime a run has seen. A message that turns
+# visible after a newer one was listed (held by a scanner, released from
+# quarantine) sits below it and was never listed again. Each run lists from this
+# far before the cursor and skips, before any get-mail, what is already held.
+CURSOR_OVERLAP = timedelta(hours=6)
+
 
 def parse_received_dt(iso: str) -> datetime:
     """Outlook returns ISO timestamps with Z suffix. Normalize for comparison."""
     return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+
+
+def _listing_start(cursor: str, overlap: timedelta) -> str:
+    """Where a listing starts: `overlap` before the cursor, in UTC with a Z.
+
+    A cursor that is not an ISO time is passed through as it is, as it always was.
+    """
+    if not overlap:
+        return cursor
+    try:
+        start = parse_received_dt(cursor)
+    except ValueError:
+        logger.warning("cursor %r is not an ISO time; listing from it with no overlap", cursor)
+        return cursor
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=UTC)
+    return (start - overlap).astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def list_new_messages(
@@ -54,9 +78,11 @@ def list_new_messages(
     max_results: int = 10000,
     select: str = DEFAULT_SELECT_FIELDS,
     allow_bootstrap: bool = False,
+    overlap: timedelta = timedelta(0),
 ) -> list[dict]:
     """
-    Fetch all message metadata received since the cursor in `state`.
+    Fetch all message metadata received since the cursor in `state`, from
+    `overlap` before it (run_hourly_sync passes CURSOR_OVERLAP).
 
     Bootstrap (no cursor) is gated by `allow_bootstrap` because silent partial
     sync is a footgun: a missing/corrupt state file would otherwise silently
@@ -65,7 +91,8 @@ def list_new_messages(
     """
     args = ["list-mail", "--folder", folder, "--select", select]
     if state.last_seen_received_at:
-        args.extend(["--since", state.last_seen_received_at, "--all", "--max", str(max_results)])
+        since = _listing_start(state.last_seen_received_at, overlap)
+        args.extend(["--since", since, "--all", "--max", str(max_results)])
     else:
         if not allow_bootstrap:
             raise BootstrapRequired(
@@ -247,9 +274,10 @@ def download_attachments_for_messages(
     For each message with HasAttachments=True, download the file payloads
     via `outlook-cli download-attachments` into base_dir/<message_id>/.
 
-    Returns a summary dict: {scanned, downloaded_messages, failed_messages}.
-    Failures are logged but do NOT raise — attachment availability is best-
-    effort, not part of the cursor-advance contract.
+    Returns a summary dict: {scanned, downloaded_messages, failed_messages,
+    timed_out}, the last the ids whose download ran out of time. Failures are
+    logged but do NOT raise — attachment availability is best-effort, not part of
+    the cursor-advance contract.
     """
     if base_dir is None:
         base_dir = ATTACHMENTS_DIR
@@ -258,6 +286,7 @@ def download_attachments_for_messages(
     targets = [m for m in messages if m.get("HasAttachments")]
     downloaded = 0
     failed = 0
+    timed_out: list[str] = []
     for msg in targets:
         msg_id = msg.get("Id")
         if not msg_id:
@@ -283,10 +312,18 @@ def download_attachments_for_messages(
         except OutlookCliError as e:
             logger.warning("download-attachments failed for %s: %s", msg_id, e)
             failed += 1
+        except subprocess.TimeoutExpired as e:
+            # One slow download must not end the run. Uncaught, it skipped the
+            # cursor save, so the folder re-listed a growing window every run and
+            # never got past this message. The caller owes it a retry instead.
+            logger.warning("download-attachments timed out for %s after %ss", msg_id, e.timeout)
+            failed += 1
+            timed_out.append(msg_id)
     return {
         "scanned": len(targets),
         "downloaded_messages": downloaded,
         "failed_messages": failed,
+        "timed_out": timed_out,
     }
 
 
@@ -297,10 +334,15 @@ def run_hourly_sync(
     concurrency: int = 5,
     fetch_attachments: bool = True,
     allow_bootstrap: bool = False,
+    db_path: Path | None = None,
+    staging_dir: Path | None = None,
 ) -> dict:
     """
     Top-level entry. Idempotent: state cursor only advances after DB commit.
     Returns a summary dict for logging.
+
+    `db_path` and `staging_dir` are where the store and the staging batches are
+    read, to skip what they already hold (default: the data home's).
     """
     state = load_outlook_sync_state(state_path)
     # Refused before anything is saved, so the other folder's cursor survives.
@@ -319,12 +361,13 @@ def run_hourly_sync(
         # 1. Pre-flight auth check
         run_outlook_cli(["auth-check"])
 
-        # 2. List new metadata
+        # 2. List new metadata, from CURSOR_OVERLAP before the cursor
         summaries = list_new_messages(
             state,
             folder=folder,
             max_results=max_results,
             allow_bootstrap=allow_bootstrap,
+            overlap=CURSOR_OVERLAP,
         )
 
         # 2b. Saturation check — if we hit the cap, the cursor would skip past
@@ -337,19 +380,31 @@ def run_hourly_sync(
                 "Re-run with --max larger than the actual backlog, or backfill explicitly."
             )
         listed = {s["Id"] for s in summaries}
+        # 2c. The overlap lists again what earlier runs took: skip what the store
+        # or a staging batch already holds, before any get-mail. A message owed a
+        # retry is fetched all the same (its attachments may still be owed).
+        held = _held_ids(
+            listed - set(state.fetch_retries),
+            db_path or DEFAULT_DB,
+            staging_dir or DATA_ROOT / "staging",
+        )
+        to_fetch = [s for s in summaries if s["Id"] not in held]
+        if held:
+            logger.info("%s: %d listed messages already held, not fetched again", folder, len(held))
         retry_ids = [i for i in state.fetch_retries if i not in listed][:FETCH_RETRIES_PER_RUN]
-        if not summaries and not retry_ids:
+        if not to_fetch and not retry_ids:
+            _advance_cursor(state, summaries)
             state.last_sync_completed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
             state.messages_in_last_run = 0
             state.consecutive_failures = 0
             save_outlook_sync_state(state_path, state)
-            return {"messages": 0, "status": "ok"}
+            return {"messages": 0, "skipped": len(held), "status": "ok"}
 
         # 3. Fetch full bodies concurrently, with the messages earlier runs could
         # not fetch. A failure comes back as None (logged): one bad message must
         # not crash the run, or the cursor wedges and the whole mailbox goes stale.
         # It is recorded instead, and fetched by its id on a later run.
-        ids = [m["Id"] for m in summaries] + retry_ids
+        ids = [m["Id"] for m in to_fetch] + retry_ids
         full_messages = [
             m for m in fetch_bodies_concurrent(ids, concurrency=concurrency) if m is not None
         ]
@@ -366,40 +421,46 @@ def run_hourly_sync(
         # 4. Commit to DB (staging). Skip when everything in the window was dropped.
         if full_messages:
             commit_messages_to_db(full_messages, folder=folder)
-        # Once staged: a run that fails before this leaves the record as it was.
-        _note_fetch_failures(state, summaries, fetched, failed, counted=bool(full_messages))
 
         # 4b. Download attachments for messages that have them.
         # This is post-commit because attachment availability is best-effort —
-        # if it fails, we still want the bodies in staging. Cursor still advances
-        # in step 5; missed attachments can be backfilled by message_id later.
-        attachment_summary = {
+        # if it fails, we still want the bodies in staging. A download that ran
+        # out of time owes its message a retry, counted like a failed get-mail, so
+        # a later run downloads it again until FETCH_MAX_ATTEMPTS gives up on it.
+        attachment_summary: dict = {
             "scanned": 0,
             "downloaded_messages": 0,
             "failed_messages": 0,
+            "timed_out": [],
         }
         if fetch_attachments and full_messages:
             try:
                 attachment_summary = download_attachments_for_messages(full_messages)
-            except OutlookCliAuthRequired:
-                # Auth died mid-attachment-fetch. Cursor hasn't advanced yet,
-                # so re-raise and let the caller record the failure. We accept
-                # that the bodies in staging will be re-extracted on retry.
+            except BaseException:
+                # Auth died mid-attachment-fetch, or worse. Cursor hasn't advanced
+                # yet, so re-raise and let the caller record the failure. The
+                # bodies are staged, though, and the held check skips staged mail:
+                # owe each a retry, uncounted, or its attachments never come.
+                owed = [m["Id"] for m in full_messages if m.get("HasAttachments")]
+                _note_fetch_failures(
+                    state, to_fetch, fetched - set(owed), [*failed, *owed], counted=False
+                )
                 raise
+        timed_out = list(attachment_summary.get("timed_out") or [])
+        # Once staged: a run that fails before this leaves the record as it was.
+        _note_fetch_failures(
+            state,
+            to_fetch,
+            fetched - set(timed_out),
+            [*failed, *timed_out],
+            counted=bool(full_messages),
+        )
 
         # 5. Update state cursor — advance over the full SEEN window (summaries
         # always carry ReceivedDateTime), not just the bodies we fetched, so a
         # failed message can't wedge the cursor and stall the mailbox: it is in
         # state.fetch_retries. A run that only fetched retries leaves it alone.
-        if summaries:
-            latest_received = max(parse_received_dt(s["ReceivedDateTime"]) for s in summaries)
-            latest_id = next(
-                s["Id"]
-                for s in summaries
-                if parse_received_dt(s["ReceivedDateTime"]) == latest_received
-            )
-            state.last_seen_received_at = latest_received.isoformat().replace("+00:00", "Z")
-            state.last_seen_message_id = latest_id
+        _advance_cursor(state, summaries)
         state.messages_in_last_run = len(full_messages)
         state.last_sync_completed_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         state.consecutive_failures = 0
@@ -408,6 +469,7 @@ def run_hourly_sync(
             "messages": len(full_messages),
             "failed": len(failed),
             "retried": len(retry_ids),
+            "skipped": len(held),
             "attachments": attachment_summary,
             "status": "ok",
         }
@@ -416,10 +478,85 @@ def run_hourly_sync(
         state.consecutive_failures += 1
         save_outlook_sync_state(state_path, state)
         raise
-    except (OSError, OutlookCliError, RuntimeError):
+    # TimeoutExpired is not an OSError: uncaught here, a timed-out listing never
+    # counted as a failure.
+    except (OSError, OutlookCliError, RuntimeError, subprocess.TimeoutExpired):
         state.consecutive_failures += 1
         save_outlook_sync_state(state_path, state)
         raise
+
+
+def _advance_cursor(state: OutlookSyncState, summaries: list[dict]) -> None:
+    """Move the cursor to the newest listed message, and never back.
+
+    Listing from before the cursor, a run can see nothing newer than it: the
+    cursor's own message may have left the folder since.
+    """
+    if not summaries:
+        return
+    latest = max(summaries, key=lambda s: parse_received_dt(s["ReceivedDateTime"]))
+    latest_received = parse_received_dt(latest["ReceivedDateTime"])
+    if state.last_seen_received_at:
+        try:
+            if parse_received_dt(state.last_seen_received_at) >= latest_received:
+                return
+        except (TypeError, ValueError):
+            pass  # an unreadable cursor is replaced, as it always was
+    state.last_seen_received_at = latest_received.isoformat().replace("+00:00", "Z")
+    state.last_seen_message_id = latest["Id"]
+
+
+def _held_ids(ids: Iterable[str], db_path: Path, staging_dir: Path) -> set[str]:
+    """The Graph ids among `ids` the store or a staging batch already holds.
+
+    By Graph id only: a copy under another id (a move mints a new one) is still
+    fetched, because staging it is how the loader records the alias and the new
+    folder. Best effort and read-only: a store that cannot be read holds nothing
+    here, so the message is fetched as before and the loader's own check drops it.
+    """
+    wanted = {i for i in ids if i}
+    if not wanted:
+        return set()
+    # mail_reconcile imports this module, so its reader is imported here.
+    from src.export.mail_reconcile import read_staged
+
+    held = wanted & read_staged(staging_dir)[0]
+    rest = sorted(wanted - held)
+    if not rest or not db_path.exists():
+        return held
+    from src.store.sql_readonly import connect_read_only
+
+    try:
+        conn = connect_read_only(db_path)
+    except (OSError, sqlite3.Error) as e:
+        logger.warning("cannot read %s to skip held messages: %s", db_path, e)
+        return held
+    try:
+        has_aliases = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'email_aliases'"
+        ).fetchone()
+        for start in range(0, len(rest), 500):
+            chunk = rest[start : start + 500]
+            marks = ",".join("?" * len(chunk))
+            held.update(
+                str(r[0])
+                for r in conn.execute(
+                    f"SELECT message_id FROM emails WHERE message_id IN ({marks})", chunk
+                )
+            )
+            if has_aliases:
+                held.update(
+                    str(r[0])
+                    for r in conn.execute(
+                        f"SELECT message_id FROM email_aliases WHERE message_id IN ({marks})",
+                        chunk,
+                    )
+                )
+    except sqlite3.Error as e:
+        logger.warning("cannot read %s to skip held messages: %s", db_path, e)
+    finally:
+        conn.close()
+    return held
 
 
 def _note_fetch_failures(
@@ -446,9 +583,12 @@ def _note_fetch_failures(
             entry["attempts"] += 1
         if entry["attempts"] >= FETCH_MAX_ATTEMPTS:
             del state.fetch_retries[message_id]
-            state.fetch_gave_up = [*state.fetch_gave_up, {"id": message_id, **entry}][
-                -FETCH_GAVE_UP_KEPT:
-            ]
+            # Dated, so a health check can tell a fresh give-up from the kept history.
+            gave_up_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+            state.fetch_gave_up = [
+                *state.fetch_gave_up,
+                {"id": message_id, **entry, "gave_up_at": gave_up_at},
+            ][-FETCH_GAVE_UP_KEPT:]
             logger.error(
                 "%s: gave up fetching %s (received %s) after %d runs; "
                 "`python -m src.cli mail-reconcile` lists the messages the store lacks",
@@ -533,6 +673,12 @@ def main() -> int:
         help="Allow first-run bootstrap (top 100 most recent) when no cursor "
         "exists. Without this flag, missing-cursor errors fast.",
     )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help="The store, read to skip the messages it holds (default: the data home's)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -550,6 +696,7 @@ def main() -> int:
                 max_results=args.max_results,
                 concurrency=args.concurrency,
                 allow_bootstrap=args.bootstrap,
+                db_path=args.db,
             )
             logger.info("Sync complete: %s", result)
             return 0
@@ -560,6 +707,11 @@ def main() -> int:
             return 4
         except OutlookCliError as e:
             logger.error("outlook-cli error (exit %d): %s", e.exit_code, e.stderr)
+            return 5
+        # A listing that ran out of time is the upstream misbehaving, as an
+        # outlook-cli error is; it used to fall to the generic handler and exit 1.
+        except subprocess.TimeoutExpired as e:
+            logger.error("outlook-cli timed out after %ss: %s", e.timeout, e.cmd)
             return 5
         except BootstrapRequired as e:
             logger.error("Bootstrap required: %s", e)

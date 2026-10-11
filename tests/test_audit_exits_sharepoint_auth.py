@@ -13,6 +13,7 @@ import pytest
 
 from src import cli
 from src.export.sharepoint_fetcher import SharepointFetchResult
+from src.pipeline import EXIT_REAUTH
 from src.store.schema import create_database
 
 URL = "https://contoso.sharepoint.com/:w:/g/sites/Team/Edeck"
@@ -44,7 +45,7 @@ def _run(db_path, status):
 
 
 def test_an_expired_session_returns_the_reauth_code(tmp_path):
-    assert _run(_db_with_one_link(tmp_path), "auth-required") == cli.EXIT_REAUTH == 4
+    assert _run(_db_with_one_link(tmp_path), "auth-required") == EXIT_REAUTH == 4
 
 
 def test_an_ordinary_fetch_failure_still_returns_zero(tmp_path):

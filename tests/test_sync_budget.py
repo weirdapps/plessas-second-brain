@@ -22,7 +22,8 @@ run was 1 min 20 s of CPU across 11 min 30 s of wall clock.
 
 import pytest
 
-from src.cli import (
+from src.llm_deadline import _UNIT_TIMEOUT_SECONDS
+from src.pipeline.sync import (
     CONVERSATION_SYNC_DEADLINE_S,
     EXTRACT_DEADLINE_BY_UNIT_S,
     EXTRACT_SYNC_DEADLINE_S,
@@ -33,7 +34,6 @@ from src.cli import (
     SYNC_UNIT_TIMEOUT_S,
     SYNC_WRAPPER_FETCH_OBSERVED_S,
 )
-from src.llm_deadline import _UNIT_TIMEOUT_SECONDS
 
 
 def _sync_command_s(extract_s: float) -> float:
@@ -105,9 +105,9 @@ def test_cmd_sync_actually_passes_the_conversation_deadline():
     all, so the default `limit=0` ran the whole pending list unbounded."""
     import inspect
 
-    from src import cli
+    from src.pipeline import sync
 
-    src = inspect.getsource(cli.cmd_sync)
+    src = inspect.getsource(sync.run)
 
     assert "run_conversation_extraction(" in src
     assert "CONVERSATION_SYNC_DEADLINE_S" in src
@@ -131,7 +131,7 @@ def test_conversation_extraction_accepts_a_deadline():
 # was restored. Asserting the sum is what stops that being discovered in
 # production ten minutes at a time.
 
-from src.cli import (  # noqa: E402
+from src.pipeline.teams_sync import (  # noqa: E402
     TEAMS_BOUND_OBSERVED_S,
     TEAMS_DISCOVER_OBSERVED_S,
     TEAMS_EMBED_OBSERVED_S,

@@ -172,9 +172,9 @@ def test_phase2_can_leave_long_texts_for_later(tmp_path, monkeypatch):
 
 
 def test_the_hourly_sync_leaves_long_texts_for_the_nightly_pass():
-    from src import cli
+    from src.pipeline import sync
 
-    source = inspect.getsource(cli)
+    source = inspect.getsource(sync)
     at = source.index("deadline_s=PHASE2_SYNC_DEADLINE_S")
     assert "max_text_chars=LONG_TEXT_CHARS" in source[at - 200 : at + 200]
 

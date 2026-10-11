@@ -38,7 +38,7 @@ def test_sync_registers_outlook_downloads_and_never_drives_mail_app(
     conn.commit()
     conn.close()
     monkeypatch.setattr(sys, "platform", platform)
-    monkeypatch.setattr("src.cli.DATA_ROOT", tmp_path)
+    monkeypatch.setattr("src.pipeline.sync.DATA_ROOT", tmp_path)
     # Stand-ins, so a sync that still reaches for Mail.app fails here instead of
     # driving the real one.
     for name, function in [

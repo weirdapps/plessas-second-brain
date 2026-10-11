@@ -37,7 +37,7 @@ def store(tmp_path, monkeypatch):
     )
     conn.commit()
     conn.close()
-    monkeypatch.setattr("src.cli.DATA_ROOT", tmp_path)
+    monkeypatch.setattr("src.pipeline.sync.DATA_ROOT", tmp_path)
     return db_path
 
 

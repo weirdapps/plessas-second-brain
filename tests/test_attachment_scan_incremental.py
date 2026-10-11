@@ -151,8 +151,8 @@ def test_sync_scans_the_directories_of_the_mail_it_loaded(tmp_path, monkeypatch)
     conn.close()
     attachments = tmp_path / "attachments"
     _downloaded(attachments, "AAMk-late", "late.pdf", days_ago=2)
-    monkeypatch.setattr("src.cli.DATA_ROOT", tmp_path)
-    monkeypatch.setattr("src.cli.ATTACHMENTS_DIR", attachments)
+    monkeypatch.setattr("src.pipeline.sync.DATA_ROOT", tmp_path)
+    monkeypatch.setattr("src.pipeline.sync.ATTACHMENTS_DIR", attachments)
     monkeypatch.setattr(llm_deadline, "_detect_systemd_unit", lambda: None)
 
     def load(*args, **kwargs):

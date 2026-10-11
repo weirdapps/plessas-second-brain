@@ -330,7 +330,7 @@ def _sync(data):
         )
 
     with (
-        patch.object(cli, "DATA_ROOT", data.root),
+        patch("src.pipeline.sync.DATA_ROOT", data.root),
         patch.object(llm_deadline, "_detect_systemd_unit", return_value=None),
         patch("src.extract.local.run_extraction", return_value=ok),
         patch("src.store.loader.load_extractions", return_value=0),
@@ -379,7 +379,7 @@ def test_sync_loads_what_waits_in_staging_when_the_export_staged_nothing_new(dat
     ok = {"extracted": 0, "failed": 0, "quota_paused": False}
     waiting = {"exported": 0, "skipped": 0, "agents": 0, "errors": 0, "pending": 1, "staged": []}
     with (
-        patch.object(cli, "DATA_ROOT", data.root),
+        patch("src.pipeline.sync.DATA_ROOT", data.root),
         patch.object(llm_deadline, "_detect_systemd_unit", return_value=None),
         patch("src.extract.local.run_extraction", return_value=ok),
         patch("src.store.loader.load_extractions", return_value=0),

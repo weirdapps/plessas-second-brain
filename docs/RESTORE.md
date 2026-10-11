@@ -143,7 +143,8 @@ python -c 'from src.config import DEFAULT_DB; from src.store.schema import get_c
 and WhatsApp sessions are embedded by their own builders, which pick up every
 thread whose vector is missing from the index, so after the `mv` they rebuild in
 full. Skip either and its vectors come back only as its sync re-adds them, at
-most 500 a run (`TEAMS_EMBED_LIMIT`, `WHATSAPP_EMBED_LIMIT` in `src/cli.py`).
+most 500 a run (`TEAMS_EMBED_LIMIT` in `src/pipeline/teams_sync.py`,
+`WHATSAPP_EMBED_LIMIT` in `src/pipeline/whatsapp_sync.py`).
 
 The rebuild sends every summary to the embedding model again (about 140,000 texts
 on the reference producer), so run it on the producer with the environment its
@@ -162,7 +163,7 @@ mail it already holds by message id.
 
 The two timestamps are in different zones, so do not copy one into the other.
 `last_sync_date` is the producer's local wall-clock time with no zone
-(`src/cli.py` writes `datetime.now()`), while `last_seen_received_at` is UTC
+(`src/pipeline/sync.py` writes `datetime.now()`), while `last_seen_received_at` is UTC
 with a trailing `Z`. Appending a `Z` to the local time moves the cursor hours
 forward, and the mail in those hours is skipped for good. Subtract at least one
 export interval as well, because mail received after the last export before

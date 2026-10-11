@@ -603,6 +603,9 @@ the marked images that are on disk, and `reextract --garbled` the marked scans, 
 (`--dry-run`). **Re-fetching a swept original from Exchange is the owner's step**: put the file
 back at the path its row records (`attachments.file_path`, or the same directory and name under
 `data/attachments`), then run the same two commands. Nothing here downloads from the mailbox.
+`ocr-regarble --apply` changes only what it has not changed before, so it can be run again: do so
+after a large `reextract` pass, since a re-read that newly marks a row summarised earlier leaves
+that summary for it to clear (Phase 2 never makes a new one).
 
 **SharePoint links by kind.** A file behind a sharing or viewer link is downloaded by
 `sharepoint-cli get`, which resolves the link through its viewer page; an intranet page is read

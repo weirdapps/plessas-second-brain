@@ -44,6 +44,7 @@ from src.export.outlook_attachments import (  # noqa: E402
     ORPHAN_GRACE_DAYS,
     is_abandoned_orphan,
 )
+from src.store.attachment_backlog import attachment_backlog  # noqa: E402
 from src.store.file_hashes import sha256_of_file  # noqa: E402
 from src.store.schema import SUMMARISED_ATTACHMENT_IDS_SQL  # noqa: E402
 
@@ -867,19 +868,12 @@ def check_attachment_lag(db):
     days: 15-63% of a day's attachments got their text more than six hours after they
     were downloaded, the slowest after 45 hours, and nothing said so. The text queue is
     Phase 1's own (an attachment with no content row); the summary queue is extracted
-    text still waiting for the model. Neither reads a finished attachment's stored text:
-    the first is answered from an index, and the second reads only the rows still
-    waiting, the same rows check_attachments counts as pending.
+    text still waiting for the model, the same rows check_attachments counts as pending.
+    Both come from src/store/attachment_backlog.py, which the MCP `stats` tool reads too,
+    and neither reads a finished attachment's stored text.
     """
     try:
-        text_n, text_oldest = db.execute(
-            "SELECT COUNT(*), MIN(a.exported_at) FROM attachments a "
-            "LEFT JOIN attachment_content ac ON ac.attachment_id = a.id WHERE ac.id IS NULL"
-        ).fetchone()
-        summary_n, summary_oldest = db.execute(
-            "SELECT COUNT(*), MIN(extracted_at) FROM attachment_content "
-            "WHERE extraction_status = 'extracted' AND llm_status = 'pending'"
-        ).fetchone()
+        (text_n, text_oldest), (summary_n, summary_oldest) = attachment_backlog(db)
     except sqlite3.OperationalError as e:
         # Same posture as check_attachments: main() runs the checks unguarded.
         return {"name": "Attachment lag", "status": "WARN", "note": f"unreadable: {e}"}

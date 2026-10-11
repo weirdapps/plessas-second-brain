@@ -172,6 +172,7 @@ class Stats(TypedDict, total=False):
     total_action_items: int
     earliest_email: Any
     latest_email: Any
+    source_class: dict[str, int] | str
     coverage: dict[str, Any]
     data_as_of: Any
     age_hours: Any

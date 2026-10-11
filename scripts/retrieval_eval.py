@@ -104,7 +104,12 @@ def run_set(conn: sqlite3.Connection, items: list[dict]) -> tuple[dict, list[dic
     register_sql_functions(conn)
     ranks, thread_ranks, misses = [], [], []
     for item in items:
-        results = query_by_keyword(conn, item["query"], limit=10)
+        # Every class, as before v33: a set built before it may hold the owner's
+        # automation mail, which search_emails now leaves out unless asked, and a
+        # class left out is no tokenising regression.
+        results = query_by_keyword(
+            conn, item["query"], limit=10, include_news=True, include_automation=True
+        )
         rank = rank_of(results, {item["email_id"]})
         thread_rank = rank_of(results, thread_of(conn, item["email_id"]))
         ranks.append(rank)

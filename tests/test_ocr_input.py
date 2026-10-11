@@ -22,13 +22,18 @@ WORDS = "Branch network review for the coming quarter, read from a scanned page"
 
 
 def _tesseract(monkeypatch, reads_in):
-    """Tesseract that finds WORDS in an image whose mode is in `reads_in`, nothing in others."""
+    """Tesseract that finds WORDS in an image whose mode is in `reads_in`, nothing in others.
+
+    `seen` holds the Greek-first reads. WORDS is English, so a read that finds it is read once
+    more English first (attachment_extractors.OCR_LANGS), and that second read is not counted.
+    """
     seen = []
 
     def fake(image, lang):
-        copy = image.copy()
-        copy.format = image.format  # copy() drops it
-        seen.append(copy)
+        if lang == ax.OCR_LANGS:
+            copy = image.copy()
+            copy.format = image.format  # copy() drops it
+            seen.append(copy)
         return WORDS if image.mode in reads_in else ""
 
     monkeypatch.setattr("pytesseract.image_to_string", fake)

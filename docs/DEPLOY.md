@@ -18,8 +18,9 @@ on a single host or split across two (see "Topology" below).
   count reports.
 - `zstd` and `openssl`, if you want encrypted offsite backups.
 
-**Tesseract is not optional if you ingest attachments.** Attachment OCR calls
-`pytesseract.image_to_string(img, lang="eng+ell")`
+**Tesseract is not optional if you ingest attachments.** Attachment OCR reads
+Greek first, `pytesseract.image_to_string(img, lang="ell+eng")`, and reads a page
+that comes out as Latin script again with `lang="eng+ell"`
 (`src/extract/attachment_extractors.py`), so both the English and the Greek
 traineddata must be installed or every image and every scanned PDF fails. `pip`
 installs the `pytesseract` wrapper, never the binary and never a language pack.
@@ -589,6 +590,22 @@ one. Run it in batches (`--limit 150`, as the stage 2 chain does), since Phase 2
 refresh run at the end of each batch. A re-read that changes nothing is not summarised again; one
 that comes back shorter or empty keeps the stored row. Count first with
 `reextract --partial --dry-run`.
+
+**Greek read as Latin letters.** OCR reads Greek first, and a text PDF's scanned pages (a
+page with under 50 characters of text that shows an image) are OCR'd inside the file's budget.
+An OCR reading that is Greek in Latin look-alike letters ("kal" for «και») is stored with the
+`ocr_garbled` mark in `extraction_error` and `llm_status = 'skipped'`: Phase 2 does not summarise
+it and the sweep keeps its file (README, "Greek read as Latin letters"). For the texts read before
+this change, on the producer: `python -m src.cli ocr-regarble` counts them and lists the
+attachment ids whose files are on disk or swept; `ocr-regarble --apply` marks them and clears
+their summaries, decisions, actions, facts and vectors. Then `transcribe-images --limit 0` reads
+the marked images that are on disk, and `reextract --garbled` the marked scans, with a count first
+(`--dry-run`). **Re-fetching a swept original from Exchange is the owner's step**: put the file
+back at the path its row records (`attachments.file_path`, or the same directory and name under
+`data/attachments`), then run the same two commands. Nothing here downloads from the mailbox.
+`ocr-regarble --apply` changes only what it has not changed before, so it can be run again: do so
+after a large `reextract` pass, since a re-read that newly marks a row summarised earlier leaves
+that summary for it to clear (Phase 2 never makes a new one).
 
 **SharePoint links by kind.** A file behind a sharing or viewer link is downloaded by
 `sharepoint-cli get`, which resolves the link through its viewer page; an intranet page is read

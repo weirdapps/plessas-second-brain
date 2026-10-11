@@ -21,6 +21,10 @@
             .docx and .pptx the library readers failed on, images that would not open
     ocr     scans and images whose OCR found too little text, read again for the grayscale
             second pass. Thousands of rows on the producer: run it in batches
+    garbled OCR text marked as Greek read as Latin look-alike letters (src/extract/ocr_garble.py),
+            read again Greek first. A reading no longer marked replaces the stored text whatever
+            its length and is summarised; one still marked stays unsummarised. The marks come
+            from Phase 1 and from `ocr-regarble --apply` (src/extract/ocr_regarble.py)
 
 A row is updated in place, so its id, and the vector keyed on it, stay its own. A re-read that
 comes back with no text leaves a row that already had text untouched (counted as kept): a
@@ -60,13 +64,15 @@ from src.extract.attachment_pipeline import (
     LONG_TEXT_CHARS,
     _connect,
     estimate_summaries,
+    llm_status_for,
     mark_full_parts,
     run_phase2,
 )
+from src.extract.ocr_garble import is_garbled
 from src.llm_cost import TokenBudget
 from src.redact import redact_secrets
 from src.store.file_hashes import locate_file
-from src.store.file_sweep import PARTIAL_SINCE_KEY, PARTIAL_SQL, UNREAD_SQL
+from src.store.file_sweep import OCR_GARBLED_SQL, PARTIAL_SINCE_KEY, PARTIAL_SQL, UNREAD_SQL
 
 OLD_TEXT_CAP = 100_000
 
@@ -127,6 +133,8 @@ SELECTORS: dict[str, tuple[str, bool]] = {
         " AND ac.extraction_error = 'Insufficient text extracted'))",
         True,
     ),
+    # A text-only document kept no file to read again.
+    "garbled": (f"{OCR_GARBLED_SQL} AND a.file_path NOT LIKE 'text:%'", True),
 }
 
 # The images pass owns these rows (src/extract/image_*.py): never selected, never written.
@@ -290,20 +298,25 @@ def reextract(
                     stats["unchanged" if tuple(before) == verdict else "relabelled"] += 1
                 continue
             text = redact_secrets(result["text"])
-            stored, stored_method = conn.execute(
-                "SELECT extracted_text, extraction_method FROM attachment_content WHERE id = ?",
+            stored, stored_method, stored_error = conn.execute(
+                "SELECT extracted_text, extraction_method, extraction_error"
+                " FROM attachment_content WHERE id = ?",
                 (ac_id,),
             ).fetchone()
+            # A reading no longer marked as Greek read as Latin look-alikes replaces one that was,
+            # whatever its length: the stored text's words were wrong, not too few.
+            mended = is_garbled(stored_error) and not is_garbled(result["error"])
             # A reader that says it stopped early (pages left unread) has not read it again.
             close = (
                 bool(stored)
+                and not mended
                 and not result["error"]
                 and ocr_close(stored_method, result["method"], stored, text)
             )
-            if stored and len(text) < len(stored) and not close:
+            if stored and len(text) < len(stored) and not close and not mended:
                 stats["kept"] += 1
                 continue
-            if has_text and (text == stored or close):
+            if has_text and not mended and (text == stored or close):
                 # Read again and found the same: only when, and by what, is new.
                 conn.execute(
                     "UPDATE attachment_content SET extraction_method = ?, extraction_status = ?,"
@@ -316,7 +329,7 @@ def reextract(
             done = conn.execute(
                 f"""UPDATE attachment_content
                    SET extracted_text = ?, extraction_method = ?, extraction_status = ?,
-                       extraction_error = ?, extracted_at = ?, llm_status = 'pending',
+                       extraction_error = ?, extracted_at = ?, llm_status = ?,
                        llm_error = NULL
                    WHERE id = ? AND {NOT_VISION}""",
                 (
@@ -325,6 +338,7 @@ def reextract(
                     result["status"],
                     result["error"],
                     now,
+                    llm_status_for(result["error"]),
                     ac_id,
                 ),
             ).rowcount

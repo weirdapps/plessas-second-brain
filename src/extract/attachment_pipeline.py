@@ -15,8 +15,8 @@ import shutil
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable
-from datetime import UTC, datetime
+from collections.abc import Iterable, Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -109,6 +109,22 @@ TEXT_PASS_KEY = "attachment_text_pass_at"
 # How recent that pass must be: two nights, so one skipped night does not bring images and
 # archives back into the hourly slice, and a pass that stopped for good is noticed in two days.
 TEXT_PASS_FRESH_HOURS = 48.0
+
+# A Vertex AI batch job (src/extract/vertex_batch.py) holds the rows it was sent for: a
+# sync_metadata row per content row, key BATCH_HOLD_KEY + its id, value the job's key, which
+# starts with the time it was sent (BATCH_KEY_TIME, UTC), so it needs no schema change. Phase 2
+# leaves a held row to its job, so no summary is paid for twice, until the job is collected or
+# BATCH_HOLD_HOURS pass: Vertex returns a job's results within 24 hours, and a job nobody
+# collects must not keep its rows from the online pass for good.
+BATCH_HOLD_KEY = "attachment_batch:"
+BATCH_HOLD_HOURS = 48
+BATCH_KEY_TIME = "%Y%m%dT%H%M%SZ"
+
+
+def batch_hold_cutoff(now: datetime | None = None) -> str:
+    """The oldest job key whose rows are still held: BATCH_HOLD_HOURS before now (UTC)."""
+    now = now or datetime.now(UTC)
+    return (now - timedelta(hours=BATCH_HOLD_HOURS)).strftime(BATCH_KEY_TIME)
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -416,38 +432,39 @@ def run_phase1(
     return stats
 
 
-def _complete_and_parse(prompt: str | Request, budget: TokenBudget | None = None) -> dict:
-    """One Phase 2 model call, parsed into an extraction.
+# What a Phase 2 call in shape v1 may answer with. Dense documents (large spreadsheets/decks)
+# yield long extraction JSON; 2048 truncated it mid-structure on ~40K-char docs, so every such
+# attachment failed with "Expecting ',' delimiter". Give the structured output room to
+# complete; parse_extraction additionally salvages any residual truncation rather than
+# dropping the summary.
+V1_MAX_TOKENS = 8192
 
-    With a budget the call is held against it before it is sent, and raises OverBudget instead
-    of being sent when it does not fit; once answered it is charged what the response reports.
-    A Request is a call in shape v2 (src/extract/call_shape.py), and goes to
-    _complete_and_parse_v2.
-    """
+
+def call_kwargs(prompt: str | Request) -> dict:
+    """What complete() is given for a Phase 2 call: the v1 prompt as the user turn, or the v2
+    request at its first budget. A batch job (src/extract/vertex_batch.py) sends the same."""
     if isinstance(prompt, Request):
-        return _complete_and_parse_v2(prompt, budget)
+        return prompt.kwargs(max_tokens_attempts(prompt.route)[0])
+    return {"max_tokens": V1_MAX_TOKENS, "messages": [{"role": "user", "content": prompt}]}
 
-    from src.extract.claude_extract import _response_text, complete
-    from src.extract.parser import parse_extraction
 
-    held = budget.reserve(len(prompt)) if budget is not None else 0
-    try:
-        response = complete(
-            # Dense documents (large spreadsheets/decks) yield long extraction
-            # JSON; 2048 truncated it mid-structure on ~40K-char docs, so every
-            # such attachment failed with "Expecting ',' delimiter". Give the
-            # structured output room to complete; parse_extraction additionally
-            # salvages any residual truncation rather than dropping the summary.
-            max_tokens=8192,
-            messages=[{"role": "user", "content": prompt}],
+def parse_reply(prompt: str | Request, response: Any) -> dict:
+    """A Phase 2 reply parsed into an extraction, as the online path parses one, a batch
+    job's reply (src/extract/vertex_batch.py) alike.
+
+    v1: the first text block, a Markdown fence around it taken off, through parse_extraction,
+    which salvages a reply cut short. v2: a refusal raises ExtractionRefused, naming its
+    category; any other reply goes through parse_extraction_v2, salvaged as v1 salvages one.
+    """
+    from src.extract.claude_extract import _response_text, refusal_error
+    from src.extract.parser import parse_extraction, parse_extraction_v2
+
+    if isinstance(prompt, Request):
+        if getattr(response, "stop_reason", None) == "refusal":
+            raise refusal_error(response)
+        return parse_extraction_v2(
+            _response_text(response), kind="attachment", source=prompt.source
         )
-    except BaseException:
-        if budget is not None:
-            budget.release(held)
-        raise
-    if budget is not None:
-        budget.settle(held, getattr(response, "usage", None))
-
     # _response_text, never content[0]. With extended thinking the model leads the
     # content list with a ThinkingBlock, which carries .thinking and no .text, so
     # content[0].text raised "'ThinkingBlock' object has no attribute 'text'".
@@ -463,14 +480,38 @@ def _complete_and_parse(prompt: str | Request, budget: TokenBudget | None = None
     return parse_extraction(raw_text)
 
 
+def _complete_and_parse(prompt: str | Request, budget: TokenBudget | None = None) -> dict:
+    """One Phase 2 model call, parsed into an extraction.
+
+    With a budget the call is held against it before it is sent, and raises OverBudget instead
+    of being sent when it does not fit; once answered it is charged what the response reports.
+    A Request is a call in shape v2 (src/extract/call_shape.py), and goes to
+    _complete_and_parse_v2.
+    """
+    if isinstance(prompt, Request):
+        return _complete_and_parse_v2(prompt, budget)
+
+    from src.extract.claude_extract import complete
+
+    held = budget.reserve(len(prompt)) if budget is not None else 0
+    try:
+        response = complete(**call_kwargs(prompt))
+    except BaseException:
+        if budget is not None:
+            budget.release(held)
+        raise
+    if budget is not None:
+        budget.settle(held, getattr(response, "usage", None))
+    return parse_reply(prompt, response)
+
+
 def _complete_and_parse_v2(request: Request, budget: TokenBudget | None = None) -> dict:
     """_complete_and_parse in call shape v2. A reply stopped at max_tokens is asked once
     more at twice the budget, and each billed call is held against the run's token budget
     and charged on its own. A reply still cut short is salvaged by the parser, as v1 does
     for a document: Phase 2 never asks a failed attachment again. A refusal raises
     ExtractionRefused, naming its category."""
-    from src.extract.claude_extract import _response_text, complete, refusal_error
-    from src.extract.parser import parse_extraction_v2
+    from src.extract.claude_extract import complete
 
     for max_tokens in max_tokens_attempts(request.route):
         held = budget.reserve(request.chars) if budget is not None else 0
@@ -484,9 +525,7 @@ def _complete_and_parse_v2(request: Request, budget: TokenBudget | None = None) 
             budget.settle(held, getattr(response, "usage", None))
         if getattr(response, "stop_reason", None) != "max_tokens":
             break
-    if getattr(response, "stop_reason", None) == "refusal":
-        raise refusal_error(response)
-    return parse_extraction_v2(_response_text(response), kind="attachment", source=request.source)
+    return parse_reply(request, response)
 
 
 def _part_key(*inputs) -> str:
@@ -530,6 +569,58 @@ def _drop_parts(ac_id) -> None:
         pass
 
 
+def save_part(ac_id: int, index: int, key: str, extraction: dict) -> None:
+    """Keep one finished part of a long document where _extract_in_parts looks for it."""
+    saved = _load_parts(ac_id)
+    saved[str(index)] = {"key": key, "extraction": extraction}
+    _save_parts(ac_id, saved)
+
+
+def _parts_of(text, filename, mime_type, email_subject, email_date, full):
+    """A long text's parts, the indices of the ones summarised (_choose_parts), and each chosen
+    part's key: what its prompt is built from, plus the call shape under v2, so a part saved in
+    one shape is not taken by a run in the other."""
+    from src.extract.attachment_prompt import split_text
+
+    parts = split_text(text)
+    chosen = _choose_parts(parts, full)
+    shape = call_shape()
+    keys = {}
+    for i in chosen:
+        inputs = (parts[i], i, len(parts), filename, mime_type, email_subject, email_date)
+        keys[i] = _part_key(*inputs) if shape == "v1" else _part_key(*inputs, "call shape v2")
+    return parts, chosen, keys
+
+
+def _part_prompt(parts, i, filename, mime_type, email_subject, email_date) -> str | Request:
+    from src.extract.attachment_prompt import attachment_input
+
+    return attachment_input(
+        extracted_text=parts[i],
+        filename=filename,
+        mime_type=mime_type,
+        email_subject=email_subject,
+        email_date=email_date,
+        part=(i + 1, len(parts)),
+    )
+
+
+def _merge_prompt(
+    extractions, chosen, parts, text, filename, mime_type, email_subject, email_date
+) -> str | Request:
+    from src.extract.attachment_prompt import merge_input
+
+    return merge_input(
+        parts=extractions,
+        filename=filename,
+        mime_type=mime_type,
+        email_subject=email_subject,
+        email_date=email_date,
+        covered=(len(chosen), len(parts)),
+        source=text,
+    )
+
+
 def _extract_in_parts(
     text,
     filename,
@@ -550,16 +641,11 @@ def _extract_in_parts(
     budget cut short resumes instead of starting over. A token budget that refuses a
     part raises OverBudget, with the finished parts saved. A part saved in one call
     shape is not taken by a run in the other: its key names the shape under v2."""
-    from src.extract.attachment_prompt import attachment_input, merge_input, split_text
-
-    parts = split_text(text)
-    chosen = _choose_parts(parts, full)
+    parts, chosen, keys = _parts_of(text, filename, mime_type, email_subject, email_date, full)
     saved = _load_parts(ac_id)
-    shape = call_shape()
     extractions = []
     for i in chosen:
-        inputs = (parts[i], i, len(parts), filename, mime_type, email_subject, email_date)
-        key = _part_key(*inputs) if shape == "v1" else _part_key(*inputs, "call shape v2")
+        key = keys[i]
         entry = saved.get(str(i))
         if isinstance(entry, dict) and entry.get("key") == key:
             extractions.append(entry["extraction"])
@@ -567,15 +653,7 @@ def _extract_in_parts(
         if out_of_time is not None and out_of_time():
             return None
         extraction = _complete_and_parse(
-            attachment_input(
-                extracted_text=parts[i],
-                filename=filename,
-                mime_type=mime_type,
-                email_subject=email_subject,
-                email_date=email_date,
-                part=(i + 1, len(parts)),
-            ),
-            budget,
+            _part_prompt(parts, i, filename, mime_type, email_subject, email_date), budget
         )
         extractions.append(extraction)
         saved[str(i)] = {"key": key, "extraction": extraction}
@@ -583,14 +661,8 @@ def _extract_in_parts(
     if out_of_time is not None and out_of_time():
         return None
     merged = _complete_and_parse(
-        merge_input(
-            parts=extractions,
-            filename=filename,
-            mime_type=mime_type,
-            email_subject=email_subject,
-            email_date=email_date,
-            covered=(len(chosen), len(parts)),
-            source=text,
+        _merge_prompt(
+            extractions, chosen, parts, text, filename, mime_type, email_subject, email_date
         ),
         budget,
     )
@@ -713,6 +785,59 @@ def _attachment_prompt(row: _Phase2Row, text: str, **kwargs) -> str | Request:
         email_date=row.email_date,
         **kwargs,
     )
+
+
+class Phase2Call(NamedTuple):
+    """One call Phase 2 makes for a row: its kind ('single', 'digest', 'part' or 'merge') and
+    what it sends, and for a part its index and the key it is saved under."""
+
+    kind: str
+    prompt: str | Request
+    part: int | None = None
+    key: str | None = None
+
+
+def next_calls(row: _Phase2Row) -> list[Phase2Call]:
+    """The calls a row needs next, each built as the online path builds it: one over the text
+    or over a spreadsheet's digest; for a long text, the chosen parts not saved yet, or, once
+    every one is, the merge. For a caller that sends them another way, a Vertex AI batch job
+    (src/extract/vertex_batch.py), whose answers apply_call keeps as the online path keeps
+    them, so a long document there takes two jobs: its parts, then its merge."""
+    route = _route(row)
+    if route == "single":
+        return [Phase2Call("single", _attachment_prompt(row, row.text))]
+    if route == "digest":
+        digest = spreadsheet_digest(row.text)
+        return [Phase2Call("digest", _attachment_prompt(row, digest, digest=True))]
+    context = (row.filename, row.mime_type, row.email_subject, row.email_date)
+    parts, chosen, keys = _parts_of(row.text, *context, row.full)
+    saved = _load_parts(row.ac_id)
+    done = {}
+    for i in chosen:
+        entry = saved.get(str(i))
+        if isinstance(entry, dict) and entry.get("key") == keys[i]:
+            done[i] = entry["extraction"]
+    missing = [i for i in chosen if i not in done]
+    if missing:
+        return [Phase2Call("part", _part_prompt(parts, i, *context), i, keys[i]) for i in missing]
+    extractions = [done[i] for i in chosen]
+    return [Phase2Call("merge", _merge_prompt(extractions, chosen, parts, row.text, *context))]
+
+
+def apply_call(
+    conn: sqlite3.Connection, stats: dict, row: _Phase2Row, call: Phase2Call, extraction: dict
+) -> None:
+    """Keep what an answered call gives a row, as the online path keeps it: a part is saved for
+    the merge; a text, a digest or a merge is stored (store_phase2_result), a digest or a merge
+    dropping the parts saved for the row first."""
+    if call.kind == "part":
+        if call.part is None or call.key is None:
+            raise ValueError("a part's call carries its index and its key")
+        save_part(row.ac_id, call.part, call.key, extraction)
+        return
+    if call.kind in ("digest", "merge"):
+        _drop_parts(row.ac_id)
+    store_phase2_result(conn, stats, row.ac_id, row.email_id, extraction, None, False)
 
 
 def mark_full_parts(conn: sqlite3.Connection, attachment_ids: Iterable[int]) -> None:
@@ -848,17 +973,20 @@ def _phase2_candidates(
     type_condition, type_params = _build_mime_type_conditions(file_type)
 
     # A text marked as Greek read as Latin look-alikes is never summarised, whatever its
-    # llm_status: its summary would be built from the wrong words.
+    # llm_status: its summary would be built from the wrong words. A row a batch job holds is
+    # the job's until it is collected or its hold lapses (BATCH_HOLD_KEY).
     query = (
         select
         + f"""        WHERE ac.extraction_status = 'extracted'
           AND ac.llm_status = 'pending'
           AND NOT {OCR_GARBLED_SQL}
+          AND NOT EXISTS (SELECT 1 FROM sync_metadata h
+                          WHERE h.key = '{BATCH_HOLD_KEY}' || ac.id AND h.value >= ?)
     """
     )
 
     # As in run_phase1: each condition's values go in as the condition is added (#199).
-    params: list = []
+    params: list = [batch_hold_cutoff()]
 
     # Scope to specific attachment IDs if provided
     if attachment_ids:
@@ -887,6 +1015,199 @@ def _phase2_candidates(
     if limit > 0:
         query += f"\n        LIMIT {int(limit)}"
     return query, params
+
+
+def phase2_ids(
+    conn: sqlite3.Connection,
+    *,
+    file_type: str | None = None,
+    attachment_ids: list[int] | None = None,
+    limit: int = 0,
+) -> list[int]:
+    """The content rows Phase 2 would summarise now, by id, in its order: run_phase2's
+    selection without its time slicing. Ids alone: putting the rows themselves in order would
+    hold every pending text in SQLite's sorter at once."""
+    query, params = _phase2_candidates(
+        file_type, attachment_ids, None, limit, select="SELECT ac.id" + _PHASE2_FROM
+    )
+    return [ac_id for (ac_id,) in conn.execute(query, params)]
+
+
+def phase2_rows(
+    conn: sqlite3.Connection,
+    *,
+    file_type: str | None = None,
+    attachment_ids: list[int] | None = None,
+    flagged: set[int] | None = None,
+) -> list[_Phase2Row]:
+    """The rows phase2_ids names, read one at a time, each marked when its attachment is
+    flagged for full parts (`flagged` saves reading the flags again)."""
+    if flagged is None:
+        flagged = full_parts_ids(conn)
+    ids = phase2_ids(conn, file_type=file_type, attachment_ids=attachment_ids)
+    return list(stored_rows(conn, ids, flagged))
+
+
+def stored_rows(
+    conn: sqlite3.Connection, ac_ids: Iterable[int], flagged: set[int]
+) -> Iterator[_Phase2Row]:
+    """These content rows as Phase 2 reads them, whatever their status, one stored text at a
+    time; a row with no text is left out. `flagged` holds the attachment ids flagged for full
+    parts."""
+    for ac_id in ac_ids:
+        r = conn.execute(_PHASE2_SELECT + " WHERE ac.id = ?", (ac_id,)).fetchone()
+        if r is not None and r[2]:
+            yield _Phase2Row._make((*r, r[1] in flagged))
+
+
+def store_phase2_result(
+    conn: sqlite3.Connection,
+    stats: dict,
+    ac_id: int,
+    email_id: int | None,
+    extraction: Any,
+    error: str | None,
+    auth_error: bool | str,
+) -> None:
+    """Store one Phase 2 result in the DB and count it in `stats`: run_phase2's, from its
+    main thread, and a batch job's (src/extract/vertex_batch.py, through apply_call).
+
+    ``auth_error`` is the worker's verdict, taken from the same classifier the retry
+    policy uses. Re-deriving it here from ``error`` — which is a string by the time it
+    arrives — is what made a surviving 401 permanent: see _extract_one_attachment.
+    """
+    from src.store.normalizer import find_or_create_topic
+
+    if auth_error == DEFERRED:
+        # Out of time between the parts of a long document: still pending, and not a
+        # failure, so the next run takes it from the start.
+        stats["deferred"] += 1
+        return
+    if auth_error == OVER_BUDGET:
+        # The run's token budget refused its next call: still pending, and not a failure.
+        # The parts a long document finished are saved, so the next run resumes it.
+        stats["over_budget"] += 1
+        return
+    now = datetime.now().isoformat()
+    if error:
+        if auth_error == TRANSIENT:
+            # Offered again next run, and still counted, so a run during an
+            # outage that lasts reads as failed rather than as a quiet night.
+            conn.execute(
+                """UPDATE attachment_content
+                   SET llm_status = 'pending', llm_error = ?, llm_extracted_at = ?
+                   WHERE id = ?""",
+                (error, now, ac_id),
+            )
+            stats["failed"] += 1
+        elif auth_error:
+            # Vertex ADC expired. Mark pending so the next cron retries
+            # automatically once the user re-auths (auth-watch clears
+            # the sentinel on its next probe). See vertex_auth.py.
+            touch_sentinel()
+            conn.execute(
+                """UPDATE attachment_content
+                   SET llm_status = 'pending', llm_error = ?, llm_extracted_at = ?
+                   WHERE id = ?""",
+                (
+                    f"deferred (gcloud reauth needed): {str(error)[:200]}",
+                    now,
+                    ac_id,
+                ),
+            )
+            stats.setdefault("deferred", 0)
+            stats["deferred"] += 1
+        else:
+            conn.execute(
+                """UPDATE attachment_content
+                   SET llm_status = 'failed', llm_error = ?, llm_extracted_at = ?
+                   WHERE id = ?""",
+                (error, now, ac_id),
+            )
+            stats["failed"] += 1
+    else:
+        # llm_error = NULL matters as much as the summary. The deferral
+        # branch above writes "deferred (gcloud reauth needed)" into it, and
+        # this success path used to leave that string behind, so a row that
+        # was retried and extracted correctly still LOOKED deferred forever.
+        # The health check counts that string, so 16 rows deferred on
+        # 2026-07-11 were reported as a live ADC backlog every day for seven
+        # weeks, and got re-attributed to whichever gcloud incident was most
+        # recent. A monitor that cannot go back to zero is not a monitor.
+        conn.execute(
+            """UPDATE attachment_content
+               SET summary = ?, language = ?, llm_status = 'extracted',
+                   llm_error = NULL, llm_extracted_at = ?
+               WHERE id = ?""",
+            (extraction.get("summary"), extraction.get("language"), now, ac_id),
+        )
+
+        att_id = conn.execute(
+            "SELECT attachment_id FROM attachment_content WHERE id = ?", (ac_id,)
+        ).fetchone()[0]
+        if email_id:
+            # The attachment's own rows are replaced by a new summary of it. Rows written
+            # before v28 carry no attachment_id, so a row already on the email is not added
+            # twice: it may be an older summary of this same attachment.
+            for table in ("decisions", "action_items", "key_facts"):
+                conn.execute(f"DELETE FROM {table} WHERE attachment_id = ?", (att_id,))
+
+            for topic_name in extraction.get("topics", []):
+                topic_id = find_or_create_topic(conn, topic_name)
+                conn.execute(
+                    "INSERT OR IGNORE INTO email_topics (email_id, topic_id) VALUES (?, ?)",
+                    (email_id, topic_id),
+                )
+
+            # The texts are masked as the loader masks an email's
+            # (src/store/loader.py), and compared masked with what the email holds.
+            for decision in extraction.get("decisions", []):
+                if isinstance(decision, dict) and decision.get("decision"):
+                    text = redact_secrets(decision["decision"])
+                    if _held(conn, "decisions", "decision", email_id, text):
+                        continue
+                    conn.execute(
+                        "INSERT INTO decisions (email_id, decision, decided_by, attachment_id)"
+                        " VALUES (?, ?, ?, ?)",
+                        (
+                            email_id,
+                            text,
+                            decision.get("decided_by"),
+                            att_id,
+                        ),
+                    )
+
+            for action in extraction.get("action_items", []):
+                if isinstance(action, dict) and action.get("task"):
+                    task = redact_secrets(action["task"])
+                    if _held(conn, "action_items", "task", email_id, task):
+                        continue
+                    conn.execute(
+                        "INSERT INTO action_items"
+                        " (email_id, task, owner, deadline, status, attachment_id)"
+                        " VALUES (?, ?, ?, ?, 'open', ?)",
+                        (
+                            email_id,
+                            task,
+                            action.get("owner"),
+                            action.get("deadline"),
+                            att_id,
+                        ),
+                    )
+
+            for fact in map(redact_secrets, extraction.get("key_facts", [])):
+                if fact and not _held(conn, "key_facts", "fact", email_id, fact):
+                    conn.execute(
+                        "INSERT INTO key_facts (email_id, fact, attachment_id) VALUES (?, ?, ?)",
+                        (email_id, fact, att_id),
+                    )
+
+        stats["extracted"] += 1
+
+    stats["processed"] += 1
+    # Committed per result: the next one may be minutes away (a long text in parts), and
+    # an open write transaction meanwhile blocks every other writer.
+    conn.commit()
 
 
 def run_phase2(
@@ -939,8 +1260,6 @@ def run_phase2(
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    from src.store.normalizer import find_or_create_topic
-
     db_path = db_path or str(DEFAULT_DB)
     conn = _connect(db_path)
 
@@ -965,142 +1284,8 @@ def run_phase2(
         return token_budget is not None and token_budget.exhausted
 
     def _store_result(ac_id, email_id, extraction, error, auth_error):
-        """Store a single result in the DB (called from main thread).
-
-        ``auth_error`` is the worker's verdict, taken from the same classifier the retry
-        policy uses. Re-deriving it here from ``error`` — which is a string by the time it
-        arrives — is what made a surviving 401 permanent: see _extract_one_attachment.
-        """
-        if auth_error == DEFERRED:
-            # Out of time between the parts of a long document: still pending, and not a
-            # failure, so the next run takes it from the start.
-            stats["deferred"] += 1
-            return
-        if auth_error == OVER_BUDGET:
-            # The run's token budget refused its next call: still pending, and not a failure.
-            # The parts a long document finished are saved, so the next run resumes it.
-            stats["over_budget"] += 1
-            return
-        now = datetime.now().isoformat()
-        if error:
-            if auth_error == TRANSIENT:
-                # Offered again next run, and still counted, so a run during an
-                # outage that lasts reads as failed rather than as a quiet night.
-                conn.execute(
-                    """UPDATE attachment_content
-                       SET llm_status = 'pending', llm_error = ?, llm_extracted_at = ?
-                       WHERE id = ?""",
-                    (error, now, ac_id),
-                )
-                stats["failed"] += 1
-            elif auth_error:
-                # Vertex ADC expired. Mark pending so the next cron retries
-                # automatically once the user re-auths (auth-watch clears
-                # the sentinel on its next probe). See vertex_auth.py.
-                touch_sentinel()
-                conn.execute(
-                    """UPDATE attachment_content
-                       SET llm_status = 'pending', llm_error = ?, llm_extracted_at = ?
-                       WHERE id = ?""",
-                    (
-                        f"deferred (gcloud reauth needed): {str(error)[:200]}",
-                        now,
-                        ac_id,
-                    ),
-                )
-                stats.setdefault("deferred", 0)
-                stats["deferred"] += 1
-            else:
-                conn.execute(
-                    """UPDATE attachment_content
-                       SET llm_status = 'failed', llm_error = ?, llm_extracted_at = ?
-                       WHERE id = ?""",
-                    (error, now, ac_id),
-                )
-                stats["failed"] += 1
-        else:
-            # llm_error = NULL matters as much as the summary. The deferral
-            # branch above writes "deferred (gcloud reauth needed)" into it, and
-            # this success path used to leave that string behind, so a row that
-            # was retried and extracted correctly still LOOKED deferred forever.
-            # The health check counts that string, so 16 rows deferred on
-            # 2026-07-11 were reported as a live ADC backlog every day for seven
-            # weeks, and got re-attributed to whichever gcloud incident was most
-            # recent. A monitor that cannot go back to zero is not a monitor.
-            conn.execute(
-                """UPDATE attachment_content
-                   SET summary = ?, language = ?, llm_status = 'extracted',
-                       llm_error = NULL, llm_extracted_at = ?
-                   WHERE id = ?""",
-                (extraction.get("summary"), extraction.get("language"), now, ac_id),
-            )
-
-            att_id = conn.execute(
-                "SELECT attachment_id FROM attachment_content WHERE id = ?", (ac_id,)
-            ).fetchone()[0]
-            if email_id:
-                # The attachment's own rows are replaced by a new summary of it. Rows written
-                # before v28 carry no attachment_id, so a row already on the email is not added
-                # twice: it may be an older summary of this same attachment.
-                for table in ("decisions", "action_items", "key_facts"):
-                    conn.execute(f"DELETE FROM {table} WHERE attachment_id = ?", (att_id,))
-
-                for topic_name in extraction.get("topics", []):
-                    topic_id = find_or_create_topic(conn, topic_name)
-                    conn.execute(
-                        "INSERT OR IGNORE INTO email_topics (email_id, topic_id) VALUES (?, ?)",
-                        (email_id, topic_id),
-                    )
-
-                # The texts are masked as the loader masks an email's
-                # (src/store/loader.py), and compared masked with what the email holds.
-                for decision in extraction.get("decisions", []):
-                    if isinstance(decision, dict) and decision.get("decision"):
-                        text = redact_secrets(decision["decision"])
-                        if _held(conn, "decisions", "decision", email_id, text):
-                            continue
-                        conn.execute(
-                            "INSERT INTO decisions (email_id, decision, decided_by, attachment_id)"
-                            " VALUES (?, ?, ?, ?)",
-                            (
-                                email_id,
-                                text,
-                                decision.get("decided_by"),
-                                att_id,
-                            ),
-                        )
-
-                for action in extraction.get("action_items", []):
-                    if isinstance(action, dict) and action.get("task"):
-                        task = redact_secrets(action["task"])
-                        if _held(conn, "action_items", "task", email_id, task):
-                            continue
-                        conn.execute(
-                            "INSERT INTO action_items"
-                            " (email_id, task, owner, deadline, status, attachment_id)"
-                            " VALUES (?, ?, ?, ?, 'open', ?)",
-                            (
-                                email_id,
-                                task,
-                                action.get("owner"),
-                                action.get("deadline"),
-                                att_id,
-                            ),
-                        )
-
-                for fact in map(redact_secrets, extraction.get("key_facts", [])):
-                    if fact and not _held(conn, "key_facts", "fact", email_id, fact):
-                        conn.execute(
-                            "INSERT INTO key_facts (email_id, fact, attachment_id) VALUES (?, ?, ?)",
-                            (email_id, fact, att_id),
-                        )
-
-            stats["extracted"] += 1
-
-        stats["processed"] += 1
-        # Committed per result: the next one may be minutes away (a long text in parts), and
-        # an open write transaction meanwhile blocks every other writer.
-        conn.commit()
+        """Store a single result in the DB (called from main thread): store_phase2_result."""
+        store_phase2_result(conn, stats, ac_id, email_id, extraction, error, auth_error)
 
     if workers <= 1:
         # Sequential mode (original behavior)
@@ -1226,10 +1411,7 @@ def estimate_phase2(
     whole would hold every pending text in SQLite's sorter at once."""
     conn = _connect(db_path or str(DEFAULT_DB))
     try:
-        query, params = _phase2_candidates(
-            file_type, attachment_ids, None, limit, select="SELECT ac.id" + _PHASE2_FROM
-        )
-        ids = [ac_id for (ac_id,) in conn.execute(query, params)]
+        ids = phase2_ids(conn, file_type=file_type, attachment_ids=attachment_ids, limit=limit)
     finally:
         conn.close()
     return estimate_summaries(db_path, ids, (), chars_per_token)
@@ -1247,14 +1429,7 @@ def estimate_summaries(
     conn = _connect(db_path or str(DEFAULT_DB))
     try:
         flagged = full_parts_ids(conn) | set(full_parts)
-
-        def rows():
-            for ac_id in ac_ids:
-                r = conn.execute(_PHASE2_SELECT + " WHERE ac.id = ?", (ac_id,)).fetchone()
-                if r is not None and r[2]:
-                    yield _Phase2Row._make((*r, r[1] in flagged))
-
-        return estimate_rows(rows(), chars_per_token)
+        return estimate_rows(stored_rows(conn, ac_ids, flagged), chars_per_token)
     finally:
         conn.close()
 

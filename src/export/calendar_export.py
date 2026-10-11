@@ -1,5 +1,6 @@
 """Calendar export module — wraps outlook-cli list-calendar and get-event."""
 
+import hashlib
 import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -21,10 +22,10 @@ MIN_SPLIT_SPAN = timedelta(hours=1)
 
 # outlook-cli calls one listing may make in all. Every full page costs two more,
 # so the bound keeps a busy window inside the unit's time budget, and reaching it
-# is a failure rather than a quiet stop. A backfill lists a year a month at a time
-# and needs the larger one.
+# is a failure rather than a quiet stop. A backfill lists one month per listing,
+# outside the hourly unit, and gives each month the larger bound.
 DEFAULT_LIST_CALLS = 120
-BACKFILL_LIST_CALLS = 3000
+BACKFILL_LIST_CALLS = 250
 
 
 def chunk_date_range(since: datetime, until: datetime) -> Iterator[tuple[datetime, datetime]]:
@@ -256,6 +257,34 @@ def _marked_time(when: dict) -> str | None:
     return value
 
 
+# What get-event's Type says about a series. list-calendar's $select carries neither
+# Type nor SeriesMasterId, so its entries say nothing either way.
+_SERIES_TYPES = {"Occurrence", "Exception", "SeriesMaster"}
+
+
+def _series(raw: dict) -> tuple[bool, str | None]:
+    """Whether an event belongs to a recurring series, and which.
+
+    `IsRecurring` was read, which Outlook never sends, so every row stored 0 while
+    SeriesMasterId arrived on two thirds of them. The series is the master's id;
+    a master is its own. An occurrence whose master id did not come back is keyed
+    by its organiser and subject, which its siblings share.
+    """
+    kind = raw.get("Type")
+    master = raw.get("SeriesMasterId")
+    if kind == "SeriesMaster":
+        return True, raw.get("Id") or master
+    if master:
+        return True, master
+    if kind in _SERIES_TYPES or raw.get("IsRecurring") is True:
+        organizer = (raw.get("Organizer") or {}).get("EmailAddress") or {}
+        key = "\n".join(
+            [str(organizer.get("Address") or "").lower(), str(raw.get("Subject") or "").casefold()]
+        )
+        return True, "derived:" + hashlib.sha256(key.encode()).hexdigest()[:16]
+    return False, None
+
+
 def parse_event(raw: dict) -> dict:
     """
     Normalize an Outlook calendar event into internal shape.
@@ -291,6 +320,7 @@ def parse_event(raw: dict) -> dict:
 
     # Extract response status
     response_status = raw.get("ResponseStatus", {})
+    is_recurring, series = _series(raw)
 
     return {
         "outlook_event_id": raw.get("Id", ""),
@@ -300,8 +330,8 @@ def parse_event(raw: dict) -> dict:
         "start_at": _marked_time(start),
         "end_at": _marked_time(end),
         "location": location.get("DisplayName", ""),
-        "is_recurring": raw.get("IsRecurring", False),
-        "recurrence_master_id": raw.get("SeriesMasterId"),
+        "is_recurring": is_recurring,
+        "recurrence_master_id": series,
         "response_status": response_status.get("Response", "None"),
         "is_cancelled": raw.get("IsCancelled", False),
         "created_at": raw.get("CreatedDateTime"),

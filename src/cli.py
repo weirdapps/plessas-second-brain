@@ -2682,9 +2682,121 @@ def _read_json_dict(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _utc_bound(moment: datetime) -> str:
+    """A window bound as start_at compares with it: UTC, to the second. A naive
+    bound is local time, as outlook-cli reads it."""
+    from datetime import UTC
+
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _whole_month(start: datetime, end: datetime, now: datetime) -> str | None:
+    """YYYY-MM when [start, end) is the whole of a month already over, else None."""
+    from datetime import timedelta
+
+    first = start.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    following = (first + timedelta(days=32)).replace(day=1)
+    if start == first and end == following and end <= now:
+        return f"{start:%Y-%m}"
+    return None
+
+
+def _calendar_windows(conn, args, now: datetime) -> tuple[list[tuple[datetime, datetime]], str]:
+    """The windows calendar-sync lists, oldest first, and the line that says so.
+
+    A plain run lists one window, by default the week behind and the 30 days ahead.
+    A backfill lists a month at a time: with neither --since nor --until, the months
+    stats coverage flags as not held in full, or the last 12 when it flags none. It
+    used to list the 365 days before it ran, which on 2026-09-27 began after the
+    months the first load had capped. A whole month an earlier backfill recorded is
+    skipped, unless one of its events still owes an extraction: only a listing
+    offers it again.
+    """
+    import sqlite3
+    from datetime import timedelta
+
+    from src.export.calendar_export import chunk_date_range
+    from src.store.calendar_coverage import density, listed_months
+
+    # --since is honoured on its own, as --until is. It used to count only with
+    # --backfill, so the README's `calendar-sync --since 2026-01-01` listed the
+    # last seven days and exited 0 with the gap it was run to fill still open.
+    until = datetime.fromisoformat(args.until) if args.until else now + timedelta(days=30)
+    if args.since:
+        since = datetime.fromisoformat(args.since)
+    elif args.backfill:
+        try:
+            flagged = [] if args.until else sorted(density(conn)["incomplete"])
+        except sqlite3.OperationalError:  # a store with no calendar yet
+            flagged = []
+        if flagged:
+            months = [datetime.fromisoformat(f"{month}-01") for month in flagged]
+            windows = [(first, (first + timedelta(days=32)).replace(day=1)) for first in months]
+            return windows, (
+                f"Calendar backfill: the {len(flagged)} month(s) coverage flags, "
+                f"{flagged[0]} to {flagged[-1]}"
+            )
+        since = now - timedelta(days=365)
+    else:
+        since = now - timedelta(days=7)
+    if not args.backfill:
+        return [(since, until)], f"Calendar sync: {since.date()} to {until.date()}"
+
+    done = listed_months(conn)
+    windows, skipped = [], 0
+    for start, end in chunk_date_range(since, until):
+        if (
+            _whole_month(start, end, now) in done
+            and not conn.execute(
+                "SELECT 1 FROM calendar_events WHERE llm_status = 'pending' "
+                "AND start_at >= ? AND start_at < ? LIMIT 1",
+                (_utc_bound(start), _utc_bound(end)),
+            ).fetchone()
+        ):
+            skipped += 1
+            continue
+        windows.append((start, end))
+    header = f"Calendar backfill: {since.date()} to {until.date()}, a month at a time"
+    if skipped:
+        header += f"; {skipped} month(s) already listed in full skipped"
+    return windows, header
+
+
+def _calendar_unchanged(existing, list_change_key) -> bool:
+    """Whether a listed event needs no fetch: its stored etag is the listed one and
+    no extraction is owed on it. No etag on either side is never unchanged."""
+    return bool(
+        existing
+        and list_change_key
+        and existing["change_key"] == list_change_key
+        and existing["llm_status"] != "pending"
+    )
+
+
+def _calendar_owed(conn, raw_events: list[dict]) -> tuple[int, int]:
+    """What a run would fetch of a listing: (new events, changed or owed ones)."""
+    new = changed = 0
+    for raw in raw_events:
+        existing = conn.execute(
+            "SELECT change_key, llm_status FROM calendar_events WHERE outlook_event_id = ?",
+            (raw.get("Id", ""),),
+        ).fetchone()
+        if existing is None:
+            new += 1
+        elif not _calendar_unchanged(existing, raw.get("@odata.etag")):
+            changed += 1
+    return new, changed
+
+
 def cmd_calendar_sync(args):
-    """Sync calendar events from Outlook into the knowledge store."""
-    from datetime import UTC, timedelta
+    """Sync calendar events from Outlook into the knowledge store.
+
+    With --backfill the window is listed a month at a time, oldest first, and each
+    whole month listed and stored is recorded, so a run that stops is resumed by
+    the next. With --dry-run the window is listed and compared with the store, and
+    nothing is fetched, extracted or written.
+    """
+    from datetime import UTC
 
     from src.config import USER_EMAIL_PATTERN
     from src.export.calendar_export import (
@@ -2698,11 +2810,14 @@ def cmd_calendar_sync(args):
     from src.extract.policy_bridge import classify_exception, is_transient
     from src.extract.vertex_auth import touch_sentinel
     from src.llm_policy import Outcome
+    from src.store.calendar_coverage import mark_month_started, record_listed_month
     from src.store.calendar_loader import (
+        adopt_reissued_occurrence,
         cancel_unlisted,
         dedupe_event_children,
         load_event,
         load_proxy_emails,
+        mark_series,
         refresh_self_flags,
     )
     from src.store.schema import get_connection, migrate_add_sync_metadata, run_migrations
@@ -2712,42 +2827,19 @@ def cmd_calendar_sync(args):
         print("Error: Database not found.")
         sys.exit(1)
 
+    # A dry run reads: it neither migrates the store nor writes to it.
+    dry_run = getattr(args, "dry_run", False)
     conn = get_connection(db_path)
-    run_migrations(conn)
+    if not dry_run:
+        run_migrations(conn)
 
-    proxy_emails = load_proxy_emails(str(DATA_ROOT / "canonical_people.json"))
+    proxy_emails = None
+    if not dry_run:
+        proxy_emails = load_proxy_emails(str(DATA_ROOT / "canonical_people.json"))
 
     now = datetime.now()
-    # --since is honoured on its own, as --until is. It used to count only with
-    # --backfill, so the README's `calendar-sync --since 2026-01-01` listed the
-    # last seven days and exited 0 with the gap it was run to fill still open.
-    if args.since:
-        since = datetime.fromisoformat(args.since)
-    elif args.backfill:
-        since = now - timedelta(days=365)
-    else:
-        since = now - timedelta(days=7)
-
-    until_dt = datetime.fromisoformat(args.until) if args.until else (now + timedelta(days=30))
-
-    print(f"Calendar sync: {since.date()} to {until_dt.date()}")
-    chunk_failures: list[str] = []
-    try:
-        if args.backfill:
-            # A year a month at a time, every busy stretch split further: the
-            # hourly run's call bound would stop it a few months in.
-            raw_events = list_events(
-                since, until_dt, failures=chunk_failures, max_calls=BACKFILL_LIST_CALLS
-            )
-        else:
-            raw_events = list_events(since, until_dt, failures=chunk_failures)
-    except OutlookCliAuthRequired:
-        conn.close()
-        print("  Outlook needs re-authentication; nothing listed", file=sys.stderr)
-        return EXIT_REAUTH
-    print(f"  Fetched {len(raw_events)} events")
-    for failure in chunk_failures:
-        print(f"  Could not fetch {failure}", file=sys.stderr)
+    windows, header = _calendar_windows(conn, args, now)
+    print(header + (" (dry run: nothing is fetched or written)" if dry_run else ""))
 
     stats = {
         "loaded": 0,
@@ -2761,8 +2853,10 @@ def cmd_calendar_sync(args):
     }
 
     # Consecutive runs each event has failed get-event, kept beside the database.
+    # They count the hourly window's runs: a backfill or a dry run leaves them alone.
     fetch_state = Path(db_path).parent / "state" / "calendar_fetch_failures.json"
-    unfetched_before = _read_json_dict(fetch_state).get("events")
+    track_fetches = not args.backfill and not dry_run
+    unfetched_before = _read_json_dict(fetch_state).get("events") if track_fetches else {}
     if not isinstance(unfetched_before, dict):
         unfetched_before = {}
     unfetched_now: dict[str, int] = {}
@@ -2770,190 +2864,252 @@ def cmd_calendar_sync(args):
     failed_fetch_runs: dict[str, int] = {}
     fetched_ok = False
     session_expired = False
-    listed_ids = [raw.get("Id", "") for raw in raw_events]
+    chunk_failures: list[str] = []
+    cancelled = 0
+    to_fetch = 0
+    listed_until: datetime | None = None
 
-    for index, raw in enumerate(raw_events):
-        event = parse_event(raw)
-        # Stored with the row, because the next run compares its list entry to it.
-        list_change_key = event.get("change_key")
-
-        # Skip if unchanged AND we do not still owe it an extraction.
-        #
-        # modified_at alone was not enough. An event whose extraction failed was still
-        # upserted with the new modified_at, so on the next run it matched here, scored
-        # skipped_unchanged, and its body_summary, decisions and action items were gone for
-        # good — no retry, and nothing in the row saying one was owed. llm_status='pending'
-        # is that debt, and it is the only value that re-offers an unchanged event.
-        #
-        # And modified_at never matched at all: list-calendar's $select does not include
-        # it, so every event was fetched and re-extracted on every run. The etag comes
-        # with every list entry. No etag on either side is never "unchanged".
-        existing = conn.execute(
-            "SELECT change_key, llm_status, extraction_hash FROM calendar_events "
-            "WHERE outlook_event_id = ?",
-            (event["outlook_event_id"],),
-        ).fetchone()
-        if (
-            existing
-            and list_change_key
-            and existing["change_key"] == list_change_key
-            and existing["llm_status"] != "pending"
-        ):
-            stats["skipped_unchanged"] += 1
-            unchanged_ids.append(event["outlook_event_id"])
-            continue
-
-        # Fetch full event (list-calendar returns a subset without Attendees,
-        # ResponseStatus, IsRecurring etc. — get-event has everything)
+    for start, end in windows:
+        month = _whole_month(start, end, now) if args.backfill else None
+        if month and not dry_run:
+            # Flagged until recorded below: a month half filled when the run stopped
+            # can hold enough events to pass for a full one.
+            mark_month_started(conn, month, datetime.now(UTC).isoformat())
+        window_failures: list[str] = []
         try:
-            body_raw = get_event_body(event["outlook_event_id"])
+            if args.backfill:
+                # Each month on a bound of its own: a busy one splits into many calls.
+                raw_events = list_events(
+                    start, end, failures=window_failures, max_calls=BACKFILL_LIST_CALLS
+                )
+            else:
+                raw_events = list_events(start, end, failures=window_failures)
         except OutlookCliAuthRequired:
-            # The session expired mid-run. Every later fetch would fail the same way,
-            # so the run stops asking and exits EXIT_REAUTH, as it does when the
-            # session is already dead at list time. Nothing is written, so the next
-            # run re-offers all of them, and their fetch-failure counts carry over.
-            remaining = listed_ids[index:]
-            stats["deferred"] += len(remaining)
-            unfetched_now.update(
-                {eid: unfetched_before[eid] for eid in remaining if eid in unfetched_before}
-            )
+            if listed_until is None:
+                conn.close()
+                print("  Outlook needs re-authentication; nothing listed", file=sys.stderr)
+                return EXIT_REAUTH
+            # The months before this one are stored and recorded; the next run resumes here.
             session_expired = True
             print(
-                f"  Outlook needs re-authentication; {len(remaining)} event(s) deferred "
-                "to the next run",
+                f"  Outlook needs re-authentication; from {start.date()} on is left to the "
+                "next run",
                 file=sys.stderr,
             )
             break
-        if not isinstance(body_raw, dict):
-            # A FETCH FAILURE, NOT AN EMPTY BODY, and collapsing the two loses the event
-            # exactly the way a blank extraction did. get_event_body swallows everything
-            # and returns None, so an Outlook outage arrived here as body_html="", fell
-            # past the 50-char gate and was recorded 'skipped' — the one value that says
-            # nothing is owed and the one the change detector will never re-offer. Three
-            # runs and the summary was gone: run one defers on a dead gcloud, run two
-            # overwrites it with 'skipped' while Outlook is down, run three sees nothing
-            # to do. Not contrived either: sb-auth-watch.sh fires calendar-sync on
-            # `gcloud_or_outlook`, so the run dispatched to recover from an outage is
-            # precisely the one that can hit step two before Outlook is back.
-            #
-            # WRITING NOTHING IS THE FIX, and it is stronger than writing 'pending'.
-            # Leaving the row alone preserves its llm_status AND does not advance
-            # modified_at, so the change detector re-offers the event on both counts; a
-            # brand-new event simply has no row, which it also re-offers. It is the only
-            # option that does not DEGRADE what is already stored: `event` here is still
-            # the list-calendar subset, which carries no Attendees or ResponseStatus, and
-            # load_event replaces the attendee rows wholesale.
-            #
-            # This does not contradict the ruling that the facts are stored even when the
-            # extraction fails. That ruling is "a MODEL failure must not cost you API data
-            # you already have". This is its mirror: an API failure must not overwrite API
-            # data you already have with less of it.
-            event_id = event["outlook_event_id"]
-            previous_runs = unfetched_before.get(event_id, 0)
-            runs = (previous_runs if isinstance(previous_runs, int) else 0) + 1
-            failed_fetch_runs[event_id] = runs
+        listed_until = end
+        print(
+            f"  Fetched {len(raw_events)} events"
+            + (f" for {month or start.date()}" if args.backfill else "")
+        )
+        for failure in window_failures:
+            print(f"  Could not fetch {failure}", file=sys.stderr)
+        chunk_failures.extend(window_failures)
+        listed_ids = [raw.get("Id", "") for raw in raw_events]
+        listed = set(listed_ids)
+
+        if dry_run:
+            new, changed = _calendar_owed(conn, raw_events)
+            to_fetch += new + changed
             print(
-                f"  Body fetch failed for {event.get('subject', '???')} ({runs} run(s) in a "
-                "row); leaving the row untouched so the next run re-offers it",
-                file=sys.stderr,
+                f"  {month or f'{start.date()}..{end.date()}'}: {len(raw_events)} listed, "
+                f"{new} new, {changed} changed or owed an extraction"
             )
             continue
 
-        fetched_ok = True
-        event = parse_event(body_raw)
-        event["change_key"] = list_change_key
-        body_obj = body_raw.get("Body", {})
-        body_html = body_obj.get("Content", "") if isinstance(body_obj, dict) else ""
+        fetch_failures_before = len(failed_fetch_runs)
+        for index, raw in enumerate(raw_events):
+            event = parse_event(raw)
+            # Stored with the row, because the next run compares its list entry to it.
+            list_change_key = event.get("change_key")
 
-        # Extract. 'skipped' until something is actually attempted: no body and under the
-        # 50-char floor are "nothing was owed", not "nothing came back", and the fetch
-        # above succeeded so both are authoritative.
-        #
-        # --skip-extraction IS NOT AUTHORITATIVE. A run told not to extract has no basis
-        # for discharging a debt, an earlier one or this event's own: a body worth
-        # extracting stays 'pending', or with the etag stored it would never be offered
-        # again. Latent today, because sb-calendar-sync.sh runs the command bare.
-        extraction = {"body_summary": "", "decisions": [], "action_items": []}
-        prior_status = existing["llm_status"] if existing else None
-        long_enough = bool(body_html) and len(body_html.strip()) >= 50
-        if args.skip_extraction:
-            llm_status = "pending" if long_enough or prior_status == "pending" else "skipped"
-        else:
-            llm_status = "skipped"
-        # The etag moves on edits the model never sees (an attendee answering, a room
-        # change). The same prompt hash means the extraction on record was made from
-        # this very prompt, so it stands: keep it and refresh only the facts.
-        prompt_hash = event_prompt_hash(event, body_html) if long_enough else None
-        keep_extraction = (
-            not args.skip_extraction
-            and prompt_hash is not None
-            and prior_status == "extracted"
-            and existing["extraction_hash"] == prompt_hash
-        )
-        if keep_extraction:
-            llm_status = "extracted"
-            stats["same_input"] += 1
-        elif not args.skip_extraction and long_enough:
+            # Skip if unchanged AND we do not still owe it an extraction.
+            #
+            # modified_at alone was not enough. An event whose extraction failed was still
+            # upserted with the new modified_at, so on the next run it matched here, scored
+            # skipped_unchanged, and its body_summary, decisions and action items were gone for
+            # good — no retry, and nothing in the row saying one was owed. llm_status='pending'
+            # is that debt, and it is the only value that re-offers an unchanged event.
+            #
+            # And modified_at never matched at all: list-calendar's $select does not include
+            # it, so every event was fetched and re-extracted on every run. The etag comes
+            # with every list entry. No etag on either side is never "unchanged".
+            existing = conn.execute(
+                "SELECT change_key, llm_status, extraction_hash FROM calendar_events "
+                "WHERE outlook_event_id = ?",
+                (event["outlook_event_id"],),
+            ).fetchone()
+            if _calendar_unchanged(existing, list_change_key):
+                stats["skipped_unchanged"] += 1
+                unchanged_ids.append(event["outlook_event_id"])
+                continue
+
+            # Fetch full event (list-calendar returns a subset without Attendees,
+            # ResponseStatus, Type, SeriesMasterId etc. — get-event has everything)
             try:
-                extraction = extract_event(event, body_html)
-                llm_status = "extracted"
-                stats["extracted"] += 1
-            except Exception as e:
-                # Same split, and the same classifier, as attachment_pipeline: a failure
-                # a re-auth would cure is a debt to retry, anything else needs a human.
-                # What reaches here has already exhausted call_with_policy's retries.
-                if classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED:
-                    llm_status = "pending"
-                    touch_sentinel()
-                    stats["deferred"] += 1
-                elif is_transient(e):
-                    # The service failed, not the event: offered again next run. The
-                    # run still fails, so an outage that lasts is seen.
-                    llm_status = "pending"
-                    stats["failed"] += 1
-                else:
-                    llm_status = "failed"
-                    # Once per event: a failure already on record was reported by the
-                    # run that recorded it. Only an edited event is offered again.
-                    if prior_status != "failed":
-                        stats["failed"] += 1
+                body_raw = get_event_body(event["outlook_event_id"])
+            except OutlookCliAuthRequired:
+                # The session expired mid-run. Every later fetch would fail the same way,
+                # so the run stops asking and exits EXIT_REAUTH, as it does when the
+                # session is already dead at list time. Nothing is written, so the next
+                # run re-offers all of them, and their fetch-failure counts carry over.
+                remaining = listed_ids[index:]
+                stats["deferred"] += len(remaining)
+                unfetched_now.update(
+                    {eid: unfetched_before[eid] for eid in remaining if eid in unfetched_before}
+                )
+                session_expired = True
                 print(
-                    f"  Extraction {llm_status} for {event.get('subject', '???')}: {e}",
+                    f"  Outlook needs re-authentication; {len(remaining)} event(s) deferred "
+                    "to the next run",
                     file=sys.stderr,
                 )
+                break
+            if not isinstance(body_raw, dict):
+                # A FETCH FAILURE, NOT AN EMPTY BODY, and collapsing the two loses the event
+                # exactly the way a blank extraction did. get_event_body swallows everything
+                # and returns None, so an Outlook outage arrived here as body_html="", fell
+                # past the 50-char gate and was recorded 'skipped' — the one value that says
+                # nothing is owed and the one the change detector will never re-offer. Three
+                # runs and the summary was gone: run one defers on a dead gcloud, run two
+                # overwrites it with 'skipped' while Outlook is down, run three sees nothing
+                # to do. Not contrived either: sb-auth-watch.sh fires calendar-sync on
+                # `gcloud_or_outlook`, so the run dispatched to recover from an outage is
+                # precisely the one that can hit step two before Outlook is back.
+                #
+                # WRITING NOTHING IS THE FIX, and it is stronger than writing 'pending'.
+                # Leaving the row alone preserves its llm_status AND does not advance
+                # modified_at, so the change detector re-offers the event on both counts; a
+                # brand-new event simply has no row, which it also re-offers. It is the only
+                # option that does not DEGRADE what is already stored: `event` here is still
+                # the list-calendar subset, which carries no Attendees or ResponseStatus, and
+                # load_event replaces the attendee rows wholesale.
+                #
+                # This does not contradict the ruling that the facts are stored even when the
+                # extraction fails. That ruling is "a MODEL failure must not cost you API data
+                # you already have". This is its mirror: an API failure must not overwrite API
+                # data you already have with less of it.
+                event_id = event["outlook_event_id"]
+                previous_runs = unfetched_before.get(event_id, 0)
+                runs = (previous_runs if isinstance(previous_runs, int) else 0) + 1
+                failed_fetch_runs[event_id] = runs
+                print(
+                    f"  Body fetch failed for {event.get('subject', '???')} ({runs} run(s) in a "
+                    "row); leaving the row untouched so the next run re-offers it",
+                    file=sys.stderr,
+                )
+                continue
 
-        # Load. The facts go in regardless — they come from the API, not the model, so
-        # they are good even when the extraction that should have accompanied them is not.
-        load_event(
-            conn,
-            event,
-            extraction,
-            user_email_pattern=USER_EMAIL_PATTERN,
-            proxy_emails=proxy_emails,
-            llm_status=llm_status,
-            extraction_hash=prompt_hash,
-            keep_extraction=keep_extraction,
-        )
-        stats["loaded"] += 1
+            fetched_ok = True
+            event = parse_event(body_raw)
+            event["change_key"] = list_change_key
+            # Only get-event names the series: an occurrence Outlook re-issued under a
+            # new id takes over its stored row, extraction and all, instead of a second.
+            if existing is None and adopt_reissued_occurrence(conn, event, listed):
+                existing = conn.execute(
+                    "SELECT change_key, llm_status, extraction_hash FROM calendar_events "
+                    "WHERE outlook_event_id = ?",
+                    (event["outlook_event_id"],),
+                ).fetchone()
+            body_obj = body_raw.get("Body", {})
+            body_html = body_obj.get("Content", "") if isinstance(body_obj, dict) else ""
 
-    # A complete listing also says which stored events Outlook no longer holds;
-    # nothing ever removed them, so deleted and re-created meetings stayed live.
-    # Not after a span that failed or came back full, nor once the session
-    # expired mid-run: what is missing then says nothing about Outlook. The
-    # window was local time to outlook-cli, as it is to since.astimezone().
-    cancelled = 0
-    if not chunk_failures and not session_expired:
-        cancelled = cancel_unlisted(
-            conn,
-            set(listed_ids),
-            since.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
-            until_dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S"),
-        )
+            # Extract. 'skipped' until something is actually attempted: no body and under the
+            # 50-char floor are "nothing was owed", not "nothing came back", and the fetch
+            # above succeeded so both are authoritative.
+            #
+            # --skip-extraction IS NOT AUTHORITATIVE. A run told not to extract has no basis
+            # for discharging a debt, an earlier one or this event's own: a body worth
+            # extracting stays 'pending', or with the etag stored it would never be offered
+            # again. Latent today, because sb-calendar-sync.sh runs the command bare.
+            extraction = {"body_summary": "", "decisions": [], "action_items": []}
+            prior_status = existing["llm_status"] if existing else None
+            long_enough = bool(body_html) and len(body_html.strip()) >= 50
+            if args.skip_extraction:
+                llm_status = "pending" if long_enough or prior_status == "pending" else "skipped"
+            else:
+                llm_status = "skipped"
+            # The etag moves on edits the model never sees (an attendee answering, a room
+            # change). The same prompt hash means the extraction on record was made from
+            # this very prompt, so it stands: keep it and refresh only the facts.
+            prompt_hash = event_prompt_hash(event, body_html) if long_enough else None
+            keep_extraction = (
+                not args.skip_extraction
+                and prompt_hash is not None
+                and prior_status == "extracted"
+                and existing["extraction_hash"] == prompt_hash
+            )
+            if keep_extraction:
+                llm_status = "extracted"
+                stats["same_input"] += 1
+            elif not args.skip_extraction and long_enough:
+                try:
+                    extraction = extract_event(event, body_html)
+                    llm_status = "extracted"
+                    stats["extracted"] += 1
+                except Exception as e:
+                    # Same split, and the same classifier, as attachment_pipeline: a failure
+                    # a re-auth would cure is a debt to retry, anything else needs a human.
+                    # What reaches here has already exhausted call_with_policy's retries.
+                    if classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED:
+                        llm_status = "pending"
+                        touch_sentinel()
+                        stats["deferred"] += 1
+                    elif is_transient(e):
+                        # The service failed, not the event: offered again next run. The
+                        # run still fails, so an outage that lasts is seen.
+                        llm_status = "pending"
+                        stats["failed"] += 1
+                    else:
+                        llm_status = "failed"
+                        # Once per event: a failure already on record was reported by the
+                        # run that recorded it. Only an edited event is offered again.
+                        if prior_status != "failed":
+                            stats["failed"] += 1
+                    print(
+                        f"  Extraction {llm_status} for {event.get('subject', '???')}: {e}",
+                        file=sys.stderr,
+                    )
 
-    # Both are idempotent and cheap, and both repair rows no upsert will touch
-    # again: stacked duplicates from the old append-only loader, and self flags
-    # written while BRAIN_USER_EMAIL_PATTERN was unset.
+            # Load. The facts go in regardless — they come from the API, not the model, so
+            # they are good even when the extraction that should have accompanied them is not.
+            load_event(
+                conn,
+                event,
+                extraction,
+                user_email_pattern=USER_EMAIL_PATTERN,
+                proxy_emails=proxy_emails,
+                llm_status=llm_status,
+                extraction_hash=prompt_hash,
+                keep_extraction=keep_extraction,
+            )
+            stats["loaded"] += 1
+
+        # A complete listing also says which stored events Outlook no longer holds;
+        # nothing ever removed them, so deleted and re-created meetings stayed live.
+        # Not after a span that failed or came back full, nor once the session
+        # expired mid-run: what is missing then says nothing about Outlook. The
+        # window was local time to outlook-cli, as it is to start.astimezone().
+        if not window_failures and not session_expired:
+            cancelled += cancel_unlisted(conn, listed, _utc_bound(start), _utc_bound(end))
+            # A whole month gone by, every event of it listed and stored: the next
+            # backfill skips it, and coverage stops flagging it however few it holds.
+            if month and len(failed_fetch_runs) == fetch_failures_before:
+                record_listed_month(conn, month, datetime.now(UTC).isoformat())
+        if session_expired:
+            break
+
+    if dry_run:
+        conn.close()
+        print(f"  Dry run: {to_fetch} event(s) to fetch, nothing written")
+        return 1 if chunk_failures else 0
+
+    # All three are idempotent and cheap, and repair rows no upsert will touch
+    # again: stacked duplicates from the old append-only loader, occurrences
+    # stored without their series flag, and self flags written while
+    # BRAIN_USER_EMAIL_PATTERN was unset.
     dup_decisions, dup_actions = dedupe_event_children(conn)
+    series_marked = mark_series(conn)
     flags_changed = 0
     if USER_EMAIL_PATTERN and proxy_emails is not None:
         flags_changed = refresh_self_flags(conn, USER_EMAIL_PATTERN, proxy_emails)
@@ -2986,7 +3142,10 @@ def cmd_calendar_sync(args):
         else:
             stats["fetch_failed"] += 1
 
-    if not chunk_failures and not stats["fetch_failed"]:
+    # Not either for a listing that never reached the present, as a backfill of
+    # months gone by does not: it says nothing about the hourly window.
+    reached_now = listed_until is not None and listed_until >= now
+    if not chunk_failures and not stats["fetch_failed"] and reached_now:
         # The run itself is the liveness signal. With a working change detector an
         # unchanged calendar writes no event row, so MAX(ingested_at) stopped
         # proving the sync ran; scripts/health_check.py reads this as well. Not on
@@ -3008,17 +3167,18 @@ def cmd_calendar_sync(args):
     import os
     import tempfile
 
-    unfetched_now.update(failed_fetch_runs)
-    new_state = {"events": unfetched_now}
-    try:
-        fetch_state.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w", dir=fetch_state.parent, prefix=fetch_state.name, delete=False
-        ) as tmp:
-            json.dump(new_state, tmp, indent=1)
-        os.replace(tmp.name, fetch_state)
-    except OSError as e:
-        print(f"  Could not write {fetch_state}: {e}", file=sys.stderr)
+    if track_fetches:
+        unfetched_now.update(failed_fetch_runs)
+        new_state = {"events": unfetched_now}
+        try:
+            fetch_state.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                "w", dir=fetch_state.parent, prefix=fetch_state.name, delete=False
+            ) as tmp:
+                json.dump(new_state, tmp, indent=1)
+            os.replace(tmp.name, fetch_state)
+        except OSError as e:
+            print(f"  Could not write {fetch_state}: {e}", file=sys.stderr)
 
     print(f"  Loaded:     {stats['loaded']}")
     print(f"  Unchanged:  {stats['skipped_unchanged']}")
@@ -3034,6 +3194,8 @@ def cmd_calendar_sync(args):
         )
     if dup_decisions or dup_actions:
         print(f"  Removed duplicate decisions/actions: {dup_decisions}/{dup_actions}")
+    if series_marked:
+        print(f"  Occurrences flagged recurring: {series_marked}")
     if flags_changed:
         print(f"  Self flags corrected: {flags_changed}")
     if cancelled:
@@ -4121,7 +4283,14 @@ def main():
     parser_cal.add_argument(
         "--backfill",
         action="store_true",
-        help="Backfill mode (default: 12 months back)",
+        help="List a month at a time, resuming where the last backfill stopped: the months "
+        "stats coverage flags as not held in full, or the last 12 when it flags none "
+        "(--since/--until set the window)",
+    )
+    parser_cal.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List the window and count what would be fetched; fetch, extract and write nothing",
     )
     parser_cal.add_argument(
         "--since", type=str, help="Start date ISO (e.g. 2025-05-14; default: 7 days back)"

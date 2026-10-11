@@ -3,13 +3,15 @@
 Second Brain nightly health check.
 
 Queries all data sources, detects staleness and failures, attempts auto-fixes,
-and emails a status report. Designed to run via launchd at 23:55 daily.
+and emails a status report. On the producer sb-health-check.timer runs it at
+23:50 every night, through scripts/wrappers/systemd/sb-health-check.sh.
 
 Usage:
     python3 scripts/health_check.py              # print to stdout
     python3 scripts/health_check.py --email      # also send via outlook-cli
     python3 scripts/health_check.py --fix        # auto-fix issues then report
     python3 scripts/health_check.py --email --fix # production mode
+    python3 scripts/health_check.py --mcp-probe  # only ask the HTTP MCP server for stats (hourly)
 """
 
 import argparse
@@ -21,6 +23,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -152,6 +156,19 @@ STALE_THRESHOLDS = {
     # runs. Measured against an image's own arrival, not against wall-clock
     # MAX(visioned_at): a quiet stretch with no eligible images must stay silent.
     "images_vision": timedelta(days=3),
+    # The 02:00 attachment pass drains text and summaries, so at 23:50 the oldest
+    # still waiting can be 22 hours old. Past a day it has missed a pass. WARN only.
+    "attachment_text_warn": timedelta(hours=24),
+    "attachment_summary_warn": timedelta(hours=24),
+    # sb-daily-sync writes the snapshot and the encrypted archive once a day.
+    "backup": timedelta(hours=26),
+    "backup_offsite": timedelta(hours=26),
+    # A restore drill is a person's job, monthly at best: a WARN past five weeks.
+    "restore_drill_warn": timedelta(days=35),
+    # The 02:00 pass rewrites the mail-loss counts; an older file is not trusted.
+    "mail_loss_file": timedelta(hours=48),
+    # A message given up this recently is news; an older give-up is history.
+    "mail_gave_up_recent": timedelta(days=7),
 }
 
 # How long a received brain.db still proves this host is a CONSUMER of the corpus
@@ -203,8 +220,7 @@ IMAGE_PENDING_GRACE = timedelta(days=1)
 ATTACHMENT_UNREGISTERED_WARN = 200
 
 # Mirrors MAX_SHAREPOINT_ATTEMPTS in src/export/sharepoint_fetcher.py, which is
-# the source of truth — this script is loaded standalone (no package import), so
-# the value is duplicated here and pinned by a test that reads the real one.
+# the source of truth; a test that reads the real one pins this copy to it.
 # Links at or past the cap are resting out their cool-off, not being neglected.
 SHAREPOINT_MAX_ATTEMPTS = 5
 
@@ -239,6 +255,10 @@ LOCAL_LOG_NAMES = frozenset({"db_pull"})
 # Linux/systemd counterpart. The VPS runs the same repo under `systemctl --user`;
 # the same logical jobs have different identifiers there (and Linux has no
 # launchctl at all, which is why the launchd path errors out on the VPS).
+#
+# The scheduled jobs, each writing <stem>.log, so check_sync_logs reads this too.
+# It is no longer the whole job list: check_jobs adds every sb-* unit systemd
+# knows (systemd_units), and reports any listed here that systemd does not.
 SYSTEMD_UNITS = {
     "sb-outlook-sync.service": "Hourly Outlook sync",
     "sb-daily-sync.service": "Daily full sync",
@@ -255,6 +275,16 @@ SYSTEMD_UNITS = {
     "sb-news-sync.service": "News sync",
     "sb-conversation-sync.service": "Conversation sync",
     "sb-health-check.service": "Health check",
+    # Added 2026-09-29 and missed by this list for a fortnight: the same gap again.
+    "sb-whatsapp-sync.service": "WhatsApp sync",
+}
+
+# Long-running services, watched when this host has them: the HTTP MCP server and
+# the bot that reads it. Only a host that serves HTTP runs them, so their absence
+# is not a fault, and they keep no per-run log for check_sync_logs to age.
+SYSTEMD_SERVICES = {
+    "sb-mcp.service": "MCP server over HTTP",
+    "telegram-brain.service": "Telegram brain bot",
 }
 
 IS_MACOS = sys.platform == "darwin"
@@ -409,7 +439,103 @@ def _utc(ts):
     return dt.astimezone(UTC)
 
 
-def check_emails(db):
+# How long each mail folder may go without new mail before the Emails row reads STALE,
+# in hours. One MAX(date_received) over every folder stayed green while a folder whose
+# export kept succeeding with nothing in it (a cursor skewed past its mail, see
+# docs/RESTORE.md) fell silent beside folders that still flowed. On a replica, at 23:50
+# on each of 61 nights to 2026-10-10, the newest Archive mail was at most 3.7 h old,
+# Sent Items 11.3 h and News 1.8 h. BRAIN_HEALTH_FOLDER_LAG_HOURS overrides any of them,
+# as "Sent Items=48,News=12"; 0 stops judging a folder. A folder holding no mail is not
+# judged at all.
+FOLDER_LAG_HOURS = {"Inbox": 6.0, "Archive": 6.0, "Sent Items": 24.0, "News": 12.0}
+
+# The export's cursor files, one per folder (src/export/outlook_export.py _STATE_FILES).
+EXPORT_STATE_DIR = DATA_ROOT / "state"
+INBOX_STATE_FILE = "outlook_sync.json"
+# Clock skew tolerated before an export's listing counts as starting in the future.
+CURSOR_AHEAD_SLACK = timedelta(minutes=10)
+
+
+def folder_lag_hours() -> dict[str, float]:
+    """FOLDER_LAG_HOURS with BRAIN_HEALTH_FOLDER_LAG_HOURS applied; a malformed entry is
+    skipped rather than fatal, as main() runs the checks unguarded."""
+    limits = dict(FOLDER_LAG_HOURS)
+    for part in os.environ.get("BRAIN_HEALTH_FOLDER_LAG_HOURS", "").split(","):
+        name, sep, hours = part.partition("=")
+        try:
+            value = float(hours)
+        except ValueError:
+            continue
+        if sep and name.strip() and value >= 0:
+            limits[name.strip()] = value
+    return limits
+
+
+def _export_states(state_dir: Path) -> dict[str, dict]:
+    """{file name: state} for each readable export cursor file in state_dir."""
+    states: dict[str, dict] = {}
+    for path in sorted(Path(state_dir).glob("outlook_sync*.json")):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            states[path.name] = data
+    return states
+
+
+def _inbox_export_ok_at(db, states: dict[str, dict]) -> list:
+    """When the Inbox export last succeeded: its cursor file on the producer, and the
+    copy every sync puts in brain.db, which is all a replica has."""
+    stamps = [states.get(INBOX_STATE_FILE, {}).get("last_sync_completed_at")]
+    try:
+        row = db.execute(
+            "SELECT value FROM sync_metadata WHERE key = 'mail_export_ok_at'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    stamps.append(row[0] if row else None)
+    return [s for s in stamps if s]
+
+
+def mail_folders(db, newest: dict, states: dict[str, dict]) -> list[dict]:
+    """One entry per judged folder: the age of its newest mail against its threshold.
+
+    The Inbox needs a second clock. Triage moves mail out of it and inbox_reconcile
+    relabels that mail Archive, so the newest row still labelled Inbox was more than six
+    hours old on 31 of those 33 nights with nothing wrong. Whether its export still
+    succeeds says whether anyone is listening, and the fresher of the two counts.
+    """
+    folders = []
+    for folder, hours in folder_lag_hours().items():
+        stamps = [newest[folder]] if newest.get(folder) else []
+        if folder == "Inbox":
+            stamps += _inbox_export_ok_at(db, states)
+        ages = [a for a in (_age(s) for s in stamps) if a is not None]
+        if not hours or not ages:
+            continue
+        age, limit = min(ages), timedelta(hours=hours)
+        folders.append({"folder": folder, "age": age, "limit": limit, "stale": age > limit})
+    return folders
+
+
+def cursors_ahead(states: dict[str, dict], now: datetime | None = None) -> list[str]:
+    """Folders whose export lists from the future: its cursor, less the overlap each run
+    lists again, is past the clock. Such an export succeeds and finds nothing until the
+    clock catches up, its heartbeat stays fresh meanwhile, and the mail in between is
+    never fetched. A cursor ahead by less than the overlap still reaches the present."""
+    from src.export.outlook_export import CURSOR_OVERLAP
+
+    now = now or datetime.now(UTC)
+    ahead = []
+    for name, state in states.items():
+        cursor = _utc(state.get("last_seen_received_at"))
+        if cursor is not None and cursor - CURSOR_OVERLAP > now + CURSOR_AHEAD_SLACK:
+            ahead.append(str(state.get("folder") or name))
+    return ahead
+
+
+def check_emails(db, state_dir: Path | None = None):
     # `message_id > 0` excludes reverse-ingest documents, which carry NEGATIVE
     # integer ids. It does NOT exclude the news source: SQLite ranks TEXT above
     # INTEGER, so 'news:article:…' > 0 is true. Without the mailbox filter one
@@ -417,8 +543,15 @@ def check_emails(db):
     # (and the loader auto-fix keyed off it). Filtering on typeof() is not an
     # option — 13k genuine mail rows carry text ids alongside 49k integer ones.
     real_mail = "message_id > 0 AND (mailbox_name IS NULL OR mailbox_name <> 'News')"
-    r = db.execute(f"SELECT COUNT(*), MAX(date_received) FROM emails WHERE {real_mail}").fetchone()
-    total, latest = r[0], r[1]
+    # One pass for the totals and each folder's newest mail, as the single query was.
+    by_folder = db.execute(
+        "SELECT mailbox_name, COUNT(*), MAX(date_received) FROM emails "
+        "WHERE message_id > 0 GROUP BY mailbox_name"
+    ).fetchall()
+    mail = [(n, latest) for name, n, latest in by_folder if name != "News"]
+    total = sum(n for n, _latest in mail)
+    latest = max((latest for _n, latest in mail if latest), default=None)
+    newest = {name: latest for name, _n, latest in by_folder if name}
     # datetime() around the column, not the bare column: stored values carry the
     # ISO 'T' separator while datetime('now', ...) renders a SPACE, and lexical
     # comparison puts 'T' (0x54) above ' ' (0x20). Every row sharing the cutoff's
@@ -437,7 +570,16 @@ def check_emails(db):
 
     age = _age(latest)
 
-    stale = age and age > STALE_THRESHOLDS["emails"]
+    states = _export_states(EXPORT_STATE_DIR if state_dir is None else state_dir)
+    folders = mail_folders(db, newest, states)
+    late = [f for f in folders if f["stale"]]
+    ahead = cursors_ahead(states)
+    if any(f["folder"] != "News" for f in folders):
+        loader_stale = any(f["folder"] != "News" for f in late)
+    else:
+        # No mail folder this check knows: the store's newest mail against one threshold.
+        loader_stale = bool(age and age > STALE_THRESHOLDS["emails"])
+    stale = bool(late or ahead or loader_stale)
     return {
         "name": "Emails",
         "total": total,
@@ -445,7 +587,12 @@ def check_emails(db):
         "recent_24h": recent_24h,
         "recent_7d": recent_7d,
         "age": age,
+        "folders": folders,
+        "late": late,
+        "cursor_ahead": ahead,
         "stale": stale,
+        # What the loader can catch up: never News, which has a sync of its own.
+        "loader_stale": loader_stale,
         "status": "STALE" if stale else "OK",
     }
 
@@ -713,6 +860,62 @@ def check_attachments(db):
     }
 
 
+def check_attachment_lag(db):
+    """How long attachments wait for their text, and extracted ones for a summary.
+
+    A document mailed in the morning reached search only after the 02:00 pass on most
+    days: 15-63% of a day's attachments got their text more than six hours after they
+    were downloaded, the slowest after 45 hours, and nothing said so. The text queue is
+    Phase 1's own (an attachment with no content row); the summary queue is extracted
+    text still waiting for the model. Neither reads a finished attachment's stored text:
+    the first is answered from an index, and the second reads only the rows still
+    waiting, the same rows check_attachments counts as pending.
+    """
+    try:
+        text_n, text_oldest = db.execute(
+            "SELECT COUNT(*), MIN(a.exported_at) FROM attachments a "
+            "LEFT JOIN attachment_content ac ON ac.attachment_id = a.id WHERE ac.id IS NULL"
+        ).fetchone()
+        summary_n, summary_oldest = db.execute(
+            "SELECT COUNT(*), MIN(extracted_at) FROM attachment_content "
+            "WHERE extraction_status = 'extracted' AND llm_status = 'pending'"
+        ).fetchone()
+    except sqlite3.OperationalError as e:
+        # Same posture as check_attachments: main() runs the checks unguarded.
+        return {"name": "Attachment lag", "status": "WARN", "note": f"unreadable: {e}"}
+    text_age, summary_age = _age(text_oldest), _age(summary_oldest)
+    late = []
+    if text_age is not None and text_age > STALE_THRESHOLDS["attachment_text_warn"]:
+        late.append(f"oldest awaiting text {format_age(text_age)}")
+    if summary_age is not None and summary_age > STALE_THRESHOLDS["attachment_summary_warn"]:
+        late.append(f"oldest awaiting a summary {format_age(summary_age)}")
+    ages = [a for a in (text_age, summary_age) if a is not None]
+    return {
+        "name": "Attachment lag",
+        "total": text_n + summary_n,
+        "age": max(ages, default=None),
+        "text_pending": text_n,
+        "text_age": text_age,
+        "summary_pending": summary_n,
+        "summary_age": summary_age,
+        "note": "; ".join(late) if late else None,
+        "status": "WARN" if late else "OK",
+    }
+
+
+def attachment_lag_detail(c: dict) -> str:
+    """The report's parenthesis for the Attachment lag row."""
+    if "text_pending" not in c:
+        return f" ({c.get('note', '')})"
+    extra = (
+        f" ({c['text_pending']:,} awaiting text, oldest {format_age(c['text_age'])};"
+        f" {c['summary_pending']:,} awaiting a summary, oldest {format_age(c['summary_age'])}"
+    )
+    if c.get("note"):
+        extra += f"; over a day: {c['note']}"
+    return extra + ")"
+
+
 # Yesterday's model spend above this many US dollars is a WARN; BRAIN_DAILY_SPEND_WARN_USD
 # overrides it. Steady state is $20-27 a weekday at Vertex eu prices (audit 2026-10-11), so 60
 # is a backfill or a runaway, not a busy day.
@@ -835,6 +1038,188 @@ def llm_spend_lines(c: dict) -> list[str]:
             f" {s['output_tokens']:>11,} out {cost:>10}"
         )
     return out
+
+
+# What scripts/backup_db.py writes: a daily snapshot, and its encrypted archive on a host
+# that holds the key. BRAIN_BACKUP_DIR and BRAIN_BACKUP_OFFSITE_DIR move them, and
+# BRAIN_RESTORE_DRILL_STAMP the stamp a person writes after a restore drill (docs/RESTORE.md).
+BACKUP_PATTERN = "brain-*.db"
+BACKUP_ARCHIVE_PATTERN = "brain-*.db.zst.enc"
+RESTORE_DRILL_STAMP = STATE_DIR / "restore-drill.stamp"
+
+
+def _newest_file(directory: Path, pattern: str) -> tuple[int, datetime | None]:
+    """(count, newest mtime) of the files matching pattern in directory."""
+    stamps = []
+    for path in directory.glob(pattern):
+        try:
+            stamps.append(datetime.fromtimestamp(path.stat().st_mtime, UTC))
+        except OSError:
+            continue  # pruned while this ran
+    return len(stamps), max(stamps, default=None)
+
+
+def _stamp_age(path: Path, now: datetime) -> timedelta | None:
+    """Age of a stamp file: the ISO-8601 time on its first line, else its mtime."""
+    try:
+        lines = path.read_text(errors="replace").strip().splitlines()
+        written = _utc(lines[0]) if lines else None
+        if written is None:
+            written = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+    except OSError:
+        return None
+    return max(timedelta(0), now - written)
+
+
+def check_backups(local_dir=None, offsite_dir=None, drill_stamp=None, now=None):
+    """Age of the newest snapshot and of the newest encrypted archive, and of the last
+    restore drill when one was recorded.
+
+    Nothing asserted on backups: the nightly report covered the data and the jobs, so a
+    backup step that stopped (it runs under `|| echo WARN` inside the daily sync) went
+    unseen until somebody needed one. STALE past a day and two hours, which fails the
+    freshness ping. A host with no backups directory is not judged, nor is a replica,
+    whose snapshots are the producer's, unless BRAIN_BACKUP_OFFSITE_DIR names the
+    archives it pulls. A drill older than five weeks is a WARN.
+    """
+    now = now or datetime.now(UTC)
+    local = Path(local_dir or os.environ.get("BRAIN_BACKUP_DIR") or DATA_ROOT / "backups")
+    explicit = offsite_dir or os.environ.get("BRAIN_BACKUP_OFFSITE_DIR")
+    offsite = Path(explicit) if explicit else local / "offsite"
+    stamp = Path(drill_stamp or os.environ.get("BRAIN_RESTORE_DRILL_STAMP") or RESTORE_DRILL_STAMP)
+    row: dict = {"name": "Backups", "total": "?", "age": None, "archive_age": None}
+    replica = is_replica()
+    if replica and not (explicit and offsite.is_dir()):
+        return {**row, "status": "N/A", "note": "snapshots are taken on the producer"}
+    if not replica and not local.is_dir():
+        return {**row, "status": "N/A", "note": f"no backups directory at {local}"}
+
+    problems, notes = [], []
+    if not replica:
+        count, newest = _newest_file(local, BACKUP_PATTERN)
+        row.update(total=count, age=None if newest is None else now - newest)
+        if newest is None:
+            problems.append(f"no snapshot in {local}")
+        elif now - newest > STALE_THRESHOLDS["backup"]:
+            problems.append(f"newest snapshot {format_age(now - newest)} old")
+    if offsite.is_dir():
+        archives, newest = _newest_file(offsite, BACKUP_ARCHIVE_PATTERN)
+        row["archive_age"] = None if newest is None else now - newest
+        if replica:
+            row.update(total=archives, age=row["archive_age"])
+        if newest is None:
+            problems.append(f"no encrypted archive in {offsite}")
+        elif now - newest > STALE_THRESHOLDS["backup_offsite"]:
+            problems.append(f"newest encrypted archive {format_age(now - newest)} old")
+    else:
+        notes.append("no encrypted archives on this host")  # no key here: by design
+    stale = bool(problems)
+    drill_age = _stamp_age(stamp, now)
+    row["drill_age"] = drill_age
+    drill_late = drill_age is not None and drill_age > STALE_THRESHOLDS["restore_drill_warn"]
+    if drill_late:
+        problems.append(f"last restore drill {format_age(drill_age)} ago")
+    status = "STALE" if stale else ("WARN" if drill_late else "OK")
+    return {**row, "note": "; ".join(problems + notes) or None, "status": status}
+
+
+def backups_detail(c: dict) -> str:
+    """The report's parenthesis for the Backups row."""
+    parts = []
+    if c.get("archive_age") is not None:
+        parts.append(f"newest archive {format_age(c['archive_age'])} old")
+    if c.get("drill_age") is not None:
+        parts.append(f"restore drill {format_age(c['drill_age'])} ago")
+    if c.get("note"):
+        parts.append(c["note"])
+    return f" ({'; '.join(parts)})" if parts else ""
+
+
+MAIL_LOSS_FILE = "mail_loss.json"
+
+
+def _mail_loss_file(path: Path, now: datetime) -> dict | None:
+    """The 02:00 pass's counts (src/export/mail_reconcile.py write_mail_loss), or None
+    when the file is missing, unreadable or older than STALE_THRESHOLDS["mail_loss_file"]."""
+    try:
+        data = json.loads(path.read_text())
+        written = _utc(data.get("updated_at"))
+        counts = {
+            "fetch_gave_up": int(data["fetch_gave_up"]),
+            "quarantined": int(data["quarantined"]),
+            "last_gave_up_at": data.get("last_gave_up_at"),
+        }
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+    if written is None or now - written > STALE_THRESHOLDS["mail_loss_file"]:
+        return None
+    return {**counts, "age": max(timedelta(0), now - written), "source": MAIL_LOSS_FILE}
+
+
+def _mail_loss_on_disk(state: Path, staging: Path) -> dict:
+    """The same counts, read from the cursor files and the quarantine directory."""
+    gave_up, dated = 0, []
+    for s in _export_states(state).values():
+        entries = s.get("fetch_gave_up")
+        if isinstance(entries, list):
+            gave_up += len(entries)
+            dated += [
+                e["gave_up_at"] for e in entries if isinstance(e, dict) and e.get("gave_up_at")
+            ]
+    quarantine = staging / "quarantine"
+    quarantined = sum(1 for p in quarantine.iterdir() if p.is_file()) if quarantine.is_dir() else 0
+    return {
+        "fetch_gave_up": gave_up,
+        "quarantined": quarantined,
+        "last_gave_up_at": max(dated, default=None),
+        "age": None,
+        "source": "the cursor files",
+    }
+
+
+def check_mail_loss(state_dir=None, staging_dir=None, now=None):
+    """Mail the export gave up fetching, and staging batches set aside as unreadable.
+
+    Neither reaches the store and neither showed anywhere but a log line: a message whose
+    fetch failed run after run is dropped from the retry list into fetch_gave_up, and a
+    batch that will not parse is moved into staging/quarantine. The 02:00 pass writes both
+    counts to state/mail_loss.json; while that file is fresh it is read, otherwise they are
+    counted here from the cursor files and the quarantine directory.
+
+    A quarantined batch is a WARN until someone deals with it. A give-up is a WARN for a
+    week: the cursor keeps its last give-ups for good, so a count alone would stay above
+    zero and warn for ever, and an older or undated one is reported as history.
+    """
+    now = now or datetime.now(UTC)
+    state = Path(state_dir) if state_dir is not None else EXPORT_STATE_DIR
+    staging = Path(staging_dir) if staging_dir is not None else DATA_ROOT / "staging"
+    row: dict = {"name": "Mail loss", "total": "?", "age": None}
+    if not state.is_dir():
+        return {**row, "status": "N/A", "note": "no export state on this host"}
+    counts = _mail_loss_file(state / MAIL_LOSS_FILE, now) or _mail_loss_on_disk(state, staging)
+    gave_up, quarantined = counts["fetch_gave_up"], counts["quarantined"]
+    last = _utc(counts["last_gave_up_at"])
+    recent = last is not None and now - last <= STALE_THRESHOLDS["mail_gave_up_recent"]
+    parts = []
+    if gave_up:
+        when = f", the newest {format_age(max(timedelta(0), now - last))} ago" if last else ""
+        parts.append(
+            f"{gave_up:,} messages given up after repeated fetch failures{when}"
+            " (python -m src.cli mail-reconcile lists the mail the store lacks)"
+        )
+    if quarantined:
+        parts.append(f"{quarantined:,} staging batches quarantined in {staging / 'quarantine'}")
+    return {
+        **row,
+        "total": gave_up + quarantined,
+        "age": counts["age"],
+        "fetch_gave_up": gave_up,
+        "quarantined": quarantined,
+        "last_gave_up_at": counts["last_gave_up_at"],
+        "source": counts["source"],
+        "note": "; ".join(parts) or None,
+        "status": "WARN" if quarantined or recent else "OK",
+    }
 
 
 def check_files_on_disk(db):
@@ -1163,14 +1548,27 @@ def check_embeddings(db, npz_path: Path | None = None, now: datetime | None = No
             "age": None,
             "status": "WARN",
         }
-    d = np.load(str(npz), allow_pickle=True)
-    n = len(d["ids"]) if "ids" in d else 0
+    try:
+        # Without pickle: the index holds plain number arrays, and a pickled one
+        # could run whatever code it carries the moment this check opened it.
+        d = np.load(str(npz), allow_pickle=False)
+        ids = d["ids"] if "ids" in d else np.array([], dtype=np.int64)
+    except (OSError, ValueError) as e:
+        return {
+            "name": "Embeddings",
+            "embedded": 0,
+            "total_emails": total_emails,
+            "age": None,
+            "status": "WARN",
+            "note": f"index unreadable: {e}",
+        }
+    n = len(ids)
     # Presence and vector count both freeze the instant the stage dies, so the
     # two signals this check used could not tell a live index from one written
     # months ago. The file's mtime is the only thing here that keeps moving.
     age = (now or datetime.now()) - datetime.fromtimestamp(npz.stat().st_mtime)
     stale = age > STALE_THRESHOLDS["embeddings"]
-    coverage = _embedding_coverage(db, d["ids"] if "ids" in d else [])
+    coverage = _embedding_coverage(db, ids)
     gaps = {
         name: (have, want)
         for name, (have, want) in coverage.items()
@@ -1185,6 +1583,103 @@ def check_embeddings(db, npz_path: Path | None = None, now: datetime | None = No
         "coverage": coverage,
         "gaps": gaps,
         "status": "STALE" if stale else ("WARN" if gaps else "OK"),
+    }
+
+
+GOLDEN_QUERY_LIMIT = 5
+
+
+def golden_phrase() -> str:
+    """What the golden query searches for: BRAIN_HEALTH_QUERY, else the owner's role, else
+    their name, else a word any working mailbox holds."""
+    from src.config import USER_NAME, USER_ROLE
+
+    return (
+        os.environ.get("BRAIN_HEALTH_QUERY", "").strip()
+        or USER_ROLE.strip()
+        or USER_NAME.strip()
+        or "meeting"
+    )
+
+
+def check_golden_query(conn=None, phrase=None, keyword=None, semantic=None):
+    """One keyword and one semantic search for a fixed phrase, through the functions the
+    MCP tools call. Every other row reads the store; this is the one that asks it a question.
+
+    Semantic search that cannot embed the query ranks around its keyword matches instead,
+    and says so only in a field of each row. It ran that way for two days in October with
+    nothing noticing, and it still does in every session started without the embedding
+    key. So an answer stood in for by keyword matches is STALE, as is a semantic search
+    that cannot run, and both fail the freshness ping. A phrase that finds nothing is a
+    WARN (BRAIN_HEALTH_QUERY names a better one), and a keyword search that breaks FAILs.
+    Only error types are reported for the semantic half: an embedding error's message
+    can quote the query or a credential, as src/store/embeddings.py notes.
+    """
+    from src.config import embed_backend
+    from src.store.embeddings import query_semantic
+    from src.store.query import query_by_keyword
+
+    phrase = phrase or golden_phrase()
+    keyword = keyword or query_by_keyword
+    semantic = semantic or query_semantic
+    own = conn is None
+    if own:
+        from src.store.schema import get_connection
+
+        conn = get_connection(str(DB_PATH))
+    row: dict = {
+        "name": "Golden query",
+        "total": "-",
+        "age": None,
+        "embed_backend": embed_backend(),
+    }
+    verdicts: list[tuple[str, str]] = []
+    kw: list = []
+    sem: list = []
+    seeded = None
+    try:
+        if conn.execute("SELECT 1 FROM emails LIMIT 1").fetchone() is None:
+            return {**row, "status": "N/A", "note": "the store holds no mail yet"}
+        try:
+            kw = keyword(conn, phrase, limit=GOLDEN_QUERY_LIMIT)
+        except Exception as e:
+            verdicts.append(("FAIL", f"keyword search raised {type(e).__name__}: {str(e)[:160]}"))
+        else:
+            if not kw:
+                verdicts.append(
+                    (
+                        "WARN",
+                        "keyword search found nothing for the golden phrase;"
+                        " set BRAIN_HEALTH_QUERY to a phrase the store holds",
+                    )
+                )
+        try:
+            sem = semantic(conn, phrase, limit=GOLDEN_QUERY_LIMIT)
+        except FileNotFoundError:
+            verdicts.append(("WARN", "no embedding index, so no semantic search"))
+        except Exception as e:
+            cause = e.__cause__ or e
+            verdicts.append(("STALE", f"semantic search failed: {type(cause).__name__}"))
+        else:
+            seeded = next((r["semantic"] for r in sem if r.get("semantic")), None)
+            if seeded:
+                verdicts.append(
+                    ("STALE", f"semantic search fell back to keyword matches ({seeded})")
+                )
+            elif not sem:
+                verdicts.append(("WARN", "semantic search returned nothing"))
+    finally:
+        if own:
+            conn.close()
+    rank = {"OK": 0, "WARN": 1, "STALE": 2, "FAIL": 3}
+    status = max((v for v, _note in verdicts), key=rank.__getitem__, default="OK")
+    return {
+        **row,
+        "keyword_rows": len(kw),
+        "semantic_rows": len(sem),
+        "semantic": seeded or "ok",
+        "note": "; ".join(note for _v, note in verdicts) or None,
+        "status": status,
     }
 
 
@@ -1623,9 +2118,47 @@ def _check_jobs_launchd():
     return results
 
 
-def _check_jobs_systemd():
-    results = {}
-    for unit, desc in SYSTEMD_UNITS.items():
+def systemd_units() -> dict[str, str]:
+    """{unit: description} for every unit check_jobs watches on a systemd host.
+
+    Every sb-* service the user manager has, the long-running services when present,
+    and every scheduled job of SYSTEMD_UNITS whether systemd still has it or not. The
+    hand-kept list missed sb-whatsapp-sync and sb-mcp within weeks of their arrival,
+    while its own comment said a unit absent from it was a job nobody watched. It
+    stays as the floor, so a unit that disappears from systemd reads NOT_LOADED instead
+    of dropping out of the report, and as the whole list where systemctl cannot
+    answer. An empty description is filled from systemd's own by _check_jobs_systemd.
+    """
+    units = dict(SYSTEMD_UNITS)
+    try:
+        out = subprocess.run(
+            [
+                systemctl_bin(),
+                "--user",
+                "list-unit-files",
+                "--type=service",
+                "--no-legend",
+                "--no-pager",
+                "sb-*",
+                *SYSTEMD_SERVICES,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return units
+    for line in (out.stdout or "").splitlines():
+        name = line.split()[0] if line.strip() else ""
+        # A template (sb-x@.service) is not a unit that runs; its instances are not listed.
+        if name.endswith(".service") and "@" not in name and name not in units:
+            units[name] = SYSTEMD_SERVICES.get(name, "")
+    return units
+
+
+def _check_jobs_systemd(units: dict[str, str] | None = None):
+    results: dict[str, dict] = {}
+    for unit, desc in (SYSTEMD_UNITS if units is None else units).items():
         try:
             out = subprocess.run(
                 [
@@ -1633,7 +2166,7 @@ def _check_jobs_systemd():
                     "--user",
                     "show",
                     unit,
-                    "--property=LoadState,ActiveState,SubState,Result,ExecMainStatus",
+                    "--property=LoadState,ActiveState,SubState,Result,ExecMainStatus,Description",
                 ],
                 capture_output=True,
                 text=True,
@@ -1642,6 +2175,7 @@ def _check_jobs_systemd():
             props = dict(
                 line.split("=", 1) for line in out.stdout.strip().splitlines() if "=" in line
             )
+            desc = desc or props.get("Description") or unit
             load = props.get("LoadState", "")
             if load in ("", "not-found", "masked"):
                 results[unit] = {"desc": desc, "status": "NOT_LOADED"}
@@ -1669,13 +2203,13 @@ def _check_jobs_systemd():
                 "status": status,
             }
         except Exception as e:
-            results[unit] = {"desc": desc, "status": f"ERROR: {e}"}
+            results[unit] = {"desc": desc or unit, "status": f"ERROR: {e}"}
     return results
 
 
 def check_jobs():
     """Scheduled-job status — launchd on macOS, systemd --user on Linux (VPS)."""
-    return _check_jobs_launchd() if IS_MACOS else _check_jobs_systemd()
+    return _check_jobs_launchd() if IS_MACOS else _check_jobs_systemd(systemd_units())
 
 
 def check_sync_logs(log_dir: Path | None = None):
@@ -1784,6 +2318,11 @@ def auto_fix(issues):
 
     Platform-agnostic: kick_job() dispatches to launchctl (macOS) or
     systemctl --user (Linux/VPS).
+
+    Only the loader is restarted. A failed unit used to be kicked whatever its
+    cause, so a nightly attachment pass that failed at 02:00 ran again at 23:50,
+    two hours before its own next run. Every other failed unit is reported and
+    left to its own timer and retry policy.
     """
     actions = []
 
@@ -1793,9 +2332,8 @@ def auto_fix(issues):
                 _kick_outcome(AUTH_WATCH_JOB, f"Queued {AUTH_WATCH_JOB} to attempt silent renewal")
             )
 
-        elif issue["type"] == "job_failed":
-            label = issue["label"]
-            actions.append(_kick_outcome(label, f"Queued {label}"))
+        elif issue["type"] == "job_failed" and issue["label"] == LOADER_JOB:
+            actions.append(_kick_outcome(LOADER_JOB, f"Queued {LOADER_JOB}"))
 
         elif issue["type"] == "stale_data":
             label = issue["label"]
@@ -1884,6 +2422,21 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
             extra = files_on_disk_detail(c)
         elif c["name"] == "LLM spend":
             extra = llm_spend_detail(c)
+        elif c["name"] == "Attachment lag":
+            extra = attachment_lag_detail(c)
+        elif c["name"] == "Backups":
+            extra = backups_detail(c)
+        elif c["name"] == "Golden query":
+            extra = (
+                f" ({c['note']})"
+                if c.get("note")
+                else (
+                    f" (keyword {c.get('keyword_rows', 0)} rows, semantic"
+                    f" {c.get('semantic_rows', 0)}, query embeddings via {c.get('embed_backend')})"
+                )
+            )
+        elif c["name"] == "Mail loss" and c.get("note"):
+            extra = f" ({c['note']})"
         elif c["name"] == "Inline Images":
             # Counts, not a percentage. The old "87% classified" was a ceiling,
             # not a shortfall: its denominator included the signature and noise
@@ -1905,7 +2458,14 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
             if c.get("pending_stale"):
                 extra += f" — oldest queued {format_age(c.get('pending_age'))} ago, not draining"
         elif c["name"] == "Emails":
-            extra = f" ({c.get('recent_24h', 0)} today)"
+            parts = [f"{c.get('recent_24h', 0)} today"]
+            parts += [
+                f"{f['folder']} {format_age(f['age'])} without new mail,"
+                f" over {format_age(f['limit'])}"
+                for f in c.get("late", [])
+            ]
+            parts += [f"{n} export cursor ahead of the clock" for n in c.get("cursor_ahead", [])]
+            extra = f" ({'; '.join(parts)})"
         elif c["name"] == "Embeddings" and c.get("gaps"):
             extra = (
                 " ("
@@ -1914,6 +2474,8 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
                 )
                 + ")"
             )
+        elif c["name"] == "Embeddings" and c.get("note"):
+            extra = f" ({c['note']})"
         elif c["name"] == "Teams":
             extra = f" ({c.get('recent_24h', 0)} today)"
             if c.get("coverage_lost"):
@@ -2128,11 +2690,12 @@ def freshness_verdict(checks, sentinels):
     return True, f"{len(checks)} sources fresh"
 
 
-def ping_freshness(ok, detail, slug=FRESHNESS_SLUG):
+def ping_freshness(ok, detail, slug=FRESHNESS_SLUG, create=False):
     """Fire-and-forget freshness ping. Never raises, never changes the exit code.
 
     Same curl invocation as hc-success@.service, so the retry and timeout
-    behaviour is identical to every other ping on the box.
+    behaviour is identical to every other ping on the box. `create` provisions a
+    check that does not exist yet, as sb-auth-watch.sh does for its own slugs.
 
     curl's own stderr is never printed: -fsS writes the failing URL into it, and
     that URL carries the Healthchecks ping key. Only the exit code is logged.
@@ -2142,7 +2705,7 @@ def ping_freshness(ok, detail, slug=FRESHNESS_SLUG):
         print("HC_PING_URL not set, skipping freshness ping.", file=sys.stderr)
         return False
 
-    url = f"{base.rstrip('/')}/{slug}" + ("" if ok else "/fail")
+    url = f"{base.rstrip('/')}/{slug}" + ("" if ok else "/fail") + ("?create=1" if create else "")
     try:
         result = subprocess.run(
             [
@@ -2170,6 +2733,193 @@ def ping_freshness(ok, detail, slug=FRESHNESS_SLUG):
         print(f"Freshness ping failed: curl exit {result.returncode}", file=sys.stderr)
         return False
     return True
+
+
+# The HTTP MCP server of docs/DEPLOY.md section 9, and the check its hourly probe pings.
+# BRAIN_MCP_URL, BRAIN_MCP_TOKEN_FILE and BRAIN_MCP_PROBE_SLUG override them; the token
+# file is the one sb-mcp.sh hands the server.
+MCP_URL = "http://127.0.0.1:8765/mcp"
+MCP_TOKEN_FILE = Path.home() / ".config" / "second-brain" / "mcp-token"
+MCP_PROBE_SLUG = "sb-mcp-stats"
+# stats calls its data stale after three hours, and the mail timer sleeps from 01:00 to
+# 07:00 every night, so the hourly probe would page every morning on that flag. Seven
+# hours is the night with slack; BRAIN_MCP_PROBE_MAX_AGE_HOURS overrides it.
+MCP_PROBE_MAX_AGE = timedelta(hours=7)
+# An initialize-handshake revision every current server still speaks.
+MCP_PROTOCOL_VERSION = "2025-06-18"
+
+
+class McpProbeError(Exception):
+    """Why the server did not answer stats, worded for the report."""
+
+
+def _mcp_request(opener, url: str, headers: dict, body=None, method="POST"):
+    """(status, lower-cased headers, body) of one request; an HTTP error is a status."""
+    data = None if body is None else json.dumps(body).encode()
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with opener.open(request, timeout=30) as resp:
+            return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read()
+    except urllib.error.HTTPError as e:
+        if e.fp is not None:
+            e.close()
+        return e.code, {}, b""
+
+
+def _jsonrpc_messages(content_type: str, body: bytes) -> list:
+    """The JSON-RPC messages of a streamable-HTTP answer: a JSON body, or the data lines
+    of an event stream."""
+    text = body.decode("utf-8", "replace")
+    if "text/event-stream" not in content_type:
+        parsed = json.loads(text) if text.strip() else []
+        return parsed if isinstance(parsed, list) else [parsed]
+    messages, data = [], []
+    for line in [*text.splitlines(), ""]:
+        if line.startswith("data:"):
+            data.append(line[5:].removeprefix(" "))
+        elif not line.strip() and data:
+            messages.append(json.loads("\n".join(data)))
+            data = []
+    return messages
+
+
+def _mcp_result(headers: dict, body: bytes, request_id: int, what: str) -> dict:
+    try:
+        messages = _jsonrpc_messages(headers.get("content-type", ""), body)
+    except ValueError as e:
+        raise McpProbeError(f"{what} answered something other than JSON-RPC: {e}") from e
+    answer = next((m for m in messages if isinstance(m, dict) and m.get("id") == request_id), None)
+    if answer is None:
+        raise McpProbeError(f"{what} came back without an answer")
+    if "error" in answer:
+        raise McpProbeError(f"{what} answered error {answer['error'].get('code')}")
+    return answer.get("result") or {}
+
+
+def _mcp_stats(opener, url: str, token: str) -> dict:
+    """The stats tool's answer over streamable HTTP: initialize, call it, end the session."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    initialize = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "second-brain-health-check", "version": "1"},
+        },
+    }
+    status, answer_headers, body = _mcp_request(opener, url, headers, initialize)
+    if status != 200:
+        raise McpProbeError(f"initialize answered HTTP {status}")
+    agreed = _mcp_result(answer_headers, body, 1, "initialize").get("protocolVersion")
+    headers["MCP-Protocol-Version"] = agreed or MCP_PROTOCOL_VERSION
+    session = answer_headers.get("mcp-session-id")
+    if session:
+        headers["Mcp-Session-Id"] = session
+    try:
+        status, _h, _b = _mcp_request(
+            opener, url, headers, {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        )
+        if status not in (200, 202):
+            raise McpProbeError(f"notifications/initialized answered HTTP {status}")
+        call = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "stats", "arguments": {}},
+        }
+        status, answer_headers, body = _mcp_request(opener, url, headers, call)
+        if status != 200:
+            raise McpProbeError(f"tools/call answered HTTP {status}")
+        result = _mcp_result(answer_headers, body, 2, "stats")
+    finally:
+        if session:
+            # Ends the session, which the server would otherwise hold until it restarts:
+            # an hourly probe would leave one behind every hour.
+            try:
+                _mcp_request(opener, url, headers, method="DELETE")
+            except OSError:
+                pass
+    if result.get("isError"):
+        raise McpProbeError("stats answered with a tool error")
+    stats = result.get("structuredContent")
+    if not isinstance(stats, dict):  # a server from before typed results: the text block
+        text = next(
+            (c.get("text") for c in result.get("content", []) if c.get("type") == "text"), ""
+        )
+        try:
+            stats = json.loads(text) if text else {}
+        except ValueError as e:
+            raise McpProbeError("stats answered text that is not JSON") from e
+    return stats
+
+
+def check_mcp_stats(url=None, token_file=None, opener=None):
+    """Does the HTTP MCP server answer an authenticated `stats`, on data that is recent?
+
+    sb-mcp and the bot that reads it had no alert at all: neither unit had a Healthchecks
+    check, and "active" is not "serving" (the producer's server answered no semantic query
+    for five days in October while systemd called it healthy). N/A where no token file
+    exists, which is every host that serves no HTTP. The token is read the way the server
+    reads it and is never printed.
+    """
+    url = url or os.environ.get("BRAIN_MCP_URL") or MCP_URL
+    if token_file is None:
+        token_file = os.environ.get("BRAIN_MCP_TOKEN_FILE") or MCP_TOKEN_FILE
+    token_path = Path(token_file).expanduser()
+    row: dict = {"name": "MCP stats", "url": url, "age_hours": None, "embed_backend": None}
+    if not token_path.exists():
+        return {**row, "status": "N/A", "note": f"no token file at {token_path}"}
+    from src.mcp_http import load_token
+
+    try:
+        token = load_token(str(token_path))
+    except ValueError as e:  # names the file and the fix, never the token
+        return {**row, "status": "FAIL", "note": str(e)}
+    opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        stats = _mcp_stats(opener, url, token)
+    except McpProbeError as e:
+        return {**row, "status": "FAIL", "note": str(e)}
+    except (OSError, ValueError) as e:  # URLError is an OSError
+        return {**row, "status": "FAIL", "note": f"no answer from {url}: {getattr(e, 'reason', e)}"}
+    age = stats.get("age_hours")
+    row.update(age_hours=age, embed_backend=stats.get("embed_backend"))
+    try:
+        limit = timedelta(hours=float(os.environ.get("BRAIN_MCP_PROBE_MAX_AGE_HOURS", "")))
+    except ValueError:
+        limit = MCP_PROBE_MAX_AGE
+    if not isinstance(age, int | float):
+        return {**row, "status": "STALE", "note": "stats reports no sync yet"}
+    if timedelta(hours=age) > limit:
+        return {**row, "status": "STALE", "note": f"it answers on data {age:.1f} h old"}
+    return {
+        **row,
+        "status": "OK",
+        "note": f"data {age:.1f} h old, query embeddings via {row['embed_backend']}",
+    }
+
+
+def run_mcp_probe(ping=False, url=None, token_file=None, opener=None) -> int:
+    """The hourly probe: one line on stdout and, with --hc-ping, a ping to its own check.
+
+    It exits 0 whatever it finds, like sb-auth-watch: the ping carries the finding and
+    the exit status only says whether the probe ran. Where nothing is configured to
+    probe, it fails, since the unit that runs it exists to probe.
+    """
+    r = check_mcp_stats(url, token_file, opener)
+    status = "FAIL" if r["status"] == "N/A" else r["status"]
+    line = f"MCP stats: {status} ({r['note']})"
+    print(line)
+    if ping:
+        slug = os.environ.get("BRAIN_MCP_PROBE_SLUG") or MCP_PROBE_SLUG
+        ping_freshness(status == "OK", line, slug=slug, create=True)
+    return 0
 
 
 def send_email(html_body, issues):
@@ -2244,7 +2994,18 @@ def main():
             "so an ad-hoc manual run cannot reset the dead-man's switch."
         ),
     )
+    parser.add_argument(
+        "--mcp-probe",
+        action="store_true",
+        help=(
+            "Only ask the HTTP MCP server for stats, for an hourly timer; with --hc-ping "
+            "the result goes to its own check (BRAIN_MCP_PROBE_SLUG, default sb-mcp-stats)."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.mcp_probe:
+        sys.exit(run_mcp_probe(ping=args.hc_ping))
 
     db = get_db()
     if not db:
@@ -2261,21 +3022,35 @@ def main():
         check_emails(db),
         check_teams(db),
         check_attachments(db),
+        check_attachment_lag(db),
         check_files_on_disk(db),
         check_images(db),
         check_calendar(db),
         check_conversations(db),
         check_embeddings(db),
+        # Its own connection, as the MCP tools open one; it also loads the whole index.
+        check_golden_query(),
         check_documents(db),
         check_whatsapp(db),
         check_news(db),
         check_sharepoint(db),
         check_sharepoint_token(),
         check_llm_spend(db),
+        check_backups(),
+        check_mail_loss(),
     ]
     db.close()
 
     jobs = check_jobs()
+    # Beside the units: sb-mcp reads "active" while it answers nothing. Not on a Mac,
+    # whose job list is launchd's and would take this line for a job that stayed.
+    if not IS_MACOS:
+        mcp = check_mcp_stats()
+        if mcp["status"] != "N/A":
+            jobs["mcp-stats"] = {
+                "desc": "MCP server answers stats",
+                "status": "OK" if mcp["status"] == "OK" else f"{mcp['status']}({mcp['note']})",
+            }
     logs = check_sync_logs()
     sentinels = check_sentinels()
     wrappers = check_wrapper_drift()
@@ -2292,7 +3067,7 @@ def main():
     # drains staging. The hourly sync now loads every hour, so this should rarely
     # fire — it's defense-in-depth for when the hourly load is skipped/failing.
     for c in checks:
-        if c.get("stale") and c.get("name") == "Emails":
+        if c.get("loader_stale") and c.get("name") == "Emails":
             fixable.append(
                 {
                     "type": "stale_data",

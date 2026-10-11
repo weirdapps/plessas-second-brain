@@ -64,7 +64,12 @@ def test_check_jobs_covers_all_logical_jobs_without_filenotfound(hc, monkeypatch
     # away — a literal here would fail on whichever platform it was not written
     # for, and CI runs the systemd one.
     expected = hc.LAUNCHD_JOBS if hc.IS_MACOS else hc.SYSTEMD_UNITS
-    assert len(jobs) == len(expected)
+    if hc.IS_MACOS:
+        assert len(jobs) == len(expected)
+    else:
+        # The systemd list is derived from the units the host has, on top of the
+        # hand-kept ones, so a host with more units reports more, never fewer.
+        assert set(expected) <= set(jobs)
     for label, info in jobs.items():
         assert "No such file or directory" not in str(info.get("status", "")), (
             f"{label} hit a bare-binary FileNotFoundError"
@@ -1510,8 +1515,8 @@ def test_check_images_exposes_age_to_the_report(hc):
 
 
 def test_sharepoint_attempt_cap_matches_the_fetcher(hc):
-    """health_check duplicates MAX_SHAREPOINT_ATTEMPTS because it loads without
-    the package. Pin the copy to the original: if the fetcher's cap moves, this
+    """health_check keeps its own copy of MAX_SHAREPOINT_ATTEMPTS.
+    Pin the copy to the original: if the fetcher's cap moves, this
     check would start ageing links that are legitimately resting, or stop
     noticing ones that are not."""
     import sys

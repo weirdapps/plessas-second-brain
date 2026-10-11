@@ -27,6 +27,10 @@
 # persisted profile lets Microsoft Entra silently re-issue Bearer tokens
 # while the device-trust cookie ESTSAUTHPERSISTENT is alive (~90 days).
 # When that cookie expires, only THEN is interactive login needed.
+# On Linux the silent renew is not attempted at all: see AUTH_WATCH_PLATFORM.
+#
+# When a sentinel clears, the jobs it held back are handed to one transient unit,
+# which starts them one at a time (run_restore, and the trigger at the bottom).
 #
 # Lives at ~/.local/bin/ (legacy from OneDrive/TCC era; constraint no longer applies post-migration).
 
@@ -52,8 +56,23 @@ WRAPPER_DIR="$HOME/.local/bin"
 # Overridable for the test suite: a stub on PATH cannot intercept an absolute
 # path, so until 2026-09-27 every test run on a Mac posted real reauth alerts.
 OSASCRIPT="${OSASCRIPT:-/usr/bin/osascript}"
+# The silent renew drives a headless browser through a sign-in that never completes
+# on a Linux host: on the producer it succeeded once in 347 Teams attempts and never
+# in 184 Outlook ones, while the token push from the laptop renewed both. So Linux
+# skips it and keeps the probe, the sentinel and the health slugs. The variable
+# overrides the detection, for the tests.
+AUTH_WATCH_PLATFORM="${AUTH_WATCH_PLATFORM:-$(uname -s)}"
+# How long the restore waits on each job it starts, and how often it looks. Fractions
+# of a second work too, which is how the tests run it.
+RESTORE_WAIT_S="${AUTH_RESTORE_WAIT_S:-1800}"
+RESTORE_POLL_S="${AUTH_RESTORE_POLL_S:-10}"
+# This script, by absolute path, for the transient unit that runs the restore.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
 mkdir -p "$LOG_DIR" "$(dirname "$SENTINEL")"
+
+# A file's mtime in epoch seconds: GNU stat, else BSD stat (a Mac), else "-".
+_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo -; }
 
 # --- Snapshot sentinel state BEFORE probes run.
 # When a probe successfully renews auth it clears its sentinel; comparing this
@@ -64,12 +83,140 @@ mkdir -p "$LOG_DIR" "$(dirname "$SENTINEL")"
 GCLOUD_WAS_BLOCKED=0
 OUTLOOK_WAS_BLOCKED=0
 TEAMS_WAS_BLOCKED=0
-[ -f "$GCLOUD_SENTINEL" ] && GCLOUD_WAS_BLOCKED=1
+# When needs_gcloud_reauth went up, which set_sentinel keeps as its mtime. The
+# restore reads it to tell a daily sync that ran before the outage from one that
+# skipped during it.
+GCLOUD_SET_AT="-"
+[ -f "$GCLOUD_SENTINEL" ] && GCLOUD_WAS_BLOCKED=1 && GCLOUD_SET_AT=$(_mtime "$GCLOUD_SENTINEL")
 [ -f "$SENTINEL" ]        && OUTLOOK_WAS_BLOCKED=1
 [ -f "$TEAMS_SENTINEL" ]  && TEAMS_WAS_BLOCKED=1
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "$(ts) — $*" >> "$LOG"; }
+
+# --- Restart, one at a time, the jobs a cleared sentinel held back ---------------
+# `sb-auth-watch.sh --restore <restored-at> <gcloud-set-at|-> <unit>...`, which the
+# trigger at the bottom of this script hands to a transient unit of its own.
+#
+# The trigger used to start every job in the same second. On 2026-10-10 at 12:02 it
+# started the daily sync, calendar, Teams, attachments and mail together, whose
+# recent memory peaks sum to about 15 GB on a host with 7.7 GB of RAM and 4 GB of
+# swap; it survived because the peaks did not line up. The daily sync also ran a
+# second time that day and replaced the morning's backup, after a recovery that was
+# not one. So each job now starts only when none of them is running, and is waited
+# on until it has finished, for at most RESTORE_WAIT_S, before the next. A job that
+# overruns is left running and the next one starts beside it: bounded, never stuck.
+RESTORE_UNITS=(sb-daily-sync.service sb-outlook-sync.service sb-calendar-sync.service sb-teams-sync.service sb-attachments.service)
+
+_polls() {   # how many RESTORE_POLL_S fit in RESTORE_WAIT_S, rounded up
+  awk -v w="$RESTORE_WAIT_S" -v p="$RESTORE_POLL_S" \
+    'BEGIN { n = (p > 0) ? w / p : 0; printf "%d", (n > int(n)) ? int(n) + 1 : n }'
+}
+
+_busy() {   # 0 while any of the jobs a restore starts is running, a timer's run included
+  # Read first, match after: piped under pipefail, is-active's own non-zero status
+  # (any unit inactive) or a SIGPIPE from grep -q would read as "nothing running".
+  local states
+  states=$(systemctl --user is-active "${RESTORE_UNITS[@]}" 2>/dev/null)
+  grep -qxE 'active|activating|deactivating|reloading' <<< "$states"
+}
+
+_wait_quiet() {
+  local n
+  n=$(_polls)
+  while _busy; do
+    if [ "$n" -le 0 ]; then
+      log "auth-restore: a job is still running after ${RESTORE_WAIT_S}s; going on"
+      return 0
+    fi
+    sleep "$RESTORE_POLL_S"
+    n=$((n - 1))
+  done
+}
+
+_epoch() {   # a systemd timestamp in epoch seconds: "@1728541752", or a local date
+  case "$1" in
+    @*) echo "${1#@}" ;;
+    # systemd before 248 has no --timestamp=unix. Its local date, zone dropped, read
+    # by GNU date in the same local time.
+    *[0-9]*) date -d "${1% *}" +%s 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+_succeeded_at() {   # when a unit's last run ended, if it ended in success
+  local out result stamp
+  out=$(systemctl --user show --timestamp=unix -p Result -p ExecMainExitTimestamp "$1" 2>/dev/null) \
+    || out=$(systemctl --user show -p Result -p ExecMainExitTimestamp "$1" 2>/dev/null) \
+    || return 1
+  result=$(printf '%s\n' "$out" | sed -n 's/^Result=//p')
+  stamp=$(printf '%s\n' "$out" | sed -n 's/^ExecMainExitTimestamp=//p')
+  [ "$result" = success ] || return 1
+  _epoch "$stamp"
+}
+
+_on_today() {   # 0 when an epoch falls on today's local date
+  local day
+  day=$(date -d "@$1" +%F 2>/dev/null || date -r "$1" +%F 2>/dev/null) || return 1
+  [ "$day" = "$(date +%F)" ]
+}
+
+_start_and_wait() {   # start a unit and wait, at most RESTORE_WAIT_S, for it to finish
+  local unit="$1" n pid
+  n=$(_polls)
+  systemctl --user reset-failed "$unit" 2>/dev/null || true
+  # A plain start returns once a Type=oneshot unit has run to its end, and joins a
+  # run already in progress rather than starting a second one.
+  systemctl --user start "$unit" >/dev/null 2>>"$LOG" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$n" -le 0 ]; then
+      # Stops the waiting client only: systemd keeps the job it queued.
+      kill "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      log "auth-restore: $unit still running after ${RESTORE_WAIT_S}s; starting the next job beside it"
+      return 0
+    fi
+    sleep "$RESTORE_POLL_S"
+    n=$((n - 1))
+  done
+  if wait "$pid"; then
+    log "auth-restore: $unit finished"
+  else
+    log "auth-restore: $unit failed, and its own unit reports it"
+  fi
+}
+
+run_restore() {   # run_restore <restored-at> <gcloud-set-at|-> <unit>...
+  local restored_at="$1" gcloud_set_at="$2" unit ended
+  shift 2
+  log "auth-restore: starting $* one at a time"
+  for unit in "$@"; do
+    _wait_quiet
+    if ended=$(_succeeded_at "$unit"); then
+      if [ "$ended" -ge "$restored_at" ]; then
+        log "auth-restore: $unit already ran since the restore; not running it again"
+        continue
+      fi
+      # Once a day is enough: a second daily sync costs twenty minutes and redoes the
+      # backup. But it exits 0 when it SKIPS on needs_gcloud_reauth, so only a success
+      # from before that sentinel went up proves it ran.
+      if [ "$unit" = sb-daily-sync.service ] && [ "$gcloud_set_at" != - ] \
+         && [ "$ended" -lt "$gcloud_set_at" ] && _on_today "$ended"; then
+        log "auth-restore: sb-daily-sync already succeeded today, before the outage; not running it again"
+        continue
+      fi
+    fi
+    _start_and_wait "$unit"
+  done
+  log "auth-restore: done"
+}
+
+if [ "${1:-}" = "--restore" ]; then
+  shift
+  run_restore "$@"
+  exit 0
+fi
 
 # Serialise runs. This script is invoked from TWO places: sb-auth-watch.service
 # (its own timer, 00/04/08/12/16/20) and sb-outlook-sync.sh's pre-flight
@@ -206,7 +353,26 @@ _renew_stderr_note() {   # $1 = surface, $2 = elapsed seconds, $3 = stderr file
   printf '%s' "$(tr '\n' ' ' < "$3" | tail -c 300)"
 }
 
+_renew_possible() { [ "$AUTH_WATCH_PLATFORM" != Linux ]; }
+
+# Set a sentinel and say who set it and why: on 2026-10-10 needs_gcloud_reauth went
+# up between two probes that both found ADC healthy, and no line named the writer.
+# Created only when absent, so its mtime stays the moment it went up, which the
+# health report prints as "present since" and the restore reads (GCLOUD_SET_AT).
+set_sentinel() {   # set_sentinel <file> <reason>
+  if [ -e "$1" ]; then
+    log "$(basename "$1") still set: $2"
+    return 0
+  fi
+  : > "$1"
+  log "set $(basename "$1"): $2 (auth-watch pid $$, run by: $(ps -o args= -p "$PPID" 2>/dev/null | cut -c1-120))"
+}
+
 try_silent_renew_outlook() {
+  if ! _renew_possible; then
+    log "outlook: no silent renew on Linux; the token push from the laptop renews it"
+    return 1
+  fi
   log "outlook: attempting silent auth-renew (headless via persistent profile)"
   local renew_stdout err t0 elapsed
   err=$(mktemp); t0=$SECONDS
@@ -222,6 +388,10 @@ try_silent_renew_outlook() {
 }
 
 try_silent_renew_teams() {
+  if ! _renew_possible; then
+    log "teams: no silent renew on Linux; the token push from the laptop renews it"
+    return 1
+  fi
   log "teams: attempting silent auth-renew (headless via persistent profile)"
   local renew_stdout err t0 elapsed
   err=$(mktemp); t0=$SECONDS
@@ -248,7 +418,7 @@ auth_check_outlook() {
       return 0
     fi
     notify_interactive_required "auth-check failed AND silent renew failed"
-    touch "$SENTINEL"
+    set_sentinel "$SENTINEL" "outlook auth-check failed and no renew restored it"
     return 1
   fi
 
@@ -256,7 +426,7 @@ auth_check_outlook() {
   if [ -z "$expires_at" ]; then
     log "outlook auth-check returned no tokenExpiresAt: $result"
     notify_interactive_required "no token expiry returned"
-    touch "$SENTINEL"
+    set_sentinel "$SENTINEL" "outlook auth-check returned no token expiry"
     return 1
   fi
 
@@ -278,12 +448,12 @@ print(int(datetime.datetime.fromisoformat(sys.argv[1].replace('Z','+00:00')).tim
     return 0
   fi
 
-  log "outlook bearer expiring within ${MIN_HOURS_BEFORE_NOTIFY}h — attempting silent renew"
+  log "outlook bearer expiring within ${MIN_HOURS_BEFORE_NOTIFY}h"
   if try_silent_renew_outlook; then
     rm -f "$SENTINEL"
     return 0
   fi
-  log "outlook silent renew failed — interactive login required"
+  log "outlook bearer not renewed: interactive login required"
   notify_interactive_required "bearer expires in ${hours_remaining}h, silent renew failed"
 
   # Do NOT latch while the bearer still works. auth-check passed at the top of
@@ -301,7 +471,7 @@ print(int(datetime.datetime.fromisoformat(sys.argv[1].replace('Z','+00:00')).tim
     return 1
   fi
 
-  touch "$SENTINEL"
+  set_sentinel "$SENTINEL" "outlook bearer expired and was not renewed"
   return 1
 }
 
@@ -347,7 +517,7 @@ _teams_latch_or_suspect() {   # $1 = the reason, as the log has always phrased i
   fi
   log "teams: $1; failing on two passes ${age}s apart: interactive login required"
   notify_teams_reauth
-  touch "$TEAMS_SENTINEL"
+  set_sentinel "$TEAMS_SENTINEL" "teams failing on two passes ${age}s apart"
   rm -f "$TEAMS_SUSPECT"
   return 1
 }
@@ -372,7 +542,7 @@ auth_check_teams() {
   # Anything non-zero = degraded. Extract which audiences failed for the log.
   local failing
   failing=$(echo "$hc_out" | jq -r '[.probes[] | select(.ok == false) | .name] | join(",")' 2>/dev/null || echo "unknown")
-  log "teams-cli health-check rc=$rc, failing probes: $failing — attempting silent renew"
+  log "teams-cli health-check rc=$rc, failing probes: $failing"
 
   if try_silent_renew_teams; then
     # Renew said it captured everything — verify with health-check before
@@ -396,12 +566,16 @@ auth_check_teams() {
   # from before the renew. The success branch above already re-probes for the
   # opposite reason; this is the same distrust applied symmetrically.
   if teams-cli health-check >/dev/null 2>&1; then
-    log "teams: renew failed but health-check now passes; transient, not latching"
+    log "teams: health-check passes on a second look; transient, not latching"
     rm -f "$TEAMS_SENTINEL" "$TEAMS_SUSPECT"
     return 0
   fi
 
-  _teams_latch_or_suspect "silent renew failed"
+  if _renew_possible; then
+    _teams_latch_or_suspect "silent renew failed"
+  else
+    _teams_latch_or_suspect "health-check still failing"
+  fi
   return 1
 }
 
@@ -444,7 +618,7 @@ auth_check_gcloud_adc() {
   fi
 
   log "gcloud ADC expired (or refresh token revoked) — Vertex AI extraction will fail"
-  touch "$GCLOUD_SENTINEL"
+  set_sentinel "$GCLOUD_SENTINEL" "gcloud ADC probe failed"
   notify_gcloud_reauth
 
   if [ -x "$GCLOUD_AUTO_LOGIN" ]; then
@@ -480,6 +654,25 @@ if [ -f "$GCLOUD_SENTINEL" ]; then hc_report sb-auth-gcloud  fail; else hc_repor
 # --- Re-trigger wrappers whose sentinels were just cleared.
 # Each wrapper has its own sentinel guards at the top, so dispatching one whose
 # OTHER blocker is still active is safe — it'll log SKIP and exit 0.
+
+# The launchd label and the systemd unit that run a wrapper: sets the caller's
+# label and unit.
+job_ids() {
+  label="" unit=""
+  case "$1" in
+    sb-daily-sync.sh)       label="com.plessas.second-brain-sync"          unit="sb-daily-sync.service" ;;
+    sb-calendar-sync.sh)    label="com.plessas.second-brain.calendar-sync" unit="sb-calendar-sync.service" ;;
+    sb-teams-sync.sh)       label="com.plessas.second-brain.teams-sync"    unit="sb-teams-sync.service" ;;
+    sb-attachment-pass.sh)  label="com.plessas.second-brain.attachments"   unit="sb-attachments.service" ;;
+    # Fired below but missing here until 2026-09-27, so every restoration took
+    # the nohup fallback: killed with this unit's cgroup when auth-watch ran on
+    # its own timer, and a second full mail sync beside the first when it ran as
+    # sb-outlook-sync's pre-flight. From the pre-flight the unit is already
+    # activating, and systemd merges this start into that job.
+    sb-outlook-sync.sh)     label="com.plessas.second-brain.sync"          unit="sb-outlook-sync.service" ;;
+  esac
+}
+
 trigger_job() {
   local script="$1"
   local reason="$2"
@@ -495,18 +688,7 @@ trigger_job() {
   # all dying with "Received signal 15" right after a restoration trigger).
   # kickstart starts the matching launchd job under its own management.
   local label="" unit=""
-  case "$script" in
-    sb-daily-sync.sh)       label="com.plessas.second-brain-sync"          unit="sb-daily-sync.service" ;;
-    sb-calendar-sync.sh)    label="com.plessas.second-brain.calendar-sync" unit="sb-calendar-sync.service" ;;
-    sb-teams-sync.sh)       label="com.plessas.second-brain.teams-sync"    unit="sb-teams-sync.service" ;;
-    sb-attachment-pass.sh)  label="com.plessas.second-brain.attachments"   unit="sb-attachments.service" ;;
-    # Fired below but missing here until 2026-09-27, so every restoration took
-    # the nohup fallback: killed with this unit's cgroup when auth-watch ran on
-    # its own timer, and a second full mail sync beside the first when it ran as
-    # sb-outlook-sync's pre-flight. From the pre-flight the unit is already
-    # activating, and systemd merges this start into that job.
-    sb-outlook-sync.sh)     label="com.plessas.second-brain.sync"          unit="sb-outlook-sync.service" ;;
-  esac
+  job_ids "$script"
 
   # systemd first on Linux, launchd first on macOS. Both hand the job to the
   # platform supervisor so it runs under ITS management. The nohup fallback is
@@ -556,6 +738,36 @@ trigger_job() {
   fi
 }
 
+# Hand the restored jobs to a transient unit of their own, which runs run_restore:
+# one at a time, in the order given. Neither caller of this script can wait for
+# them. Its own unit is stopped after ten minutes and the daily sync alone takes
+# twenty, and sb-outlook-sync runs it as a pre-flight, where waiting would hold the
+# mail sync and then wait on it. The transient unit is outside both, and shows in
+# `systemctl --user list-units 'sb-auth-restore-*'` while it runs. No --collect,
+# so one that fails stays listed. Returns non-zero when systemd did not take it.
+hand_off_restore() {   # hand_off_restore <reason> <wrapper>...
+  local reason="$1" script label unit name
+  local units=()
+  shift
+  command -v systemd-run >/dev/null 2>&1 || return 1
+  for script in "$@"; do
+    job_ids "$script"
+    [ -n "$unit" ] && units+=("$unit")
+  done
+  [ "${#units[@]}" -gt 0 ] || return 1
+  name="sb-auth-restore-$(date +%Y%m%d%H%M%S)-$$"
+  if systemd-run --user --unit="$name" \
+       --description="second-brain: restart the jobs an auth outage held back, one at a time" \
+       --setenv=AUTH_RESTORE_WAIT_S="$RESTORE_WAIT_S" --setenv=AUTH_RESTORE_POLL_S="$RESTORE_POLL_S" \
+       /bin/bash "$SELF" --restore "$(date +%s)" "$GCLOUD_SET_AT" "${units[@]}" \
+       >/dev/null 2>>"$LOG"; then
+    log "auth-trigger: $name starts ${units[*]} one at a time (reason=$reason)"
+    return 0
+  fi
+  log "auth-trigger: systemd-run did not take $name; starting the jobs together, as before"
+  return 1
+}
+
 # Determine which wrappers should fire. A job runs at most once per auth-watch
 # tick even if multiple sentinels were restored.
 fire_daily=0
@@ -567,28 +779,41 @@ fire_attachments=0
 # lapse cost four hours of mail instead of minutes — and the overnight schedule
 # (22:00 -> 01:00 -> 07:00) can stretch that to nine.
 fire_outlook_sync=0
+restored=""
 
 if [ "$GCLOUD_WAS_BLOCKED" = "1" ] && [ ! -f "$GCLOUD_SENTINEL" ]; then
   log "auth-trigger: gcloud ADC restored — queueing all gcloud-gated jobs"
   fire_daily=1; fire_calendar=1; fire_teams=1; fire_attachments=1
   fire_outlook_sync=1
+  restored="$restored gcloud"
 fi
 if [ "$OUTLOOK_WAS_BLOCKED" = "1" ] && [ ! -f "$SENTINEL" ]; then
   log "auth-trigger: outlook auth restored — queueing outlook-gated jobs"
   fire_calendar=1; fire_attachments=1; fire_outlook_sync=1
+  restored="$restored outlook"
 fi
 if [ "$TEAMS_WAS_BLOCKED" = "1" ] && [ ! -f "$TEAMS_SENTINEL" ]; then
   log "auth-trigger: teams auth restored — queueing teams-sync"
   fire_teams=1
+  restored="$restored teams"
 fi
 
 if [ "$fire_daily$fire_calendar$fire_teams$fire_attachments$fire_outlook_sync" != "00000" ]; then
   echo "$(ts) — === auth-watch restoration trigger ===" >> "$TRIGGERED_LOG"
-  [ "$fire_daily" = "1" ]       && trigger_job sb-daily-sync.sh        gcloud
-  [ "$fire_calendar" = "1" ]    && trigger_job sb-calendar-sync.sh     gcloud_or_outlook
-  [ "$fire_teams" = "1" ]       && trigger_job sb-teams-sync.sh        gcloud_or_teams
-  [ "$fire_attachments" = "1" ] && trigger_job sb-attachment-pass.sh   gcloud_or_outlook
-  [ "$fire_outlook_sync" = "1" ] && trigger_job sb-outlook-sync.sh     gcloud_or_outlook
+  # In the order the restore starts them: the daily sync, then mail, calendar,
+  # Teams, and the attachment pass last.
+  restore=()
+  [ "$fire_daily" = "1" ]        && restore+=(sb-daily-sync.sh)
+  [ "$fire_outlook_sync" = "1" ] && restore+=(sb-outlook-sync.sh)
+  [ "$fire_calendar" = "1" ]     && restore+=(sb-calendar-sync.sh)
+  [ "$fire_teams" = "1" ]        && restore+=(sb-teams-sync.sh)
+  [ "$fire_attachments" = "1" ]  && restore+=(sb-attachment-pass.sh)
+  # Without systemd-run (a Mac, or a refusal), every job starts at once, as before.
+  if ! hand_off_restore "${restored# }" "${restore[@]}"; then
+    for script in "${restore[@]}"; do
+      trigger_job "$script" "${restored# }"
+    done
+  fi
 fi
 
 exit 0

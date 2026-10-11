@@ -6,6 +6,10 @@
 #   2. ./.venv or ./venv          (in-repo; .venv may symlink to ~/.venvs)
 #   3. ~/.venvs/second-brain      (shared venv dir)
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+# The checkout on the module path, so `-m src.cli` resolves from any directory (the
+# project installs no package). Not a cd: a relative path in the arguments, as in
+# `brain ingest ./report.pdf`, names a file where brain was run.
+export PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}"
 for _py in \
   "${SECOND_BRAIN_VENV_PYTHON:-}" \
   "$REPO_DIR/.venv/bin/python" \

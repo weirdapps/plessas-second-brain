@@ -56,6 +56,7 @@ from src.evals import (
     write_jsonl,
     write_private,
 )
+from src.store.owner import is_owner_address, owner_address_sql
 
 # --- the label vocabulary -------------------------------------------------------------
 
@@ -297,11 +298,13 @@ def _strata_candidates(conn, since: str, owner_pattern: str) -> tuple[dict, set[
     to_owner: set[int] = set()
     cc_owner: set[int] = set()
     if pattern:
+        # The owner's listed addresses, each whole (src/store/owner.py).
+        is_owner, params = owner_address_sql("p.email", owner_pattern)
         rows = conn.execute(
             "SELECT ep.email_id, ep.role_in_email FROM email_people ep"
             " JOIN people p ON p.id = ep.person_id"
-            " WHERE ep.role_in_email IN ('recipient', 'cc') AND lower(p.email) LIKE ?",
-            (f"%{pattern}%",),
+            f" WHERE ep.role_in_email IN ('recipient', 'cc') AND {is_owner}",
+            params,
         )
         for email_id, role in rows:
             (to_owner if role == "recipient" else cc_owner).add(email_id)
@@ -310,7 +313,7 @@ def _strata_candidates(conn, since: str, owner_pattern: str) -> tuple[dict, set[
         _WINDOW_SQL, (since,)
     ):
         sender = (sender or "").lower()
-        sent = mailbox in SENT_MAILBOXES or bool(pattern and pattern in sender)
+        sent = mailbox in SENT_MAILBOXES or is_owner_address(sender, owner_pattern)
         bulk = not sent and bool(_BULK_SENDER.search(sender) or bulk_body)
         if (
             not bulk

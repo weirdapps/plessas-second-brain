@@ -64,9 +64,17 @@ def test_the_local_part_of_an_address_finds_a_greek_name():
 
 def test_the_local_part_needs_four_letters():
     conn = _store()
+    # A surname only the address spells, after an initial.
+    _person(conn, "Μαρία Κ.", "mkalogirou@example.com")
     # Three letters after an initial would fit many addresses.
-    assert resolve_person(conn, "syn") == (None, 0, [])
-    assert _resolved(conn, "synt") == "Μαρία Συνθέτου"
+    assert resolve_person(conn, "kal") == (None, 0, [])
+    assert _resolved(conn, "kalo") == "Μαρία Κ."
+
+
+def test_three_latin_letters_start_a_greek_word_as_three_greek_ones_do():
+    # Transliterated, 'syn' starts Συνθέτου as 'συν' does (person_resolve).
+    conn = _store()
+    assert _resolved(conn, "syn") == _resolved(conn, "συν") == "Μαρία Συνθέτου"
 
 
 def test_every_match_is_counted_and_the_runners_up_named():

@@ -4,7 +4,6 @@ Provides rich context functions for the email-handler plugin and /recall skill
 to retrieve person, topic, conversation, and decision context from the knowledge store.
 """
 
-import re
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -25,6 +24,7 @@ from src.store.ordering import (
     fact_order,
     parent_dates,
 )
+from src.store.person_resolve import resolve_identity
 from src.store.source_class import visible_sql, with_source_class
 
 # Every list in a context dossier is capped at this many rows unless the caller
@@ -44,67 +44,15 @@ DEFAULT_CONTEXT_LIMIT = 20
 def resolve_person(
     conn: sqlite3.Connection, name_or_email: str, *, local_part: bool = True
 ) -> tuple[sqlite3.Row | None, int, list[dict]]:
-    """The person a name or email means, how many people matched, and the next three.
+    """The person a name or email means, how many people it can mean, and the next three.
 
-    A name is matched folded (case, accents, final sigma), because people are
-    mostly stored in ALL-CAPS Greek and SQLite's LIKE folds ASCII only. Several
-    people usually match a surname, and fetchone() used to pick whichever row came
-    first with no word of the others; the most-emailed match wins, and the caller
-    is told how many there were. person_context and meeting_prep both resolve
-    through here, so one name means one person in both.
+    resolve_identity's answer without resolved_by, for the callers that unpack three
+    values; see src/store/person_resolve.py for the rules. person_context,
+    sender_brief and meeting_prep all resolve through resolve_identity, so one name
+    means one person in each.
     """
-    register_sql_functions(conn)  # sb_fold et al., whoever opened conn
-    if not any(ch.isalnum() for ch in search_fold(name_or_email)):
-        # '%%' matched everyone, so an empty name (a trailing comma in a list of
-        # attendees) resolved to the most-emailed person; '%' and '_' are LIKE
-        # wildcards, and '.' ends every initial.
-        return None, 0, []
-    if "@" in name_or_email:
-        row = conn.execute(
-            "SELECT id, name, email, role, department FROM people WHERE LOWER(email) = LOWER(?)",
-            (name_or_email.strip(),),
-        ).fetchone()
-        return row, (1 if row else 0), []
-    # At the start of a word, as a search matches (greek._phrase_pattern, which
-    # sb_match applies to a phrase when given no words or tokens): anywhere inside
-    # a name, 'AI' resolved to a forename holding it and 'EU' to a bank, and recall
-    # attached that dossier to topic queries. The LIKE only rules rows out first.
-    phrase = " ".join(search_fold(name_or_email).split())
-    # Only the head of the phrase is anchored when its last word is under three
-    # letters, because that word is an initial ('Surname T') and _phrase_pattern
-    # would make it a whole word; a query of one short word stays whole ('AI').
-    head, _, tail = phrase.rpartition(" ")
-    anchor = head if head and len(tail) < 3 and tail.isalpha() else phrase
-    # And the local part of an address, where one word of four letters or more
-    # starts a token or follows a one-letter initial ('jexample'), so a name
-    # stored only in Greek is found by the Latin surname its address spells.
-    # recall turns that off for the dossier it attaches on its own: there a topic
-    # word ('data', 'info') started some mailbox's local part and brought it in.
-    local = phrase if local_part and re.fullmatch(r"[a-z0-9]{4,}", phrase) else ""
-    where = r"""
-        (sb_fold(p.name) LIKE '%' || :phrase || '%' AND sb_match(p.name, :anchor, '', '') > 0)
-        OR (:local <> '' AND (LOWER(p.email) LIKE :local || '%@%'
-                              OR LOWER(p.email) LIKE '_' || :local || '%@%'
-                              OR LOWER(p.email) LIKE '%.' || :local || '%@%'
-                              OR LOWER(p.email) LIKE '%-' || :local || '%@%'
-                              OR LOWER(p.email) LIKE '%\_' || :local || '%@%' ESCAPE '\'))
-    """
-    args = {"phrase": phrase, "anchor": anchor, "local": local}
-    candidates = conn.execute(
-        f"""
-        SELECT p.id, p.name, p.email, p.role, p.department
-        FROM people p
-        WHERE {where}
-        ORDER BY (SELECT COUNT(*) FROM email_people ep WHERE ep.person_id = p.id) DESC, p.id
-        LIMIT 4
-        """,
-        args,
-    ).fetchall()
-    if not candidates:
-        return None, 0, []
-    match_count = conn.execute(f"SELECT COUNT(*) FROM people p WHERE {where}", args).fetchone()[0]
-    others = [{"name": c["name"], "email": c["email"]} for c in candidates[1:]]
-    return candidates[0], match_count, others
+    res = resolve_identity(conn, name_or_email, local_part=local_part)
+    return res.row, res.match_count, res.other_candidates
 
 
 def get_person_context(
@@ -121,19 +69,23 @@ def get_person_context(
 
     Args:
         conn: Database connection
-        name_or_email: Person's name (partial match) or email address
+        name_or_email: Person's name (the start of its words, either script), email
+            address, WhatsApp JID or Teams MRI; resolved by
+            src/store/person_resolve.py, an identity first
         days: Number of days to look back
         limit: Max rows per list (topics, decisions, open_actions). Each list is
             accompanied by a `<name>_total` giving the unbounded count.
             recent_emails holds at most min(limit, 10), with no total.
         local_part: Also match a name against the start of an address's local
-            part (see resolve_person).
+            part (see resolve_identity).
         include_news, include_automation: Count and list news items and the
             owner's automation mail too, left out by default
             (src/store/source_class.py)
 
     Returns:
-        Dict with person info, email_count, recent_emails, topics,
+        Dict with person info, resolved_by ('email', 'mri', 'jid', 'name' or
+        'alias'; None when no one matched), match_count, other_candidates (each
+        with its identifier kind), email_count, recent_emails, topics,
         sentiment_distribution, decisions, open_actions, communication_pattern;
         every email, decision and action row carries its email_id and source_class
     """
@@ -142,13 +94,13 @@ def get_person_context(
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
     visible = visible_sql(conn, "e.id", include_news, include_automation)
 
-    person_row, match_count, other_candidates = resolve_person(
-        conn, name_or_email, local_part=local_part
-    )
+    resolution = resolve_identity(conn, name_or_email, local_part=local_part)
+    person_row = resolution.row
 
     if not person_row:
         return {
             "person": None,
+            "resolved_by": None,
             "match_count": 0,
             "other_candidates": [],
             "email_count": 0,
@@ -414,8 +366,9 @@ def get_person_context(
 
     return {
         "person": person,
-        "match_count": match_count,
-        "other_candidates": other_candidates,
+        "resolved_by": resolution.resolved_by,
+        "match_count": resolution.match_count,
+        "other_candidates": resolution.other_candidates,
         "email_count": email_count,
         "recent_emails": recent_emails,
         "topics": topics,

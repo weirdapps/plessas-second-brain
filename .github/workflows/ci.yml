@@ -67,7 +67,12 @@ jobs:
       # -rs lists every skipped test with its reason. A skip in CI is a test that
       # runs NOWHERE, because the developer machine has the tool and never sees
       # the skip; printing them keeps that visible instead of silent.
-      - run: uv run --frozen --no-build pytest -q -rs --cov=src --cov=scripts --cov-report=term-missing
+      # --cov-fail-under is the coverage gate. SonarCloud reported this figure
+      # (86.8% when it was removed) and gated nothing; here a drop below 85
+      # fails the job.
+      - run: >-
+          uv run --frozen --no-build pytest -q -rs --cov=src --cov=scripts
+          --cov-report=term-missing --cov-fail-under=85
   types:
     # mypy ran only in pre-commit, on changed files, with imports followed
     # silently and without the project's dependencies, so it could not see a

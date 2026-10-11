@@ -919,3 +919,100 @@ backfill for links recorded `ok` with no text stored (mostly viewer pages saved 
 (`--dry-run`). It is resumable: the `sync_metadata` row `sharepoint_refetch_since` marks when it
 began, a link attempted since is done, and a finished pass finds nothing. Delete that row to read
 them all again.
+
+## 11. Batch jobs for backfills (Vertex AI batch prediction)
+
+A backfill of attachment summaries (`reextract`, or a large Phase 2 queue) can run as Vertex AI
+batch prediction jobs at half the online price (README, "Batch jobs for backfills"). The requests
+go to a Cloud Storage bucket as JSONL, a job in the extraction region answers them into the same
+bucket within 24 hours, and `--batch-collect` stores the replies. Nothing scheduled uses it: the
+hourly sync and the nightly pass stay online.
+
+**What to create, once, in the Vertex project.** The commands below use placeholders: `PROJECT_ID`,
+`PROJECT_NUMBER`, `BUCKET` and `OWNER_EMAIL` (the account whose Application Default Credentials
+the producer runs on).
+
+1. A bucket in the jobs' region. With `VERTEX_SDK_REGION=eu` that is the `EU` multi-region; Google
+   asks for the bucket and the job in the same region. Uniform access, no public access, and a
+   lifecycle rule that deletes what it holds after seven days: the files carry the documents' text
+   and the replies, and a job is collected within two days.
+
+   ```bash
+   printf '%s\n' '{"rule": [{"action": {"type": "Delete"}, "condition": {"age": 7}}]}' > lifecycle.json
+   gcloud storage buckets create gs://BUCKET --project=PROJECT_ID --location=EU \
+     --uniform-bucket-level-access --public-access-prevention --lifecycle-file=lifecycle.json
+   ```
+
+2. Roles. The producer's account creates and reads jobs and writes and reads the bucket; the
+   Vertex AI service agent, which runs the job, reads the input and writes the output.
+
+   ```bash
+   gcloud projects add-iam-policy-binding PROJECT_ID \
+     --member=user:OWNER_EMAIL --role=roles/aiplatform.user
+   gcloud storage buckets add-iam-policy-binding gs://BUCKET \
+     --member=user:OWNER_EMAIL --role=roles/storage.objectUser
+   gcloud storage buckets add-iam-policy-binding gs://BUCKET \
+     --member=serviceAccount:service-PROJECT_NUMBER@gcp-sa-aiplatform.iam.gserviceaccount.com \
+     --role=roles/storage.objectUser
+   ```
+
+   The account already calls Claude through `roles/aiplatform.user` or a role that holds it, so
+   the first binding may be in place. The service agent's grant is the one a job's error names
+   when it is missing.
+
+3. In the producer's environment (`.env`, or the env file the units read):
+   `BRAIN_BATCH_BUCKET=gs://BUCKET/second-brain`, and `BRAIN_BATCH_LOCATION` only to run the jobs
+   somewhere other than `VERTEX_SDK_REGION`. The project, the model and the call shape are the
+   online path's. A job's files go under `gs://BUCKET/second-brain/<job key>/`: `input.jsonl`, and
+   the job's output under `output/`.
+
+**The probe first.** On the producer, with the same environment as the timers:
+
+```bash
+python -m src.cli reextract --batch --probe
+```
+
+It sends ten requests built from the newest stored texts (or from the rows a selector chooses, as
+in `reextract --long --batch --probe`), holds nothing, and waits up to an hour, printing the job's
+name and its two paths at once. When the job ends it prints, per request, the outcome (`parsed`,
+or why not), the stop reason, the tokens and the summary, then the cost at batch and at online
+rates. It stores nothing; its job and its replies go in the usage log. If the wait runs out, the
+job runs on, and `reextract --batch-collect` prints the replies later. What it settles:
+
+- an error at the job's creation naming the location: `eu` takes no Claude batch job, so set
+  `BRAIN_BATCH_LOCATION` to an EU region that serves the model, with a bucket in that region;
+- an error naming the bucket or a permission: the roles above;
+- replies counted `failed` with a message about the response's keys: the output lines are laid out
+  otherwise than the code reads them, and nothing was stored. Report the message (it names the
+  keys, not the text) before any backfill;
+- under `BRAIN_EXTRACT_CALL_SHAPE=v2`, run it a second time: cache reads in the usage log and
+  `parsed` replies say that batch jobs take the cached system prompt and the structured outputs.
+
+**The backfill.** Price it first: `python -m src.cli reextract --long --estimate` prints the online
+and the batch cost. Then, on the producer:
+
+1. Send a job: `python -m src.cli reextract --long --batch --limit 500` (or `--capped`,
+   `--partial`, ... as before), which reads the rows again as usual and sends their summaries.
+   A job takes 2,000 requests, and a long document takes one per part it summarises (its merge
+   goes in a later job), so choose `--limit` for the rows of a run to fit one job; the command
+   prints how many it could not send. Pass the `highest id` it prints back as `--after-id` for the
+   next run. For a Phase 2 queue: `python -m src.cli process-attachments --phase 2 --batch`,
+   repeated until it says `nothing to send`. A token budget bounds what is sent as it bounds an
+   online run. Vertex runs four jobs at a time in a project by default.
+2. The rows a job holds are left out of the hourly sync and the nightly pass, so nothing is paid
+   for twice, for 48 hours or until collected. A row the job could not take stays pending, and the
+   next online pass summarises it at the online price: send it in the next job first. Sending while
+   the nightly pass runs can pay for a few rows twice; the collect then finds them summarised and
+   leaves them.
+3. Collect, once the jobs have ended (the Vertex console, or the command, says so):
+   `python -m src.cli process-attachments --batch-collect`. It prints, per job, the rows stored, the
+   parts saved for a merge, and the rows left pending with the reason. A job still running is left
+   for the next collect; run it again later. A `reextract` job's collect drops the vectors of the
+   rows it stored, so the next index build embeds the new summaries.
+4. Repeat 1 and 3 until the selectors and the queue are empty. Long documents need one more round:
+   after their parts are collected, `process-attachments --phase 2 --batch` sends their merges.
+   Rows left pending (a failed line, a refusal, a reply cut short) go to the online path, which
+   asks again with its refusal fallback and its larger second budget.
+
+The usage log names each batch reply's job (`batch_job`), and the health check's spend row prices
+it at batch rates.

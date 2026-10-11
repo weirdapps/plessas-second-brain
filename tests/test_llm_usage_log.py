@@ -81,3 +81,118 @@ def test_an_unwritable_log_never_costs_the_call(monkeypatch, tmp_path):
     out = claude_extract.complete(max_tokens=10, messages=[{"role": "user", "content": "x"}])
 
     assert out is response
+
+
+# --- what each line says about the call (issue 163) ---------------------------------
+
+
+class _Details:
+    thinking_tokens = 210
+
+
+class _CacheCreation:
+    ephemeral_5m_input_tokens = 0
+    ephemeral_1h_input_tokens = 3100
+
+
+class _FullUsage(_Usage):
+    cache_creation_input_tokens = 3100
+    cache_read_input_tokens = 0
+    output_tokens_details = _Details()
+    cache_creation = _CacheCreation()
+
+
+class _StopDetails:
+    category = "general_harms"
+
+
+class _FullResponse(_Response):
+    def __init__(self, stop_reason="end_turn"):
+        super().__init__()
+        self.usage = _FullUsage()
+        self.stop_reason = stop_reason
+        self.id = "msg_test_1"
+        self._request_id = "req_test_1"
+        if stop_reason == "refusal":
+            self.stop_details = _StopDetails()
+
+
+def test_a_line_carries_thinking_cache_ttl_ids_effort_budget_and_prompt_hash(monkeypatch, tmp_path):
+    from src.extract.call_shape import prompt_hash, system_blocks
+
+    monkeypatch.setattr(claude_extract, "USAGE_LOG_DIR", tmp_path)
+    _patch_client(monkeypatch, _FullResponse())
+    system = system_blocks("instructions", "examples")
+    output_config = {"effort": "high", "format": {"type": "json_schema", "schema": {}}}
+
+    claude_extract.complete(
+        max_tokens=8192,
+        system=system,
+        messages=[{"role": "user", "content": "x"}],
+        output_config=output_config,
+    )
+
+    [rec] = _usage_lines(tmp_path)
+    assert rec["thinking_tokens"] == 210
+    assert (rec["cache_write_5m_tokens"], rec["cache_write_1h_tokens"]) == (0, 3100)
+    assert rec["cache_creation_input_tokens"] == 3100
+    assert (rec["request_id"], rec["response_id"]) == ("req_test_1", "msg_test_1")
+    assert rec["effort"] == "high"
+    assert rec["max_tokens"] == 8192
+    assert rec["prompt_hash"] == prompt_hash(system, output_config["format"])
+    assert rec["refusal_category"] is None
+
+
+def test_a_refusal_logs_its_category(monkeypatch, tmp_path):
+    monkeypatch.setattr(claude_extract, "USAGE_LOG_DIR", tmp_path)
+    monkeypatch.delenv("VERTEX_MODEL_FALLBACK_SDK", raising=False)
+    _patch_client(monkeypatch, _FullResponse(stop_reason="refusal"))
+
+    claude_extract.complete(max_tokens=10, messages=[{"role": "user", "content": "x"}])
+
+    [rec] = _usage_lines(tmp_path)
+    assert rec["stop_reason"] == "refusal"
+    assert rec["refusal_category"] == "general_harms"
+
+
+def test_a_v1_call_logs_the_new_fields_empty(monkeypatch, tmp_path):
+    """v1 sends no system prompt, schema or effort; a platform that reports no thinking
+    or cache split leaves those empty rather than zero."""
+    monkeypatch.setattr(claude_extract, "USAGE_LOG_DIR", tmp_path)
+    _patch_client(monkeypatch, _Response())
+
+    claude_extract.complete(max_tokens=8192, messages=[{"role": "user", "content": "x"}])
+
+    [rec] = _usage_lines(tmp_path)
+    for key in (
+        "thinking_tokens",
+        "cache_write_5m_tokens",
+        "cache_write_1h_tokens",
+        "request_id",
+        "response_id",
+        "effort",
+        "prompt_hash",
+        "refusal_category",
+    ):
+        assert rec[key] is None, key
+    assert rec["max_tokens"] == 8192
+
+
+def test_logging_sends_the_request_unchanged(monkeypatch, tmp_path):
+    """The log reads the request; it must not add to it."""
+    monkeypatch.setattr(claude_extract, "USAGE_LOG_DIR", tmp_path)
+    sent = []
+
+    class FakeMessages:
+        def create(self, **kw):
+            sent.append(kw)
+            return _Response()
+
+    fake = type("Client", (), {"messages": FakeMessages()})()
+    monkeypatch.setattr("src.extract.claude_extract._get_client_and_model", lambda: (fake, "m"))
+
+    claude_extract.complete(max_tokens=8192, messages=[{"role": "user", "content": "x"}])
+
+    assert sent == [
+        {"model": "m", "max_tokens": 8192, "messages": [{"role": "user", "content": "x"}]}
+    ]

@@ -73,7 +73,16 @@ def _extraction(path: Path, drop_points: float, now: datetime) -> tuple[dict, li
     out: dict = {"latest": None, "previous": None, "change_points": None}
     if latest is None:
         return out, []
-    keep = ("date", "run_id", "model", "prompt_sha", "effort", "pass_rate", "cost_usd")
+    keep = (
+        "date",
+        "run_id",
+        "model",
+        "call_shape",
+        "prompt_sha",
+        "effort",
+        "pass_rate",
+        "cost_usd",
+    )
     out["latest"] = {k: latest.get(k) for k in keep}
     out["latest"]["scored"] = (latest.get("rows") or {}).get("scored")
     out["latest"]["age_days"] = _age_days(latest, now)

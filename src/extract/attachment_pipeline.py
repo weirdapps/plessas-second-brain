@@ -23,6 +23,7 @@ from typing import Any, NamedTuple
 from src.config import ATTACHMENTS_DIR, DATA_ROOT, DEFAULT_DB
 from src.extract.attachment_digest import is_spreadsheet, spreadsheet_digest
 from src.extract.attachment_extractors import ZIP_MIME_TYPES, extract_text_from_file
+from src.extract.call_shape import Request, call_shape, max_tokens_attempts
 from src.extract.ocr_garble import is_garbled
 from src.extract.vertex_auth import touch_sentinel
 from src.llm_cost import (
@@ -407,12 +408,17 @@ def run_phase1(
     return stats
 
 
-def _complete_and_parse(prompt: str, budget: TokenBudget | None = None) -> dict:
+def _complete_and_parse(prompt: str | Request, budget: TokenBudget | None = None) -> dict:
     """One Phase 2 model call, parsed into an extraction.
 
     With a budget the call is held against it before it is sent, and raises OverBudget instead
     of being sent when it does not fit; once answered it is charged what the response reports.
+    A Request is a call in shape v2 (src/extract/call_shape.py), and goes to
+    _complete_and_parse_v2.
     """
+    if isinstance(prompt, Request):
+        return _complete_and_parse_v2(prompt, budget)
+
     from src.extract.claude_extract import _response_text, complete
     from src.extract.parser import parse_extraction
 
@@ -447,6 +453,32 @@ def _complete_and_parse(prompt: str, budget: TokenBudget | None = None) -> dict:
         lines = raw_text.split("\n")
         raw_text = "\n".join(lines[1:-1])
     return parse_extraction(raw_text)
+
+
+def _complete_and_parse_v2(request: Request, budget: TokenBudget | None = None) -> dict:
+    """_complete_and_parse in call shape v2. A reply stopped at max_tokens is asked once
+    more at twice the budget, and each billed call is held against the run's token budget
+    and charged on its own. A reply still cut short is salvaged by the parser, as v1 does
+    for a document: Phase 2 never asks a failed attachment again. A refusal raises
+    ExtractionRefused, naming its category."""
+    from src.extract.claude_extract import _response_text, complete, refusal_error
+    from src.extract.parser import parse_extraction_v2
+
+    for max_tokens in max_tokens_attempts(request.route):
+        held = budget.reserve(request.chars) if budget is not None else 0
+        try:
+            response = complete(**request.kwargs(max_tokens))
+        except BaseException:
+            if budget is not None:
+                budget.release(held)
+            raise
+        if budget is not None:
+            budget.settle(held, getattr(response, "usage", None))
+        if getattr(response, "stop_reason", None) != "max_tokens":
+            break
+    if getattr(response, "stop_reason", None) == "refusal":
+        raise refusal_error(response)
+    return parse_extraction_v2(_response_text(response), kind="attachment", source=request.source)
 
 
 def _part_key(*inputs) -> str:
@@ -507,19 +539,18 @@ def _extract_in_parts(
     With ``ac_id`` every finished part is saved as it lands, and a part saved by an
     earlier run is reused while its text and place are unchanged, so a document the
     budget cut short resumes instead of starting over. A token budget that refuses a
-    part raises OverBudget, with the finished parts saved."""
-    from src.extract.attachment_prompt import (
-        build_attachment_prompt,
-        build_merge_prompt,
-        split_text,
-    )
+    part raises OverBudget, with the finished parts saved. A part saved in one call
+    shape is not taken by a run in the other: its key names the shape under v2."""
+    from src.extract.attachment_prompt import attachment_input, merge_input, split_text
 
     parts = split_text(text)
     chosen = _choose_parts(parts, full)
     saved = _load_parts(ac_id)
+    shape = call_shape()
     extractions = []
     for i in chosen:
-        key = _part_key(parts[i], i, len(parts), filename, mime_type, email_subject, email_date)
+        inputs = (parts[i], i, len(parts), filename, mime_type, email_subject, email_date)
+        key = _part_key(*inputs) if shape == "v1" else _part_key(*inputs, "call shape v2")
         entry = saved.get(str(i))
         if isinstance(entry, dict) and entry.get("key") == key:
             extractions.append(entry["extraction"])
@@ -527,7 +558,7 @@ def _extract_in_parts(
         if out_of_time is not None and out_of_time():
             return None
         extraction = _complete_and_parse(
-            build_attachment_prompt(
+            attachment_input(
                 extracted_text=parts[i],
                 filename=filename,
                 mime_type=mime_type,
@@ -543,13 +574,14 @@ def _extract_in_parts(
     if out_of_time is not None and out_of_time():
         return None
     merged = _complete_and_parse(
-        build_merge_prompt(
-            extractions,
+        merge_input(
+            parts=extractions,
             filename=filename,
             mime_type=mime_type,
             email_subject=email_subject,
             email_date=email_date,
             covered=(len(chosen), len(parts)),
+            source=text,
         ),
         budget,
     )
@@ -634,10 +666,11 @@ def _route(row: _Phase2Row) -> str:
     return "parts"
 
 
-def _attachment_prompt(row: _Phase2Row, text: str, **kwargs) -> str:
-    from src.extract.attachment_prompt import build_attachment_prompt
+def _attachment_prompt(row: _Phase2Row, text: str, **kwargs) -> str | Request:
+    """The row's prompt (call shape v1) or request (v2), src/extract/call_shape.py."""
+    from src.extract.attachment_prompt import attachment_input
 
-    return build_attachment_prompt(
+    return attachment_input(
         extracted_text=text,
         filename=row.filename,
         mime_type=row.mime_type or "",
@@ -1086,26 +1119,33 @@ def _planned_calls(row: _Phase2Row) -> list[tuple[int, int]]:
 
     The prompts are built as the run builds them; the merge's carries the chosen parts'
     answers, which do not exist before the run and are counted at OUTPUT_TOKENS_PER_CALL each.
+    Under call shape v2 a call's characters include its system prompt, which the cache
+    serves at a fraction of the price after the first call: an upper bound there.
     """
-    from src.extract.attachment_prompt import build_merge_prompt, split_text
+    from src.extract.attachment_prompt import merge_input, split_text
+
+    def chars(prompt: str | Request) -> int:
+        return prompt.chars if isinstance(prompt, Request) else len(prompt)
 
     route = _route(row)
     if route == "single":
-        return [(len(_attachment_prompt(row, row.text)), 0)]
+        return [(chars(_attachment_prompt(row, row.text)), 0)]
     if route == "digest":
-        return [(len(_attachment_prompt(row, spreadsheet_digest(row.text), digest=True)), 0)]
+        return [(chars(_attachment_prompt(row, spreadsheet_digest(row.text), digest=True)), 0)]
     parts = split_text(row.text)
     chosen = _choose_parts(parts, row.full)
-    calls = [(len(_attachment_prompt(row, parts[i], part=(i + 1, len(parts)))), 0) for i in chosen]
-    merge = build_merge_prompt(
-        [],
+    calls = [
+        (chars(_attachment_prompt(row, parts[i], part=(i + 1, len(parts)))), 0) for i in chosen
+    ]
+    merge = merge_input(
+        parts=[],
         filename=row.filename,
         mime_type=row.mime_type or "",
         email_subject=row.email_subject,
         email_date=row.email_date,
         covered=(len(chosen), len(parts)),
     )
-    return [*calls, (len(merge), len(chosen))]
+    return [*calls, (chars(merge), len(chosen))]
 
 
 def estimate_rows(rows: Iterable[_Phase2Row], chars_per_token: float | None = None) -> dict:

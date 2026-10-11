@@ -210,6 +210,22 @@ def test_a_torn_line_does_not_hide_the_runs_around_it(home):
     assert summary["extraction"]["previous"]["date"] == "2026-10-04"
 
 
+def test_the_summary_names_the_call_shape_each_run_measured(home):
+    """A v2 run after a v1 run on the same set is the comparison the switch waits for."""
+    write(
+        home,
+        "extraction",
+        extraction_run("2026-10-04", 0.8),  # before call shapes were recorded
+        extraction_run("2026-10-10", 0.8, call_shape="v1"),
+        extraction_run("2026-10-11", 0.85, call_shape="v2"),
+    )
+
+    summary = latest_eval_summary(home)["extraction"]
+
+    assert (summary["latest"]["call_shape"], summary["previous"]["call_shape"]) == ("v2", "v1")
+    assert summary["change_points"] == pytest.approx(5.0)
+
+
 def test_the_default_home_is_the_eval_home(tmp_path, monkeypatch):
     monkeypatch.setenv("BRAIN_DATA_DIR", str(tmp_path))
     write(tmp_path, "extraction", extraction_run("2026-10-11", 0.8))

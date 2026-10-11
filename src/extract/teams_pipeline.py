@@ -305,18 +305,26 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
     """
     import os
 
+    from src.extract.call_shape import thread_call
     from src.extract.claude_extract import _response_text, complete
 
     # None lets complete() use the configured model, as every other call site
     # does. The old fallback skipped CLAUDE_EXTRACT_MODEL for a hardcoded 4.6
     # model, which on an eu client configured for 4.7+ returns 429.
     model = os.environ.get("BRAIN_TEAMS_MODEL") or None
-    resp = complete(
-        model=model,
-        max_tokens=2048,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
+    # Call shape v1: one call at 2,048. v2: 8,192 at a pinned effort, and once more at
+    # twice that when the reply stops at max_tokens (src/extract/call_shape.py).
+    budgets, pinned = thread_call("teams", 2048)
+    for max_tokens in budgets:
+        resp = complete(
+            model=model,
+            max_tokens=max_tokens,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            **pinned,
+        )
+        if getattr(resp, "stop_reason", None) != "max_tokens":
+            break
     if getattr(resp, "stop_reason", None) == "refusal":
         raise ThreadRefused("both model tiers refused the thread (stop_reason='refusal')")
     # Same leading-ThinkingBlock hazard as every other call site. No teams_threads row

@@ -10,12 +10,20 @@ the calls would cost and stop.
     python scripts/extraction_eval.py --dry-run [--judge]    # validate, test the grader, regrade, estimate
     python scripts/extraction_eval.py --run --judge --yes    # extract, grade, record
     python scripts/extraction_eval.py --calibrate --yes      # how far the judge agrees with the owner
+    python scripts/extraction_eval.py --run --yes --call-shape v2   # the same cases in call shape v2
+    python scripts/extraction_eval.py --run --yes --synthetic       # six built-in cases, no set needed
+
+`--call-shape v1|v2` builds every extraction call in that shape (src/extract/call_shape.py);
+without it the run takes BRAIN_EXTRACT_CALL_SHAPE's, as the sync would. Run the set under
+both and compare the two records before turning v2 on. `--synthetic` runs, or dry-runs, six
+labelled cases the eval builds itself in place of the set, for a host that has none.
 
 The set and its results live in ${BRAIN_DATA_DIR:-~/.second-brain}/evals/extraction/, never
 in the repository. README.md, section Evals, says how to label the set and read the results.
 """
 
 import argparse
+import json
 import os
 import sqlite3
 import sys
@@ -25,10 +33,31 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.config import DEFAULT_DB  # noqa: E402
-from src.evals import connect_read_only, file_sha, inside_repo  # noqa: E402
+from src.evals import connect_read_only, file_sha, inside_repo, text_sha  # noqa: E402
 from src.evals import extraction as ev  # noqa: E402
+from src.extract.call_shape import SHAPES, call_shape  # noqa: E402
+from src.extract.claude_extract import ClaudeNotConfigured  # noqa: E402
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _synthetic_owner() -> tuple[str, str]:
+    """The owner as configured, whom the synthetic cases write to and from."""
+    return os.environ.get("BRAIN_USER_NAME", ""), os.environ.get("BRAIN_USER_EMAIL_PATTERN", "")
+
+
+def _aliases(args, files: ev.Files) -> list[str]:
+    """The owner's names for grading: owner.json's, or for the synthetic set his configured
+    name, which its cases carry."""
+    if args.synthetic:
+        return ev.default_owner_aliases(_synthetic_owner()[0] or "Owner Person")
+    return ev.load_owner_aliases(files)
+
+
+def _set_sha(args, files: ev.Files, cases: list[dict]) -> str:
+    if args.synthetic:
+        return text_sha(json.dumps(cases, sort_keys=True, ensure_ascii=False))
+    return file_sha(files.cases)
 
 
 def _pct(value) -> str:
@@ -132,7 +161,7 @@ def _dry_run(args, files: ev.Files, cases: list[dict]) -> int:
     _describe(cases)
     if not _valid(cases):
         return 1
-    aliases = ev.load_owner_aliases(files)
+    aliases = _aliases(args, files)
     test = ev.self_test(cases, aliases)
     print(
         f"grader self-test on {test['cases']} labelled cases: the gold itself"
@@ -145,7 +174,8 @@ def _dry_run(args, files: ev.Files, cases: list[dict]) -> int:
     if regraded and regraded["rows"]:
         print(f"run {regraded['run_id']}, regraded against the gold as it stands:")
         _print_scores(regraded)
-    _print_estimate(ev.estimate(cases, reps=args.reps, judge=args.judge), len(cases), args.reps)
+    estimate = ev.estimate(cases, reps=args.reps, judge=args.judge, call_shape=args.call_shape)
+    _print_estimate(estimate, len(cases), args.reps)
     return 1 if test["oracle_failures"] else 0
 
 
@@ -179,7 +209,9 @@ def _run(args, files: ev.Files, cases: list[dict]) -> int:
         return 2
     _describe(selected)
     _print_estimate(
-        ev.estimate(selected, reps=args.reps, judge=args.judge), len(selected), args.reps
+        ev.estimate(selected, reps=args.reps, judge=args.judge, call_shape=args.call_shape),
+        len(selected),
+        args.reps,
     )
     if not args.yes:
         print("Nothing was called. Add --yes to run it.")
@@ -193,13 +225,15 @@ def _run(args, files: ev.Files, cases: list[dict]) -> int:
         workers=args.workers,
         effort=args.effort,
         judge=args.judge,
-        set_sha=file_sha(files.cases),
+        set_sha=_set_sha(args, files, cases),
+        aliases=_aliases(args, files),
+        call_shape=args.call_shape,
     )
     rows = record["rows"]
     print(
-        f"run {record['run_id']}: {record['model']}, prompt {record['prompt_sha']}, effort"
-        f" {record['effort']}; {rows['scored']} graded, {rows['truncated']} truncated,"
-        f" {rows['refused']} refused, {rows['errors']} errors"
+        f"run {record['run_id']}: {record['model']}, call shape {record['call_shape']}, prompt"
+        f" {record['prompt_sha']}, effort {record['effort']}; {rows['scored']} graded,"
+        f" {rows['truncated']} truncated, {rows['refused']} refused, {rows['errors']} errors"
     )
     _print_scores(record)
     if record["judge"]:
@@ -297,6 +331,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--case", action="append", default=[], metavar="ID", help="run only this case (repeatable)"
     )
+    parser.add_argument(
+        "--call-shape",
+        choices=SHAPES,
+        help="build every extraction call in this shape (default: BRAIN_EXTRACT_CALL_SHAPE's)",
+    )
+    parser.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="use six labelled cases the eval builds itself instead of the set"
+        " (--dry-run and --run)",
+    )
     args = parser.parse_args(argv)
 
     files = ev.Files(args.dir or ev.default_root())
@@ -307,11 +352,24 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.synthetic and (args.build or args.calibrate):
+        print("--synthetic goes with --dry-run or --run", file=sys.stderr)
+        return 2
     if args.build:
         return _build(args, files)
-    cases, code = _load(files)
-    if cases is None:
-        return code
+    try:
+        args.call_shape = args.call_shape or call_shape()
+    except ClaudeNotConfigured as e:
+        print(e, file=sys.stderr)
+        return 2
+    if args.synthetic:
+        name, pattern = _synthetic_owner()
+        cases = ev.synthetic_cases(owner_name=name, owner_pattern=pattern)
+    else:
+        loaded, code = _load(files)
+        if loaded is None:
+            return code
+        cases = loaded
     if args.dry_run:
         return _dry_run(args, files, cases)
     if args.run:

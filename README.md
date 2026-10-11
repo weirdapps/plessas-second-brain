@@ -44,7 +44,7 @@ graph TD
 | Microsoft 365 mail | `src/export/outlook_export.py` + `outlook_cli.py` | Primary. Hourly, one `--since` cursor per folder. |
 | Attachments | `src/export/outlook_attachments.py`, `src/extract/attachment_extractors.py` | PDF (PyMuPDF), DOCX (`python-docx`), PPTX (`python-pptx`), XLSX (`openpyxl`), XLSB (`pyxlsb`), XLS (`xlrd`), images (Tesseract OCR, Greek first and English first again for a page that reads as Latin script, a grayscale second pass when colour finds too little; the scanned pages of a text PDF are OCR'd too), EML and clear-signed `.p7m`, `.mso` object containers (the workbooks behind charts pasted into mail), `.wmz`/`.emz` drawings (their text records), and text formats routed by their bytes (ICS, VCF, XML, SVG, EPS, VTT). Files encrypted at rest (rights-protected Office files and `.rpmsg` messages, password-protected Office files and PDFs) are recognised from their bytes and recorded as `extraction_status = 'encrypted'`, method `rms`, `rms-message` or `password`: nothing reads them without the key. |
 | Inline email images | `src/extract/image_classifier.py`, `image_pipeline.py`, `image_vision.py` | Dimensions plus bytes plus sender-scoped SHA256 dedup cascade; vision LLM stage for content images, cached by SHA256. |
-| Calendar events | `src/export/calendar_export.py`, `src/extract/calendar_extractor.py` | Outlook events with attendees, body summary, decisions. |
+| Calendar events | `src/export/calendar_export.py`, `src/extract/calendar_extractor.py` | Outlook events with attendees and series; an invitation's purpose and agenda, a past meeting's decisions. |
 | MS Teams | `src/export/teams_cli.py`, `teams_export.py`, `src/extract/teams_pipeline.py` | Chats, threads, messages, MRI resolution. |
 | WhatsApp | `scripts/whatsapp_snapshot.py`, `src/export/whatsapp_export.py`, `src/extract/whatsapp_pipeline.py` | A minimized snapshot pushed hourly from the Mac that runs a WhatsApp bridge; sessions extracted and embedded like Teams threads. See [WhatsApp](#whatsapp). |
 | SharePoint links | `src/extract/sharepoint_url_scanner.py`, `src/export/sharepoint_fetcher.py` | Managed host defaults to `contoso.sharepoint.com` (override via `SHAREPOINT_HOST`). |
@@ -120,7 +120,7 @@ Mail deleted or junked in Outlook keeps the folder it had, where it used to be r
 - `person_context(name_or_email, days, limit, include_news, include_automation)`. History, sentiment, decisions, open actions, communication pattern, `teams`: the messages they wrote in the window and the threads they wrote in (`recent_threads`, with `recent_threads_total`), and `whatsapp`, the same for WhatsApp, matched on a name of two words or more against sender names, since WhatsApp has no address to join on. Each list is capped at `limit` (default 20) and carries a `<name>_total` sibling with the real count, so a truncated answer is distinguishable from a complete one. A name is matched ignoring case and accents; when several people match, the most-emailed one is used and `match_count` / `other_candidates` say who else it could be (`sender_brief` and `meeting_prep` resolve names the same way).
 - `topic_context(topic, days, limit, include_news, include_automation)`. Key people, decisions, actions, facts. Same `limit` and `<name>_total` contract.
 - `sender_brief(name_or_email, days)`. Compact briefing suitable for inline display.
-- `meeting_prep(people, topic, days, include_news, include_automation)`. Per-attendee dossiers, optionally scoped to a topic.
+- `meeting_prep(people, topic, days, include_news, include_automation)`. Per-attendee dossiers, optionally scoped to a topic, and `meetings`: the `next` and `last` meetings (three each, the last within `days`) that the people it resolved share with you, the ones most of them attend first, each with its `body_summary` (an invitation's purpose and agenda, see [Calendar](#calendar)), `is_recurring`, and at most 12 attendees as `query_calendar_events` lists them, those people kept among them.
 
 Every dossier dates and orders its rows the same way (`src/store/ordering.py`): decisions newest first by their own date when it is an ISO date, else by their parent's (the email, Teams or WhatsApp session, meeting or conversation they came from); key facts newest parent first; open actions upcoming first, soonest first, then undated, then overdue, most recently missed first. Every decision, fact and action row carries `date` and `parent_date`.
 
@@ -138,7 +138,11 @@ Every dossier dates and orders its rows the same way (`src/store/ordering.py`): 
 
 ### Calendar
 
-- `query_calendar_events(person, since, until, keyword, limit)`. Times come back as `start_at`/`end_at` in UTC (a trailing `Z`) and as `start_local`/`end_local` in Europe/Athens with the offset. A bare-date `since`/`until` is an Athens calendar day, and `limit` is capped at 200. A meeting Outlook no longer lists is kept as cancelled and left out. Each event lists its first 10 attendees, the ones `person` matched first, with `attendees_total` counting them all (events average about 48 attendees and reach 500), and `response_status` is your own response. For the full list, `sql_query` on `event_attendees`.
+- `query_calendar_events(person, since, until, keyword, limit, max_attendees)`. Times come back as `start_at`/`end_at` in UTC (a trailing `Z`) and as `start_local`/`end_local` in Europe/Athens with the offset. A bare-date `since`/`until` is an Athens calendar day, and `limit` is capped at 200. A meeting Outlook no longer lists is kept as cancelled and left out. Each event lists at most `max_attendees` attendees (default 12, 0 to 500): you and the organiser always, then the ones `person` matched, listed first, then the rest in invitation order, with `attendees_total` counting them all (events average about 48 attendees and reach 500). It listed the first 10 until 2026-10-11, which could leave out the organiser and you. `response_status` is your own response, and `is_recurring` marks one occurrence of a recurring series. For the full list, `sql_query` on `event_attendees`.
+
+An event's `body_summary` depends on what its text can be. Outlook keeps the organiser's invitation as the event's text, so a meeting still to come, and every occurrence of a recurring series, is read as an invitation: the summary gives its purpose, agenda and who is expected (`Purpose: ... Agenda: ...; .... Expected: ....`), and no decision or action item is taken from it. Only a single meeting already over is asked for decisions and actions, and only from notes or minutes written into it. Before 2026-10-11 every invitation was asked for decisions, and one daily call's agenda, paraphrased 296 times, was most of the calendar's decisions; those stay in the store until you clear them (see `docs/DEPLOY.md`). The text is read as a reader sees it, the HTML converted and the online-meeting joining details (Teams, Zoom, Webex links, ids and dial-ins) left out, and an invitation with nothing else costs no model call. The occurrences of a series share one reading for as long as their invitation stays the same.
+
+Each stored occurrence carries `is_recurring` and its series in `recurrence_master_id`: the master event's id, or, when Outlook does not send it, a `derived:` key built from the organiser and the subject. An occurrence Outlook lists again under a new id (its series sent again: the same series and start, the old id no longer listed) keeps its row rather than being stored twice.
 
 ### Teams
 
@@ -174,6 +178,8 @@ Conversation memory is the owner's own sessions. Each turn's `speaker` says who 
 ### Stats
 
 - `stats()`. Counts across emails, news articles, standalone documents, conversations, topics, people, decisions, actions, attachments, key facts and calendar events, plus `coverage`: the first and last date held per mailbox, Teams, WhatsApp, calendar and conversations, and `source_class`: the emails of each class, or `"pending migration"` on a store older than v33. Check it before reading an empty answer as 'nothing happened'.
+
+  The calendar's first date says nothing about the months after it, so `coverage.calendar` also has `per_month` (the meetings held in each month of their UTC start, a month holding none included), `expected_per_month` (the median of the months already over, leaving out any holding exactly one listing page), `incomplete` (the months not held in full: `capped` holds exactly the 10 an early load kept of each month, `sparse` under a quarter of the usual month, `partial` a month a backfill began and did not finish), `complete_from` (the first month after the last incomplete one) and a `note` when any month is incomplete. The current month and those ahead are never flagged, a quieter month such as August is not either, and neither is a month `calendar-sync --backfill` listed and stored in full, however few meetings it held. Fewer than three months already over give no usual month, and nothing is flagged but `partial`.
 
   It also returns `data_as_of`, `age_hours` and `stale`. `data_as_of` is the older of two stamps, both returned as stored: `last_sync_date`, which every `sync` writes, and `mail_export_ok_at`, the Inbox export's last success, which `sync` copies in. `stale_warning` names the one that is behind. On a read replica that is the only way to tell a live corpus from one whose feed stopped, because both answer queries identically.
 
@@ -422,6 +428,8 @@ python -m src.cli sync --engine claude --workers 4
 
 # Ingestion by source
 python -m src.cli calendar-sync --since 2026-01-01
+python -m src.cli calendar-sync --backfill --dry-run   # the months stats coverage flags: list them, count what would be fetched; nothing written
+python -m src.cli calendar-sync --backfill             # fill them a month at a time; run again to resume (see DEPLOY)
 python -m src.cli news-sync --relevance 60
 python -m src.cli teams-sync --workers 4
 python -m src.cli teams-backfill-replies    # once, on the producer: store the channel replies stored posts hold; no Teams call
@@ -523,7 +531,7 @@ src/
     image_vision.py            Vision LLM stage
     image_pipeline.py          Orchestration and backfill
     web_ingest.py              URL and YouTube ingestion
-    calendar_extractor.py      Calendar body summarization
+    calendar_extractor.py      Calendar summaries: an invitation's purpose and agenda, a past meeting's decisions
     teams_mri.py               Teams MRI to display-name resolution
     teams_pipeline.py          Thread extraction dispatcher
     teams_threads.py           Message to thread bounding
@@ -549,6 +557,8 @@ src/
     teams_query.py             Teams thread, chat, and search
     sql_readonly.py            Read-only SQL over brain.db for the sql_query and sql_schema tools
     calendar_loader.py         Calendar event and attendee loader
+    calendar_coverage.py       Calendar events per month and the months not held in full, for stats and --backfill
+    calendar_query.py          A dozen attendees per event, and the meetings meeting_prep names
   ingest/
     reverse_scan.py            Filesystem scan with latest-version-per-name dedup
   evals/
@@ -713,6 +723,8 @@ The pipeline is just CLI commands, so schedule them however you like. Examples:
 - **macOS launchd** / **systemd timers**: wrap the same two commands (and `embed`) in a service unit pointing at your checkout and venv.
 
 Typical cadence: staging and `sync` hourly, `embed` daily. `sync` stages no mail itself: it extracts and loads what `outlook_export` (or your own exporter) staged. Nor does it cover every source: `calendar-sync`, `teams-sync`, `whatsapp-sync`, `news-sync` and `process-sharepoint` each want their own schedule.
+
+The hourly `calendar-sync` lists the week behind and the 30 days ahead, so a month it never reached stays as the first load left it. `calendar-sync --backfill` is not a schedule but a one-off for that: with no window it fills the months `stats` coverage flags as not held in full (`--dry-run` first counts what it would fetch), a month at a time, and a run that stops is resumed by the next one (see `docs/DEPLOY.md`).
 
 [`docs/DEPLOY.md`](docs/DEPLOY.md) has the full recipe, including the two-host shape (one producer that ingests, workstations that read an rsync'd replica) and the `loginctl enable-linger` without which `systemd --user` timers die at logout.
 

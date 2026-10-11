@@ -783,7 +783,7 @@ def meeting_prep(
     include_news: IncludeNews = False,
     include_automation: IncludeAutomation = False,
 ) -> MeetingPrep:
-    """Prepare me for a meeting: a dossier per attendee (emails, decisions, open actions, topics, sentiment), and the topic's context when one is given.
+    """Prepare me for a meeting: a dossier per attendee (emails, decisions, open actions, topics, sentiment), `meetings` (the next and last ones they share with me, each with its purpose and a dozen attendees), and the topic's context when one is given.
 
     Each name resolves as person_context resolves it, with match_count and
     other_candidates when it is ambiguous. News and the owner's automation mail
@@ -1029,6 +1029,8 @@ def stats() -> Stats:
     """How big and how fresh is the brain: counts per source, freshness (data_as_of, age_hours, stale), and `coverage`, the first and last date held per mailbox, Teams, WhatsApp, calendar and conversations.
 
     Check coverage before reading an empty answer as 'nothing happened'.
+    `coverage.calendar` adds `per_month` and `incomplete`, the months not held in
+    full, where a meeting may be missing.
     `earliest_email` is the oldest row of any kind, a stray old document
     included; where mail really starts is in `coverage`. `embed_backend` names
     the service that embeds search queries and `last_embed_error` its last

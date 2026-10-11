@@ -539,6 +539,51 @@ running syncs exit, pull, run `python -m src.cli migrate`, and start the timers 
 store that has not migrated yet sweeps as before, only slower: the index hint is given only
 when the index exists.
 
+**Calendar months the first load capped.** The first calendar load kept ten events of each
+month, and the `--backfill` run after v25 listed the 365 days before it ran, which began after
+them: on the replica on 2026-10-11, May to August 2025 held 10 events each and September 2025
+held 34, against a usual month of 228. `stats` now counts the calendar per month and names such
+months in `coverage.calendar.incomplete`, and `calendar-sync --backfill`, given no window, fills
+exactly those, oldest first, a month at a time: it lists the month in full, fetches each event
+it does not hold (one get-event call each, and a model call where an invitation has text beyond
+its joining details, once per series), marks cancelled what Outlook no longer lists, and
+records the month in `sync_metadata`. A run that stops leaves its month flagged `partial`, and
+the next run resumes there; a recorded month is never listed again unless one of its events
+still owes an extraction, and coverage stops flagging it. No schema change. Once, on the
+producer after the pull, with calendar-sync's environment loaded (Outlook and the model):
+
+```bash
+python -m src.cli calendar-sync --backfill --dry-run   # lists the flagged months; counts what it would fetch; writes nothing
+python -m src.cli calendar-sync --backfill             # fills them; run it again until the dry run counts 0
+```
+
+Each month's listing is bounded at 250 list-calendar calls, and a busy month takes a few dozen
+at most, one when outlook-access pages list-calendar itself. It can run beside the timer: it
+lists only months already over and leaves the hourly unit's heartbeat and fetch-failure counts
+alone. To go back before the first month held, give the window, for example
+`--backfill --since 2025-03-01 --until 2025-05-01`; a window is walked the same way, and the
+months a backfill recorded are skipped.
+
+From the same release a recurring occurrence carries `is_recurring` (it was 0 on every row:
+the field read was one Outlook never sends) and its series in `recurrence_master_id`; every
+calendar-sync sets the flag on the occurrences already stored, about 2,000 rows the first
+time. And an invitation is read as one: a meeting still to come, and every occurrence of a
+series, gets its purpose, agenda and who is expected, and no decisions or actions, while only
+a single meeting already over is asked for decisions, from its notes. An event is extracted
+again under the new prompt the next time it changes, and an occurrence whose series'
+invitation was already read takes that reading without a model call. The decisions and actions
+extracted from invitations before stay in the store until you clear them: on the replica on
+2026-10-11, 477 of the 519 calendar decisions and 253 of the 367 calendar actions (66 still
+open) sit on occurrences of a series or on single meetings extracted before they took place.
+No command clears them; to do it on the producer:
+
+```sql
+DELETE FROM decisions WHERE event_id IN (SELECT id FROM calendar_events
+  WHERE recurrence_master_id IS NOT NULL OR body_extracted_at < start_at);
+DELETE FROM action_items WHERE event_id IN (SELECT id FROM calendar_events
+  WHERE recurrence_master_id IS NOT NULL OR body_extracted_at < start_at);
+```
+
 ## 8. Backup and restore
 
 `scripts/backup_db.py` takes an MVCC-consistent snapshot of a live `brain.db`,

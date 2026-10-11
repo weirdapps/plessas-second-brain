@@ -117,9 +117,10 @@ def test_refetch_requires_url(mock_get_conn, mock_conn):
         sharepoint_index(operation="refetch")
 
 
+@patch("src.mcp_server._get_write_conn")
 @patch("src.mcp_server._get_conn")
 @patch("src.export.sharepoint_fetcher.fetch_sharepoint_link")
-def test_refetch_calls_fetcher(mock_fetch, mock_get_conn, mock_conn):
+def test_refetch_calls_fetcher(mock_fetch, mock_get_conn, mock_get_write_conn, mock_conn):
     from pathlib import Path
 
     from src.export.sharepoint_fetcher import SharepointFetchResult
@@ -137,6 +138,8 @@ def test_refetch_calls_fetcher(mock_fetch, mock_get_conn, mock_conn):
         file_size=42,
     )
     mock_get_conn.return_value = mock_conn
+    # The refetch records what it fetched through the one read-write connection.
+    mock_get_write_conn.return_value = mock_conn
 
     from src.mcp_server import sharepoint_index
 

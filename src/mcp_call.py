@@ -63,6 +63,7 @@ def call(name: str, arguments: Any) -> dict:
     """
     import anyio
     from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+    from mcp.types import CallToolResult
     from pydantic import ValidationError
 
     from src.mcp_server import mcp
@@ -96,9 +97,9 @@ def call(name: str, arguments: Any) -> dict:
             raise InvalidInput(_rejected(name, exc.__cause__), schema) from None
         # The tool's own words, which the server sends a client as an error result.
         raise ToolCallError(str(exc.__cause__ or exc)) from None
-    if result.is_error or result.structured_content is None:
-        text = " ".join(getattr(block, "text", "") for block in result.content)
-        raise ToolCallError(f"{name}: {text or 'no structured result'}")
+    if not isinstance(result, CallToolResult) or result.structured_content is None:
+        # Every tool declares an output schema, and none asks the client for input.
+        raise ToolCallError(f"{name} gave no structured result")
     return result.structured_content
 
 

@@ -277,7 +277,26 @@ HEALTH_EMAIL_TO=you@example.com python scripts/health_check.py --email
 ```
 
 Other flags: `--email-if-issues` (silent on a healthy run), `--fix` (attempt the
-auto-fixes), and `--hc-ping`.
+auto-fixes), `--hc-ping`, and `--mcp-probe` (section 9). `--fix` restarts only the
+loader (the daily sync) and queues auth-watch for a re-auth sentinel; any other failed
+unit is reported and left to its own timer.
+
+**What it asserts beyond counts.** Besides each source's age, these rows look at the
+pipeline itself. STALE in any of them fails the freshness ping, like any other STALE.
+
+| Row | Verdict | Setting |
+| --- | --- | --- |
+| Emails | Each folder's newest mail against its own limit: Inbox and Archive 6 h, Sent Items 24 h, News 12 h. Triage relabels Inbox mail Archive, so the Inbox also counts its export's last success. STALE past a limit, or when an export would list from the future (its cursor ahead of the clock by more than the six-hour listing overlap). | `BRAIN_HEALTH_FOLDER_LAG_HOURS="Sent Items=48,News=12"`; 0 stops judging a folder |
+| Golden query | One keyword and one semantic search for a fixed phrase, through the store's own search functions. STALE when the semantic half falls back to keyword matches or cannot run, WARN when the phrase finds nothing. | `BRAIN_HEALTH_QUERY`, else `BRAIN_USER_ROLE`, else `BRAIN_USER_NAME` |
+| Attachment lag | The oldest attachment waiting for its text, and the oldest text waiting for a summary. WARN past a day. | |
+| Backups | The newest `brain-*.db` snapshot and the newest `brain-*.db.zst.enc` archive, STALE past 26 h; the last restore drill, WARN past 35 days ([`RESTORE.md`](RESTORE.md)). Not judged on a replica. | `BRAIN_BACKUP_DIR` (default `$BRAIN_DATA_DIR/backups`), `BRAIN_BACKUP_OFFSITE_DIR` (default its `offsite`), `BRAIN_RESTORE_DRILL_STAMP` |
+| Mail loss | Messages the export gave up fetching, and staging batches quarantined as unreadable. WARN on any quarantined batch, and on a message given up in the last week; the cursor files keep their give-ups for good, so older ones are reported, not warned on. | Read from `state/mail_loss.json` while it is under two days old, else counted from the cursor files |
+
+The golden query loads the whole embedding index (about 1.7 GB on the reference
+producer) into the check's own process, so schedule the check where that memory is
+free. On a systemd host the job list is every `sb-*` service the user manager has,
+plus the bot's unit when present (section 9); the list kept in the script is the
+floor, so a unit that disappears reads NOT_LOADED instead of dropping out.
 
 **Model spend.** The `LLM spend` row prices yesterday's model calls (UTC) from the
 usage log every call appends to, `llm-usage-YYYY-MM.jsonl` in the data home, with a
@@ -463,6 +482,64 @@ A user service stops when your last session ends unless linger is on (section 5,
 
 A client authenticates with `Authorization: Bearer <token>`; for Claude Code,
 an `http` entry with that header in its MCP configuration.
+
+### Alerts for the server and the bot
+
+A failed long-running unit raised nothing: neither sb-mcp nor the bot that reads it
+had a Healthchecks check. Give each the drop-in the scheduled units carry, where
+`hc-success@` and `hc-fail@` are the host-local templates that ping the check named
+after their instance (`$HC_PING_URL/<name>`, and `.../fail`):
+
+```ini
+# ~/.config/systemd/user/sb-mcp.service.d/healthcheck.conf
+[Unit]
+OnSuccess=hc-success@sb-mcp.service
+OnFailure=hc-fail@sb-mcp.service
+```
+
+```ini
+# ~/.config/systemd/user/telegram-brain.service.d/healthcheck.conf (the bot's unit)
+[Unit]
+OnSuccess=hc-success@telegram-brain.service
+OnFailure=hc-fail@telegram-brain.service
+```
+
+A long-running unit pings success only when it stops cleanly, so give these two
+checks a long period: the failure ping is the signal they carry. And "active" is not
+"serving", so an hourly probe asks the server for `stats` with the bearer token, the
+way a client does:
+
+```ini
+# ~/.config/systemd/user/sb-mcp-probe.service
+[Unit]
+Description=second-brain: does the HTTP MCP server answer stats
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/plessas-second-brain
+EnvironmentFile=%h/.config/healthchecks-ping.env
+ExecStart=%h/plessas-second-brain/.venv/bin/python scripts/health_check.py --mcp-probe --hc-ping
+```
+
+```ini
+# ~/.config/systemd/user/sb-mcp-probe.timer
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+It reads the token from `BRAIN_MCP_TOKEN_FILE`, else `~/.config/second-brain/mcp-token`,
+and never prints it. It pings `sb-mcp-stats` (`BRAIN_MCP_PROBE_SLUG`), creating the
+check on its first ping, so set that check's period to one hour. The ping fails when
+the server does not answer, refuses the token, or answers on data more than 7 hours
+old (`BRAIN_MCP_PROBE_MAX_AGE_HOURS`; the server's own `stale` flag turns at 3 hours,
+which every night's gap in the mail timer passes). The probe exits 0 whatever it finds:
+the ping carries the finding. The nightly report shows the same line under SCHEDULED
+JOBS on a systemd host that has the token file.
 
 ## 10. Files are inputs
 

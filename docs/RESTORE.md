@@ -169,6 +169,13 @@ An untested restore is a hypothesis. Run the sequence above against the newest
 offsite snapshot on whatever schedule you can live with, and check that step 2
 comes back clean and step 3's counts land where you expect.
 
+Then record it on the host whose health check should age it, so a drill that
+stops happening shows up there (its Backups row warns after 35 days):
+
+```bash
+date -u +%Y-%m-%dT%H:%M:%SZ > ~/.second-brain/restore-drill.stamp   # or $BRAIN_RESTORE_DRILL_STAMP
+```
+
 Last exercised: 2026-09-09, twice.
 
 First on a synthetic database, which validates the command sequence but not any

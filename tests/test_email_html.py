@@ -8,7 +8,6 @@ inline-image positions read the markup, so it is kept (schema v23).
 
 import argparse
 import sqlite3
-from pathlib import Path
 from unittest.mock import patch
 
 from src.config import CURRENT_SCHEMA_VERSION
@@ -482,28 +481,6 @@ def test_loading_emails_migrates_an_older_store_first(tmp_path):
     staging, extracted = _staged(tmp_path)
 
     assert load_extractions(str(db), str(extracted), str(staging)) == 1
-
-    assert _kept(db) == (TEXT, True, CURRENT_SCHEMA_VERSION)
-
-
-def test_recovering_extractions_migrates_an_older_store_first(tmp_path, monkeypatch):
-    """The recovery script caught the failure to save the HTML and committed the
-    text: the markup was gone for good, and split-html cannot bring it back."""
-    import importlib.util
-
-    path = Path(__file__).parent.parent / "scripts" / "recover_missing_extractions.py"
-    spec = importlib.util.spec_from_file_location("recover_missing_extractions", path)
-    assert spec and spec.loader
-    recover = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(recover)
-    db = tmp_path / "b.db"
-    _older_store(db)
-    staging, extracted = _staged(tmp_path)
-    monkeypatch.setattr(recover, "DB", db)
-    monkeypatch.setattr(recover, "STAGING", staging)
-    monkeypatch.setattr(recover, "EXTRACTED", extracted)
-
-    assert recover.main() == 0
 
     assert _kept(db) == (TEXT, True, CURRENT_SCHEMA_VERSION)
 

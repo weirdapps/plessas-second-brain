@@ -48,7 +48,7 @@ graph TD
 | MS Teams | `src/export/teams_cli.py`, `teams_export.py`, `src/extract/teams_pipeline.py` | Chats, threads, messages, MRI resolution. |
 | WhatsApp | `scripts/whatsapp_snapshot.py`, `src/export/whatsapp_export.py`, `src/extract/whatsapp_pipeline.py` | A minimized snapshot pushed hourly from the Mac that runs a WhatsApp bridge; sessions extracted and embedded like Teams threads. See [WhatsApp](#whatsapp). |
 | SharePoint links | `src/extract/sharepoint_url_scanner.py`, `src/export/sharepoint_fetcher.py` | Managed host defaults to `contoso.sharepoint.com` (override via `SHAREPOINT_HOST`). |
-| Standalone documents | `src/cli.py ingest`, `reverse-ingest`, `src/ingest/reverse_scan.py` | Latest-version-per-logical-name dedup. `reverse-ingest` scans only the directories you name with `--root`; nothing schedules a scan. |
+| Standalone documents | `src/cli.py ingest`, `reverse-ingest`, `src/ingest/reverse_scan.py` | Latest-version-per-logical-name dedup. `reverse-ingest` scans only the directories you name with `--root`; nothing schedules a scan. A file whose bytes are already stored is skipped with its reason: ingested before, or held by an attachment whose text is stored (`attachments.sha256`), such as a mail attachment saved into a folder. A twin that failed, was skipped, is encrypted or was read in part does not stop it. |
 | Web and YouTube | `src/extract/web_ingest.py` | URL fetch plus transcript pull via `youtube-transcript-api`. |
 | News digests | `src/export/news_export.py` | Reads an external news-reader SQLite DB (`BRAIN_NEWS_DB`) read-only. Digest syntheses plus articles at or above `--relevance`. Landed under `mailbox_name = 'News'`, so mail counts exclude them. Not sent to the model: the summary is the synthesis's brief or the article's opening, the topics its section categories or the article's categories (`src/extract/news_extract.py`). |
 | Claude Code sessions | `src/export/conversation_export.py` | Reads `~/.claude/projects`. |
@@ -434,7 +434,6 @@ python -m src.cli reextract --stale --formats          # read with today's reade
 python -m src.cli reextract --ocr --limit 500          # OCR low-text scans and images again (grayscale second pass), in batches
 python -m src.cli reextract --long --estimate          # price a re-summary before running it; changes nothing
 python -m src.cli reextract --full-parts 1234 5678     # summarise these attachments from every part, now and on every later summary
-python scripts/relabel_attachment_status.py [--apply]  # give old failed/skipped rows today's unread verdicts: encrypted kinds, skip reasons
 python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents
 python -m src.cli process-sharepoint --ingest-fetched  # store the files earlier SharePoint fetches left on disk
 python -m src.cli process-sharepoint --refetch-content --max-fetches 0 --deadline-s 1800  # read again the links recorded ok with no text
@@ -522,12 +521,9 @@ src/
 scripts/
   health_check.py              Per-source freshness and job status; email + Healthchecks ping
   backup_db.py                 MVCC-safe encrypted DB snapshot + retention (see docs/RESTORE.md)
-  recover_missing_extractions.py  Backfill emails that staged but never extracted
-  repair_case_twins.py         Gives emails back their own extraction where a case twin's was stored (report by default)
+  forget_duplicate_documents.py  Forgets synced documents byte-identical to a mail attachment that holds their text, stored before ingest checked for such twins (dry run by default)
   reap_orphan_attachments.py   Resolves attachment dirs the registrar can never claim
   scrub_secrets.py             Redacts credentials, card numbers, IBANs and passwords already in the DB or, with --files, in files (dry run by default)
-  repair_people.py             Mends garbled people names and unsaved sender addresses (dry run by default)
-  backfill-all.sh              One-shot backfill across all sources
   conversation-capture.sh      Helper to snapshot Claude Code sessions
   pii-gauntlet.sh              Guards tracked files (and, with --mode=history, published history) against personal-data leaks
   wrappers/                    Archive of the scheduler wrappers each host runs

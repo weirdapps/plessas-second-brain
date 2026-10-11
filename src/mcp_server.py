@@ -1045,8 +1045,12 @@ def stats() -> Stats:
     the service that embeds search queries and `last_embed_error` its last
     failure in this server ({type, at}, or null). `source_class` counts the
     emails of each class, or says 'pending migration' on a store older than
-    the class, whose reads leave out news alone.
+    the class, whose reads leave out news alone. `attachments_awaiting_text` and
+    `attachments_awaiting_summary` count the attachments search cannot yet see
+    by their text or their summary; each `_oldest_hours` is how long the oldest
+    has waited.
     """
+    from src.store.attachment_backlog import backlog_stats
     from src.store.query import get_stats
 
     conn = _get_conn()
@@ -1060,6 +1064,7 @@ def stats() -> Stats:
             "SELECT COUNT(*) as cnt FROM attachment_content WHERE llm_status = 'extracted'"
         ).fetchone()
         s["attachments_extracted"] = row["cnt"]
+        s.update(backlog_stats(conn))  # the health check's Attachment lag queues
         row = conn.execute("SELECT COUNT(*) as cnt FROM key_facts").fetchone()
         s["total_key_facts"] = row["cnt"]
 

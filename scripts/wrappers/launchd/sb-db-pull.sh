@@ -247,8 +247,8 @@ else
     # `-readonly` shipped on 2026-08-25 and failed all 21 runs it ever made: exactly
     # the always-fails bug the URI note warns about, reached by a second road. Guard
     # against the third by asserting on a healthy file, not by reasoning about flags.
-    # A read-write open recreates the `-shm`, and is how the MCP server opens this
-    # file anyway, so the check reads the copy the way its only consumer does.
+    # A read-write open recreates the `-shm`. (The MCP server reads this file with
+    # immutable=1, which needs none, but /usr/bin/sqlite3 cannot take that URI.)
     INTEGRITY=$(sqlite3 "$NEW_DB" 'PRAGMA quick_check;' 2>&1 | head -3 | tr '\n' ' ')
     # The check's own open made these, for a name that is about to go.
     rm -f "$NEW_DB-wal" "$NEW_DB-shm"

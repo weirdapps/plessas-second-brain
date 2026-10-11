@@ -6,15 +6,16 @@ from pathlib import Path
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
+from src import config
 from src.store import sql_readonly
 
 
 @pytest.fixture(autouse=True)
 def _no_pull_stamp(tmp_path: Path, monkeypatch) -> None:
-    """Open the producer's way on any host. sql_readonly reads REPLICA_STAMP, not
-    BRAIN_ROLE, so on a host with a pull stamp every fixture database opened with
-    immutable=1. A test that needs the stamp sets it."""
-    monkeypatch.setattr(sql_readonly, "REPLICA_STAMP", tmp_path / "absent-db-pull.stamp")
+    """Open the producer's way on any host: with this host's pull stamp, a test that
+    clears BRAIN_ROLE would open every fixture database with immutable=1. A test that
+    needs the stamp sets it."""
+    monkeypatch.setattr(config, "REPLICA_STAMP", tmp_path / "absent-db-pull.stamp")
 
 
 @pytest.fixture
@@ -204,6 +205,38 @@ def test_pragma_names_match_in_any_case(db):
     assert "subject" in {row[1] for row in out["rows"]}
 
 
+# Virtual tables that read the file page by page, free pages included.
+RAW_PAGE_TABLES = ["sqlite_dbpage", "dbstat", "sqlite_dbdata", "sqlite_dbptr"]
+
+
+@pytest.mark.parametrize("table", RAW_PAGE_TABLES + [t.upper() for t in RAW_PAGE_TABLES])
+def test_tables_that_read_raw_pages_are_denied_by_name(table):
+    # By name, so a build that compiles one in is held to the same rule as this one.
+    assert (
+        sql_readonly._authorize(sqlite3.SQLITE_READ, table, "data", "main", None)
+        == sqlite3.SQLITE_DENY
+    )
+
+
+def _built_in(table: str) -> bool:
+    probe = sqlite3.connect(":memory:")
+    try:
+        probe.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchall()
+        return True
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        probe.close()
+
+
+@pytest.mark.parametrize("table", RAW_PAGE_TABLES)
+def test_sql_query_refuses_the_raw_page_tables_this_build_has(db, table):
+    if not _built_in(table):
+        pytest.skip(f"this SQLite build has no {table}")
+    out = sql_readonly.run_query(f"SELECT * FROM {table.upper()}", db_path=db)
+    assert out.get("error", "").startswith("refused: "), out
+
+
 def test_fts_match_works_through_the_authorizer(db):
     out = sql_readonly.run_query(
         "SELECT rowid FROM emails_fts WHERE emails_fts MATCH 'budget'", db_path=db
@@ -277,17 +310,18 @@ def _capture_uris(monkeypatch) -> list[str]:
     return seen
 
 
-def test_replica_opens_immutable(db, tmp_path, monkeypatch):
+def test_sql_query_reads_a_pulled_copy_immutable(db, tmp_path, monkeypatch):
     stamp = tmp_path / "db-pull.stamp"
     stamp.write_text("pulled")
-    monkeypatch.setattr(sql_readonly, "REPLICA_STAMP", stamp)
+    monkeypatch.setattr(config, "REPLICA_STAMP", stamp)
+    monkeypatch.delenv("BRAIN_ROLE")
     seen = _capture_uris(monkeypatch)
-    sql_readonly.connect_read_only(db).close()
-    assert seen[0].endswith("?mode=ro&immutable=1")
+    sql_readonly.run_query("SELECT 1", db_path=db)
+    assert seen == [f"{db.resolve().as_uri()}?mode=ro&immutable=1"]
 
 
 def test_producer_opens_plain_read_only(db, tmp_path, monkeypatch):
-    monkeypatch.setattr(sql_readonly, "REPLICA_STAMP", tmp_path / "absent.stamp")
+    monkeypatch.setattr(config, "REPLICA_STAMP", tmp_path / "absent.stamp")
     seen = _capture_uris(monkeypatch)
     sql_readonly.connect_read_only(db).close()
     assert seen[0].endswith("?mode=ro")

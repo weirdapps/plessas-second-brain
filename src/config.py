@@ -101,6 +101,19 @@ def is_replica() -> bool:
     return REPLICA_STAMP.exists()
 
 
+def is_pulled_copy() -> bool:
+    """Whether the store here is a copy the pull put in place, which nothing writes.
+
+    The pull stamps REPLICA_STAMP and renames each verified copy over the store, so
+    only there may a reader skip SQLite's locks (immutable=1). BRAIN_ROLE=producer
+    overrides the stamp, as it does for is_replica(). BRAIN_ROLE=replica alone is not
+    enough: the producer serves with it while its timers write the same file.
+    """
+    if os.environ.get("BRAIN_ROLE", "").strip().lower() == "producer":
+        return False
+    return REPLICA_STAMP.exists()
+
+
 def replica_refusal(what: str) -> str:
     """The message that refuses `what` on a host where is_replica() holds."""
     if os.environ.get("BRAIN_ROLE", "").strip().lower() == "replica":

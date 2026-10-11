@@ -16,10 +16,10 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from src import config
 from src.export import mail_reconcile as mr
 from src.export.outlook_cli import OutlookCliAuthRequired
 from src.export.state import OutlookSyncState, save_outlook_sync_state
-from src.store import sql_readonly
 from src.store.schema import create_database
 
 NOW = datetime(2026, 10, 11, 2, 0, tzinfo=UTC)
@@ -116,7 +116,7 @@ def test_a_failed_reconcile_keeps_when_the_last_one_succeeded(home):
 
 @pytest.fixture
 def db(tmp_path, monkeypatch):
-    monkeypatch.setattr(sql_readonly, "REPLICA_STAMP", tmp_path / "absent-db-pull.stamp")
+    monkeypatch.setattr(config, "REPLICA_STAMP", tmp_path / "absent-db-pull.stamp")
     path = tmp_path / "brain.db"
     create_database(str(path)).close()
     return path

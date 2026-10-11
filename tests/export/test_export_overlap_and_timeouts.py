@@ -20,9 +20,9 @@ from unittest.mock import patch
 
 import pytest
 
+from src import config
 from src.export import outlook_export
 from src.export.state import OutlookSyncState, load_outlook_sync_state, save_outlook_sync_state
-from src.store import sql_readonly
 from src.store.schema import create_database
 
 CURSOR = "2026-10-01T12:00:00Z"
@@ -32,7 +32,7 @@ LATER = "2026-10-01T13:00:00Z"
 @pytest.fixture
 def held(tmp_path, monkeypatch):
     """A store holding one message and an alias of another, and a staged third."""
-    monkeypatch.setattr(sql_readonly, "REPLICA_STAMP", tmp_path / "absent-db-pull.stamp")
+    monkeypatch.setattr(config, "REPLICA_STAMP", tmp_path / "absent-db-pull.stamp")
     db = tmp_path / "brain.db"
     conn = create_database(str(db))
     conn.execute(

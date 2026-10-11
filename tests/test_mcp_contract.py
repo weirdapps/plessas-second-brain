@@ -11,14 +11,15 @@ ways, most of them flagged as success. The server instructions ran past the
 
 import json
 import re
+import sqlite3
 from datetime import UTC, datetime
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import ValidationError
 
-from src import mcp_server
-from src.store.schema import create_database, get_connection
+from src import config, mcp_server
+from src.store.schema import create_database
 from tests.mcp_listing import listed_tools, registered_tool
 
 # ------------------------------------------------------------- tools/list
@@ -173,7 +174,9 @@ def store(tmp_path, monkeypatch):
     )
     conn.commit()
     conn.close()
-    monkeypatch.setattr(mcp_server, "_get_conn", lambda: get_connection(str(path)))
+    # The store itself, not a stand-in connection: every call goes through the open a
+    # client's call goes through.
+    monkeypatch.setattr(mcp_server, "DEFAULT_DB", path)
     monkeypatch.setattr(sql_readonly, "DEFAULT_DB", path)
     monkeypatch.setattr("src.export.outlook_cli.run_outlook_cli", lambda args: [])
     return path
@@ -278,3 +281,102 @@ def test_a_recall_that_found_nothing_says_why(store):
 def test_an_unknown_person_or_topic_says_why(store):
     assert mcp_server.person_context("Nobody")["reason"]
     assert mcp_server.topic_context("zzyzx")["reason"]
+
+
+# ------------------------------------------------------ how a call opens the store
+
+# Calls that open brain.db read-write. Every other call reads through the read-only
+# open, so a name added here is a decision about who may write, never drift.
+READ_WRITE = {"sharepoint_index refetch"}
+LINK = "https://tenant.example.com/sites/Team/Shared%20Documents/Plan.txt"
+
+
+@pytest.mark.parametrize("on_replica", [False, True], ids=["producer", "replica"])
+def test_only_the_refetch_opens_the_store_read_write(store, tmp_path, monkeypatch, on_replica):
+    """readOnlyHint promises a client that a call changes nothing; this holds every tool to it.
+
+    Each sample call runs against the store, and every sqlite3.connect is recorded as
+    read-only (a mode=ro URI) or read-write.
+    """
+    from src.export import sharepoint_fetcher
+    from src.export.sharepoint_fetcher import SharepointFetchResult
+
+    seed = sqlite3.connect(store)
+    try:
+        sharepoint_fetcher.record_link_in_db(seed, url=LINK, message_id="1", status="http-error")
+    finally:
+        seed.close()
+    monkeypatch.setattr(config, "SHAREPOINT_HOST", "tenant.example.com")
+    monkeypatch.setattr(
+        sharepoint_fetcher,
+        "fetch_sharepoint_link",
+        lambda url, out_dir, managed_host=None: SharepointFetchResult(
+            url=url, status="http-error", error_message="refused"
+        ),
+    )
+    monkeypatch.setattr(config, "REPLICA_STAMP", tmp_path / "no-pull-stamp")
+    if on_replica:
+        monkeypatch.setenv("BRAIN_ROLE", "replica")
+    calls = {name: (name, args) for name, args in CALLS.items()}
+    calls["sharepoint_index refetch"] = ("sharepoint_index", {"operation": "refetch", "url": LINK})
+    opened: list[str] = []
+    real = sqlite3.connect
+
+    def spy(database, *args, **kwargs):
+        if database != ":memory:":
+            read_only = kwargs.get("uri") and "mode=ro" in str(database)
+            opened.append("read-only" if read_only else "read-write")
+        return real(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", spy)
+    seen: dict[str, set[str]] = {}
+    for label, (tool, args) in calls.items():
+        opened.clear()
+        if on_replica and label == "sharepoint_index refetch":
+            with pytest.raises(ToolError, match="Refusing"):
+                getattr(mcp_server, tool)(**args)
+        else:
+            getattr(mcp_server, tool)(**args)
+        seen[label] = set(opened)
+
+    assert {label for label, modes in seen.items() if "read-write" in modes} == (
+        set() if on_replica else READ_WRITE
+    )
+    # Every call but the live mailbox reads the store, through the read-only open.
+    assert {label for label, modes in seen.items() if "read-only" in modes} == set(seen) - {
+        "outlook_live_search"
+    }
+
+
+@pytest.mark.parametrize(
+    "role, stamped, reads_the_wal",
+    [
+        pytest.param(None, True, False, id="Mac replica: immutable, the pulled file alone"),
+        pytest.param("replica", False, True, id="producer HTTP server: read-only with locks"),
+        pytest.param("producer", False, True, id="single host: read-only with locks"),
+    ],
+)
+def test_each_deployment_reads_through_its_own_open(
+    store, tmp_path, monkeypatch, role, stamped, reads_the_wal
+):
+    """Where timers write the store, a read sees what they committed to the WAL; on a
+    pulled copy only the pull replaces the file, so a stray WAL is never replayed."""
+    from tests.test_store_connections import _topics, _uncheckpointed_row
+
+    stamp = tmp_path / "db-pull.stamp"
+    if stamped:
+        stamp.write_text("2026-10-11T00:00:00+00:00")
+    monkeypatch.setattr(config, "REPLICA_STAMP", stamp)
+    if role is None:
+        monkeypatch.delenv("BRAIN_ROLE")
+    else:
+        monkeypatch.setenv("BRAIN_ROLE", role)
+
+    with _uncheckpointed_row(store):
+        conn = mcp_server._get_conn()
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                conn.execute("DELETE FROM emails")
+            assert ("fresh" in _topics(conn)) is reads_the_wal
+        finally:
+            conn.close()

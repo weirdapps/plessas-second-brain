@@ -116,6 +116,9 @@ def _connect(db_path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout = 60000")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
+    # As get_connection: a re-extraction overwrites and deletes attachment text, and
+    # without this the old text stays in the pages it frees.
+    conn.execute("PRAGMA secure_delete = ON")
     return conn
 
 

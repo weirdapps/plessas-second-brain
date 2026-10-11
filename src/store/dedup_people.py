@@ -84,6 +84,8 @@ def get_connection(db_path: str | None = None) -> sqlite3.Connection:
     # WAL + NORMAL sync (see schema.get_connection). foreign_keys stays OFF here by design.
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
+    # As schema.get_connection: zero what the dedup's deletes free.
+    conn.execute("PRAGMA secure_delete = ON")
     return conn
 
 

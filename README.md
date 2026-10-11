@@ -545,7 +545,7 @@ scripts/
   health_check.py              Per-source freshness and job status; email + Healthchecks ping
   extraction_eval.py           Extraction eval CLI: build, dry run, run, calibrate (see Evals)
   retrieval_eval.py            Retrieval evals: the known-item guard and the qa set (see Evals)
-  backup_db.py                 MVCC-safe encrypted DB snapshot + retention (see docs/RESTORE.md)
+  backup_db.py                 MVCC-safe encrypted DB snapshot, retention and the weekly restore drill (see docs/RESTORE.md)
   forget_duplicate_documents.py  Forgets synced documents byte-identical to a mail attachment that holds their text, stored before ingest checked for such twins (dry run by default)
   reap_orphan_attachments.py   Resolves attachment dirs the registrar can never claim
   scrub_secrets.py             Redacts credentials, card numbers, IBANs and passwords already in the DB or, with --files, in files (dry run by default)

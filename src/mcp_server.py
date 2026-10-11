@@ -41,6 +41,7 @@ from src.mcp_results import (
     TeamsThread,
     TopicContext,
 )
+from src.store import envelope
 from src.store.calendar_query import ATTENDEES_MAX, ATTENDEES_SHOWN
 from src.store.schema import get_connection
 from src.store.sql_readonly import connect_read_only
@@ -96,14 +97,14 @@ not yet synced here, is on the separate WhatsApp MCP server.\
 # never BRAIN_ROLE=replica: the producer serves with it.
 _REPLICA_FRESHNESS = """\
 Freshness. This is a REPLICA, synced from the machine that builds it, so it can \
-lag. `stats` returns data_as_of / age_hours / stale, and `recall` attaches \
-_stale_warning when it matters. For mail newer than the replica, use \
+lag. Every result opens with data_as_of and stale, and _stale_warning when it \
+matters; `stats` adds age_hours. For mail newer than the replica, use \
 `outlook_live_search`, which looks back 24 hours at most."""
 _STORE_FRESHNESS = """\
-Freshness. The store is as fresh as its last sync, so it can lag. `stats` \
-returns data_as_of / age_hours / stale, and `recall` attaches _stale_warning \
-when it matters. For mail newer than the store, use `outlook_live_search`, \
-which looks back 24 hours at most."""
+Freshness. The store is as fresh as its last sync, so it can lag. Every result \
+opens with data_as_of and stale, and _stale_warning when it matters; `stats` \
+adds age_hours. For mail newer than the store, use `outlook_live_search`, which \
+looks back 24 hours at most."""
 
 
 def _instructions() -> str:
@@ -164,6 +165,46 @@ IncludeAutomation = Annotated[
     Field(
         description="Include the reports the owner's own jobs mail him (source_class "
         "automation), left out by default."
+    ),
+]
+# The kinds a row says it is (src/store/envelope.py), as each search takes them. Leaving
+# news out needs no switch of its own: include_news is false unless set.
+_NEWS_IN_KINDS = "Naming news includes it whatever include_news says; omit for every kind."
+RecallKinds = Annotated[
+    list[
+        Literal[
+            "email",
+            "news",
+            "document",
+            "attachment",
+            "teams",
+            "whatsapp",
+            "calendar",
+            "conversation",
+            "image",
+        ]
+    ]
+    | None,
+    Field(
+        min_length=1,
+        description="Only rows of these kinds, as each row's `kind` says; a decision, action "
+        "or commitment is of the kind of the item it was taken from. " + _NEWS_IN_KINDS,
+    ),
+]
+SearchEmailsKinds = Annotated[
+    list[Literal["email", "news", "document", "attachment", "teams", "whatsapp", "conversation"]]
+    | None,
+    Field(
+        min_length=1,
+        description="Only rows of these kinds: email, news, document; in semantic mode also "
+        "attachment, teams, whatsapp, conversation. " + _NEWS_IN_KINDS,
+    ),
+]
+EmailKinds = Annotated[
+    list[Literal["email", "news", "document"]] | None,
+    Field(
+        min_length=1,
+        description="Only emails of these kinds: email (mail), news, document. " + _NEWS_IN_KINDS,
     ),
 ]
 # Conversation memory is the owner's sessions (src/export/conversation_export.py).
@@ -271,12 +312,46 @@ def _check_date(name: str, value: str | None) -> None:
         ) from None
 
 
-def _rows(rows: list[dict], reason: str, key: str = "result") -> dict:
-    """`rows` under `key`, held to the response budget, with `reason` when there are none.
+def _header(conn) -> dict:
+    """What every result opens with: `data_as_of` and `stale`, read as recall and stats
+    always read them (query.get_freshness: the older of the last sync and the last
+    mail export), and `_stale_warning`, the sentence to pass on, when the store is behind.
+
+    Only recall said this, and a replica hours behind every night by schedule answered
+    every other tool like a store in which nothing had happened since.
+    """
+    from src.store.query import get_freshness
+
+    fresh = get_freshness(conn)
+    head = {"data_as_of": fresh["data_as_of"], "stale": fresh["stale"]}
+    if fresh["stale"]:
+        head["_stale_warning"] = fresh["stale_warning"]
+    return head
+
+
+def _store_header(path) -> dict:
+    """_header of the store at `path`, through the read-only open, for the tools that
+    open their own connection (sql_query and sql_schema)."""
+    conn = connect_read_only(path, immutable=True)
+    try:
+        return _header(conn)
+    finally:
+        conn.close()
+
+
+def _headed(head: dict, out: dict) -> dict:
+    """`out` with the header first: a result too big to show inline is saved to a file
+    whose preview is its first 2 KB."""
+    return {**head, **out}
+
+
+def _rows(head: dict, rows: list[dict], reason: str, key: str = "result") -> dict:
+    """`rows` under `key` after the header, held to the response budget, which counts
+    the header too, with `reason` when there are none.
 
     An empty list with no word on why read the same as a broken search.
     """
-    out: dict = {key: rows}
+    out: dict = {**head, key: rows}
     if not rows:
         out["reason"] = reason
     return budget_response(out)
@@ -329,6 +404,7 @@ def person_context(
             include_news=include_news,
             include_automation=include_automation,
         )
+        head = _header(conn)
     finally:
         conn.close()
     if out.get("person") is None:
@@ -336,7 +412,7 @@ def person_context(
             "No person's name or address matched. Try a surname alone, the other "
             "alphabet, or the email address."
         )
-    return cast(PersonContext, out)
+    return cast(PersonContext, _headed(head, out))
 
 
 @_tool()
@@ -368,11 +444,12 @@ def topic_context(
             include_news=include_news,
             include_automation=include_automation,
         )
+        head = _header(conn)
     finally:
         conn.close()
     if out.get("topic") is None:
         out["reason"] = "No topic tag matched; recall searches the text itself."
-    return cast(TopicContext, out)
+    return cast(TopicContext, _headed(head, out))
 
 
 @_tool()
@@ -391,7 +468,8 @@ def sender_brief(
 
     conn = _get_conn()
     try:
-        return cast(SenderBrief, _sender_brief(conn, name_or_email, days=days))
+        card = _sender_brief(conn, name_or_email, days=days)
+        return cast(SenderBrief, _headed(_header(conn), card))
     finally:
         conn.close()
 
@@ -421,13 +499,33 @@ def email_thread(
             raise ToolError(
                 f"no email has id {email_id}; take email_id from a search_emails or recall row"
             )
-        return {
+        out = {
             "email_id": email_id,
             "emails": query_thread(conn, email_id, limit=limit),
             "thread_total": total,
         }
+        return cast(EmailThread, _headed(_header(conn), out))
     finally:
         conn.close()
+
+
+# The tool for each kind keyword search_emails cannot hold, and the vectors each kind
+# a semantic search_emails ranks is stored as (src/store/embeddings.py).
+_KIND_TOOLS = {
+    "attachment": "search_attachments",
+    "teams": "search_teams",
+    "whatsapp": "search_whatsapp",
+    "conversation": "search_conversations",
+}
+_VECTOR_KINDS = {
+    "email": "email",
+    "news": "email",
+    "document": "email",
+    "attachment": "attachment",
+    "teams": "teams_thread",
+    "whatsapp": "whatsapp_thread",
+    "conversation": "conversation",
+}
 
 
 @_tool()
@@ -439,6 +537,7 @@ def search_emails(
     ] = 20,
     include_news: IncludeNews = False,
     include_automation: IncludeAutomation = False,
+    kinds: SearchEmailsKinds = None,
 ) -> RowsResult:
     """Find emails, standalone documents and news articles (they share one table) by keyword or by meaning.
 
@@ -447,30 +546,46 @@ def search_emails(
     partial_match. One email per thread: a subject match shows the thread's
     newest, and thread_matches counts its other matching emails, which
     email_thread reads. Semantic mode can also return attachment, Teams, WhatsApp
-    and conversation rows, each with its `type`; when the query cannot be
-    embedded it ranks around the best keyword matches and marks each row
-    `semantic: keyword_seeded: <error>`. News and the owner's automation mail are
-    left out unless included.
+    and conversation rows; when the query cannot be embedded it ranks around the
+    best keyword matches and marks each row `semantic: keyword_seeded: <error>`.
+    Each row says its `kind` (email, news, document...), and `kinds` keeps only
+    those. News and the owner's automation mail are left out unless included.
     """
     _check_choice("search_type", search_type, _SEARCH_TYPES)
     limit = _cap(limit)
-    switches = {"include_news": include_news, "include_automation": include_automation}
+    switches = {
+        "include_news": include_news or "news" in (kinds or ()),
+        "include_automation": include_automation,
+    }
+    email_kinds = None if kinds is None else [k for k in kinds if k in envelope.EMAIL_KINDS]
+    classes = envelope.classes_for(email_kinds) if email_kinds else None
+    if search_type == "keyword" and kinds is not None and len(email_kinds or ()) < len(kinds):
+        other = next(k for k in kinds if k not in envelope.EMAIL_KINDS)
+        raise ToolError(
+            f"keyword search_emails finds emails, news and documents; for {other} rows use "
+            f"{_KIND_TOOLS[other]}, or search_type='semantic'"
+        )
     conn = _get_conn()
     try:
         if search_type == "semantic":
             from src.store.embeddings import SemanticUnavailable, query_semantic
 
+            vectors = None if kinds is None else {_VECTOR_KINDS[k] for k in kinds}
             try:
-                rows = query_semantic(conn, query, limit=limit, **switches)
+                rows = query_semantic(
+                    conn, query, limit=limit, kinds=vectors, classes=classes, **switches
+                )
             except SemanticUnavailable as e:
                 raise ToolError(str(e)) from e
+            envelope.semantic(conn, rows)
         else:
             from src.store.query import query_by_keyword
 
-            rows = query_by_keyword(conn, query, limit=limit, **switches)
+            rows = query_by_keyword(conn, query, limit=limit, classes=classes, **switches)
+        head = _header(conn)
     finally:
         conn.close()
-    return cast(RowsResult, _rows(rows, _NO_WORD))
+    return cast(RowsResult, _rows(head, rows, _NO_WORD))
 
 
 _RECALL_KINDS = (
@@ -511,6 +626,7 @@ def recall(
     ] = False,
     include_news: IncludeNews = False,
     include_automation: IncludeAutomation = False,
+    kinds: RecallKinds = None,
 ) -> RecallResult:
     """Tell me everything we know about X: one search across every index, the default first call.
 
@@ -519,20 +635,23 @@ def recall(
     and `truncated` when the 40,000-character budget cut rows. Then ten buckets:
     emails (with standalone documents), attachments, conversations, decisions,
     actions, commitments, inline_images, teams, whatsapp, calendar_events;
-    `summary.kinds_with_results` names those with rows. Only emails fuses keyword
-    and semantic ranking. A bucket where nothing held the whole query falls back
-    to rows holding some of its words, flagged partial_match, and
-    `summary.partial_kinds` names it. News and the owner's automation mail are
-    left out unless included; on a store older than the class only news is, and
-    `summary.source_class` says so. Summaries are cut to about 300 characters.
+    `summary.kinds_with_results` names those with rows, and `kinds` keeps only
+    rows of the kinds named. Only emails fuses keyword and semantic ranking. A
+    bucket where nothing held the whole query falls back to rows holding some of
+    its words, flagged partial_match, and `summary.partial_kinds` names it. News
+    and the owner's automation mail are left out unless included; on a store
+    older than the class only news is, and `summary.source_class` says so.
+    Summaries are cut to about 300 characters.
     """
     from functools import partial
 
     from src.store.embeddings import semantic_email_candidates
-    from src.store.query import get_freshness
     from src.store.recall import compact_rows
     from src.store.recall import recall as _recall
 
+    # Naming news asks for it; the semantic candidates are held to the same kinds.
+    include_news = include_news or "news" in (kinds or ())
+    email_kinds = None if kinds is None else [k for k in kinds if k in envelope.EMAIL_KINDS]
     conn = _get_conn()
     try:
         # Inject the semantic provider so the emails bucket is a keyword+semantic
@@ -546,23 +665,19 @@ def recall(
                 semantic_email_candidates,
                 include_news=include_news,
                 include_automation=include_automation,
+                classes=envelope.classes_for(email_kinds),
             ),
             include_context=include_context,
             include_news=include_news,
             include_automation=include_automation,
+            kinds=kinds,
         )
-        fresh = get_freshness(conn)
+        fresh = _header(conn)
     finally:
         conn.close()
     # Summary and freshness first: a result too big to show inline is saved to a
     # file whose preview is its first 2 KB, and these were its last keys.
-    out: dict = {
-        "summary": found["summary"],
-        "data_as_of": fresh["data_as_of"],
-        "stale": fresh["stale"],
-    }
-    if fresh["stale"]:
-        out["_stale_warning"] = fresh["stale_warning"]
+    out: dict = {"summary": found["summary"], **fresh}
     if not found["summary"].get("total_hits"):
         out["reason"] = _NO_WORD
     out["query"] = found["query"]
@@ -599,13 +714,15 @@ def query_emails(
     ] = 20,
     include_news: IncludeNews = False,
     include_automation: IncludeAutomation = False,
+    kinds: EmailKinds = None,
 ) -> RowsResult:
     """List the emails that match every filter given: person, topic, keyword and date range.
 
     At least one filter is needed. For a date window with nothing else, add a
     person or a keyword: a busy week holds over a thousand emails and only the
-    newest come back. News and the owner's automation mail are left out unless
-    included.
+    newest come back. Each row says its `kind` (email, news or document), and
+    `kinds` keeps only those. News and the owner's automation mail are left out
+    unless included.
     """
     from src.store.query import query_combined
 
@@ -626,14 +743,17 @@ def query_emails(
             start_date=start_date,
             end_date=end_date,
             limit=_cap(limit),
-            include_news=include_news,
+            include_news=include_news or "news" in (kinds or ()),
             include_automation=include_automation,
+            classes=envelope.classes_for(kinds),
         )
+        head = _header(conn)
     finally:
         conn.close()
     return cast(
         RowsResult,
         _rows(
+            head,
             rows,
             "No email matched every filter given. Widen the dates or drop a filter, and check "
             "stats coverage for the dates held.",
@@ -680,11 +800,16 @@ def query_decisions(
             include_news=include_news,
             include_automation=include_automation,
         )
+        head = _header(conn)
     finally:
         conn.close()
     return cast(
         RowsResult,
-        _rows(rows, f"No decision matched in the last {days} days; widen days or drop a filter."),
+        _rows(
+            head,
+            rows,
+            f"No decision matched in the last {days} days; widen days or drop a filter.",
+        ),
     )
 
 
@@ -709,7 +834,7 @@ def query_actions(
         bool, Field(description="Include action items extracted from news articles.")
     ] = False,
     include_automation: IncludeAutomation = False,
-) -> list[dict]:
+) -> RowsResult:
     """What is still to be done, by whom: action items, optionally by owner and status.
 
     Ordered so the actionable ones come first: upcoming deadlines soonest first,
@@ -719,13 +844,13 @@ def query_actions(
     the source last saw activity): nothing records that an action was done, so
     there is no other status. Items from news articles and from the owner's
     automation mail are left out unless asked for; `source_class` gives an email
-    item's class.
+    item's class. The rows come under `result`.
     """
     from src.store.query import query_action_items
 
     conn = _get_conn()
     try:
-        return query_action_items(
+        rows = query_action_items(
             conn,
             owner=owner,
             status=status,
@@ -733,8 +858,13 @@ def query_actions(
             include_news=include_news,
             include_automation=include_automation,
         )
+        head = _header(conn)
     finally:
         conn.close()
+    return cast(
+        RowsResult,
+        _rows(head, rows, f"No {status} action item matched; drop the owner or change status."),
+    )
 
 
 @_tool()
@@ -771,6 +901,7 @@ def stale_threads(
     conn = _get_conn()
     try:
         out: dict = {
+            **_header(conn),
             "stale_threads": find_stale_threads(
                 conn, days=days, max_days=max_days, limit=limit, **switches
             ),
@@ -815,17 +946,15 @@ def meeting_prep(
     conn = _get_conn()
     try:
         people_list = [p.strip() for p in people.split(",") if p.strip()]
-        return cast(
-            MeetingPrep,
-            _mp(
-                conn,
-                people_list,
-                topic=topic,
-                days=days,
-                include_news=include_news,
-                include_automation=include_automation,
-            ),
+        prep = _mp(
+            conn,
+            people_list,
+            topic=topic,
+            days=days,
+            include_news=include_news,
+            include_automation=include_automation,
         )
+        return cast(MeetingPrep, _headed(_header(conn), prep))
     finally:
         conn.close()
 
@@ -863,9 +992,10 @@ def search_attachments(
             include_news=include_news,
             include_automation=include_automation,
         )
+        head = _header(conn)
     finally:
         conn.close()
-    return cast(RowsResult, _rows(rows, _NO_WORD))
+    return cast(RowsResult, _rows(head, rows, _NO_WORD))
 
 
 @_tool()
@@ -1032,9 +1162,11 @@ def query_calendar_events(
             )
             if partial:
                 events[-1]["partial_match"] = True
+        envelope.calendar(conn, events)
+        head = _header(conn)
     finally:
         conn.close()
-    out: dict = {"events": events, "count": len(events)}
+    out: dict = {**head, "events": events, "count": len(events)}
     if not events:
         out["reason"] = (
             "No event matched. since and until are Athens days, and cancelled meetings are "
@@ -1118,7 +1250,8 @@ def stats() -> Stats:
 
         s["embed_backend"] = embed_backend()
         s["last_embed_error"] = last_embed_error()
-        return cast(Stats, s)
+        # The header first, as on every result; age_hours and stale_warning stay below.
+        return cast(Stats, _headed(_header(conn), s))
     finally:
         conn.close()
 
@@ -1151,6 +1284,7 @@ def search_conversations(
     limit = _cap(limit)
     conn = _get_conn()
     try:
+        head = _header(conn)
         if search_type == "semantic":
             from src.store.conversation_query import conversation_ids_in_workspace, with_kinds
             from src.store.embeddings import (
@@ -1175,7 +1309,7 @@ def search_conversations(
                     reason = f"No conversation was held in a workspace matching {workspace!r}."
                     if not include_agents:
                         reason += " Agent sessions are left out unless include_agents."
-                    return cast(RowsResult, _rows([], reason))
+                    return cast(RowsResult, _rows(head, [], reason))
             try:
                 rows = query_semantic(
                     conn, query, limit=limit, kinds={"conversation"}, allowed_ids=allowed
@@ -1184,18 +1318,24 @@ def search_conversations(
                 raise ToolError(str(e)) from e
             if include_agents:
                 with_kinds(conn, rows, "id")
+            envelope.semantic(conn, rows)
         else:
             from src.store.conversation_query import search_conversations_keyword
 
-            rows = search_conversations_keyword(
-                conn, query, workspace=workspace, limit=limit, include_agents=include_agents
+            rows = envelope.conversations(
+                conn,
+                search_conversations_keyword(
+                    conn, query, workspace=workspace, limit=limit, include_agents=include_agents
+                ),
             )
     finally:
         conn.close()
     return cast(
         RowsResult,
         _rows(
-            _inert(rows), "No past conversation matched; try other words, or no workspace filter."
+            head,
+            _inert(rows),
+            "No past conversation matched; try other words, or no workspace filter.",
         ),
     )
 
@@ -1213,13 +1353,14 @@ def conversation_context(
     conn = _get_conn()
     try:
         out = get_conversation_context(conn, session_id, include_agents=include_agents)
+        head = _header(conn)
     finally:
         conn.close()
     if "error" in out:
         if out.get("kind") == "agent":
             raise ToolError(out["error"])
         raise ToolError(f"{out['error']}; take session_id from a search_conversations row")
-    return cast(ConversationContext, _inert(out))
+    return cast(ConversationContext, _headed(head, _inert(out)))
 
 
 @_tool(SHAREPOINT)
@@ -1247,6 +1388,7 @@ def sharepoint_index(
     _check_choice("operation", operation, ("list_stale", "list_unfetched", "refetch"))
     conn = _get_conn()
     try:
+        head = _header(conn)
         if operation == "list_stale":
             # Enumerate the one healthy status rather than the failing ones. The
             # hardcoded IN ('stale', 'http-error') was already incomplete when it
@@ -1264,7 +1406,7 @@ def sharepoint_index(
                 ORDER BY last_attempt_at DESC
                 """
             ).fetchall()
-            return {"links": [dict(r) for r in rows]}
+            return cast(SharepointIndex, _headed(head, {"links": [dict(r) for r in rows]}))
 
         if operation == "list_unfetched":
             rows = conn.execute(
@@ -1275,7 +1417,7 @@ def sharepoint_index(
                 ORDER BY last_attempt_at DESC
                 """
             ).fetchall()
-            return {"links": [dict(r) for r in rows]}
+            return cast(SharepointIndex, _headed(head, {"links": [dict(r) for r in rows]}))
 
         if not url:
             raise ToolError("url is required for refetch: a link from list_stale or list_unfetched")
@@ -1324,7 +1466,8 @@ def sharepoint_index(
             )
         finally:
             writer.close()
-        return {"status": result.status, "document_message_id": document}
+        refetched = {"status": result.status, "document_message_id": document}
+        return cast(SharepointIndex, _headed(head, refetched))
     finally:
         conn.close()
 
@@ -1387,7 +1530,8 @@ def attachment_image_search(
             if img.get("partial_match"):
                 result["partial_match"] = True
             results.append(result)
-        out: dict = {"results": results, "count": len(results)}
+        envelope.images(conn, results)
+        out: dict = {**_header(conn), "results": results, "count": len(results)}
         if not results:
             out["reason"] = "No image description held any meaningful word of the query."
         return cast(ImageSearch, out)
@@ -1444,12 +1588,15 @@ def outlook_live_search(
         needle = subject_contains.lower()
         raw = [m for m in raw if needle in (m.get("Subject", "") or "").lower()]
     messages = [{k: m[k] for k in _LIVE_MAIL_FIELDS if k in m} for m in raw]
-    return {
+    # The live mailbox, not the store: as of this call, never behind.
+    live = {"data_as_of": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), "stale": False}
+    out = {
         "messages": messages,
         "count": len(messages),
         "since_minutes": since_minutes,
         "clamped": since_minutes != requested,
     }
+    return cast(LiveMail, _headed(live, out))
 
 
 _LIVE_MAIL_FIELDS = (
@@ -1492,13 +1639,17 @@ def search_teams(
     _check_choice("kind", kind, ("thread", "message", "both"))
     conn = _get_conn()
     try:
-        rows = q(conn, query, kind=kind, limit=_cap(limit))
+        rows = envelope.teams(conn, q(conn, query, kind=kind, limit=_cap(limit)))
+        head = _header(conn)
     finally:
         conn.close()
     return cast(
         ResultsResult,
         _rows(
-            rows, "No Teams thread or message matched; try other words or kind='both'.", "results"
+            head,
+            rows,
+            "No Teams thread or message matched; try other words or kind='both'.",
+            "results",
         ),
     )
 
@@ -1533,16 +1684,20 @@ def search_whatsapp(
         raise ToolError(f"days must be 1 or more; got {days!r}")
     conn = _get_conn()
     try:
-        rows = q(conn, query, chat=chat, days=days, limit=_cap(limit))
+        rows = envelope.whatsapp(conn, q(conn, query, chat=chat, days=days, limit=_cap(limit)))
+        head = _header(conn)
     finally:
         conn.close()
-    out: dict = {"results": rows}
-    if not rows:
-        out["reason"] = (
+    return cast(
+        ResultsResult,
+        _rows(
+            head,
+            rows,
             "No WhatsApp session or message matched; try other words, a longer days window, "
-            "or no chat filter."
-        )
-    return cast(ResultsResult, out)
+            "or no chat filter.",
+            "results",
+        ),
+    )
 
 
 @_tool()
@@ -1557,11 +1712,12 @@ def teams_thread_context(
     conn = _get_conn()
     try:
         out = thread_context(conn, thread_id)
+        head = _header(conn)
     finally:
         conn.close()
     if "error" in out:
         raise ToolError(f"no Teams thread has id {thread_id}; take thread_id from search_teams")
-    return cast(TeamsThread, out)
+    return cast(TeamsThread, _headed(head, out))
 
 
 @_tool()
@@ -1575,11 +1731,14 @@ def teams_chat_summary(
     conn = _get_conn()
     try:
         out = chat_summary(conn, chat_id, days=days)
+        if "error" not in out:
+            envelope.teams(conn, out["threads"], key="id")
+        head = _header(conn)
     finally:
         conn.close()
     if "error" in out:
         raise ToolError(f"no Teams chat has id {chat_id}; take chat_id from search_teams")
-    return cast(TeamsChat, out)
+    return cast(TeamsChat, _headed(head, out))
 
 
 @_tool()
@@ -1608,13 +1767,14 @@ def sql_query(
     was left out. A result wider than 32 columns is refused, and so is a query
     that reads or builds a value over 8 MiB: read long text by id with substr().
     """
+    from src.store import sql_readonly
     from src.store.sql_readonly import run_query
 
     out = run_query(sql, limit=_cap(limit))
     if "error" in out:
         raise ToolError(out["error"])
     # conversation_turns.content is read here in full, harness tags and all.
-    return cast(SqlResult, _inert(out))
+    return cast(SqlResult, _headed(_store_header(sql_readonly.DEFAULT_DB), _inert(out)))
 
 
 @_tool()
@@ -1630,12 +1790,13 @@ def sql_schema(
     where counting ran out of the shared time budget. Full-text index shadow
     tables are left out.
     """
+    from src.store import sql_readonly
     from src.store.sql_readonly import describe
 
     out = describe(table)
     if "error" in out:
         raise ToolError(out["error"])
-    return cast(SqlSchema, out)
+    return cast(SqlSchema, _headed(_store_header(sql_readonly.DEFAULT_DB), out))
 
 
 def _host_port(value: str) -> tuple[str, int]:

@@ -148,6 +148,8 @@ Every dossier dates and orders its rows the same way (`src/store/ordering.py`): 
 
 A channel thread holds the post and its replies, each reply a message of its own, and a post is dated by when it was written, not by its newest reply. A message edited or deleted after it was first stored is brought up to date on a later pull: the edit replaces the text, a deletion blanks it, and either sends the thread back to extraction. Before this, replies stayed inside the post's stored payload, out of search and extraction, and the first draft of an edited message and the text of a deleted one were kept. `python -m src.cli teams-backfill-replies` stores the replies already held in stored posts, once (see `docs/DEPLOY.md`).
 
+A message's text is what a reader sees of it: no tags, entities decoded, a block or a line break on a line of its own, and the visible text of a mention, a link (its address after it, as in a mail body) and an emoji kept. The HTML is kept beside it. The content's shape decides, not the type the payload declares: the services declare an HTML body as text, and until this change the text of every HTML message was its markup, so `search_teams` matched words such as `itemtype` and `nbsp` and the model read the tags. System messages (calls, membership changes) keep the service's XML. `python -m src.cli teams-strip-html` converts the text stored before, once (see `docs/DEPLOY.md`).
+
 ### WhatsApp
 
 - `search_whatsapp(query, chat, days, limit)`. Session summaries and raw message text, newest first, one row per session. `chat` narrows to chats whose name contains it (or one exact JID); `days` to sessions active in the window.
@@ -423,6 +425,7 @@ python -m src.cli calendar-sync --since 2026-01-01
 python -m src.cli news-sync --relevance 60
 python -m src.cli teams-sync --workers 4
 python -m src.cli teams-backfill-replies    # once, on the producer: store the channel replies stored posts hold; no Teams call
+python -m src.cli teams-strip-html          # once, on the producer: convert message text stored as HTML (--dry-run counts); no Teams or model call
 python -m src.cli whatsapp-sync             # the snapshot at BRAIN_WHATSAPP_SNAPSHOT (see WhatsApp below)
 python -m src.cli process-attachments --phase 2 --workers 2
 python -m src.cli process-attachments --phase 2 --estimate             # calls, tokens and cost of the pending summaries; no model call
@@ -557,7 +560,7 @@ scripts/
   health_check.py              Per-source freshness and job status; email + Healthchecks ping
   extraction_eval.py           Extraction eval CLI: build, dry run, run, calibrate (see Evals)
   retrieval_eval.py            Retrieval evals: the known-item guard and the qa set (see Evals)
-  backup_db.py                 MVCC-safe encrypted DB snapshot + retention (see docs/RESTORE.md)
+  backup_db.py                 MVCC-safe encrypted DB snapshot, retention and the weekly restore drill (see docs/RESTORE.md)
   forget_duplicate_documents.py  Forgets synced documents byte-identical to a mail attachment that holds their text, stored before ingest checked for such twins (dry run by default)
   reap_orphan_attachments.py   Resolves attachment dirs the registrar can never claim
   scrub_secrets.py             Redacts credentials, card numbers, IBANs and passwords already in the DB or, with --files, in files (dry run by default)

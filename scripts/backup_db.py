@@ -30,6 +30,10 @@ Usage (VPS, from sb-daily-sync.sh):
 Usage (Mac, from sb-db-pull.sh — GFS-prune the pulled offsite copies):
     python scripts/backup_db.py --prune-only \\
         --offsite-dir ~/second-brain-backups/offsite --gfs-daily 14 --gfs-weekly 8
+
+Usage (Mac, weekly: the restore drill on the newest pulled archive, docs/RESTORE.md):
+    python scripts/backup_db.py --drill --offsite-dir ~/second-brain-backups/offsite \\
+        --key-file ~/.second-brain/backup.key --db data/brain.db --hc-slug brain-restore-drill
 """
 
 from __future__ import annotations
@@ -40,14 +44,24 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import urllib.request
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from glob import glob
 from pathlib import Path
+from typing import NamedTuple
 
 LOCAL_PATTERN = "brain-*.db"
 OFFSITE_SUFFIX = ".db.zst.enc"
 OFFSITE_PATTERN = "brain-*.db.zst.enc"
+
+# What the restore drill counts in the restored copy and in the database it is
+# compared with: the four tables every other one hangs off.
+DRILL_TABLES = ("emails", "attachments", "teams_messages", "decisions")
+# How far a restored count may sit from the source's, as a share of the larger of the
+# two. The newest archive is up to a day older than the database it is compared with,
+# so equality is not the test; an archive of an empty, cut short or stale database is.
+DRILL_TOLERANCE = 0.10
 
 # Every file this script writes is the whole corpus, plaintext or encrypted.
 # sqlite and open() take the process umask, which left the local plaintext
@@ -232,6 +246,164 @@ def prune_gfs(directory: str, pattern: str, daily: int, weekly: int) -> list[str
     return removed
 
 
+def default_drill_stamp() -> str:
+    """Where a passing drill records itself: the file scripts/health_check.py ages.
+
+    BRAIN_RESTORE_DRILL_STAMP when set, else ~/.second-brain/restore-drill.stamp, which
+    is the rule health_check.check_backups reads it by.
+    """
+    return os.environ.get("BRAIN_RESTORE_DRILL_STAMP") or str(
+        Path.home() / ".second-brain" / "restore-drill.stamp"
+    )
+
+
+def newest_archive(directory: str) -> str | None:
+    """The newest ``brain-YYYYMMDD.db.zst.enc`` in ``directory``, by the date in its name."""
+    files = _dated_files(directory, OFFSITE_PATTERN)
+    return files[0][1] if files else None
+
+
+def _count_rows(conn: sqlite3.Connection) -> dict[str, int | None]:
+    """Rows in each of DRILL_TABLES, None for a table the database does not have."""
+    counts: dict[str, int | None] = {}
+    for table in DRILL_TABLES:
+        try:
+            counts[table] = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+        except sqlite3.OperationalError:  # no such table
+            counts[table] = None
+    return counts
+
+
+def _source_counts(db_path: str) -> dict[str, int | None]:
+    """Row counts of the database an archive is compared with, read without writing it.
+
+    mode=ro, so nothing can change it. On a replica, immutable=1 as well: a plain
+    read-only open of a freshly pulled WAL copy fails, and nothing but the pull writes
+    there. Never on the producer, where writers fill the WAL and the locks must stay on.
+    src.config.is_replica decides, as it does for every other reader of the store.
+    """
+    if not os.path.isfile(db_path):
+        raise FileNotFoundError(f"source database not found: {db_path}")
+    root = str(Path(__file__).resolve().parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from src.config import is_replica
+
+    uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+    if is_replica():
+        uri += "&immutable=1"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        return _count_rows(conn)
+    finally:
+        conn.close()
+
+
+class DrillResult(NamedTuple):
+    """What a restore drill found. It passed when ``problems`` is empty.
+
+    A NamedTuple, not a dataclass: the tests load this script by path, outside
+    sys.modules, where a dataclass under postponed annotations cannot be built.
+    """
+
+    archive: str
+    quick_check: str
+    restored: dict[str, int | None]
+    source: dict[str, int | None]
+    problems: list[str]
+
+
+def restore_drill(
+    archive: str,
+    key_file: str,
+    source_db: str,
+    work_dir: str | None = None,
+    tolerance: float = DRILL_TOLERANCE,
+) -> DrillResult:
+    """Restore ``archive`` into a private temporary directory and judge what comes back.
+
+    Decrypts and decompresses it with :func:`decrypt_decompress`, runs PRAGMA
+    quick_check, and compares the row counts of DRILL_TABLES with ``source_db``, each
+    within ``tolerance`` of the larger of the two. The directory, and the plaintext copy
+    of the corpus in it, is removed however the drill ends. ``source_db`` is only read.
+    Raises when the archive cannot be restored at all.
+    """
+    want = _source_counts(source_db)
+    got: dict[str, int | None] = dict.fromkeys(DRILL_TABLES)
+    with tempfile.TemporaryDirectory(prefix="restore-drill-", dir=work_dir) as tmp:
+        restored = os.path.join(tmp, "brain.db")
+        decrypt_decompress(archive, restored, key_file)
+        conn = sqlite3.connect(restored)
+        try:
+            verdict = str(conn.execute("PRAGMA quick_check").fetchone()[0])
+            if verdict == "ok":
+                got = _count_rows(conn)
+        finally:
+            conn.close()
+    if verdict != "ok":
+        return DrillResult(
+            os.path.basename(archive), verdict, got, want, [f"quick_check: {verdict}"]
+        )
+    problems = []
+    for table in DRILL_TABLES:
+        restored_rows, source_rows = got[table], want[table]
+        if restored_rows is None:
+            problems.append(f"{table}: missing from the restored copy")
+        elif source_rows is None:
+            problems.append(f"{table}: missing from {source_db}")
+        elif abs(restored_rows - source_rows) > tolerance * max(restored_rows, source_rows):
+            problems.append(
+                f"{table}: {restored_rows:,} rows restored, {source_rows:,} in the source"
+            )
+    return DrillResult(os.path.basename(archive), verdict, got, want, problems)
+
+
+def _counts_line(result: DrillResult) -> str:
+    return ", ".join(f"{t} {result.restored[t]:,}/{result.source[t]:,}" for t in DRILL_TABLES)
+
+
+def _record_drill(path: str, result: DrillResult) -> None:
+    """Write the stamp of a passing drill: when (ISO-8601 UTC on line 1, the line the
+    health check ages), which archive, and the verdict with the counts."""
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(f"{now}\n{result.archive}\nok: quick_check ok; restored/source rows: ")
+        f.write(f"{_counts_line(result)}\n")
+    os.replace(tmp, path)
+
+
+def _drill(args: argparse.Namespace) -> int:
+    """main()'s --drill: 0, a stamp and a success ping on a pass; 1 and /fail otherwise.
+
+    A failed drill leaves the stamp alone, so the health check's drill age keeps growing
+    while the Healthchecks slug carries the failure at once.
+    """
+    try:
+        if not tools_available():
+            raise RuntimeError("zstd/openssl not available")
+        if not os.path.isfile(args.key_file):
+            raise FileNotFoundError(f"key file not found: {args.key_file}")
+        archive = newest_archive(args.offsite_dir)
+        if archive is None:
+            raise FileNotFoundError(f"no {OFFSITE_PATTERN} in {args.offsite_dir}")
+        result = restore_drill(archive, args.key_file, args.db, args.work_dir, args.drill_tolerance)
+        if not result.problems:
+            _record_drill(args.drill_stamp or default_drill_stamp(), result)
+    except Exception as exc:  # noqa: BLE001 - every failure is a failed drill, on its slug
+        _log(f"restore drill FAILED: {exc}")
+        _ping(args.hc_slug, "/fail")
+        return 1
+    if result.problems:
+        _log(f"restore drill FAILED on {result.archive}: {'; '.join(result.problems)}")
+        _ping(args.hc_slug, "/fail")
+        return 1
+    _log(f"restore drill OK on {result.archive}: quick_check ok, {_counts_line(result)}")
+    _ping(args.hc_slug)
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="MVCC-safe brain.db backup")
     ap.add_argument("--db")
@@ -251,10 +423,59 @@ def main(argv=None) -> int:
         help=(
             "Healthchecks slug to report this backup on. Pings success only when a "
             "snapshot was actually written, and /fail on every skip or error path. "
+            "With --drill, success is a drill that passed. "
             "Requires HC_PING_URL in the environment; ignored without it."
         ),
     )
+    ap.add_argument(
+        "--drill",
+        action="store_true",
+        help=(
+            "Restore drill: decrypt the newest archive in --offsite-dir with --key-file "
+            "into a temporary directory, run PRAGMA quick_check, compare row counts with "
+            "--db, remove the copy, and on a pass write the drill stamp. --db is only "
+            "read. Exits 1 on any failure."
+        ),
+    )
+    ap.add_argument(
+        "--drill-stamp",
+        help=(
+            "Where a passing drill records itself (default: $BRAIN_RESTORE_DRILL_STAMP, "
+            "else ~/.second-brain/restore-drill.stamp, the file health_check.py ages)."
+        ),
+    )
+    ap.add_argument(
+        "--drill-tolerance",
+        type=float,
+        default=DRILL_TOLERANCE,
+        help=(
+            "How far each restored row count may sit from --db's, as a share of the "
+            f"larger of the two (default {DRILL_TOLERANCE})."
+        ),
+    )
+    ap.add_argument(
+        "--work-dir",
+        help=(
+            "Where the drill decrypts to (default: the system temporary directory). "
+            "It needs room for the whole database."
+        ),
+    )
     args = ap.parse_args(argv)
+
+    if args.drill:
+        if args.prune_only:
+            ap.error("--drill and --prune-only are separate runs")
+        needed = (
+            ("--offsite-dir", args.offsite_dir),
+            ("--key-file", args.key_file),
+            ("--db", args.db),
+        )
+        missing = [flag for flag, value in needed if not value]
+        if missing:
+            ap.error(f"--drill needs {', '.join(missing)}")
+        if not 0 <= args.drill_tolerance < 1:
+            ap.error("--drill-tolerance is a share, from 0 up to but not including 1")
+        return _drill(args)
 
     # prune-only is the Mac side tidying copies it pulled. It takes no backup, so
     # it must never report on the backup slug: that would turn the VPS's snapshot

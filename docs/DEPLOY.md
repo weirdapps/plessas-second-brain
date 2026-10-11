@@ -10,6 +10,8 @@ on a single host or split across two (see "Topology" below).
   committed `uv.lock`.
 - `sqlite3` on `PATH`. `scripts/health_check.py` and the replica pull both shell
   out to it.
+- `unzip` on a replica. The pull checks a new `embeddings.npz` with `unzip -t`
+  before it replaces the old one. macOS ships it.
 - `tesseract`, plus the language data for the languages your attachments are
   written in.
 - `antiword` (or `catdoc`) on Linux, for legacy Word `.doc` attachments. macOS
@@ -171,9 +173,50 @@ Everything above describes one host that ingests and serves from the same
   server reads that copy. `scripts/wrappers/launchd/sb-db-pull.sh` is the
   reference implementation: it checkpoints the producer's WAL, takes a
   `.backup` snapshot there, rsyncs the snapshot rather than the live file
-  (copying a WAL-mode database in place can capture a torn read), runs
-  `PRAGMA quick_check` on the result, and writes a UTC timestamp to
-  `~/.second-brain/db-pull.stamp`.
+  (copying a WAL-mode database in place can capture a torn read) into
+  `brain.db.new`, runs `PRAGMA quick_check` on that, and only then renames it
+  over `brain.db`. `embeddings.npz` follows the same way, checked with
+  `unzip -t`, and only beside a database that passed. A copy that fails its
+  check is discarded and the replica stays as it was; the run logs the
+  `ERROR`, exits 1 and leaves the stamp alone. On success it writes a UTC
+  timestamp to `~/.second-brain/db-pull.stamp`.
+
+**An unchanged producer costs no snapshot.** The `.backup` rewrites the whole
+database on the producer. When the producer's `brain.db` has the mtime and size
+the last good pull recorded (`~/.second-brain/db-pull.source`, written beside
+the stamp), an empty `-wal`, and the consumer's snapshot is still there, the run
+reuses that snapshot instead. Any failed run deletes the record, so the next one
+snapshots afresh.
+
+**Run the pull around the clock.** The `stats` tool calls a copy older than three
+hours stale, so a pull that stops overnight leaves every early-morning answer
+flagged stale. Schedule it hourly all day: in the agent's plist, replace the
+`StartCalendarInterval` array of per-hour entries with this one dictionary, which
+fires at minute 45 of every hour:
+
+```xml
+<key>StartCalendarInterval</key>
+<dict>
+    <key>Minute</key>
+    <integer>45</integer>
+</dict>
+```
+
+Then reload it (`launchctl disable` alone does not stop a loaded job):
+
+```bash
+PLIST=~/Library/LaunchAgents/<db-pull label>.plist
+launchctl bootout "gui/$(id -u)/<db-pull label>"
+# edit "$PLIST" as above
+plutil -lint "$PLIST"
+launchctl bootstrap "gui/$(id -u)" "$PLIST"
+# one calendar trigger left, whose descriptor names only "Minute" => 45
+launchctl print "gui/$(id -u)/<db-pull label>" | grep -A3 descriptor
+```
+
+Install the current wrapper before changing the schedule
+(`cp scripts/wrappers/launchd/sb-db-pull.sh ~/.local/bin/`): it is what makes a
+night hour in which nothing wrote cost the producer no snapshot.
 
 **On the producer, enable linger.** `systemd --user` timers are killed when the
 user's last session ends, so without this every ingest job stops silently as
@@ -452,6 +495,36 @@ within their deadline. A second run stores nothing. On a copy of the replica's T
 on 2026-10-11: 3,135 replies from 1,961 posts, 897 posts re-dated, 893 threads queued, in
 two seconds. No schema change, and it can run beside the timers.
 
+**Teams message text.** teams-sync stores a message's text as a reader sees it whenever its
+content holds markup, whatever type the payload declares. It used to wait for a declared
+"html", which the chat service never sends, so the text of every HTML message was its markup.
+To convert the rows stored before, run `python -m src.cli teams-strip-html` once on the
+producer after the pull (`--dry-run` counts first, read-only). It calls neither Teams nor a
+model: it converts each row from the HTML the row keeps, redacting credentials as ingest
+does, writes only the rows whose text changes, 500 to a transaction, so it can run beside
+the timers, and the full-text index follows through its trigger. System messages keep their
+XML. A second run changes nothing, and `--limit N` caps the rows one run changes. Run it once
+more after a teams-sync that started before the pull has exited, since that job stores
+markup as before. Until it has run, a reaction to a message stored before sends its thread
+back to extraction, as an edit does, because the new text differs from the stored markup.
+On a copy of the replica's Teams tables on 2026-10-11: 37,741 of 79,127 messages converted
+in 5 s, a second run changed none, and a search for `itemtype` went from 8,871 messages to
+0. No schema change.
+
+It sends nothing back to extraction, which is where the cost is: the summaries, titles,
+decisions, actions and facts of the threads concerned stay as extracted from the markup, and
+their vectors, which embed the summaries, with them. To refresh them, send those threads back
+to extraction; the following teams-sync runs extract them, newest first, one model call each
+within their deadline, and embed each again, since it was extracted after it was embedded
+(6,648 threads on that copy):
+
+```sql
+UPDATE teams_threads SET extraction_status = 'pending'
+WHERE extraction_status = 'extracted' AND id IN (
+  SELECT thread_id FROM teams_messages
+  WHERE is_system = 0 AND content_text IS NOT content_html);
+```
+
 **Upgrading to schema v32.** From v32 `attachment_content` has three small indexes that
 answer the file sweep's classification and two health-check queries without reading the
 stored text. `extracted_text` (3 GB on the producer) sits ahead of the columns those queries
@@ -472,6 +545,31 @@ when the index exists.
 verifies it, and optionally writes a zstd-compressed, AES-256-encrypted offsite
 copy. The restore path, its prerequisites, and the checks that tell a good
 archive from a corrupt one are in [`RESTORE.md`](RESTORE.md).
+
+**A file-level backup of the producer takes the snapshot, not the live file.**
+restic, or anything like it, reads `brain.db` while the timers write it, and a
+WAL-mode database copied that way can be torn. Keep the data home in its paths,
+so the daily `backups/brain-YYYYMMDD.db` is what it stores, and exclude the live
+file, its sidecars and the encrypted archives. For restic, these lines in the
+excludes file (with your data home's absolute path), and no line excluding
+`backups/` as a whole:
+
+```text
+/path/to/data-home/brain.db
+/path/to/data-home/brain.db-wal
+/path/to/data-home/brain.db-shm
+/path/to/data-home/backups/offsite
+```
+
+Restoring from it is in [`RESTORE.md`](RESTORE.md), "restic: the copy off both
+hosts".
+
+**Drill the restore weekly.** `python scripts/backup_db.py --drill` decrypts the
+newest archive into a temporary directory, runs `PRAGMA quick_check`, compares row
+counts with a database you name, and records a pass in
+`~/.second-brain/restore-drill.stamp`, which the health check's Backups row ages
+(section 7). [`RESTORE.md`](RESTORE.md), "Exercise it", has the command and a
+LaunchAgent for the consumer that pulls the archives.
 
 ## 9. Serve to Claude Code
 

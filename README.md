@@ -112,7 +112,7 @@ The MCP server exposes 27 tools (all defined in `src/mcp_server.py`). Register t
 
 ### Attachments and images
 
-- `search_attachments(query, limit)`. FTS over extracted text and LLM summaries.
+- `search_attachments(query, limit)`. FTS over extracted text and LLM summaries. Since 2026-10-11 a long attachment's summary is built from part of it: a spreadsheet's from its structure, any other long text's from three of its parts (see [Attachment summaries and spend](#attachment-summaries-and-spend)). The full extracted text is still searched.
 - `attachment_image_search(query, limit)`. Case- and accent-blind match on vision descriptions of classified content images: the whole query first, then any meaningful word (`partial_match`).
 
 ### Calendar
@@ -307,9 +307,23 @@ Preferred credential path. Uses Application Default Credentials, no API key requ
 - `BRAIN_DATA_DIR`: data home for the DB, attachments, staging, embeddings and SharePoint files. Attachment files are deleted once their content is stored, as described in [Files are inputs](docs/DEPLOY.md#10-files-are-inputs). Defaults to `<repo>/data`. Use an **absolute** path: `src/config.py` does not call `expanduser()`, and systemd's `EnvironmentFile=` does not expand `~` either, so a tilde produces a directory literally named `~`.
 - The database file is `brain.db` inside `BRAIN_DATA_DIR`, so `<repo>/data/brain.db` by default. The global `--db` flag (placed before the subcommand, e.g. `python -m src.cli --db /path/brain.db stats`) overrides it.
 
-`scripts/health_check.py` reads two more, `HEALTH_EMAIL_TO` and `HC_PING_URL`. Both are documented in [`docs/DEPLOY.md`](docs/DEPLOY.md).
+`scripts/health_check.py` reads three more: `HEALTH_EMAIL_TO` and `HC_PING_URL`, documented in [`docs/DEPLOY.md`](docs/DEPLOY.md), and `BRAIN_DAILY_SPEND_WARN_USD` (below).
 
 No credentials are printed by the code. All secrets are read from environment or (for Google) from ADC.
+
+### Attachment summaries and spend
+
+Phase 2 of the attachment pipeline (`process-attachments --phase 2`, the nightly pass, `reextract`) asks the model for one summary per document. Text up to 50,000 characters goes in one call, as before. A longer text is summarised from part of it, and the full extracted text stays stored for keyword search:
+
+- **Spreadsheets** (text read by `openpyxl`, `pyxlsb` or `xlrd`) go in one call over a digest built from the stored cells (`src/extract/attachment_digest.py`): per sheet its name and size, header row, up to 20 sample rows (the first 15 and the last 5), each column's type with its minimum, maximum and mean or its distinct count, and up to 2,000 characters of free text; the whole digest stays under 30,000 characters. The prompt says it is a digest and asks for decisions and action items only from text that states them, not from table rows.
+- **Any other long text** is summarised from three of its 40,000-character parts, its first, its last and the one richest in headings or table-of-contents lines, then a merge: four calls where it used to take up to 51.
+- **A flagged attachment** keeps the old behaviour, up to 50 parts spread across it plus the merge, a long spreadsheet included. `python -m src.cli reextract --full-parts ID...` flags attachments by id (the `attachment_id` that `search_attachments` returns) and summarises them again now; the flag holds for every later summary. It is a `sync_metadata` row per attachment, key `attachment_summary_full:<id>`, so it needs no schema change; delete the row to lift it.
+
+A run can be given a token budget, input and output tokens together: `--token-budget N` on `process-attachments` and `reextract`, or `BRAIN_ATTACHMENT_TOKEN_BUDGET` in the environment, which is how the nightly pass picks it up without a wrapper change (`--token-budget 0` lifts it for one run). Each call is estimated before it is sent, its prompt's characters at `BRAIN_CHARS_PER_TOKEN` characters a token (default 1.6, measured on this corpus's attachment prompts) plus 1,500 output tokens, and charged what the response reports once answered. The run stops before the first call that would pass the budget, leaves the rest pending for the next run (a long document keeps the parts it finished), prints how many it left, and exits 0. Calls already in flight finish, so with several workers a run can end a little over.
+
+`--estimate` on either command prints how many calls and tokens the pending work (or the rows `reextract` would choose) would take, and its cost, without calling the model or changing anything. Rows `reextract` must read again first are estimated from the text they hold now, and rows that hold none yet are counted apart. Prices come from one rate table, `src/llm_cost.py`: Claude Sonnet 5.5 on Vertex AI's `eu` endpoint, in USD per million tokens 2.20 input, 11.00 output, 1.10 and 5.50 as a batch job, 0.11 for a cache read.
+
+The nightly health check reports yesterday's spend (UTC) from the usage log every call writes, `llm-usage-YYYY-MM.jsonl` under the data home: an `LLM spend` row with calls, tokens and cost, and a line per call site. It is WARN above `BRAIN_DAILY_SPEND_WARN_USD` (default 60) or when a call used a model the rate table cannot price, and STALE when the store shows model work that day (mail that received a summary, attachment summaries written) but the log holds no call, which also fails the freshness ping. On a replica it reads N/A: the calls, and their log, are the producer's.
 
 ## Usage
 
@@ -359,6 +373,8 @@ python -m src.cli news-sync --relevance 60
 python -m src.cli teams-sync --workers 4
 python -m src.cli whatsapp-sync             # the snapshot at BRAIN_WHATSAPP_SNAPSHOT (see WhatsApp below)
 python -m src.cli process-attachments --phase 2 --workers 2
+python -m src.cli process-attachments --phase 2 --estimate             # calls, tokens and cost of the pending summaries; no model call
+python -m src.cli process-attachments --phase 2 --token-budget 2000000 # stop before passing 2M tokens; the rest stay pending
 python -m src.cli process-images --limit 500
 python -m src.cli process-sharepoint --since 2026-06-01   # a rescan by date; the nightly run continues past the last email id it scanned, fetching at most --max-fetches (100)
 python -m src.cli split-html                # after v23, on the producer: HTML bodies loaded before it (see DEPLOY)
@@ -388,6 +404,8 @@ python -m src.cli reextract --capped --zip --unread    # read and summarise agai
 python -m src.cli reextract --partial                  # read again in full what the old readers read in part (resumable)
 python -m src.cli reextract --stale --formats          # read with today's readers what older code skipped or failed on
 python -m src.cli reextract --ocr --limit 500          # OCR low-text scans and images again (grayscale second pass), in batches
+python -m src.cli reextract --long --estimate          # price a re-summary before running it; changes nothing
+python -m src.cli reextract --full-parts 1234 5678     # summarise these attachments from every part, now and on every later summary
 python scripts/relabel_attachment_status.py [--apply]  # give old failed/skipped rows today's unread verdicts: encrypted kinds, skip reasons
 python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents
 python -m src.cli process-sharepoint --ingest-fetched  # store the files earlier SharePoint fetches left on disk
@@ -409,6 +427,7 @@ src/
   bridge.py                    Legacy JSON-over-CLI bridge (superseded by MCP)
   llm_policy.py                Shared Vertex retry and auth policy (vendored, SHA256 drift-checked)
   llm_deadline.py              Derives PTS_LLM_DEADLINE from the calling unit's own budget
+  llm_cost.py                  Rate table, a run's token budget, the usage log read back as spend
   export/
     outlook_export.py          Hourly Outlook ingestion via outlook-cli
     outlook_cli.py             outlook-cli subprocess wrapper
@@ -436,6 +455,7 @@ src/
     vertex_fallback.py         Model and region fallback on policy refusals
     policy_bridge.py           Maps SDK failures onto the shared policy; wires the re-auth callback
     attachment_pipeline.py     Two-phase pipeline (text extraction, then LLM)
+    attachment_digest.py       A long spreadsheet's structure, summarised instead of its cells
     attachment_extractors.py   PDF, DOCX, PPTX, XLSX, XLSB, XLS, image, EML, RPMSG
     image_classifier.py        Dimensions plus bytes plus SHA256 dedup cascade
     image_vision.py            Vision LLM stage

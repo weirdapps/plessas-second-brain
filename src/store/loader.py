@@ -558,30 +558,22 @@ def _write_extraction(
                 (email_id, redact_secrets(commitment)),
             )
 
-    # Load people and their roles
-    people_roles = extraction.get("people_roles", {})
-    if isinstance(people_roles, dict):
-        for person_name, roles in people_roles.items():
-            # Try to get email from recipients
-            person_email = _find_person_email(person_name, metadata)
-            person_id = find_or_create_person(conn, person_name, person_email)
+    # Load people and their roles: people_roles in schema v1, people in schema v2
+    for person_name, person_email, roles in _named_people(extraction, metadata):
+        person_id = find_or_create_person(conn, person_name, person_email)
 
-            # Add roles (could be string or list)
-            if isinstance(roles, str):
-                roles = [roles]
-
-            for role in roles:
-                if isinstance(role, dict):
-                    role = role.get("role", str(role))
-                if not isinstance(role, str):
-                    role = str(role)
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO email_people (email_id, person_id, role_in_email)
-                    VALUES (?, ?, ?)
-                    """,
-                    (email_id, person_id, role),
-                )
+        for role in roles:
+            if isinstance(role, dict):
+                role = role.get("role", str(role))
+            if not isinstance(role, str):
+                role = str(role)
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO email_people (email_id, person_id, role_in_email)
+                VALUES (?, ?, ?)
+                """,
+                (email_id, person_id, role),
+            )
 
     # Load key facts
     for fact in extraction.get("key_facts", []):
@@ -1022,6 +1014,70 @@ def _header_addresses(metadata: dict) -> list[str]:
         metadata.get("cc_recipients", metadata.get("cc")) or []
     )
     return [p["address"] for p in people if isinstance(p, dict) and p.get("address")]
+
+
+def _header_people(metadata: dict) -> dict[str, str]:
+    """The name each address in the headers (sender, To, Cc) is shown with, by the address
+    folded to lower case; the address itself when no name is shown."""
+    sender = metadata.get("sender") or {}
+    entries = [sender] + (metadata.get("to_recipients", metadata.get("to")) or [])
+    entries += metadata.get("cc_recipients", metadata.get("cc")) or []
+    out: dict[str, str] = {}
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("address"):
+            address = str(entry["address"]).strip()
+            out.setdefault(address.lower(), str(entry.get("name") or address))
+    return out
+
+
+def _named_people(extraction: dict, metadata: dict) -> list[tuple[str, str | None, list]]:
+    """(name, address or None, roles) of each person the model named.
+
+    Schema v1 names them in `people_roles`, a role or a list of roles by name. Schema v2
+    (src/extract/schema_v2.py) lists them in `people`, each with its name as written, its
+    name in Latin letters, an address and one role. The model's address is taken only
+    when it is one of the email's own header addresses, and then the person is the
+    header's: its name as the headers show it, so a name the model transliterated or
+    wrote in the body never becomes anyone's name on record. Any other address is
+    dropped, since a body can carry a planted one, and the person is looked up by name
+    in the headers as v1 does, its name as written first, then its Latin form. The Latin
+    name has no column yet; it stays in the extraction file.
+    """
+    people = extraction.get("people")
+    if isinstance(people, list):
+        headers = _header_people(metadata)
+        out: list[tuple[str, str | None, list]] = []
+        for person in people:
+            if not isinstance(person, dict):
+                continue
+            written = str(person.get("name_as_written") or "").strip()
+            latin = str(person.get("name_latin") or "").strip()
+            if not (written or latin):
+                continue
+            role = person.get("role")
+            roles = [role if isinstance(role, str) else ""]
+            address = str(person.get("email") or "").strip().lower()
+            if address not in headers:
+                found = (written and _find_person_email(written, metadata)) or (
+                    latin and _find_person_email(latin, metadata)
+                )
+                address = str(found or "").strip().lower()
+            if address in headers:
+                out.append((headers[address], address, roles))
+            else:
+                out.append((written or latin, None, roles))
+        return out
+
+    people_roles = extraction.get("people_roles", {})
+    if not isinstance(people_roles, dict):
+        return []
+    named: list[tuple[str, str | None, list]] = []
+    for person_name, roles in people_roles.items():
+        # Try to get email from recipients
+        person_email = _find_person_email(person_name, metadata)
+        # Add roles (could be string or list)
+        named.append((person_name, person_email, [roles] if isinstance(roles, str) else roles))
+    return named
 
 
 def _find_person_email(person_name: str, metadata: dict) -> str | None:

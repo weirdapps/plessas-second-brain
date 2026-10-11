@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from src.config import DATA_ROOT
-from src.extract.call_shape import prompt_hash
+from src.extract.call_shape import call_shape, max_tokens_attempts, prompt_hash
 from src.llm_policy import (
     Action,
     Attempt,
@@ -515,8 +515,23 @@ def complete(*, max_tokens: int, messages: list, model: str | None = None, **kwa
     return response
 
 
+class ExtractionRefused(ValueError):
+    """The model refused the item. A ValueError, so the email path counts it as an
+    unusable reply (src/extract/local.py), as it counted a refusal without text."""
+
+
+def refusal_error(response: Any) -> ExtractionRefused:
+    """The error a refused reply raises, naming its category when the platform gave one."""
+    category = getattr(getattr(response, "stop_details", None), "category", None)
+    return ExtractionRefused(f"the model refused the item (category {category or 'unknown'})")
+
+
 def extract_one(email: dict) -> dict | None:
-    """Extract structured data from a single email using Claude."""
+    """Extract structured data from a single email using Claude, in the call shape
+    BRAIN_EXTRACT_CALL_SHAPE picks (src/extract/call_shape.py)."""
+    if call_shape() == "v2":
+        return _extract_one_v2(email)
+
     from src.extract.parser import parse_extraction
     from src.extract.prompt import build_extraction_prompt
 
@@ -535,6 +550,29 @@ def extract_one(email: dict) -> dict | None:
         raise ValueError(f"LLM response truncated at max_tokens={response.usage.output_tokens}")
 
     extraction = parse_extraction(text)
+    extraction["message_id"] = email["message_id"]
+    return extraction
+
+
+def _extract_one_v2(email: dict) -> dict:
+    """extract_one in call shape v2: the cached system prompt, the fenced email, schema v2
+    and a pinned effort; a reply stopped at max_tokens is asked once more at twice the
+    budget. Each billed call is logged on its own. Raises ExtractionRefused for a refusal
+    and ValueError for a reply still cut short or holding no JSON object."""
+    from src.extract.parser import parse_extraction_v2
+    from src.extract.prompt import build_email_request_v2
+
+    request = build_email_request_v2(email)
+    for max_tokens in max_tokens_attempts(request.route):
+        response = complete(**request.kwargs(max_tokens))
+        if getattr(response, "stop_reason", None) != "max_tokens":
+            break
+    stop = getattr(response, "stop_reason", None)
+    if stop == "refusal":
+        raise refusal_error(response)
+    if stop == "max_tokens":
+        raise ValueError(f"LLM response truncated at max_tokens={max_tokens}")
+    extraction = parse_extraction_v2(_response_text(response), kind="email", source=request.source)
     extraction["message_id"] = email["message_id"]
     return extraction
 

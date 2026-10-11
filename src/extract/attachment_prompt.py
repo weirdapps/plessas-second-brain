@@ -63,10 +63,12 @@ def build_attachment_prompt(
     email_subject: str | None = None,
     email_date: str | None = None,
     part: tuple[int, int] | None = None,
+    digest: bool = False,
 ) -> str:
     """Build extraction prompt for an attachment's extracted text.
 
-    `part` is (this part, how many) when Phase 2 sends a long text in parts.
+    `part` is (this part, how many) when Phase 2 sends a long text in parts. `digest` says the
+    text is a long spreadsheet's digest (src/extract/attachment_digest.py), not its cells.
     """
     identity_context = _identity_context()
     email_context = _email_context(email_subject, email_date)
@@ -79,6 +81,17 @@ def build_attachment_prompt(
             f"\n[Document truncated from {len(extracted_text)} to {max_chars} characters]\n"
         )
     part_note = f"\nThis is part {part[0]} of {part[1]} of a longer document.\n" if part else ""
+    # An instruction, so it stays outside the fence, where the model is told to follow nothing.
+    digest_note = (
+        (
+            "\nThe document content is a digest of a spreadsheet, not its cells: per sheet its"
+            " size, header row, sample rows, column types with their statistics, and any free"
+            " text. Describe what the workbook holds and shows. Take decisions and action items"
+            " only from text that states them, never from table rows.\n"
+        )
+        if digest
+        else ""
+    )
 
     # The filename and the parent email's subject are third-party text too.
     document = f"""{email_context}Attachment filename: {filename}
@@ -89,7 +102,7 @@ Document content:
 
     return f"""You are extracting structured information from a document attachment.
 {identity_context}
-{truncation_note}{part_note}
+{truncation_note}{part_note}{digest_note}
 {fence(document)}
 
 ---
@@ -138,7 +151,7 @@ def build_merge_prompt(
     if covered and covered[0] < covered[1]:
         coverage = (
             f"\n4. These are the extractions of {covered[0]} of the document's {covered[1]} parts,"
-            " spread evenly across it: describe the whole document from them, and say the"
+            " taken from across it: describe the whole document from them, and say the"
             f" summary covers {covered[0]} of {covered[1]} parts"
         )
     document = f"""{_email_context(email_subject, email_date)}Attachment filename: {filename}

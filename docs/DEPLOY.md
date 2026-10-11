@@ -256,6 +256,17 @@ HEALTH_EMAIL_TO=you@example.com python scripts/health_check.py --email
 Other flags: `--email-if-issues` (silent on a healthy run), `--fix` (attempt the
 auto-fixes), and `--hc-ping`.
 
+**Model spend.** The `LLM spend` row prices yesterday's model calls (UTC) from the
+usage log every call appends to, `llm-usage-YYYY-MM.jsonl` in the data home, with a
+line per call site below the table. It warns above `BRAIN_DAILY_SPEND_WARN_USD`
+(default 60, in US dollars) and reads STALE when the store shows model work that
+day but the log holds no call, which fails the freshness ping like any other STALE.
+To cap what one nightly attachment pass can spend, put `BRAIN_ATTACHMENT_TOKEN_BUDGET`
+in the environment its unit starts with: a pass that reaches the budget leaves the
+rest pending and exits 0. `python -m src.cli process-attachments --phase 2 --estimate`
+prices the pending work first. The README's "Attachment summaries and spend" has the
+details.
+
 **Wire up the dead man's switch.** A health check that emails you is worth
 exactly as much as the scheduler that runs it. If the host is off, or the timer
 never fires, silence is indistinguishable from health. `--hc-ping` reports data

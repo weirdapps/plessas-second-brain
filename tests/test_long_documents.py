@@ -110,7 +110,10 @@ def test_a_long_text_is_summarised_in_parts_then_merged(tmp_path, monkeypatch):
 
     stats = run_phase2(str(path))
 
-    assert len(calls) == len(split_text(text)) + 1
+    # Three of its four parts (CAPPED_SUMMARY_PARTS), then the merge; a flagged row takes all
+    # four (tests/test_attachment_spend.py).
+    assert len(split_text(text)) == 4
+    assert len(calls) == attachment_pipeline.CAPPED_SUMMARY_PARTS + 1
     assert stats["extracted"] == 1
     conn = sqlite3.connect(path)
     assert conn.execute("SELECT summary, llm_status FROM attachment_content").fetchone() == (

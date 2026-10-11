@@ -4,6 +4,7 @@ Provides command-line access to export, extract, load, and query operations.
 """
 
 import argparse
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -320,9 +321,47 @@ def format_action_result(action: dict) -> str:
     return "\n".join(lines)
 
 
+def _token_budget(args):
+    """The run's token budget: --token-budget, else BRAIN_ATTACHMENT_TOKEN_BUDGET; None for no
+    limit (neither set, or 0). ValueError for a value that is not a whole number of 0 or more."""
+    from src.llm_cost import TokenBudget
+
+    limit = getattr(args, "token_budget", None)
+    if limit is None:
+        raw = os.environ.get("BRAIN_ATTACHMENT_TOKEN_BUDGET", "").strip()
+        try:
+            limit = int(raw) if raw else 0
+        except ValueError:
+            limit = -1
+        if limit < 0:
+            raise ValueError(
+                f"BRAIN_ATTACHMENT_TOKEN_BUDGET must be a whole number of tokens, not {raw!r}"
+            )
+    if limit < 0:
+        raise ValueError(f"--token-budget must be 0 or more, not {limit}")
+    return TokenBudget(limit) if limit > 0 else None
+
+
+def _print_estimate(est: dict) -> None:
+    """The lines a dry-run estimate prints (src/extract/attachment_pipeline.py estimate_rows)."""
+    from src.llm_cost import OUTPUT_TOKENS_PER_CALL
+
+    print(f"  attachments   : {est['rows']:,}")
+    print(f"  calls         : {est['calls']:,}")
+    print(
+        f"  input tokens  : {est['input_tokens']:,}"
+        f" (at {est['chars_per_token']:g} characters a token)"
+    )
+    print(f"  output tokens : {est['output_tokens']:,} ({OUTPUT_TOKENS_PER_CALL:,} a call)")
+    print(
+        f"  cost          : ${est['cost_usd']:,.2f} at {est['model']} Vertex eu rates"
+        f" (${est['batch_cost_usd']:,.2f} as a batch job)"
+    )
+
+
 def cmd_process_attachments(args):
     """Extract text and structured data from attachments."""
-    from src.extract.attachment_pipeline import run_phase1, run_phase2
+    from src.extract.attachment_pipeline import estimate_phase2, run_phase1, run_phase2
     from src.store.schema import get_connection, run_migrations
 
     db_path = str(args.db)
@@ -338,6 +377,21 @@ def cmd_process_attachments(args):
     phase = getattr(args, "phase", None)
     file_type = getattr(args, "type", None)
     limit = args.limit or 0
+
+    if getattr(args, "estimate", False):
+        # Phase 1 reads files and calls no model; what a run would spend is Phase 2's.
+        print("Phase 2 estimate, pending attachments (no model call made):")
+        _print_estimate(estimate_phase2(db_path, limit=limit, file_type=file_type))
+        return 0
+    # Checked before Phase 1 when Phase 2 will run, so a bad value stops the run before any
+    # work; a Phase 1 run does not read it.
+    budget = None
+    if phase is None or phase == 2:
+        try:
+            budget = _token_budget(args)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
 
     # Bounds the run for a caller under an external timeout — the nightly job
     # has TimeoutStartSec=1h and now carries the whole backfill, where a count
@@ -369,13 +423,26 @@ def cmd_process_attachments(args):
         workers = getattr(args, "workers", 1) or 1
         print(f"\nPhase 2: Vertex AI structured extraction (workers={workers})...")
         stats = run_phase2(
-            db_path, limit=limit, file_type=file_type, workers=workers, deadline_s=deadline_s
+            db_path,
+            limit=limit,
+            file_type=file_type,
+            workers=workers,
+            deadline_s=deadline_s,
+            token_budget=budget,
         )
         print(f"  Processed: {stats['processed']}")
         print(f"  Extracted: {stats['extracted']}")
         print(f"  Failed: {stats['failed']}")
         if stats.get("deferred"):
             print(f"  Deferred (out of time): {stats['deferred']}")
+        if stats.get("over_budget"):
+            # A planned stop, not a failure: the rest stay pending for the next run.
+            print(f"  Left pending (token budget reached): {stats['over_budget']}")
+        if budget is not None:
+            print(
+                f"  Token budget: {budget.spent:,} of {budget.limit:,} tokens spent"
+                f" in {budget.calls:,} calls"
+            )
         phase_failed |= stats["failed"] > 0 and stats["extracted"] == 0
 
     print("\nAttachment processing complete.")
@@ -571,14 +638,36 @@ def cmd_ingest_session_notes(args):
 
 def cmd_reextract(args):
     """Read again and summarise again rows earlier code capped, skipped or could not read."""
-    from src.extract.reextract import SELECTORS, reextract
+    from src.extract.reextract import SELECTORS, estimate_reextract, reextract
 
     which = {name for name in SELECTORS if getattr(args, name, False)}
-    if not which:
+    full_parts = getattr(args, "full_parts", None) or None
+    if not which and not full_parts:
         print(
-            "Error: choose at least one of " + ", ".join(f"--{name}" for name in SELECTORS),
+            "Error: choose at least one of "
+            + ", ".join(f"--{name}" for name in SELECTORS)
+            + ", or --full-parts",
             file=sys.stderr,
         )
+        return 2
+    chosen = ", ".join(sorted(which) + (["full parts"] if full_parts else []))
+    if getattr(args, "estimate", False):
+        est = estimate_reextract(
+            args.db,
+            which,
+            limit=args.limit or None,
+            after_id=getattr(args, "after_id", 0) or None,
+            full_parts=full_parts,
+        )
+        print(f"reextract ({chosen}) ESTIMATE (no model call made, nothing changed):")
+        print(f"  selected      : {est['selected']:,}")
+        print(f"  no text yet   : {est['unknown']:,} (read first, so not estimated)")
+        _print_estimate(est)
+        return 0
+    try:
+        budget = _token_budget(args)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
         return 2
     stats = reextract(
         args.db,
@@ -588,10 +677,13 @@ def cmd_reextract(args):
         workers=args.workers,
         root=args.root,
         after_id=getattr(args, "after_id", 0) or None,
+        full_parts=full_parts,
+        token_budget=budget,
     )
-    print(f"reextract ({', '.join(sorted(which))}){' DRY RUN' if args.dry_run else ''}:")
+    print(f"reextract ({chosen}){' DRY RUN' if args.dry_run else ''}:")
     for key in (
         "selected",
+        "flagged",
         "reread",
         "resummarise",
         "missing",
@@ -601,6 +693,7 @@ def cmd_reextract(args):
         "ocr_close",
         "summarised",
         "failed",
+        "over_budget",
     ):
         print(f"  {key:<12}: {stats[key]:,}")
     # No thousands separator: a batch runner passes this back as --after-id.
@@ -3305,6 +3398,21 @@ def main():
         dest="deadline_s",
         help="Wall-clock budget in seconds; remaining work is deferred to the next run",
     )
+    parser_process_att.add_argument(
+        "--token-budget",
+        type=int,
+        default=None,
+        dest="token_budget",
+        help=(
+            "Phase 2 stops before the call that would pass this many tokens (input and output);"
+            " the rest stay pending. Default BRAIN_ATTACHMENT_TOKEN_BUDGET, else no limit; 0 = none"
+        ),
+    )
+    parser_process_att.add_argument(
+        "--estimate",
+        action="store_true",
+        help="Print the calls, tokens and cost Phase 2's pending work would take; run nothing",
+    )
     parser_process_att.set_defaults(func=cmd_process_attachments)
 
     # Bulk attachment registration (nightly counterpart to the sync's Step 3b)
@@ -3425,6 +3533,29 @@ def main():
         type=int,
         default=0,
         help="Only rows above this content id: the highest id a previous batch printed",
+    )
+    parser_reextract.add_argument(
+        "--full-parts",
+        type=int,
+        nargs="+",
+        default=None,
+        dest="full_parts",
+        metavar="ATTACHMENT_ID",
+        help="Flag these attachments to be summarised from every part (up to 50) instead of 3,"
+        " now and on every later summary, and summarise them again",
+    )
+    parser_reextract.add_argument(
+        "--token-budget",
+        type=int,
+        default=None,
+        dest="token_budget",
+        help="Stop summarising before the call that would pass this many tokens;"
+        " default BRAIN_ATTACHMENT_TOKEN_BUDGET, else no limit; 0 = none",
+    )
+    parser_reextract.add_argument(
+        "--estimate",
+        action="store_true",
+        help="Print the calls, tokens and cost the chosen rows would take; change nothing",
     )
     parser_reextract.add_argument("--dry-run", action="store_true", help="Count only")
     parser_reextract.add_argument("--workers", type=int, default=4, help="Phase 2 workers")

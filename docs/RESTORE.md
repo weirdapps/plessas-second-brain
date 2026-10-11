@@ -53,6 +53,16 @@ Losing the producer no longer costs the archives.
 Keep the RETIRED key. It is the only thing that opens anything written before the
 rotation date in its filename.
 
+**Open item: escrow, and an authenticated format.** The keys sit on the producer
+and on the consumer, and the consumer keeps them beside the archives it pulls, so
+the encryption keeps the archives from neither host. Confirm a copy of each key is
+held off both hosts and off every backup target (a password manager or a hardware
+key), so neither host holds the only copy. `openssl enc` also carries no MAC:
+damage to an archive shows only after it is decrypted, in `quick_check`, which the
+drill below now runs weekly. `age`, or restic, would authenticate what they
+decrypt. Delete the retired key once the last archive it opens has left the GFS
+window. (Audit 2026-10-11, security-privacy-10.)
+
 ## Restore
 
 Prerequisites: `zstd`, `openssl` and `sqlite3` on `PATH`, plus the key file.
@@ -126,7 +136,22 @@ Otherwise rebuild it, from the repo directory:
 mv "$DATA/embeddings.npz" "$DATA/embeddings.npz.pre-restore"
 python -m src.cli embed --force   # emails, attachments, conversations
 python -c 'from src.config import DEFAULT_DB; from src.store.schema import get_connection; from src.store.embeddings import build_teams_index; print(build_teams_index(get_connection(str(DEFAULT_DB))))'   # Teams threads
+python -c 'from src.config import DEFAULT_DB; from src.store.schema import get_connection; from src.store.embeddings import build_whatsapp_index; print(build_whatsapp_index(get_connection(str(DEFAULT_DB))))'   # WhatsApp sessions
 ```
+
+`embed --force` covers emails, attachments and conversations only. Teams threads
+and WhatsApp sessions are embedded by their own builders, which pick up every
+thread whose vector is missing from the index, so after the `mv` they rebuild in
+full. Skip either and its vectors come back only as its sync re-adds them, at
+most 500 a run (`TEAMS_EMBED_LIMIT`, `WHATSAPP_EMBED_LIMIT` in `src/cli.py`).
+
+The rebuild sends every summary to the embedding model again (about 140,000 texts
+on the reference producer), so run it on the producer with the environment its
+scheduled jobs use. The service is chosen as it is everywhere else
+(`src.config.embed_backend`): `BRAIN_EMBED_BACKEND` when set, else the Gemini API
+when `GEMINI_API_KEY` is set, else Vertex AI. Where the Vertex project refuses the
+embedding model, export `BRAIN_EMBED_BACKEND=gemini` and `GEMINI_API_KEY` before
+step 5. Both serve `gemini-embedding-001`, so the vectors join one index.
 
 The export cursors are not in the snapshot either, and they are now ahead of
 it. Each `outlook_sync*.json` under `$DATA/state` still holds the newest mail
@@ -163,20 +188,145 @@ launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/<db-pull plist>
 do step 1 in Python than in a shell pipeline. It is the exact inverse of the
 `compress_encrypt()` that wrote the file.
 
+## restic: the copy off both hosts
+
+The local snapshots and the encrypted archives both sit on the producer's data
+disk, and the archives' only other copy is on the consumer that pulls them. A
+file-level backup of the producer to a third place (the reference producer runs
+restic nightly) is what survives losing both hosts, so it has to hold a database
+that opens.
+
+**Back up the snapshot, never the live file.** `brain.db` runs in WAL mode and is
+written while a backup reads it, so a copy of the live file can be torn, and a
+`-wal` read a moment later belongs to another instant. The daily
+`backups/brain-YYYYMMDD.db` that `backup_db.py` writes is consistent and passed
+`PRAGMA integrity_check`, so that is the copy restic should hold. Keep the data
+home among the backup's paths and exclude the live file, its sidecars and the
+encrypted archives (incompressible, so restic would store each one whole, and the
+consumer already holds them). In restic's excludes file, with your data home's
+absolute path:
+
+```text
+/path/to/data-home/brain.db
+/path/to/data-home/brain.db-wal
+/path/to/data-home/brain.db-shm
+/path/to/data-home/backups/offsite
+```
+
+If the excludes file leaves out `backups/` wholesale, delete that line: the
+snapshots under it are the only consistent copy. Consecutive snapshots share most
+of their pages, so deduplication stores what changed between them rather than
+each one whole; the first run after the change reads every snapshot once. restic
+holds whichever snapshot is newest when it runs, so it trails the live database by
+up to a day.
+
+To restore from it, on the producer, as the user the restic job runs as and with
+its repository and password in the environment. `--host` matters on a repository
+other machines back up to as well: `latest` is otherwise the newest snapshot of
+any of them.
+
+```bash
+umask 077
+restic snapshots --host <producer>
+restic ls --host <producer> latest /path/to/data-home/backups | grep 'brain-[0-9]*\.db$'
+restic dump --host <producer> latest /path/to/data-home/backups/brain-YYYYMMDD.db > brain.db
+```
+
+Then continue at step 2: the snapshot is plain SQLite, so there is nothing to
+decrypt or decompress, and steps 2 to 6 apply as written. restic's own
+`check --read-data-subset` proves the repository reads back, not that the database
+in it opens, and the drill below covers the encrypted archives only, so run this
+path by hand now and then.
+
 ## Exercise it
 
-An untested restore is a hypothesis. Run the sequence above against the newest
-offsite snapshot on whatever schedule you can live with, and check that step 2
-comes back clean and step 3's counts land where you expect.
+An untested restore is a hypothesis, so the drill is a scheduled job.
+`scripts/backup_db.py --drill` decrypts the newest archive in `--offsite-dir` into
+a private temporary directory, runs `PRAGMA quick_check` on it, and compares the
+row counts of `emails`, `attachments`, `teams_messages` and `decisions` with the
+database named by `--db`, each within 10% of it (`--drill-tolerance`; the archive
+is up to a day older, so the counts are close, not equal). It only reads that
+database, and removes the decrypted copy however it ends.
 
-Then record it on the host whose health check should age it, so a drill that
-stops happening shows up there (its Backups row warns after 35 days):
+A pass writes `~/.second-brain/restore-drill.stamp` (or `--drill-stamp`, or
+`$BRAIN_RESTORE_DRILL_STAMP`): the time on line 1, which the health check's
+Backups row ages and warns on after 35 days, then the archive's name and the
+counts. A failure exits 1 and leaves the stamp alone. With `--hc-slug` and
+`HC_PING_URL` set, a pass pings the slug and a failure pings its `/fail`.
+
+Run it weekly on the consumer that pulls the archives, which holds the keys, the
+archives and a replica to compare with:
+
+```bash
+cd /path/to/plessas-second-brain
+.venv/bin/python scripts/backup_db.py --drill \
+  --offsite-dir ~/second-brain-backups/offsite --key-file ~/.second-brain/backup.key \
+  --db data/brain.db --hc-slug brain-restore-drill
+```
+
+It needs `zstd` and `openssl` on `PATH`, as the manual steps do, and room for the
+whole database where it decrypts (`--work-dir`, else the system temporary
+directory). Below, a LaunchAgent for it, Sundays at 10:15, clear of the pull at
+:45. launchd's `PATH` has no Homebrew, hence the `export`. It expands neither `~`
+nor `$HOME` in its keys, hence `__HOME__`. And `HC_PING_URL` is a secret, so it
+comes from a file only the owner can read, never from the plist; without that
+file the drill still runs and records, and only the ping is skipped.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.second-brain.restore-drill</string>
+    <key>WorkingDirectory</key>
+    <string>__HOME__/SourceCode/plessas-second-brain</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"; if [ -r "$HOME/.config/healthchecks-ping.env" ]; then set -a; . "$HOME/.config/healthchecks-ping.env"; set +a; fi; exec .venv/bin/python scripts/backup_db.py --drill --offsite-dir "$HOME/second-brain-backups/offsite" --key-file "$HOME/.second-brain/backup.key" --db data/brain.db --hc-slug brain-restore-drill</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>
+        <key>Hour</key>
+        <integer>10</integer>
+        <key>Minute</key>
+        <integer>15</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>StandardOutPath</key>
+    <string>__HOME__/.second-brain/logs/restore-drill.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.second-brain/logs/restore-drill.log</string>
+</dict>
+</plist>
+```
+
+Saved as `restore-drill.plist`, install it and run the first drill at once:
+
+```bash
+AGENT=~/Library/LaunchAgents/com.example.second-brain.restore-drill.plist
+sed "s|__HOME__|$HOME|g" restore-drill.plist > "$AGENT"
+plutil -lint "$AGENT"
+launchctl bootstrap "gui/$(id -u)" "$AGENT"
+launchctl kickstart "gui/$(id -u)/com.example.second-brain.restore-drill"
+tail -3 ~/.second-brain/logs/restore-drill.log   # "restore drill OK on brain-..."
+```
+
+A restore you exercise by hand, by the steps above, is recorded the same way:
 
 ```bash
 date -u +%Y-%m-%dT%H:%M:%SZ > ~/.second-brain/restore-drill.stamp   # or $BRAIN_RESTORE_DRILL_STAMP
 ```
 
-Last exercised: 2026-09-09, twice.
+Last exercised by hand: 2026-09-09, twice. From 2026-10 the drill above exercises
+it every week once its agent is installed, and the stamp says when it last passed.
 
 First on a synthetic database, which validates the command sequence but not any
 archive. Then, once a consumer had its own key, against the newest REAL offsite

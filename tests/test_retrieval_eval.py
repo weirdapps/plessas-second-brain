@@ -1,11 +1,14 @@
-"""scripts/retrieval_eval.py: a known-item baseline for keyword search."""
+"""scripts/retrieval_eval.py: the known-item guard for keyword search and the qa set."""
 
 import importlib.util
 import json
+import stat
 from pathlib import Path
 
+import numpy as np
 import pytest
 
+from src.evals import REPO_ROOT, read_jsonl
 from src.store.schema import create_database
 
 SCRIPT = Path(__file__).parent.parent / "scripts" / "retrieval_eval.py"
@@ -59,15 +62,61 @@ def test_the_score_counts_ranks(ev):
 def test_build_then_run_finds_the_email_by_its_subject(ev, db, tmp_path, capsys):
     """The subject is indexed from v22, so this is also the index's own check."""
     eval_set = tmp_path / "set.json"
+    results = tmp_path / "evals" / "retrieval" / "results.jsonl"
 
     assert ev.main(["build", "--db", str(db), "--file", str(eval_set)]) == 0
-    assert ev.main(["run", "--db", str(db), "--file", str(eval_set)]) == 0
+    assert (
+        ev.main(["run", "--db", str(db), "--file", str(eval_set), "--results", str(results)]) == 0
+    )
 
     out = capsys.readouterr().out
     result = json.loads(out[out.index("{") : out.rindex("}") + 1])
     assert result["email"]["hit@1"] == 1.0
     assert result["thread"]["hit@1"] == 1.0
     assert json.loads(eval_set.read_text())[0]["email_id"] == 1
+    assert stat.S_IMODE(eval_set.stat().st_mode) == 0o600
+
+
+def test_each_known_item_run_is_recorded_and_prints_no_subject_words(ev, db, tmp_path, capsys):
+    eval_set = tmp_path / "set.json"
+    results = tmp_path / "evals" / "retrieval" / "results.jsonl"
+    eval_set.write_text(json.dumps([{"email_id": 1, "query": "zebrafinch nowhere"}]))
+
+    assert (
+        ev.main(["run", "--db", str(db), "--file", str(eval_set), "--results", str(results)]) == 0
+    )
+
+    (record,) = read_jsonl(results)
+    assert record["eval"] == "known-item"
+    assert (record["thread"]["hit@1"], record["misses"]) == (0.0, 1)  # the news item ranks first
+    assert record["set_sha"] and record["date"]
+    assert stat.S_IMODE(results.stat().st_mode) == 0o600
+    assert "zebrafinch" not in capsys.readouterr().out
+
+
+def test_known_items_are_only_subjects_no_other_thread_shares(ev, tmp_path):
+    """Two words that several threads' subjects hold make a tie-break, not a test: in the
+    audit of 2026-10-11 such items came first 4 times in 61, unshared ones 65 in 66."""
+    path = tmp_path / "t.db"
+    conn = create_database(str(path))
+    conn.executemany(
+        "INSERT INTO emails (id, message_id, date_received, subject, mailbox_name, summary, "
+        "conversation_id) VALUES (?, ?, '2026-09-01T00:00:00Z', ?, ?, 'nothing', ?)",
+        [
+            (1, 1, "Quarterly zebrafinch budget review", "Inbox", "A"),
+            (2, 2, "Weekly status report", "Inbox", "B"),
+            (3, 3, "Weekly status report", "Inbox", "C"),
+            (4, 4, "RE: Weekly status report", "Inbox", "B"),
+            (5, 5, "Kiwi orchard visit", "Inbox", "D"),
+            (6, 6, "Orchard visit for kiwi growers", "News", None),  # news competes in run
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    items = ev.build_set(ev._open(path), size=10, seed=1)
+
+    assert [i["email_id"] for i in items] == [1]
 
 
 def test_the_database_is_opened_read_only(ev, db):
@@ -126,3 +175,283 @@ def test_a_thread_is_the_one_search_and_email_thread_know(ev, tmp_path):
     assert ev.thread_of(ro, 1) == {1}
     assert ev.thread_of(ro, 3) == {3}
     assert ev.thread_of(ro, 5) == {5, 6}
+
+
+# --- the qa set ------------------------------------------------------------------------
+
+
+@pytest.fixture
+def qa_store(tmp_path):
+    """Mail, a calendar event and two logged sessions in which the brain was asked things."""
+    path = tmp_path / "qa.db"
+    conn = create_database(str(path))
+    conn.executemany(
+        "INSERT INTO emails (id, message_id, date_received, subject, mailbox_name, summary,"
+        " content, conversation_id) VALUES (?, ?, ?, ?, 'Archive', ?, ?, ?)",
+        [
+            (
+                1,
+                1,
+                "2026-10-01T09:00:00Z",
+                "Budget 2027 plan",
+                "plan",
+                "The plan is attached.",
+                "T1",
+            ),
+            (2, 2, "2026-10-02T09:00:00Z", "Re: Budget 2027 plan", "ok", "Approved.", "T1"),
+            (3, 3, "2026-10-03T09:00:00Z", "Lunch menu", "food", "Pasta today.", "T2"),
+            (4, 4, "2026-10-04T09:00:00Z", "Kiwi orchard visit", "trip", "We go Friday.", None),
+        ],
+    )
+    conn.execute(
+        "INSERT INTO calendar_events (id, outlook_event_id, subject, start_at, end_at, ingested_at)"
+        " VALUES (1, 'e1', 'Zebrafinch review', '2026-10-05T09:00:00Z', '2026-10-05T10:00:00Z',"
+        " '2026-10-01T00:00:00Z')"
+    )
+    conn.executemany(
+        "INSERT INTO conversations (id, session_id, started_at, workspace, created_at)"
+        " VALUES (?, ?, '2026-10-01T10:00:00Z', ?, '2026-10-01T10:00:00Z')",
+        [(1, "s-work", "/home/u/work"), (2, "s-brain", "/home/u/src/second-brain")],
+    )
+    turns = [
+        (1, 0, "user", "what did we decide about the budget plan?"),
+        (1, 1, "assistant", "[Tool: mcp__second-brain__recall]\nWe approved it."),
+        (1, 2, "user", "<task-notification>done</task-notification>"),
+        (1, 3, "assistant", "[Tool: mcp__second-brain__search_emails]"),
+        (1, 4, "user", "and what about the lunch menu today?"),
+        (1, 5, "assistant", "[Tool: Bash ls]"),
+        (1, 6, "user", "What did we decide about the budget   plan?"),
+        (
+            1,
+            7,
+            "assistant",
+            "[Tool: mcp__second-brain__search_emails]\n[Tool: mcp__second-brain__recall]",
+        ),
+        (1, 8, "user", "ok go on"),
+        (1, 9, "assistant", "[Tool: mcp__second-brain__stats]"),
+        (2, 0, "user", "test the recall tool on budget questions"),
+        (2, 1, "assistant", "[Tool: mcp__second-brain__recall]"),
+    ]
+    conn.executemany(
+        "INSERT INTO conversation_turns (conversation_id, turn_index, timestamp, speaker, content)"
+        " VALUES (?, ?, ?, ?, ?)",
+        [
+            (c, i, f"2026-10-0{c}T10:{i:02d}:00Z", speaker, content)
+            for c, i, speaker, content in turns
+        ],
+    )
+    conn.commit()
+    conn.close()
+    return path
+
+
+@pytest.fixture
+def index(tmp_path):
+    """Four email vectors: the budget thread on one axis, lunch and the kiwi trip on others."""
+    path = tmp_path / "embeddings.npz"
+    vectors = np.array(
+        [[1, 0, 0, 0], [0.8, 0.2, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]], dtype=np.float32
+    )
+    np.savez(path, ids=np.array([1, 2, 3, 4]), vectors=vectors)
+    return path
+
+
+def embed(texts):
+    """The query's axis, as the vectors above have it."""
+    out = []
+    for text in texts:
+        if "budget" in text:
+            out.append([1.0, 0, 0, 0])
+        elif "kiwi" in text:
+            out.append([0, 0, 1.0, 0])
+        else:
+            out.append([0, 0, 0, 1.0])
+    return np.array(out, dtype=np.float32)
+
+
+def question(qid, query, **gold):
+    return {"id": qid, "question": f"question {qid}", "query": query, "modes": [], "gold": gold}
+
+
+def test_build_qa_mines_the_questions_put_to_the_brain(ev, qa_store):
+    items = ev.mine_questions(ev._open(qa_store), size=10)
+
+    assert [i["question"] for i in items] == ["What did we decide about the budget plan?"]
+    (item,) = items
+    assert item["id"] == "q001"
+    assert item["tools"] == ["recall", "search_emails"]
+    assert item["source"] == {"session_id": "s-work", "turn_index": 6}
+    assert item["gold"] == {kind: [] for kind in ev.GOLD_KINDS}
+    assert item["query"] == "" and item["answer"] == ""
+
+
+def test_sessions_in_the_brain_repository_itself_are_left_out_unless_asked(ev, qa_store):
+    items = ev.mine_questions(ev._open(qa_store), size=10, all_workspaces=True)
+
+    assert [i["source"]["session_id"] for i in items] == ["s-brain", "s-work"]
+
+
+def test_the_metrics_follow_the_ranks_of_the_gold(ev):
+    both = ev.qa_metrics([1, 3])
+    one = ev.qa_metrics([None, 7])
+
+    assert (both["recall@5"], both["recall@10"], both["rr"]) == (1.0, 1.0, 1.0)
+    assert both["ndcg@10"] == pytest.approx((1 + 1 / np.log2(4)) / (1 + 1 / np.log2(3)))
+    assert (one["recall@5"], one["recall@10"], one["rr"]) == (0.0, 0.5, pytest.approx(1 / 7))
+    assert one["ndcg@10"] == pytest.approx((1 / np.log2(8)) / (1 + 1 / np.log2(3)))
+    assert ev.qa_metrics([None])["ndcg@10"] == 0.0
+
+
+def test_run_qa_grades_each_mode_on_the_kinds_it_can_return(ev, qa_store, index):
+    items = [
+        question("q1", "budget plan", email=[1]),  # the thread, whichever email shows it
+        question("q2", "zebrafinch review", event=[1]),  # only recall returns events
+        question("q3", "kiwi orchard", email=[4]),  # an email with no thread
+        question("q4", "lunch"),  # not labelled yet
+    ]
+
+    result = ev.run_qa(ev._open(qa_store), items, embed_fn=embed, index_path=index)
+
+    assert (result["questions"], result["labelled"]) == (4, 3)
+    modes = result["modes"]
+    assert {m: modes[m]["questions"] for m in modes} == {
+        "keyword": 2,
+        "semantic": 2,
+        "hybrid": 2,
+        "recall": 3,
+    }
+    for mode in modes:
+        assert modes[mode]["recall@10"] == 1.0, mode
+        assert modes[mode]["mrr"] == 1.0, mode
+    assert result["semantic_status"] == {"semantic": {"ok": 3}, "recall": {"ok": 3}}
+    first = result["per_question"][0]
+    assert first["id"] == "q1" and first["units"] == ["thread:T1"]
+
+
+def test_a_question_can_be_held_to_some_modes(ev, qa_store, index):
+    items = [{**question("q1", "budget plan", email=[1]), "modes": ["keyword"]}]
+
+    result = ev.run_qa(ev._open(qa_store), items, embed_fn=embed, index_path=index)
+
+    assert list(result["modes"]) == ["keyword"]
+
+
+def test_an_embedding_outage_shows_in_the_status_of_every_call(ev, qa_store, index):
+    def down(texts):
+        raise RuntimeError("model refused")
+
+    result = ev.run_qa(
+        ev._open(qa_store),
+        [question("q1", "budget plan", email=[1])],
+        embed_fn=down,
+        index_path=index,
+    )
+
+    status = result["semantic_status"]
+    assert status["semantic"] == {"keyword_seeded: RuntimeError": 1}
+    assert status["recall"] == {"keyword_seeded: RuntimeError": 1}
+
+
+def test_a_gold_email_missing_from_the_store_is_counted(ev, qa_store, index):
+    result = ev.run_qa(
+        ev._open(qa_store),
+        [question("q1", "budget plan", email=[999])],
+        embed_fn=embed,
+        index_path=index,
+    )
+
+    assert result["unknown_gold"] == 1
+    assert result["modes"]["keyword"]["recall@10"] == 0.0
+
+
+def test_validate_qa_names_problems_without_their_values(ev):
+    items = [
+        question("q1", "a", email=[1]),
+        question("q1", "b"),
+        {**question("q2", "c"), "modes": ["fuzzy"]},
+        {**question("q3", "d"), "gold": {"email": "12"}},
+        {**question("q4", "e"), "gold": {"tickets": [1]}},
+        {"id": "q5", "question": ""},
+        question("q6", "f", email=["12"], thread=["AAQkADk="], conversation=["s-1", 3]),
+    ]
+
+    problems = ev.validate_qa(items)
+
+    assert [p for p in problems if p.startswith("q6:")] == [
+        "q6: gold.email is not a list of numeric ids"
+    ]
+    for qid in ("q2", "q3", "q4", "q5"):
+        assert any(p.startswith(f"{qid}:") for p in problems), qid
+    assert any("duplicate" in p for p in problems)
+    assert not any("fuzzy" in p or "tickets" in p for p in problems)
+
+
+def qa_argv(qa_store, tmp_path, *extra):
+    return [
+        *extra,
+        "--db",
+        str(qa_store),
+        "--qa-file",
+        str(tmp_path / "evals" / "retrieval" / "qa.jsonl"),
+        "--results",
+        str(tmp_path / "evals" / "retrieval" / "results.jsonl"),
+    ]
+
+
+def test_build_qa_writes_a_private_set_and_keeps_the_owners_labels(ev, qa_store, tmp_path, capsys):
+    qa_file = tmp_path / "evals" / "retrieval" / "qa.jsonl"
+
+    assert ev.main(qa_argv(qa_store, tmp_path, "--build-qa")) == 0
+    assert stat.S_IMODE(qa_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(qa_file.parent.stat().st_mode) == 0o700
+    assert ev.main(qa_argv(qa_store, tmp_path, "--build-qa")) == 2
+    assert ev.main(qa_argv(qa_store, tmp_path, "--build-qa", "--force", "--all-workspaces")) == 0
+    assert len(read_jsonl(qa_file)) == 2
+    assert "budget" not in capsys.readouterr().out
+
+
+def test_run_qa_records_a_dated_run_and_prints_no_question(
+    ev, qa_store, tmp_path, capsys, monkeypatch
+):
+    from src.evals import write_jsonl
+    from src.store import embeddings
+
+    monkeypatch.setattr(embeddings, "EMBEDDINGS_FILE", tmp_path / "no-index.npz")
+    qa_file = tmp_path / "evals" / "retrieval" / "qa.jsonl"
+    results = tmp_path / "evals" / "retrieval" / "results.jsonl"
+    write_jsonl(qa_file, [question("q1", "budget plan", email=[1])])
+
+    assert ev.main(qa_argv(qa_store, tmp_path, "--run-qa")) == 0
+
+    (record,) = read_jsonl(results)
+    assert record["eval"] == "qa" and record["date"] and record["set_sha"]
+    assert record["modes"]["keyword"]["recall@10"] == 1.0
+    # No vector index here: semantic search is down, and the record says so.
+    assert set(record["semantic_status"]["semantic"]) == {"unavailable: FileNotFoundError"}
+    out = capsys.readouterr().out
+    assert "budget" not in out and "question q1" not in out
+
+
+def test_run_qa_needs_a_labelled_set(ev, qa_store, tmp_path):
+    from src.evals import write_jsonl
+
+    assert ev.main(qa_argv(qa_store, tmp_path, "--run-qa")) == 2  # no set yet
+    write_jsonl(tmp_path / "evals" / "retrieval" / "qa.jsonl", [question("q1", "budget plan")])
+    assert ev.main(qa_argv(qa_store, tmp_path, "--run-qa")) == 2  # nothing labelled
+    write_jsonl(tmp_path / "evals" / "retrieval" / "qa.jsonl", [{"id": "q1"}])
+    assert ev.main(qa_argv(qa_store, tmp_path, "--run-qa")) == 1  # invalid
+
+
+def test_nothing_is_written_inside_the_repository(ev, qa_store):
+    inside = REPO_ROOT / "evals-should-not-exist"
+
+    assert ev.main(["--build-qa", "--db", str(qa_store), "--qa-file", str(inside / "q.jsonl")]) == 2
+    assert ev.main(["run", "--db", str(qa_store), "--results", str(inside / "r.jsonl")]) == 2
+    assert not inside.exists()
+
+
+def test_one_mode_at_a_time(ev):
+    with pytest.raises(SystemExit):
+        ev.main(["build", "--run-qa"])
+    with pytest.raises(SystemExit):
+        ev.main([])

@@ -17,6 +17,7 @@ from src.extract.image_classifier import (
 from src.redact import redact_secrets
 from src.store.email_html import markup_or_text
 from src.store.file_sweep import (
+    OCR_GARBLED_SQL,
     TRANSCRIPTION_OWED_SQL,
     VISION_ATTEMPTS_LIMIT,
     VISION_FILLABLE_SQL,
@@ -73,6 +74,10 @@ def project_vision_text(conn: sqlite3.Connection) -> int:
 
     Credentials are redacted on the way, as Phase 1 redacts what it reads. Returns the rows
     written; a row that already holds exactly this is left alone.
+
+    A row whose OCR text is marked as Greek read as Latin look-alikes takes the image's text only
+    once the image is transcribed: the description alone would drop the figures that the OCR
+    text still holds.
     """
     rows = conn.execute(
         f"""SELECT ac.id, ii.vision_description, ii.vision_transcription,
@@ -81,7 +86,8 @@ def project_vision_text(conn: sqlite3.Connection) -> int:
             JOIN attachments a ON a.sha256 = ii.sha256
             JOIN attachment_content ac ON ac.attachment_id = a.id
             WHERE ii.classification = 'content' AND ii.vision_description IS NOT NULL
-              AND {VISION_FILLABLE_SQL}"""
+              AND {VISION_FILLABLE_SQL}
+              AND (ii.transcribed_at IS NOT NULL OR NOT {OCR_GARBLED_SQL})"""
     ).fetchall()
     # attachment_content keeps Phase 1's timestamp format.
     now = datetime.now().isoformat()

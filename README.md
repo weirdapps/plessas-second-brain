@@ -42,7 +42,7 @@ graph TD
 | Source | Module | Notes |
 | --- | --- | --- |
 | Microsoft 365 mail | `src/export/outlook_export.py` + `outlook_cli.py` | Primary. Hourly, one `--since` cursor per folder. |
-| Attachments | `src/export/outlook_attachments.py`, `src/extract/attachment_extractors.py` | PDF (PyMuPDF), DOCX (`python-docx`), PPTX (`python-pptx`), XLSX (`openpyxl`), XLSB (`pyxlsb`), XLS (`xlrd`), images (Tesseract OCR, a grayscale second pass when colour finds too little), EML and clear-signed `.p7m`, `.mso` object containers (the workbooks behind charts pasted into mail), `.wmz`/`.emz` drawings (their text records), and text formats routed by their bytes (ICS, VCF, XML, SVG, EPS, VTT). Files encrypted at rest (rights-protected Office files and `.rpmsg` messages, password-protected Office files and PDFs) are recognised from their bytes and recorded as `extraction_status = 'encrypted'`, method `rms`, `rms-message` or `password`: nothing reads them without the key. |
+| Attachments | `src/export/outlook_attachments.py`, `src/extract/attachment_extractors.py` | PDF (PyMuPDF), DOCX (`python-docx`), PPTX (`python-pptx`), XLSX (`openpyxl`), XLSB (`pyxlsb`), XLS (`xlrd`), images (Tesseract OCR, Greek first and English first again for a page that reads as Latin script, a grayscale second pass when colour finds too little; the scanned pages of a text PDF are OCR'd too), EML and clear-signed `.p7m`, `.mso` object containers (the workbooks behind charts pasted into mail), `.wmz`/`.emz` drawings (their text records), and text formats routed by their bytes (ICS, VCF, XML, SVG, EPS, VTT). Files encrypted at rest (rights-protected Office files and `.rpmsg` messages, password-protected Office files and PDFs) are recognised from their bytes and recorded as `extraction_status = 'encrypted'`, method `rms`, `rms-message` or `password`: nothing reads them without the key. |
 | Inline email images | `src/extract/image_classifier.py`, `image_pipeline.py`, `image_vision.py` | Dimensions plus bytes plus sender-scoped SHA256 dedup cascade; vision LLM stage for content images, cached by SHA256. |
 | Calendar events | `src/export/calendar_export.py`, `src/extract/calendar_extractor.py` | Outlook events with attendees, body summary, decisions. |
 | MS Teams | `src/export/teams_cli.py`, `teams_export.py`, `src/extract/teams_pipeline.py` | Chats, threads, messages, MRI resolution. |
@@ -133,6 +133,7 @@ Every dossier dates and orders its rows the same way (`src/store/ordering.py`): 
 ### Attachments and images
 
 - `search_attachments(query, limit, include_news, include_automation)`. FTS over extracted text and LLM summaries; each row carries its email's `source_class`. Since 2026-10-11 a long attachment's summary is built from part of it: a spreadsheet's from its structure, any other long text's from three of its parts (see [Attachment summaries and spend](#attachment-summaries-and-spend)). The full extracted text is still searched.
+  Also since 2026-10-11, an OCR text that is Greek read as Latin look-alike letters ("kal" for «και», "tnv" for «την») carries the mark `ocr_garbled` in `extraction_error` and gets no summary: its text is still searched, but no summary, decision, action or fact is made from the wrong words. An image's text is replaced by its vision transcription, a scan's by `reextract --garbled`. See [Greek read as Latin letters](#greek-read-as-latin-letters).
 - `attachment_image_search(query, limit)`. Case- and accent-blind match on vision descriptions of classified content images: the whole query first, then any meaningful word (`partial_match`).
 
 ### Calendar
@@ -254,7 +255,7 @@ launchctl kickstart gui/$(id -u)/com.plessas.whatsapp-sync-vps   # the first pus
 
 Requires Python 3.12+ and, if you ingest attachments, system packages that `pip` cannot install:
 
-- **`tesseract` plus its language data.** Attachment OCR calls `pytesseract.image_to_string(img, lang="eng+ell")`, so the English *and* Greek traineddata must both be present or every image and scanned PDF fails. `pytesseract` is a wrapper around the binary, not the binary. In a corpus with scanned documents in it, OCR ends up the most common extraction method of all.
+- **`tesseract` plus its language data.** Attachment OCR reads Greek first, `pytesseract.image_to_string(img, lang="ell+eng")`, and reads a page that comes out as Latin script again with `lang="eng+ell"`, so the English *and* Greek traineddata must both be present or every image and scanned PDF fails. `pytesseract` is a wrapper around the binary, not the binary. In a corpus with scanned documents in it, OCR ends up the most common extraction method of all.
 - **`antiword` (or `catdoc`) on Linux**, for legacy Word `.doc` attachments. macOS converts them with its built-in `textutil`; a Linux host with neither records every `.doc` as skipped, which no failure count reports.
 - **`zstd` and `openssl`**, only if you want the encrypted offsite backups from `scripts/backup_db.py`. Missing either one silently downgrades to local-snapshot-only.
 
@@ -349,6 +350,16 @@ A run can be given a token budget, input and output tokens together: `--token-bu
 
 The nightly health check reports yesterday's spend (UTC) from the usage log every call writes, `llm-usage-YYYY-MM.jsonl` under the data home: an `LLM spend` row with calls, tokens and cost, and a line per call site. It is WARN above `BRAIN_DAILY_SPEND_WARN_USD` (default 60) or when a call used a model the rate table cannot price, and STALE when the store shows model work that day (mail that received a summary, attachment summaries written) but the log holds no call, which also fails the freshness ping. On a replica it reads N/A: the calls, and their log, are the producer's.
 
+### Greek read as Latin letters
+
+Tesseract with English first reads many Greek letters as the Latin letters they look like: «και» comes out as "kal", «την» as "tnv", the capitals «ΤΟΥ» as "TOY". In one store about 800 images and scans became such text, and their summaries named the wrong programme and the wrong figure. Since 2026-10-11:
+
+- **Greek first.** Every image, scan page and TIFF frame is read `ell+eng`. A page whose reading comes out as Latin script (at most 30% of its letters Greek, figures alone included) is read again `eng+ell`, the order every page was read in before, because Greek first misreads some figures and signs in English text ("Q3" as "93", "+2.4%" as "42.48"); that reading is kept unless it is itself Greek in Latin look-alikes. An English page now costs two tesseract passes; a Greek page and a blank image cost what they did.
+- **The scanned pages of a text PDF.** A page whose text layer holds fewer than 50 characters and that shows an image is OCR'd, inside the existing two-minute OCR budget per file. Before, OCR ran only when the whole PDF held under 50 characters, so a scanned annex inside a text PDF was never read. Blank pages are not read.
+- **The mark.** An OCR reading (methods `ocr`, `pymupdf+tesseract`, `zip`) that `src/extract/ocr_garble.py` takes for Greek in Latin look-alikes keeps its text and gets `ocr_garbled: ...` in `extraction_error`, with `llm_status = 'skipped'`; there is no schema change. The detector wants at most 30% Greek letters and at least three Greek function words in their Latin look-alike spellings, two of them different, and two per 1,000 Latin letters. Phase 2 never summarises a marked row, the file sweep and the orphan reaper keep its file, and Phase 1 does not copy it to another attachment with the same bytes.
+- **Reading it again.** A marked image that the vision pass filed as content owes its transcription: the nightly image pass (or `transcribe-images`) transcribes it, and the transcription replaces the garbled text. A marked scan is read again Greek first by `reextract --garbled`; a reading no longer marked replaces the stored text, whatever its length, and is summarised.
+- **What was read before.** `python -m src.cli ocr-regarble` finds the stored texts the detector flags, counts them by method, and lists by attachment id which files are still on disk and which were swept. `--apply` marks them, clears their summaries, deletes the decisions, action items and key facts those summaries wrote (by `attachment_id`: rows written before schema v28 carry none and stay on the email) and drops their vectors. It refuses to run on a replica. A swept original has to be fetched from Exchange again by hand, to the path its row records, before either route can read it: that is an owner step.
+
 ## Usage
 
 ### Run the MCP server
@@ -432,6 +443,8 @@ python -m src.cli reextract --capped --zip --unread    # read and summarise agai
 python -m src.cli reextract --partial                  # read again in full what the old readers read in part (resumable)
 python -m src.cli reextract --stale --formats          # read with today's readers what older code skipped or failed on
 python -m src.cli reextract --ocr --limit 500          # OCR low-text scans and images again (grayscale second pass), in batches
+python -m src.cli ocr-regarble [--apply]              # find stored OCR text that is Greek read as Latin letters; --apply marks it and clears its summaries
+python -m src.cli reextract --garbled                 # read marked scans again, Greek first, and summarise the ones that now read
 python -m src.cli reextract --long --estimate          # price a re-summary before running it; changes nothing
 python -m src.cli reextract --full-parts 1234 5678     # summarise these attachments from every part, now and on every later summary
 python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents
@@ -485,6 +498,8 @@ src/
     attachment_pipeline.py     Two-phase pipeline (text extraction, then LLM)
     attachment_digest.py       A long spreadsheet's structure, summarised instead of its cells
     attachment_extractors.py   PDF, DOCX, PPTX, XLSX, XLSB, XLS, image, EML, RPMSG
+    ocr_garble.py              Detector for Greek read as Latin look-alike letters
+    ocr_regarble.py            `ocr-regarble`: finds and marks the stored ones
     image_classifier.py        Dimensions plus bytes plus SHA256 dedup cascade
     image_vision.py            Vision LLM stage
     image_pipeline.py          Orchestration and backfill
@@ -517,9 +532,15 @@ src/
     calendar_loader.py         Calendar event and attendee loader
   ingest/
     reverse_scan.py            Filesystem scan with latest-version-per-name dedup
+  evals/
+    __init__.py                Where the eval sets live (outside the checkout) and owner-only file writes
+    extraction.py              The extraction eval: building, programmatic checks, the run, the judge
+    summary.py                 The latest eval results against the run before, for the health check
 
 scripts/
   health_check.py              Per-source freshness and job status; email + Healthchecks ping
+  extraction_eval.py           Extraction eval CLI: build, dry run, run, calibrate (see Evals)
+  retrieval_eval.py            Retrieval evals: the known-item guard and the qa set (see Evals)
   backup_db.py                 MVCC-safe encrypted DB snapshot + retention (see docs/RESTORE.md)
   forget_duplicate_documents.py  Forgets synced documents byte-identical to a mail attachment that holds their text, stored before ingest checked for such twins (dry run by default)
   reap_orphan_attachments.py   Resolves attachment dirs the registrar can never claim
@@ -586,7 +607,58 @@ pytest -k recall                    # filter by expression
 pytest --cov=src --cov-report=term  # with coverage
 ```
 
-Before and after changing how text is tokenised (stemming, prefix matching), run the regression guard. `scripts/retrieval_eval.py build` samples emails and keeps two words of each subject as a query; `run` reports how often keyword search returns the email, and its thread, first, in the top 5 and in the top 10. Compare the thread figures: replies share a subject, and a subject match returns one email per thread. It can show a loss, not a gain, because the queries are the subject's own words. The set holds subjects, so it is written to `~/.second-brain/retrieval-eval.json`, outside the repository, and both steps open the database read-only.
+The tests stub the model, so they say nothing about extraction or retrieval quality; the evals below do.
+
+### Evals
+
+Three evals put a number on quality before a change ships: a prompt, an effort level, a model, tokenising, ranking. Their sets are the owner's own mail and questions, and their gold labels are the owner's judgement, so **case ids and gold labels never enter the repository**. Sets and results live under `${BRAIN_DATA_DIR:-~/.second-brain}/evals/`. Every directory the scripts create there is 0700 and every file 0600, and a path inside the checkout is refused. Nothing the scripts print holds an item, a question or a label: they print ids, counts and rates.
+
+| Eval | Set | Built by | Graded by | Model calls |
+| --- | --- | --- | --- | --- |
+| Extraction, 40 cases | `evals/extraction/cases.jsonl` | `scripts/extraction_eval.py --build` | programmatic checks, then a judge | extraction and judge, only with `--yes` |
+| Retrieval qa, 30-50 questions | `evals/retrieval/qa.jsonl` | `scripts/retrieval_eval.py --build-qa` | recall@5, recall@10, MRR, nDCG@10 per mode | query embeddings only |
+| Known-item, 20 queries | `~/.second-brain/retrieval-eval.json` | `scripts/retrieval_eval.py build` | hit@1, hit@5, hit@10, MRR | none |
+
+Each run appends one dated record to `evals/extraction/results.jsonl` or `evals/retrieval/results.jsonl`. `latest_eval_summary()` in `src/evals/summary.py` reads them back for the health check: it compares the newest run of each kind with the newest earlier run on the same set (for extraction, the same cases too), and warns when the headline falls by more than 5 points or a semantic call was not `ok`.
+
+#### Extraction
+
+1. `python scripts/extraction_eval.py --build` reads the store read-only and drafts 38 real items from the last 180 days: 10 Sent Items with commitments, 10 inbound asks of the owner, 8 FYI mails or forwards (half with an attachment), 6 bulk mails or notifications, and 4 long Greek threads with quoted history. It adds 2 crafted injection items, whose gold is given. It writes `cases.jsonl`, a reading copy `cases.md`, and `owner.json` with the names the owner goes by in extracted fields: add the other scripts' forms there. It never replaces a set without `--force`. With `BRAIN_USER_EMAIL_PATTERN` set, an inbound ask must be addressed to the owner, and an FYI may be mail he is only copied on.
+2. Label each case's `gold` in `cases.jsonl`, reading the case in `cases.md`, and delete any case that does not fit. A case counts once its `item_kind` is set:
+   - `item_kind`: `work_thread`, `fyi_forward`, `notification`, `bulk`, `invite_logistics`, `regulatory_text`, `personal` or `other`
+   - `language`: `el`, `en`, `mixed` or `other`
+   - `decisions`: `{"text", "owner_role", "status"}`, with `owner_role` one of `owner_decided`, `assigned_to_owner`, `owner_assigned_other`, `owner_fyi`, `third_party`, and `status` one of `made`, `proposed`, `requested`
+   - `actions`: `{"text", "direction", "deadline"}`, with `direction` one of `owner_owes`, `owed_to_owner`, `third_party`, and `deadline` a `YYYY-MM-DD` date or `null`
+   - `must_not`: phrases no extracted decision, action or commitment may contain, such as a decision quoted from older mail in the thread, or what an injected instruction dictates
+3. `--dry-run` validates the set and grades the gold itself (it must pass every check) and no answer (it must fail them all). It also regrades the last run's saved replies against the gold as it stands, and prints the cost estimate. It calls no model and writes nothing.
+4. `--run --judge` prints the estimate and stops; add `--yes` to spend it. Each case is extracted twice through `claude_extract.extract_one`, the function the sync calls, then graded. The run appends its record (model, prompt hash, effort, per-check pass rates, cost) to `results.jsonl`, writes every graded row with the model's own text to `runs/<run_id>.jsonl`, and records each attempt that produced nothing to grade in `errors.jsonl`. A truncated or refused reply is counted, not graded, and a reply from another model is an error. `--effort low|medium|high` sends `output_config.effort` with every call, for a sweep; `--case ID` runs a pilot.
+5. `--calibrate --yes` measures how often the judge pairs items as the owner would: on probes the gold fixes (the gold itself, the gold less one item, another case's gold, "I don't know"), and on the last run's outputs that the owner has counted in `calibration.jsonl` (written on first use, for him to fill in). Below 90% agreement, the judge's scores should not steer a change.
+
+| Check | Passes when | Graded |
+| --- | --- | --- |
+| `schema_valid` | the reply parses as it stands, in the parser's schema | always |
+| `kind` | `item_kind` equals the gold | once the extraction emits `item_kind` |
+| `language` | the language, as a code, equals the gold | labelled cases |
+| `owner_roles` | the owner's decisions and debts count as the gold's: by `owner_role` and `direction` once emitted, until then by `decided_by` and `owner` against `owner.json` | labelled cases, with fields or names |
+| `bulk_empty` | there is no decision and no action | gold kind `bulk` or `notification` |
+| `deadlines` | the action deadlines equal the gold's | labelled cases |
+| `evidence_verbatim` | every evidence quote is in the source, spacing aside | once the extraction emits `evidence` |
+| `no_card_iban` | no card number or IBAN passes the masker's own checks | always |
+| `must_not` | no decision, action or commitment holds a must-not phrase, case and accents aside | gold with `must_not` |
+
+A reply that cannot be parsed fails every check that applies. The judge matches the decision and action sets, and the eval computes precision, recall and F1 from its pairs.
+
+Cost: on the replica's real prompts the script estimates $2.32 for 80 extraction calls and at most $2.31 for the judge, at Vertex `eu` Sonnet 5.5 rates. Both are upper bounds, since they count 1,500 output tokens a call against the 832 email extraction measured, so expect about $3 per configuration, and about $10 for an effort sweep over three levels. Noise: 80 graded rows put about ±11 points around a pass rate, so compare configurations, and read single cases in `runs/`. The calls reach the usage log like every other call, under the sites `src.evals.extraction._eval_extraction_call` and `src.evals.extraction._judge_call`, so the health check's spend row shows eval spend apart from production.
+
+#### Retrieval qa
+
+1. `python scripts/retrieval_eval.py --build-qa` drafts up to 60 questions from the owner's logged sessions: a user turn answered by a call to a `second-brain` tool. Each draft holds the question and the tools called, with every gold list empty. Sessions in the brain's own repository are left out unless `--all-workspaces`.
+2. Keep 30-50 real questions, and for each fill `gold` with the ids of the items that answer it: `email` (a row's `email_id`; any email of its thread counts), `attachment` (`attachment_id`), `teams` or `whatsapp` (thread ids), `conversation` (id or session id), `event` (calendar event id) or `thread` (an Outlook conversation id). Optionally set `query` to the keywords a session would send (real calls send 4-6-word keyword bags, and the question itself is the default), `modes` to limit the modes, and `answer` for a later answer judge.
+3. `--run-qa` asks each labelled question in four modes: `keyword` and `semantic` as `search_emails` runs them, `hybrid` as recall's fused email bucket, and `recall` as its whole bundle at 10 rows per kind. A question is graded in a mode only on the gold kinds that mode can return. The record carries recall@5, recall@10, MRR and nDCG@10 per mode, and every semantic and recall call's `summary.semantic` status, so an embedding outage shows. It loads the vector index as the MCP server does (about 1.5 GB on the current corpus), so on the producer, run it apart from the embedding jobs.
+
+#### Known-item
+
+Before and after changing how text is tokenised (stemming, prefix matching), run the regression guard. `scripts/retrieval_eval.py build` samples emails and keeps two words of each subject as a query. It keeps only subjects whose two words no other thread's subject holds both of: in the 2026-10-11 audit, shared queries came first 4 times in 61, which measured ambiguity rather than search. `run` reports how often keyword search returns the email, and its thread, first, in the top 5 and in the top 10, and appends the run to `evals/retrieval/results.jsonl`. Compare the thread figures: replies share a subject, and a subject match returns one email per thread. It can show a loss, not a gain, because the queries are the subject's own words.
 
 ### Lint and format
 

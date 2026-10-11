@@ -362,7 +362,7 @@ def test_ocr_pdf_pages_concatenates_per_page_text():
     scanned PDF silently failed OCR because Image.open() can't read PDFs."""
     from unittest.mock import MagicMock, patch
 
-    from src.extract.attachment_extractors import _ocr_pdf_pages
+    from src.extract.attachment_extractors import OCR_LANGS, _ocr_pdf_pages
 
     fake_pix = MagicMock()
     fake_pix.tobytes.return_value = b"fake_png_bytes"
@@ -381,14 +381,18 @@ def test_ocr_pdf_pages_concatenates_per_page_text():
             "Second page continues with additional regulatory content for completeness",
         ]
     )
+    current = [""]
+
+    def read(img, lang):
+        # Each page is read Greek first, then, being English, once more English first.
+        if lang == OCR_LANGS:
+            current[0] = next(page_texts)
+        return current[0]
 
     with (
         patch("fitz.open", return_value=fake_doc),
         patch("PIL.Image.open"),
-        patch(
-            "pytesseract.image_to_string",
-            side_effect=lambda img, lang: next(page_texts),
-        ),
+        patch("pytesseract.image_to_string", side_effect=read),
     ):
         result = _ocr_pdf_pages("/tmp/fake.pdf")
 

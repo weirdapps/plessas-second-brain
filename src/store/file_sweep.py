@@ -10,7 +10,9 @@ an unsupported type, an image with too little text) or holds an encrypted origin
 outcome, not the content: the file is the only copy of what the database lacks, and a password,
 granted rights or a better reader may still open it. Neither goes a picture the vision pass
 described in place of text. And an image the transcription pass still owes (described, not
-yet transcribed) keeps its file, because run_transcription reads it.
+yet transcribed) keeps its file, because run_transcription reads it. Nor a text Phase 1 marked
+as Greek read as Latin look-alike letters (OCR_GARBLED_SQL): its words are wrong, and the file
+is the way to a better reading.
 
 A Phase 1 row is not always proof the bytes were read. Phase 1 opens the row's recorded
 absolute path, while this module finds files by directory and name, so a row recorded on
@@ -36,6 +38,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from src.config import DATA_ROOT
+from src.extract.ocr_garble import OCR_GARBLED
 
 SWEEP_POLICY_FILE = DATA_ROOT / "state" / "sweep-policy.json"
 VISION_ATTEMPTS_LIMIT = 3
@@ -97,13 +100,21 @@ PARTIAL_SQL = (
 # and Phase 1 does not copy the row to another attachment with the same bytes.
 NOT_FULLY_READ_SQL = f"({UNREAD_SQL} OR {PARTIAL_SQL})"
 
+# A text Phase 1 marked as Greek read as Latin look-alike letters (src/extract/ocr_garble.py):
+# an OCR reading whose words are wrong, about 800 of them in one store (audit 2026-10-11). Its
+# content is not held, so its file stays for a better reading (OCR again, Greek first, or the
+# image's vision transcription), and Phase 2 does not summarise it. 1 or 0, never NULL.
+OCR_GARBLED_SQL = f"COALESCE(ac.extraction_error LIKE '%{OCR_GARBLED}%', 0)"
+
 # The content is held: Phase 1 extracted the file's text, all of it, and the text is the file's
 # own rather than the image pass's description of a picture ('vision' rows keep their image).
 # Keyed on the status, never on the error text: 'failed', 'skipped' and 'encrypted' (method
-# 'rms', 'rms-message' or 'password') all leave the file as the only copy of its content.
+# 'rms', 'rms-message' or 'password') all leave the file as the only copy of its content. A
+# text marked as garbled Greek is not held either.
 FULLY_HELD_SQL = (
     "(ac.extraction_status = 'extracted'"
     f" AND NOT COALESCE({NOT_FULLY_READ_SQL}, 0)"
+    f" AND NOT {OCR_GARBLED_SQL}"
     " AND COALESCE(ac.extraction_method, '') <> 'vision')"
 )
 
@@ -115,12 +126,15 @@ IMAGE_SUFFIXES = frozenset(
 
 
 # An attachment_content row (alias ac) that an image's vision text may fill: it holds no text
-# read from the file (OCR found too little, or failed), or it is vision's own. A row with text
-# from the file is never overwritten, and none is inserted: Phase 1 stays the first writer, so
-# an image Phase 1 has not reached yet is filled once it has.
+# read from the file (OCR found too little, or failed), it is vision's own, or its OCR text is
+# marked as Greek read as Latin look-alikes, which the transcription replaces once there is one
+# (src/extract/image_pipeline.py project_vision_text). Other text from the file is never
+# overwritten, and no row is inserted: Phase 1 stays the first writer, so an image Phase 1 has
+# not reached yet is filled once it has.
 VISION_FILLABLE_SQL = (
     "(COALESCE(trim(ac.extracted_text, char(32, 9, 10, 11, 12, 13)), '') = ''"
-    " OR ac.extraction_method = 'vision')"
+    " OR ac.extraction_method = 'vision'"
+    f" OR {OCR_GARBLED_SQL})"
 )
 
 # A content image (alias ii) that still owes its transcription: described, not transcribed,

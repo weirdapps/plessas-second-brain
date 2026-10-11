@@ -23,6 +23,7 @@ from typing import NamedTuple
 from src.config import ATTACHMENTS_DIR, DATA_ROOT, DEFAULT_DB
 from src.extract.attachment_digest import is_spreadsheet, spreadsheet_digest
 from src.extract.attachment_extractors import extract_text_from_file
+from src.extract.ocr_garble import is_garbled
 from src.extract.vertex_auth import touch_sentinel
 from src.llm_cost import (
     ESTIMATE_MODEL,
@@ -35,7 +36,7 @@ from src.llm_cost import (
 )
 from src.redact import redact_secrets
 from src.store.file_hashes import sha256_of_file
-from src.store.file_sweep import FULLY_HELD_SQL, NOT_FULLY_READ_SQL
+from src.store.file_sweep import FULLY_HELD_SQL, NOT_FULLY_READ_SQL, OCR_GARBLED_SQL
 from src.store.source_class import stored_class
 
 logger = logging.getLogger(__name__)
@@ -149,7 +150,8 @@ def _build_mime_type_conditions(file_type: str | None) -> tuple[str, list]:
 # Another attachment with the same bytes whose row is fully finished: text extracted from the
 # file itself and summarised. Only that is passed on. A failure or a skip may come from an older
 # extractor (a zip the old code never unpacked, a converter a host lacked), and a copy that
-# inherited it would never meet the current one; reading it again costs no model call.
+# inherited it would never meet the current one; reading it again costs no model call. Nor is a
+# text marked as Greek read as Latin look-alikes passed on: today's OCR may read it right.
 _REUSABLE_SQL = f"""
     SELECT ac.extracted_text, ac.extraction_method, ac.extraction_status,
            ac.extraction_error, ac.summary, ac.language, ac.llm_status
@@ -157,10 +159,19 @@ _REUSABLE_SQL = f"""
     JOIN attachment_content ac ON ac.attachment_id = a.id
     WHERE a.sha256 = ? AND a.id != ?
       AND NOT COALESCE({NOT_FULLY_READ_SQL}, 0)
+      AND NOT {OCR_GARBLED_SQL}
       AND ac.extraction_status = 'extracted' AND ac.llm_status = 'extracted'
     ORDER BY ac.id
     LIMIT 1
 """
+
+
+def llm_status_for(error: str | None) -> str:
+    """The llm_status a content row starts with: 'pending', Phase 2's queue, or 'skipped' for a
+    text marked as Greek read as Latin look-alikes (src/extract/ocr_garble.py). That one is not
+    summarised until it is read again, and is neither queued work nor a failure, both of which
+    the health check counts."""
+    return "skipped" if is_garbled(error) else "pending"
 
 
 def _reuse_content(conn: sqlite3.Connection, att_id: int, sha256: str, now: str) -> str | None:
@@ -288,7 +299,7 @@ def run_phase1(
             """INSERT OR IGNORE INTO attachment_content
                (attachment_id, extracted_text, extraction_method,
                 extraction_status, extraction_error, extracted_at, llm_status)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
                 att_id,
                 result["text"],
@@ -296,6 +307,7 @@ def run_phase1(
                 result["status"],
                 result["error"],
                 now,
+                llm_status_for(result["error"]),
             ),
         )
 
@@ -680,10 +692,13 @@ def _phase2_candidates(
     them. `select` is the SELECT and FROM it starts with."""
     type_condition, type_params = _build_mime_type_conditions(file_type)
 
+    # A text marked as Greek read as Latin look-alikes is never summarised, whatever its
+    # llm_status: its summary would be built from the wrong words.
     query = (
         select
-        + """        WHERE ac.extraction_status = 'extracted'
+        + f"""        WHERE ac.extraction_status = 'extracted'
           AND ac.llm_status = 'pending'
+          AND NOT {OCR_GARBLED_SQL}
     """
     )
 
@@ -1352,8 +1367,16 @@ def ingest_text_document(
             """INSERT INTO attachment_content
                (attachment_id, extracted_text, extraction_method, extraction_status,
                 extraction_error, extracted_at, llm_status)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
-            (attachment_id, redact_secrets(text) if text else text, method, status, error, now),
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                attachment_id,
+                redact_secrets(text) if text else text,
+                method,
+                status,
+                error,
+                now,
+                llm_status_for(error),
+            ),
         )
     return {
         "skipped": False,

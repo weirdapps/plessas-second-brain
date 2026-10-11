@@ -16,13 +16,13 @@ import sqlite3
 import threading
 import time
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from src.config import ATTACHMENTS_DIR, DATA_ROOT, DEFAULT_DB
 from src.extract.attachment_digest import is_spreadsheet, spreadsheet_digest
-from src.extract.attachment_extractors import extract_text_from_file
+from src.extract.attachment_extractors import ZIP_MIME_TYPES, extract_text_from_file
 from src.extract.ocr_garble import is_garbled
 from src.extract.vertex_auth import touch_sentinel
 from src.llm_cost import (
@@ -35,8 +35,14 @@ from src.llm_cost import (
     cost_usd,
 )
 from src.redact import redact_secrets
+from src.store.attachment_backlog import hours_since
 from src.store.file_hashes import sha256_of_file
-from src.store.file_sweep import FULLY_HELD_SQL, NOT_FULLY_READ_SQL, OCR_GARBLED_SQL
+from src.store.file_sweep import (
+    FULLY_HELD_SQL,
+    IMAGE_SUFFIXES,
+    NOT_FULLY_READ_SQL,
+    OCR_GARBLED_SQL,
+)
 from src.store.source_class import stored_class
 
 logger = logging.getLogger(__name__)
@@ -85,6 +91,15 @@ OVER_BUDGET = "over budget"
 # night after night. A part is reused only while its text and place are unchanged, and the
 # file goes once the merge is done.
 PARTS_DIR = DATA_ROOT / "state" / "attachment_parts"
+
+# When Phase 1 last ran over every kind (process-attachments with no --type, as the nightly pass
+# runs it), a sync_metadata row, so it needs no schema change. The hourly sync leaves images and
+# archives to that pass only while it runs: a host that runs `sync` alone, as the documented cron
+# schedule does, reads them hourly as before.
+TEXT_PASS_KEY = "attachment_text_pass_at"
+# How recent that pass must be: two nights, so one skipped night does not bring images and
+# archives back into the hourly slice, and a pass that stopped for good is noticed in two days.
+TEXT_PASS_FRESH_HOURS = 48.0
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -194,12 +209,47 @@ def _reuse_content(conn: sqlite3.Connection, att_id: int, sha256: str, now: str)
     return status
 
 
+def is_heavy_kind(file_path: str, mime_type: str | None) -> bool:
+    """Whether reading this file can take minutes: an image is OCR'd (up to OCR_MAX_SECONDS) and
+    a zip archive has every member read (up to ZIP_MAX_SECONDS), against the hourly sync's 90 s
+    slice. An image is known by its type or its name, as the file sweep knows one
+    (IMAGE_SUFFIXES), and an archive as the extractor routes one (ZIP_MIME_TYPES or .zip).
+    Archives with no reader (.rar, .7z, .gz) are skipped at once, so they are not heavy."""
+    mime = (mime_type or "").lower()
+    suffix = Path(file_path).suffix.lower()
+    return (
+        mime.startswith("image/")
+        or suffix in IMAGE_SUFFIXES
+        or mime in ZIP_MIME_TYPES
+        or suffix == ".zip"
+    )
+
+
+def record_text_pass(conn: sqlite3.Connection) -> None:
+    """Stamp a Phase 1 pass over every kind, now (UTC): see TEXT_PASS_KEY."""
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES (?, ?)",
+        (TEXT_PASS_KEY, datetime.now(UTC).isoformat()),
+    )
+    conn.commit()
+
+
+def text_pass_is_recent(conn: sqlite3.Connection, now: datetime | None = None) -> bool:
+    """Whether a Phase 1 pass over every kind ran in the last TEXT_PASS_FRESH_HOURS. A missing or
+    unreadable stamp reads as no pass, so the hourly sync keeps reading every kind."""
+    row = conn.execute("SELECT value FROM sync_metadata WHERE key = ?", (TEXT_PASS_KEY,)).fetchone()
+    hours = hours_since(row[0] if row else None, now)
+    return hours is not None and hours < TEXT_PASS_FRESH_HOURS
+
+
 def run_phase1(
     db_path: str | None = None,
     limit: int = 0,
     file_type: str | None = None,
     attachment_ids: list[int] | None = None,
     deadline_s: float | None = None,
+    newest_first: bool = False,
+    defer_heavy: bool = False,
 ) -> dict:
     """Run Phase 1: local text extraction for all unprocessed attachments.
 
@@ -218,10 +268,18 @@ def run_phase1(
             caller under an external timeout — sb-outlook-sync has
             TimeoutStartSec=10min — needs to bound TIME, not count, or it gets
             SIGTERMed mid-file. Same contract as run_backfill(deadline_s=...).
+        newest_first: Take the newest mail first, by its email's received time, instead of in
+            registration order. The hourly sync passes it, so the day's documents are not read
+            after a backlog; the nightly pass keeps registration order.
+        defer_heavy: Leave images and zip archives (is_heavy_kind) without a row, counted as
+            `heavy`, for a pass without it; a copy of a row already held is still taken. The
+            hourly sync passes it while the nightly pass runs. The filter applies to the rows
+            selected, so with `limit` fewer may be read.
 
     Returns:
         Dict with processing stats: processed, extracted, failed, skipped, encrypted (no text
-        without a key, src/extract/attachment_extractors.encrypted_result), deferred, reused.
+        without a key, src/extract/attachment_extractors.encrypted_result), deferred, reused,
+        heavy, and ids: the attachments given a row in this run, in the order read.
     """
     db_path = db_path or str(DEFAULT_DB)
     conn = _connect(db_path)
@@ -230,11 +288,13 @@ def run_phase1(
     # Build query with parameterized conditions
     type_condition, type_params = _build_mime_type_conditions(file_type)
 
-    # Build base query
-    query = """
+    # Build base query. The email is joined only to order by its received time.
+    email_join = "LEFT JOIN emails e ON e.id = a.email_id" if newest_first else ""
+    query = f"""
         SELECT a.id, a.file_path, a.mime_type, a.filename, a.sha256
         FROM attachments a
         LEFT JOIN attachment_content ac ON a.id = ac.attachment_id
+        {email_join}
         WHERE ac.id IS NULL
     """
 
@@ -250,7 +310,13 @@ def run_phase1(
     if type_condition:
         query += f"\n        {type_condition}"
 
-    query += "\n        ORDER BY a.id"
+    if newest_first:
+        # Compared as instants: the store holds received times with a Z, with an offset and
+        # with neither, and as text 11:30+03:00 sorts after 09:00Z. One that does not parse,
+        # or an attachment with no email, goes last.
+        query += "\n        ORDER BY julianday(e.date_received) DESC, a.id DESC"
+    else:
+        query += "\n        ORDER BY a.id"
 
     # Add limit if specified (safe - integer validated)
     if limit > 0:
@@ -259,7 +325,7 @@ def run_phase1(
     # Find attachments not yet in attachment_content
     rows = conn.execute(query, params).fetchall()
 
-    stats = {
+    stats: dict[str, Any] = {
         "processed": 0,
         "extracted": 0,
         "failed": 0,
@@ -267,6 +333,8 @@ def run_phase1(
         "encrypted": 0,
         "deferred": 0,
         "reused": 0,
+        "heavy": 0,
+        "ids": [],
     }
     deadline = None if deadline_s is None else time.monotonic() + deadline_s
 
@@ -286,7 +354,14 @@ def run_phase1(
                 stats["processed"] += 1
                 stats["reused"] += 1
                 stats[reused] = stats.get(reused, 0) + 1
+                stats["ids"].append(att_id)
                 continue
+
+        # After the copy above, which reads no file whatever the kind. Left without a row,
+        # the next pass that reads every kind selects it again.
+        if defer_heavy and is_heavy_kind(file_path, mime_type):
+            stats["heavy"] += 1
+            continue
 
         result = extract_text_from_file(file_path, mime_type or "")
         # Attachments do NOT pass through data/staging, so the redaction applied
@@ -318,6 +393,7 @@ def run_phase1(
 
         stats["processed"] += 1
         stats[result["status"]] = stats.get(result["status"], 0) + 1
+        stats["ids"].append(att_id)
 
     conn.commit()
     conn.close()
@@ -687,9 +763,13 @@ def _phase2_candidates(
     max_text_chars: int | None,
     limit: int,
     select: str = _PHASE2_SELECT,
+    first_ids: Iterable[int] = (),
+    newest_first: bool = False,
 ) -> tuple[str, list]:
     """The query (and its parameters) for the rows Phase 2 summarises, in the order it takes
-    them. `select` is the SELECT and FROM it starts with."""
+    them. `select` is the SELECT and FROM it starts with. `first_ids` (attachment ids) go ahead
+    of the rest; `newest_first` orders the rest by their email's received time, newest first,
+    instead of by id."""
     type_condition, type_params = _build_mime_type_conditions(file_type)
 
     # A text marked as Greek read as Latin look-alikes is never summarised, whatever its
@@ -718,7 +798,15 @@ def _phase2_candidates(
     # Short texts first, then by id. A long document is many calls long, and in id order
     # the long rows of 10-01 came first every night, so 743 short rows waited behind them
     # for days (2026-10-04). A long one cut short now resumes, so going last costs it nothing.
-    query += f"\n        ORDER BY length(ac.extracted_text) > {LONG_TEXT_CHARS}, ac.id"
+    order = [f"length(ac.extracted_text) > {LONG_TEXT_CHARS}", "ac.id"]
+    if newest_first:
+        # As run_phase1 orders them: received times compared as instants.
+        order[1:] = ["julianday(e.date_received) DESC", "ac.id DESC"]
+    first = list(first_ids)
+    if first:
+        order.insert(0, f"ac.attachment_id IN ({','.join('?' * len(first))}) DESC")
+        params.extend(first)
+    query += "\n        ORDER BY " + ", ".join(order)
     if limit > 0:
         query += f"\n        LIMIT {int(limit)}"
     return query, params
@@ -733,6 +821,8 @@ def run_phase2(
     workers: int = 1,
     max_text_chars: int | None = None,
     token_budget: TokenBudget | None = None,
+    first_ids: Iterable[int] | None = None,
+    newest_first: bool = False,
 ) -> dict:
     """Run Phase 2: Vertex AI structured extraction on extracted text.
 
@@ -761,6 +851,11 @@ def run_phase2(
             estimated before it is sent, and the first that would pass the budget stops the
             run: nothing further is dispatched, and the rest are returned as `over_budget`,
             left at llm_status='pending' for the next run. None = no limit.
+        first_ids: Attachment ids to take before the rest, the rest still taken in the time
+            left. The hourly sync passes what Phase 1 has just read, so a document mailed this
+            morning gets its summary in the same run.
+        newest_first: Take the rest by their email's received time, newest first, as the
+            hourly sync's Phase 1 does, instead of by id.
 
     Returns:
         Dict with processing stats: processed, extracted, failed, deferred, over_budget.
@@ -772,7 +867,14 @@ def run_phase2(
     db_path = db_path or str(DEFAULT_DB)
     conn = _connect(db_path)
 
-    query, params = _phase2_candidates(file_type, attachment_ids, max_text_chars, limit)
+    query, params = _phase2_candidates(
+        file_type,
+        attachment_ids,
+        max_text_chars,
+        limit,
+        first_ids=first_ids or (),
+        newest_first=newest_first,
+    )
     flagged = full_parts_ids(conn)
     rows = [_Phase2Row._make((*r, r[1] in flagged)) for r in conn.execute(query, params)]
 

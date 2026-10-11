@@ -52,6 +52,7 @@ class ResultsResult(TypedDict):
 @with_config(_OPEN)
 class PersonContext(TypedDict, total=False):
     person: dict[str, Any] | None
+    resolved_by: str | None
     match_count: int
     other_candidates: list[Any]
     email_count: int
@@ -101,6 +102,7 @@ class SenderBrief(TypedDict, total=False):
     open_actions_count: int
     last_contact: Any
     sentiment: dict[str, Any]
+    resolved_by: str | None
     match_count: int
     other_candidates: list[Any]
 

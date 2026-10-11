@@ -6,6 +6,7 @@ and provides cosine similarity search.
 
 import fcntl
 import gc
+import json
 import os
 import sqlite3
 import sys
@@ -28,7 +29,20 @@ ATTACHMENT_FETCH_CHUNK = 500
 
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_DIM = 3072
+# The task type the documents are embedded with. None sends none, and the queries go the
+# same way.
+EMBEDDING_TASK: str | None = None
+# The version of the texts the vectors are made from: _email_embed_text, the attachment,
+# conversation and WhatsApp prefixes (build_index, _whatsapp_threads_to_embed) and the bare
+# Teams summary. Bump it with any change to them: a vector made from another text is in
+# another space, which an index refuses to mix with its own (embedding_space).
+EMBEDDING_TEMPLATE_VERSION = 1
 EMBEDDINGS_FILE = DATA_ROOT / "embeddings.npz"
+# The npz member naming the space the vectors are in, beside "ids" and "vectors": a JSON
+# object {model, dim, task, template}. Read from its own member, so no check loads a vector.
+SPACE_MEMBER = "space"
+# The sync_metadata key that keeps the same object in the store, for SQL to read.
+EMBEDDING_SPACE_KEY = "embedding_space"
 BATCH_SIZE = 100  # Google API batch limit
 LOG_FILE = DATA_ROOT / "embeddings.log"
 
@@ -47,7 +61,7 @@ WHATSAPP_THREAD_ID_OFFSET = -1_000_000_000
 # the hybrid-recall candidate helper both hit this, so a long-lived process (the MCP
 # server) loads and unit-normalizes the ~1 GB index ONCE instead of on every query.
 # Reloads automatically when embeddings.npz changes (a sync job appended vectors).
-_INDEX_CACHE: dict = {"path": None, "mtime": None, "ids": None, "unit": None}
+_INDEX_CACHE: dict = {"path": None, "mtime": None, "ids": None, "unit": None, "space": None}
 # The HTTP server runs each session's tool call in a worker thread, so callers
 # overlap. Unlocked, every one that missed the cache loaded its own copy: 3.3 GB
 # for two cold callers on the 1.6 GB index, 5 GB for two after a rewrite, against
@@ -55,28 +69,135 @@ _INDEX_CACHE: dict = {"path": None, "mtime": None, "ids": None, "unit": None}
 _CACHE_LOCK = threading.Lock()
 
 
+class IndexSpaceMismatch(RuntimeError):
+    """The index holds vectors of another embedding space than the ones offered to it."""
+
+
+def embedding_space(dim: int = EMBEDDING_DIM) -> dict:
+    """The space this code embeds into: its model, the vectors' dimension, the task type and the
+    version of the texts the vectors are made from. Vectors compare only within one space: a
+    model's space is not another's (gemini-embedding-2's is not 001's), and a task type, an
+    output dimension or another text moves every vector."""
+    return {
+        "model": EMBEDDING_MODEL,
+        "dim": int(dim),
+        "task": EMBEDDING_TASK,
+        "template": EMBEDDING_TEMPLATE_VERSION,
+    }
+
+
+def _space_array(space: dict) -> np.ndarray:
+    return np.array(json.dumps(space, sort_keys=True))
+
+
+def _parse_space(array: np.ndarray) -> dict:
+    return json.loads(str(array[()]))
+
+
+def _archive_space(archive: zipfile.ZipFile) -> dict | None:
+    """The space recorded in an open index archive, or None when it records none."""
+    name = f"{SPACE_MEMBER}.npy"
+    if name not in archive.namelist():
+        return None
+    with archive.open(name) as member:
+        return _parse_space(np.lib.format.read_array(member, allow_pickle=False))
+
+
+def _npz_space(data) -> dict | None:
+    """The space recorded in an index opened with np.load, or None when it records none."""
+    return _parse_space(data[SPACE_MEMBER]) if SPACE_MEMBER in data.files else None
+
+
+def index_space(index_path=None) -> dict | None:
+    """The space the index records, read without its vectors; None for an index saved before
+    the space was recorded, and for no index at all."""
+    path = EMBEDDINGS_FILE if index_path is None else Path(index_path)
+    if not path.exists():
+        return None
+    with zipfile.ZipFile(path) as archive:
+        return _archive_space(archive)
+
+
+def _width(vectors) -> int:
+    return int(vectors.shape[1]) if vectors.ndim == 2 else 0
+
+
+def _differences(held: dict, offered: dict) -> str:
+    return ", ".join(
+        f"{key} {held.get(key)!r} (offered {offered.get(key)!r})"
+        for key in ("model", "dim", "task", "template")
+        if held.get(key) != offered.get(key)
+    )
+
+
+def _refuse_mix(held: dict, offered: dict) -> None:
+    raise IndexSpaceMismatch(
+        f"{EMBEDDINGS_FILE} holds vectors of another embedding space than the ones offered to "
+        f"it: {_differences(held, offered)}. Refusing to mix two spaces in one index. Rebuild "
+        "it in this code's space with `python -m src.cli embed --force`; the next teams-sync "
+        "and whatsapp-sync add their vectors back."
+    )
+
+
+def _merge_space(held: dict | None, width: int, offered: dict) -> None:
+    """Refuse vectors of `offered` space a place in an index of another one.
+
+    `held` is what the index records; an index saved before the space was recorded is taken as
+    this code's space at its own vectors' `width`, and gets the space written on this save.
+    """
+    if held is None:
+        held = embedding_space(width)
+    if held != offered:
+        _refuse_mix(held, offered)
+
+
+def _record_space(conn: sqlite3.Connection, space: dict) -> None:
+    """Keep the space of the index just saved in sync_metadata too, where SQL can read it with
+    no index at hand. Written and committed only when it changed, so an hourly save neither
+    writes nor commits anything the caller left pending."""
+    conn.execute("CREATE TABLE IF NOT EXISTS sync_metadata (key TEXT PRIMARY KEY, value TEXT)")
+    value = json.dumps(space, sort_keys=True)
+    row = conn.execute(
+        "SELECT value FROM sync_metadata WHERE key = ?", (EMBEDDING_SPACE_KEY,)
+    ).fetchone()
+    if row is None or row[0] != value:
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES (?, ?)",
+            (EMBEDDING_SPACE_KEY, value),
+        )
+        conn.commit()
+
+
 def _load_index(index_path=None):
-    """Return (ids, unit_vectors) for the embedding index, cached by file mtime.
+    """Return (ids, unit_vectors) for the embedding index; see _load_index_and_space."""
+    ids, unit, _space = _load_index_and_space(index_path)
+    return ids, unit
+
+
+def _load_index_and_space(index_path=None):
+    """Return (ids, unit_vectors, space) for the embedding index, cached by file mtime.
 
     Vectors are L2-normalized once at load, so cosine similarity at query time is a
-    single matrix-vector product. Raises FileNotFoundError if no index exists.
+    single matrix-vector product. `space` is what the index records, None for an index
+    saved before it was recorded. Raises FileNotFoundError if no index exists.
     Concurrent callers share one load: the others wait for it, then read the cache.
     """
     path = EMBEDDINGS_FILE if index_path is None else Path(index_path)
     if not path.exists():
         raise FileNotFoundError("No embedding index found. Run 'python -m src.cli embed' first.")
     with _CACHE_LOCK:
-        # The hit is checked under the lock as well: the cache is four fields, and
+        # The hit is checked under the lock as well: the cache is five fields, and
         # a check outside it could match the path and mtime, then read the None a
         # reload had just put in their place.
         mtime = path.stat().st_mtime
         if _INDEX_CACHE["path"] == str(path) and _INDEX_CACHE["mtime"] == mtime:
-            return _INDEX_CACHE["ids"], _INDEX_CACHE["unit"]
+            return _INDEX_CACHE["ids"], _INDEX_CACHE["unit"], _INDEX_CACHE["space"]
         # Let go of the stale index before reading the new one, so a reload holds
         # one index, plus the old one only while a reader is still mid-call.
-        _INDEX_CACHE.update({"path": None, "mtime": None, "ids": None, "unit": None})
+        _INDEX_CACHE.update({"path": None, "mtime": None, "ids": None, "unit": None, "space": None})
         data = np.load(path, allow_pickle=False)
         ids = data["ids"]
+        space = _npz_space(data)
         # Normalise IN PLACE. `vectors` is a fresh array this call owns, so dividing
         # into it is safe, and it is the difference between one 1.44 GB allocation
         # and three: `vectors / norms` builds a second full array and `.astype()`
@@ -91,8 +212,10 @@ def _load_index(index_path=None):
         norms[norms == 0] = 1
         vectors /= norms
         unit = vectors
-        _INDEX_CACHE.update({"path": str(path), "mtime": mtime, "ids": ids, "unit": unit})
-        return ids, unit
+        _INDEX_CACHE.update(
+            {"path": str(path), "mtime": mtime, "ids": ids, "unit": unit, "space": space}
+        )
+        return ids, unit, space
 
 
 def _log(msg: str):
@@ -148,12 +271,18 @@ def _indexed_ids() -> set[int]:
 
     Refuses a misaligned file here, before anyone pays for embeddings: the
     vector count comes from the .npy header inside the archive, not the data.
+    And a file of another model, task type or text template: the vectors this
+    code would add could not join it. The dimension of the vectors offered is
+    known only once they are made, and is checked at the merge.
     """
     if not EMBEDDINGS_FILE.exists():
         return set()
-    # One handle for both members: a writer's atomic replace between two opens
+    # One handle for every member: a writer's atomic replace between two opens
     # would pair the old ids with the new header and read as misalignment.
     with zipfile.ZipFile(EMBEDDINGS_FILE) as archive:
+        space = _archive_space(archive)
+        if space is not None:
+            _merge_space(space, 0, embedding_space(space.get("dim", EMBEDDING_DIM)))
         with archive.open("ids.npy") as member:
             raw_ids = np.lib.format.read_array(member, allow_pickle=False)
         with archive.open("vectors.npy") as member:
@@ -172,8 +301,8 @@ def _indexed_ids() -> set[int]:
     return ids
 
 
-def _atomic_savez(path, ids, vectors) -> None:
-    """Persist the id/vector arrays to ``path`` atomically.
+def _atomic_savez(path, ids, vectors, space: dict | None = None) -> None:
+    """Persist the id/vector arrays to ``path`` atomically, with the space they are in.
 
     ``np.savez`` streams the (~1 GB) archive to its target incrementally, so a
     process killed mid-write — e.g. an OOM SIGKILL during a sync — leaves a
@@ -181,12 +310,24 @@ def _atomic_savez(path, ids, vectors) -> None:
     Writing to a sibling temp file and ``replace``-ing it into place means
     ``path`` is only ever the previous good archive or the complete new one,
     never a half-written zip.
+
+    ``space`` goes in the SPACE_MEMBER member. None means this code's space at the
+    vectors' width: what build_index and _append_to_index save, having merged only
+    vectors of that space. remove_vectors passes the space the file records.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    vectors = np.asarray(vectors)
+    if space is None:
+        space = embedding_space(_width(vectors))
     # np.savez auto-appends ".npz" if missing — strip it from our tmp basename.
     tmp_base = path.with_suffix(".tmp")  # e.g. .../embeddings.tmp
-    np.savez(tmp_base, ids=np.asarray(ids, dtype=np.int64), vectors=vectors)
+    np.savez(
+        tmp_base,
+        ids=np.asarray(ids, dtype=np.int64),
+        vectors=vectors,
+        space=_space_array(space),  # the member SPACE_MEMBER names
+    )
     tmp_path = tmp_base.with_suffix(".tmp.npz")  # actual file np.savez wrote
     tmp_path.replace(path)
 
@@ -508,18 +649,21 @@ def build_index(conn: sqlite3.Connection, force: bool = False) -> int:
     texts = [t[1] for t in to_embed]
 
     new_vectors = generate_embeddings(texts, client)
+    space = embedding_space(_width(new_vectors))
 
     with _index_lock():
         # A force rebuild rewrites the file from what this function owns
-        # (emails, attachments, conversations). Teams vectors it drops come
-        # back on the next teams-sync, which selects by membership in the file.
+        # (emails, attachments, conversations), in this code's space. Teams vectors
+        # it drops come back on the next teams-sync, which selects by membership
+        # in the file.
         if force or not EMBEDDINGS_FILE.exists():
             all_ids = ids
             all_vectors = new_vectors
         else:
             # Merge into the file AS IT IS NOW, in file order (never set order;
             # see the comment above). Ids another writer added since the
-            # snapshot are kept, and not duplicated.
+            # snapshot are kept, and not duplicated. Its space is checked again
+            # here: another writer may have rebuilt it since the snapshot.
             data = np.load(EMBEDDINGS_FILE, allow_pickle=False)
             existing_id_order = [int(x) for x in data["ids"]]
             existing_vectors = data["vectors"]
@@ -529,6 +673,7 @@ def build_index(conn: sqlite3.Connection, force: bool = False) -> int:
                     f"{len(existing_vectors)} vectors; refusing to extend a "
                     "misaligned index"
                 )
+            _merge_space(_npz_space(data), _width(existing_vectors), space)
             present = set(existing_id_order)
             fresh = [i for i, vid in enumerate(ids) if vid not in present]
             # Fresh ones too: a conversation loaded again while it was embedded.
@@ -555,6 +700,7 @@ def build_index(conn: sqlite3.Connection, force: bool = False) -> int:
         _atomic_savez(EMBEDDINGS_FILE, all_ids, all_vectors)
 
     _log(f"Saved {len(all_ids)} embeddings to {EMBEDDINGS_FILE}")
+    _record_space(conn, space)
     return len(to_embed)
 
 
@@ -668,18 +814,53 @@ def _keyword_seed_vector(conn: sqlite3.Connection, query: str, ids, unit) -> np.
     return unit[rows].mean(axis=0)
 
 
+def _require_query_space(space: dict | None) -> None:
+    """Raise IndexSpaceMismatch unless this code embeds queries into the index's space.
+
+    A query is embedded as typed, so the model and the task type decide where it
+    lands; the template is how the documents' texts were built and moves no query.
+    An index saved before the space was recorded is taken as this code's.
+    """
+    if space is None:
+        return
+    wanted = {"model": EMBEDDING_MODEL, "task": EMBEDDING_TASK}
+    differ = ", ".join(
+        f"{key} {space.get(key)!r} (this code {value!r})"
+        for key, value in wanted.items()
+        if space.get(key) != value
+    )
+    if differ:
+        raise IndexSpaceMismatch(
+            f"the index is in another embedding space than this code embeds queries into: "
+            f"{differ}; rebuild it with `python -m src.cli embed --force`"
+        )
+
+
 def _query_vector(
-    conn: sqlite3.Connection, query: str, ids, unit, embed
+    conn: sqlite3.Connection, query: str, ids, unit, embed, space: dict | None = None
 ) -> tuple[np.ndarray, str | None]:
     """The query's unit vector, and how it was made: None, or 'keyword_seeded: <error type>'.
 
-    When the model cannot embed the query, the vector is the centroid of its best
-    keyword matches. Raises the embedding error when no keyword match can stand in.
+    When the model cannot embed the query, or would embed it into another space than
+    the index's (`space`, what the index records), the vector is the centroid of its
+    best keyword matches, whose vectors are the index's own. Raises the error when no
+    keyword match can stand in.
     """
     try:
+        _require_query_space(space)
         vector = np.asarray(embed([query])[0], dtype=np.float32)
+        if vector.shape != (_width(unit),):
+            raise IndexSpaceMismatch(
+                f"the query's vector has dim {vector.size} and the index's vectors "
+                f"dim {_width(unit)}"
+            )
         seeded = None
-    except Exception as e:  # the model is unreachable; the index is not
+    except Exception as e:  # the model is unreachable, or in another space; the index is not
+        if isinstance(e, IndexSpaceMismatch):
+            print(
+                f"semantic search: {e}. Ranking around the keyword matches' vectors instead.",
+                file=sys.stderr,
+            )
         seed = _keyword_seed_vector(conn, query, ids, unit)
         if seed is None:
             raise
@@ -728,12 +909,14 @@ def query_semantic(
         List of dicts with keys: email_id, date, subject, summary, similarity;
         email and attachment rows carry their email's source_class
     """
-    # Index load + unit-normalization is cached across calls (see _load_index),
+    # Index load + unit-normalization is cached across calls (see _load_index_and_space),
     # so a long-lived process pays the ~1 GB read once, not per query.
-    ids, normalized = _load_index(index_path)
+    ids, normalized, space = _load_index_and_space(index_path)
 
     try:
-        query_norm, seeded = _query_vector(conn, query, ids, normalized, embed_fn or embed_query)
+        query_norm, seeded = _query_vector(
+            conn, query, ids, normalized, embed_fn or embed_query, space
+        )
     except Exception as e:
         raise SemanticUnavailable(
             "semantic search unavailable: the query could not be embedded "
@@ -901,8 +1084,8 @@ def semantic_email_candidates(
     stood in for by its keyword matches. News items and the owner's automation mail,
     and their attachments, are left out unless included (src/store/source_class.py).
     """
-    ids, normalized = _load_index(index_path)
-    query_norm, seeded = _query_vector(conn, query, ids, normalized, embed_fn or embed_query)
+    ids, normalized, space = _load_index_and_space(index_path)
+    query_norm, seeded = _query_vector(conn, query, ids, normalized, embed_fn or embed_query, space)
     similarities = normalized @ query_norm
     # Over-fetch: several attachment vectors can collapse onto one email, so we
     # need headroom to fill `limit` emails. Other kinds, and the classes a read
@@ -927,19 +1110,24 @@ def semantic_email_candidates(
     return SemanticCandidates(out, semantic=seeded or "ok")
 
 
-def _append_to_index(ids: list[int], vectors) -> None:
-    """Append (id, vector) rows to EMBEDDINGS_FILE.
+def _append_to_index(ids: list[int], vectors) -> dict:
+    """Append (id, vector) rows to EMBEDDINGS_FILE; returns the space saved.
 
-    EMBEDDINGS_FILE format: npz with arrays 'ids' (int64) and 'vectors' (float32).
-    Re-saves the merged arrays atomically. Existing ids are replaced (so re-embedding
-    the same teams_thread overwrites its prior vector instead of duplicating it).
-    Load, merge and save all happen under the index lock (see _index_lock).
+    EMBEDDINGS_FILE format: npz with arrays 'ids' (int64) and 'vectors' (float32),
+    and the space they are in (SPACE_MEMBER). Re-saves the merged arrays atomically.
+    Existing ids are replaced (so re-embedding the same teams_thread overwrites its
+    prior vector instead of duplicating it). Vectors of another space than the
+    file's are refused. Load, merge and save all happen under the index lock (see
+    _index_lock).
     """
+    vectors = np.asarray(vectors)
+    space = embedding_space(_width(vectors))
     with _index_lock():
         if EMBEDDINGS_FILE.exists():
             existing = np.load(EMBEDDINGS_FILE, allow_pickle=False)
             old_ids = existing["ids"]
             old_vecs = existing["vectors"]
+            _merge_space(_npz_space(existing), _width(old_vecs), space)
             # Drop any rows whose id matches one we're inserting (replace semantics).
             keep = ~np.isin(old_ids, np.array(ids, dtype=np.int64))
             merged_ids = np.concatenate([old_ids[keep], np.array(ids, dtype=np.int64)])
@@ -951,6 +1139,7 @@ def _append_to_index(ids: list[int], vectors) -> None:
             merged_ids = np.array(ids, dtype=np.int64)
             merged_vecs = vectors
         _atomic_savez(EMBEDDINGS_FILE, merged_ids, merged_vecs)
+    return space
 
 
 def _teams_threads_to_embed(conn, indexed: set[int] | None = None) -> list[tuple[int, str]]:
@@ -1016,7 +1205,7 @@ def build_teams_index(conn, force: bool = False, limit: int = 0) -> int:
     # query_semantic guard `item_id <= TEAMS_THREAD_ID_OFFSET` actually fires.
     # The earlier i+OFFSET form silently fell into the conversation routing
     # branch and degraded semantic search. Validation gate caught it.
-    _append_to_index(
+    space = _append_to_index(
         ids=[TEAMS_THREAD_ID_OFFSET - i for i in ids],
         vectors=vecs,
     )
@@ -1028,6 +1217,7 @@ def build_teams_index(conn, force: bool = False, limit: int = 0) -> int:
             (now, tid),
         )
     conn.commit()
+    _record_space(conn, space)
     return len(ids)
 
 
@@ -1077,11 +1267,12 @@ def build_whatsapp_index(conn, force: bool = False, limit: int = 0) -> int:
     if not pairs:
         return 0
     vecs = generate_embeddings([p[1] for p in pairs])
-    _append_to_index(ids=[WHATSAPP_THREAD_ID_OFFSET - p[0] for p in pairs], vectors=vecs)
+    space = _append_to_index(ids=[WHATSAPP_THREAD_ID_OFFSET - p[0] for p in pairs], vectors=vecs)
     now = datetime.now(UTC).isoformat()
     for tid, _text in pairs:
         conn.execute("UPDATE whatsapp_threads SET embedding_at = ? WHERE id = ?", (now, tid))
     conn.commit()
+    _record_space(conn, space)
     return len(pairs)
 
 
@@ -1111,7 +1302,12 @@ def remove_vectors(ids) -> int:
         keep = np.array([vid not in drop for vid in order], dtype=bool)
         removed = len(order) - int(keep.sum())
         if removed:
-            _atomic_savez(EMBEDDINGS_FILE, [v for v in order if v not in drop], vectors[keep])
+            # Removing adds no vector, so the file keeps the space it records, whatever it
+            # is; one saved before the space was recorded is this code's at its width.
+            space = _npz_space(data) or embedding_space(_width(vectors))
+            _atomic_savez(
+                EMBEDDINGS_FILE, [v for v in order if v not in drop], vectors[keep], space
+            )
         del data, vectors
         gc.collect()
     if removed:

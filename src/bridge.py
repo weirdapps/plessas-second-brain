@@ -30,7 +30,8 @@ def sender_brief(conn, name_or_email: str, days: int = 365) -> dict:
 
     Returns:
         Dict with: known (bool), name, email, role, email_count,
-        top_topics, recent_decisions, open_actions_count, last_contact
+        top_topics, recent_decisions, open_actions_count, last_contact,
+        resolved_by, match_count, other_candidates
     """
     from src.store.context import get_person_context
 
@@ -54,7 +55,9 @@ def sender_brief(conn, name_or_email: str, days: int = 365) -> dict:
         "open_actions_count": ctx["open_actions_total"],
         "last_contact": ctx["communication_pattern"].get("last_email_date", ""),
         "sentiment": ctx["sentiment_distribution"],
-        # A name can match several people; the most-emailed is the one above.
+        # A name can fit several people: how this one was found, how many it
+        # could be, and the next ones (src/store/person_resolve.py).
+        "resolved_by": ctx["resolved_by"],
         "match_count": ctx["match_count"],
         "other_candidates": ctx["other_candidates"],
     }

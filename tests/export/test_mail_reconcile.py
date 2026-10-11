@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
+from src import config
 from src.export import mail_reconcile as mr
 from src.store import sql_readonly
 from src.store.schema import create_database
@@ -22,7 +23,7 @@ from src.store.schema import create_database
 @pytest.fixture(autouse=True)
 def _no_pull_stamp(tmp_path, monkeypatch):
     """Open the store the producer's way on any host (see tests/test_sql_readonly.py)."""
-    monkeypatch.setattr(sql_readonly, "REPLICA_STAMP", tmp_path / "absent-db-pull.stamp")
+    monkeypatch.setattr(config, "REPLICA_STAMP", tmp_path / "absent-db-pull.stamp")
 
 
 def _when(text):

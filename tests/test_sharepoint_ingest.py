@@ -269,6 +269,7 @@ def test_the_mcp_refetch_keeps_no_file(conn, monkeypatch):
     record_link_in_db(conn, url=URL, message_id="AAMk-1", status="http-error")
     monkeypatch.setattr(config, "SHAREPOINT_HOST", "tenant.example.com")
     monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
+    monkeypatch.setattr(mcp_server, "_get_write_conn", lambda: conn)
     seen: list = []
     _fake_fetch(monkeypatch, seen=seen)
 

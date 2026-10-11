@@ -101,6 +101,19 @@ def is_replica() -> bool:
     return REPLICA_STAMP.exists()
 
 
+def is_pulled_copy() -> bool:
+    """Whether the store here is a copy the pull put in place, which nothing writes.
+
+    The pull stamps REPLICA_STAMP and renames each verified copy over the store, so
+    only there may a reader skip SQLite's locks (immutable=1). BRAIN_ROLE=producer
+    overrides the stamp, as it does for is_replica(). BRAIN_ROLE=replica alone is not
+    enough: the producer serves with it while its timers write the same file.
+    """
+    if os.environ.get("BRAIN_ROLE", "").strip().lower() == "producer":
+        return False
+    return REPLICA_STAMP.exists()
+
+
 def replica_refusal(what: str) -> str:
     """The message that refuses `what` on a host where is_replica() holds."""
     if os.environ.get("BRAIN_ROLE", "").strip().lower() == "replica":
@@ -142,7 +155,7 @@ GEMINI_MODEL = os.environ.get("BRAIN_GEMINI_MODEL", "gemini-2.5-flash")
 # The Claude model and its Vertex region have no default: src/extract/claude_extract.py.
 
 # Schema version — bump when adding migrations (must match number of migrations in schema.py)
-CURRENT_SCHEMA_VERSION = 33
+CURRENT_SCHEMA_VERSION = 34
 
 ATTACHMENTS_DIR = DATA_ROOT / "attachments"
 RAW_BATCH_DIR = DATA_ROOT / "raw"

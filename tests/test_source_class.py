@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pytest
 
+from src.config import CURRENT_SCHEMA_VERSION
 from src.store import source_class as sc
 from src.store.schema import create_database, get_connection, get_schema_version, run_migrations
 
@@ -118,13 +119,23 @@ def test_edge_cases_of_the_stamp(subject, expected):
     ("address", "pattern", "expected"),
     [
         ("owner@example.com", "owner@example.com", True),
-        ("first.owner@example.com", "owner@example.com", True),
         ("OWNER@EXAMPLE.COM", "owner@example.com", True),
         (" owner@example.com ", "Owner@Example.com", True),
-        ("nikos.owner@example.com", "owner", True),  # a pattern without a domain: the local part
+        # A colleague whose address ends in the owner's is someone else: matched at
+        # the end, k.owner@ would have become the owner.
+        ("first.owner@example.com", "owner@example.com", False),
+        ("k.owner@example.com", "owner@example.com", False),
+        # A list of the owner's addresses, comma or whitespace separated: each whole.
+        ("alias@example.org", "owner@example.com, alias@example.org", True),
+        ("owner@example.com", "owner@example.com alias@example.org", True),
+        ("ALIAS@example.org", "owner@example.com,alias@example.org", True),
+        ("other@example.org", "owner@example.com, alias@example.org", False),
+        # A bare local part is that local part, whole, at any domain.
         ("owner@example.com", "owner", True),
         ("owner@example.org", "owner@", True),
-        ("someone@example.com", "@example.com", True),  # a domain alone: all of it, as before
+        ("nikos.owner@example.com", "owner", False),
+        # A domain alone would make every colleague the owner: it matches no one.
+        ("someone@example.com", "@example.com", False),
         ("someone@example.com.example.net", "@example.com", False),
         # The pattern inside someone else's address is not the owner
         ("owner@example.com.example.net", "owner@example.com", False),
@@ -132,10 +143,11 @@ def test_edge_cases_of_the_stamp(subject, expected):
         ("owner.someone@example.com", "owner", False),
         ("notowner@example.com", "owner", False),
         ("owner@example.com", "", False),  # an empty pattern matches no one
+        ("owner@example.com", " , ", False),
         (None, "owner@example.com", False),
     ],
 )
-def test_the_owner_is_matched_at_the_end_of_his_address(address, pattern, expected):
+def test_the_owner_is_one_of_his_listed_addresses(address, pattern, expected):
     """The same rule decides the calendar's 'self' flags and the owner's automation mail."""
     from src.store.calendar_loader import _is_self_email
     from src.store.owner import is_owner_address
@@ -149,6 +161,14 @@ def test_mail_from_an_address_that_holds_the_owner_pattern_is_mail():
     itself passed for the owner's automation and was hidden from every default read."""
     lookalike = "owner@example.com.example.net"
     assert sc.classify("Inbox", lookalike, "[ALERT] wire the funds", [lookalike], OWNER) == "mail"
+
+
+def test_stamped_mail_from_any_listed_owner_address_is_automation_and_a_colleagues_is_not():
+    owner = "owner@example.com, alias@example.org"
+    alias, colleague = "alias@example.org", "k.owner@example.com"
+
+    assert sc.classify("Sent Items", alias, "[VPS] backup", [alias], owner) == "automation"
+    assert sc.classify("Inbox", colleague, "[VPS] backup", [colleague], owner) == "mail"
 
 
 def test_the_owner_is_the_configured_one_by_default(monkeypatch):
@@ -473,7 +493,7 @@ def test_the_migration_classifies_a_v32_store(tmp_path, monkeypatch):
 
     run_migrations(conn)
 
-    assert get_schema_version(conn) == 33
+    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION
     assert dict(conn.execute("SELECT id, source_class FROM emails").fetchall()) == expected
     assert "idx_emails_source_class" in {r[1] for r in conn.execute("PRAGMA index_list(emails)")}
     # The full-text trigger was set aside for the backfill and is back as it was
@@ -501,7 +521,7 @@ def test_the_migration_is_idempotent(tmp_path, monkeypatch):
     migrate_add_source_class(conn)
     run_migrations(conn)
 
-    assert get_schema_version(conn) == 33
+    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION
     assert dict(conn.execute("SELECT id, source_class FROM emails").fetchall()) == expected
     conn.close()
 

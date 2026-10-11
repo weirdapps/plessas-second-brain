@@ -43,6 +43,7 @@ from src.mcp_results import (
 )
 from src.store.calendar_query import ATTENDEES_MAX, ATTENDEES_SHOWN
 from src.store.schema import get_connection
+from src.store.sql_readonly import connect_read_only
 
 # Routing text, not marketing. Under tool search only the tool NAMES and this
 # string load at session start, so this is what decides whether the brain gets
@@ -91,8 +92,8 @@ not yet synced here, is on the separate WhatsApp MCP server.\
 """
 
 # REPLICA is true only where the hourly pull runs: over HTTP on the producer the
-# store is the master. The pull stamp decides, as it does for sql_query's open,
-# never BRAIN_ROLE: the producer serves with BRAIN_ROLE=replica.
+# store is the master. The pull stamp decides, as it does for the read-only open,
+# never BRAIN_ROLE=replica: the producer serves with it.
 _REPLICA_FRESHNESS = """\
 Freshness. This is a REPLICA, synced from the machine that builds it, so it can \
 lag. `stats` returns data_as_of / age_hours / stale, and `recall` attaches \
@@ -197,7 +198,18 @@ def _inert(value: Any) -> Any:
 
 
 def _get_conn():
-    """Get a database connection with row factory."""
+    """The store, read-only: every tool reads through this, and a write through it raises.
+
+    It asks for immutable=1, which only a pulled copy grants: the Mac reads the file
+    the pull verified, without locks or a -wal. Everywhere else, the producer's HTTP
+    server included, it opens read-only with SQLite's locking (connect_read_only).
+    """
+    return connect_read_only(DEFAULT_DB, immutable=True)
+
+
+def _get_write_conn():
+    """The store, read-write, for the one write a tool makes: sharepoint_index's refetch
+    records what it fetched. A replica refuses the refetch before this is reached."""
     return get_connection(str(DEFAULT_DB))
 
 
@@ -281,10 +293,11 @@ def person_context(
     name_or_email: Annotated[
         str,
         Field(
-            description="A name or address, case and accent blind. A name matches at the "
-            "start of a word ('Papa' finds Papadopoulos), a last word of one or two letters "
-            "is an initial, and one Latin word of 4+ letters also matches an address's "
-            "local part ('jexample', 'john.example')."
+            description="The address when you have one (exact), else a name: case, accent "
+            "and script blind ('Papadopoulos' finds Παπαδόπουλος), each word at the start "
+            "of a word in any order ('Papa' finds Papadopoulos), a short last word an "
+            "initial; one Latin word of 4+ letters also matches an address's local part "
+            "('jexample', 'john.example')."
         ),
     ],
     days: Days = 365,
@@ -297,11 +310,12 @@ def person_context(
     """Brief me on a person: their email history, topics, sentiment, decisions, open actions, communication pattern, meetings (last_met, next_meeting, meeting_count_30d), and their Teams and WhatsApp activity.
 
     Each list is capped at `limit` and has a `<name>_total` sibling with the real
-    count, so a complete answer reads apart from the head of a long one. An
-    ambiguous name resolves to the most-emailed match; match_count and
-    other_candidates say who else it could be. News and the owner's automation
-    mail are left out unless included. Use sender_brief for a short card,
-    meeting_prep for several people at once.
+    count, so a complete answer reads apart from the head of a long one. A name
+    resolves to someone with an address before a mere mention, then the
+    most-emailed: resolved_by says how ('email', 'mri', 'jid', 'name', 'alias'),
+    match_count how many people the name fits, other_candidates who else, with
+    their identifier. News and the owner's automation mail are left out unless
+    included. Use sender_brief for a short card, meeting_prep for several people.
     """
     from src.store.context import get_person_context
 
@@ -370,7 +384,8 @@ def sender_brief(
 ) -> SenderBrief:
     """Who is this sender: a short card with known or not, role, how much mail, top topics, decision and open-action counts, and last contact.
 
-    For inbox triage and mail review; person_context gives the full dossier.
+    For inbox triage and mail review; person_context gives the full dossier. Pass
+    the address: resolved_by and match_count say how sure a name match is.
     """
     from src.bridge import sender_brief as _sender_brief
 
@@ -777,7 +792,13 @@ def stale_threads(
 
 @_tool()
 def meeting_prep(
-    people: Annotated[str, Field(description="Attendee names or addresses, separated by commas.")],
+    people: Annotated[
+        str,
+        Field(
+            description="Attendees separated by commas: each one's address when you have "
+            "it (exact), else the name."
+        ),
+    ],
     topic: Annotated[str | None, Field(description="The meeting's topic, to focus on.")] = None,
     days: Days = 365,
     include_news: IncludeNews = False,
@@ -785,9 +806,9 @@ def meeting_prep(
 ) -> MeetingPrep:
     """Prepare me for a meeting: a dossier per attendee (emails, decisions, open actions, topics, sentiment), `meetings` (the next and last ones they share with me, each with its purpose and a dozen attendees), and the topic's context when one is given.
 
-    Each name resolves as person_context resolves it, with match_count and
-    other_candidates when it is ambiguous. News and the owner's automation mail
-    are left out unless included.
+    Each attendee resolves as person_context resolves it, with resolved_by,
+    match_count and other_candidates. News and the owner's automation mail are
+    left out unless included.
     """
     from src.store.query import meeting_prep as _mp
 
@@ -1288,17 +1309,21 @@ def sharepoint_index(
 
         # Fetched into a temporary directory and stored as text; no file is kept.
         msg_id = msg_id_row["message_id"]
-        result, document = sharepoint_ingest.fetch_and_ingest(conn, url, msg_id)
-        sharepoint_fetcher.record_link_in_db(
-            conn,
-            url=url,
-            message_id=msg_id,
-            status=result.status,
-            fetched_path=None,
-            file_name=result.file_name,
-            file_size=result.file_size,
-            document_message_id=document,
-        )
+        writer = _get_write_conn()
+        try:
+            result, document = sharepoint_ingest.fetch_and_ingest(writer, url, msg_id)
+            sharepoint_fetcher.record_link_in_db(
+                writer,
+                url=url,
+                message_id=msg_id,
+                status=result.status,
+                fetched_path=None,
+                file_name=result.file_name,
+                file_size=result.file_size,
+                document_message_id=document,
+            )
+        finally:
+            writer.close()
         return {"status": result.status, "document_message_id": document}
     finally:
         conn.close()

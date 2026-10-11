@@ -6,9 +6,9 @@ import sys
 
 import pytest
 
+from src import config
 from src.export import mail_reconcile as mr
 from src.export.outlook_cli import OutlookCliAuthRequired, OutlookCliError
-from src.store import sql_readonly
 from src.store.schema import create_database, get_connection
 
 LISTING = {
@@ -31,7 +31,7 @@ LISTING = {
 
 @pytest.fixture
 def db(tmp_path, monkeypatch):
-    monkeypatch.setattr(sql_readonly, "REPLICA_STAMP", tmp_path / "absent-db-pull.stamp")
+    monkeypatch.setattr(config, "REPLICA_STAMP", tmp_path / "absent-db-pull.stamp")
     path = tmp_path / "brain.db"
     conn = create_database(str(path))
     conn.execute(

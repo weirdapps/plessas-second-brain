@@ -9,7 +9,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from src.export.state import load_json_or_quarantine
+from src.export.state import load_json_or_quarantine, write_json_atomic
 from src.extract.extraction_files import read_extraction
 from src.extract.parser import _as_string_list
 from src.redact import redact_secrets
@@ -689,8 +689,11 @@ def stored_email(conn: sqlite3.Connection, email_id: int) -> dict:
 def load_conversations(db_path: str) -> int:
     """Load extracted conversations from JSON files into the database.
 
-    Reads conversation batch files from staging/conversations/ and
-    corresponding extraction files from extracted/conversations/.
+    Reads the staged copies in staging/conversations/ (src/export/conversation_export.py)
+    and the extractions in extracted/conversations/ of the sessions staged there, the only
+    ones that can load. Then removes the staged copies nothing can use any more
+    (_prune_staged_conversations): the staging dir held every batch ever written, 773 MB on
+    the producer, and every load and extraction parsed all of it.
 
     Args:
         db_path: Path to SQLite database
@@ -699,6 +702,7 @@ def load_conversations(db_path: str) -> int:
         Number of conversations successfully loaded
     """
     from src.config import DATA_ROOT
+    from src.export.conversation_export import read_staged_conversations
 
     from .schema import get_connection, run_migrations
 
@@ -711,41 +715,103 @@ def load_conversations(db_path: str) -> int:
     conn = get_connection(db_path)
     run_migrations(conn)
 
-    extractions = {}
-    for extraction_file in sorted(extracted_dir.glob("*.json")):
-        with open(extraction_file, encoding="utf-8") as f:
-            extractions[extraction_file.stem] = json.load(f)
-
     # Each extraction loads with the copy of its session it read, where that is
     # still staged, not with the newest copy, which is ahead of it when the
     # session went on between the two; else with the newest. Only those two
-    # copies of a session are kept: every batch ever written is still on disk.
-    newest: dict[str, dict] = {}
-    read: dict[str, dict] = {}
-    for batch_file in sorted(staging_dir.glob("conversation-batch-*.json")):
-        batch = load_json_or_quarantine(batch_file)
-        if batch is None:
-            continue
-        for conv in batch.get("conversations", []):
+    # copies of a session are kept in memory, each with where it was staged
+    # (file, position); of every file, which sessions it held where.
+    extractions: dict[str, dict] = {}
+    newest: dict[str, tuple[Path, int, dict]] = {}
+    read: dict[str, tuple[Path, int, dict]] = {}
+    held_by: dict[Path, list[tuple[str, int]]] = {}
+    for path, conversations in read_staged_conversations(staging_dir):
+        places = held_by.setdefault(path, [])
+        for index, conv in enumerate(conversations):
             session_id = conv["session_id"]
-            newest[session_id] = conv
+            if session_id not in newest:  # first seen: its extraction, if any
+                extraction = _staged_session_extraction(extracted_dir, session_id)
+                if extraction is not None:
+                    extractions[session_id] = extraction
+            places.append((session_id, index))
+            newest[session_id] = (path, index, conv)
             extraction = extractions.get(session_id)
             ended_at = str(conv.get("ended_at") or "")
             if extraction is not None and extraction.get("transcript_ended_at") == ended_at:
-                read[session_id] = conv
+                read[session_id] = (path, index, conv)
 
     loaded_count = 0
-    for session_id, extraction in extractions.items():
-        metadata = read.get(session_id) or newest.get(session_id)
-        if metadata is None:
-            continue
-
-        if load_single_conversation(conn, metadata, extraction):
+    # In the order of the extraction files' names, as the directory was read.
+    for session_id in sorted(extractions, key=lambda s: f"{s}.json"):
+        _, _, metadata = read.get(session_id) or newest[session_id]
+        if load_single_conversation(conn, metadata, extractions[session_id]):
             loaded_count += 1
 
     conn.commit()
+    stored = {
+        row[0]: (row[1], row[2])
+        for row in conn.execute("SELECT session_id, ended_at, turn_count FROM conversations")
+    }
     conn.close()
+    pruned, freed = _prune_staged_conversations(staging_dir, held_by, newest, read, stored)
+    if pruned:
+        print(f"  Pruned {pruned} staged conversation files ({freed / 1024 / 1024:.1f} MB freed)")
     return loaded_count
+
+
+def _staged_session_extraction(extracted_dir: Path, session_id: str) -> dict | None:
+    """The extraction written for a staged session, or None. Read only for the sessions
+    staged, the only ones that can load, where every extraction file was read before."""
+    path = extracted_dir / f"{session_id}.json"
+    if path.parent != extracted_dir or not path.is_file():
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _prune_staged_conversations(
+    staging_dir: Path,
+    held_by: dict[Path, list[tuple[str, int]]],
+    newest: dict[str, tuple[Path, int, dict]],
+    read: dict[str, tuple[Path, int, dict]],
+    stored: dict[str, tuple[str | None, int | None]],
+) -> tuple[int, int]:
+    """Remove the staged copies nothing can use any more, and split each batch written
+    before one file per session into those files. Returns (files removed, bytes freed).
+
+    A copy is of use while it is its session's newest (extraction takes that one) or the
+    one its extraction read (the load pairs those), and the store holds neither it nor a
+    later version: load_single_conversation loads only a copy that went on past what the
+    store holds. So a loaded copy goes, and so does one a newer copy replaced before any
+    extraction read it.
+    """
+    from src.export.conversation_export import staged_path
+
+    usable = {(path, index): conv for path, index, conv in [*newest.values(), *read.values()]}
+
+    def of_use(path: Path, session_id: str, index: int) -> dict | None:
+        conv = usable.get((path, index))
+        if conv is None:
+            return None
+        in_store = stored.get(session_id)
+        return conv if in_store is None or conversation_went_on(conv, *in_store) else None
+
+    pruned = freed = 0
+    for path, places in held_by.items():
+        keep = [conv for sid, index in places if (conv := of_use(path, sid, index)) is not None]
+        if keep and not path.name.startswith("conversation-batch-"):
+            continue
+        for conv in keep:
+            target = staged_path(staging_dir, conv)
+            if not target.exists():
+                write_json_atomic(target, {"conversations": [conv]}, redact=True)
+        try:
+            size = path.stat().st_size
+            path.unlink()
+        except OSError:  # removed meanwhile
+            continue
+        pruned += 1
+        freed += size
+    return pruned, freed
 
 
 def conversation_went_on(metadata: dict, ended_at: str | None, turns: int | None) -> bool:

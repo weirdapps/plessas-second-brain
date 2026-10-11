@@ -1562,8 +1562,10 @@ def cmd_export_conversations(args):
     if result["agents"]:
         print(f"Agent sessions left out: {result['agents']} (--include-agents keeps them)")
     print(f"Errors: {result['errors']}")
-    if result["batch_file"]:
-        print(f"Batch file: {result['batch_file']}")
+    if result["pending"]:
+        print(f"Staged before, not loaded yet: {result['pending']}")
+    if result["staged"]:
+        print(f"Staged {len(result['staged'])} files in {Path(result['staged'][0]).parent}")
 
 
 def cmd_extract_conversations(args):
@@ -2217,8 +2219,13 @@ def cmd_sync(args):
 
     conv_loaded = 0
     conv_export = export_conversations(days=7, loaded=loaded)
-    if conv_export["exported"] > 0:
+    # Staged before and not loaded yet: the export no longer stages those again, and
+    # one sb-conversation-sync extracted waits for a load here.
+    waiting = conv_export.get("pending", 0)
+    if conv_export["exported"] > 0 or waiting > 0:
         print(f"  Exported {conv_export['exported']} new or grown conversations")
+        if waiting:
+            print(f"  {waiting} staged before and not loaded yet")
         from src.extract.local import run_conversation_extraction
 
         run_conversation_extraction(deadline_s=CONVERSATION_SYNC_DEADLINE_S)

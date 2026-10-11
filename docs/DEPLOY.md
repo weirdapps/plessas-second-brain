@@ -363,13 +363,12 @@ The export reads a transcript again only when it changed, or when the store lost
 it held (`staging/conversations/transcripts-read.json`; any change to the exporter
 reads them all once).
 
-**Conversations leave the hourly unit.** `sb-outlook-sync.sh` now runs
-`sync --skip-conversations`. `sb-conversation-sync` still exports and extracts
-conversations three times a day, and `sb-daily-sync` and `sb-noon-catchup`, which run the
-whole `sync`, load and embed them; a session reaches the store at the next of those two
-runs instead of within the hour. To take conversations back into the hourly run, drop
-the flag from the wrapper. Copy `sb-outlook-sync.sh` into `~/.local/bin` after pulling
-this change; no other wrapper or unit changes, and nothing to migrate.
+**Conversations stay in every sync.** All three sync wrappers, the hourly
+`sb-outlook-sync.sh` included, run the whole `sync`, so a session reaches the store
+within the hour; `sb-conversation-sync` also exports and extracts conversations three
+times a day. With staging pruned and an unchanged transcript not read again, that step is
+cheap. `sync --skip-conversations` leaves it out of a run; no wrapper passes it. No
+wrapper or unit changes with this, and nothing to migrate.
 
 Each `outlook_export` run lists its folder from six hours before its cursor, so
 mail that turned visible after newer mail was listed (a scanner hold, a release

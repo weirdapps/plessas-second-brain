@@ -1,11 +1,11 @@
-"""The hourly mail unit leaves Claude Code conversations, Step 7 of sync, to the others.
+"""`sync --skip-conversations` leaves Step 7, the Claude Code conversations, out of a run.
 
-Step 7 exported, extracted and loaded conversations on every hourly mail run. It parsed
-every transcript of the last week (1.15 GB on the producer) and every staged batch (773 MB)
-to find the few sessions that had changed, inside the unit that loads mail and runs at its
-memory cap. sb-conversation-sync exports and extracts them three times a day; the hourly
-wrapper now passes --skip-conversations, and sb-daily-sync and sb-noon-catchup, which run
-the whole sync, load them.
+It is there for anyone who wants a sync without them; no scheduled unit passes it. Step 7
+read every transcript of the last week (1.15 GB on the producer) and every staged batch
+(773 MB) on every run. With staging pruned once loaded and an unchanged transcript not read
+again (tests/test_conversation_staging.py) it is cheap, and conversation memory should not
+lag the mail by half a day, so the hourly mail unit loads conversations as the daily and
+noon syncs do.
 """
 
 import re
@@ -116,23 +116,19 @@ def _sync_calls(wrapper: str, tmp_path: Path) -> list[str]:
     return [c for c in calls if "src.cli sync" in c]
 
 
-def test_the_hourly_wrapper_runs_sync_without_the_conversations(tmp_path):
-    calls = _sync_calls("sb-outlook-sync.sh", tmp_path)
-
-    assert calls
-    assert all("--skip-conversations" in c for c in calls)
+_SYNC_WRAPPERS = ("sb-outlook-sync.sh", "sb-noon-catchup.sh", "sb-daily-sync.sh")
 
 
-def test_every_sync_the_hourly_wrapper_starts_skips_them_the_lock_retry_too():
-    text = (_WRAPPERS / "sb-outlook-sync.sh").read_text()
-    starts = [line for line in text.splitlines() if re.search(r"-m src\.cli sync\b", line)]
-
-    assert len(starts) == 2
-    assert all("--skip-conversations" in line for line in starts)
-
-
-def test_the_daily_and_noon_syncs_still_load_them(tmp_path):
-    for wrapper in ("sb-daily-sync.sh", "sb-noon-catchup.sh"):
+def test_every_sync_unit_loads_the_conversations(tmp_path):
+    for wrapper in _SYNC_WRAPPERS:
         calls = _sync_calls(wrapper, tmp_path / wrapper)
         assert calls, wrapper
         assert not any("--skip-conversations" in c for c in calls), wrapper
+
+
+def test_no_sync_start_in_any_wrapper_skips_them_the_lock_retries_too():
+    for wrapper in _SYNC_WRAPPERS:
+        text = (_WRAPPERS / wrapper).read_text()
+        starts = [line for line in text.splitlines() if re.search(r"-m src\.cli sync\b", line)]
+        assert starts, wrapper
+        assert not any("--skip-conversations" in line for line in starts), wrapper

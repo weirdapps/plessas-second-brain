@@ -94,9 +94,7 @@ IMAGE_CLASSIFY_SYNC_BUDGET_S = 90.0
 # 23:28 the previous evening was SIGTERMed seconds after printing "Sync
 # complete". 30 s holds the previously assumed sum exactly, so the margin tests
 # keep the same headroom they were written against; the remainder drains on
-# sb-conversation-sync, which has 900 s. The hourly unit now skips the step
-# (--skip-conversations), and the allowance stays in the sum for the daily and
-# noon units, which run it.
+# sb-conversation-sync, which has 900 s.
 CONVERSATION_SYNC_DEADLINE_S = 30.0
 
 # Step 2 (email extraction) had no bound either, and could sleep an hour
@@ -2206,9 +2204,8 @@ def cmd_sync(args):
     elif not (p1_stats.get("processed", 0) or deferred or heavy):
         print("  No new attachments to process")
 
-    # Step 7: Sync conversations from Claude Code sessions. The hourly mail unit passes
-    # --skip-conversations: sb-conversation-sync exports and extracts them, and the daily
-    # and noon syncs, which run this step, load them.
+    # Step 7: Sync conversations from Claude Code sessions. --skip-conversations leaves it
+    # out; no scheduled unit passes it.
     print("\nStep 7: Syncing Claude Code conversations...")
     conv_loaded = 0
     if getattr(args, "skip_conversations", False):
@@ -4075,8 +4072,7 @@ def main():
     parser_sync.add_argument(
         "--skip-conversations",
         action="store_true",
-        help="Leave out Step 7, the Claude Code conversations: the hourly mail unit passes it, "
-        "and sb-conversation-sync and the daily and noon syncs take them",
+        help="Leave out Step 7, the Claude Code conversations (no scheduled unit passes it)",
     )
     parser_sync.add_argument(
         "--full-dedup",

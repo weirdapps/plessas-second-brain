@@ -149,9 +149,6 @@ note_rc "$rc3"
 #   - pgrep: at 07:00/12:00 a daily/noon load is already running (and a long prior
 #     hourly load could still be going) — defer rather than double-extract or
 #     fight for the DB lock.
-# --skip-conversations: Step 7, the Claude Code conversations, is not this unit's. It read
-#   every transcript of the last week and every staged conversation file, every hour;
-#   sb-conversation-sync exports and extracts them, and the daily and noon syncs load them.
 rc4=0
 if [ -f "$HOME/.second-brain/needs_gcloud_reauth" ]; then
   echo "$(ts) — load skipped (needs_gcloud_reauth sentinel)" >> "$LOG"
@@ -159,14 +156,14 @@ elif pgrep -f "src\.cli sync" >/dev/null 2>&1; then
   echo "$(ts) — load skipped (another sync already running)" >> "$LOG"
 else
   echo "$(ts) — start load (sync --skip-export)" >> "$LOG"
-  "$PYTHON" -m src.cli sync --engine claude --workers 8 --skip-export --skip-conversations >> "$LOG" 2>&1
+  "$PYTHON" -m src.cli sync --engine claude --workers 8 --skip-export >> "$LOG" 2>&1
   rc4=$?
   # Retry once on DB-lock contention (mirrors sb-daily-sync.sh).
   if [ "$rc4" -ne 0 ] && tail -20 "$LOG" | grep -qi "database is locked"; then
     echo "$(ts) — load retry after database-lock" >> "$LOG"
     sleep 10
     "$PYTHON" -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()" "$DB" 2>/dev/null || true
-    "$PYTHON" -m src.cli sync --engine claude --workers 8 --skip-export --skip-conversations >> "$LOG" 2>&1
+    "$PYTHON" -m src.cli sync --engine claude --workers 8 --skip-export >> "$LOG" 2>&1
     rc4=$?
   fi
   echo "$(ts) — load done (rc=$rc4)" >> "$LOG"

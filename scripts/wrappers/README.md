@@ -52,17 +52,12 @@ the marker as a convention that may or may not be present, never as the test.
 
 ## What the three sync wrappers ask of `src.cli sync`
 
-| Wrapper | When | Flags that change what runs |
-| --- | --- | --- |
-| `sb-outlook-sync.sh` | hourly | `--skip-conversations`: Step 7, the Claude Code conversations, is left to the others |
-| `sb-noon-catchup.sh` | noon | none: the whole sync, conversations included |
-| `sb-daily-sync.sh` | morning | none: the whole sync, conversations included |
-
-`sb-conversation-sync.sh` exports and extracts the conversations three times a day; the
-noon and daily syncs load and embed them. `--skip-conversations` came with #148: copy
-`sb-outlook-sync.sh` into `~/.local/bin` on the producer after pulling it (docs/DEPLOY.md,
-section 6). `sync --full-dedup` is for a hand run: `sync` already takes the whole people
-table once a day.
+`sb-outlook-sync.sh` (hourly), `sb-noon-catchup.sh` (noon) and `sb-daily-sync.sh`
+(morning) each run the whole sync, Claude Code conversations (Step 7) included, and
+`sb-conversation-sync.sh` exports and extracts conversations three times a day besides.
+`sync --skip-conversations` (Step 7 left out) and `sync --full-dedup` (the people dedup
+over the whole table, which `sync` already takes once a day) are for a hand run: no
+wrapper passes either.
 
 ## What is deliberately absent
 

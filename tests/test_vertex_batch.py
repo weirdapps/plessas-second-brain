@@ -407,6 +407,22 @@ def test_the_token_budget_bounds_what_is_sent(cloud, store):
     assert [row.ac_id for row in ap.phase2_rows(conn)] == rows[2:]
 
 
+def test_an_unusable_setting_stops_the_send_before_anything_is_sent(cloud, store, monkeypatch):
+    """A setting the online path refuses to plan with stops the batch as well, with nothing
+    uploaded, recorded or held."""
+    path, conn = store
+    add(conn, LONG)
+    monkeypatch.setenv("BRAIN_ATTACHMENT_FULL_PARTS_UPTO", "eight")
+
+    with pytest.raises(
+        claude_extract.ClaudeNotConfigured, match="BRAIN_ATTACHMENT_FULL_PARTS_UPTO"
+    ):
+        vertex_batch.submit(str(path))
+
+    assert cloud.storage.objects == {} and cloud.jobs.created == []
+    assert vertex_batch.open_jobs(conn) == [] and holds(conn) == 0
+
+
 def test_a_job_takes_at_most_its_cap(cloud, store, monkeypatch):
     path, conn = store
     rows = [add(conn, SHORT + str(i)) for i in range(4)]

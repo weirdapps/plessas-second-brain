@@ -1280,6 +1280,20 @@ def meeting_prep(
 
         result["attendees"].append(dossier)
 
+    # The meetings the people resolved share with the owner, the next and the last,
+    # each with a dozen of its attendees: it listed none, the one thing a meeting
+    # prep cannot do without.
+    from src.store.calendar_query import shared_meetings
+
+    try:
+        result["meetings"] = shared_meetings(
+            conn,
+            [d["resolved_email"] for d in result["attendees"] if d.get("resolved_email")],
+            days=days,
+        )
+    except sqlite3.OperationalError:  # a store with no calendar
+        result["meetings"] = {"next": [], "last": []}
+
     # Topic context (if provided)
     if topic:
         topic_normalized = normalize_topic(topic)
@@ -1619,6 +1633,17 @@ def get_stats(conn: sqlite3.Connection) -> dict:
     return stats
 
 
+def _calendar_density(conn: sqlite3.Connection) -> dict:
+    """The calendar's events per month and its months not held in full; nothing
+    on a store without a calendar."""
+    from src.store.calendar_coverage import density
+
+    try:
+        return density(conn)
+    except sqlite3.OperationalError:
+        return {}
+
+
 def get_coverage(conn: sqlite3.Connection) -> dict:
     """The first and last date each source holds, and how many items.
 
@@ -1647,10 +1672,15 @@ def get_coverage(conn: sqlite3.Connection) -> dict:
         "teams": span("SELECT MIN(started_at), MAX(ended_at), COUNT(*) FROM teams_threads"),
         "whatsapp": span("SELECT MIN(sent_at), MAX(sent_at), COUNT(*) FROM whatsapp_messages"),
         # Meetings Outlook no longer lists are kept as cancelled, not deleted.
-        "calendar": span(
-            "SELECT MIN(start_at), MAX(start_at), COUNT(*) FROM calendar_events "
-            "WHERE is_cancelled = 0"
-        ),
+        # The span alone read four months of ten meetings each as covered: the
+        # months beside it say which ones are not held in full.
+        "calendar": {
+            **span(
+                "SELECT MIN(start_at), MAX(start_at), COUNT(*) FROM calendar_events "
+                "WHERE is_cancelled = 0"
+            ),
+            **_calendar_density(conn),
+        },
         "conversations": span(
             "SELECT MIN(started_at), MAX(COALESCE(ended_at, started_at)), COUNT(*) "
             "FROM conversations"

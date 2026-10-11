@@ -72,6 +72,20 @@ load_config_file(
     Path(os.environ.get("BRAIN_CONFIG_FILE", str(Path.home() / ".config" / "second-brain" / "env")))
 )
 
+
+def embed_backend() -> str:
+    """The embedding service: BRAIN_EMBED_BACKEND when set, else "gemini" when
+    GEMINI_API_KEY is, else "vertex".
+
+    A process that had the key but not the switch called Vertex, which can refuse
+    the model while the key would have worked, and semantic search went quiet.
+    """
+    chosen = os.environ.get("BRAIN_EMBED_BACKEND", "").strip().lower()
+    if chosen:
+        return chosen
+    return "gemini" if os.environ.get("GEMINI_API_KEY") else "vertex"
+
+
 # A replica holds a copy of the database built on another host, and the next
 # pull replaces it. The pull job stamps this file. Writing to the copy is how a
 # local `embed` left a WAL that the next pull replayed over a fresh copy, on

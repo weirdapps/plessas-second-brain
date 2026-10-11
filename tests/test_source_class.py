@@ -718,8 +718,15 @@ def test_recall(store):
     from src.store.recall import recall
 
     conn, _, _ = store
-    out = recall(conn, WORD, limit_per_kind=20)
-    full = recall(conn, WORD, limit_per_kind=20, include_news=True, include_automation=True)
+    out = recall(conn, WORD, limit_per_kind=20, include_context=True)
+    full = recall(
+        conn,
+        WORD,
+        limit_per_kind=20,
+        include_context=True,
+        include_news=True,
+        include_automation=True,
+    )
     for kind in ("emails", "decisions", "actions", "commitments"):
         assert _classes(out[kind]) <= DEFAULT | {None}, kind
         assert {"news", "automation"} <= _classes(full[kind]), kind
@@ -817,11 +824,11 @@ def test_the_tools_take_the_switches(store, monkeypatch):
     monkeypatch.setattr(mcp_server, "_get_conn", lambda: get_connection(str(path)))
     on = {"include_news": True, "include_automation": True}
     tools = [
-        lambda **kw: mcp_server.search_emails(WORD, **kw),
-        lambda **kw: mcp_server.query_emails(keyword=WORD, **kw),
-        lambda **kw: mcp_server.query_decisions(**kw),
+        lambda **kw: mcp_server.search_emails(WORD, **kw)["result"],
+        lambda **kw: mcp_server.query_emails(keyword=WORD, **kw)["result"],
+        lambda **kw: mcp_server.query_decisions(**kw)["result"],
         lambda **kw: mcp_server.query_actions(**kw),
-        lambda **kw: mcp_server.search_attachments(WORD, **kw),
+        lambda **kw: mcp_server.search_attachments(WORD, **kw)["result"],
         lambda **kw: mcp_server.recall(WORD, **kw)["decisions"],
         lambda **kw: mcp_server.person_context("Colleague", **kw)["decisions"],
         lambda **kw: mcp_server.topic_context(f"{WORD} pilot", **kw)["key_facts"],

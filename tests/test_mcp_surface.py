@@ -208,7 +208,7 @@ def test_unfiltered_decisions_cover_every_source_and_skip_news(conn, monkeypatch
     conn.commit()
     monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
 
-    rows = mcp_server.query_decisions(days=30)
+    rows = mcp_server.query_decisions(days=30)["result"]
 
     assert [r["decision"] for r in rows] == ["Teams decision"]
 

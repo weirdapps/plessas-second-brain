@@ -57,7 +57,7 @@ def db(tmp_path, monkeypatch):
 
     monkeypatch.setattr(embeddings, "EMBEDDINGS_FILE", index)
     monkeypatch.setattr(
-        embeddings, "generate_embeddings", lambda texts: np.array([[0.0, 1.0, 0.0]], np.float32)
+        embeddings, "embed_query", lambda texts: np.array([[0.0, 1.0, 0.0]], np.float32)
     )
     return path
 
@@ -66,7 +66,9 @@ def db(tmp_path, monkeypatch):
 def test_semantic_search_ranks_inside_the_workspace(db, workspace):
     from src.mcp_server import search_conversations
 
-    rows = search_conversations("okapi", search_type="semantic", workspace=workspace, limit=1)
+    rows = search_conversations("okapi", search_type="semantic", workspace=workspace, limit=1)[
+        "result"
+    ]
 
     assert [r["session_id"] for r in rows] == ["s4"]
 
@@ -74,14 +76,16 @@ def test_semantic_search_ranks_inside_the_workspace(db, workspace):
 def test_semantic_search_in_a_workspace_with_no_sessions_is_empty(db):
     from src.mcp_server import search_conversations
 
-    assert search_conversations("okapi", search_type="semantic", workspace="nowhere") == []
+    out = search_conversations("okapi", search_type="semantic", workspace="nowhere")
+
+    assert out["result"] == []
 
 
 @pytest.mark.parametrize("workspace", ["brain-repo", PATH])
 def test_keyword_search_finds_turns_by_path_or_project(db, workspace):
     from src.mcp_server import search_conversations
 
-    rows = search_conversations("okapi lock", workspace=workspace)
+    rows = search_conversations("okapi lock", workspace=workspace)["result"]
 
     assert [(r["session_id"], r["match_type"]) for r in rows] == [("s4", "turn_content")]
     assert not rows[0].get("partial_match")

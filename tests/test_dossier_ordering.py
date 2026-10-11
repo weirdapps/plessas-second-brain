@@ -152,7 +152,7 @@ def test_meeting_prep_orders_and_dates_its_rows(db):
 
 
 def test_the_dossiers_recall_attaches_lead_with_the_newest(db):
-    out = recall(db, "Alice Example")
+    out = recall(db, "Alice Example", include_context=True)
     assert out["person_context"] is not None
     assert [r["decision"] for r in out["person_context"]["decisions"]] == DECISIONS
     assert [r["task"] for r in out["person_context"]["open_actions"]] == ACTIONS[:5]

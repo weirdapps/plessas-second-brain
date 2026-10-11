@@ -154,12 +154,20 @@ def _date_error(name: str, value: str | None) -> dict | None:
 
 
 @mcp.tool()
-def person_context(name_or_email: str, days: int = 365, limit: int = 20) -> dict:
+def person_context(
+    name_or_email: str,
+    days: int = 365,
+    limit: int = 20,
+    include_news: bool = False,
+    include_automation: bool = False,
+) -> dict:
     """Get rich context for a person: email history, topics, sentiment, decisions, open actions, communication pattern, Teams activity.
 
     Each list is capped at `limit` and carries a `<name>_total` sibling
     (topics_total, decisions_total, open_actions_total) with the real count, so
-    you can tell a complete answer from the head of a long one.
+    you can tell a complete answer from the head of a long one. News items and
+    the owner's automation mail are left out unless included; every email,
+    decision and action row says its `source_class`.
 
     Args:
         name_or_email: Person's name or email address, case and accent blind. A
@@ -174,34 +182,59 @@ def person_context(name_or_email: str, days: int = 365, limit: int = 20) -> dict
             else.
         days: Lookback period in days (default: 365)
         limit: Max rows per list (default: 20)
+        include_news: Include news items (default: False)
+        include_automation: Include the owner's automation mail (default: False)
     """
     from src.store.context import get_person_context
 
     conn = _get_conn()
     try:
-        return get_person_context(conn, name_or_email, days=days, limit=_cap(limit))
+        return get_person_context(
+            conn,
+            name_or_email,
+            days=days,
+            limit=_cap(limit),
+            include_news=include_news,
+            include_automation=include_automation,
+        )
     finally:
         conn.close()
 
 
 @mcp.tool()
-def topic_context(topic: str, days: int = 365, limit: int = 20) -> dict:
+def topic_context(
+    topic: str,
+    days: int = 365,
+    limit: int = 20,
+    include_news: bool = False,
+    include_automation: bool = False,
+) -> dict:
     """Get context for a topic: related emails, key people, decisions, open actions, key facts.
 
     Each list is capped at `limit` and carries a `<name>_total` sibling
     (key_people_total, decisions_total, open_actions_total, key_facts_total)
-    with the real count.
+    with the real count. News items and the owner's automation mail are left out
+    unless included; every row drawn from an email says its `source_class`.
 
     Args:
         topic: Topic name (partial match)
         days: Lookback period in days (default: 365)
         limit: Max rows per list (default: 20)
+        include_news: Include news items (default: False)
+        include_automation: Include the owner's automation mail (default: False)
     """
     from src.store.context import get_topic_context
 
     conn = _get_conn()
     try:
-        return get_topic_context(conn, topic, days=days, limit=_cap(limit))
+        return get_topic_context(
+            conn,
+            topic,
+            days=days,
+            limit=_cap(limit),
+            include_news=include_news,
+            include_automation=include_automation,
+        )
     finally:
         conn.close()
 
@@ -251,13 +284,21 @@ def email_thread(email_id: int, limit: int = 50) -> dict:
 
 
 @mcp.tool()
-def search_emails(query: str, search_type: str = "keyword", limit: int = 20) -> list[dict] | dict:
+def search_emails(
+    query: str,
+    search_type: str = "keyword",
+    limit: int = 20,
+    include_news: bool = False,
+    include_automation: bool = False,
+) -> list[dict] | dict:
     """Search emails by keyword (FTS5) or semantic similarity (embeddings).
 
     Keyword mode returns one email per thread (a subject match shows the thread's
     newest); a row whose thread has more than one email matching in its
     subject, summary or body says how many in thread_matches, and email_thread
-    reads the rest of it.
+    reads the rest of it. Every row says its `source_class` (mail, automation,
+    news, document, session_note); news and the owner's automation mail are left
+    out unless included.
 
     When the embedding model cannot embed the query, semantic mode ranks by
     similarity to the query's best keyword matches instead, and every row says
@@ -270,29 +311,38 @@ def search_emails(query: str, search_type: str = "keyword", limit: int = 20) -> 
         search_type: "keyword" for full-text search, "semantic" for embedding similarity;
             anything else is an error
         limit: Maximum results (default: 20, at most 200)
+        include_news: Include news items (default: False)
+        include_automation: Include the owner's automation mail (default: False)
     """
     if search_type not in _SEARCH_TYPES:
         return _unknown("search_type", search_type, _SEARCH_TYPES)
     limit = _cap(limit)
+    switches = {"include_news": include_news, "include_automation": include_automation}
     conn = _get_conn()
     try:
         if search_type == "semantic":
             from src.store.embeddings import SemanticUnavailable, query_semantic
 
             try:
-                return query_semantic(conn, query, limit=limit)
+                return query_semantic(conn, query, limit=limit, **switches)
             except SemanticUnavailable as e:
                 return {"error": str(e)}
         else:
             from src.store.query import query_by_keyword
 
-            return query_by_keyword(conn, query, limit=limit)
+            return query_by_keyword(conn, query, limit=limit, **switches)
     finally:
         conn.close()
 
 
 @mcp.tool()
-def recall(query: str, limit_per_kind: int = 5, days: int = 365) -> dict:
+def recall(
+    query: str,
+    limit_per_kind: int = 5,
+    days: int = 365,
+    include_news: bool = False,
+    include_automation: bool = False,
+) -> dict:
     """Unified search across every text-bearing index. Use this as the default 'tell me everything you know about X' entry point.
 
     Returns ten buckets, keyed exactly as listed: emails (which also covers
@@ -309,17 +359,24 @@ def recall(query: str, limit_per_kind: int = 5, days: int = 365) -> dict:
     keyword-only. A bucket where nothing held the whole query falls
     back to rows holding some of its words, each flagged partial_match, and
     `summary.partial_kinds` names those buckets. When the local replica is
-    behind, the result carries `_stale_warning` and `data_as_of`.
+    behind, the result carries `_stale_warning` and `data_as_of`. News items and
+    the owner's automation mail are left out of every bucket and dossier unless
+    included; every row drawn from an email says its `source_class`.
 
     Args:
         query: Free-text query (keyword, name, topic, etc.)
         limit_per_kind: Max results per category (default 5)
         days: Lookback window for the auto-pulled person/topic context (default 365)
+        include_news: Include news items (default: False)
+        include_automation: Include the owner's automation mail (default: False)
     """
+    from functools import partial
+
     from src.store.embeddings import semantic_email_candidates
     from src.store.query import get_freshness
     from src.store.recall import recall as _recall
 
+    switches = {"include_news": include_news, "include_automation": include_automation}
     conn = _get_conn()
     try:
         # Inject the semantic provider so the emails bucket is a keyword+semantic
@@ -329,7 +386,12 @@ def recall(query: str, limit_per_kind: int = 5, days: int = 365) -> dict:
             query,
             limit_per_kind=_cap(limit_per_kind),
             days=days,
-            semantic_candidates=semantic_email_candidates,
+            semantic_candidates=partial(
+                semantic_email_candidates,
+                include_news=include_news,
+                include_automation=include_automation,
+            ),
+            **switches,
         )
         # This is the documented front door, so it is where a stale replica has
         # to be visible. Only present when it matters, so a healthy call is
@@ -351,8 +413,13 @@ def query_emails(
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 20,
+    include_news: bool = False,
+    include_automation: bool = False,
 ) -> list[dict] | dict:
     """Query emails with combined filters: person, topic, keyword, date range.
+
+    News items and the owner's automation mail are left out unless included;
+    every row says its `source_class`.
 
     Args:
         person: Filter by person name
@@ -361,6 +428,8 @@ def query_emails(
         start_date: Start date (YYYY-MM-DD); any other form is an error
         end_date: End date (YYYY-MM-DD); any other form is an error
         limit: Maximum results (default: 20, at most 200)
+        include_news: Include news items (default: False)
+        include_automation: Include the owner's automation mail (default: False)
     """
     from src.store.query import query_combined
 
@@ -378,6 +447,8 @@ def query_emails(
             start_date=start_date,
             end_date=end_date,
             limit=_cap(limit),
+            include_news=include_news,
+            include_automation=include_automation,
         )
     finally:
         conn.close()
@@ -390,13 +461,16 @@ def query_decisions(
     days: int = 365,
     limit: int = 20,
     include_news: bool = False,
+    include_automation: bool = False,
 ) -> list[dict]:
     """Query recent decisions, optionally filtered by topic or person.
 
     Covers decisions taken in email, Teams threads, calendar events and past
-    Claude Code conversations; each result carries a `source` saying which.
-    Excludes decisions extracted from ingested news articles unless you ask for
-    them: those are things companies announced, not things this user decided.
+    Claude Code conversations; each result carries a `source` saying which, and
+    `source_class` for one taken in an email. Excludes decisions extracted from
+    ingested news articles and from the owner's automation mail unless you ask
+    for them: those are things companies announced or bots reported, not things
+    this user decided.
 
     Args:
         topic: Filter by topic name
@@ -404,6 +478,8 @@ def query_decisions(
         days: Lookback period in days (default: 365)
         limit: Maximum results (default: 20)
         include_news: Include news-derived decisions (default: False)
+        include_automation: Include decisions from the owner's automation mail
+            (default: False)
     """
     from src.store.query import query_decisions as _qd
 
@@ -419,6 +495,7 @@ def query_decisions(
             days=days,
             limit=_cap(limit),
             include_news=include_news,
+            include_automation=include_automation,
         )
     finally:
         conn.close()
@@ -430,16 +507,18 @@ def query_actions(
     status: str = "open",
     limit: int = 20,
     include_news: bool = False,
+    include_automation: bool = False,
 ) -> list[dict]:
     """Query action items, optionally filtered by owner and status.
 
     Ordered so the actionable ones come first: upcoming deadlines soonest-first,
     then undated items, then overdue ones most-recently-missed first. Each row
-    carries `overdue` and a `source` of email / teams / calendar / conversation.
-    Nothing is hidden, but most dated open items are already overdue and would
-    otherwise fill every page.
+    carries `overdue`, a `source` of email / teams / calendar / conversation, and
+    `source_class` for an item from an email. Nothing is hidden, but most dated
+    open items are already overdue and would otherwise fill every page.
 
-    Excludes items extracted from ingested news articles unless asked.
+    Excludes items extracted from ingested news articles and from the owner's
+    automation mail unless asked.
 
     Args:
         owner: Filter by action owner name
@@ -449,33 +528,49 @@ def query_actions(
             was done, so there is no other status.
         limit: Maximum results (default: 20)
         include_news: Include news-derived action items (default: False)
+        include_automation: Include action items from the owner's automation
+            mail (default: False)
     """
     from src.store.query import query_action_items
 
     conn = _get_conn()
     try:
         return query_action_items(
-            conn, owner=owner, status=status, limit=_cap(limit), include_news=include_news
+            conn,
+            owner=owner,
+            status=status,
+            limit=_cap(limit),
+            include_news=include_news,
+            include_automation=include_automation,
         )
     finally:
         conn.close()
 
 
 @mcp.tool()
-def stale_threads(days: int = 5, limit: int = 20, max_days: int = 30) -> dict:
+def stale_threads(
+    days: int = 5,
+    limit: int = 20,
+    max_days: int = 30,
+    include_news: bool = False,
+    include_automation: bool = False,
+) -> dict:
     """Find stale email threads (you sent last, no reply) and overdue action items.
 
     Both lists are capped at `limit`, newest first, and each has a `_total`:
     `stale_threads` holds threads whose last message you sent between `days`
     and `max_days` ago; `overdue_actions` holds the most recently missed
-    deadlines from every source but news. Requires BRAIN_USER_EMAIL_PATTERN for
-    the stale-thread half; without it `stale_threads` is always empty and
-    `stale_threads_unavailable` explains why.
+    deadlines from every source but news and the owner's automation mail, unless
+    included. Requires BRAIN_USER_EMAIL_PATTERN for the stale-thread half;
+    without it `stale_threads` is always empty and `stale_threads_unavailable`
+    explains why.
 
     Args:
         days: Stale threshold in days (default: 5)
         limit: Max rows per list (default: 20)
         max_days: Oldest thread still worth a reminder, in days (default: 30)
+        include_news: Include news items (default: False)
+        include_automation: Include the owner's automation mail (default: False)
     """
     from src.config import USER_EMAIL_PATTERN
     from src.store.query import (
@@ -486,13 +581,18 @@ def stale_threads(days: int = 5, limit: int = 20, max_days: int = 30) -> dict:
     )
 
     limit = _cap(limit)
+    switches = {"include_news": include_news, "include_automation": include_automation}
     conn = _get_conn()
     try:
         out: dict = {
-            "stale_threads": find_stale_threads(conn, days=days, max_days=max_days, limit=limit),
-            "stale_threads_total": count_stale_threads(conn, days=days, max_days=max_days),
-            "overdue_actions": find_overdue_actions(conn, limit=limit),
-            "overdue_actions_total": count_overdue_actions(conn),
+            "stale_threads": find_stale_threads(
+                conn, days=days, max_days=max_days, limit=limit, **switches
+            ),
+            "stale_threads_total": count_stale_threads(
+                conn, days=days, max_days=max_days, **switches
+            ),
+            "overdue_actions": find_overdue_actions(conn, limit=limit, **switches),
+            "overdue_actions_total": count_overdue_actions(conn, **switches),
         }
         if not USER_EMAIL_PATTERN:
             out["stale_threads_unavailable"] = (
@@ -505,41 +605,74 @@ def stale_threads(days: int = 5, limit: int = 20, max_days: int = 30) -> dict:
 
 
 @mcp.tool()
-def meeting_prep(people: str, topic: str | None = None, days: int = 365) -> dict:
+def meeting_prep(
+    people: str,
+    topic: str | None = None,
+    days: int = 365,
+    include_news: bool = False,
+    include_automation: bool = False,
+) -> dict:
     """Generate meeting preparation dossiers for attendees.
+
+    News items and the owner's automation mail are left out unless included;
+    every email, decision, fact and action row says its `source_class`.
 
     Args:
         people: Comma-separated list of attendee names or emails
         topic: Optional meeting topic for focused context
         days: Lookback period in days (default: 365)
+        include_news: Include news items (default: False)
+        include_automation: Include the owner's automation mail (default: False)
     """
     from src.store.query import meeting_prep as _mp
 
     conn = _get_conn()
     try:
         people_list = [p.strip() for p in people.split(",") if p.strip()]
-        return _mp(conn, people_list, topic=topic, days=days)
+        return _mp(
+            conn,
+            people_list,
+            topic=topic,
+            days=days,
+            include_news=include_news,
+            include_automation=include_automation,
+        )
     finally:
         conn.close()
 
 
 @mcp.tool()
-def search_attachments(query: str, limit: int = 20) -> list[dict]:
+def search_attachments(
+    query: str,
+    limit: int = 20,
+    include_news: bool = False,
+    include_automation: bool = False,
+) -> list[dict]:
     """Search attachment content (PDFs, Word, Excel, PowerPoint) using full-text search.
 
     Searches both extracted text and LLM-generated summaries from email attachments.
-    Returns filename, parent email subject, matching snippet, and summary.
+    Returns filename, parent email subject, matching snippet, and summary, and the
+    parent email's `source_class`; attachments of news items and of the owner's
+    automation mail are left out unless included.
 
     Args:
         query: Plain words: every word first, then any meaningful word, with those rows
             flagged partial_match. Quotes and operators are ignored.
         limit: Maximum results (default: 20)
+        include_news: Include news items (default: False)
+        include_automation: Include the owner's automation mail (default: False)
     """
     from src.store.query import search_attachments as _search
 
     conn = _get_conn()
     try:
-        return _search(conn, query, limit=_cap(limit))
+        return _search(
+            conn,
+            query,
+            limit=_cap(limit),
+            include_news=include_news,
+            include_automation=include_automation,
+        )
     finally:
         conn.close()
 

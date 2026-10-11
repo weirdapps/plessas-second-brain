@@ -3050,6 +3050,39 @@ def cmd_migrate(args):
         print("Database is already up to date.")
 
 
+def cmd_classify_sources(args):
+    """Give every stored email the class the rules give it today (src/store/source_class.py).
+
+    The v33 migration and the loader set the class; this sets it again for rows stored before
+    a change that moves it, such as BRAIN_USER_EMAIL_PATTERN being set after the migration ran.
+    Writes only the rows whose class changes.
+    """
+    from src.store.schema import get_connection, run_migrations
+    from src.store.source_class import CLASSES, reclassify
+
+    db_path = str(args.db)
+    if not Path(db_path).exists():
+        print("Error: Database not found.")
+        sys.exit(1)
+
+    conn = get_connection(db_path)
+    try:
+        run_migrations(conn)
+        if conn.in_transaction:
+            conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            counts = reclassify(conn)
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+    for name in CLASSES:
+        print(f"{name}: {counts.get(name, 0)}")
+
+
 def cmd_import_people(args):
     """Import canonical people from JSON file."""
     import json
@@ -3966,6 +3999,13 @@ def main():
     # Migrate command
     parser_migrate = subparsers.add_parser("migrate", help="Run database migrations")
     parser_migrate.set_defaults(func=cmd_migrate)
+
+    parser_classify = subparsers.add_parser(
+        "classify-sources",
+        help="Set every email's source_class again by today's rules "
+        "(after BRAIN_USER_EMAIL_PATTERN is set or changed)",
+    )
+    parser_classify.set_defaults(func=cmd_classify_sources)
 
     # Import people command
     parser_import = subparsers.add_parser("import-people", help="Import canonical people from JSON")

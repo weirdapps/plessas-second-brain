@@ -497,6 +497,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_image_transcription(conn)
     if current < 32:
         migrate_add_attachment_content_indexes(conn)
+    if current < 33:
+        migrate_add_source_class(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -723,6 +725,53 @@ def migrate_add_attachment_content_indexes(conn: sqlite3.Connection) -> None:
         for name, columns in ATTACHMENT_CONTENT_INDEXES:
             conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON attachment_content({columns})")
         conn.commit()
+    finally:
+        conn.execute(f"PRAGMA busy_timeout = {int(busy_ms)}")
+
+
+def migrate_add_source_class(conn: sqlite3.Connection) -> None:
+    """v33: emails.source_class, what each row is, so every read path can leave out news and the
+    owner's automation mail. The classes and their rules are in src/store/source_class.py; the
+    loader and the document writers set it on every new row.
+
+    NOT NULL DEFAULT 'mail' rewrites nothing: a row stored before the column reads the default.
+    Then only the rows of another class are written, by reclassify, with the full-text trigger
+    set aside. On a copy of the replica (6.5 GB, 96K emails) that wrote 26K rows in 7 s, with
+    182 MB of WAL. Measured with plain UPDATEs on the same copy, writing every row cost 23 s and
+    838 MB, and keeping the trigger for the 26K rows 19 s and 279 MB.
+
+    One immediate transaction, checked inside it, as v22: two units can start together after a
+    deploy, and a failure leaves the store as it was. The wait for the lock is raised to ten
+    minutes. The owner's stamped mail to himself needs BRAIN_USER_EMAIL_PATTERN: without it that
+    mail is left as 'mail', stderr says so, and `brain classify-sources` sets it once configured.
+    """
+    from src.store.source_class import reclassify
+
+    if not _table_exists(conn, "emails"):
+        return
+    if conn.in_transaction:
+        conn.commit()
+    busy_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    conn.execute("PRAGMA busy_timeout = 600000")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            columns = {r[1] for r in conn.execute("PRAGMA table_info(emails)")}
+            added = "source_class" not in columns
+            if added:
+                conn.execute(
+                    "ALTER TABLE emails ADD COLUMN source_class TEXT NOT NULL DEFAULT 'mail'"
+                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_emails_source_class ON emails(source_class)"
+            )
+            if added:
+                reclassify(conn)
+            conn.execute("COMMIT")
+        except BaseException:
+            # Not an explicit ROLLBACK: see _index_email_subjects.
+            conn.rollback()
+            raise
     finally:
         conn.execute(f"PRAGMA busy_timeout = {int(busy_ms)}")
 

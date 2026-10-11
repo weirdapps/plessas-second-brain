@@ -24,6 +24,7 @@ from src.store.ordering import (
     parent_dates,
 )
 from src.store.schema import subject_to_conversation_id
+from src.store.source_class import visible_sql, with_source_class
 
 # The loader threads an email with no conversation id and no references by the
 # hash of its normalized subject, so every blank subject shares this id: 92
@@ -157,7 +158,8 @@ def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> li
 
     Returns:
         List of dicts with keys: email_id, date, subject, summary,
-        sender_name, sender_address, sentiment
+        sender_name, sender_address, sentiment, source_class. A thread asked for
+        by id comes back whole, whatever its class.
     """
     row = conn.execute(f"SELECT {_THREAD} FROM emails e WHERE e.id = ?", (email_id,)).fetchone()
     if not row:
@@ -195,7 +197,7 @@ def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> li
         """,
         (json.dumps(ids),),
     )
-    return [dict(r) for r in cursor.fetchall()]
+    return with_source_class(conn, [dict(r) for r in cursor.fetchall()])
 
 
 def count_thread(conn: sqlite3.Connection, email_id: int) -> int:
@@ -259,7 +261,14 @@ def _linked_to_ids(conn: sqlite3.Connection, ids_json: str) -> str:
     return "e.id IN (SELECT email_id FROM email_people WHERE person_id IN ids)"
 
 
-def query_by_person(conn: sqlite3.Connection, name_or_email: str, limit: int = 20) -> list[dict]:
+def query_by_person(
+    conn: sqlite3.Connection,
+    name_or_email: str,
+    limit: int = 20,
+    *,
+    include_news: bool = False,
+    include_automation: bool = False,
+) -> list[dict]:
     """Find emails involving a person (as sender, recipient, or mentioned in people_roles).
 
     Searches by partial name match (case-insensitive) or exact email address match.
@@ -268,9 +277,12 @@ def query_by_person(conn: sqlite3.Connection, name_or_email: str, limit: int = 2
         conn: Database connection
         name_or_email: Person's name (partial match OK) or email address
         limit: Maximum number of results to return
+        include_news, include_automation: Include news items and the owner's
+            automation mail, left out by default (src/store/source_class.py)
 
     Returns:
-        List of dicts with keys: email_id, date, subject, summary, person_role, sentiment
+        List of dicts with keys: email_id, date, subject, summary, person_role,
+        sentiment, source_class
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
     ids = _person_ids(conn, name_or_email)
@@ -294,15 +306,23 @@ def query_by_person(conn: sqlite3.Connection, name_or_email: str, limit: int = 2
         FROM emails e
         WHERE """
         + _linked_to_ids(conn, ids_json)
-        + """
+        + f"""
+          AND {visible_sql(conn, "e.id", include_news, include_automation)}
         ORDER BY e.date_received DESC
         LIMIT ?
     """
     )
-    return [dict(row) for row in conn.execute(query, (ids_json, limit))]
+    return with_source_class(conn, [dict(row) for row in conn.execute(query, (ids_json, limit))])
 
 
-def query_by_topic(conn: sqlite3.Connection, topic: str, limit: int = 20) -> list[dict]:
+def query_by_topic(
+    conn: sqlite3.Connection,
+    topic: str,
+    limit: int = 20,
+    *,
+    include_news: bool = False,
+    include_automation: bool = False,
+) -> list[dict]:
     """Find emails tagged with a topic.
 
     Matches against normalized topic name (partial match OK).
@@ -311,11 +331,13 @@ def query_by_topic(conn: sqlite3.Connection, topic: str, limit: int = 20) -> lis
         conn: Database connection
         topic: Topic name (partial match OK)
         limit: Maximum number of results to return
+        include_news, include_automation: Include news items and the owner's
+            automation mail, left out by default (src/store/source_class.py)
 
     Returns:
-        List of dicts with keys: email_id, date, subject, summary, topic
+        List of dicts with keys: email_id, date, subject, summary, topic, source_class
     """
-    query = """
+    query = f"""
         SELECT DISTINCT
             e.id as email_id,
             e.date_received as date,
@@ -326,6 +348,7 @@ def query_by_topic(conn: sqlite3.Connection, topic: str, limit: int = 20) -> lis
         JOIN email_topics et ON e.id = et.email_id
         JOIN topics t ON et.topic_id = t.id
         WHERE t.name LIKE ?
+          AND {visible_sql(conn, "e.id", include_news, include_automation)}
         ORDER BY e.date_received DESC
         LIMIT ?
     """
@@ -335,7 +358,7 @@ def query_by_topic(conn: sqlite3.Connection, topic: str, limit: int = 20) -> lis
     params = (f"%{topic_normalized}%", limit)
 
     cursor = conn.execute(query, params)
-    return [dict(row) for row in cursor.fetchall()]
+    return with_source_class(conn, [dict(row) for row in cursor.fetchall()])
 
 
 def query_by_keyword(
@@ -343,6 +366,9 @@ def query_by_keyword(
     keyword: str,
     limit: int = 20,
     search_content_only: bool = False,
+    *,
+    include_news: bool = False,
+    include_automation: bool = False,
 ) -> list[dict]:
     """Full-text search using FTS5 on email subjects, summaries, content, key facts
     and attachments.
@@ -352,20 +378,23 @@ def query_by_keyword(
         keyword: Search keyword or phrase
         limit: Maximum number of results to return
         search_content_only: When True, only match against the content column
+        include_news, include_automation: Include news items and the owner's
+            automation mail, left out by default (src/store/source_class.py)
 
     Returns:
-        List of dicts with keys: email_id, date, subject, summary, snippet, source
-        where source is 'subject', 'summary', 'content', 'mixed' (every word, but
-        across those three fields), 'key_fact' or 'attachment'; a row whose thread
-        has more than one email matching across its subject, summary and body adds
-        thread_matches, that count. When no row carries
+        List of dicts with keys: email_id, date, subject, summary, snippet, source,
+        source_class, where source is 'subject', 'summary', 'content', 'mixed'
+        (every word, but across those three fields), 'key_fact' or 'attachment';
+        a row whose thread has more than one email matching across its subject,
+        summary and body adds thread_matches, that count. When no row carries
         every token, rows matching any meaningful token come back instead, each
         flagged partial_match.
     """
+    visible = visible_sql(conn, "e.id", include_news, include_automation)
     for expression, partial in fts5_query_variants(keyword):
-        results = _keyword_waterfall(conn, expression, limit, search_content_only)
+        results = _keyword_waterfall(conn, expression, limit, search_content_only, visible)
         if results:
-            return _mark_partial(results, partial)
+            return with_source_class(conn, _mark_partial(results, partial))
     return []
 
 
@@ -450,12 +479,14 @@ def _keyword_waterfall(
     safe_keyword: str,
     limit: int,
     search_content_only: bool,
+    visible: str = "1",
 ) -> list[dict]:
     """query_by_keyword's source waterfall for one sanitized MATCH expression.
 
     One row per thread, from whichever source found the thread first: a thread's
     emails share its subject and quote each other, and one thread filled the
-    page. email_thread shows the rest of it.
+    page. email_thread shows the rest of it. `visible` is a condition on e, the
+    email, that every source applies (source_class.visible_sql).
     """
     results: list[dict] = []
     seen_ids: set[int] = set()
@@ -507,7 +538,7 @@ def _keyword_waterfall(
                     ROW_NUMBER() OVER (t ORDER BY e.date_received DESC, e.id DESC) as nth
                 FROM emails_fts
                 JOIN emails e ON e.id = emails_fts.rowid
-                WHERE emails_fts.subject_f MATCH ?
+                WHERE emails_fts.subject_f MATCH ? AND {visible}
                 WINDOW t AS (PARTITION BY COALESCE({_THREAD}, e.id))
             )
             WHERE nth = 1
@@ -540,7 +571,7 @@ def _keyword_waterfall(
                 -- Column names carry the _f suffix from schema v20: the FTS indexes
                 -- the folded GENERATED columns, and an external-content FTS5's
                 -- column names are by definition its content table's column names.
-                WHERE emails_fts.summary_f MATCH ? {_NOT_TAKEN}
+                WHERE emails_fts.summary_f MATCH ? {_NOT_TAKEN} AND {visible}
             )
             WHERE nth = 1
             ORDER BY score, date DESC, email_id DESC
@@ -561,7 +592,7 @@ def _keyword_waterfall(
                         {_best_of_each_thread("emails_fts.rank")} as nth
                     FROM emails e
                     JOIN emails_fts ON emails_fts.rowid = e.id
-                    WHERE emails_fts.content_f MATCH ? {_NOT_TAKEN}
+                    WHERE emails_fts.content_f MATCH ? {_NOT_TAKEN} AND {visible}
                 )
                 WHERE nth = 1
                 ORDER BY score, date DESC, email_id DESC
@@ -600,7 +631,7 @@ def _keyword_waterfall(
                         {_best_of_each_thread("emails_fts.rank")} as nth
                     FROM emails e
                     JOIN emails_fts ON emails_fts.rowid = e.id
-                    WHERE emails_fts MATCH ? {_NOT_TAKEN}
+                    WHERE emails_fts MATCH ? {_NOT_TAKEN} AND {visible}
                 )
                 WHERE nth = 1
                 ORDER BY score, date DESC, email_id DESC
@@ -640,7 +671,7 @@ def _keyword_waterfall(
                 FROM key_facts_fts
                 JOIN key_facts kf ON kf.id = key_facts_fts.rowid
                 JOIN emails e ON e.id = kf.email_id
-                WHERE key_facts_fts MATCH ? {_NOT_TAKEN}
+                WHERE key_facts_fts MATCH ? {_NOT_TAKEN} AND {visible}
             )
             WHERE nth = 1
             ORDER BY score, date DESC, email_id DESC
@@ -666,7 +697,7 @@ def _keyword_waterfall(
                     JOIN attachment_content ac ON ac.id = attachment_content_fts.rowid
                     JOIN attachments a ON a.id = ac.attachment_id
                     JOIN emails e ON e.id = a.email_id
-                    WHERE attachment_content_fts MATCH ? {_NOT_TAKEN}
+                    WHERE attachment_content_fts MATCH ? {_NOT_TAKEN} AND {visible}
                 )
                 WHERE nth = 1
                 ORDER BY score, date DESC, email_id DESC
@@ -714,7 +745,13 @@ def _keyword_waterfall(
 
 
 def query_by_date_range(
-    conn: sqlite3.Connection, start_date: str, end_date: str, limit: int = 50
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+    limit: int = 50,
+    *,
+    include_news: bool = False,
+    include_automation: bool = False,
 ) -> list[dict]:
     """Find emails within date range (ISO 8601 strings).
 
@@ -723,11 +760,13 @@ def query_by_date_range(
         start_date: Start date (ISO 8601 format, e.g., '2026-03-01')
         end_date: End date (ISO 8601 format, e.g., '2026-03-31')
         limit: Maximum number of results to return
+        include_news, include_automation: Include news items and the owner's
+            automation mail, left out by default (src/store/source_class.py)
 
     Returns:
-        List of dicts with keys: email_id, date, subject, summary, sender
+        List of dicts with keys: email_id, date, subject, summary, sender, source_class
     """
-    query = """
+    query = f"""
         SELECT
             e.id as email_id,
             e.date_received as date,
@@ -736,12 +775,13 @@ def query_by_date_range(
             e.sender_name as sender
         FROM emails e
         WHERE DATE(e.date_received) >= DATE(?) AND DATE(e.date_received) <= DATE(?)
+          AND {visible_sql(conn, "e.id", include_news, include_automation)}
         ORDER BY e.date_received DESC
         LIMIT ?
     """
 
     cursor = conn.execute(query, (start_date, end_date, limit))
-    return [dict(row) for row in cursor.fetchall()]
+    return with_source_class(conn, [dict(row) for row in cursor.fetchall()])
 
 
 # A decision's date: its own when it is one, else its parent's. The extractor
@@ -757,6 +797,8 @@ def query_decisions(
     limit: int = 20,
     days: int | None = None,
     include_news: bool = False,
+    *,
+    include_automation: bool = False,
 ) -> list[dict]:
     """Find decisions, optionally filtered by topic or person.
 
@@ -772,10 +814,14 @@ def query_decisions(
             Default False: 15,602 of 104,768 decisions come from market
             commentary, and a decision some company announced is not one this
             user or their colleagues took.
+        include_automation: Include decisions extracted from the owner's
+            automation mail: bot settings and report lines, not decisions anyone
+            took (src/store/source_class.py). Default False.
 
     Returns:
         List of dicts with keys: decision_id, decision, decided_by, date (its own
-        ISO date, else its parent's), parent_date, email_subject, source, topics
+        ISO date, else its parent's), parent_date, email_id, email_subject,
+        source, source_class (None when the parent is not an email), topics
         (comma-separated); newest first
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
@@ -790,6 +836,7 @@ def query_decisions(
             d.decision,
             d.decided_by,
             {decision_dates(PARENT_DATE)},
+            e.id as email_id,
             COALESCE(e.subject, tt.title, wt.title, ce.subject, c.summary) as email_subject,
             CASE
                 WHEN e.id IS NOT NULL THEN 'email'
@@ -824,8 +871,7 @@ def query_decisions(
         where_clauses.append("sb_fold(d.decided_by) LIKE ?")
         params.append(f"%{search_fold(person)}%")
 
-    if not include_news:
-        where_clauses.append("(e.id IS NULL OR e.mailbox_name IS NULL OR e.mailbox_name <> 'News')")
+    where_clauses.append(visible_sql(conn, "d.email_id", include_news, include_automation))
 
     # Nothing has been decided at a date still to come. A meeting next week
     # returned its agenda as decisions, and dated by the meeting they sorted
@@ -851,7 +897,7 @@ def query_decisions(
     params.append(limit)
 
     cursor = conn.execute(query, params)
-    return [dict(row) for row in cursor.fetchall()]
+    return with_source_class(conn, [dict(row) for row in cursor.fetchall()])
 
 
 # An ISO date this store can actually sort and compare. 3,157 open action items
@@ -869,6 +915,8 @@ def query_action_items(
     limit: int = 20,
     include_news: bool = False,
     sources: tuple[str, ...] = ("email", "teams", "whatsapp", "calendar", "conversation"),
+    *,
+    include_automation: bool = False,
 ) -> list[dict]:
     """Find action items, filtered by owner and/or status.
 
@@ -885,10 +933,14 @@ def query_action_items(
             was a Teams thread, a calendar event or a conversation turn: 10,654
             open items, of which the 2,555 calendar ones had no read path
             anywhere in the codebase.
+        include_automation: Include items extracted from the owner's automation
+            mail, which re-creates the same "execute" or "monitor" item in every
+            report (src/store/source_class.py). Default False.
 
     Returns:
         List of dicts with keys: action_id, task, owner, deadline, status,
-        email_subject, date and parent_date (both its parent's date), source
+        email_id, email_subject, date and parent_date (both its parent's date),
+        source, source_class (None when the parent is not an email)
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
     # LEFT JOIN every parent, then COALESCE for display. `source` tells the
@@ -901,6 +953,7 @@ def query_action_items(
             a.owner,
             a.deadline,
             a.status,
+            e.id as email_id,
             COALESCE(e.subject, tt.title, wt.title, ce.subject, c.summary) as email_subject,
             {parent_dates(PARENT_DATE)},
             CASE
@@ -935,8 +988,7 @@ def query_action_items(
         where_clauses.append("sb_fold(a.owner) LIKE ?")
         params.append(f"%{search_fold(owner)}%")
 
-    if not include_news:
-        where_clauses.append("(e.id IS NULL OR e.mailbox_name IS NULL OR e.mailbox_name <> 'News')")
+    where_clauses.append(visible_sql(conn, "a.email_id", include_news, include_automation))
 
     wanted = set(sources)
     if wanted != {"email", "teams", "whatsapp", "calendar", "conversation"}:
@@ -968,7 +1020,7 @@ def query_action_items(
     params.append(limit)
 
     cursor = conn.execute(query, params)
-    return [dict(row) for row in cursor.fetchall()]
+    return with_source_class(conn, [dict(row) for row in cursor.fetchall()])
 
 
 def query_combined(
@@ -979,6 +1031,9 @@ def query_combined(
     start_date: str | None = None,
     end_date: str | None = None,
     limit: int = 20,
+    *,
+    include_news: bool = False,
+    include_automation: bool = False,
 ) -> list[dict]:
     """Combined query with multiple filters (AND logic).
 
@@ -992,10 +1047,12 @@ def query_combined(
         start_date: Optional start date (ISO 8601)
         end_date: Optional end date (ISO 8601)
         limit: Maximum number of results to return
+        include_news, include_automation: Include news items and the owner's
+            automation mail, left out by default (src/store/source_class.py)
 
     Returns:
         List of dicts with keys: email_id, date, subject, summary, sender,
-        topics (comma-separated), relevance_score
+        topics (comma-separated), relevance_score, source_class
 
     Raises:
         ValueError: If no filters are provided
@@ -1053,11 +1110,11 @@ def query_combined(
         where_clauses.append("DATE(e.date_received) <= DATE(?)")
         params.append(end_date)
 
+    where_clauses.append(visible_sql(conn, "e.id", include_news, include_automation))
+
     # The newest `limit` matching emails are picked first, then their topics are
     # joined: grouping every match by topic before the LIMIT sorted them all.
-    picked = "SELECT e.id FROM emails e"
-    if where_clauses:
-        picked += " WHERE " + " AND ".join(where_clauses)
+    picked = "SELECT e.id FROM emails e WHERE " + " AND ".join(where_clauses)
     picked += " ORDER BY e.date_received DESC LIMIT ?"
     query = (
         cte
@@ -1083,7 +1140,7 @@ def query_combined(
     params = cte_params + params + [limit]
 
     cursor = conn.execute(query, params)
-    return [dict(row) for row in cursor.fetchall()]
+    return with_source_class(conn, [dict(row) for row in cursor.fetchall()])
 
 
 def meeting_prep(
@@ -1092,6 +1149,9 @@ def meeting_prep(
     topic: str | None = None,
     days: int = 365,
     limit_per_person: int = 10,
+    *,
+    include_news: bool = False,
+    include_automation: bool = False,
 ) -> dict:
     """Generate a meeting prep dossier for attendees.
 
@@ -1101,16 +1161,20 @@ def meeting_prep(
         topic: Optional meeting topic to focus on
         days: How far back to look (default: 90 days)
         limit_per_person: Max emails per person (default: 10)
+        include_news, include_automation: Include news items and the owner's
+            automation mail, left out by default (src/store/source_class.py)
 
     Returns:
         Dict with keys:
         - attendees: list of per-person dossiers
         - topic_context: topic-related context (if topic provided)
+        Every email, decision, fact and action row carries its source_class.
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
     from datetime import datetime, timedelta
 
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    visible = visible_sql(conn, "e.id", include_news, include_automation)
 
     result: dict[str, Any] = {"attendees": [], "topic_context": None}
 
@@ -1143,7 +1207,7 @@ def meeting_prep(
         # roles came back twice (the DISTINCT took in the role), and so did its
         # decisions and actions. The role shown is one of theirs, sender first.
         cursor = conn.execute(
-            """
+            f"""
             SELECT e.id as email_id, e.date_received as date, e.subject, e.summary,
                 (SELECT ep.role_in_email FROM email_people ep
                   WHERE ep.email_id = e.id AND ep.person_id = ?
@@ -1151,12 +1215,12 @@ def meeting_prep(
                 e.sentiment
             FROM emails e
             WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
-              AND e.date_received >= ?
+              AND e.date_received >= ? AND {visible}
             ORDER BY e.date_received DESC LIMIT ?
         """,
             (person_id, person_id, cutoff, limit_per_person),
         )
-        dossier["emails"] = [dict(r) for r in cursor.fetchall()]
+        dossier["emails"] = with_source_class(conn, [dict(r) for r in cursor.fetchall()])
 
         # Sentiment distribution
         for email in dossier["emails"]:
@@ -1168,41 +1232,41 @@ def meeting_prep(
         cursor = conn.execute(
             f"""
             SELECT d.decision, d.decided_by, {decision_dates(EMAIL_DATE)},
-                e.subject as email_subject
+                e.id as email_id, e.subject as email_subject
             FROM decisions d
             JOIN emails e ON d.email_id = e.id
             WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
-              AND e.date_received >= ?
+              AND e.date_received >= ? AND {visible}
             ORDER BY {decision_order(EMAIL_DATE)} LIMIT 10
         """,
             (person_id, cutoff),
         )
-        dossier["decisions"] = [dict(r) for r in cursor.fetchall()]
+        dossier["decisions"] = with_source_class(conn, [dict(r) for r in cursor.fetchall()])
 
         # Open action items, the actionable first
         cursor = conn.execute(
             f"""
             SELECT a.task, a.owner, a.deadline, a.status, {parent_dates(EMAIL_DATE)},
-                e.subject as email_subject
+                e.id as email_id, e.subject as email_subject
             FROM action_items a
             JOIN emails e ON a.email_id = e.id
             WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
-              AND a.status = 'open'
+              AND a.status = 'open' AND {visible}
             ORDER BY {action_order(EMAIL_DATE)} LIMIT 10
         """,
             (person_id,),
         )
-        dossier["open_actions"] = [dict(r) for r in cursor.fetchall()]
+        dossier["open_actions"] = with_source_class(conn, [dict(r) for r in cursor.fetchall()])
 
         # Top topics
         cursor = conn.execute(
-            """
+            f"""
             SELECT t.display_name as topic, COUNT(*) as count
             FROM email_topics et
             JOIN topics t ON et.topic_id = t.id
             JOIN emails e ON et.email_id = e.id
             WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
-              AND e.date_received >= ?
+              AND e.date_received >= ? AND {visible}
             GROUP BY t.id ORDER BY count DESC LIMIT 5
         """,
             (person_id, cutoff),
@@ -1227,45 +1291,46 @@ def meeting_prep(
         cursor = conn.execute(
             f"""
             SELECT d.decision, d.decided_by, {decision_dates(EMAIL_DATE)},
-                   e.subject as email_subject
+                   e.id as email_id, e.subject as email_subject
             FROM decisions d
             JOIN emails e ON d.email_id = e.id
             WHERE e.id IN (SELECT et.email_id FROM email_topics et
                            JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
-              AND e.date_received >= ?
+              AND e.date_received >= ? AND {visible}
             ORDER BY {decision_order(EMAIL_DATE)} LIMIT 20
         """,
             (f"%{topic_normalized}%", cutoff),
         )
-        topic_ctx["decisions"] = [dict(r) for r in cursor.fetchall()]
+        topic_ctx["decisions"] = with_source_class(conn, [dict(r) for r in cursor.fetchall()])
 
         cursor = conn.execute(
             f"""
-            SELECT kf.fact, {parent_dates(EMAIL_DATE)}, e.subject
+            SELECT kf.fact, {parent_dates(EMAIL_DATE)}, e.id as email_id, e.subject
             FROM key_facts kf
             JOIN emails e ON kf.email_id = e.id
             WHERE e.id IN (SELECT et.email_id FROM email_topics et
                            JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
-              AND e.date_received >= ?
+              AND e.date_received >= ? AND {visible}
             ORDER BY {fact_order(EMAIL_DATE)} LIMIT 20
         """,
             (f"%{topic_normalized}%", cutoff),
         )
-        topic_ctx["key_facts"] = [dict(r) for r in cursor.fetchall()]
+        topic_ctx["key_facts"] = with_source_class(conn, [dict(r) for r in cursor.fetchall()])
 
         cursor = conn.execute(
             f"""
-            SELECT a.task, a.owner, a.deadline, a.status, {parent_dates(EMAIL_DATE)}
+            SELECT a.task, a.owner, a.deadline, a.status, {parent_dates(EMAIL_DATE)},
+                   e.id as email_id
             FROM action_items a
             JOIN emails e ON a.email_id = e.id
             WHERE e.id IN (SELECT et.email_id FROM email_topics et
                            JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
-              AND a.status = 'open'
+              AND a.status = 'open' AND {visible}
             ORDER BY {action_order(EMAIL_DATE)} LIMIT 20
         """,
             (f"%{topic_normalized}%",),
         )
-        topic_ctx["action_items"] = [dict(r) for r in cursor.fetchall()]
+        topic_ctx["action_items"] = with_source_class(conn, [dict(r) for r in cursor.fetchall()])
 
         result["topic_context"] = topic_ctx
 
@@ -1277,7 +1342,9 @@ def meeting_prep(
 _MEETING_RESPONSE_PREFIXES = ("Accepted:", "Tentative:", "Declined:", "Αποδεκτή:", "Αποδοχή:")
 
 
-def _stale_threads_sql(select: str, days: int, max_days: int) -> tuple[str, tuple]:
+def _stale_threads_sql(
+    select: str, days: int, max_days: int, visible: str = "1"
+) -> tuple[str, tuple]:
     """Threads whose last message the user sent between `days` and `max_days` ago,
     to someone else, and not as a meeting response.
 
@@ -1287,9 +1354,10 @@ def _stale_threads_sql(select: str, days: int, max_days: int) -> tuple[str, tupl
 
     Mail with no recipient or cc but the owner (health checks and digests he
     sends himself) and meeting responses were about 80% of the list on the
-    replica, and nobody will ever answer either. The window is cut in UTC, the
-    time the store holds: naive local time put a thread 4.9 days old under
-    days=5.
+    replica, and nobody will ever answer either; nor will anyone answer his
+    automation's mail to others, left out by `visible` (source_class.visible_sql
+    on e). The window is cut in UTC, the time the store holds: naive local time
+    put a thread 4.9 days old under days=5.
     """
     from datetime import UTC, datetime, timedelta
 
@@ -1327,6 +1395,7 @@ def _stale_threads_sql(select: str, days: int, max_days: int) -> tuple[str, tupl
           {not_a_response}
           AND lpt.last_date < ?
           AND lpt.last_date >= ?
+          AND {visible}
     """
     return sql, (
         _BLANK_SUBJECT_THREAD,
@@ -1339,7 +1408,13 @@ def _stale_threads_sql(select: str, days: int, max_days: int) -> tuple[str, tupl
 
 
 def find_stale_threads(
-    conn: sqlite3.Connection, days: int = 5, max_days: int = 30, limit: int = 20
+    conn: sqlite3.Connection,
+    days: int = 5,
+    max_days: int = 30,
+    limit: int = 20,
+    *,
+    include_news: bool = False,
+    include_automation: bool = False,
 ) -> list[dict]:
     """Threads where the user sent last and nobody replied, newest first.
 
@@ -1354,53 +1429,81 @@ def find_stale_threads(
         days: Days since the user's message before a thread counts as stale
         max_days: Oldest such message still worth a reminder
         limit: Maximum threads to return
+        include_news, include_automation: Include news items and the owner's
+            automation mail, left out by default (src/store/source_class.py)
 
     Returns:
-        List of dicts with keys: conversation_id, subject, date_received,
-        sender_address, days_waiting
+        List of dicts with keys: email_id, conversation_id, subject,
+        date_received, sender_address, days_waiting, source_class
     """
     if not USER_EMAIL_PATTERN:
         return []
     sql, params = _stale_threads_sql(
-        "e.conversation_id, e.subject, e.date_received, e.sender_address, "
+        "e.id as email_id, e.conversation_id, e.subject, e.date_received, e.sender_address, "
         "CAST(julianday('now') - julianday(e.date_received) AS INTEGER) as days_waiting",
         days,
         max_days,
+        visible_sql(conn, "e.id", include_news, include_automation),
     )
     rows = conn.execute(sql + " ORDER BY e.date_received DESC LIMIT ?", (*params, limit))
-    return [dict(r) for r in rows.fetchall()]
+    return with_source_class(conn, [dict(r) for r in rows.fetchall()])
 
 
-def count_stale_threads(conn: sqlite3.Connection, days: int = 5, max_days: int = 30) -> int:
+def count_stale_threads(
+    conn: sqlite3.Connection,
+    days: int = 5,
+    max_days: int = 30,
+    *,
+    include_news: bool = False,
+    include_automation: bool = False,
+) -> int:
     """How many threads find_stale_threads would return without its limit."""
     if not USER_EMAIL_PATTERN:
         return 0
-    sql, params = _stale_threads_sql("COUNT(*)", days, max_days)
+    sql, params = _stale_threads_sql(
+        "COUNT(*)",
+        days,
+        max_days,
+        visible_sql(conn, "e.id", include_news, include_automation),
+    )
     return conn.execute(sql, params).fetchone()[0]
 
 
-# Open, past an ISO date, and not from a news article. Free text sorted to the
-# top with days_overdue = NULL and pushed the real answers off the end. A
-# parseable julianday() was not enough either: it reads a bare year ('2026') as
-# Julian day 2026 and '10:00' as today, so those counted as overdue with
-# days_overdue near 2.46 million. The same ISO test query_action_items uses.
-_OVERDUE_WHERE = f"""
+def _overdue_where(
+    conn: sqlite3.Connection, include_news: bool = False, include_automation: bool = False
+) -> str:
+    """Open, past an ISO date, and not from a news item or the owner's automation
+    mail unless asked. Free text sorted to the top with days_overdue = NULL and
+    pushed the real answers off the end. A parseable julianday() was not enough
+    either: it reads a bare year ('2026') as Julian day 2026 and '10:00' as today,
+    so those counted as overdue with days_overdue near 2.46 million. The same ISO
+    test query_action_items uses."""
+    return f"""
     ai.status = 'open' AND ai.deadline {_ISO_DATE}
       AND date(substr(ai.deadline, 1, 10)) IS NOT NULL
       AND substr(ai.deadline, 1, 10) < date('now')
-      AND (e.id IS NULL OR e.mailbox_name IS NULL OR e.mailbox_name <> 'News')
+      AND {visible_sql(conn, "ai.email_id", include_news, include_automation)}
 """
 
 
-def count_overdue_actions(conn: sqlite3.Connection) -> int:
-    """How many open action items are past a parseable deadline, news excluded."""
+def count_overdue_actions(
+    conn: sqlite3.Connection, *, include_news: bool = False, include_automation: bool = False
+) -> int:
+    """How many open action items are past a parseable deadline, news and the
+    owner's automation mail excluded unless asked."""
     return conn.execute(
-        "SELECT COUNT(*) FROM action_items ai LEFT JOIN emails e ON ai.email_id = e.id "
-        "WHERE " + _OVERDUE_WHERE
+        "SELECT COUNT(*) FROM action_items ai WHERE "
+        + _overdue_where(conn, include_news, include_automation)
     ).fetchone()[0]
 
 
-def find_overdue_actions(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
+def find_overdue_actions(
+    conn: sqlite3.Connection,
+    limit: int = 20,
+    *,
+    include_news: bool = False,
+    include_automation: bool = False,
+) -> list[dict]:
     """Find action items past their deadline, most recently missed first.
 
     `limit` is not optional in practice. This had no bound until 2026-09-09 and
@@ -1413,13 +1516,13 @@ def find_overdue_actions(conn: sqlite3.Connection, limit: int = 20) -> list[dict
     overdue first, the list opened on items missed years ago.
 
     Returns:
-        List of dicts with keys: action_id, task, owner, deadline,
+        List of dicts with keys: action_id, task, owner, deadline, email_id,
         email_subject, date and parent_date (both its parent's date), source,
-        days_overdue
+        days_overdue, source_class (None when the parent is not an email)
     """
     results = conn.execute(
         f"""
-        SELECT ai.id as action_id, ai.task, ai.owner, ai.deadline,
+        SELECT ai.id as action_id, ai.task, ai.owner, ai.deadline, e.id as email_id,
                COALESCE(e.subject, tt.title, wt.title, ce.subject, c.summary) as email_subject,
                {parent_dates(PARENT_DATE)},
                CASE
@@ -1440,14 +1543,14 @@ def find_overdue_actions(conn: sqlite3.Connection, limit: int = 20) -> list[dict
         LEFT JOIN conversation_turns ct ON ai.conversation_turn_id = ct.id
         LEFT JOIN conversations c ON ct.conversation_id = c.id
         WHERE """
-        + _OVERDUE_WHERE
+        + _overdue_where(conn, include_news, include_automation)
         + """
         ORDER BY ai.deadline DESC
         LIMIT ?
     """,
         (limit,),
     ).fetchall()
-    return [dict(r) for r in results]
+    return with_source_class(conn, [dict(r) for r in results])
 
 
 def get_stats(conn: sqlite3.Connection) -> dict:
@@ -1630,6 +1733,9 @@ def search_attachments(
     conn: sqlite3.Connection,
     keyword: str,
     limit: int = 20,
+    *,
+    include_news: bool = False,
+    include_automation: bool = False,
 ) -> list[dict]:
     """Search attachment content using FTS5.
 
@@ -1637,11 +1743,14 @@ def search_attachments(
         conn: Database connection
         keyword: Search term
         limit: Maximum results
+        include_news, include_automation: Include the attachments of news items
+            and of the owner's automation mail, left out by default
+            (src/store/source_class.py)
 
     Returns:
-        List of dicts with: attachment_id, filename, mime_type,
-        email_subject, email_date, snippet, summary. Rows from the any-token
-        fallback carry partial_match.
+        List of dicts with: attachment_id, filename, mime_type, email_id,
+        email_subject, email_date, snippet, summary, source_class (the email's).
+        Rows from the any-token fallback carry partial_match.
     """
     # Check if attachment_content_fts exists
     tables = [
@@ -1653,37 +1762,37 @@ def search_attachments(
     if "attachment_content_fts" not in tables:
         return []
 
+    visible = visible_sql(conn, "a.email_id", include_news, include_automation)
     for safe_kw, partial in fts5_query_variants(keyword):
         rows = conn.execute(
-            """
+            f"""
             SELECT ac.attachment_id, a.filename, a.mime_type,
                    e.subject, e.date_received,
                    snippet(attachment_content_fts, 0, '>>>', '<<<', '...', 40) as text_snippet,
-                   ac.summary
+                   ac.summary, a.email_id
             FROM attachment_content_fts
             JOIN attachment_content ac ON ac.id = attachment_content_fts.rowid
             JOIN attachments a ON a.id = ac.attachment_id
             LEFT JOIN emails e ON e.id = a.email_id
-            WHERE attachment_content_fts MATCH ?
+            WHERE attachment_content_fts MATCH ? AND {visible}
             ORDER BY rank
             LIMIT ?
         """,
             (safe_kw, limit),
         ).fetchall()
         if rows:
-            return _mark_partial(
-                [
-                    {
-                        "attachment_id": r[0],
-                        "filename": r[1],
-                        "mime_type": r[2],
-                        "email_subject": r[3],
-                        "email_date": r[4],
-                        "snippet": r[5],
-                        "summary": r[6],
-                    }
-                    for r in rows
-                ],
-                partial,
-            )
+            found = [
+                {
+                    "attachment_id": r[0],
+                    "filename": r[1],
+                    "mime_type": r[2],
+                    "email_id": r[7],
+                    "email_subject": r[3],
+                    "email_date": r[4],
+                    "snippet": r[5],
+                    "summary": r[6],
+                }
+                for r in rows
+            ]
+            return with_source_class(conn, _mark_partial(found, partial))
     return []

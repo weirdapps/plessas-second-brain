@@ -82,37 +82,45 @@ See [`examples/example_exporter.py`](examples/example_exporter.py) for a ~40-lin
 
 The MCP server exposes 27 tools (all defined in `src/mcp_server.py`). Register the server once with `claude mcp add` (see [Register with Claude Code](#register-with-claude-code)), then every session picks them up.
 
+### News and automation are left out by default
+
+Every row of the `emails` table has a `source_class` (schema v33, rules in `src/store/source_class.py`): `mail`, `automation` (the reports your own jobs mail you), `news`, `document` (standalone documents, SharePoint files and pages, web imports) or `session_note` (notes Claude sessions wrote). Every tool that reads mail or what was extracted from it (`recall`, `search_emails`, `query_emails`, `person_context`, `topic_context`, `meeting_prep`, `query_decisions`, `query_actions`, `stale_threads`, `search_attachments`, and `sender_brief` through `person_context`) leaves out `news` and `automation` unless you pass `include_news=true` or `include_automation=true`. Documents and session notes stay in. Every row drawn from an email carries its `source_class`; a decision or action whose parent is not an email (Teams, WhatsApp, a meeting, a conversation) carries `null` and is never filtered.
+
+This changes results: decisions, actions and key facts from news items and from your automation mail no longer appear in "what did we decide" or "what do I owe" answers unless asked for. Before v33 only `query_decisions`, `query_actions` and the overdue half of `stale_threads` left out news, and nothing left out automation.
+
 ### Unified recall
 
-- `recall(query, limit_per_kind, days)`. Fan-out across every text-bearing index, plus auto-pulled person and topic context. This is the default "tell me everything you know about X" entry point.
+- `recall(query, limit_per_kind, days, include_news, include_automation)`. Fan-out across every text-bearing index, plus auto-pulled person and topic context. This is the default "tell me everything you know about X" entry point.
 
   Ten result buckets, keyed exactly as returned: `emails` (which also covers standalone documents and news, since they share the `emails` table), `attachments`, `conversations`, `decisions`, `actions`, `commitments`, `inline_images`, `teams`, `whatsapp`, `calendar_events`. `summary.kinds_with_results` names the ones that matched.
 
-  Only the `emails` bucket is a keyword plus semantic fusion (reciprocal rank fusion over FTS5 and embedding hits, degrading to keyword-only if the index or credentials are absent). Every other bucket is keyword-only. When the local database is behind, the response carries `_stale_warning` and `data_as_of`.
+  Only the `emails` bucket is a keyword plus semantic fusion (reciprocal rank fusion over FTS5 and embedding hits, degrading to keyword-only if the index or credentials are absent). Every other bucket is keyword-only. When the local database is behind, the response carries `_stale_warning` and `data_as_of`. News and automation are left out of every bucket, the semantic candidates and both dossiers unless included (see above).
 
 ### Emails
 
-- `search_emails(query, search_type, limit)`. Keyword (FTS5) or semantic (embedding). Keyword search tries the subject first, then the summary, the body, key facts and attachments, and returns one email per thread (for a subject match, the thread's newest); a row whose thread has more than one email matching in its subject, summary or body says how many in `thread_matches`.
-- `email_thread(email_id, limit)`. The emails of a hit's thread, oldest first, with `thread_total`; a thread longer than `limit` comes back as the `limit` emails centred on the hit, and a News item or an email with no conversation id as a thread of one.
-- `query_emails(person, topic, keyword, start_date, end_date, limit)`. Combined filters.
+- `search_emails(query, search_type, limit, include_news, include_automation)`. Keyword (FTS5) or semantic (embedding). Keyword search tries the subject first, then the summary, the body, key facts and attachments, and returns one email per thread (for a subject match, the thread's newest); a row whose thread has more than one email matching in its subject, summary or body says how many in `thread_matches`. Semantic search leaves the vectors of news and automation mail, and of their attachments, out of the ranking unless included.
+- `email_thread(email_id, limit)`. The emails of a hit's thread, oldest first, with `thread_total`; a thread longer than `limit` comes back as the `limit` emails centred on the hit, and a News item or an email with no conversation id as a thread of one. The thread asked for comes back whatever its class, each row saying its `source_class`.
+- `query_emails(person, topic, keyword, start_date, end_date, limit, include_news, include_automation)`. Combined filters.
 - `outlook_live_search(folder, since_minutes, subject_contains)`. Bypasses the DB and queries the live Outlook mailbox directly, for mail newer than the store. `since_minutes` defaults to 60 and is capped at 1440 (24 hours); the answer's `since_minutes` and `clamped` say what was searched. This is the escape hatch when `stats` says the local copy is stale.
 
 ### People and topics
 
-- `person_context(name_or_email, days, limit)`. History, sentiment, decisions, open actions, communication pattern, `teams`: the messages they wrote in the window and the threads they wrote in (`recent_threads`, with `recent_threads_total`), and `whatsapp`, the same for WhatsApp, matched on a name of two words or more against sender names, since WhatsApp has no address to join on. Each list is capped at `limit` (default 20) and carries a `<name>_total` sibling with the real count, so a truncated answer is distinguishable from a complete one. A name is matched ignoring case and accents; when several people match, the most-emailed one is used and `match_count` / `other_candidates` say who else it could be (`sender_brief` and `meeting_prep` resolve names the same way).
-- `topic_context(topic, days, limit)`. Key people, decisions, actions, facts. Same `limit` and `<name>_total` contract.
+- `person_context(name_or_email, days, limit, include_news, include_automation)`. History, sentiment, decisions, open actions, communication pattern, `teams`: the messages they wrote in the window and the threads they wrote in (`recent_threads`, with `recent_threads_total`), and `whatsapp`, the same for WhatsApp, matched on a name of two words or more against sender names, since WhatsApp has no address to join on. Each list is capped at `limit` (default 20) and carries a `<name>_total` sibling with the real count, so a truncated answer is distinguishable from a complete one. A name is matched ignoring case and accents; when several people match, the most-emailed one is used and `match_count` / `other_candidates` say who else it could be (`sender_brief` and `meeting_prep` resolve names the same way).
+- `topic_context(topic, days, limit, include_news, include_automation)`. Key people, decisions, actions, facts. Same `limit` and `<name>_total` contract.
 - `sender_brief(name_or_email, days)`. Compact briefing suitable for inline display.
-- `meeting_prep(people, topic, days)`. Per-attendee dossiers, optionally scoped to a topic.
+- `meeting_prep(people, topic, days, include_news, include_automation)`. Per-attendee dossiers, optionally scoped to a topic.
+
+Every dossier dates and orders its rows the same way (`src/store/ordering.py`): decisions newest first by their own date when it is an ISO date, else by their parent's (the email, Teams or WhatsApp session, meeting or conversation they came from); key facts newest parent first; open actions upcoming first, soonest first, then undated, then overdue, most recently missed first. Every decision, fact and action row carries `date` and `parent_date`.
 
 ### Decisions and actions
 
-- `query_decisions(topic, person, days, limit)`.
-- `query_actions(owner, status, limit)`.
-- `stale_threads(days, limit, max_days)`. Threads whose last message you sent between `days` and `max_days` (default 30) ago, plus overdue action items from every source but news; both lists newest first, capped at `limit`, with `stale_threads_total` and `overdue_actions_total` giving the untruncated counts. The stale-thread half needs `BRAIN_USER_EMAIL_PATTERN`; without it that half is always empty and the response says so.
+- `query_decisions(topic, person, days, limit, include_news, include_automation)`.
+- `query_actions(owner, status, limit, include_news, include_automation)`.
+- `stale_threads(days, limit, max_days, include_news, include_automation)`. Threads whose last message you sent between `days` and `max_days` (default 30) ago, plus overdue action items from every source but news and automation; both lists newest first, capped at `limit`, with `stale_threads_total` and `overdue_actions_total` giving the untruncated counts. The stale-thread half needs `BRAIN_USER_EMAIL_PATTERN`; without it that half is always empty and the response says so.
 
 ### Attachments and images
 
-- `search_attachments(query, limit)`. FTS over extracted text and LLM summaries. Since 2026-10-11 a long attachment's summary is built from part of it: a spreadsheet's from its structure, any other long text's from three of its parts (see [Attachment summaries and spend](#attachment-summaries-and-spend)). The full extracted text is still searched.
+- `search_attachments(query, limit, include_news, include_automation)`. FTS over extracted text and LLM summaries; each row carries its email's `source_class`. Since 2026-10-11 a long attachment's summary is built from part of it: a spreadsheet's from its structure, any other long text's from three of its parts (see [Attachment summaries and spend](#attachment-summaries-and-spend)). The full extracted text is still searched.
 - `attachment_image_search(query, limit)`. Case- and accent-blind match on vision descriptions of classified content images: the whole query first, then any meaningful word (`partial_match`).
 
 ### Calendar
@@ -396,6 +404,7 @@ python -m src.cli stats
 
 # Housekeeping
 python -m src.cli migrate
+python -m src.cli classify-sources          # set every email's source_class again, e.g. after BRAIN_USER_EMAIL_PATTERN is set
 python -m src.cli embed --force
 python -m src.cli prune-staged
 python -m src.cli hash-attachments          # record a content hash for every attachment file still on disk
@@ -470,6 +479,8 @@ src/
     schema.py                  Tables, FTS5 indexes, migrations
     loader.py                  Extracted JSON to SQLite
     query.py                   Person, topic, keyword, date, decisions, actions, FTS, combined
+    source_class.py            What an emails row is (mail, automation, news, document, session note) and the default filter
+    ordering.py                How decisions, key facts and actions are dated and ordered in every list
     context.py                 Rich person and topic context aggregations
     embeddings.py              Embedding index build and query
     recall.py                  Unified `recall` fan-out
@@ -519,6 +530,17 @@ skill/
 `data/brain.db` (SQLite). Migrations run automatically via `src/store/schema.py`; the current schema version is `CURRENT_SCHEMA_VERSION` in `src/config.py` and is tracked in the `schema_version` table.
 
 - **Core content**: `emails`, `topics`, `email_topics`, `decisions`, `action_items`, `commitments`, `people`, `email_people`, `key_facts`, and from v23 `email_html`: an HTML body is stored as the text a reader sees, and the HTML is kept here, zlib-compressed, for the SharePoint link scan and the inline-image positions
+- **Source class** (v33): `emails.source_class`, `NOT NULL DEFAULT 'mail'`, indexed (`idx_emails_source_class`). Set when a row is stored (the loader, `ingest_document`, `ingest_text_document`), by these rules, the first that matches:
+
+  | Class | Rule |
+  | --- | --- |
+  | `news` | `mailbox_name = 'News'` |
+  | `session_note` | `mailbox_name = 'External'` from `session-note@documents.local` |
+  | `document` | any other `mailbox_name = 'External'` row |
+  | `automation` | a subject starting with `[VPS]` or `[ALERT]` (any case); or mail sent by the owner (`BRAIN_USER_EMAIL_PATTERN`) to no one but himself, not a reply or forward, whose subject starts with a bracketed tag (`[nightly] ...`) or holds an ISO date |
+  | `mail` | everything else, including whatever the rules are unsure of |
+
+  The v33 migration classifies existing rows in one transaction, writing only the rows that are not `mail`. The owner rule needs `BRAIN_USER_EMAIL_PATTERN`; if it was unset when the migration ran, set it and run `python -m src.cli classify-sources`, which sets every row's class again by today's rules and writes only the rows that change. A replica on newer code than its pulled store reads the class off `mailbox_name`, the sender and the subject until the store is migrated (everything but the owner rule).
 - **Attachments and images**: `attachments`, `attachment_content`, `inline_images`, `inline_image_occurrences`, `sender_signature_index`
 - **Calendar**: `calendar_events`, `event_attendees`
 - **Teams**: `teams_chats`, `teams_threads`, `teams_messages`, `teams_mri_resolution`

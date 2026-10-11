@@ -18,6 +18,33 @@ Four stages, run on a schedule:
 3. **Load.** Write rows into SQLite with FTS5 full-text indexes, embedding vectors, and thread reconstruction. Schema migrations run automatically.
 4. **Serve.** Expose the store as MCP tools that Claude Code plugins (`mail`, `meetings`, `chat`, `decks`, and more) call directly.
 
+## What changed on 2026-10-11
+
+The changes merged on 2026-10-11 (#181 to #216) that you will notice, and the switch that gives the old behaviour back where there is one. A store built before then also wants a few one-off commands: [`docs/DEPLOY.md`](docs/DEPLOY.md), section 12, lists them in order.
+
+| Change | What you notice | The old behaviour |
+| --- | --- | --- |
+| Reading moved to `brain tool` | `brain tool NAME 'JSON'` calls any MCP tool. The seventeen read commands (`query ...`, `prep`, `stale`, `stats`, `teams-search`, `teams-thread`, `teams-chat`, `teams-stats`, `sharepoint-refused`) answer with that tool's JSON instead of text, and print one deprecation line ([table](#deprecated-read-commands)) | They go in the next release |
+| One-off maintenance under `brain maint` | `migrate`, `classify-sources`, `reextract`, `calendar-sync --backfill` and the other one-offs print one deprecation line under their old names ([list](#one-off-maintenance-brain-maint)) | The old names work until the next release |
+| News and automation left out | Every tool that reads mail, or what was extracted from it, leaves out news items and the reports your own jobs mail you ([details](#news-and-automation-are-left-out-by-default)) | `include_news=true`, `include_automation=true` on the call |
+| Your addresses matched whole | `BRAIN_USER_EMAIL_PATTERN` is a list of your addresses, each matched exactly, no longer as a substring: an alias it does not list is someone else ([Identity](#identity)) | None: list every address you send from, then run `brain maint classify-sources` |
+| A 40,000-character answer | Ten tools hold their answer to 40,000 characters and name what they cut in `truncated` ([MCP tools](#mcp-tools)) | None: narrow the query or lower `limit` |
+| One envelope on every row | Every result opens with `data_as_of` and `stale`; every row says its `kind`, `who`, `ref` and `date`, and a search hit its `matched_in`. `source` on email search rows is deprecated in favour of `matched_in` ([MCP tools](#mcp-tools)) | The fields a row already had stay beside the new names; `source` goes in the next release |
+| `recall` dossiers on request | `recall` attaches the person and topic dossiers only when asked ([Unified recall](#unified-recall)) | `include_context=true` |
+| Greek words in any form | A Greek keyword also finds the word's other forms: `κάρτες` finds `κάρτα` ([details](#greek-words-are-matched-in-any-form)) | `BRAIN_QUERY_STEMMING=0` |
+| People resolved to identities first | A name resolves to someone known by an address, a Teams MRI or a WhatsApp JID before a name only seen in text; `resolved_by`, `match_count` and `other_candidates` say how ([People and topics](#people-and-topics)) | None |
+| Your own sessions only | Conversation tools leave out agent sessions; `recall_preference` and `recent_conversations` are removed, which leaves 25 tools ([details](#claude-code-conversation-memory)) | `include_agents=true` for agent sessions; none for the two tools |
+| Calendar | Each event lists 12 attendees, you and the organiser first; an invitation is summarised as its purpose and agenda, with no decisions or actions ([Calendar](#calendar)) | `max_attendees` up to 500; none for invitations |
+| Claude settings required | `CLAUDE_EXTRACT_MODEL` and `VERTEX_SDK_REGION` have no default, so the first Claude call stops until both are set; `ANTHROPIC_API_KEY` alone no longer selects the direct API ([Extraction engine](#extraction-engine)) | `BRAIN_ALLOW_DIRECT_API=1`, with no Vertex project, for the direct API |
+| Embeddings through the Gemini API when a key is set | With `GEMINI_API_KEY` in the environment, the index and every search query are embedded through the Gemini API, not Vertex (the same model) | `BRAIN_EMBED_BACKEND=vertex` |
+| Attachments in the hourly sync | Newest mail first; images and zip archives wait for the nightly pass while one runs ([details](#attachments-in-the-hourly-sync)) | `BRAIN_SYNC_HEAVY_ATTACHMENTS=1` |
+| Long attachments | A spreadsheet is summarised from a digest of its structure; any other long text from every part up to 8 parts and from three parts above that, where up to 50 were read ([details](#attachment-summaries-and-spend)) | `BRAIN_ATTACHMENT_FULL_PARTS_UPTO` raises the threshold; `brain maint reextract --full-parts ID` gives one attachment up to 50 parts |
+| Card numbers, IBANs and passwords | Masked before the model sees them, and again at load ([Security](#security)) | None |
+| Greek OCR | Scans and images are read Greek first; a reading that is Greek in Latin look-alike letters is marked and not summarised ([details](#greek-read-as-latin-letters)) | None |
+| The health check judges more | New rows for the query path, per-folder mail lag, attachment lag, backups and the restore drill, mail loss and model spend; a STALE among them fails the freshness ping ([`docs/DEPLOY.md`](docs/DEPLOY.md#7-health-check-optional)) | `BRAIN_HEALTH_FOLDER_LAG_HOURS` sets a folder's limit; 0 stops judging it |
+
+New settings: `BRAIN_ALLOW_DIRECT_API`, `BRAIN_EXTRACT_CALL_SHAPE` (`v1`, the default, builds the requests as before), `BRAIN_QUERY_STEMMING`, `BRAIN_SYNC_HEAVY_ATTACHMENTS`, `BRAIN_ATTACHMENT_FULL_PARTS_UPTO`, `BRAIN_ATTACHMENT_TOKEN_BUDGET`, `BRAIN_CHARS_PER_TOKEN`, `BRAIN_BATCH_BUCKET` and `BRAIN_BATCH_LOCATION` ([Configuration](#configuration)); `BRAIN_DAILY_SPEND_WARN_USD`, `BRAIN_HEALTH_FOLDER_LAG_HOURS`, `BRAIN_HEALTH_QUERY`, `BRAIN_BACKUP_DIR`, `BRAIN_BACKUP_OFFSITE_DIR`, `BRAIN_RESTORE_DRILL_STAMP`, `BRAIN_MCP_URL`, `BRAIN_MCP_PROBE_SLUG` and `BRAIN_MCP_PROBE_MAX_AGE_HOURS` for the health check and the backups ([`docs/DEPLOY.md`](docs/DEPLOY.md), sections 7 and 9). The MCP server also reads an owner-only environment file of its own ([Run the MCP server](#run-the-mcp-server)).
+
 ## Architecture
 
 ```mermaid
@@ -41,7 +68,7 @@ graph TD
 
 | Source | Module | Notes |
 | --- | --- | --- |
-| Microsoft 365 mail | `src/export/outlook_export.py` + `outlook_cli.py` | Primary. Hourly, one `--since` cursor per folder. |
+| Microsoft 365 mail | `src/export/outlook_export.py` + `outlook_cli.py` | Primary. Hourly through the day (the reference timer runs at :10 past 01 and 07 to 22), one `--since` cursor per folder. |
 | Attachments | `src/export/outlook_attachments.py`, `src/extract/attachment_extractors.py` | PDF (PyMuPDF), DOCX (`python-docx`), PPTX (`python-pptx`), XLSX (`openpyxl`), XLSB (`pyxlsb`), XLS (`xlrd`), images (Tesseract OCR, Greek first and English first again for a page that reads as Latin script, a grayscale second pass when colour finds too little; the scanned pages of a text PDF are OCR'd too), EML and clear-signed `.p7m`, `.mso` object containers (the workbooks behind charts pasted into mail), `.wmz`/`.emz` drawings (their text records), and text formats routed by their bytes (ICS, VCF, XML, SVG, EPS, VTT). Files encrypted at rest (rights-protected Office files and `.rpmsg` messages, password-protected Office files and PDFs) are recognised from their bytes and recorded as `extraction_status = 'encrypted'`, method `rms`, `rms-message` or `password`: nothing reads them without the key. |
 | Inline email images | `src/extract/image_classifier.py`, `image_pipeline.py`, `image_vision.py` | Dimensions plus bytes plus sender-scoped SHA256 dedup cascade; vision LLM stage for content images, cached by SHA256. |
 | Calendar events | `src/export/calendar_export.py`, `src/extract/calendar_extractor.py` | Outlook events with attendees and series; an invitation's purpose and agenda, a past meeting's decisions. |
@@ -106,13 +133,13 @@ A field a row already had stays beside its new name: `email_id`, `thread_id` and
 
 **Shape snapshot.** `tests/fixtures/mcp_shapes.json` holds every tool's output schema keys, the keys of a sample result in order and the keys of each of its lists of rows, read against a store holding an item of every kind. A change to any of them fails `tests/test_mcp_shapes.py` until the snapshot is regenerated with `SNAPSHOT_UPDATE=1`, so the diff of that file is the review of the change. Add fields; rename or remove one only after a release of notice here.
 
-**Contract.** Every tool is annotated read-only, idempotent and closed-world, so a client may run several at once, except `outlook_live_search` (open-world: it reads the live mailbox) and `sharepoint_index` (not read-only: `refetch` records what it fetched). Choices are enums and every `limit` has bounds in the input schema, so a bad value is refused before the tool runs. Every tool declares an output schema (`src/mcp_results.py`), so results also go out as compact `structuredContent`. A failure (a malformed argument, an unknown id, a missing filter, a refused SQL statement) is a tool error, `isError: true`, whose message says what to do next; "nothing matched" is an empty list with a `reason`.
+**Contract.** Every tool is annotated read-only, idempotent and closed-world, so a client may run several at once, except `outlook_live_search` (open-world: it reads the live mailbox) and `sharepoint_index` (open-world, and not read-only: `refetch` fetches from SharePoint and records what it fetched). Choices are enums and every `limit` has bounds in the input schema, so a bad value is refused before the tool runs. Every tool declares an output schema (`src/mcp_results.py`), so results also go out as compact `structuredContent`. A failure (a malformed argument, an unknown id, a missing filter, a refused SQL statement) is a tool error, `isError: true`, whose message says what to do next; "nothing matched" is an empty list with a `reason`.
 
 **Connections.** Every tool but the `sharepoint_index` refetch reads through one read-only open (`connect_read_only`, `src/store/sql_readonly.py`, to which `sql_query` and `sql_schema` add their caps), so a write through it raises. It opens `mode=ro` with SQLite's locking, which the producer needs because its timers write the file it serves; only a pulled copy (the pull stamp exists and `BRAIN_ROLE` is not `producer`) is opened `immutable=1`, as the server asks there, or when a locking open fails there. Writers open through `get_connection` with `secure_delete` on, so what they delete is zeroed rather than left in free pages; on a replica it returns the read-only connection instead.
 
 ### News and automation are left out by default
 
-Every row of the `emails` table has a `source_class` (schema v33, rules in `src/store/source_class.py`): `mail`, `automation` (the reports your own jobs mail you), `news`, `document` (standalone documents, SharePoint files and pages, web imports) or `session_note` (notes Claude sessions wrote). Every tool that reads mail or what was extracted from it (`recall`, `search_emails`, `query_emails`, `person_context`, `topic_context`, `meeting_prep`, `query_decisions`, `query_actions`, `stale_threads`, `search_attachments`, and `sender_brief` through `person_context`) leaves out `news` and `automation` unless you pass `include_news=true` or `include_automation=true`. Documents and session notes stay in. Every row drawn from an email carries its `source_class`; a decision or action whose parent is not an email (Teams, WhatsApp, a meeting, a conversation) carries `null` and is never filtered. On a store older than v33, as a replica's is between new code and its next pull, only `news` is left out; `recall`'s `summary.source_class` and `stats` say so.
+Every row of the `emails` table has a `source_class` (schema v33; the rules are under [Database schema](#database-schema) and in `src/store/source_class.py`): `mail`, `automation` (the reports your own jobs mail you), `news`, `document` (standalone documents, SharePoint files and pages, web imports) or `session_note` (notes Claude sessions wrote). Every tool that reads mail or what was extracted from it (`recall`, `search_emails`, `query_emails`, `person_context`, `topic_context`, `meeting_prep`, `query_decisions`, `query_actions`, `stale_threads`, `search_attachments`, and `sender_brief` through `person_context`) leaves out `news` and `automation` unless you pass `include_news=true` or `include_automation=true`. Documents and session notes stay in. Every row drawn from an email carries its `source_class`; a decision or action whose parent is not an email (Teams, WhatsApp, a meeting, a conversation) carries `null` and is never filtered. On a store older than v33, as a replica's is between new code and its next pull, only `news` is left out; `recall`'s `summary.source_class` and `stats` say so.
 
 This changes results: decisions, actions and key facts from news items and from your automation mail no longer appear in "what did we decide" or "what do I owe" answers unless asked for. Before v33 only `query_decisions`, `query_actions` and the overdue half of `stale_threads` left out news, and nothing left out automation.
 
@@ -178,7 +205,7 @@ Every dossier dates and orders its rows the same way (`src/store/ordering.py`): 
 
 - `query_calendar_events(person, since, until, keyword, limit, max_attendees)`. Times come back as `start_at`/`end_at` in UTC (a trailing `Z`) and as `start_local`/`end_local` in Europe/Athens with the offset. A bare-date `since`/`until` is an Athens calendar day, and `limit` is capped at 200. A meeting Outlook no longer lists is kept as cancelled and left out. Each event lists at most `max_attendees` attendees (default 12, 0 to 500): you and the organiser always, then the ones `person` matched, listed first, then the rest in invitation order, with `attendees_total` counting them all (events average about 48 attendees and reach 500). It listed the first 10 until 2026-10-11, which could leave out the organiser and you. `response_status` is your own response, and `is_recurring` marks one occurrence of a recurring series. For the full list, `sql_query` on `event_attendees`.
 
-An event's `body_summary` depends on what its text can be. Outlook keeps the organiser's invitation as the event's text, so a meeting still to come, and every occurrence of a recurring series, is read as an invitation: the summary gives its purpose, agenda and who is expected (`Purpose: ... Agenda: ...; .... Expected: ....`), and no decision or action item is taken from it. Only a single meeting already over is asked for decisions and actions, and only from notes or minutes written into it. Before 2026-10-11 every invitation was asked for decisions, and one daily call's agenda, paraphrased 296 times, was most of the calendar's decisions; those stay in the store until you clear them (see `docs/DEPLOY.md`). The text is read as a reader sees it, the HTML converted and the online-meeting joining details (Teams, Zoom, Webex links, ids and dial-ins) left out, and an invitation with nothing else costs no model call. The occurrences of a series share one reading for as long as their invitation stays the same.
+An event's `body_summary` depends on what its text can be. Outlook keeps the organiser's invitation as the event's text, so a meeting still to come, and every occurrence of a recurring series, is read as an invitation: the summary gives its purpose, agenda and who is expected (`Purpose: ... Agenda: ...; .... Expected: ....`), and no decision or action item is taken from it. Only a single meeting already over is asked for decisions and actions, and only from notes or minutes written into it. Before 2026-10-11 every invitation was asked for decisions, and one daily call's agenda, paraphrased 296 times, was most of the calendar's decisions; those stay in the store until you clear them ([`docs/DEPLOY.md`](docs/DEPLOY.md#12-upgrading-a-producer), section 12, has the SQL). The text is read as a reader sees it, the HTML converted and the online-meeting joining details (Teams, Zoom, Webex links, ids and dial-ins) left out, and an invitation with nothing else costs no model call. The occurrences of a series share one reading for as long as their invitation stays the same.
 
 Each stored occurrence carries `is_recurring` and its series in `recurrence_master_id`: the master event's id, or, when Outlook does not send it, a `derived:` key built from the organiser and the subject. An occurrence Outlook lists again under a new id (its series sent again: the same series and start, the old id no longer listed) keeps its row rather than being stored twice.
 
@@ -188,11 +215,11 @@ Each stored occurrence carries `is_recurring` and its series in `recurrence_mast
 - `teams_thread_context(thread_id)`. Full thread with decisions, actions, facts.
 - `teams_chat_summary(chat_id, days)`. Recent activity per chat or channel.
 
-A channel thread holds the post and its replies, each reply a message of its own, and a post is dated by when it was written, not by its newest reply. A message edited or deleted after it was first stored is brought up to date on a later pull: the edit replaces the text, a deletion blanks it, and either sends the thread back to extraction. Before this, replies stayed inside the post's stored payload, out of search and extraction, and the first draft of an edited message and the text of a deleted one were kept. `python -m src.cli maint teams-backfill-replies` stores the replies already held in stored posts, once (see `docs/DEPLOY.md`).
+A channel thread holds the post and its replies, each reply a message of its own, and a post is dated by when it was written, not by its newest reply. A message edited or deleted after it was first stored is brought up to date on a later pull: the edit replaces the text, a deletion blanks it, and either sends the thread back to extraction. Before 2026-10-11, replies stayed inside the post's stored payload, out of search and extraction, and the first draft of an edited message and the text of a deleted one were kept. On a store from before then, `brain maint teams-backfill-replies` stores the replies its posts hold, once ([`docs/DEPLOY.md`](docs/DEPLOY.md#12-upgrading-a-producer), section 12).
 
-A message's text is what a reader sees of it: no tags, entities decoded, a block or a line break on a line of its own, and the visible text of a mention, a link (its address after it, as in a mail body) and an emoji kept. The HTML is kept beside it. The content's shape decides, not the type the payload declares: the services declare an HTML body as text, and until this change the text of every HTML message was its markup, so `search_teams` matched words such as `itemtype` and `nbsp` and the model read the tags. System messages (calls, membership changes) keep the service's XML. `python -m src.cli maint teams-strip-html` converts the text stored before, once (see `docs/DEPLOY.md`).
+A message's text is what a reader sees of it: no tags, entities decoded, a block or a line break on a line of its own, and the visible text of a mention, a link (its address after it, as in a mail body) and an emoji kept. The HTML is kept beside it. The content's shape decides, not the type the payload declares: the services declare an HTML body as text, and until this change the text of every HTML message was its markup, so `search_teams` matched words such as `itemtype` and `nbsp` and the model read the tags. System messages (calls, membership changes) keep the service's XML. `brain maint teams-strip-html` converts the text stored before, once (section 12 of `docs/DEPLOY.md`).
 
-Each message also keeps the payload teams-cli returned (`raw_json`), which the pull compares to tell an edit or a delete; nothing else reads it once the replies are stored. `python -m src.cli maint teams-drop-raw-json` drops it from the stored messages, once, after `teams-backfill-replies` and `teams-strip-html`: about 133 MB of the 244 MB table on the producer. A channel post whose payload still holds a reply that is not a message of its own keeps its payload, and `--dry-run` counts what would go. New messages keep their payload, and one whose payload was dropped gets it back, with the same text and no new extraction, the next time a pull reads it.
+Each message also keeps the payload teams-cli returned (`raw_json`), which the pull compares to tell an edit or a delete; nothing else reads it once the replies are stored. `brain maint teams-drop-raw-json` drops it from the messages stored before, once, after `teams-backfill-replies` (section 12 of `docs/DEPLOY.md`); a channel post whose payload still holds a reply that is not a message of its own keeps its payload. New messages keep their payload, and one whose payload was dropped gets it back, with the same text and no new extraction, the next time a pull reads it.
 
 ### WhatsApp
 
@@ -208,7 +235,7 @@ Each message also keeps the payload teams-cli returned (`raw_json`), which the p
 
 ### Claude Code conversation memory
 
-Conversation memory is the owner's own sessions. Each turn's `speaker` says who wrote it: `user` only for what the owner typed, `agent` for the rest of what Claude Code puts in the user role (skill and command bodies, compaction summaries, task notifications, command output, messages from teammates and other sessions), `assistant` for the session's own answers. An agent session (a teammate's or subagent's, a scripted run, any with no turn the owner typed) is left out of every read below unless `include_agents=true`; a new one reaches the store only through `export-conversations --include-agents`, and `relabel-conversations` tags those stored before. Stored harness tags (`<system-reminder>`, `<task-notification>`, `<teammate-message>` and the like) come back with their `<` escaped, here and in `sql_query`, so recalled text cannot read as a live harness message.
+Conversation memory is the owner's own sessions. Each turn's `speaker` says who wrote it: `user` only for what the owner typed, `agent` for the rest of what Claude Code puts in the user role (skill and command bodies, compaction summaries, task notifications, command output, messages from teammates and other sessions), `assistant` for the session's own answers. An agent session (a teammate's or subagent's, a scripted run, any with no turn the owner typed) is left out of every read below unless `include_agents=true`; a new one reaches the store only through `export-conversations --include-agents`, and `brain maint relabel-conversations` tags those stored before (section 12 of `docs/DEPLOY.md`). Stored harness tags (`<system-reminder>`, `<task-notification>`, `<teammate-message>` and the like) come back with their `<` escaped, here and in `sql_query`, so recalled text cannot read as a live harness message.
 
 - `search_conversations(query, search_type, workspace, limit, include_agents)`. With `include_agents`, each row says its `kind`, `owner` or `agent`.
 - `conversation_context(session_id, include_agents)`. An agent session is an error unless `include_agents`; the result says its `kind`.
@@ -217,9 +244,9 @@ Conversation memory is the owner's own sessions. Each turn's `speaker` says who 
 
 ### Stats
 
-- `stats()`. Counts across emails, news articles, standalone documents, conversations, topics, people, decisions, actions, attachments, key facts and calendar events, plus `coverage`: the first and last date held per mailbox, Teams, WhatsApp, calendar and conversations, and `source_class`: the emails of each class, or `"pending migration"` on a store older than v33. Check it before reading an empty answer as 'nothing happened'.
+- `stats()`. Counts of emails, news items, standalone documents, topics, people, decisions, actions, key facts, attachments and conversations, plus `coverage`: for each mailbox, Teams, WhatsApp, the calendar and conversations, the first and last date held and how many items, and `source_class`: the emails of each class, or `"pending migration"` on a store older than v33. Check it before reading an empty answer as 'nothing happened'.
 
-  The calendar's first date says nothing about the months after it, so `coverage.calendar` also has `per_month` (the meetings held in each month of their UTC start, a month holding none included), `expected_per_month` (the median of the months already over, leaving out any holding exactly one listing page), `incomplete` (the months not held in full: `capped` holds exactly the 10 an early load kept of each month, `sparse` under a quarter of the usual month, `partial` a month a backfill began and did not finish), `complete_from` (the first month after the last incomplete one) and a `note` when any month is incomplete. The current month and those ahead are never flagged, a quieter month such as August is not either, and neither is a month `calendar-sync --backfill` listed and stored in full, however few meetings it held. Fewer than three months already over give no usual month, and nothing is flagged but `partial`.
+  The calendar's first date says nothing about the months after it, so `coverage.calendar` also has `per_month` (the meetings held in each month of their UTC start, a month holding none included), `expected_per_month` (the median of the months already over, leaving out any holding exactly one listing page), `incomplete` (the months not held in full: `capped` holds exactly the 10 an early load kept of each month, `sparse` under a quarter of the usual month, `partial` a month a backfill began and did not finish), `complete_from` (the first month after the last incomplete one) and a `note` when any month is incomplete. The current month and those ahead are never flagged, a quieter month such as August is not either, and neither is a month `brain maint calendar-backfill` listed and stored in full, however few meetings it held. Fewer than three months already over give no usual month, and nothing is flagged but `partial`.
 
   It also returns `data_as_of`, `age_hours` and `stale`. `data_as_of` is the older of two stamps, both returned as stored: `last_sync_date`, which every `sync` writes, and `mail_export_ok_at`, the Inbox export's last success, which `sync` copies in. `stale_warning` names the one that is behind. On a read replica that is the only way to tell a live corpus from one whose feed stopped, because both answer queries identically.
 
@@ -249,74 +276,14 @@ From then on WhatsApp is a source like Teams: `search_whatsapp`, the `whatsapp` 
 - **What leaves the Mac** is the snapshot and nothing else. The bridge also stores, per media message, the CDN URL, the media key and the file hashes, which together download and decrypt that photo or voice note; the snapshot is built from an allowlist of columns, and a test reads its raw bytes to prove none of them survived. The bridge's own store is opened read-only and never written.
 - **Owner-only at every hop.** The snapshot is built under umask 077 in a private temporary directory that is removed on exit; it lands 0600 in a 0700 directory on the producer; `brain.db` is 0600 there, and the Mac's replica is now pulled 0600 in a 0700 directory as well (`sb-db-pull.sh`).
 - **No message in any log.** The snapshot builder and both wrappers log counts only, and the bridge's own stdout, which prints every message, is not involved.
-- **Where the content goes** is where every other source's goes: `brain.db`, the vectors of its summaries, the model provider configured for extraction and embeddings (Vertex AI), and the encrypted offsite snapshots and host backups of `brain.db`. Credentials inside messages are redacted before any of that (`src/redact.py`).
+- **Where the content goes** is where every other source's goes: `brain.db`, the vectors of its summaries, the model providers configured for extraction (Vertex AI by default) and for embeddings (Vertex AI, or the Gemini API when `GEMINI_API_KEY` or `BRAIN_EMBED_BACKEND=gemini` selects it; see [Alternative credentials](#alternative-credentials)), and the encrypted offsite snapshots and host backups of `brain.db`. Credentials inside messages are redacted before any of that (`src/redact.py`).
 - **This repository** holds code and synthetic fixtures only. Where the bridge keeps its store is host configuration (`SB_WHATSAPP_SOURCE` in the installed plist), not a path in this public tree.
 
-### Deploy
-
-On the **producer**, after pulling this repository and reinstalling (schema v26 applies on the next connection):
-
-```bash
-cp scripts/wrappers/systemd/sb-whatsapp-sync.sh ~/.local/bin/
-# ~/scripts/run-sb-whatsapp-sync.sh: a copy of run-sb-teams-sync.sh that execs sb-whatsapp-sync.sh
-```
-
-```ini
-# ~/.config/systemd/user/sb-whatsapp-sync.service
-[Unit]
-Description=second-brain WhatsApp sync
-
-[Service]
-Type=oneshot
-ExecStart=%h/scripts/run-sb-whatsapp-sync.sh
-TimeoutStartSec=600
-
-# ~/.config/systemd/user/sb-whatsapp-sync.timer
-[Unit]
-Description=second-brain WhatsApp sync, after the Mac's :50 push
-
-[Timer]
-OnCalendar=*-*-* 01,07,08,09,10,11,12,13,14,15,16,17,18,19,20,21,22:55:00 Europe/Athens
-RandomizedDelaySec=120
-
-[Install]
-WantedBy=timers.target
-
-# ~/.config/systemd/user/sb-whatsapp-sync.service.d/healthcheck.conf
-[Unit]
-OnSuccess=hc-success@sb-whatsapp-sync.service
-OnFailure=hc-fail@sb-whatsapp-sync.service
-```
-
-The Healthchecks check `sb-whatsapp-sync` must exist before the first run. Install the Mac side first, so the first run finds a snapshot rather than exiting 66, then `systemctl --user daemon-reload && systemctl --user enable --now sb-whatsapp-sync.timer`.
-
-On the **Mac that runs the bridge**, after pulling this repository:
-
-```bash
-cp scripts/wrappers/launchd/sync-whatsapp-to-vps.sh scripts/wrappers/launchd/sb-db-pull.sh ~/.local/bin/
-sed -e "s|__HOME__|$HOME|g" -e "s|__WHATSAPP_STORE__|/path/to/the/bridge/store/messages.db|g" \
-  scripts/wrappers/launchd/com.plessas.whatsapp-sync-vps.plist \
-  > ~/Library/LaunchAgents/com.plessas.whatsapp-sync-vps.plist
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.plessas.whatsapp-sync-vps.plist
-launchctl kickstart gui/$(id -u)/com.plessas.whatsapp-sync-vps   # the first push
-```
-
-**First backfill**: `systemctl --user start sb-whatsapp-sync.service` on the producer once the first push has landed. Extraction is deadline-bounded (300 s a run), so a large first backlog drains over a few hourly runs; starting the service again drains it faster. Check with `python -m src.cli tool stats` (`whatsapp_messages`, `coverage.whatsapp`) and the nightly health report's WhatsApp line.
+The producer's timer, the Mac's LaunchAgent and the first backfill are set up in [`docs/DEPLOY.md`](docs/DEPLOY.md), section 5, "WhatsApp from the Mac that runs the bridge".
 
 ## Installation
 
-Requires Python 3.12+ and, if you ingest attachments, system packages that `pip` cannot install:
-
-- **`tesseract` plus its language data.** Attachment OCR reads Greek first, `pytesseract.image_to_string(img, lang="ell+eng")`, and reads a page that comes out as Latin script again with `lang="eng+ell"`, so the English *and* Greek traineddata must both be present or every image and scanned PDF fails. `pytesseract` is a wrapper around the binary, not the binary. In a corpus with scanned documents in it, OCR ends up the most common extraction method of all.
-- **`antiword` (or `catdoc`) on Linux**, for legacy Word `.doc` attachments. macOS converts them with its built-in `textutil`; a Linux host with neither records every `.doc` as skipped, which no failure count reports.
-- **`zstd` and `openssl`**, only if you want the encrypted offsite backups from `scripts/backup_db.py`. Missing either one silently downgrades to local-snapshot-only.
-
-```bash
-brew install tesseract tesseract-lang                  # macOS
-sudo apt-get install tesseract-ocr tesseract-ocr-ell   # Debian/Ubuntu
-sudo apt-get install antiword                          # Debian/Ubuntu, legacy .doc
-tesseract --list-langs | grep -x ell                   # verify the Greek pack
-```
+Requires Python 3.12+ and [`uv`](https://docs.astral.sh/uv/), which installs exactly what the committed `uv.lock` pins. Attachment ingestion also needs system packages `pip` cannot install: `tesseract` with both its English and Greek language data (OCR reads Greek first, and English first again for a page that comes out as Latin script), `antiword` or `catdoc` on Linux for legacy Word `.doc` files, and `zstd` and `openssl` for the encrypted backups. [`docs/DEPLOY.md`](docs/DEPLOY.md), section 1, has the install commands and what silently fails without each.
 
 Microsoft 365 ingestion needs three separate open-source CLIs, one per surface: [`outlook-cli`](https://github.com/weirdapps/outlook-access) for mail, attachments and calendar, [`teams-cli`](https://github.com/weirdapps/teams-access) for Teams, and [`sharepoint-cli`](https://github.com/weirdapps/sharepoint-access) for SharePoint reference links. They share no session and each logs in separately. Everything else (local documents, URLs, YouTube, news, Claude Code conversations, or your own exporter) works without any of them.
 
@@ -327,20 +294,14 @@ git clone https://github.com/weirdapps/plessas-second-brain.git
 git clone git@github.com:weirdapps/plessas-second-brain.git
 
 cd plessas-second-brain
-
-python3.12 -m venv .venv
-source .venv/bin/activate
-
-# uv is the canonical package manager (uv.lock is committed):
-uv pip install -e ".[dev]"
-
-# pip also works:
-pip install -e ".[dev]"
+uv sync --frozen              # .venv from uv.lock; add --extra dev for the tests
 ```
+
+`pyproject.toml` declares no build system, so the project is not installed as a package: commands run from the checkout, through `./brain` and `./run_mcp.sh`, which find the venv themselves and work from any directory, or as `.venv/bin/python -m src.cli` from the checkout's root. `pip install -e .` ignores `uv.lock` and puts `src/` itself, not the checkout, on the module path, so use uv.
 
 ## Configuration
 
-Read from environment variables. Only identity plus one extraction path is strictly required: Vertex (a project, a Claude model and its region) or Gemini.
+Read from environment variables. Only identity plus one extraction path is strictly required: Vertex (a project, a Claude model and its region), Gemini, or the direct Anthropic API once switched on ([Alternative credentials](#alternative-credentials)). This section lists the settings of the pipeline and the MCP server; those of the health check and the backups are listed with their checks in [`docs/DEPLOY.md`](docs/DEPLOY.md), sections 7 and 9, and `.env.example` is a starting point with the common ones.
 
 Four identity and tenant settings (`BRAIN_USER_NAME`, `BRAIN_USER_ROLE`, `BRAIN_USER_EMAIL_PATTERN`, `SHAREPOINT_HOST`) can also live in a per-host file, `~/.config/second-brain/env` (override the path with `BRAIN_CONFIG_FILE`), one `KEY=value` per line, `#` comments allowed. `src/config.py` applies it at import, and the environment wins over it. It exists because the processes that need these settings may start without a login shell: Claude Code passes the MCP server the environment `claude` itself was launched with, which from a GUI or an IDE holds no shell profile, and systemd starts the timers with a fixed one. Any other key in the file is ignored, so a credential, a backend switch or a relocated data home pasted into it is never picked up. Nothing reads a `.env` file; the schedulers that want one source it themselves.
 
@@ -350,14 +311,14 @@ Used in extraction prompts and stale-thread detection.
 
 - `BRAIN_USER_NAME`
 - `BRAIN_USER_ROLE`
-- `BRAIN_USER_EMAIL_PATTERN`: every address you send from, primary and aliases, separated by commas (`first.last@example.com,alias@example.com`). Each is matched whole and case-blind; an entry without a domain (`first.last`) matches that local part at any domain. Nothing else matches: not `k.last@example.com` for `last@example.com`, and not a bare `@example.com`, which would make every colleague you. It decides your sent mail (stale threads, automation mail), your meetings' self flags, and the people row that is you.
+- `BRAIN_USER_EMAIL_PATTERN`: every address you send from, primary and aliases, separated by commas or spaces (`first.last@example.com,alias@example.com`). Each is matched whole and case-blind; an entry without a domain (`first.last`) matches that local part at any domain. Nothing else matches: not `k.last@example.com` for `last@example.com`, and not a bare `@example.com`, which would make every colleague you. Until 2026-10-11 it was matched as a substring. It decides your sent mail (stale threads, automation mail), your meetings' self flags, and the people row that is you. After setting or changing it, run `brain maint classify-sources` on the host that builds the store; the next calendar sync refreshes the self flags of the meetings it lists (the week behind and the 30 days ahead); `brain maint calendar-backfill` re-lists older months.
 
 ### Extraction engine
 
 - `BRAIN_EXTRACT_ENGINE`: `claude` (default) or `gemini`.
 - `CLAUDE_EXTRACT_MODEL` or `VERTEX_MODEL_EXTRACT`: the Claude model, required with the `claude` engine, and with no default. A model your Vertex project's allowlist does not hold fails every call, and the old default had become one, so a host that sets none now stops at its first Claude call with a message naming these variables. Work met before that stays pending, and the read-only tools and the tests never need it.
 - `BRAIN_GEMINI_MODEL`: Gemini model override (default `gemini-2.5-flash`).
-- `BRAIN_TEAMS_MODEL`: override for Teams thread extraction.
+- `BRAIN_TEAMS_MODEL`, `BRAIN_WHATSAPP_MODEL`: overrides for Teams thread and WhatsApp session extraction.
 - `BRAIN_EXTRACT_CALL_SHAPE`: `v1` (default) or `v2`, how the Claude extraction calls are built; see the next section. Off until the extraction eval says otherwise.
 
 ### Extraction call shape
@@ -405,9 +366,10 @@ Preferred credential path. Uses Application Default Credentials, no API key requ
 - `BRAIN_ROLE`: `producer` or `replica`. A replica holds a copy of the database built on another host, and every command but the read-only ones (`tool`, the deprecated readers it replaces, `mail-reconcile`'s report, `maint prune-staged` and `maint scrub`'s dry run) refuses to run there, as do the maintenance scripts and store modules that write and the MCP `sharepoint_index` refetch, since the next pull replaces what they would write. Without this variable a host is a replica when the pull job's stamp `~/.second-brain/db-pull.stamp` exists.
 - `SECOND_BRAIN_VENV_PYTHON`: explicit venv override for `run_mcp.sh`.
 - `BRAIN_DATA_DIR`: data home for the DB, attachments, staging, embeddings and SharePoint files. Attachment files are deleted once their content is stored, as described in [Files are inputs](docs/DEPLOY.md#10-files-are-inputs). Defaults to `<repo>/data`. Use an **absolute** path: `src/config.py` does not call `expanduser()`, and systemd's `EnvironmentFile=` does not expand `~` either, so a tilde produces a directory literally named `~`.
-- The database file is `brain.db` inside `BRAIN_DATA_DIR`, so `<repo>/data/brain.db` by default. The global `--db` flag (placed before the subcommand, e.g. `python -m src.cli --db /path/brain.db stats`) overrides it.
+- The database file is `brain.db` inside `BRAIN_DATA_DIR`, so `<repo>/data/brain.db` by default. The global `--db` flag (placed before the subcommand, e.g. `python -m src.cli --db /path/brain.db tool stats`) overrides it.
+- `BRAIN_WHATSAPP_SNAPSHOT`: the WhatsApp snapshot `whatsapp-sync` reads (default `~/.second-brain/whatsapp/whatsapp-snapshot.db`, where the Mac's push puts it; see [WhatsApp](#whatsapp)).
 
-`scripts/health_check.py` reads three more: `HEALTH_EMAIL_TO` and `HC_PING_URL`, documented in [`docs/DEPLOY.md`](docs/DEPLOY.md), and `BRAIN_DAILY_SPEND_WARN_USD` (below).
+`scripts/health_check.py` and `scripts/backup_db.py` read their own settings (`HEALTH_EMAIL_TO`, `HC_PING_URL`, `BRAIN_DAILY_SPEND_WARN_USD`, `BRAIN_HEALTH_FOLDER_LAG_HOURS`, `BRAIN_HEALTH_QUERY`, `BRAIN_BACKUP_DIR`, `BRAIN_BACKUP_OFFSITE_DIR`, `BRAIN_RESTORE_DRILL_STAMP`, `BRAIN_MCP_URL`, `BRAIN_MCP_TOKEN_FILE`, `BRAIN_MCP_PROBE_SLUG`, `BRAIN_MCP_PROBE_MAX_AGE_HOURS`, `BRAIN_LABEL_PREFIX`), each documented beside its check in [`docs/DEPLOY.md`](docs/DEPLOY.md), sections 6, 7 and 9.
 
 No credentials are printed by the code. All secrets are read from environment or (for Google) from ADC.
 
@@ -421,7 +383,7 @@ No credentials are printed by the code. All secrets are read from environment or
 
 - **Newest mail first.** Phase 1 takes attachments by their email's received time, newest first, compared as instants whatever the stored format. Taken in registration order, the day's documents waited behind the backlog until the nightly pass, which keeps that order.
 - **Phase 2 follows Phase 1.** It starts with the documents Phase 1 has just read, then any other text awaiting a summary, newest first, within its own slice, and it runs whether or not Phase 1 read anything. A document mailed in the morning is normally searchable by its text and its summary after the next hourly run; on a busy morning the summaries of the rest follow over the next runs. Texts over 50,000 characters still wait for the nightly pass.
-- **Images and zip archives wait for the nightly pass, while one runs.** One of them can take two minutes (OCR, or every member of an archive) against the 90-second slice. The hourly slice leaves them only while a `process-attachments` run over every kind (no `--type`) has stamped the `sync_metadata` row `attachment_text_pass_at` in the last 48 hours, so a host that runs `sync` alone, as the cron example in [`docs/DEPLOY.md`](docs/DEPLOY.md) does, keeps reading them hourly. An image whose bytes another attachment already holds is copied at once either way. `BRAIN_SYNC_HEAVY_ATTACHMENTS=1` reads them hourly regardless, as before.
+- **Images and zip archives wait for the nightly pass, while one runs.** One of them can take two minutes (OCR, or every member of an archive) against the 90-second slice. The hourly slice leaves them only while a `process-attachments` run over every kind (no `--type`) has stamped the `sync_metadata` row `attachment_text_pass_at` in the last 48 hours, so a host that runs `sync` with no nightly pass keeps reading them hourly (the cron example in [`docs/DEPLOY.md`](docs/DEPLOY.md), section 6, schedules one). An image whose bytes another attachment already holds is copied at once either way. `BRAIN_SYNC_HEAVY_ATTACHMENTS=1` reads them hourly regardless, as before.
 
 `stats` and the health check's Attachment lag row say how many attachments wait and for how long.
 
@@ -505,10 +467,9 @@ In any Claude Code session, ask "what do we know about X" and the agent calls `r
 
 ```bash
 # Incremental sync over what `python -m src.export.outlook_export` staged: extract, load,
-# register+process attachments, dedup people, embed, Claude Code conversations, inline
-# images. Not Teams, calendar, news, SharePoint. A run reads what it brought: the people
-# dedup takes the groups of the people it loaded (the whole table once a day), registration
-# the attachment directories written since its last scan, and the index is saved once.
+# register attachments, dedup people, attachment text and summaries, Claude Code
+# conversations, inline images, then one embedding pass (docs/DEPLOY.md section 6 has the
+# stages and their budgets). Not Teams, WhatsApp, calendar, news or SharePoint.
 python -m src.cli sync --engine claude --workers 4
 python -m src.cli sync --skip-conversations   # Claude Code conversations (Step 7) left out; no scheduled unit passes it
 python -m src.cli sync --full-dedup           # the people dedup over the whole table, even with no new mail
@@ -532,7 +493,8 @@ python -m src.cli ingest-session-notes [--all]         # notes Claude sessions w
 
 # Housekeeping
 python -m src.cli load                      # creates brain.db on a fresh host and loads what was extracted
-python -m src.cli embed --force
+python -m src.cli embed                     # vectors for the emails, attachments and conversations that have none; a sync that loaded something ends with this pass
+python -m src.cli embed --force             # starts the index over (Vector index, below): every one of those again; Teams and WhatsApp return 500 a run with their syncs
 python -m src.cli sweep-files --policy      # delete attachment files whose content is stored (report-only by default)
 python -m src.cli mail-reconcile --since 2025-03-16 --json gaps.json   # Outlook messages the store lacks; read-only, so it runs on a replica
 python -m src.cli mail-reconcile --since 2026-05-01 --refetch --record-aliases  # producer: stage them for the next sync, note the ids of Archive copies
@@ -583,17 +545,17 @@ The seventeen read commands that mirrored the MCP tools by hand are deprecated a
 
 #### One-off maintenance: `brain maint`
 
-`brain maint --help` lists them; each takes the arguments of the command it runs. The old spellings (`brain migrate`, `brain calendar-sync --backfill`, `brain process-sharepoint --ingest-fetched`...) work for one release and print one deprecation line; `docs/DEPLOY.md` keeps them, since they also run on code from before this.
+`brain maint --help` lists them; each takes the arguments of the command it runs. The old spellings (`brain migrate`, `brain calendar-sync --backfill`, `brain process-sharepoint --ingest-fetched`...) work for one release and print one deprecation line. On a checkout from before 2026-10-11, which has no `maint`, use them: drop `maint` from the commands here and in `docs/DEPLOY.md`, and spell the renamed ones `calendar-sync --backfill`, `process-sharepoint --ingest-fetched` (`--refetch-content`, `--repair-links`) and `scripts/scrub_secrets.py`.
 
 ```bash
 python -m src.cli maint migrate
 python -m src.cli maint classify-sources          # set every email's source_class again, e.g. after BRAIN_USER_EMAIL_PATTERN is set
 python -m src.cli maint calendar-backfill --dry-run   # the months stats coverage flags: list them, count what would be fetched; nothing written
-python -m src.cli maint calendar-backfill             # fill them a month at a time; run again to resume (see DEPLOY)
+python -m src.cli maint calendar-backfill             # fill them a month at a time; run again to resume (DEPLOY section 12)
 python -m src.cli maint teams-backfill-replies    # once, on the producer: store the channel replies stored posts hold; no Teams call
 python -m src.cli maint teams-strip-html          # once, on the producer: convert message text stored as HTML (--dry-run counts); no Teams or model call
-python -m src.cli maint teams-drop-raw-json [--dry-run] [--limit N]   # once, on the producer, after teams-backfill-replies and teams-strip-html: drop the raw Teams payloads (see DEPLOY)
-python -m src.cli maint split-html                # after v23, on the producer: HTML bodies loaded before it (see DEPLOY)
+python -m src.cli maint teams-drop-raw-json [--dry-run] [--limit N]   # once, on the producer, after teams-backfill-replies: drop the raw Teams payloads (DEPLOY section 12)
+python -m src.cli maint split-html                # after v23, on the producer: HTML bodies loaded before it (DEPLOY section 12)
 python -m src.cli maint prune-staged
 python -m src.cli maint import-people [--file canonical_people.json]
 python -m src.cli maint hash-attachments          # record a content hash for every attachment file still on disk
@@ -607,10 +569,10 @@ python -m src.cli maint reextract --garbled                 # read marked scans 
 python -m src.cli maint reextract --long --estimate          # price a re-summary before running it; changes nothing
 python -m src.cli maint reextract --batch --probe            # ten requests as a batch job: prints the replies and the cost, stores nothing
 python -m src.cli maint reextract --long --batch --limit 500 # read again, then send the summaries as a batch job; --batch-collect stores them
-python -m src.cli maint reextract --full-parts 1234 5678     # summarise these attachments from every part, now and on every later summary
+python -m src.cli maint reextract --full-parts 1234 5678     # summarise these attachments from up to 50 parts, now and on every later summary
 python -m src.cli maint retry-stubs [--dry-run]   # extract again the emails loaded without an extraction after failing three runs
 python -m src.cli maint transcribe-images --limit 100      # transcribe content images whose attachments hold no text
-python -m src.cli maint relabel-conversations [--dry-run]    # once, on the producer: stored turns the owner did not type become 'agent' (see DEPLOY)
+python -m src.cli maint relabel-conversations [--dry-run]    # once, on the producer: stored turns the owner did not type become 'agent' (DEPLOY section 12)
 python -m src.cli maint sharepoint-ingest-fetched           # store the files earlier SharePoint fetches left on disk
 python -m src.cli maint sharepoint-refetch-content --max-fetches 0 --deadline-s 1800  # read again the links recorded ok with no text
 python -m src.cli maint sharepoint-repair-links [--dry-run] # queue again the links the old scanner mangled and the pages read without their text
@@ -625,12 +587,16 @@ src/
   mcp_call.py                  `brain tool`: an MCP tool called through the server's own call, JSON out
   config.py                    Paths, env-driven settings, schema version
   mcp_server.py                MCP server (MCPServer, mcp SDK v2), 25 tools
-  bridge.py                    Legacy JSON-over-CLI bridge (superseded by MCP)
+  mcp_http.py                  Streamable-HTTP serving: bearer auth, loopback only
+  mcp_results.py               The tools' return types, which their output schemas are built from
+  mcp_budget.py                The 40,000-character budget for tool results
+  bridge.py                    JSON-over-CLI bridge for other plugins; `sender_brief` lives here and the MCP tool calls it
+  redact.py                    Strips credentials and masks card numbers, IBANs and passwords before they reach the store
   llm_policy.py                Shared Vertex retry and auth policy (vendored, SHA256 drift-checked)
   llm_deadline.py              Derives PTS_LLM_DEADLINE from the calling unit's own budget
   llm_cost.py                  Rate table, a run's token budget, the usage log read back as spend
   pipeline/                    The jobs with several stages, one module each, with their budgets
-    sync.py                    `sync`: extract, load, attachments, dedup, conversations, images, embed
+    sync.py                    `sync`: extract, load, register, dedup, attachments, conversations, images, embed
     teams_sync.py              `teams-sync`: discover, pull, bound, resolve, extract, embed
     whatsapp_sync.py           `whatsapp-sync`: ingest the snapshot, bound, extract, embed
     calendar_sync.py           `calendar-sync`: list, fetch, extract and load what changed
@@ -646,9 +612,13 @@ src/
     teams_cli.py               teams-cli subprocess wrapper
     teams_export.py            Teams chats, threads, messages
     inbox_reconcile.py         Inbox to Archive move detection; Deleted Items and Junk as state
+    mail_reconcile.py          `mail-reconcile`: the Outlook messages the store lacks, staged again
     refetch_garbled.py         `refetch-garbled`: swept originals of garbled OCR texts, from the mailbox
+    session_notes.py           Notes Claude sessions wrote, ingested as text-only documents
+    whatsapp_export.py         `whatsapp-sync` step 1: the pushed snapshot into the WhatsApp tables
     sharepoint_fetcher.py      SharePoint link fetch and host classification
     sharepoint_cli.py          sharepoint-cli subprocess wrapper (cookie session, not bearer)
+    sharepoint_repair.py       Repairs what old faults left in sharepoint_links; lists what the tenant refuses
     state.py                   Atomic staging writes and the Outlook sync cursor
   extract/
     prompt.py                  Email extraction prompt
@@ -666,6 +636,10 @@ src/
     vertex_fallback.py         Model and region fallback on policy refusals
     policy_bridge.py           Maps SDK failures onto the shared policy; wires the re-auth callback
     attachment_pipeline.py     Two-phase pipeline (text extraction, then LLM)
+    reextract.py               `reextract`: redo the rows earlier code capped, skipped or could not read
+    stub_retry.py              `retry-stubs`: extract again the emails loaded as stubs
+    html_text.py               HTML bodies as the text a reader sees
+    sharepoint_ingest.py       SharePoint files and pages as text-only documents; the fetched file is not kept
     vertex_batch.py            Phase 2 as a Vertex AI batch job at half price: send, hold, collect, probe
     attachment_digest.py       A long spreadsheet's structure, summarised instead of its cells
     attachment_extractors.py   PDF, DOCX, PPTX, XLSX, XLSB, XLS, image, EML, RPMSG
@@ -679,6 +653,9 @@ src/
     teams_mri.py               Teams MRI to display-name resolution
     teams_pipeline.py          Thread extraction dispatcher
     teams_threads.py           Message to thread bounding
+    whatsapp_threads.py        `whatsapp-sync` step 2: gap-bounded sessions per chat
+    whatsapp_pipeline.py       `whatsapp-sync` step 3: extract every changed session, the Teams way
+    whatsapp_prompt.py         WhatsApp session extraction prompt
     sharepoint_url_scanner.py  Detect SharePoint URLs in email bodies
   store/
     schema.py                  Tables, FTS5 indexes, migrations
@@ -702,6 +679,14 @@ src/
     action_lifecycle.py        Dedups action items and ages out stale ones
     conversation_query.py      Claude Code conversation search
     teams_query.py             Teams thread, chat, and search
+    teams_raw_json.py          `teams-drop-raw-json`: drops the raw Teams payloads nothing needs
+    whatsapp_query.py          WhatsApp session and message search
+    greek.py                   Greek accent folding for Python and SQL, and the query-side stems
+    email_html.py              An email's HTML, kept compressed beside the text its body holds
+    attachment_backlog.py      How many attachments wait for their text or summary, and since when
+    file_hashes.py             Content hashes for attachment files
+    file_sweep.py              Deletes attachment files whose content is already stored
+    forget.py                  Forgets documents: their rows and their vectors
     sql_readonly.py            Read-only SQL over brain.db for the sql_query and sql_schema tools
     calendar_loader.py         Calendar event and attendee loader
     calendar_coverage.py       Calendar events per month and the months not held in full, for stats and --backfill
@@ -721,6 +706,7 @@ scripts/
   forget_duplicate_documents.py  Forgets synced documents byte-identical to a mail attachment that holds their text, stored before ingest checked for such twins (dry run by default)
   reap_orphan_attachments.py   Resolves attachment dirs the registrar can never claim
   scrub_secrets.py             Redacts credentials, card numbers, IBANs and passwords already in the DB or, with --files, in files (dry run by default)
+  whatsapp_snapshot.py         Builds the minimized WhatsApp snapshot from the bridge's store (stdlib, for /usr/bin/python3)
   hooks/session-end-push.sh    Claude Code SessionEnd hook: sends the ended session's transcript to the producer
   pii-gauntlet.sh              Guards tracked files (and, with --mode=history, published history) against personal-data leaks
   wrappers/                    Archive of the scheduler wrappers each host runs
@@ -730,8 +716,8 @@ examples/
   sample-batch.json            A complete synthetic staging batch
 
 docs/
-  DEPLOY.md                    Prerequisites, bootstrap, scheduling, topology, health
-  RESTORE.md                   Backup artefacts and the verified restore path
+  DEPLOY.md                    Prerequisites, bootstrap, topology, schedule, health, upgrades
+  RESTORE.md                   Backup artefacts, the restore path, restic and the weekly drill
 
 skill/
   recall.md                    Reference prompt for the recall workflow. Not installed
@@ -741,7 +727,7 @@ skill/
 
 ## Database schema
 
-`data/brain.db` (SQLite). Migrations run automatically via `src/store/schema.py`; the current schema version is `CURRENT_SCHEMA_VERSION` in `src/config.py` and is tracked in the `schema_version` table.
+`data/brain.db` (SQLite). Migrations run automatically via `src/store/schema.py`, when a command that writes opens the store; the current schema version is `CURRENT_SCHEMA_VERSION` in `src/config.py` and is tracked in the `schema_version` table. [`docs/DEPLOY.md`](docs/DEPLOY.md#12-upgrading-a-producer), section 12, says when a migration wants the timers stopped.
 
 - **Core content**: `emails`, `topics`, `email_topics`, `decisions`, `action_items`, `commitments`, `people`, `email_people`, `key_facts`, and from v23 `email_html`: an HTML body is stored as the text a reader sees, and the HTML is kept here, zlib-compressed, for the SharePoint link scan and the inline-image positions
 - **Source class** (v33): `emails.source_class`, `NOT NULL DEFAULT 'mail'`, indexed (`idx_emails_source_class`). Set when a row is stored (the loader, `ingest_document`, `ingest_text_document`), by these rules, the first that matches:
@@ -763,8 +749,8 @@ skill/
 - **External refs**: `sharepoint_links`
 - **FTS5**: `emails_fts` (summary, body and, from v22, subject, all accent-folded), `key_facts_fts`, `attachment_content_fts`, `conversation_turns_fts`, `conversations_fts`, `teams_messages_fts`, `teams_threads_fts`, `whatsapp_messages_fts`, `whatsapp_threads_fts`, `calendar_events_fts`. Each is kept in step with its table by three triggers. From v34 the update trigger (`<table>_au`) fires only when an UPDATE sets the row's `id` or a column the index reads, so a status, a timestamp, a mailbox move or a Teams payload no longer re-indexes the row's whole text; the v34 migration recreates the ten triggers and rebuilds no index
 - **People lookups** (v34): `idx_people_email_lower` on `lower(email)` serves every `LOWER(email) = ?` lookup as written (the loader's, for each sender, recipient and cc, and those of the people dedup, the calendar loader and the Teams MRI resolution), so each keeps its exact meaning and none reads the whole table any more; `idx_people_name_email` on `(name, email)` serves the loader's lookups of a person named without an address
-- **Vector index**: `embeddings.npz` beside the database, one vector per email, attachment, conversation, Teams thread and WhatsApp session summary (`ids` and `vectors`). From the schema v34 release it also records the space its vectors are in, as a JSON member `space`: `{model, dim, task, template}`, the embedding model, the vectors' dimension, the task type (`null`: none is sent) and the version of the texts the vectors are made from (`EMBEDDING_TEMPLATE_VERSION` in `src/store/embeddings.py`, to bump with any change to those texts). It is read on its own, without loading a vector. Every writer refuses to merge vectors of another space into the index, before paying for any embedding when it can, with `IndexSpaceMismatch` and the command that starts it over: `python -m src.cli embed --force` (the next teams-sync and whatsapp-sync add their vectors back). An index saved before that release records no space: it is taken as this code's, at its own vectors' dimension, and the space is written on its next save, with no step to run. The same object is kept in `sync_metadata` under `embedding_space` for SQL to read, written when it changes
-- **Metadata**: `sync_metadata` (per-source cursors), `schema_version`. `sync_metadata` also holds a row per stored email found in Outlook's Deleted Items or Junk Email, keyed `mail_location:<emails.message_id>`, with the JSON `{location, deleted_at, internet_message_id}`: `location` is `Deleted Items` or `Junk Email`, `deleted_at` the UTC time it was first seen in Deleted Items (null for Junk), and the Message-ID is normalised (no brackets, lower case). The hourly `src/export/inbox_reconcile.py` writes it when the email is first seen there, keeps it after the folder purges the email, and removes it when the email is back in the Inbox. The email row itself is never deleted or relabelled for it. A match by Message-ID says a copy is there: mail sent with a copy to oneself keeps another in Sent Items, which this does not list. A Vertex AI batch job keeps its record under `attachment_batch_job:<key>` (JSON: its Vertex name, origin, call shape, files, and the `custom_id`s of each content row, cut to a short record once collected) and holds each row it was sent for under `attachment_batch:<content id>`, valued with the job's key ([Batch jobs for backfills](#batch-jobs-for-backfills))
+- **Vector index**: `embeddings.npz` beside the database, one vector per email, attachment, conversation, Teams thread and WhatsApp session summary (`ids` and `vectors`). From the schema v34 release it also records the space its vectors are in, as a JSON member `space`: `{model, dim, task, template}`, the embedding model, the vectors' dimension, the task type (`null`: none is sent) and the version of the texts the vectors are made from (`EMBEDDING_TEMPLATE_VERSION` in `src/store/embeddings.py`, to bump with any change to those texts). It is read on its own, without loading a vector. Every writer refuses to merge vectors of another space into the index, before paying for any embedding when it can, with `IndexSpaceMismatch` and the command that starts it over: `python -m src.cli embed --force` (the next teams-sync and whatsapp-sync add their vectors back, 500 a run; step 5 of `docs/RESTORE.md` rebuilds them at once). An index saved before that release records no space: it is taken as this code's, at its own vectors' dimension, and the space is written on its next save, with no step to run. The same object is kept in `sync_metadata` under `embedding_space` for SQL to read, written when it changes
+- **Metadata**: `sync_metadata` (per-source cursors), `schema_version`. `sync_metadata` also holds a row per stored email found in Outlook's Deleted Items or Junk Email, keyed `mail_location:<emails.message_id>`, with the JSON `{location, deleted_at, internet_message_id}`: `location` is `Deleted Items` or `Junk Email`, `deleted_at` the UTC time it was first seen in Deleted Items (null for Junk), and the Message-ID is normalised (no brackets, lower case). The hourly `src/export/inbox_reconcile.py` writes it when the email is first seen there, keeps it after the folder purges the email, and removes it when the email is back in the Inbox. The email row itself is never deleted or relabelled for it. A match by Message-ID says a copy is there: mail sent with a copy to oneself keeps another in Sent Items, which this does not list. A Vertex AI batch job keeps its record under `attachment_batch_job:<key>` (JSON: its Vertex name, origin, call shape, files, and the `custom_id`s of each content row, cut to a short record once collected) and holds each row it was sent for under `attachment_batch:<content id>`, valued with the job's key ([Batch jobs for backfills](#batch-jobs-for-backfills)). The other rows, each described with what writes it: `last_sync_date`, `last_sync_count` and `mail_export_ok_at` ([Stats](#stats)); `person_alias:<mention id>` ([People and topics](#people-and-topics)); `attachment_summary_full:<attachment id>` ([Attachment summaries and spend](#attachment-summaries-and-spend)); `attachment_text_pass_at` ([Attachments in the hourly sync](#attachments-in-the-hourly-sync)); `refetch_garbled:<attachment id>` ([Greek read as Latin letters](#greek-read-as-latin-letters)); `calendar_month_listed:<YYYY-MM>`, `calendar_month_started:<YYYY-MM>` and `calendar_last_listed` (the calendar backfill, [Stats](#stats)); `people_dedup_high_water`, `people_dedup_full_at` and `attachment_scan_started_ns` (what one `sync` reads, `docs/DEPLOY.md` section 6); `reextract_partial_since` and `sharepoint_refetch_since` (`docs/DEPLOY.md` section 10); `embedding_space` (Vector index, above)
 
 `commitments` has no dedicated MCP tool and no CLI subcommand. The `commitments` bucket of `recall` is the only way to read it.
 
@@ -869,22 +855,15 @@ Dependabot is configured for the `uv` ecosystem (see `.github/dependabot.yml`), 
 
 ### Scheduling
 
-The pipeline is just CLI commands, so schedule them however you like. Examples:
+The pipeline is CLI commands, so any scheduler runs it: cron, launchd or systemd timers. `sync` stages no mail itself, it extracts and loads what `outlook_export` (or your own exporter) staged, and it covers mail only: `calendar-sync`, `teams-sync`, `whatsapp-sync`, `news-sync` and `process-sharepoint` each want their own schedule, and a nightly `process-attachments` pass reads what the hourly slice leaves. The hourly `calendar-sync` lists the week behind and the 30 days ahead; a month it never reached is filled by the one-off `brain maint calendar-backfill`, not by a schedule.
 
-- **cron** (hourly staging and sync): `5 * * * * cd /path/to/repo && .venv/bin/python -m src.export.outlook_export --folder Inbox >> ~/second-brain.log 2>&1`, then `7 * * * * cd /path/to/repo && .venv/bin/python -m src.cli sync >> ~/second-brain.log 2>&1`
-- **macOS launchd** / **systemd timers**: wrap the same two commands (and `embed`) in a service unit pointing at your checkout and venv.
-
-Typical cadence: staging and `sync` hourly, `embed` daily. `sync` stages no mail itself: it extracts and loads what `outlook_export` (or your own exporter) staged. Nor does it cover every source: `calendar-sync`, `teams-sync`, `whatsapp-sync`, `news-sync` and `process-sharepoint` each want their own schedule.
-
-The hourly `calendar-sync` lists the week behind and the 30 days ahead, so a month it never reached stays as the first load left it. `calendar-sync --backfill` is not a schedule but a one-off for that: with no window it fills the months `stats` coverage flags as not held in full (`--dry-run` first counts what it would fetch), a month at a time, and a run that stops is resumed by the next one (see `docs/DEPLOY.md`).
-
-[`docs/DEPLOY.md`](docs/DEPLOY.md) has the full recipe, including the two-host shape (one producer that ingests, workstations that read an rsync'd replica) and the `loginctl enable-linger` without which `systemd --user` timers die at logout.
+[`docs/DEPLOY.md`](docs/DEPLOY.md), section 6, has the recipes, the stages of one `sync` in order, and the reference deployment's hourly and nightly units; section 5 has the two-host shape (one producer that ingests, workstations that read a pulled replica) and the `loginctl enable-linger` without which `systemd --user` timers die at logout.
 
 ## Security
 
 Report vulnerabilities via GitHub's private vulnerability reporting. See `SECURITY.md`.
 
-Credentials are redacted on the way in (`src/redact.py`): every staging batch, extracted attachment text, Teams and WhatsApp messages, and calendar bodies before they reach the model. Card numbers (issuer range, length and Luhn check), IBANs (mod-97 check) and password values after a password key are masked at the same points, to the first six and last four digits, the country and last four characters, and the key; at load the decision, action item, commitment and key fact texts the model writes are masked again, and every extraction prompt tells the model not to copy such values. Rows stored before that existed are cleaned with `python scripts/scrub_secrets.py --apply` on the host that builds the database, with the jobs that write it stopped. It rewrites them under `secure_delete` and optimizes every full-text index, which removes what the run itself frees; `--vacuum` also drops copies freed by earlier churn, and needs free space of about twice the database. Snapshots taken before the scrub keep the old rows until retention ages them out. `scrub_secrets.py --files DIR ... --apply` masks the staged batches, extracted outputs and notes under each directory the same way. `scripts/pii-gauntlet.sh --mode=history` scans every line and filename ever committed, on every ref and on the pull-request heads fetched from `origin`, against the same checks as CI plus the private denylist.
+Credentials are redacted on the way in (`src/redact.py`): every staging batch, extracted attachment text, Teams and WhatsApp messages, and calendar bodies before they reach the model. Card numbers (issuer range, length and Luhn check), IBANs (mod-97 check) and password values after a password key are masked at the same points, to the first six and last four digits, the country and last four characters, and the key; at load the decision, action item, commitment and key fact texts the model writes are masked again, and every extraction prompt tells the model not to copy such values. Rows stored before that existed are cleaned with `python scripts/scrub_secrets.py --apply` (or `brain maint scrub --apply`) on the host that builds the database, with the jobs that write it stopped; a dry run, the default, counts first. It rewrites them under `secure_delete` and optimizes every full-text index, which removes what the run itself frees; `--vacuum` also drops copies freed by earlier churn, and needs free space of about twice the database. Snapshots taken before the scrub keep the old rows until retention ages them out. `scrub_secrets.py --files DIR ... --apply` masks the staged batches, extracted outputs and notes under each directory the same way. `scripts/pii-gauntlet.sh --mode=history` scans every line and filename ever committed, on every ref and on the pull-request heads fetched from `origin`, against the same checks as CI plus the private denylist.
 
 ## License
 

@@ -144,8 +144,10 @@ DATA_ROOT = Path(os.environ.get("BRAIN_DATA_DIR") or REPO_ROOT / "data")
 DEFAULT_DB = DATA_ROOT / "brain.db"
 
 # User identity for extraction context and ownership detection.
-# BRAIN_USER_EMAIL_PATTERN is used to detect your sent emails in stale thread
-# detection (matched case-insensitively against sender_address).
+# BRAIN_USER_EMAIL_PATTERN lists the owner's addresses, separated by commas or
+# spaces. Each is matched whole and case-blind, never as a substring, and an entry
+# without a domain matches that local part at any domain (src/store/owner.py). It
+# decides the owner's sent mail, stale threads, automation mail and calendar flags.
 USER_NAME = os.environ.get("BRAIN_USER_NAME", "")
 USER_ROLE = os.environ.get("BRAIN_USER_ROLE", "")
 USER_EMAIL_PATTERN = os.environ.get("BRAIN_USER_EMAIL_PATTERN", "")

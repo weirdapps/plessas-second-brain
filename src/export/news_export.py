@@ -26,8 +26,9 @@ NEWS_MAILBOX = "News"
 PIPELINES = ("digest", "monitor", "market", "stack")
 NEWS_BATCH_START = 70000
 
-# Synthesized sender domain. Must never collide with a real address, because
-# BRAIN_USER_EMAIL_PATTERN is substring-matched against sender addresses.
+# Synthesized sender domain, never a real one. An address here is the owner's only
+# if BRAIN_USER_EMAIL_PATTERN lists it whole, or lists its local part with no domain,
+# which matches at any domain (src/store/owner.py).
 NEWS_DOMAIN = "news.local"
 
 

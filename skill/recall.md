@@ -78,13 +78,14 @@ copy is behind, and `stats` always returns `data_as_of`, `age_hours` and
 `stale`. For mail newer than the replica, use `outlook_live_search`. A list cut
 to fit the 40,000-character answer budget is named in `truncated`.
 
-The CLI mirrors the same queries when no MCP session is available:
+When no MCP session is available, `brain tool` calls the same tools from a shell
+and prints their answers as JSON:
 
 ```bash
-python -m src.cli query keyword "budget approval" --limit 20 -v
-python -m src.cli query combined --person "Duarte" --topic "cards" \
-  --start 2025-01-01 --end 2025-12-31 --limit 20 -v
-python -m src.cli stats
+python -m src.cli tool recall '{"query": "budget approval"}'
+python -m src.cli tool query_emails '{"person": "Duarte", "topic": "cards",
+  "start_date": "2025-01-01", "end_date": "2025-12-31", "limit": 20}'
+python -m src.cli tool stats
 ```
 
 ## Step 3: synthesize

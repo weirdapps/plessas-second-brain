@@ -82,7 +82,29 @@ See [`examples/example_exporter.py`](examples/example_exporter.py) for a ~40-lin
 
 The MCP server exposes 25 tools (all defined in `src/mcp_server.py`). Register the server once with `claude mcp add` (see [Register with Claude Code](#register-with-claude-code)), then every session picks them up.
 
-**Response budget.** Claude Code saves a tool result longer than 50,000 characters to a file and hands the model a path instead. `recall`, `search_emails`, `query_emails`, `search_attachments`, `search_conversations`, `search_teams`, `query_decisions` and `query_calendar_events` therefore hold their answer to 40,000 characters, measured on the indented JSON the server sends (`src/mcp_budget.py`). Over that, rows are cut from the tail of whichever list holds the most characters, and `truncated` names each list that lost rows as `{"kept": n, "total": m}`; ask again with a narrower query or a lower `limit` for the rest. `search_emails`, `query_emails`, `search_attachments`, `search_conversations` and `query_decisions` return their rows as `{"result": [...]}`, which is also what their structured content always was.
+**Response budget.** Claude Code saves a tool result longer than 50,000 characters to a file and hands the model a path instead. `recall`, `search_emails`, `query_emails`, `search_attachments`, `search_conversations`, `search_teams`, `search_whatsapp`, `query_decisions`, `query_actions` and `query_calendar_events` therefore hold their answer to 40,000 characters, measured on the indented JSON the server sends, header and row envelope included (`src/mcp_budget.py`). Over that, rows are cut from the tail of whichever list holds the most characters, and `truncated` names each list that lost rows as `{"kept": n, "total": m}`; ask again with a narrower query or a lower `limit` for the rest. `search_emails`, `query_emails`, `search_attachments`, `search_conversations`, `query_decisions` and `query_actions` return their rows as `{"result": [...]}`, which is also what their structured content always was (`query_actions` returned a bare list until #139).
+
+**Freshness, on every result.** Every result opens with `data_as_of` and `stale` (`recall` after its `summary`), read as `stats` reads them: the older of the last `sync` and the Inbox export's last success. When the store is more than 3 hours behind, `_stale_warning` follows with the sentence to pass on. `outlook_live_search` reads the live mailbox, so its `data_as_of` is the time of the call and `stale` is `false`. Until #139 only `recall` and `stats` said this, so a replica hours behind answered every other tool like a store in which nothing had happened since.
+
+**The row envelope.** Every row a search or a list returns says what it stands for, under the same names in every tool (`src/store/envelope.py`):
+
+| Field | What it holds |
+| --- | --- |
+| `kind` | `email`, `news`, `document`, `attachment`, `teams`, `whatsapp`, `calendar`, `conversation` or `image`. A decision, action, commitment or key fact takes the kind of the item it was taken from, and the rest of its envelope describes that item. |
+| `mailbox` | The email's folder (an attachment's: its email's), only where the kind has one. |
+| `who` | The sender, author or organiser as the store has them: `Name <address>`, or whichever of the two it holds; `null` when it holds neither. A Teams or WhatsApp row names the sender of the message that matched, else whoever wrote first in the thread. |
+| `ref` | The id the tool that reads the item takes: `emails.id` (`email_thread`), `attachments.id`, `teams_threads.id` (`teams_thread_context`), `whatsapp_threads.id`, `calendar_events.id`, a conversation's `session_id` (`conversation_context`), an image's `sha256`. |
+| `date` | The item's own date as stored: the email's arrival, the meeting's or the session's start. A decision keeps its own date. |
+| `ingested_at` | When the store took the item in, only where it records that: an attachment's export, a calendar event's ingest, a conversation's load. The store keeps no such time for mail, Teams or WhatsApp. |
+| `matched_in` | On a row a search matched, the field the words matched in: an email's `subject`, `summary`, `content`, `mixed`, `key_fact` or `attachment`, a Teams or WhatsApp `thread` or `message`, a conversation's `summary` or `turn_content`, or `semantic`. |
+
+A field a row already had stays beside its new name: `email_id`, `thread_id` and `id` beside `ref`, `start_at` and `started_at` beside `date`, `match` and `match_type` beside `matched_in`, and under `include_agents` a conversation row's `kind` stays `owner` or `agent`. The parts a context tool reads of one item (`teams_thread_context`'s messages, `conversation_context`'s turns, a chat summary's last messages) carry no envelope.
+
+**Deprecated: `source` on search rows.** An email search row's `source` named the field the words matched in, which `matched_in` now says; it stays for one release and is then dropped from search rows. On decision and action rows `source` is the kind of the item they were taken from (`email`, `teams`, `whatsapp`, `calendar`, `conversation`) and stays.
+
+**`kinds`.** `recall`, `search_emails` and `query_emails` take `kinds`, a list of row kinds: only rows of those kinds come back, chosen in the query before its limit, so a page of mail no longer crowds out the one document asked for. `recall` skips the buckets none of whose rows can be one, and keeps the decisions, actions and commitments taken from an item of a kind named (one whose item is gone comes back only without `kinds`). Keyword `search_emails` takes `email`, `news` and `document`; semantic mode takes `attachment`, `teams`, `whatsapp` and `conversation` too. There is no `exclude_news`: news is left out unless `include_news` is set, and naming `news` in `kinds` lets it in.
+
+**Shape snapshot.** `tests/fixtures/mcp_shapes.json` holds every tool's output schema keys, the keys of a sample result in order and the keys of each of its lists of rows, read against a store holding an item of every kind. A change to any of them fails `tests/test_mcp_shapes.py` until the snapshot is regenerated with `SNAPSHOT_UPDATE=1`, so the diff of that file is the review of the change. Add fields; rename or remove one only after a release of notice here.
 
 **Contract.** Every tool is annotated read-only, idempotent and closed-world, so a client may run several at once, except `outlook_live_search` (open-world: it reads the live mailbox) and `sharepoint_index` (not read-only: `refetch` records what it fetched). Choices are enums and every `limit` has bounds in the input schema, so a bad value is refused before the tool runs. Every tool declares an output schema (`src/mcp_results.py`), so results also go out as compact `structuredContent`. A failure (a malformed argument, an unknown id, a missing filter, a refused SQL statement) is a tool error, `isError: true`, whose message says what to do next; "nothing matched" is an empty list with a `reason`.
 
@@ -106,7 +128,7 @@ The price is precision, since a stem can start a different word: `πλήρης` 
 
 ### Unified recall
 
-- `recall(query, limit_per_kind, days, include_context, include_news, include_automation)`. Fan-out across every text-bearing index. This is the default "tell me everything you know about X" entry point.
+- `recall(query, limit_per_kind, days, include_context, include_news, include_automation, kinds)`. Fan-out across every text-bearing index. This is the default "tell me everything you know about X" entry point.
 
   Ten result buckets, keyed exactly as returned: `emails` (which also covers standalone documents and news, since they share the `emails` table), `attachments`, `conversations`, `decisions`, `actions`, `commitments`, `inline_images`, `teams`, `whatsapp`, `calendar_events`. `summary.kinds_with_results` names the ones that matched.
 
@@ -122,9 +144,9 @@ The price is precision, since a stem can start a different word: `πλήρης` 
 
 ### Emails
 
-- `search_emails(query, search_type, limit, include_news, include_automation)`. Keyword (FTS5) or semantic (embedding). Keyword search tries the subject first, then the summary, the body, key facts and attachments, and returns one email per thread (for a subject match, the thread's newest); a row whose thread has more than one email matching in its subject, summary or body says how many in `thread_matches`. Semantic search leaves the vectors of news and automation mail, and of their attachments, out of the ranking unless included.
+- `search_emails(query, search_type, limit, include_news, include_automation, kinds)`. Keyword (FTS5) or semantic (embedding). Keyword search tries the subject first, then the summary, the body, key facts and attachments, and returns one email per thread (for a subject match, the thread's newest); a row whose thread has more than one email matching in its subject, summary or body says how many in `thread_matches`. Semantic search leaves the vectors of news and automation mail, and of their attachments, out of the ranking unless included.
 - `email_thread(email_id, limit)`. The emails of a hit's thread, oldest first, with `thread_total`; a thread longer than `limit` comes back as the `limit` emails centred on the hit, and a News item or an email with no conversation id as a thread of one. The thread asked for comes back whatever its class, each row saying its `source_class`.
-- `query_emails(person, topic, keyword, start_date, end_date, limit, include_news, include_automation)`. Combined filters.
+- `query_emails(person, topic, keyword, start_date, end_date, limit, include_news, include_automation, kinds)`. Combined filters.
 - `outlook_live_search(folder, since_minutes, subject_contains)`. Bypasses the DB and queries the live Outlook mailbox directly, for mail newer than the store. `since_minutes` defaults to 60 and is capped at 1440 (24 hours); the answer's `since_minutes` and `clamped` say what was searched. This is the escape hatch when `stats` says the local copy is stale.
 
 Mail deleted or junked in Outlook keeps the folder it had, where it used to be relabelled `Archive` like mail moved there; where it went, and when it was first seen deleted, is recorded beside it (see [Database schema](#database-schema)). Nothing is removed from the store: these tools still return it.
@@ -573,6 +595,7 @@ src/
     loader.py                  Extracted JSON to SQLite
     query.py                   Person, topic, keyword, date, decisions, actions, FTS, combined
     source_class.py            What an emails row is (mail, automation, news, document, session note) and the default filter
+    envelope.py                What every search or list row says it stands for: kind, mailbox, who, ref, dates, matched_in
     owner.py                   Whether an address or a name is the owner's, and the one people row every spelling of him resolves to
     ordering.py                How decisions, key facts and actions are dated and ordered in every list
     context.py                 Rich person and topic context aggregations

@@ -1,0 +1,1552 @@
+{
+  "attachment_image_search": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "count",
+        "data_as_of",
+        "reason",
+        "results",
+        "stale"
+      ],
+      "required": [
+        "count",
+        "data_as_of",
+        "results",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "results",
+      "count"
+    ],
+    "rows": {
+      "results": [
+        "date",
+        "description",
+        "kind",
+        "occurrences",
+        "ref",
+        "sha256",
+        "who"
+      ],
+      "results[].occurrences": [
+        "message_id",
+        "position_in_body",
+        "sender_email"
+      ]
+    }
+  },
+  "conversation_context": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "action_items",
+        "data_as_of",
+        "decisions",
+        "key_facts",
+        "kind",
+        "session_id",
+        "stale",
+        "summary",
+        "topics",
+        "turns"
+      ],
+      "required": [
+        "data_as_of",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "id",
+      "session_id",
+      "started_at",
+      "ended_at",
+      "workspace",
+      "project_name",
+      "turn_count",
+      "summary",
+      "topics_summary",
+      "kind",
+      "turns",
+      "decisions",
+      "action_items",
+      "key_facts",
+      "topics"
+    ],
+    "rows": {
+      "turns": [
+        "content_length",
+        "has_code",
+        "has_tool_use",
+        "speaker",
+        "summary",
+        "timestamp",
+        "turn_index"
+      ]
+    }
+  },
+  "email_thread": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "data_as_of",
+        "email_id",
+        "emails",
+        "stale",
+        "thread_total"
+      ],
+      "required": [
+        "data_as_of",
+        "email_id",
+        "emails",
+        "stale",
+        "thread_total"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "email_id",
+      "emails",
+      "thread_total"
+    ],
+    "rows": {
+      "emails": [
+        "date",
+        "email_id",
+        "kind",
+        "mailbox",
+        "ref",
+        "sender_address",
+        "sender_name",
+        "sentiment",
+        "source_class",
+        "subject",
+        "summary",
+        "who"
+      ]
+    }
+  },
+  "meeting_prep": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "attendees",
+        "data_as_of",
+        "meetings",
+        "stale",
+        "topic_context"
+      ],
+      "required": [
+        "data_as_of",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "attendees",
+      "topic_context",
+      "meetings"
+    ],
+    "rows": {
+      "attendees": [
+        "decisions",
+        "emails",
+        "match_count",
+        "name",
+        "open_actions",
+        "other_candidates",
+        "resolved_by",
+        "resolved_email",
+        "resolved_name",
+        "sentiment_summary",
+        "topics"
+      ],
+      "attendees[].decisions": [
+        "date",
+        "decided_by",
+        "decision",
+        "email_id",
+        "email_subject",
+        "kind",
+        "mailbox",
+        "parent_date",
+        "ref",
+        "source_class",
+        "who"
+      ],
+      "attendees[].emails": [
+        "date",
+        "email_id",
+        "kind",
+        "mailbox",
+        "ref",
+        "role",
+        "sentiment",
+        "source_class",
+        "subject",
+        "summary",
+        "who"
+      ],
+      "attendees[].open_actions": [
+        "date",
+        "deadline",
+        "email_id",
+        "email_subject",
+        "kind",
+        "mailbox",
+        "owner",
+        "parent_date",
+        "ref",
+        "source_class",
+        "status",
+        "task",
+        "who"
+      ],
+      "attendees[].topics": [
+        "count",
+        "topic"
+      ],
+      "meetings.last": [
+        "attendees",
+        "attendees_total",
+        "body_summary",
+        "date",
+        "end_local",
+        "id",
+        "ingested_at",
+        "is_recurring",
+        "kind",
+        "location",
+        "organizer",
+        "ref",
+        "start_at",
+        "start_local",
+        "subject",
+        "who"
+      ],
+      "meetings.last[].attendees": [
+        "email",
+        "name",
+        "status"
+      ],
+      "meetings.next": [
+        "attendees",
+        "attendees_total",
+        "body_summary",
+        "date",
+        "end_local",
+        "id",
+        "ingested_at",
+        "is_recurring",
+        "kind",
+        "location",
+        "organizer",
+        "ref",
+        "start_at",
+        "start_local",
+        "subject",
+        "who"
+      ],
+      "meetings.next[].attendees": [
+        "email",
+        "name",
+        "status"
+      ],
+      "topic_context.action_items": [
+        "date",
+        "deadline",
+        "email_id",
+        "kind",
+        "mailbox",
+        "owner",
+        "parent_date",
+        "ref",
+        "source_class",
+        "status",
+        "task",
+        "who"
+      ],
+      "topic_context.decisions": [
+        "date",
+        "decided_by",
+        "decision",
+        "email_id",
+        "email_subject",
+        "kind",
+        "mailbox",
+        "parent_date",
+        "ref",
+        "source_class",
+        "who"
+      ],
+      "topic_context.key_facts": [
+        "date",
+        "email_id",
+        "fact",
+        "kind",
+        "mailbox",
+        "parent_date",
+        "ref",
+        "source_class",
+        "subject",
+        "who"
+      ]
+    }
+  },
+  "outlook_live_search": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "clamped",
+        "count",
+        "data_as_of",
+        "messages",
+        "since_minutes",
+        "stale"
+      ],
+      "required": [
+        "clamped",
+        "count",
+        "data_as_of",
+        "messages",
+        "since_minutes",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "messages",
+      "count",
+      "since_minutes",
+      "clamped"
+    ],
+    "rows": {}
+  },
+  "person_context": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "communication_pattern",
+        "data_as_of",
+        "decisions",
+        "decisions_total",
+        "email_count",
+        "last_met",
+        "match_count",
+        "meeting_count_30d",
+        "next_meeting",
+        "open_actions",
+        "open_actions_total",
+        "other_candidates",
+        "person",
+        "reason",
+        "recent_emails",
+        "resolved_by",
+        "sentiment_distribution",
+        "stale",
+        "teams",
+        "topics",
+        "topics_total",
+        "whatsapp"
+      ],
+      "required": [
+        "data_as_of",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "person",
+      "resolved_by",
+      "match_count",
+      "other_candidates",
+      "email_count",
+      "recent_emails",
+      "topics",
+      "topics_total",
+      "sentiment_distribution",
+      "decisions",
+      "decisions_total",
+      "open_actions",
+      "open_actions_total",
+      "communication_pattern",
+      "last_met",
+      "next_meeting",
+      "meeting_count_30d",
+      "teams",
+      "whatsapp"
+    ],
+    "rows": {
+      "decisions": [
+        "date",
+        "decided_by",
+        "decision",
+        "email_id",
+        "kind",
+        "mailbox",
+        "parent_date",
+        "ref",
+        "source_class",
+        "who"
+      ],
+      "open_actions": [
+        "date",
+        "deadline",
+        "email_id",
+        "kind",
+        "mailbox",
+        "owner",
+        "parent_date",
+        "ref",
+        "source_class",
+        "status",
+        "task",
+        "who"
+      ],
+      "recent_emails": [
+        "date",
+        "email_id",
+        "kind",
+        "mailbox",
+        "ref",
+        "role_in_email",
+        "source_class",
+        "subject",
+        "summary",
+        "who"
+      ],
+      "teams.recent_threads": [
+        "chat",
+        "date",
+        "kind",
+        "last_message_at",
+        "messages",
+        "ref",
+        "thread_id",
+        "title",
+        "who"
+      ],
+      "topics": [
+        "count",
+        "topic"
+      ],
+      "whatsapp.recent_threads": [
+        "chat",
+        "date",
+        "kind",
+        "last_message_at",
+        "messages",
+        "ref",
+        "thread_id",
+        "title",
+        "who"
+      ]
+    }
+  },
+  "query_actions": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "data_as_of",
+        "reason",
+        "result",
+        "stale",
+        "truncated"
+      ],
+      "required": [
+        "data_as_of",
+        "result",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "result"
+    ],
+    "rows": {
+      "result": [
+        "action_id",
+        "date",
+        "deadline",
+        "email_id",
+        "email_subject",
+        "kind",
+        "mailbox",
+        "overdue",
+        "owner",
+        "parent_date",
+        "ref",
+        "source",
+        "source_class",
+        "status",
+        "task",
+        "who"
+      ]
+    }
+  },
+  "query_calendar_events": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "count",
+        "data_as_of",
+        "events",
+        "reason",
+        "stale",
+        "truncated"
+      ],
+      "required": [
+        "count",
+        "data_as_of",
+        "events",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "events",
+      "count"
+    ],
+    "rows": {
+      "events": [
+        "attendees",
+        "attendees_total",
+        "body_summary",
+        "date",
+        "end_at",
+        "end_local",
+        "id",
+        "ingested_at",
+        "is_recurring",
+        "is_self_organized",
+        "kind",
+        "location",
+        "organizer",
+        "ref",
+        "response_status",
+        "start_at",
+        "start_local",
+        "subject",
+        "who"
+      ],
+      "events[].attendees": [
+        "email",
+        "name",
+        "status"
+      ]
+    }
+  },
+  "query_decisions": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "data_as_of",
+        "reason",
+        "result",
+        "stale",
+        "truncated"
+      ],
+      "required": [
+        "data_as_of",
+        "result",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "result"
+    ],
+    "rows": {
+      "result": [
+        "date",
+        "decided_by",
+        "decision",
+        "decision_id",
+        "email_id",
+        "email_subject",
+        "kind",
+        "mailbox",
+        "parent_date",
+        "ref",
+        "source",
+        "source_class",
+        "topics",
+        "who"
+      ]
+    }
+  },
+  "query_emails": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "data_as_of",
+        "reason",
+        "result",
+        "stale",
+        "truncated"
+      ],
+      "required": [
+        "data_as_of",
+        "result",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "result"
+    ],
+    "rows": {
+      "result": [
+        "date",
+        "email_id",
+        "kind",
+        "mailbox",
+        "ref",
+        "relevance_score",
+        "sender",
+        "source_class",
+        "subject",
+        "summary",
+        "topics",
+        "who"
+      ]
+    }
+  },
+  "recall": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "actions",
+        "attachments",
+        "calendar_events",
+        "commitments",
+        "conversations",
+        "data_as_of",
+        "decisions",
+        "emails",
+        "inline_images",
+        "person_context",
+        "query",
+        "reason",
+        "stale",
+        "summary",
+        "teams",
+        "topic_context",
+        "truncated",
+        "whatsapp"
+      ],
+      "required": [
+        "actions",
+        "attachments",
+        "calendar_events",
+        "commitments",
+        "conversations",
+        "data_as_of",
+        "decisions",
+        "emails",
+        "inline_images",
+        "query",
+        "stale",
+        "summary",
+        "teams",
+        "whatsapp"
+      ]
+    },
+    "result_keys": [
+      "summary",
+      "data_as_of",
+      "stale",
+      "query",
+      "emails",
+      "attachments",
+      "conversations",
+      "decisions",
+      "actions",
+      "commitments",
+      "inline_images",
+      "teams",
+      "whatsapp",
+      "calendar_events",
+      "person_context",
+      "topic_context"
+    ],
+    "rows": {
+      "actions": [
+        "date",
+        "deadline",
+        "email_id",
+        "email_subject",
+        "id",
+        "kind",
+        "mailbox",
+        "owner",
+        "parent_date",
+        "ref",
+        "source",
+        "source_class",
+        "status",
+        "task",
+        "who"
+      ],
+      "attachments": [
+        "attachment_id",
+        "date",
+        "email_date",
+        "email_id",
+        "email_subject",
+        "filename",
+        "ingested_at",
+        "kind",
+        "mailbox",
+        "mime_type",
+        "ref",
+        "snippet",
+        "source_class",
+        "summary",
+        "who"
+      ],
+      "calendar_events": [
+        "body_summary",
+        "date",
+        "id",
+        "ingested_at",
+        "kind",
+        "organizer_name",
+        "ref",
+        "start_at",
+        "subject",
+        "who"
+      ],
+      "commitments": [
+        "by_person",
+        "commitment",
+        "date",
+        "email_id",
+        "email_subject",
+        "id",
+        "kind",
+        "mailbox",
+        "ref",
+        "source_class",
+        "to_person",
+        "who"
+      ],
+      "conversations": [
+        "conversation_id",
+        "date",
+        "ingested_at",
+        "kind",
+        "match_type",
+        "matched_in",
+        "project_name",
+        "ref",
+        "session_id",
+        "summary",
+        "turn_count",
+        "who"
+      ],
+      "decisions": [
+        "date",
+        "decided_by",
+        "decision",
+        "decision_date",
+        "email_id",
+        "email_subject",
+        "event_id",
+        "id",
+        "kind",
+        "mailbox",
+        "parent_date",
+        "ref",
+        "source",
+        "source_class",
+        "teams_thread_id",
+        "whatsapp_thread_id",
+        "who"
+      ],
+      "emails": [
+        "date",
+        "email_id",
+        "kind",
+        "mailbox",
+        "matched_in",
+        "ref",
+        "source",
+        "source_class",
+        "subject",
+        "summary",
+        "thread_matches",
+        "who"
+      ],
+      "inline_images": [
+        "classification",
+        "date",
+        "height",
+        "kind",
+        "ref",
+        "sha256",
+        "vision_description",
+        "who",
+        "width"
+      ],
+      "teams": [
+        "channel_topic",
+        "chat_id",
+        "date",
+        "ended_at",
+        "kind",
+        "match",
+        "matched_in",
+        "message_count",
+        "participants",
+        "ref",
+        "started_at",
+        "summary",
+        "team_name",
+        "thread_id",
+        "title",
+        "who"
+      ],
+      "topic_context.decisions": [
+        "date",
+        "decided_by",
+        "decision",
+        "email_id",
+        "kind",
+        "mailbox",
+        "parent_date",
+        "ref",
+        "source_class",
+        "who"
+      ],
+      "topic_context.key_facts": [
+        "date",
+        "email_id",
+        "fact",
+        "kind",
+        "mailbox",
+        "parent_date",
+        "ref",
+        "source_class",
+        "who"
+      ],
+      "topic_context.key_people": [
+        "email_count",
+        "name"
+      ],
+      "topic_context.open_actions": [
+        "date",
+        "deadline",
+        "email_id",
+        "kind",
+        "mailbox",
+        "owner",
+        "parent_date",
+        "ref",
+        "source_class",
+        "status",
+        "task",
+        "who"
+      ],
+      "topic_context.recent_emails": [
+        "date",
+        "email_id",
+        "kind",
+        "mailbox",
+        "ref",
+        "sender",
+        "source_class",
+        "subject",
+        "summary",
+        "who"
+      ],
+      "whatsapp": [
+        "chat_id",
+        "chat_kind",
+        "chat_name",
+        "date",
+        "ended_at",
+        "kind",
+        "match",
+        "matched_in",
+        "message_count",
+        "participants",
+        "ref",
+        "started_at",
+        "summary",
+        "thread_id",
+        "title",
+        "who"
+      ]
+    }
+  },
+  "search_attachments": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "data_as_of",
+        "reason",
+        "result",
+        "stale",
+        "truncated"
+      ],
+      "required": [
+        "data_as_of",
+        "result",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "result"
+    ],
+    "rows": {
+      "result": [
+        "attachment_id",
+        "date",
+        "email_date",
+        "email_id",
+        "email_subject",
+        "filename",
+        "ingested_at",
+        "kind",
+        "mailbox",
+        "mime_type",
+        "ref",
+        "snippet",
+        "source_class",
+        "summary",
+        "who"
+      ]
+    }
+  },
+  "search_conversations": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "data_as_of",
+        "reason",
+        "result",
+        "stale",
+        "truncated"
+      ],
+      "required": [
+        "data_as_of",
+        "result",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "result"
+    ],
+    "rows": {
+      "result": [
+        "conversation_id",
+        "date",
+        "ingested_at",
+        "kind",
+        "match_type",
+        "matched_in",
+        "project_name",
+        "ref",
+        "session_id",
+        "snippet",
+        "summary",
+        "turn_count",
+        "who"
+      ]
+    }
+  },
+  "search_emails": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "data_as_of",
+        "reason",
+        "result",
+        "stale",
+        "truncated"
+      ],
+      "required": [
+        "data_as_of",
+        "result",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "result"
+    ],
+    "rows": {
+      "result": [
+        "date",
+        "email_id",
+        "kind",
+        "mailbox",
+        "matched_in",
+        "ref",
+        "snippet",
+        "source",
+        "source_class",
+        "subject",
+        "summary",
+        "thread_matches",
+        "who"
+      ]
+    }
+  },
+  "search_teams": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "data_as_of",
+        "reason",
+        "results",
+        "stale",
+        "truncated"
+      ],
+      "required": [
+        "data_as_of",
+        "results",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "results"
+    ],
+    "rows": {
+      "results": [
+        "channel_topic",
+        "chat_id",
+        "date",
+        "ended_at",
+        "kind",
+        "match",
+        "matched_in",
+        "message_count",
+        "participants",
+        "ref",
+        "snippet",
+        "started_at",
+        "summary",
+        "team_name",
+        "thread_id",
+        "title",
+        "who"
+      ]
+    }
+  },
+  "search_whatsapp": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "data_as_of",
+        "reason",
+        "results",
+        "stale",
+        "truncated"
+      ],
+      "required": [
+        "data_as_of",
+        "results",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "results"
+    ],
+    "rows": {
+      "results": [
+        "chat_id",
+        "chat_kind",
+        "chat_name",
+        "date",
+        "ended_at",
+        "kind",
+        "match",
+        "matched_in",
+        "message_count",
+        "participants",
+        "ref",
+        "snippet",
+        "started_at",
+        "summary",
+        "thread_id",
+        "title",
+        "who"
+      ]
+    }
+  },
+  "sender_brief": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "data_as_of",
+        "email",
+        "email_count",
+        "known",
+        "last_contact",
+        "match_count",
+        "name",
+        "open_actions_count",
+        "other_candidates",
+        "query",
+        "recent_decisions",
+        "resolved_by",
+        "role",
+        "sentiment",
+        "stale",
+        "top_topics"
+      ],
+      "required": [
+        "data_as_of",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "known",
+      "name",
+      "email",
+      "role",
+      "email_count",
+      "top_topics",
+      "recent_decisions",
+      "open_actions_count",
+      "last_contact",
+      "sentiment",
+      "resolved_by",
+      "match_count",
+      "other_candidates"
+    ],
+    "rows": {}
+  },
+  "sharepoint_index": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "data_as_of",
+        "document_message_id",
+        "links",
+        "stale",
+        "status"
+      ],
+      "required": [
+        "data_as_of",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "links"
+    ],
+    "rows": {}
+  },
+  "sql_query": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "columns",
+        "data_as_of",
+        "row_count",
+        "rows",
+        "stale",
+        "truncated"
+      ],
+      "required": [
+        "columns",
+        "data_as_of",
+        "row_count",
+        "rows",
+        "stale",
+        "truncated"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "columns",
+      "rows",
+      "row_count",
+      "truncated"
+    ],
+    "rows": {}
+  },
+  "sql_schema": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "columns",
+        "data_as_of",
+        "indexes",
+        "stale",
+        "table",
+        "tables"
+      ],
+      "required": [
+        "data_as_of",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "table",
+      "columns",
+      "indexes"
+    ],
+    "rows": {
+      "columns": [
+        "name",
+        "not_null",
+        "pk",
+        "type"
+      ],
+      "indexes": [
+        "name",
+        "unique"
+      ]
+    }
+  },
+  "stale_threads": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "data_as_of",
+        "overdue_actions",
+        "overdue_actions_total",
+        "stale",
+        "stale_threads",
+        "stale_threads_total",
+        "stale_threads_unavailable"
+      ],
+      "required": [
+        "data_as_of",
+        "overdue_actions",
+        "overdue_actions_total",
+        "stale",
+        "stale_threads",
+        "stale_threads_total"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "stale_threads",
+      "stale_threads_total",
+      "overdue_actions",
+      "overdue_actions_total",
+      "stale_threads_unavailable"
+    ],
+    "rows": {
+      "overdue_actions": [
+        "action_id",
+        "date",
+        "days_overdue",
+        "deadline",
+        "email_id",
+        "email_subject",
+        "kind",
+        "owner",
+        "parent_date",
+        "ref",
+        "source",
+        "source_class",
+        "task",
+        "who"
+      ]
+    }
+  },
+  "stats": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "age_hours",
+        "attachments_awaiting_summary",
+        "attachments_awaiting_summary_oldest_hours",
+        "attachments_awaiting_text",
+        "attachments_awaiting_text_oldest_hours",
+        "attachments_extracted",
+        "coverage",
+        "data_as_of",
+        "earliest_email",
+        "embed_backend",
+        "last_embed_error",
+        "latest_email",
+        "source_class",
+        "stale",
+        "stale_warning",
+        "total_action_items",
+        "total_attachments",
+        "total_conversation_turns",
+        "total_conversations",
+        "total_decisions",
+        "total_documents",
+        "total_emails",
+        "total_key_facts",
+        "total_news_articles",
+        "total_people",
+        "total_topics"
+      ],
+      "required": [
+        "data_as_of",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "total_emails",
+      "total_news_articles",
+      "total_documents",
+      "total_topics",
+      "total_people",
+      "total_decisions",
+      "total_action_items",
+      "earliest_email",
+      "latest_email",
+      "source_class",
+      "coverage",
+      "age_hours",
+      "last_sync_date",
+      "total_attachments",
+      "attachments_extracted",
+      "attachments_awaiting_text",
+      "attachments_awaiting_text_oldest_hours",
+      "attachments_awaiting_summary",
+      "attachments_awaiting_summary_oldest_hours",
+      "total_key_facts",
+      "total_conversations",
+      "total_conversation_turns",
+      "whatsapp_messages",
+      "whatsapp_sessions",
+      "calendar_events",
+      "event_attendees",
+      "embed_backend",
+      "last_embed_error"
+    ],
+    "rows": {}
+  },
+  "teams_chat_summary": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "chat",
+        "data_as_of",
+        "last_messages",
+        "open_actions",
+        "stale",
+        "threads",
+        "top_senders"
+      ],
+      "required": [
+        "data_as_of",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "chat",
+      "threads",
+      "last_messages",
+      "top_senders",
+      "open_actions"
+    ],
+    "rows": {
+      "last_messages": [
+        "composed_at",
+        "content_text",
+        "sender_display_name"
+      ],
+      "open_actions": [
+        "deadline",
+        "owner",
+        "task"
+      ],
+      "threads": [
+        "date",
+        "ended_at",
+        "id",
+        "kind",
+        "message_count",
+        "ref",
+        "started_at",
+        "summary",
+        "title",
+        "who"
+      ],
+      "top_senders": [
+        "n",
+        "name"
+      ]
+    }
+  },
+  "teams_thread_context": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "action_items",
+        "data_as_of",
+        "decisions",
+        "key_facts",
+        "messages",
+        "stale",
+        "thread"
+      ],
+      "required": [
+        "data_as_of",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "thread",
+      "messages",
+      "decisions",
+      "action_items",
+      "key_facts"
+    ],
+    "rows": {
+      "action_items": [
+        "deadline",
+        "owner",
+        "status",
+        "task"
+      ],
+      "decisions": [
+        "decided_by",
+        "decision",
+        "decision_date"
+      ],
+      "messages": [
+        "composed_at",
+        "content_text",
+        "is_system",
+        "parent_message_id",
+        "sender_display_name",
+        "sender_mri",
+        "sender_person_id"
+      ]
+    }
+  },
+  "topic_context": {
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "data_as_of",
+        "decisions",
+        "decisions_total",
+        "email_count",
+        "key_facts",
+        "key_facts_total",
+        "key_people",
+        "key_people_total",
+        "open_actions",
+        "open_actions_total",
+        "reason",
+        "recent_emails",
+        "stale",
+        "topic"
+      ],
+      "required": [
+        "data_as_of",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "topic",
+      "email_count",
+      "recent_emails",
+      "key_people",
+      "key_people_total",
+      "decisions",
+      "decisions_total",
+      "open_actions",
+      "open_actions_total",
+      "key_facts",
+      "key_facts_total"
+    ],
+    "rows": {
+      "decisions": [
+        "date",
+        "decided_by",
+        "decision",
+        "email_id",
+        "kind",
+        "mailbox",
+        "parent_date",
+        "ref",
+        "source_class",
+        "who"
+      ],
+      "key_facts": [
+        "date",
+        "email_id",
+        "fact",
+        "kind",
+        "mailbox",
+        "parent_date",
+        "ref",
+        "source_class",
+        "who"
+      ],
+      "key_people": [
+        "email_count",
+        "name"
+      ],
+      "open_actions": [
+        "date",
+        "deadline",
+        "email_id",
+        "kind",
+        "mailbox",
+        "owner",
+        "parent_date",
+        "ref",
+        "source_class",
+        "status",
+        "task",
+        "who"
+      ],
+      "recent_emails": [
+        "date",
+        "email_id",
+        "kind",
+        "mailbox",
+        "ref",
+        "sender",
+        "source_class",
+        "subject",
+        "summary",
+        "who"
+      ]
+    }
+  }
+}

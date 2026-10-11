@@ -60,6 +60,10 @@ os.environ.pop("SHAREPOINT_HOST", None)
 # Greek query stemming is on unless BRAIN_QUERY_STEMMING is 0. A shell that turned it
 # off would run every search test in the other mode; a test sets it when it means to.
 os.environ.pop("BRAIN_QUERY_STEMMING", None)
+# A long attachment is summarised from every part up to BRAIN_ATTACHMENT_FULL_PARTS_UPTO
+# parts. A shell that set it would change the calls every parts test counts; a test sets it
+# when it means to.
+os.environ.pop("BRAIN_ATTACHMENT_FULL_PARTS_UPTO", None)
 # A replica's pull job stamps ~/.second-brain/db-pull.stamp, and write commands
 # refuse to run where it exists. CI has no stamp, so a test driving a write
 # command would pass there and exit 2 on a replica. tests/test_replica_guard.py

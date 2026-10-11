@@ -74,7 +74,7 @@ def _row(text="Policy text. Payments above 50,000 euros need two signatories.", 
 
 
 def _long_text():
-    """Over LONG_TEXT_CHARS, so it goes in parts: four of them, of which three are read."""
+    """Over LONG_TEXT_CHARS, so it goes in parts: four of them, every one read."""
     paragraph = "Paragraph about the plan. " + "word " * 400
     return "\n\n".join([paragraph] * 70)[:130_000]
 
@@ -148,7 +148,7 @@ def test_v2_parts_name_their_part_and_the_merge_combines_them(v2, model):
 
     assert error is None
     *parts, merge = model.calls
-    assert len(parts) == ap.CAPPED_SUMMARY_PARTS
+    assert len(parts) == len(attachment_prompt.split_text(_long_text()))
     for sent in parts:
         before, _inside, _ = _fenced(_turn(sent))
         assert re.search(r"part \d of \d", before)
@@ -164,7 +164,7 @@ def test_v2_every_attachment_call_shares_one_system_prompt(v2, model):
     ap._extract_one_attachment(_row())
     ap._extract_one_attachment(_row(text=_long_text()))
 
-    assert len(model.calls) == 1 + ap.CAPPED_SUMMARY_PARTS + 1
+    assert len(model.calls) == 1 + len(attachment_prompt.split_text(_long_text())) + 1
     assert len({json.dumps(c["system"], sort_keys=True) for c in model.calls}) == 1
 
 
@@ -219,7 +219,7 @@ def test_parts_saved_under_v1_are_not_reused_under_v2(model, monkeypatch):
     merged = ap._extract_in_parts(text, "f.txt", "text/plain", None, None, lambda: False, 9)
 
     assert merged is not None and merged["extraction_schema"] == 2
-    assert len(model.calls) == 2 + ap.CAPPED_SUMMARY_PARTS + 1
+    assert len(model.calls) == 2 + len(attachment_prompt.split_text(text)) + 1
 
 
 def test_the_estimate_counts_a_v2_call_with_its_system_prompt(monkeypatch):

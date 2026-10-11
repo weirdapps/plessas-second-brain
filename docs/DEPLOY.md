@@ -535,6 +535,18 @@ It reads no row of the indexed tables and rebuilds no index. Any command that mi
 it (`sync`, `teams-sync`, `migrate`), so no timer needs stopping: a job still running the old
 code works with the new triggers, and its own migrations end at v33.
 
+The same release records in `embeddings.npz` the embedding space its vectors are in (model,
+dimension, task type, text template): see Vector index in the README's Database schema. Nothing
+to run: an index without it is taken as the current space and tagged on its next save, by
+`sync`, `teams-sync` or `whatsapp-sync`. A job still running the old code saves the index
+without it again, and the next save puts it back. From then on a writer refuses vectors of
+another space, and a search that would embed its query into another space ranks around its
+keyword matches instead and says why on stderr, on the producer and on a replica alike. After a
+deliberate change of model, task type, dimension or text template, start the index over with
+`python -m src.cli embed --force` on the producer, apart from the embedding jobs: it embeds
+every email, attachment and conversation summary again (mind the API quota), and the next
+`teams-sync` and `whatsapp-sync` add their vectors back.
+
 ## 8. Backup and restore
 
 `scripts/backup_db.py` takes an MVCC-consistent snapshot of a live `brain.db`,

@@ -301,7 +301,10 @@ def run_phase1(
         WHERE ac.id IS NULL
     """
 
-    params = list(type_params)
+    # Each condition's values go in as the condition is added, so they bind in the order the
+    # placeholders appear. The type's went in first, ahead of the ids', and the two together
+    # matched nothing (#199).
+    params: list = []
 
     # Scope to specific attachment IDs if provided
     if attachment_ids:
@@ -312,6 +315,7 @@ def run_phase1(
     # Add type filter if present
     if type_condition:
         query += f"\n        {type_condition}"
+        params.extend(type_params)
 
     if newest_first:
         # Compared as instants: the store holds received times with a Z, with an offset and
@@ -785,7 +789,8 @@ def _phase2_candidates(
     """
     )
 
-    params = list(type_params)
+    # As in run_phase1: each condition's values go in as the condition is added (#199).
+    params: list = []
 
     # Scope to specific attachment IDs if provided
     if attachment_ids:
@@ -795,6 +800,7 @@ def _phase2_candidates(
 
     if type_condition:
         query += f"\n        {type_condition}"
+        params.extend(type_params)
     if max_text_chars is not None:
         query += "\n        AND length(ac.extracted_text) <= ?"
         params.append(max_text_chars)

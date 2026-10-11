@@ -49,9 +49,9 @@ def test_a_queued_job_is_reported_as_queued(hc, monkeypatch, macos):
     monkeypatch.setattr(hc, "IS_MACOS", macos)
     monkeypatch.setattr(hc.subprocess, "run", _fake_run(calls, 0))
 
-    actions = hc.auto_fix([{"type": "job_failed", "label": "sb-x.service"}])
+    actions = hc.auto_fix([{"type": "job_failed", "label": hc.LOADER_JOB}])
 
-    assert actions == ["Queued sb-x.service"]
+    assert actions == [f"Queued {hc.LOADER_JOB}"]
 
 
 @pytest.mark.parametrize("macos", [False, True])
@@ -64,13 +64,13 @@ def test_a_refused_kick_is_reported_as_failed_with_its_reason(hc, monkeypatch, m
 
     actions = hc.auto_fix(
         [
-            {"type": "job_failed", "label": "sb-x.service"},
+            {"type": "job_failed", "label": hc.LOADER_JOB},
             {"type": "stale_data", "label": "sb-x.service", "name": "Emails"},
             {"type": "sentinel", "name": "needs_reauth"},
         ]
     )
 
-    assert actions[0] == "Failed to kick sb-x.service (rc=5): Unit sb-x.service not found."
+    assert actions[0] == f"Failed to kick {hc.LOADER_JOB} (rc=5): Unit sb-x.service not found."
     assert actions[1] == "Failed to kick sb-x.service (rc=5): Unit sb-x.service not found."
     assert actions[2].startswith(f"Failed to kick {hc.AUTH_WATCH_JOB} (rc=5)")
     assert not any("Kicked" in a or "Queued" in a for a in actions)

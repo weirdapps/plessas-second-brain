@@ -123,8 +123,8 @@ MODEL_UNUSABLE_ALARM = 3
 
 # Observed span for the stages that have no budget of their own: load,
 # registration (count-bounded), people dedup, and the incremental embeddings
-# update (about 10 s), made twice when Step 7 loads conversations, and each
-# rewrites the whole index. Mail fetch is SYNC_WRAPPER_FETCH_OBSERVED_S above.
+# update (about 10 s), made once at the end of the run (Step 9), which rewrites
+# the whole index. Mail fetch is SYNC_WRAPPER_FETCH_OBSERVED_S above.
 SYNC_FIXED_WORK_S = 80.0
 
 # What the stages after Step 2 need, held back from the unit's remaining time.
@@ -2117,17 +2117,10 @@ def cmd_sync(args):
         dedup_result = run_dedup(db_path=db_path)
         reduced = dedup_result.get("total_reduced", 0)
         print(f"Dedup: {reduced} duplicates merged")
-
-        # Step 5: Update embeddings for new emails
-        print("\nStep 5: Updating embeddings...")
-        from src.store.embeddings import build_index
-
-        conn_embed = get_conn(db_path)
-        build_index(conn_embed)
-        conn_embed.close()
-        print("Embeddings updated")
     else:
-        print("\nNo new emails — skipping dedup and embeddings")
+        print("\nNo new emails — skipping dedup")
+
+    # Step 5, the embeddings, waits for the end of the run: Step 9.
 
     # Step 6: Process new attachment content
     from src.extract.attachment_pipeline import (
@@ -2207,6 +2200,7 @@ def cmd_sync(args):
     }
     conn_conv.close()
 
+    conv_loaded = 0
     conv_export = export_conversations(days=7, loaded=loaded)
     if conv_export["exported"] > 0:
         print(f"  Exported {conv_export['exported']} new or grown conversations")
@@ -2221,19 +2215,6 @@ def cmd_sync(args):
             return 143
         conv_loaded = load_convs(db_path)
         print(f"  Loaded {conv_loaded} conversations")
-        if conv_loaded:
-            # Their vectors now, not at the next sync with new mail (Step 5 ran
-            # before them): a session loaded again has a new id, which semantic
-            # search cannot find until it has one.
-            from src.store.embeddings import build_index
-
-            conn_embed = get_conn(db_path)
-            try:
-                build_index(conn_embed)
-            except Exception as e:  # the next sync embeds what this one could not
-                print(f"  Embedding the conversations failed: {e}", file=sys.stderr)
-            finally:
-                conn_embed.close()
     else:
         print("  No new conversations to sync")
 
@@ -2282,6 +2263,31 @@ def cmd_sync(args):
             print("  No unclassified images")
     except Exception as e:
         print(f"  Image classification skipped: {e}")
+
+    # Step 9: one embedding pass for everything this run stored: the mail of Step 3, the
+    # attachment summaries of Step 6, the conversations of Step 7 (one loaded again has a new
+    # id, which semantic search cannot find until it has a vector) and the image descriptions
+    # of Step 8. Step 5 embedded after Step 4, and Step 7 again when it loaded conversations,
+    # and each pass loads and rewrites the whole index (embeddings.npz, 1.7 GB on the
+    # producer): an hourly run saved it twice to load one email, at its 6 GB MemoryMax. Taken
+    # when mail or conversations loaded, as those two were; a run stopped before it leaves
+    # its vectors to the next run's pass.
+    if count > 0 or conv_loaded:
+        print("\nStep 9: Updating embeddings...")
+        from src.store.embeddings import build_index
+
+        conn_embed = get_conn(db_path)
+        try:
+            build_index(conn_embed)
+            print("Embeddings updated")
+        except Exception as e:
+            # A run that loaded mail fails here, as Step 5 did. One that loaded only
+            # conversations goes on, as Step 7 did, and the next pass embeds them.
+            if count > 0:
+                raise
+            print(f"  Embedding the conversations failed: {e}", file=sys.stderr)
+        finally:
+            conn_embed.close()
 
     # Update sync metadata
     conn = get_conn(db_path)

@@ -605,10 +605,14 @@ auth_check_gcloud_adc() {
   # self-heal, every hourly run planted a false needs_gcloud_reauth that then
   # blocked its own load step. Try known install locations, then fall back to
   # PATH (mirrors health_check.py's launchctl_bin/systemctl_bin resolution).
-  local c gcloud_bin=""
-  for c in /opt/homebrew/bin/gcloud "$HOME/google-cloud-sdk/bin/gcloud" /usr/local/bin/gcloud /usr/bin/gcloud; do
-    [ -x "$c" ] && { gcloud_bin="$c"; break; }
-  done
+  # AUTH_WATCH_GCLOUD names the binary outright, for the tests: the paths above win
+  # over any stub on PATH, and a real gcloud took 11s to fail from a test's HOME.
+  local c gcloud_bin="${AUTH_WATCH_GCLOUD:-}"
+  if [ -z "$gcloud_bin" ]; then
+    for c in /opt/homebrew/bin/gcloud "$HOME/google-cloud-sdk/bin/gcloud" /usr/local/bin/gcloud /usr/bin/gcloud; do
+      [ -x "$c" ] && { gcloud_bin="$c"; break; }
+    done
+  fi
   [ -z "$gcloud_bin" ] && gcloud_bin="$(command -v gcloud 2>/dev/null || echo gcloud)"
 
   if "$gcloud_bin" auth application-default print-access-token &>/dev/null 2>&1; then

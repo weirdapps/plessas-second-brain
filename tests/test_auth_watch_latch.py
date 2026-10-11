@@ -118,6 +118,8 @@ def _run_watcher(home: Path):
             "SHELL": "/bin/bash",
             "UID": "501",
             "OSASCRIPT": str(home / "osascript"),
+            # The stub above; a real gcloud is found ahead of it otherwise.
+            "AUTH_WATCH_GCLOUD": str(_bin(home) / "gcloud"),
         },
         capture_output=True,
         text=True,

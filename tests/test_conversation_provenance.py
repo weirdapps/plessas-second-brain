@@ -210,8 +210,8 @@ def staged(tmp_path, monkeypatch):
 
 
 def _staged_sessions(result):
-    batch = json.loads(Path(result["batch_file"]).read_text())
-    return {c["session_id"]: c["kind"] for c in batch["conversations"]}
+    staged = [json.loads(Path(p).read_text())["conversations"] for p in result["staged"]]
+    return {c["session_id"]: c["kind"] for conversations in staged for c in conversations}
 
 
 def test_agent_sessions_are_left_out_of_the_export_by_default(staged):

@@ -354,6 +354,28 @@ moved, and where stored mail you have since deleted or junked now is (the
 README's Database schema has the `mail_location:` rows it writes).
 `scripts/wrappers/systemd/sb-outlook-sync.sh` runs all of these hourly.
 
+**What one `sync` reads.** A run pays for what it brought, not for the whole store. The
+people dedup takes the groups of the people its load added or changed and of any added
+since the last pass, and the whole table once a day or with `sync --full-dedup` (or
+`python -m src.store.dedup_people`); the `sync_metadata` rows `people_dedup_high_water`
+and `people_dedup_full_at` hold its place. Attachment registration scans the message
+directories written since its last complete scan began (`attachment_scan_started_ns`)
+and those of the mail the run loaded; the nightly `register-attachments` still walks
+every directory. The embedding index is saved once, at the end of the run. Conversation
+staging holds one file per session and version, and a load removes what nothing can use
+any more: the first load after this change also splits the multi-session
+`conversation-batch-*.json` files, so expect it to free most of `staging/conversations`.
+The export reads a transcript again only when it changed, or when the store lost what
+it held (`staging/conversations/transcripts-read.json`; any change to the exporter
+reads them all once).
+
+**Conversations stay in every sync.** All three sync wrappers, the hourly
+`sb-outlook-sync.sh` included, run the whole `sync`, so a session reaches the store
+within the hour; `sb-conversation-sync` also exports and extracts conversations three
+times a day. With staging pruned and an unchanged transcript not read again, that step is
+cheap. `sync --skip-conversations` leaves it out of a run; no wrapper passes it. No
+wrapper or unit changes with this, and nothing to migrate.
+
 Each `outlook_export` run lists its folder from six hours before its cursor, so
 mail that turned visible after newer mail was listed (a scanner hold, a release
 from quarantine) is still caught. It skips, before fetching, what the store or a

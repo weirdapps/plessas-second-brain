@@ -13,14 +13,30 @@ session with no owner turn is kind 'agent': left out of the export unless asked
 for, and out of every conversation read path by default. The kind is not stored
 on its own: a stored conversation is an agent session when it holds user-role
 turns and none of them is the owner's (src/store/conversation_query.py).
+
+Staging holds one file per session and version, and the export reads a transcript
+again only when it changed (export_conversations).
 """
 
+import hashlib
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
 from src.config import CLAUDE_CODE_PROJECTS_DIR, CONVERSATION_STAGING_DIR
-from src.export.state import write_json_atomic
+from src.export.state import load_json_or_quarantine, write_json_atomic
+
+# Staged copies: one file per session and version, conversation-session-<id>.<end>.<turns>.json
+# (staged_path), and the batches of several sessions written before those, named
+# conversation-batch-<time>.json, until a load splits them (src/store/loader.py). A later
+# copy of a session wins: the batches sort before the session files, and the files of one
+# session sort by version.
+STAGED_GLOB = "conversation-*.json"
+
+# What the export learnt from each transcript it read, kept beside the staged copies and
+# never matched by STAGED_GLOB (export_conversations).
+TRANSCRIPTS_READ = "transcripts-read.json"
 
 # Record types that carry conversation content
 _CONTENT_TYPES = {"user", "assistant"}
@@ -392,6 +408,97 @@ def scan_conversation_files(
     return files
 
 
+def staged_path(staging_dir: Path, conv: dict) -> Path:
+    """The file a copy of `conv` is staged in: one per session and version (its end and its
+    turn count), so the same version exported again replaces its own file and a newer one
+    goes beside it. A session id is a UUID; one holding anything else, or a long one, gets a
+    digest of itself in the name, so that two ids never share a file."""
+    session_id = str(conv.get("session_id") or "")
+    key = re.sub(r"[^A-Za-z0-9_-]", "_", session_id)
+    if key != session_id or not key or len(key) > 64:
+        key = f"{key[:64]}_{hashlib.sha256(session_id.encode('utf-8')).hexdigest()[:12]}"
+    ended = re.sub(r"\D", "", str(conv.get("ended_at") or ""))[:20].ljust(20, "0")
+    turns = int(conv.get("turn_count") or len(conv.get("turns") or []))
+    return Path(staging_dir) / f"conversation-session-{key}.{ended}.{turns:06d}.json"
+
+
+def staged_files(staging_dir: Path) -> list[Path]:
+    """Every staged file, in the order in which a later copy of a session wins."""
+    return sorted(Path(staging_dir).glob(STAGED_GLOB))
+
+
+def read_staged_conversations(staging_dir: Path):
+    """(file, the conversations it holds) for every staged file. One a load removed since
+    the listing is passed over; one that cannot be parsed is moved aside, as an unreadable
+    mail batch is (load_json_or_quarantine)."""
+    for path in staged_files(staging_dir):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            continue
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            data = load_json_or_quarantine(path)
+            if data is None:
+                continue
+        yield path, data.get("conversations", []) if isinstance(data, dict) else []
+
+
+def _code_version() -> str:
+    """A digest of this module: what the export recorded of a transcript holds only for the
+    code that read it."""
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+
+
+def _transcripts_read(path: Path) -> dict[str, dict]:
+    """The record export_conversations keeps, or nothing when it is missing, unreadable, or
+    written by other code."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict) or data.get("code") != _code_version():
+        return {}
+    transcripts = data.get("transcripts")
+    return transcripts if isinstance(transcripts, dict) else {}
+
+
+def _held(conv: dict | None) -> dict | None:
+    """What a transcript held, as the record keeps it: None when too short to export."""
+    if conv is None:
+        return None
+    return {
+        "session_id": conv["session_id"],
+        "ended_at": conv["ended_at"],
+        "turn_count": conv["turn_count"],
+        "kind": conv.get("kind"),
+    }
+
+
+def _outcome_unread(
+    held: dict | None,
+    loaded: dict[str, tuple[str | None, int | None]],
+    include_agents: bool,
+    staging_dir: Path,
+) -> str | None:
+    """What an unchanged transcript comes to without reading it: 'skipped' (too short, or
+    loaded and not gone on since), 'agents' (an agent session left out) or 'pending'
+    (staged, its load to come). None when it has to be read: the store does not hold it
+    and no copy of it is staged."""
+    from src.store.loader import conversation_went_on
+
+    if held is None:
+        return "skipped"
+    if held.get("kind") == "agent" and not include_agents:
+        return "agents"
+    previous = loaded.get(held.get("session_id") or "")
+    if previous is not None and not conversation_went_on(held, *previous):
+        return "skipped"
+    if staged_path(staging_dir, held).is_file():
+        return "pending"
+    return None
+
+
 def export_conversations(
     days: int | None = None,
     limit: int = 0,
@@ -400,6 +507,13 @@ def export_conversations(
     include_agents: bool = False,
 ) -> dict:
     """Export Claude Code conversations to staging directory.
+
+    Each conversation goes to a file of its own (staged_path). Every transcript read is
+    recorded with its size and mtime as they were before the read (TRANSCRIPTS_READ), and
+    one that has not changed since is not read again: the 1.15 GB of the last week's
+    transcripts were parsed on every export to skip the sessions already loaded. It is read
+    again when the store no longer holds what it held and no copy is staged, and every one
+    is read again after a change to this module.
 
     Args:
         days: Only export conversations from last N days (None = all)
@@ -414,31 +528,65 @@ def export_conversations(
 
     Returns:
         Dict with 'exported', 'skipped', 'agents' (agent sessions left out),
-        'errors', 'batch_file' keys
+        'errors', 'pending' (staged before and not loaded yet, not read again) and
+        'staged' (the files written) keys
     """
     CONVERSATION_STAGING_DIR.mkdir(parents=True, exist_ok=True)
 
     files = scan_conversation_files(days=days, workspace_filter=workspace_filter)
     if not files:
-        return {"exported": 0, "skipped": 0, "agents": 0, "errors": 0, "batch_file": None}
+        return {
+            "exported": 0,
+            "skipped": 0,
+            "agents": 0,
+            "errors": 0,
+            "pending": 0,
+            "staged": [],
+        }
 
     from src.store.loader import conversation_went_on
 
     loaded = loaded or {}
+    record_path = CONVERSATION_STAGING_DIR / TRANSCRIPTS_READ
+    known = _transcripts_read(record_path)
+    record = {str(f): known[str(f)] for f in files if str(f) in known}
     conversations: list[dict] = []
     skipped = 0
     agents = 0
     errors = 0
+    pending = 0
 
     for jsonl_file in files:
         if limit and len(conversations) >= limit:
             break
 
         try:
+            st = jsonl_file.stat()
+            seen: list[int] | None = [st.st_size, st.st_mtime_ns]
+        except OSError:
+            seen = None
+        entry = known.get(str(jsonl_file))
+        if seen is not None and entry is not None and entry.get("seen") == seen:
+            outcome = _outcome_unread(
+                entry.get("held"), loaded, include_agents, CONVERSATION_STAGING_DIR
+            )
+            if outcome == "skipped":
+                skipped += 1
+                continue
+            if outcome == "agents":
+                agents += 1
+                continue
+            if outcome == "pending":
+                pending += 1
+                continue
+
+        try:
             conv = parse_conversation(jsonl_file)
         except Exception:
             errors += 1
             continue
+        if seen is not None:
+            record[str(jsonl_file)] = {"seen": seen, "held": _held(conv)}
 
         if conv is None:
             skipped += 1
@@ -457,24 +605,18 @@ def export_conversations(
 
         conversations.append(conv)
 
-    if not conversations:
-        return {
-            "exported": 0,
-            "skipped": skipped,
-            "agents": agents,
-            "errors": errors,
-            "batch_file": None,
-        }
-
-    # Write batch file
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    batch_file = CONVERSATION_STAGING_DIR / f"conversation-batch-{timestamp}.json"
-    write_json_atomic(batch_file, {"conversations": conversations}, redact=True)
+    staged = []
+    for conv in conversations:
+        path = staged_path(CONVERSATION_STAGING_DIR, conv)
+        write_json_atomic(path, {"conversations": [conv]}, redact=True)
+        staged.append(str(path))
+    write_json_atomic(record_path, {"code": _code_version(), "transcripts": record})
 
     return {
         "exported": len(conversations),
         "skipped": skipped,
         "agents": agents,
         "errors": errors,
-        "batch_file": str(batch_file),
+        "pending": pending,
+        "staged": staged,
     }

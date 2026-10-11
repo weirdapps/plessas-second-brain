@@ -6,7 +6,6 @@ Resumable state tracking.
 """
 
 import functools
-import json
 import os
 import signal
 import sqlite3
@@ -853,23 +852,24 @@ CONV_STATE_FILE = DATA_DIR / "state" / "conv_extract_state.json"
 
 
 def collect_conversations() -> list[dict]:
-    """Load all staged conversation batches, one entry per session.
+    """Load all staged conversations, one entry per session.
 
-    Every batch file ever written is still on disk (708 of them on the VPS,
-    back to 2026-04-12), and a session that stays open across several exports is
-    re-staged into each batch it was still live for. Concatenating them counted
+    A session that stays open across several exports was re-staged into each batch
+    it was still live for, and every batch stayed on disk. Concatenating them counted
     1,696 distinct sessions as 5,265 entries, one of them 248 times, and since a
     session only leaves the pending list once it extracts successfully, every
-    copy was offered again on every run.
+    copy was offered again on every run. Staging now holds a file per session and
+    version, and a load removes what it no longer needs (src/store/loader.py).
 
-    The LAST copy wins: batch filenames are timestamps and the glob is sorted, so
-    the newest export of a session is also its most complete transcript.
+    The LAST copy wins: staging order puts the newest copy of a session last
+    (src/export/conversation_export.py STAGED_GLOB), and it is also its most
+    complete transcript.
     """
-    batch_files = sorted(CONV_STAGING_DIR.glob("conversation-batch-*.json"))
+    from src.export.conversation_export import read_staged_conversations
+
     by_session: dict[str, dict] = {}
-    for bf in batch_files:
-        data = json.load(open(bf, encoding="utf-8"))
-        for conv in data.get("conversations", []):
+    for _path, conversations in read_staged_conversations(CONV_STAGING_DIR):
+        for conv in conversations:
             # dict preserves insertion order, and re-assigning an existing key
             # keeps its original position, so a session holds the slot of its
             # FIRST appearance while carrying the content of its LAST.

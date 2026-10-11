@@ -189,9 +189,9 @@ def test_no_limit_registers_everything(db, tmp_path):
 
 
 def test_returns_the_ids_it_created(db, tmp_path):
-    """Step 6 scopes Phase 1/2 to `new_attachment_ids`, falling back to UNSCOPED
-    when the list is empty. Without ids here, the first run after a backlog is
-    registered would run an unbounded LLM pass over every pending attachment."""
+    """The ids of the rows a pass created come back with its counts. Step 6 of the
+    sync scoped Phase 1/2 to them until #198; it now chains Phase 2 on what Phase 1
+    read, newest mail first, so a caller that wants this pass's rows reads them here."""
     _email(db, "AAMk-ids")
     _downloaded(tmp_path, "AAMk-ids", "a.pdf", "b.png")
 

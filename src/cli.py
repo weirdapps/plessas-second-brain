@@ -4034,10 +4034,16 @@ def main():
         "--limit",
         type=int,
         default=None,
-        help="Most messages to ask the mailbox for in this run (default 200)",
+        help="Most messages to ask the mailbox for in this run, both halves together (default 200)",
     )
     parser_refetch_garbled.add_argument(
         "--root", default=str(ATTACHMENTS_DIR), help="Attachments root, where the files go back"
+    )
+    parser_refetch_garbled.add_argument(
+        "--no-lookup",
+        action="store_true",
+        help="Ask by id only: do not look up the messages with no mailbox id by folder, time"
+        " and subject",
     )
     parser_refetch_garbled.set_defaults(func=cmd_refetch_garbled)
 

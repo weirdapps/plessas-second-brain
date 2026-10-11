@@ -74,18 +74,6 @@ CASES = [
         "src.store.embeddings:query_semantic",
         "limit",
     ),
-    (
-        "recall_preference",
-        {"topic": "okapi"},
-        "src.store.conversation_query:recall_preferences",
-        "limit",
-    ),
-    (
-        "recent_conversations",
-        {},
-        "src.store.conversation_query:recent_conversations",
-        "limit",
-    ),
     ("attachment_image_search", {"query": "okapi"}, "src.store.recall:_folded_bucket", 3),
     ("search_teams", {"query": "okapi"}, "src.store.teams_query:search_teams", "limit"),
     ("search_whatsapp", {"query": "okapi"}, "src.store.whatsapp_query:search_whatsapp", "limit"),
@@ -149,8 +137,8 @@ def test_a_negative_or_zero_limit_returns_one_row_not_all_or_none(db, limit):
 @pytest.mark.parametrize(
     "call",
     [
-        lambda: mcp_server.search_emails("okapi", search_type="Semantic"),
-        lambda: mcp_server.search_conversations("okapi", search_type="fuzzy"),
+        lambda: mcp_server.search_emails("okapi", search_type="Semantic"),  # type: ignore[arg-type]
+        lambda: mcp_server.search_conversations("okapi", search_type="fuzzy"),  # type: ignore[arg-type]
     ],
 )
 def test_an_unknown_search_type_is_an_error_naming_the_allowed_values(db, call):

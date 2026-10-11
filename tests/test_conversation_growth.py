@@ -259,23 +259,6 @@ def test_the_loader_leaves_a_conversation_that_did_not_go_on(tmp_path):
     )
 
 
-def test_replace_loads_a_conversation_again_whatever_it_holds(tmp_path):
-    """The hook that ingests a session while it runs replaces what it loaded
-    before, grown or not, under an id above every one in use."""
-    conn = create_database(str(tmp_path / "b.db"))
-    meta = _transcript("s", "2026-09-01T10:00:00Z", [("user", "okapi one")])
-    assert load_single_conversation(conn, meta, _extraction("first", "d1", "t1", "f1", "alpha"))
-    other = _transcript("t", "2026-09-01T10:00:00Z", [("user", "x")])
-    assert load_single_conversation(conn, other, _extraction("other", "d", "t", "f", "o"))
-
-    assert load_single_conversation(
-        conn, meta, _extraction("again", "d2", "t2", "f2", "beta"), replace=True
-    )
-
-    rows = conn.execute("SELECT id, session_id, summary FROM conversations ORDER BY id").fetchall()
-    assert [tuple(r) for r in rows] == [(2, "t", "other"), (3, "s", "again")]
-
-
 def test_a_conversation_loaded_again_is_embedded_again_and_its_old_vector_goes(
     tmp_path, monkeypatch
 ):
@@ -346,45 +329,6 @@ def test_a_conversation_loaded_again_is_embedded_again_and_its_old_vector_goes(
     embeddings.build_index(conn)
     ids = sorted(int(i) for i in np.load(index, allow_pickle=False)["ids"])
     assert ids == sorted(others)  # the old vector pruned, the fresh one dropped
-
-
-def test_the_running_session_hook_replaces_what_it_loaded(tmp_path, monkeypatch):
-    """It deleted the session and loaded it again, which gave the new row the old
-    id whenever the session was the newest, so build_index kept its old vector."""
-    import argparse
-
-    from src import cli
-    from src.export import conversation_export
-    from src.extract import claude_extract
-    from src.store.schema import get_connection
-
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    db = tmp_path / "b.db"
-    create_database(str(db)).close()
-    versions = iter(
-        [
-            _transcript("s", "2026-09-01T10:00:00Z", [("user", "a")]),
-            _transcript("s", "2026-09-01T12:00:00Z", [("user", "a"), ("assistant", "b")]),
-        ]
-    )
-    monkeypatch.setattr(conversation_export, "parse_conversation", lambda path: next(versions))
-    summaries = iter(["first", "second"])
-    monkeypatch.setattr(
-        claude_extract,
-        "extract_conversation",
-        lambda conv: _extraction(next(summaries), "d", "t", "f", "x"),
-    )
-    transcript = tmp_path / "t.jsonl"
-    args = argparse.Namespace(transcript=str(transcript), session_id="s", db=db)
-    rows = []
-    for lines in (60, 120):  # 50 new lines since the last run bring it back
-        transcript.write_text("{}\n" * lines)
-        cli.cmd_ingest_conversation_incremental(args)
-        conn = get_connection(str(db))
-        rows += [tuple(r) for r in conn.execute("SELECT id, summary FROM conversations")]
-        conn.close()
-
-    assert rows == [(1, "first"), (2, "second")]
 
 
 def test_an_extraction_is_loaded_with_the_copy_it_read(tmp_path, monkeypatch):
@@ -504,8 +448,6 @@ def test_the_loader_waits_for_an_extraction_of_the_transcript_staged(tmp_path):
 
     other = _transcript("t", "2026-09-01T10:00:00Z", [("user", "x")])
     assert load_single_conversation(conn, other, legacy)  # a first load, as before
-    stale = {**legacy, "transcript_ended_at": "2026-09-01T09:00:00Z"}
-    assert load_single_conversation(conn, other, stale, replace=True)  # the caller's own
 
 
 def test_sync_embeds_the_conversations_it_loads(tmp_path, monkeypatch):

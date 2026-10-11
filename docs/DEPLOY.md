@@ -192,6 +192,69 @@ attaches a `_stale_warning` when the copy is behind.
 `scripts/wrappers/` archives the wrapper scripts both sides actually run, with
 its own README.
 
+### Claude Code conversations from a workstation
+
+The producer reads Claude Code transcripts from its own `~/.claude/projects`, so
+each workstation sends a session's transcript there when the session ends. A
+Claude Code `SessionEnd` hook, `scripts/hooks/session-end-push.sh`, reads the
+hook's input on stdin, leaves agent sessions out (a subagent's, an in-process or
+split-pane teammate's, a scripted `claude -p` run's) and starts
+`scripts/wrappers/launchd/sync-transcripts-to-vps.sh` in the background, detached,
+so the session's 1.5 s hook budget is never spent on the network. The push sends
+that one transcript to the same path on the producer, owner-only, and never the
+session's `subagents/` directory. It keeps the WhatsApp push's contract:
+`~/.second-brain/transcripts-sync.stamp` on both hosts after a push,
+`transcripts-sync.fail` with the reason when one fails, and a producer it cannot
+reach skipped quietly until the gap outlives 24 hours or 12 runs. A transcript it
+could not send waits in `~/.second-brain/transcripts-sync.pending` and goes with
+the next push. Its log is `~/Library/Logs/transcripts-sync-vps.log`.
+
+```bash
+cp scripts/hooks/session-end-push.sh scripts/wrappers/launchd/sync-transcripts-to-vps.sh ~/.local/bin/
+```
+
+Then add the hook to the `hooks` block of `~/.claude/settings.json`. If a
+`SessionEnd` entry is there already, add the inner hook to its `hooks` list. The
+test keeps a host where the script is not installed quiet:
+
+```json
+"SessionEnd": [
+  {
+    "hooks": [
+      {
+        "type": "command",
+        "command": "[ -f \"$HOME/.local/bin/session-end-push.sh\" ] && bash \"$HOME/.local/bin/session-end-push.sh\" || true",
+        "timeout": 5
+      }
+    ]
+  }
+]
+```
+
+The push names the producer `vps` (an `~/.ssh/config` host); set
+`SB_TRANSCRIPTS_VPS` to change it. Check it after the next session ends: the
+stamp updates, and the log says `pushed 1 transcript(s)`.
+
+Remove any older capture path. The `ingest-conversation-incremental` subcommand
+and `scripts/conversation-capture.sh` are gone, and a hook that ingested
+transcripts on the workstation is refused there anyway, since a replica writes
+nothing: drop any `SessionStart` or `Stop` hook that called them. A periodic copy
+of `~/.claude/projects` to the producer can go too once the stamp shows the hook
+working; note that `ingest-session-notes` then no longer sees subagent
+transcripts, which only such a copy carried.
+
+Conversations stored before this change hold every user-role turn as the
+owner's. Relabel them once, on the producer:
+
+```bash
+python -m src.cli relabel-conversations --dry-run   # counts only, writes nothing
+python -m src.cli relabel-conversations
+```
+
+It reads each session's transcript where the producer still holds one, and the
+stored turn's text otherwise. A conversation left with no owner turn is an agent
+session, which every conversation read leaves out by default; nothing is deleted.
+
 ## 6. Schedule
 
 The pipeline is just CLI commands, so schedule them however you like. Source your

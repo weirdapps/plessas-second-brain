@@ -748,8 +748,6 @@ def load_single_conversation(
     conn: sqlite3.Connection,
     metadata: dict,
     extraction: dict,
-    *,
-    replace: bool = False,
 ) -> bool:
     """Load a single conversation with its extraction into the database.
 
@@ -757,8 +755,6 @@ def load_single_conversation(
         conn: Database connection
         metadata: Conversation metadata from staging (session_id, turns, etc.)
         extraction: Extracted data from LLM (summary, topics, decisions, etc.)
-        replace: Load it again even if it has not gone on since it was loaded
-            (the hook that ingests a session while it runs)
 
     Returns:
         True if loaded, False if the store holds it and it has not gone on since
@@ -781,13 +777,13 @@ def load_single_conversation(
         stale = str(described) < str(metadata.get("ended_at") or "")
     else:
         stale = conversation_went_on(metadata, described, extraction["transcript_turn_count"])
-    if stale and not replace:
+    if stale:
         return False
-    if existing and not (replace or conversation_went_on(metadata, existing[1], existing[2])):
+    if existing and not conversation_went_on(metadata, existing[1], existing[2]):
         return False
     # About to write: the checks again under the write lock.
     if _take_the_write_lock(conn):
-        return load_single_conversation(conn, metadata, extraction, replace=replace)
+        return load_single_conversation(conn, metadata, extraction)
     new_id = None  # SQLite's next
     if existing:
         delete_conversation(conn, existing[0])
@@ -895,7 +891,12 @@ def load_single_conversation(
     # Conversation extractions are read from disk without parse_extraction, and
     # files written before it normalised these lists hold dict items (stored as
     # a repr) or nulls (which stopped every conversation load).
-    for pref in _as_string_list(extraction.get("preferences_expressed")):
+    # Only the owner states his preferences: a session with no turn he typed (an
+    # agent session, staged only with --include-agents) keeps none, whatever the
+    # model returned, since the prompt's rule is an instruction and not a control.
+    owner_spoke = any(turn.get("speaker") == "user" for turn in metadata.get("turns", []))
+    preferences = extraction.get("preferences_expressed") if owner_spoke else None
+    for pref in _as_string_list(preferences):
         if pref:
             conn.execute(
                 """

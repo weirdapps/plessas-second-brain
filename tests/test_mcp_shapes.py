@@ -3,9 +3,10 @@
 The Telegram bot and the marketplace skills read these results, and nothing checked
 what they could rely on: freshness travelled with one tool of 25, a search row's
 `source` meant the field that matched, and a key renamed in one tool reached them
-unannounced. This holds, per tool, the output schema's keys as `tools/list` gives
-them, the keys of a sample result in order, and the keys of every list of rows in
-it, read against a store holding an item of every kind (tests/seeded_store.py).
+unannounced. This holds, per tool, the arguments it takes and which are required,
+the output schema's keys as `tools/list` gives them, the keys of a sample result in
+order, and the keys of every list of rows in it, read against a store holding an
+item of every kind (tests/seeded_store.py).
 
 A change to any of them fails here until the snapshot is regenerated, and the diff
 of that file is the review of the change:
@@ -41,10 +42,17 @@ def _rows(value, path: str, found: dict) -> None:
 
 
 def _shape(name: str, result: dict) -> dict:
-    schema = listed_tools()[name].output_schema or {}
+    tool = listed_tools()[name]
+    schema = tool.output_schema or {}
     rows: dict = {}
     _rows(result, "", rows)
     return {
+        # The arguments a caller names: a renamed or newly required one breaks every call
+        # written against the old name, however the result looks.
+        "input_schema": {
+            "properties": sorted(tool.input_schema.get("properties", {})),
+            "required": sorted(tool.input_schema.get("required", [])),
+        },
         "output_schema": {
             "properties": sorted(schema.get("properties", {})),
             "required": sorted(schema.get("required", [])),

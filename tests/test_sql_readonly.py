@@ -6,15 +6,16 @@ from pathlib import Path
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
+from src import config
 from src.store import sql_readonly
 
 
 @pytest.fixture(autouse=True)
 def _no_pull_stamp(tmp_path: Path, monkeypatch) -> None:
-    """Open the producer's way on any host. sql_readonly reads REPLICA_STAMP, not
-    BRAIN_ROLE, so on a host with a pull stamp every fixture database opened with
-    immutable=1. A test that needs the stamp sets it."""
-    monkeypatch.setattr(sql_readonly, "REPLICA_STAMP", tmp_path / "absent-db-pull.stamp")
+    """Open the producer's way on any host: with this host's pull stamp, a test that
+    clears BRAIN_ROLE would open every fixture database with immutable=1. A test that
+    needs the stamp sets it."""
+    monkeypatch.setattr(config, "REPLICA_STAMP", tmp_path / "absent-db-pull.stamp")
 
 
 @pytest.fixture
@@ -309,17 +310,18 @@ def _capture_uris(monkeypatch) -> list[str]:
     return seen
 
 
-def test_replica_opens_immutable(db, tmp_path, monkeypatch):
+def test_sql_query_reads_a_pulled_copy_immutable(db, tmp_path, monkeypatch):
     stamp = tmp_path / "db-pull.stamp"
     stamp.write_text("pulled")
-    monkeypatch.setattr(sql_readonly, "REPLICA_STAMP", stamp)
+    monkeypatch.setattr(config, "REPLICA_STAMP", stamp)
+    monkeypatch.delenv("BRAIN_ROLE")
     seen = _capture_uris(monkeypatch)
-    sql_readonly.connect_read_only(db).close()
-    assert seen[0].endswith("?mode=ro&immutable=1")
+    sql_readonly.run_query("SELECT 1", db_path=db)
+    assert seen == [f"{db.resolve().as_uri()}?mode=ro&immutable=1"]
 
 
 def test_producer_opens_plain_read_only(db, tmp_path, monkeypatch):
-    monkeypatch.setattr(sql_readonly, "REPLICA_STAMP", tmp_path / "absent.stamp")
+    monkeypatch.setattr(config, "REPLICA_STAMP", tmp_path / "absent.stamp")
     seen = _capture_uris(monkeypatch)
     sql_readonly.connect_read_only(db).close()
     assert seen[0].endswith("?mode=ro")

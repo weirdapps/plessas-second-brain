@@ -42,6 +42,7 @@ from src.mcp_results import (
     TopicContext,
 )
 from src.store.schema import get_connection
+from src.store.sql_readonly import connect_read_only
 
 # Routing text, not marketing. Under tool search only the tool NAMES and this
 # string load at session start, so this is what decides whether the brain gets
@@ -90,8 +91,8 @@ not yet synced here, is on the separate WhatsApp MCP server.\
 """
 
 # REPLICA is true only where the hourly pull runs: over HTTP on the producer the
-# store is the master. The pull stamp decides, as it does for sql_query's open,
-# never BRAIN_ROLE: the producer serves with BRAIN_ROLE=replica.
+# store is the master. The pull stamp decides, as it does for the read-only open,
+# never BRAIN_ROLE=replica: the producer serves with it.
 _REPLICA_FRESHNESS = """\
 Freshness. This is a REPLICA, synced from the machine that builds it, so it can \
 lag. `stats` returns data_as_of / age_hours / stale, and `recall` attaches \
@@ -196,7 +197,18 @@ def _inert(value: Any) -> Any:
 
 
 def _get_conn():
-    """Get a database connection with row factory."""
+    """The store, read-only: every tool reads through this, and a write through it raises.
+
+    It asks for immutable=1, which only a pulled copy grants: the Mac reads the file
+    the pull verified, without locks or a -wal. Everywhere else, the producer's HTTP
+    server included, it opens read-only with SQLite's locking (connect_read_only).
+    """
+    return connect_read_only(DEFAULT_DB, immutable=True)
+
+
+def _get_write_conn():
+    """The store, read-write, for the one write a tool makes: sharepoint_index's refetch
+    records what it fetched. A replica refuses the refetch before this is reached."""
     return get_connection(str(DEFAULT_DB))
 
 
@@ -1292,17 +1304,21 @@ def sharepoint_index(
 
         # Fetched into a temporary directory and stored as text; no file is kept.
         msg_id = msg_id_row["message_id"]
-        result, document = sharepoint_ingest.fetch_and_ingest(conn, url, msg_id)
-        sharepoint_fetcher.record_link_in_db(
-            conn,
-            url=url,
-            message_id=msg_id,
-            status=result.status,
-            fetched_path=None,
-            file_name=result.file_name,
-            file_size=result.file_size,
-            document_message_id=document,
-        )
+        writer = _get_write_conn()
+        try:
+            result, document = sharepoint_ingest.fetch_and_ingest(writer, url, msg_id)
+            sharepoint_fetcher.record_link_in_db(
+                writer,
+                url=url,
+                message_id=msg_id,
+                status=result.status,
+                fetched_path=None,
+                file_name=result.file_name,
+                file_size=result.file_size,
+                document_message_id=document,
+            )
+        finally:
+            writer.close()
         return {"status": result.status, "document_message_id": document}
     finally:
         conn.close()

@@ -2052,7 +2052,12 @@ def migrate_add_calendar(conn: sqlite3.Connection) -> None:
 
 
 def get_connection(db_path: str) -> sqlite3.Connection:
-    """Open an existing SQLite database.
+    """Open an existing SQLite database: read-write, or read-only on a replica.
+
+    A replica's copy is replaced by the next pull, so a write there is lost, or, left
+    in a WAL, replayed over the next copy (2026-08-29). There this returns the store's
+    read-only connection (src.store.sql_readonly.connect_read_only), through which a
+    write raises; each writer's own replica guard still refuses first, and says why.
 
     Args:
         db_path: Path to the SQLite database file
@@ -2065,6 +2070,13 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     """
     if not Path(db_path).exists():
         raise FileNotFoundError(f"Database not found: {db_path}")
+
+    from src.config import is_replica
+
+    if is_replica():
+        from src.store.sql_readonly import connect_read_only
+
+        return connect_read_only(db_path)
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row

@@ -6,13 +6,16 @@ write: the connection opens read-only with query_only on, and an authorizer
 allows nothing but reading. One statement per call, a time budget, and caps on
 rows, cells and the whole answer keep a careless query from flooding the
 caller's context.
+
+connect_read_only is also the store's one read-only open: every MCP tool that
+reads, and src.store.schema.get_connection on a replica, go through it.
 """
 
 import sqlite3
 import time
 from pathlib import Path
 
-from src.config import DEFAULT_DB, REPLICA_STAMP
+from src.config import DEFAULT_DB, is_pulled_copy
 from src.store.greek import register_sql_functions
 
 MAX_ROWS = 200
@@ -28,6 +31,9 @@ BUDGET_SECONDS = 10.0
 MAX_VALUE_BYTES = 8 * 1024 * 1024
 MAX_COLUMNS = 32
 _PROGRESS_STEPS = 10_000
+# As src.store.schema.get_connection: long enough to outlast any one write
+# transaction. Only a locking open waits; an immutable one takes no locks.
+_BUSY_TIMEOUT_SECONDS = 60.0
 # Room for the cut marker, "… [cut, N chars]", with N up to eight digits.
 _MARKER_CHARS = len("… [cut, 99999999 chars]")
 
@@ -68,23 +74,63 @@ def _authorize(
     return sqlite3.SQLITE_DENY
 
 
-def connect_read_only(db_path: Path | None = None) -> sqlite3.Connection:
-    """A read-only connection with the store's SQL functions and query_only on."""
+def connect_read_only(
+    db_path: Path | str | None = None, *, immutable: bool = False
+) -> sqlite3.Connection:
+    """A connection that cannot write, with the store's SQL functions and query_only on.
+
+    It opens with SQLite's locking (mode=ro), so it reads what a writer committed,
+    the WAL included, and never a page mid-write. immutable=1 (no locks, no -wal or
+    -shm, any WAL ignored) is taken only where the store is a pulled copy, which
+    nothing writes (src.config.is_pulled_copy): when the caller asks for it, or when
+    the locking open fails, as it does on a WAL file copied without its -shm into a
+    directory this process cannot create one in. Anywhere else immutable is never
+    used: the producer serves while its timers write the same file.
+    """
+    return _connect(db_path, immutable=immutable, limits=())
+
+
+def _connect(
+    db_path: Path | str | None, *, immutable: bool, limits: tuple[tuple[int, int], ...]
+) -> sqlite3.Connection:
     path = Path(db_path or DEFAULT_DB)
     if not path.exists():
         raise FileNotFoundError(f"Database not found: {path}")
-    uri = f"{path.resolve().as_uri()}?mode=ro"
-    if REPLICA_STAMP.exists():
-        # A pulled replica: nothing writes here, and a plain read-only open
-        # fails with SQLITE_CANTOPEN (14). The producer must never take this
-        # branch: immutable=1 skips locking on a database that is being written.
-        uri += "&immutable=1"
-    conn = sqlite3.connect(uri, uri=True)
+    pulled = is_pulled_copy()
+    if immutable and pulled:
+        return _open(path, immutable=True, limits=limits)
     try:
-        conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
-        conn.setlimit(sqlite3.SQLITE_LIMIT_COLUMN, MAX_COLUMNS)
+        return _open(path, immutable=False, limits=limits)
+    except sqlite3.OperationalError as exc:
+        if not (pulled and _cannot_open_read_only(exc)):
+            raise
+    return _open(path, immutable=True, limits=limits)
+
+
+def _cannot_open_read_only(exc: sqlite3.OperationalError) -> bool:
+    """Whether a locking read-only open failed for want of its -wal or -shm
+    (SQLITE_CANTOPEN or SQLITE_READONLY, extended codes included), which an immutable
+    open does not need, and not because the file is damaged or no database."""
+    code = getattr(exc, "sqlite_errorcode", 0) & 0xFF
+    return code in (sqlite3.SQLITE_CANTOPEN, sqlite3.SQLITE_READONLY)
+
+
+def _open(
+    path: Path, *, immutable: bool, limits: tuple[tuple[int, int], ...]
+) -> sqlite3.Connection:
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    if immutable:
+        uri += "&immutable=1"
+    conn = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT_SECONDS)
+    try:
+        for category, value in limits:
+            conn.setlimit(category, value)
         conn.row_factory = sqlite3.Row
         register_sql_functions(conn)
+        # The first read loads the schema, and a locking open reaches for its -wal and
+        # -shm with it: a store that cannot be opened this way fails here, where the
+        # caller can still take the immutable open, not at its first query.
+        conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
         # SQLite sizes a sort's in-memory runs from cache_size. A sort that carries
         # long texts peaked at 1.06 GB on a real store with the default 2 MB, and
         # at 0.31 GB with 16 MB. temp_store=FILE keeps sort data on disk even where
@@ -93,9 +139,21 @@ def connect_read_only(db_path: Path | None = None) -> sqlite3.Connection:
         conn.execute("PRAGMA temp_store = FILE")
         conn.execute("PRAGMA query_only = ON")
     except BaseException:
-        conn.close()  # a file that is not a database, or a schema too wide to read
+        # A file that is not a database, a schema too wide to read, or a store this
+        # process cannot open read-only with locks.
+        conn.close()
         raise
     return conn
+
+
+def _connect_for_sql(db_path: Path | None) -> sqlite3.Connection:
+    """The read-only open with the caps an arbitrary query needs, set before the schema
+    is read. Immutable on a pulled copy, as sql_query has always opened one there."""
+    limits = (
+        (sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES),
+        (sqlite3.SQLITE_LIMIT_COLUMN, MAX_COLUMNS),
+    )
+    return _connect(db_path, immutable=True, limits=limits)
 
 
 def _arm_budget(conn: sqlite3.Connection) -> None:
@@ -115,7 +173,7 @@ def run_query(sql: str, limit: int = MAX_ROWS, db_path: Path | None = None) -> d
     """Run one read-only statement; rows and cells capped, writes refused."""
     limit = max(1, min(int(limit), MAX_ROWS))
     try:
-        conn = connect_read_only(db_path)
+        conn = _connect_for_sql(db_path)
     except (FileNotFoundError, sqlite3.Error) as exc:
         return {"error": str(exc)}
     _arm_budget(conn)
@@ -188,7 +246,7 @@ def describe(table: str | None = None, db_path: Path | None = None) -> dict:
     one scans its whole content table, which took over 30 s on a real store.
     """
     try:
-        conn = connect_read_only(db_path)
+        conn = _connect_for_sql(db_path)
     except (FileNotFoundError, sqlite3.Error) as exc:
         return {"error": str(exc)}
     try:

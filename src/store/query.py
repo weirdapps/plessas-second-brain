@@ -23,6 +23,7 @@ from src.store.ordering import (
     fact_order,
     parent_dates,
 )
+from src.store.owner import owner_address_sql
 from src.store.schema import subject_to_conversation_id
 from src.store.source_class import class_counts, visible_sql, with_source_class
 
@@ -1157,7 +1158,8 @@ def meeting_prep(
 
     Args:
         conn: Database connection
-        people: List of attendee names or emails
+        people: List of attendee names or emails; an address is exact, a name
+            may fit several people
         topic: Optional meeting topic to focus on
         days: How far back to look (default: 90 days)
         limit_per_person: Max emails per person (default: 10)
@@ -1166,7 +1168,8 @@ def meeting_prep(
 
     Returns:
         Dict with keys:
-        - attendees: list of per-person dossiers
+        - attendees: list of per-person dossiers, each with resolved_by,
+          match_count and other_candidates as person_context gives them
         - topic_context: topic-related context (if topic provided)
         Every email, decision, fact and action row carries its source_class.
     """
@@ -1178,7 +1181,7 @@ def meeting_prep(
 
     result: dict[str, Any] = {"attendees": [], "topic_context": None}
 
-    from src.store.context import resolve_person
+    from src.store.person_resolve import resolve_identity
 
     for person in people:
         dossier: dict[str, Any] = {
@@ -1192,9 +1195,11 @@ def meeting_prep(
 
         # One person per attendee, resolved as person_context resolves a name. A
         # folded LIKE in every query merged every namesake into one dossier.
-        person_row, match_count, others = resolve_person(conn, person)
-        dossier["match_count"] = match_count
-        dossier["other_candidates"] = others
+        resolution = resolve_identity(conn, person)
+        person_row = resolution.row
+        dossier["resolved_by"] = resolution.resolved_by
+        dossier["match_count"] = resolution.match_count
+        dossier["other_candidates"] = resolution.other_candidates
         if person_row is None:
             result["attendees"].append(dossier)
             continue
@@ -1366,7 +1371,10 @@ def _stale_threads_sql(
     now = datetime.now(UTC)
     cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
     oldest = (now - timedelta(days=max_days)).strftime("%Y-%m-%dT%H:%M:%S")
-    owner = f"%{USER_EMAIL_PATTERN}%"
+    # The owner's listed addresses, each whole (src/store/owner.py): a substring test
+    # took a colleague's thread for his, and could not read a list.
+    sent_by_owner, sent_params = owner_address_sql("e.sender_address", USER_EMAIL_PATTERN)
+    to_owner, to_params = owner_address_sql("p.email", USER_EMAIL_PATTERN)
     not_a_response = " ".join(
         "AND COALESCE(e.subject, '') NOT LIKE ?" for _ in _MEETING_RESPONSE_PREFIXES
     )
@@ -1386,11 +1394,11 @@ def _stale_threads_sql(
         FROM latest_per_thread lpt
         JOIN emails e ON e.conversation_id = lpt.conversation_id
                      AND e.date_received = lpt.last_date
-        WHERE LOWER(e.sender_address) LIKE LOWER(?)
+        WHERE {sent_by_owner}
           AND EXISTS (
               SELECT 1 FROM email_people ep JOIN people p ON p.id = ep.person_id
               WHERE ep.email_id = e.id AND ep.role_in_email IN ('recipient', 'cc')
-                AND LOWER(COALESCE(p.email, '')) NOT LIKE LOWER(?)
+                AND NOT {to_owner}
           )
           {not_a_response}
           AND lpt.last_date < ?
@@ -1399,8 +1407,8 @@ def _stale_threads_sql(
     """
     return sql, (
         _BLANK_SUBJECT_THREAD,
-        owner,
-        owner,
+        *sent_params,
+        *to_params,
         *(f"{prefix}%" for prefix in _MEETING_RESPONSE_PREFIXES),
         cutoff,
         oldest,

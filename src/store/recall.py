@@ -24,6 +24,7 @@ from src.store.greek import (
 )
 from src.store.normalizer import normalize_topic
 from src.store.ordering import action_order, decision_dates, decision_order, parent_dates
+from src.store.person_resolve import IDENTIFIER_KINDS, resolve_identity
 from src.store.query import (
     fts5_query_variants,
     query_by_keyword,
@@ -277,18 +278,26 @@ _CONTEXT_HINT_LIMIT = 5
 def _maybe_person_context(
     conn: sqlite3.Connection, query: str, days: int, **switches: bool
 ) -> dict | None:
-    """Return person_context if the query plausibly matches a known person.
+    """Return person_context if the query means one known person for sure.
 
     `switches` are include_news and include_automation, as recall was given them.
     """
-    # resolve_person is the test, so for a name recall attaches the person
+    # resolve_identity is the test, so for a name recall attaches the person
     # person_context and meeting_prep find: one with a word starting with the
     # query. A substring test found a name for most topics ('AI' inside
     # Michail, 'EU' inside Piraeus) and attached that dossier, and a separate
-    # pre-check here disagreed with resolve_person in both directions. Not by an
+    # pre-check here disagreed with the resolver in both directions. Not by an
     # address's local part, which a topic word such as 'data' or 'info' starts
-    # often enough. No match-count threshold: a real surname matches about 50
-    # people. An unmatched name returns early.
+    # often enough. And only for an identifier, or a name that fits one person
+    # (rows the alias map joins count once): a surname fitting 20 rows was
+    # attached as whichever was most emailed, and 2 of the 7 dossiers attached
+    # in an audit were the right person on the wrong row. person_context
+    # resolves a name it cannot be sure of and says so.
+    resolution = resolve_identity(conn, query, local_part=False)
+    if resolution.row is None or (
+        resolution.resolved_by not in IDENTIFIER_KINDS and resolution.match_count != 1
+    ):
+        return None
     ctx = get_person_context(
         conn, query, days=days, limit=_CONTEXT_HINT_LIMIT, local_part=False, **switches
     )

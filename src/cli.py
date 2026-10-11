@@ -2025,6 +2025,8 @@ def cmd_sync(args):
             conn.close()
             return
 
+    # Where the mail this run loads starts, so Step 3b finds the directories of what it loads.
+    last_email_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM emails").fetchone()[0]
     conn.close()
 
     # Step 1: sync stages no mail. `python -m src.export.outlook_export` does,
@@ -2093,16 +2095,22 @@ def cmd_sync(args):
         print("\nStep 3b: Registering attachments outlook-cli downloaded...")
         from datetime import UTC, timedelta
 
-        from src.export.outlook_attachments import register_downloaded_attachments
+        from src.export.outlook_attachments import register_new_downloads
 
         window_start = (
             datetime.now(UTC) - timedelta(hours=ATTACHMENT_REGISTER_WINDOW_H)
         ).isoformat()
         conn_reg = get_conn(db_path)
         try:
-            reg = register_downloaded_attachments(
+            # The directories written since the last complete scan, and those of the mail
+            # this run loaded, not every directory: the nightly pass walks them all.
+            loaded_mail = conn_reg.execute(
+                "SELECT message_id FROM emails WHERE id > ?", (last_email_id,)
+            ).fetchall()
+            reg = register_new_downloads(
                 conn_reg,
                 ATTACHMENTS_DIR,
+                [str(row[0]) for row in loaded_mail],
                 limit=ATTACHMENT_REGISTER_LIMIT,
                 since=window_start,
             )

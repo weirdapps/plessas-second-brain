@@ -295,7 +295,7 @@ def test_each_billed_call_of_a_retry_is_logged(v2, model, tmp_path):
 @pytest.mark.parametrize("example", prompt.EMAIL_EXAMPLES_V2, ids=lambda e: e.title)
 def test_each_worked_example_is_a_valid_answer_quoting_its_email(example):
     answer = example.answer
-    text = prompt._email_text(example.email)
+    text = prompt._email_text(example.item)
 
     assert schema_v2.problems(answer, schema_v2.EMAIL_SCHEMA_V2) == []
     for key in ("decisions", "action_items", "commitments"):

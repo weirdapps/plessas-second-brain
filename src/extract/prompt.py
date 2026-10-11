@@ -333,7 +333,7 @@ PAYMENT DATA
 """
 
 
-def _identity_v2() -> str:
+def identity_v2() -> str:
     """Who the owner is, for the v2 instructions; stable for a deployment."""
     if not (USER_NAME or USER_ROLE):
         return (
@@ -343,18 +343,19 @@ def _identity_v2() -> str:
     who = USER_NAME or "the person whose mailbox it is"
     role = f", whose role is {USER_ROLE}" if USER_ROLE else ""
     return (
-        f"The owner of this email archive is {who}{role}. Read every email from the"
-        " owner's side: the owner may be its sender, a recipient, copied, or not named"
-        " in it at all."
+        f"The owner of this email archive is {who}{role}. Read every email and document"
+        " from the owner's side: the owner may be the sender, a recipient, copied, or not"
+        " named at all."
     )
 
 
 @dataclass(frozen=True)
 class WorkedExample:
-    """An email, the answer the v2 instructions want for it, and why."""
+    """An item (an email, or a document's builder arguments), the answer the v2
+    instructions want for it, and why."""
 
     title: str
-    email: dict
+    item: dict
     answer: dict
     why: str
 
@@ -365,7 +366,7 @@ _EXAMPLE_OWNER_EN = {"name": "Eleni Pappa", "address": "eleni.pappa@example.com"
 EMAIL_EXAMPLES_V2 = (
     WorkedExample(
         title="a reply the owner sent, in Greek, with the request it answers quoted below it",
-        email={
+        item={
             "sender": _EXAMPLE_OWNER_GR,
             "to_recipients": [{"name": "Νίκος Αντωνίου", "address": "nikos.antoniou@example.com"}],
             "cc_recipients": [{"name": "Μαρία Κωστάκη", "address": "maria.kostaki@example.com"}],
@@ -467,7 +468,7 @@ EMAIL_EXAMPLES_V2 = (
     ),
     WorkedExample(
         title="an email to the owner, in English, forwarding a regulator's circular with a request",
-        email={
+        item={
             "sender": {"name": "Daniel Reed", "address": "daniel.reed@example.com"},
             "to_recipients": [_EXAMPLE_OWNER_EN],
             "cc_recipients": [],
@@ -548,22 +549,21 @@ EMAIL_EXAMPLES_V2 = (
     ),
 )
 
-_EXAMPLES_INTRO = (
-    "WORKED EXAMPLES\n"
-    "The two examples below show what a good answer looks like. Their owner is a"
-    " fictional Ελένη Παππά (Eleni Pappa); in real emails the owner is the person named"
-    " above. Each email is shown as it would appear between the tags, then the answer,"
-    " then why."
-)
 
-
-def _examples_text(examples: tuple[WorkedExample, ...], render) -> str:
-    """The worked examples as the cached system block shows them."""
-    parts = [_EXAMPLES_INTRO]
+def examples_text(examples: tuple[WorkedExample, ...], render, noun: str) -> str:
+    """The worked examples as the cached system block shows them: each `noun` rendered as
+    it appears between the tags, its answer, and why."""
+    parts = [
+        "WORKED EXAMPLES\n"
+        "The two examples below show what a good answer looks like. Their owner is a"
+        f" fictional Ελένη Παππά (Eleni Pappa); in a real {noun} the owner is the person"
+        f" named above. Each {noun} is shown as it would appear between the tags, then the"
+        " answer, then why."
+    ]
     for n, example in enumerate(examples, start=1):
         answer = json.dumps(example.answer, ensure_ascii=False, indent=2)
         parts.append(
-            f"Example {n}: {example.title}.\n\n{render(example.email)}\n\n"
+            f"Example {n}: {example.title}.\n\n{render(example.item)}\n\n"
             f"Answer:\n{answer}\n\nWhy: {example.why}"
         )
     return "\n\n".join(parts)
@@ -572,8 +572,8 @@ def _examples_text(examples: tuple[WorkedExample, ...], render) -> str:
 def email_system_v2() -> list[dict]:
     """The v2 system prompt for emails: the instructions, then the worked examples,
     cached at the examples. The same bytes for every email of a deployment."""
-    instructions = _EMAIL_INSTRUCTIONS_V2.format(identity=_identity_v2()) + PROMPT_RULE
-    return system_blocks(instructions, _examples_text(EMAIL_EXAMPLES_V2, _email_text))
+    instructions = _EMAIL_INSTRUCTIONS_V2.format(identity=identity_v2()) + PROMPT_RULE
+    return system_blocks(instructions, examples_text(EMAIL_EXAMPLES_V2, _email_text, "email"))
 
 
 def build_email_request_v2(email: dict[str, Any]) -> Request:

@@ -140,9 +140,11 @@ def _plant(repo: Path, files: dict[str, str]) -> str:
     return _git(repo, "rev-parse", "--short", "HEAD")
 
 
-def _run(repo: Path, mode: str = "ci", denylist: Path | None = None):
+def _run(repo: Path, mode: str = "ci", denylist: Path | None = None, bin_dir: Path | None = None):
     env = {k: v for k, v in os.environ.items() if k not in ("CI", "GITHUB_ACTIONS")}
     env["PII_DENYLIST"] = str(denylist or repo.parent / "absent.conf")
+    if bin_dir:
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
     return subprocess.run(
         ["bash", "scripts/pii-gauntlet.sh", f"--mode={mode}"],
         cwd=repo,
@@ -213,3 +215,20 @@ def test_the_shapes_run_in_every_mode(repo, tmp_path, mode):
     assert f"FAIL [{CARD}]" in result.stdout
     if mode == "history":
         assert planted in result.stdout
+
+
+def test_a_filter_that_cannot_run_reports_every_candidate_instead_of_none(repo, tmp_path):
+    """An awk that rejects the program prints nothing and exits non-zero, which
+    would clear every candidate line: the check would print OK having decided
+    nothing. When the filter fails, every candidate counts as a hit."""
+    fake = tmp_path / "bin" / "awk"
+    fake.parent.mkdir()
+    real = shutil.which("awk")
+    fake.write_text(f'#!/bin/sh\ncase "$1" in *scan_runs*) exit 2 ;; esac\nexec {real} "$@"\n')
+    fake.chmod(0o755)
+    _plant(repo, {"card.txt": f"pan {not_luhn(VISA)}"})
+
+    result = _run(repo, bin_dir=fake.parent)
+
+    assert result.returncode == 1, result.stdout
+    assert "card.txt:2" in _failures(result.stdout).get(CARD, [])

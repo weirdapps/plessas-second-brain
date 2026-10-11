@@ -540,11 +540,16 @@ check_shape() {
   SHAPE_PLACEHOLDERS=""
 }
 
+# A filter that cannot run prints nothing, which would clear every candidate and
+# pass the check having decided nothing. Fail closed instead: report them all.
 keep_shapes() {
-  local hits="$1"
-  if [ -n "$SHAPE" ] && [ -n "$hits" ]; then
-    printf '%s\n' "$hits" | shape_filter
+  local hits="$1" kept
+  if [ -z "$SHAPE" ] || [ -z "$hits" ]; then
+    printf '%s' "$hits"
+  elif kept=$(printf '%s\n' "$hits" | shape_filter); then
+    printf '%s' "$kept"
   else
+    echo "pii-gauntlet: the $SHAPE filter failed, so every candidate line is reported" >&2
     printf '%s' "$hits"
   fi
 }

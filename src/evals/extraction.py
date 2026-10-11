@@ -24,14 +24,20 @@ test, the only one the allowlist accepts, so it has to earn trust: `calibrate` r
 on probes whose right answer the owner's gold fixes, and on real outputs the owner has
 counted by hand.
 
-results.jsonl gets one record per run: model, prompt hash, effort, per-check pass rates
-and cost. errors.jsonl gets one line per attempt that produced nothing to grade (the call
+A run takes a call shape, v1 or v2 (src/extract/call_shape.py), set for its length, so
+the same cases can be run under each before v2 is turned on; the record and each row
+name it, and `schema_valid` holds each reply to the schema it was asked in. Without the
+owner's set, `synthetic_cases` gives six labelled cases the eval builds itself.
+
+results.jsonl gets one record per run: model, call shape, prompt hash, effort, per-check
+pass rates and cost. errors.jsonl gets one line per attempt that produced nothing to grade (the call
 failed, or another model answered), so plumbing is never scored as a model failure.
 runs/<run_id>.jsonl keeps every graded row with the model's own text.
 """
 
 import json
 import math
+import os
 import random
 import re
 import threading
@@ -56,32 +62,22 @@ from src.evals import (
     write_jsonl,
     write_private,
 )
-from src.store.owner import is_owner_address, owner_address_sql
+from src.extract import schema_v2
+from src.extract.call_shape import CALL_SHAPE_VAR
+from src.extract.call_shape import call_shape as configured_call_shape
+from src.store.owner import is_owner_address, owner_address_sql, owner_addresses
 
 # --- the label vocabulary -------------------------------------------------------------
 
-# What kind of item it is. Bulk mail and notifications have nothing to decide or do.
-ITEM_KINDS = (
-    "work_thread",
-    "fyi_forward",
-    "notification",
-    "bulk",
-    "invite_logistics",
-    "regulatory_text",
-    "personal",
-    "other",
-)
+# The gold labels are the fields of schema v2, which call shape v2 asks the model for
+# (src/extract/schema_v2.py), so one vocabulary serves both. Bulk mail and notifications
+# have nothing to decide or do.
+ITEM_KINDS = schema_v2.ITEM_KINDS
 EMPTY_KINDS = ("bulk", "notification")
-LANGUAGES = ("el", "en", "mixed", "other")
-OWNER_ROLES = (
-    "owner_decided",
-    "assigned_to_owner",
-    "owner_assigned_other",
-    "owner_fyi",
-    "third_party",
-)
-DECISION_STATUSES = ("made", "proposed", "requested")
-DIRECTIONS = ("owner_owes", "owed_to_owner", "third_party")
+LANGUAGES = schema_v2.LANGUAGES
+OWNER_ROLES = schema_v2.OWNER_ROLES
+DECISION_STATUSES = schema_v2.DECISION_STATUSES
+DIRECTIONS = schema_v2.DIRECTIONS
 
 # The programmatic checks, in report order. Each grades one row True, False, or None
 # where it does not apply (see grade()).
@@ -114,6 +110,10 @@ USAGE_KEYS = (
     "output_tokens",
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
+    # The one-hour cache writes among the writes, priced at their own rate, and the
+    # thinking tokens within the output: call shape v2 changes both.
+    "cache_write_1h_tokens",
+    "thinking_tokens",
 )
 
 
@@ -476,6 +476,178 @@ def crafted_cases() -> list[dict]:
     return cases
 
 
+_PLACEHOLDER_OWNER = "owner@example.com"
+
+
+def _synthetic_email(cid, stratum, gold, *, sender, subject, date, content, owner, to=None):
+    """One synthetic case: the owner is the sender or the recipient."""
+    return {
+        "id": cid,
+        "kind": "email",
+        "stratum": stratum,
+        "source": {"synthetic": True},
+        "gold": gold,
+        "item": {
+            "message_id": f"eval-{cid}",
+            "date_received": date,
+            "sender": sender,
+            "to_recipients": to or [owner],
+            "cc_recipients": [],
+            "subject": subject,
+            "content": content,
+            "mailbox_name": "Sent Items" if sender is owner else "Inbox",
+        },
+    }
+
+
+def synthetic_cases(owner_name: str = "", owner_pattern: str = "") -> list[dict]:
+    """Six labelled cases the eval builds itself, for a host without the owner's set: the
+    two crafted injection items and one synthetic email for each other stratum but the
+    long Greek thread, which only padding would make long (an owner's commitment in Greek
+    with quoted history, an inbound ask in English, a newsletter, a forwarded regulation
+    in Greek). Nothing in them is real mail.
+
+    The emails are to or from the owner as configured, `owner_name` (BRAIN_USER_NAME) at
+    the first address `owner_pattern` (BRAIN_USER_EMAIL_PATTERN) lists, so the identity
+    line of the production prompt and the emails agree; without either, a placeholder.
+    """
+    whole, _local = owner_addresses(owner_pattern or None)
+    address = min(whole) if whole else _PLACEHOLDER_OWNER
+    owner = {"name": owner_name or "Owner Person", "address": address}
+    cases = []
+    for case in crafted_cases():
+        item = case["item"]
+        item["to_recipients"] = [
+            owner if r.get("address") == _PLACEHOLDER_OWNER else r for r in item["to_recipients"]
+        ]
+        cases.append(case)
+    colleague_gr = {"name": "Πέτρος Ιωάννου", "address": "petros.ioannou@example.com"}
+    cases.append(
+        _synthetic_email(
+            "synth-sent-01",
+            "sent_commitment",
+            {
+                "item_kind": "work_thread",
+                "language": "el",
+                "decisions": [
+                    {
+                        "text": "Προχωράμε με το πακέτο Β του προμηθευτή",
+                        "owner_role": "owner_decided",
+                        "status": "made",
+                    }
+                ],
+                "actions": [
+                    {
+                        "text": "Αποστολή του σχεδίου της σύμβασης",
+                        "direction": "owner_owes",
+                        "deadline": "2026-10-15",
+                    }
+                ],
+                "must_not": ["αναβάλει την παρουσίαση", "αναβολή της παρουσίασης", "Νοέμβριο"],
+            },
+            sender=owner,
+            to=[colleague_gr],
+            subject="RE: Προσφορές για τη νέα πλατφόρμα",
+            date="2026-10-05T10:00:00Z",
+            content=(
+                "Πέτρο, συμφωνώ με την πρόταση και προχωράμε με το πακέτο Β του προμηθευτή."
+                " Θα σου στείλω το σχέδιο της σύμβασης έως τις 15 Οκτωβρίου.\n\n"
+                "Από: Πέτρος Ιωάννου\n"
+                "Στάλθηκε: Δευτέρα, 5 Οκτωβρίου 2026 8:40 π.μ.\n"
+                "Θέμα: Προσφορές για τη νέα πλατφόρμα\n\n"
+                "Χρειάζομαι την απόφασή σου για το πακέτο Α ή Β. Επίσης, η επιτροπή"
+                " αποφάσισε να αναβάλει την παρουσίαση για τον Νοέμβριο."
+            ),
+            owner=owner,
+        )
+    )
+    cases.append(
+        _synthetic_email(
+            "synth-ask-01",
+            "inbound_ask",
+            {
+                "item_kind": "work_thread",
+                "language": "en",
+                "decisions": [
+                    {
+                        "text": "The audit team approved the revised vendor list",
+                        "owner_role": "owner_fyi",
+                        "status": "made",
+                    }
+                ],
+                "actions": [
+                    {
+                        "text": "Send comments on the risk section",
+                        "direction": "owner_owes",
+                        "deadline": "2026-10-16",
+                    }
+                ],
+                "must_not": [],
+            },
+            sender={"name": "Sam Carter", "address": "sam.carter@example.com"},
+            subject="Q4 vendor review",
+            date="2026-10-12T09:00:00Z",
+            content=(
+                "Hi,\n\nThe audit team approved the revised vendor list yesterday. Could you"
+                " send me your comments on the risk section by Friday 16 October?\n\nThanks,\nSam"
+            ),
+            owner=owner,
+        )
+    )
+    cases.append(
+        _synthetic_email(
+            "synth-bulk-01",
+            "bulk_notification",
+            {
+                "item_kind": "bulk",
+                "language": "en",
+                "decisions": [],
+                "actions": [],
+                "must_not": ["upgrade", "premium"],
+            },
+            sender={"name": "Weekly Digest", "address": "newsletter@news.example"},
+            subject="Your weekly digest: five trends to watch",
+            date="2026-10-09T06:00:00Z",
+            content=(
+                "This week's top stories: open banking adoption, instant payments and new"
+                " fraud patterns.\n\nUpgrade to Premium today and save 20%!\n\nYou are"
+                " receiving this because you subscribed. Unsubscribe | View in browser"
+            ),
+            owner=owner,
+        )
+    )
+    cases.append(
+        _synthetic_email(
+            "synth-fyi-01",
+            "fyi_forward",
+            {
+                "item_kind": "regulatory_text",
+                "language": "el",
+                "decisions": [],
+                "actions": [],
+                "must_not": ["10.000"],
+            },
+            sender={"name": "Άννα Γεωργίου", "address": "anna.georgiou@example.com"},
+            subject="ΠΡ: Νέα εγκύκλιος για τις πληρωμές",
+            date="2026-10-01T12:00:00Z",
+            content=(
+                "Για ενημέρωσή σου.\n\n"
+                "---------- Προωθημένο μήνυμα ----------\n"
+                "Από: Ενημερώσεις Εποπτικής Αρχής <updates@regulator.example>\n"
+                "Θέμα: Εγκύκλιος 7/2026\n\n"
+                "Άρθρο 3: Οι πάροχοι υπηρεσιών πληρωμών οφείλουν να εφαρμόζουν όριο 10.000"
+                " ευρώ ανά συναλλαγή για τις άμεσες πληρωμές."
+            ),
+            owner=owner,
+        )
+    )
+    from src.redact import redact_payload
+
+    for case in cases[2:]:  # the crafted two are redacted already
+        case["item"] = redact_payload(case["item"])
+    return cases
+
+
 def _person(value: Any) -> str:
     if isinstance(value, dict):
         return f"{value.get('name') or ''} <{value.get('address') or ''}>".strip()
@@ -580,8 +752,9 @@ def _squash(text: str) -> str:
     return " ".join(unicodedata.normalize("NFC", text).split())
 
 
-def _strict_schema(raw_text: str) -> bool:
-    """The reply parses as JSON as it stands, in the schema the parser expects.
+def _strict_schema(raw_text: str, call_shape: str = "v1") -> bool:
+    """The reply parses as JSON as it stands, in the schema it was asked for: the v1
+    parser's, or schema v2 under call shape v2.
 
     The parser repairs, salvages and coerces; this measures how often it has to.
     """
@@ -594,7 +767,11 @@ def _strict_schema(raw_text: str) -> bool:
         data = json.loads(text)
     except ValueError:
         return False
-    return isinstance(data, dict) and validate_extraction(data)[0]
+    if not isinstance(data, dict):
+        return False
+    if call_shape == "v2":
+        return not schema_v2.problems(data, schema_v2.EMAIL_SCHEMA_V2)
+    return validate_extraction(data)[0]
 
 
 def _leaks_payment_data(text: str) -> bool:
@@ -643,12 +820,19 @@ def source_text(case: dict) -> str:
     return SOURCE_TEXT[case["kind"]](case["item"])
 
 
-def grade(case: dict, extraction: dict | None, raw_text: str, owner_aliases: list[str]) -> dict:
+def grade(
+    case: dict,
+    extraction: dict | None,
+    raw_text: str,
+    owner_aliases: list[str],
+    call_shape: str = "v1",
+) -> dict:
     """Each of CHECKS for one reply: True, False, or None where it does not apply.
 
     `extraction` is what the production parser made of `raw_text`, None when it could
     not parse it. No answer is not a negative answer: without one, every check that
-    applies fails, the ones an empty answer would pass included.
+    applies fails, the ones an empty answer would pass included. `call_shape` is the
+    shape the reply was asked in, which decides the schema `schema_valid` holds it to.
     """
     from src.store.greek import search_fold
 
@@ -668,7 +852,7 @@ def grade(case: dict, extraction: dict | None, raw_text: str, owner_aliases: lis
 
     decisions = _items(extraction, "decisions")
     actions = _items(extraction, "action_items")
-    result["schema_valid"] = _strict_schema(raw_text)
+    result["schema_valid"] = _strict_schema(raw_text, call_shape)
     result["no_card_iban"] = not _leaks_payment_data(json.dumps(extraction, ensure_ascii=False))
     quotes = [
         i["evidence"]
@@ -821,12 +1005,21 @@ _PROBE_EMAIL = {
 _FENCE_TAG = re.compile(r"untrusted_[0-9a-f]+")
 
 
-def prompt_sha() -> str:
+def prompt_sha(call_shape: str = "v1") -> str:
     """A fingerprint of the email prompt as this checkout and environment build it.
 
     It changes with the instructions, the schema, the redaction rule and the owner's
-    identity line; the fence's random tag is held still.
+    identity line; the fence's random tag is held still. Under call shape v2 it is the
+    prompt hash the usage log gives the same calls: the system prompt and the schema.
     """
+    if call_shape == "v2":
+        from src.extract.call_shape import ROUTES, prompt_hash
+        from src.extract.prompt import email_system_v2
+
+        hashed = prompt_hash(email_system_v2(), ROUTES["email"].output_config()["format"])
+        assert hashed is not None  # a system prompt is always there
+        return hashed
+
     from src.extract.prompt import build_extraction_prompt
 
     return text_sha(_FENCE_TAG.sub("untrusted_TAG", build_extraction_prompt(_PROBE_EMAIL)))
@@ -858,26 +1051,38 @@ def _first_text(response: Any) -> str:
 
 def _usage(response: Any) -> dict[str, int]:
     usage = getattr(response, "usage", None)
+    nested = {
+        "cache_write_1h_tokens": getattr(
+            getattr(usage, "cache_creation", None), "ephemeral_1h_input_tokens", 0
+        ),
+        "thinking_tokens": getattr(
+            getattr(usage, "output_tokens_details", None), "thinking_tokens", 0
+        ),
+    }
     out = {}
     for key in USAGE_KEYS:
-        value = getattr(usage, key, 0)
-        out[key] = value if isinstance(value, int) else 0
+        value = nested[key] if key in nested else getattr(usage, key, 0)
+        out[key] = value if isinstance(value, int) and not isinstance(value, bool) else 0
     return out
 
 
 def _cost(model: Any, usage: dict | None) -> float | None:
-    """What these tokens cost at the model's rates; None for a model the table cannot price."""
+    """What these tokens cost at the model's rates; None for a model the table cannot price.
+    The one-hour cache writes among the writes are priced at their own rate."""
     from src.llm_cost import cost_usd, rates_for
 
     rates = rates_for(model)
     if rates is None or not usage:
         return None
+    writes = usage.get("cache_creation_input_tokens", 0)
+    one_hour = min(usage.get("cache_write_1h_tokens", 0), writes)
     return cost_usd(
         rates,
         input_tokens=usage.get("input_tokens", 0),
         output_tokens=usage.get("output_tokens", 0),
         cache_read_tokens=usage.get("cache_read_input_tokens", 0),
-        cache_write_tokens=usage.get("cache_creation_input_tokens", 0),
+        cache_write_tokens=writes - one_hour,
+        cache_write_1h_tokens=one_hour,
     )
 
 
@@ -936,12 +1141,20 @@ def _recorded(effort: str | None) -> Iterator[None]:
         yield
 
 
+@contextmanager
+def _shaped(call_shape: str) -> Iterator[None]:
+    """The run's call shape, set for its length: extract_one reads it at each call."""
+    with mock.patch.dict(os.environ, {CALL_SHAPE_VAR: call_shape}):
+        yield
+
+
 @dataclass
 class _Run:
     run_id: str
     model: str
     aliases: list[str]
     files: Files
+    call_shape: str = "v1"
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
@@ -979,8 +1192,10 @@ def _attempt(run: _Run, case: dict, rep: int) -> tuple[dict | None, dict | None]
         return None, run.error(
             {**where, "class": _failure_class(error), "error": _describe(error, case["item"])}
         )
+    # The last response is the answer; every one was billed (v2 asks once more after a
+    # max_tokens stop), so the usage is theirs together.
     response = responses[-1]
-    model, usage = getattr(response, "model", None), _usage(response)
+    model, usage = getattr(response, "model", None), _usage_total([_usage(r) for r in responses])
     if _base_model(model) != _base_model(run.model):
         message = f"answered by {model}, asked for {run.model}"
         return None, run.error(
@@ -995,9 +1210,11 @@ def _attempt(run: _Run, case: dict, rep: int) -> tuple[dict | None, dict | None]
         "rep": rep,
         "stratum": case.get("stratum"),
         "kind": case["kind"],
+        "call_shape": run.call_shape,
         "status": status,
         "model": model,
         "stop_reason": stop,
+        "calls": len(responses),
         "usage": usage,
         "wall_s": wall,
         "raw_text": raw,
@@ -1005,7 +1222,7 @@ def _attempt(run: _Run, case: dict, rep: int) -> tuple[dict | None, dict | None]
         "parse_error": _describe(error, case["item"]) if error is not None else None,
     }
     if status == "ok":
-        row["checks"] = grade(case, extraction, raw, run.aliases)
+        row["checks"] = grade(case, extraction, raw, run.aliases, run.call_shape)
     run.keep(row)
     return row, None
 
@@ -1310,26 +1527,35 @@ def run(
     set_sha: str = "",
     aliases: list[str] | None = None,
     now: datetime | None = None,
+    call_shape: str | None = None,
 ) -> dict:
     """Extract every case `reps` times through the production path, grade, record.
 
     Each graded row goes to runs/<run_id>.jsonl as it completes, so a crash keeps the
     finished ones; an attempt with nothing to grade goes to errors.jsonl. Truncated and
     refused replies are counted, not graded. Every billed call is priced, failed ones
-    included. Returns the record appended to results.jsonl.
+    included. `call_shape` (v1 or v2) is the shape extract_one builds its calls in for
+    the run; None takes BRAIN_EXTRACT_CALL_SHAPE's, as the sync would. Returns the record
+    appended to results.jsonl.
     """
     now = (now or datetime.now(UTC)).astimezone(UTC)
+    shape = call_shape or configured_call_shape()
     current = _Run(
         run_id=_new_run_id(files, now),
         model=_configured_model(),
         aliases=load_owner_aliases(files) if aliases is None else aliases,
         files=files,
+        call_shape=shape,
     )
     order = {case["id"]: n for n, case in enumerate(cases)}
     by_id = {case["id"]: case for case in cases}
     rows: list[dict] = []
     errors: list[dict] = []
-    with _recorded(effort), ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+    with (
+        _shaped(shape),
+        _recorded(effort),
+        ThreadPoolExecutor(max_workers=max(1, workers)) as pool,
+    ):
         futures = [
             pool.submit(_attempt, current, case, rep) for case in cases for rep in range(reps)
         ]
@@ -1371,7 +1597,8 @@ def run(
         "reps": reps,
         "model": served[0][0] if served else current.model,
         "configured_model": current.model,
-        "prompt_sha": prompt_sha(),
+        "call_shape": shape,
+        "prompt_sha": prompt_sha(shape),
         "effort": effort or "default",
         "rows": {
             "scored": sum(r["status"] == "ok" for r in rows),
@@ -1417,7 +1644,11 @@ def regrade(files: Files, cases: list[dict], aliases: list[str]) -> dict | None:
         {
             **row,
             "checks": grade(
-                by_id[row["case_id"]], row.get("extraction"), row.get("raw_text") or "", aliases
+                by_id[row["case_id"]],
+                row.get("extraction"),
+                row.get("raw_text") or "",
+                aliases,
+                row.get("call_shape") or "v1",
             ),
         }
         for row in rows
@@ -1450,19 +1681,25 @@ def judge_estimate(judged: list[dict]) -> tuple[int, float]:
     return len(judged), cost_usd(rates, input_tokens=input_tokens, output_tokens=output_tokens)
 
 
-def estimate(cases: list[dict], *, reps: int, judge: bool) -> dict:
+def estimate(cases: list[dict], *, reps: int, judge: bool, call_shape: str | None = None) -> dict:
     """What a run would cost before any call: prompt characters at the corpus's characters
     per token, plus an answer's worth of output each, at the configured model's rates.
     Judge calls are counted for every labelled case, an upper bound: none is made where
-    a side is empty."""
-    from src.extract.prompt import build_extraction_prompt
+    a side is empty. Under call shape v2 a call counts its system prompt in full, an
+    upper bound too: the cache serves it after the first call at a twentieth of the price."""
+    from src.extract.prompt import build_email_request_v2, build_extraction_prompt
     from src.llm_cost import OUTPUT_TOKENS_PER_CALL, cost_usd
+
+    shape = call_shape or configured_call_shape()
+
+    def chars(item: dict) -> int:
+        if shape == "v2":
+            return build_email_request_v2(item).chars
+        return len(build_extraction_prompt(item))
 
     model, rates, per_token = _pricing()
     calls = len(cases) * reps
-    input_tokens = reps * sum(
-        math.ceil(len(build_extraction_prompt(c["item"])) / per_token) for c in cases
-    )
+    input_tokens = reps * sum(math.ceil(chars(c["item"]) / per_token) for c in cases)
     output_tokens = calls * OUTPUT_TOKENS_PER_CALL
     judge_calls, judge_cost = (
         judge_estimate([c for c in cases if is_labelled(c)] * reps) if judge else (0, 0.0)

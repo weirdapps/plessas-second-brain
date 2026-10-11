@@ -277,11 +277,11 @@ LANGUAGE
 ITEM KIND
 item_kind says what the email is:
 - work_thread: people working on something: asking, deciding, reporting or agreeing, including a forward that asks something.
-- fyi_forward: forwarded or copied for information, asking nothing of the owner.
+- fyi_forward: forwarded or copied for information, asking nothing of the owner, and not the text of a regulation.
 - notification: an automated message from a system, such as an alert, a receipt, or a workflow or delivery notice.
 - bulk: a newsletter, marketing or another mass mailing.
 - invite_logistics: arranging a meeting: times, rooms, dial-in details.
-- regulatory_text: the text of a law, regulation, circular or standard, sent or forwarded as it is.
+- regulatory_text: the text of a law, regulation, circular or standard, sent or forwarded with no request of its own.
 - personal: private life rather than work.
 - other: none of these.
 Bulk mail, notifications and invite logistics normally have no decisions and no action items.

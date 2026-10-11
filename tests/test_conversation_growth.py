@@ -56,7 +56,7 @@ def test_a_loaded_conversation_that_went_on_is_staged_again(tmp_path, monkeypatc
         loaded={"grew": loaded_at_ten, "same": loaded_at_ten, "later": loaded_at_ten}
     )
 
-    staged = json.loads(Path(result["batch_file"]).read_text())["conversations"]
+    staged = [c for p in result["staged"] for c in json.loads(Path(p).read_text())["conversations"]]
     by_id = {c["session_id"]: c for c in staged}
     assert set(by_id) == {"grew", "new"}
     assert by_id["grew"]["regrown_from"] == "2026-09-01T10:00:00Z"  # what was loaded

@@ -123,8 +123,8 @@ MODEL_UNUSABLE_ALARM = 3
 
 # Observed span for the stages that have no budget of their own: load,
 # registration (count-bounded), people dedup, and the incremental embeddings
-# update (about 10 s), made twice when Step 7 loads conversations, and each
-# rewrites the whole index. Mail fetch is SYNC_WRAPPER_FETCH_OBSERVED_S above.
+# update (about 10 s), made once at the end of the run (Step 9), which rewrites
+# the whole index. Mail fetch is SYNC_WRAPPER_FETCH_OBSERVED_S above.
 SYNC_FIXED_WORK_S = 80.0
 
 # What the stages after Step 2 need, held back from the unit's remaining time.
@@ -1562,8 +1562,10 @@ def cmd_export_conversations(args):
     if result["agents"]:
         print(f"Agent sessions left out: {result['agents']} (--include-agents keeps them)")
     print(f"Errors: {result['errors']}")
-    if result["batch_file"]:
-        print(f"Batch file: {result['batch_file']}")
+    if result["pending"]:
+        print(f"Staged before, not loaded yet: {result['pending']}")
+    if result["staged"]:
+        print(f"Staged {len(result['staged'])} files in {Path(result['staged'][0]).parent}")
 
 
 def cmd_extract_conversations(args):
@@ -2025,6 +2027,8 @@ def cmd_sync(args):
             conn.close()
             return
 
+    # Where the mail this run loads starts, so Step 3b finds the directories of what it loads.
+    last_email_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM emails").fetchone()[0]
     conn.close()
 
     # Step 1: sync stages no mail. `python -m src.export.outlook_export` does,
@@ -2076,7 +2080,11 @@ def cmd_sync(args):
 
     extracted_dir = DATA_ROOT / "extracted"
     staging_dir = DATA_ROOT / "staging"
-    count = load_extractions(db_path, str(extracted_dir), str(staging_dir))
+    # The people rows this load adds or changes, which Step 4 takes.
+    touched_people: set[int] = set()
+    count = load_extractions(
+        db_path, str(extracted_dir), str(staging_dir), touched_people=touched_people
+    )
     print(f"Loaded {count} new emails")
 
     # Step 3b: record the attachments outlook-cli downloaded with the mail.
@@ -2089,16 +2097,22 @@ def cmd_sync(args):
         print("\nStep 3b: Registering attachments outlook-cli downloaded...")
         from datetime import UTC, timedelta
 
-        from src.export.outlook_attachments import register_downloaded_attachments
+        from src.export.outlook_attachments import register_new_downloads
 
         window_start = (
             datetime.now(UTC) - timedelta(hours=ATTACHMENT_REGISTER_WINDOW_H)
         ).isoformat()
         conn_reg = get_conn(db_path)
         try:
-            reg = register_downloaded_attachments(
+            # The directories written since the last complete scan, and those of the mail
+            # this run loaded, not every directory: the nightly pass walks them all.
+            loaded_mail = conn_reg.execute(
+                "SELECT message_id FROM emails WHERE id > ?", (last_email_id,)
+            ).fetchall()
+            reg = register_new_downloads(
                 conn_reg,
                 ATTACHMENTS_DIR,
+                [str(row[0]) for row in loaded_mail],
                 limit=ATTACHMENT_REGISTER_LIMIT,
                 since=window_start,
             )
@@ -2109,25 +2123,21 @@ def cmd_sync(args):
             f" ({reg['deferred']} awaiting their email)"
         )
 
-    # Step 4: Deduplicate people
-    if count > 0:
-        print("\nStep 4: Deduplicating people...")
+    # Step 4: Deduplicate people: the groups of the rows this load added or changed, and of
+    # any added since the last pass (src/store/dedup_people.py run_dedup), not every person.
+    # --full-dedup takes the whole table, and runs whether or not mail loaded.
+    full_dedup = bool(getattr(args, "full_dedup", False))
+    if count > 0 or full_dedup:
+        print("\nStep 4: Deduplicating people" + (" (whole table)" if full_dedup else "") + "...")
         from src.store.dedup_people import run_dedup
 
-        dedup_result = run_dedup(db_path=db_path)
+        dedup_result = run_dedup(db_path=db_path, touched=None if full_dedup else touched_people)
         reduced = dedup_result.get("total_reduced", 0)
         print(f"Dedup: {reduced} duplicates merged")
-
-        # Step 5: Update embeddings for new emails
-        print("\nStep 5: Updating embeddings...")
-        from src.store.embeddings import build_index
-
-        conn_embed = get_conn(db_path)
-        build_index(conn_embed)
-        conn_embed.close()
-        print("Embeddings updated")
     else:
-        print("\nNo new emails — skipping dedup and embeddings")
+        print("\nNo new emails — skipping dedup")
+
+    # Step 5, the embeddings, waits for the end of the run: Step 9.
 
     # Step 6: Process new attachment content
     from src.extract.attachment_pipeline import (
@@ -2194,48 +2204,45 @@ def cmd_sync(args):
     elif not (p1_stats.get("processed", 0) or deferred or heavy):
         print("  No new attachments to process")
 
-    # Step 7: Sync conversations from Claude Code sessions
+    # Step 7: Sync conversations from Claude Code sessions. --skip-conversations leaves it
+    # out; no scheduled unit passes it.
     print("\nStep 7: Syncing Claude Code conversations...")
-    from src.export.conversation_export import export_conversations
-    from src.store.loader import load_conversations as load_convs
-
-    conn_conv = get_conn(db_path)
-    run_mig(conn_conv)
-    loaded = {
-        r["session_id"]: (r["ended_at"], r["turn_count"])
-        for r in conn_conv.execute("SELECT session_id, ended_at, turn_count FROM conversations")
-    }
-    conn_conv.close()
-
-    conv_export = export_conversations(days=7, loaded=loaded)
-    if conv_export["exported"] > 0:
-        print(f"  Exported {conv_export['exported']} new or grown conversations")
-        from src.extract.local import run_conversation_extraction
-
-        run_conversation_extraction(deadline_s=CONVERSATION_SYNC_DEADLINE_S)
-        if stop_requested():  # as after Step 2
-            print(
-                "Stop requested during conversation extraction; the later steps did not run",
-                file=sys.stderr,
-            )
-            return 143
-        conv_loaded = load_convs(db_path)
-        print(f"  Loaded {conv_loaded} conversations")
-        if conv_loaded:
-            # Their vectors now, not at the next sync with new mail (Step 5 ran
-            # before them): a session loaded again has a new id, which semantic
-            # search cannot find until it has one.
-            from src.store.embeddings import build_index
-
-            conn_embed = get_conn(db_path)
-            try:
-                build_index(conn_embed)
-            except Exception as e:  # the next sync embeds what this one could not
-                print(f"  Embedding the conversations failed: {e}", file=sys.stderr)
-            finally:
-                conn_embed.close()
+    conv_loaded = 0
+    if getattr(args, "skip_conversations", False):
+        print("  Skipped (--skip-conversations)")
     else:
-        print("  No new conversations to sync")
+        from src.export.conversation_export import export_conversations
+        from src.store.loader import load_conversations as load_convs
+
+        conn_conv = get_conn(db_path)
+        run_mig(conn_conv)
+        loaded = {
+            r["session_id"]: (r["ended_at"], r["turn_count"])
+            for r in conn_conv.execute("SELECT session_id, ended_at, turn_count FROM conversations")
+        }
+        conn_conv.close()
+
+        conv_export = export_conversations(days=7, loaded=loaded)
+        # Staged before and not loaded yet: the export no longer stages those again, and
+        # one sb-conversation-sync extracted waits for a load here.
+        waiting = conv_export.get("pending", 0)
+        if conv_export["exported"] > 0 or waiting > 0:
+            print(f"  Exported {conv_export['exported']} new or grown conversations")
+            if waiting:
+                print(f"  {waiting} staged before and not loaded yet")
+            from src.extract.local import run_conversation_extraction
+
+            run_conversation_extraction(deadline_s=CONVERSATION_SYNC_DEADLINE_S)
+            if stop_requested():  # as after Step 2
+                print(
+                    "Stop requested during conversation extraction; the later steps did not run",
+                    file=sys.stderr,
+                )
+                return 143
+            conv_loaded = load_convs(db_path)
+            print(f"  Loaded {conv_loaded} conversations")
+        else:
+            print("  No new conversations to sync")
 
     # Step 8: Classify new inline images (Stage 1 heuristic + Stage 3 vision LLM)
     print("\nStep 8: Classifying new inline images...")
@@ -2282,6 +2289,31 @@ def cmd_sync(args):
             print("  No unclassified images")
     except Exception as e:
         print(f"  Image classification skipped: {e}")
+
+    # Step 9: one embedding pass for everything this run stored: the mail of Step 3, the
+    # attachment summaries of Step 6, the conversations of Step 7 (one loaded again has a new
+    # id, which semantic search cannot find until it has a vector) and the image descriptions
+    # of Step 8. Step 5 embedded after Step 4, and Step 7 again when it loaded conversations,
+    # and each pass loads and rewrites the whole index (embeddings.npz, 1.7 GB on the
+    # producer): an hourly run saved it twice to load one email, at its 6 GB MemoryMax. Taken
+    # when mail or conversations loaded, as those two were; a run stopped before it leaves
+    # its vectors to the next run's pass.
+    if count > 0 or conv_loaded:
+        print("\nStep 9: Updating embeddings...")
+        from src.store.embeddings import build_index
+
+        conn_embed = get_conn(db_path)
+        try:
+            build_index(conn_embed)
+            print("Embeddings updated")
+        except Exception as e:
+            # A run that loaded mail fails here, as Step 5 did. One that loaded only
+            # conversations goes on, as Step 7 did, and the next pass embeds them.
+            if count > 0:
+                raise
+            print(f"  Embedding the conversations failed: {e}", file=sys.stderr)
+        finally:
+            conn_embed.close()
 
     # Update sync metadata
     conn = get_conn(db_path)
@@ -4088,6 +4120,18 @@ def main():
         metavar="SECONDS",
         help="If another sync is running, wait up to this long for it, then skip "
         "with exit 0 (default: 0, skip at once)",
+    )
+    parser_sync.add_argument(
+        "--skip-conversations",
+        action="store_true",
+        help="Leave out Step 7, the Claude Code conversations (no scheduled unit passes it)",
+    )
+    parser_sync.add_argument(
+        "--full-dedup",
+        action="store_true",
+        help="Deduplicate the whole people table, not only the groups of the people this "
+        "run's load wrote, and do it even when no mail loaded (a whole pass also runs on its "
+        "own once a day)",
     )
     parser_sync.set_defaults(func=cmd_sync)
 

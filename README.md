@@ -425,8 +425,12 @@ In any Claude Code session, ask "what do we know about X" and the agent calls `r
 ```bash
 # Incremental sync over what `python -m src.export.outlook_export` staged: extract, load,
 # register+process attachments, dedup people, embed, Claude Code conversations, inline
-# images. Not Teams, calendar, news, SharePoint.
+# images. Not Teams, calendar, news, SharePoint. A run reads what it brought: the people
+# dedup takes the groups of the people it loaded (the whole table once a day), registration
+# the attachment directories written since its last scan, and the index is saved once.
 python -m src.cli sync --engine claude --workers 4
+python -m src.cli sync --skip-conversations   # Claude Code conversations (Step 7) left out; no scheduled unit passes it
+python -m src.cli sync --full-dedup           # the people dedup over the whole table, even with no new mail
 
 # Ingestion by source
 python -m src.cli calendar-sync --since 2026-01-01

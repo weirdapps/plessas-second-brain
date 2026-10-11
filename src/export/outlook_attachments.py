@@ -9,7 +9,9 @@ For each attachment in a message:
 
 import logging
 import mimetypes
+import os
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +35,14 @@ REFERENCE_ATTACHMENT = "#Microsoft.OutlookServices.ReferenceAttachment"
 # seconds, and the nightly bulk pass closes anything the hourly window skipped.
 # A week is pure headroom over both.
 ORPHAN_GRACE_DAYS = 7
+
+# sync_metadata row: when the last complete hourly scan of the attachments tree began, in
+# nanoseconds since the epoch (register_new_downloads).
+SCAN_STAMP_KEY = "attachment_scan_started_ns"
+
+# A directory last written this long before that scan began is scanned again, so neither a
+# file system that keeps mtimes to the second nor a small clock step can hide one.
+SCAN_SLACK_NS = 600 * 10**9
 
 
 def is_abandoned_orphan(msg_dir: Path, grace_days: float = ORPHAN_GRACE_DAYS, now=None) -> bool:
@@ -139,6 +149,7 @@ def register_downloaded_attachments(
     now: str | None = None,
     since: str | None = None,
     grace_days: float = ORPHAN_GRACE_DAYS,
+    only: Iterable[str] | None = None,
 ) -> dict:
     """Record `attachments` rows for files outlook-cli has already downloaded.
 
@@ -172,10 +183,20 @@ def register_downloaded_attachments(
     apart is what lets the health check report an actionable backlog instead of a
     WARN that can never clear. Neither is a refusal: an aged directory still
     registers the moment its email shows up.
+
+    `only` names the message directories to scan, and None scans every one (see
+    register_new_downloads). `limited` says the limit stopped the pass with files left.
     """
     stamp = now or datetime.now().isoformat()
     base_dir = Path(base_dir)
-    stats: dict = {"scanned": 0, "registered": 0, "deferred": 0, "abandoned": 0, "ids": []}
+    stats: dict = {
+        "scanned": 0,
+        "registered": 0,
+        "deferred": 0,
+        "abandoned": 0,
+        "ids": [],
+        "limited": False,
+    }
 
     if not base_dir.is_dir():
         return stats
@@ -204,7 +225,12 @@ def register_downloaded_attachments(
     emails = {str(mid): (mid, eid) for mid, eid in rows}
     aliases = _aliases(conn, since)
 
-    for msg_dir in sorted(base_dir.iterdir()):
+    if only is None:
+        msg_dirs = sorted(base_dir.iterdir())
+    else:
+        # Directory names only: a name that is a path would reach outside the tree.
+        msg_dirs = sorted(base_dir / name for name in set(only) if name and Path(name).name == name)
+    for msg_dir in msg_dirs:
         if not msg_dir.is_dir():
             continue
         stats["scanned"] += 1
@@ -252,6 +278,7 @@ def register_downloaded_attachments(
         for f in files:
             if limit is not None and stats["registered"] >= limit:
                 conn.commit()
+                stats["limited"] = True
                 return stats
             sha256 = sha256_of_file(f)
             if via_alias and sha256 in held:
@@ -286,6 +313,67 @@ def register_downloaded_attachments(
             held.add(sha256)
 
     conn.commit()
+    return stats
+
+
+def changed_message_dirs(base_dir: Path, since_ns: int) -> set[str]:
+    """Names of the message directories under `base_dir` last written at or after
+    `since_ns`. Writing or removing a file in a directory changes its mtime, so these are
+    the directories that may hold a file no scan has seen. One directory listing, and one
+    stat per entry: no directory is opened."""
+    names: set[str] = set()
+    try:
+        entries = os.scandir(base_dir)
+    except OSError:
+        return names
+    with entries:
+        for entry in entries:
+            try:
+                if entry.is_dir() and entry.stat().st_mtime_ns >= since_ns:
+                    names.add(entry.name)
+            except OSError:
+                continue
+    return names
+
+
+def register_new_downloads(
+    conn,
+    base_dir: Path,
+    loaded_message_ids: Iterable[str] = (),
+    *,
+    limit: int | None = None,
+    since: str | None = None,
+) -> dict:
+    """The hourly sync's registration: register_downloaded_attachments over the message
+    directories written since the last complete scan began, and the directories of
+    `loaded_message_ids`, the mail this run loaded (downloaded before its email loaded, one
+    was passed over then as awaiting it).
+
+    It listed every directory and every file in each, 8,970 directories to register the
+    attachments of one email on 2026-10-10. The first scan, with no stamp, still takes them
+    all. A scan the limit cut short keeps the stamp it found, so the next run takes the same
+    directories again; a complete one records when it began. What a scan passes over, the
+    nightly `register-attachments` registers: it walks every directory.
+    """
+    began = time.time_ns()
+    row = conn.execute(
+        "SELECT value FROM sync_metadata WHERE key = ?", (SCAN_STAMP_KEY,)
+    ).fetchone()
+    try:
+        last = int(row[0]) if row else None
+    except (TypeError, ValueError):
+        last = None
+    only = None
+    if last is not None:
+        only = changed_message_dirs(Path(base_dir), last - SCAN_SLACK_NS)
+        only |= {str(message_id) for message_id in loaded_message_ids}
+    stats = register_downloaded_attachments(conn, base_dir, limit=limit, since=since, only=only)
+    if not stats.get("limited"):
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES (?, ?)",
+            (SCAN_STAMP_KEY, str(began)),
+        )
+        conn.commit()
     return stats
 
 

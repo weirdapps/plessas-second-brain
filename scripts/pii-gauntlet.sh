@@ -3,7 +3,8 @@
 #
 # THREE MODES:
 #   --mode=ci      Scan only git-tracked files. Used by GitHub Actions to gate
-#                  pushes. Any hit = FAIL = exit 1.
+#                  pushes. Any hit = FAIL = exit 1. Prints path:line, never the
+#                  matched text: an Actions log on a public repo is public.
 #   --mode=doctor  (default) Scan the entire working tree. Distinguishes tracked
 #                  hits (FAIL — these would ship publicly) from gitignored hits
 #                  (INFO — local-only, never pushed). Exit 1 only on tracked hits.
@@ -129,10 +130,22 @@ if [ "$MODE" = "history" ]; then
       PR_HEADS_UNSCANNED=1
     fi
   fi
-  git -c core.quotePath=false log --all -p -U0 --no-color --no-ext-diff \
-    --format='commit %h' > "$HISTORY_ALL"
+  # Count what the run covers, so a PASS over no pull-request heads cannot pass
+  # for a PASS over all of them.
+  if [ "$PR_HEADS_UNSCANNED" -eq 1 ]; then
+    echo "Pull-request heads scanned: none (the fetch from origin failed)"
+  elif git remote get-url origin >/dev/null 2>&1; then
+    echo "Pull-request heads scanned: $(git for-each-ref --format='%(refname)' refs/gauntlet-pr/ | wc -l | tr -d ' ')"
+  else
+    echo "Pull-request heads scanned: 0 (no origin remote)"
+  fi
+  echo
+  # A licence names its author by design; ci and doctor mode skip it too.
+  NOT_LICENCE=(':(exclude,glob)**/LICENSE' ':(exclude,glob)**/LICENSE.md' ':(exclude,glob)**/LICENSE.txt')
   git -c core.quotePath=false log --all --full-history -p -U0 --no-color --no-ext-diff \
-    --format='commit %h' -- . ':(exclude,glob)**/pii-gauntlet.sh' > "$HISTORY_NOSELF"
+    --format='commit %h' -- . "${NOT_LICENCE[@]}" > "$HISTORY_ALL"
+  git -c core.quotePath=false log --all --full-history -p -U0 --no-color --no-ext-diff \
+    --format='commit %h' -- . ':(exclude,glob)**/pii-gauntlet.sh' "${NOT_LICENCE[@]}" > "$HISTORY_NOSELF"
   git -c core.quotePath=false log --all --diff-filter=AR --name-only \
     --format='commit %h' > "$HISTORY_NAMES"
   HISTORY_SRC="$HISTORY_NOSELF"
@@ -149,12 +162,24 @@ fi
 # invalid bytes rather than the line: a UTF-8 grep silently skips any line that
 # carries one, which hid every line of a legacy cp1253 or Latin-1 file. grep
 # keeps the caller's locale, which the Greek checks below were measured under.
+#
+# A line holding a regex escape is also emitted with the escapes removed, after a
+# tab on the same line, so a published regex is checked as the value it encodes.
+# The old inline denylist published its entries that way, dots escaped, and a
+# pattern for the value never matched its escaped spelling: history mode printed
+# OK for an address that was in the published text. One line either way, so the
+# count stays one per added line.
 scan_history() {
   local pattern="$1"
   LC_ALL=C awk '/^commit [0-9a-f]+$/ { c = $2; hunk = 0; next }
        /^diff --git / { hunk = 0; next }
        /^@@ / { hunk = 1; next }
-       hunk && /^\+/ { print c ":" substr($0, 2) }' "$HISTORY_SRC" \
+       hunk && /^\+/ {
+         l = substr($0, 2); u = l
+         if (index(u, "\\")) { gsub(/\\[.]/, ".", u); gsub(/\\-/, "-", u); gsub(/\\[+]/, "+", u); gsub(/\\@/, "@", u) }
+         if (u != l) l = l "\t" u
+         print c ":" l
+       }' "$HISTORY_SRC" \
     | iconv -f UTF-8 -t UTF-8 -c \
     | grep -${CASE_FLAG}E "$pattern" 2>/dev/null || true
   LC_ALL=C awk '/^commit [0-9a-f]+$/ { c = $2; next } NF { print c "\t" $0 }' "$HISTORY_NAMES" \
@@ -258,9 +283,20 @@ scan_ci() {
   # -i, matching scan_doctor above. Without it the GATE was case-sensitive
   # while the local doctor was not, so the check that blocks a push was the
   # weaker of the two, which is backwards.
+  # -H: xargs can hand the last grep a single file, and grep then drops the
+  # filename, so the hit would have no path to report.
   if [ -s "$TRACKED_TMP" ]; then
-    tr '\n' '\0' < "$TRACKED_TMP" | xargs -0 grep -${CASE_FLAG}nE --binary-files=without-match "$pattern" 2>/dev/null || true
+    tr '\n' '\0' < "$TRACKED_TMP" | xargs -0 grep -${CASE_FLAG}nHE --binary-files=without-match "$pattern" 2>/dev/null || true
   fi
+}
+
+# path:line for a CI-mode hit, never the text. The matched text is what a hit
+# says must not be published, and printing it into a public Actions log is
+# publishing it again. A filename hit is already its own location.
+hit_locations() {
+  LC_ALL=C awk '/:\(filename\)$/ { print; next }
+    match($0, /:[0-9]+:/) { print substr($0, 1, RSTART + RLENGTH - 2); next }
+    { print "(location withheld)" }'
 }
 
 # Drop hits that are documentation rather than live configuration.
@@ -302,6 +338,217 @@ apply_exclusion() {
   printf '%s' "$hits"
 }
 
+# A pattern grep cannot compile makes it exit 2, the error goes to /dev/null
+# with every other grep error here, and the check prints OK having searched for
+# nothing. GNU grep on a runner and BSD grep on a Mac do not accept the same
+# patterns, so the private denylist is exactly where that would first happen.
+pattern_compiles() {
+  printf '' | grep -E -e "$1" >/dev/null 2>&1
+  [ $? -ne 2 ]
+}
+
+# The shape checks. grep finds the lines that LOOK like a phone number, an IBAN,
+# a card number, an IPv4 address or a tailnet host; this keeps a line only if it
+# holds a value of that kind that is real: it passes the kind's own test (Luhn,
+# mod-97, a public address range) and is not one of the placeholders. A random
+# 16-digit number passes Luhn one time in ten, so the issuer range, the length,
+# more than two distinct digits and a number standing on its own carry the rest.
+#
+# Placeholders are compared as normalised VALUES (digits only, compact capitals,
+# the tailnet label), so a line holding a placeholder and a real value still
+# fails, which a line-level exclusion would let through.
+#
+# Portable awk on purpose (BSD awk, mawk, gawk): no interval expressions, no
+# gensub, no backreferences. LC_ALL=C because every value is ASCII and a line of
+# Greek prose is bytes to skip, not characters to understand.
+SHAPE=""
+SHAPE_PLACEHOLDERS=""
+shape_filter() {
+  SHAPE="$SHAPE" SHAPE_PLACEHOLDERS="$SHAPE_PLACEHOLDERS" LC_ALL=C awk '
+    function isdig(c) { return c != "" && index("0123456789", c) > 0 }
+    function isalnum(c) {
+      return c != "" && index("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", c) > 0
+    }
+    function placeholder(v) { return index(" " PH " ", " " v " ") > 0 }
+    function at(s, i) { return i >= 1 ? substr(s, i, 1) : "" }
+    # A number standing on its own: not inside a word or an id, not the
+    # fraction of a decimal, and for a card not the digits after a "+".
+    function left_ok(s, i, kind,   c) {
+      c = at(s, i - 1)
+      if (isalnum(c)) return 0
+      if (c == "." && isdig(at(s, i - 2))) return 0
+      if (kind == "card" && c == "+") return 0
+      return 1
+    }
+    function luhn(d,   i, n, sum, alt) {
+      sum = 0; alt = 0
+      for (i = length(d); i >= 1; i--) {
+        n = substr(d, i, 1) + 0
+        if (alt) { n = n * 2; if (n > 9) n = n - 9 }
+        sum += n; alt = !alt
+      }
+      return sum % 10 == 0
+    }
+    function distinct(d,   i, c, seen, n) {
+      split("", seen); n = 0
+      for (i = 1; i <= length(d); i++) { c = substr(d, i, 1); if (!(c in seen)) { seen[c] = 1; n++ } }
+      return n
+    }
+    # Groups a..b of the current run as a printed card: one run of 13-19 digits,
+    # fours with a shorter last group, or the 4-6-5 and 4-6-4 issuer layouts.
+    function card_layout(a, b,   k, total) {
+      if (a == b) return length(G[a]) >= 13 && length(G[a]) <= 19
+      total = 0
+      for (k = a; k <= b; k++) total += length(G[k])
+      if (total < 13 || total > 19) return 0
+      if (b - a == 2 && length(G[a]) == 4 && length(G[a + 1]) == 6 && length(G[b]) >= 4 && length(G[b]) <= 5) return 1
+      for (k = a; k < b; k++) if (length(G[k]) != 4) return 0
+      return length(G[b]) <= 4
+    }
+    function card_ok(d) {
+      return index("23456", substr(d, 1, 1)) > 0 && distinct(d) > 2 && luhn(d) && !placeholder(d)
+    }
+    # +30 or 0030, then a 69 mobile or a 21-28 landline: ten national digits.
+    function phone_ok(d, before) {
+      if (before == "+" && substr(d, 1, 2) == "30") d = substr(d, 3)
+      else if (substr(d, 1, 4) == "0030") d = substr(d, 5)
+      if (length(d) != 10) return 0
+      if (substr(d, 1, 2) != "69" && !(substr(d, 1, 1) == "2" && index("12345678", substr(d, 2, 1)) > 0)) return 0
+      return !placeholder(d)
+    }
+    # Runs of digit groups joined by one separator from seps; every run of
+    # consecutive groups is a candidate, so a row number or a year printed in
+    # front of a number does not hide it.
+    function scan_runs(s, seps, kind,   n, i, j, first, ng, a, b, d, L, R) {
+      n = length(s); i = 1
+      while (i <= n) {
+        if (!isdig(substr(s, i, 1))) { i++; continue }
+        first = i; L = at(s, i - 1); ng = 0
+        while (1) {
+          j = i
+          while (j <= n && isdig(substr(s, j, 1))) j++
+          ng++; G[ng] = substr(s, i, j - i); S[ng] = substr(s, j, 1)
+          if (S[ng] != "" && index(seps, S[ng]) > 0 && isdig(substr(s, j + 1, 1))) { i = j + 1; continue }
+          break
+        }
+        R = substr(s, j, 1)
+        for (a = 1; a <= ng; a++) {
+          if (a == 1 && !left_ok(s, first, kind)) continue
+          d = ""
+          for (b = a; b <= ng && b <= a + 4; b++) {
+            if (b > a && S[b - 1] != S[a]) break
+            d = d G[b]
+            if (b == ng && isalnum(R)) continue
+            if (kind == "card" && card_layout(a, b) && card_ok(d)) return 1
+            if (kind == "phone" && phone_ok(d, (a == 1) ? L : " ")) return 1
+          }
+        }
+        i = j + 1
+      }
+      return 0
+    }
+    function iban_ok(v,   r, i, c, m) {
+      r = substr(v, 5) substr(v, 1, 4); m = 0
+      for (i = 1; i <= length(r); i++) {
+        c = substr(r, i, 1)
+        if (isdig(c)) m = (m * 10 + c) % 97
+        else m = (m * 100 + index("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c) + 9) % 97
+      }
+      return m == 1
+    }
+    # GR, two check digits and 23 more characters, compact or printed in groups.
+    function scan_iban(s,   u, pos, start, i, c, v, got) {
+      u = toupper(s); pos = 1
+      while (pos <= length(u) && match(substr(u, pos), /GR[0-9][0-9]/)) {
+        start = pos + RSTART - 1; pos = start + 1
+        if (isalnum(at(u, start - 1))) continue
+        v = substr(u, start, 4); got = 0; i = start + 4
+        while (i <= length(u) && got < 23) {
+          c = substr(u, i, 1)
+          if (isalnum(c)) { v = v c; got++ }
+          else if (!(c == " " && isalnum(substr(u, i + 1, 1)))) break
+          i++
+        }
+        if (got == 23 && !isalnum(substr(u, i, 1)) && iban_ok(v) && !placeholder(v)) return 1
+      }
+      return 0
+    }
+    # Private (RFC 1918), loopback, link-local, this-network, documentation
+    # (RFC 5737), multicast and reserved addresses are not findings. Everything
+    # else is, including 100.64.0.0/10: shared address space, which is where a
+    # tailnet numbers its machines.
+    function ip_public(a, b, c) {
+      if (a == 0 || a == 10 || a == 127 || a >= 224) return 0
+      if (a == 169 && b == 254) return 0
+      if (a == 172 && b >= 16 && b <= 31) return 0
+      if (a == 192 && b == 168) return 0
+      if (a == 192 && b == 0 && c == 2) return 0
+      if (a == 198 && b == 51 && c == 100) return 0
+      if (a == 203 && b == 0 && c == 113) return 0
+      return 1
+    }
+    function scan_ipv4(s,   pos, start, m, q, i, ok) {
+      pos = 1
+      while (pos <= length(s) && match(substr(s, pos), /[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+/)) {
+        start = pos + RSTART - 1; pos = start + 1
+        m = substr(s, start, RLENGTH)
+        ok = !isalnum(at(s, start - 1)) && at(s, start - 1) != "."
+        ok = ok && !isalnum(substr(s, start + RLENGTH, 1))
+        ok = ok && !(substr(s, start + RLENGTH, 1) == "." && isdig(substr(s, start + RLENGTH + 1, 1)))
+        if (!ok) continue
+        split(m, q, ".")
+        for (i = 1; i <= 4; i++) if (length(q[i]) > 3 || q[i] + 0 > 255) ok = 0
+        if (ok && ip_public(q[1] + 0, q[2] + 0, q[3] + 0) && !placeholder(m)) return 1
+      }
+      return 0
+    }
+    # <machine>.<tailnet>.ts.net; the placeholder is the tailnet label.
+    function scan_tailnet(s,   l, pos, k, j, c, host, label) {
+      l = tolower(s); pos = 1
+      while ((k = index(substr(l, pos), ".ts.net")) > 0) {
+        k = pos + k - 1; pos = k + 1
+        c = substr(l, k + 7, 1)
+        if (isalnum(c) || c == "-") continue
+        j = k - 1
+        while (j >= 1) {
+          c = substr(l, j, 1)
+          if (!(isalnum(c) || c == "-" || c == ".")) break
+          j--
+        }
+        host = substr(l, j + 1, k - j - 1)
+        sub(/^[.]+/, "", host)
+        if (host == "") continue
+        label = host; sub(/.*[.]/, "", label)
+        if (!placeholder(label)) return 1
+      }
+      return 0
+    }
+    BEGIN { KIND = ENVIRON["SHAPE"]; PH = ENVIRON["SHAPE_PLACEHOLDERS"] }
+    KIND == "card" && scan_runs($0, " -", "card") { print; next }
+    KIND == "phone" && scan_runs($0, " ", "phone") { print; next }
+    KIND == "iban" && scan_iban($0) { print; next }
+    KIND == "ipv4" && scan_ipv4($0) { print; next }
+    KIND == "tailnet" && scan_tailnet($0) { print; next }'
+}
+
+# A shape check: check, then shape_filter over its hits.
+check_shape() {
+  SHAPE="$3"
+  SHAPE_PLACEHOLDERS="${4:-}"
+  check "$1" "$2"
+  SHAPE=""
+  SHAPE_PLACEHOLDERS=""
+}
+
+keep_shapes() {
+  local hits="$1"
+  if [ -n "$SHAPE" ] && [ -n "$hits" ]; then
+    printf '%s\n' "$hits" | shape_filter
+  else
+    printf '%s' "$hits"
+  fi
+}
+
 # Run one check case-SENSITIVELY. Restores the flag afterwards so nothing else
 # is affected, and takes the same arguments as check.
 check_cs() {
@@ -318,11 +565,18 @@ check() {
   local exclude_path="${4:-}"
   local hits
 
+  if ! pattern_compiles "$pattern"; then
+    echo "FAIL [$label]: the pattern does not compile on this grep, so nothing was checked"
+    FAIL=1
+    return
+  fi
+
   if [ "$MODE" = "history" ]; then
     # The commit and the check, never the text: the point is to locate history
     # that needs rewriting, not to reprint what it discloses.
     hits=$(scan_history "$pattern")
     hits=$(apply_exclusion "$hits" "$exclude" "$exclude_path")
+    hits=$(keep_shapes "$hits")
     if [ -n "$hits" ]; then
       local count commits
       count=$(printf '%s\n' "$hits" | wc -l | tr -d ' ')
@@ -342,9 +596,10 @@ check() {
     # hole found in this file.
     hits=$(printf '%s\n%s' "$(scan_ci "$pattern")" "$(scan_paths "$pattern" "$TREE_PATHS")" | grep -v '^$' || true)
     hits=$(apply_exclusion "$hits" "$exclude" "$exclude_path")
+    hits=$(keep_shapes "$hits")
     if [ -n "$hits" ]; then
       echo "FAIL [$label]:"
-      echo "$hits" | head -20
+      printf '%s\n' "$hits" | hit_locations | head -20
       echo
       FAIL=1
     else
@@ -364,6 +619,7 @@ check() {
     "$(scan_paths "$pattern" "$TREE_PATHS")" \
     "$(scan_paths "$pattern" "$UNTRACKED_PATHS")" | grep -v '^$' || true)
   hits=$(apply_exclusion "$hits" "$exclude" "$exclude_path")
+  hits=$(keep_shapes "$hits")
   if [ -z "$hits" ]; then
     echo "OK   [$label]"
     return
@@ -476,8 +732,15 @@ PLACEHOLDER_VALUE='123456789|987654321|111111111|000000000'
 # Some repos name the employer on purpose: a marketplace written for colleagues
 # says so in its README by design. Those opt out with a repo-root marker rather
 # than carrying a permanent red light.
+#
+# The Greek name in every case and accent: the genitive, the archaic genitive,
+# no accents, capitals. The nominative alone let the other forms through. Each
+# letter is an alternation of literal characters rather than a bracket
+# expression, for the locale reason given at GRK_CAP below, and both cases are
+# spelled out because -i folds Greek only in a UTF-8 locale.
+EMPLOYER_GR='(Ε|ε)(Θ|θ)(Ν|ν)(Ι|ι|Ί|ί)(Κ|κ)(Η|η|Ή|ή)(Σ|ς)?[[:space:]]+(Τ|τ)(Ρ|ρ)(Α|α|Ά|ά)(Π|π)(Ε|ε|Έ|έ)(Ζ|ζ)(Α|α|Ά|ά|Η|η|Ή|ή)(Σ|ς)?'
 if [ ! -f ".pii-gauntlet-allow-employer-name" ]; then
-  check "Employer name" '(^|[^A-Za-z0-9])(NBG|ΕΤΕ)([^A-Za-z0-9]|$)|Εθνική Τράπεζα|National Bank of Greece' "$PLACEHOLDER"
+  check "Employer name" "(^|[^A-Za-z0-9])(NBG|ΕΤΕ)([^A-Za-z0-9]|$)|$EMPLOYER_GR|National Bank of Greece" "$PLACEHOLDER"
 else
   echo "OK   [Employer name] (opted out via .pii-gauntlet-allow-employer-name)"
 fi
@@ -526,6 +789,33 @@ check_cs "All-caps Greek personal name" \
   "${GRK_CAP}{4,}[[:space:]]+${GRK_CAP}{4,}" \
   'ΠΑΠΑΔΟΠΟΥΛΟΥ ΜΑΡΙΝΑ'
 
+# Shapes of personal and infrastructure data. A 2026-10-11 audit planted 24 leak
+# kinds in a scratch repo and the checks above caught 6: phone numbers, IBANs,
+# card numbers, IP addresses and tailnet hosts all passed, with the private
+# denylist loaded or not. grep below only finds candidate lines; shape_filter
+# decides, by checksum, range and placeholder.
+#
+# Placeholders, as normalised values (shape_filter compares whole values):
+#   phone: the two invented numbers tests/test_redact_payment_data.py uses,
+#          and 2147483647, the largest 32-bit integer, which has a landline's
+#          shape.
+#   card:  published test numbers (Visa, Mastercard, Amex, Discover). This
+#          repo's fixtures build theirs at run time, so none is a literal.
+#   IBAN:  the Greek example from the SWIFT IBAN registry.
+#   IPv4:  none listed; the RFC 5737 documentation ranges are the placeholders,
+#          excluded with the private ranges inside shape_filter.
+#   host:  tailnet labels a document would invent.
+check_shape "Greek phone number" '(69|2[1-8])( ?[0-9]){8}' phone \
+  '2101234567 6912345678 2147483647'
+check_shape "Greek IBAN" 'GR[0-9]{2}' iban \
+  'GR1601101250000000012300695'
+check_shape "Card number" \
+  '[0-9]{13}|[0-9]{4}[ -][0-9]{4}[ -][0-9]{4}[ -][0-9]|[0-9]{4}[ -][0-9]{6}[ -][0-9]{4}' card \
+  '4012888888881881 5105105105105100 378282246310005 6011111111111117'
+check_shape "Public IPv4 address" '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}' ipv4
+check_shape "Tailnet host" '\.ts\.net' tailnet \
+  'example tailnet-name your-tailnet'
+
 
 # ---------------------------------------------------------------------------
 # Name-based checks, loaded from a private denylist
@@ -569,9 +859,10 @@ if [ -r "$PII_DENYLIST" ]; then
 else
   # Absence is handled differently by mode, on purpose.
   #
-  # In CI on a public repo the denylist legitimately does not exist and never
-  # will, so failing here would just paint six repos red forever. Say plainly
-  # that the name checks did not run, and let the generic ones stand.
+  # In CI the denylist exists only where a PII_DENYLIST secret is set and GitHub
+  # hands it over, which it never does for a fork or a Dependabot run, so
+  # failing here would just paint those runs red forever. Say plainly that the
+  # name checks did not run, and let the generic ones stand.
   #
   # Locally the file should always be there. Its absence is a real
   # misconfiguration, and a guard that cannot evaluate its condition must
@@ -581,7 +872,8 @@ else
   if [ "$MODE" = "ci" ]; then
     echo "SKIP [name-based checks]: no denylist at $PII_DENYLIST"
     echo "     Generic org-tell checks above still ran. Name, family, partner and"
-    echo "     private-path checks did NOT. This is expected in public CI."
+    echo "     private-path checks did NOT. Expected where no PII_DENYLIST secret"
+    echo "     reaches the job: a fork, a Dependabot run, another repository."
   else
     echo "FAIL [name-based checks]: no denylist at $PII_DENYLIST"
     echo "     Locally this file must exist. Without it the name, family, partner"

@@ -41,6 +41,7 @@ from src.mcp_results import (
     TeamsThread,
     TopicContext,
 )
+from src.store.calendar_query import ATTENDEES_MAX, ATTENDEES_SHOWN
 from src.store.schema import get_connection
 
 # Routing text, not marketing. Under tool search only the tool NAMES and this
@@ -846,9 +847,6 @@ def search_attachments(
     return cast(RowsResult, _rows(rows, _NO_WORD))
 
 
-ATTENDEES_SHOWN = 10
-
-
 @_tool()
 def query_calendar_events(
     person: Annotated[
@@ -866,6 +864,15 @@ def query_calendar_events(
     limit: Annotated[
         int, Field(ge=1, le=MAX_LIMIT, description="Maximum events, 1 to 200 (default 20).")
     ] = 20,
+    max_attendees: Annotated[
+        int,
+        Field(
+            ge=0,
+            le=ATTENDEES_MAX,
+            description="Most attendees listed per event, 0 to 500 (default 12); "
+            "attendees_total counts them all.",
+        ),
+    ] = ATTENDEES_SHOWN,
 ) -> CalendarEvents:
     """What meetings did I have, or do I have: calendar events by attendee, date range or keyword, newest first.
 
@@ -873,13 +880,18 @@ def query_calendar_events(
     are the same times in Europe/Athens with their offset, e.g.
     2026-10-01T16:00:00+03:00: quote those to the user. A bare date in since or
     until is an Athens calendar day, so a meeting at 00:30 Athens time falls on its
-    own day, not the one before. Each event lists its first 10 attendees, the ones
-    `person` matched first, and `attendees_total` counts them all;
-    `response_status` is the user's own response. Cancelled meetings are left out.
+    own day, not the one before. Each event lists at most `max_attendees`
+    attendees (12): the user and the organiser always, then the ones `person`
+    matched, listed first, then the rest in invitation order; `attendees_total`
+    counts them all. `response_status` is the user's own response, `is_recurring`
+    marks one occurrence of a series, and `body_summary` of an invitation (a
+    meeting to come, or any occurrence of a series) gives its purpose, agenda and
+    who is expected. Cancelled meetings are left out.
     """
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
 
+    from src.store.calendar_query import athens_time, capped_attendees
     from src.store.greek import search_fold
 
     athens = ZoneInfo("Europe/Athens")
@@ -902,15 +914,6 @@ def query_calendar_events(
         if moment.tzinfo is None:
             moment = moment.replace(tzinfo=athens)
         return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-
-    def local(value: str | None) -> str | None:
-        """A stored time in Athens, with its offset; None if it does not parse."""
-        try:
-            moment = datetime.fromisoformat(value or "")
-        except ValueError:
-            return None
-        # Every stored time is UTC, the few written without the 'Z' included.
-        return moment.replace(tzinfo=moment.tzinfo or UTC).astimezone(athens).isoformat()
 
     bounds: dict[str, str] = {}
     for name, value in (("since", since), ("until", until)):
@@ -983,41 +986,27 @@ def query_calendar_events(
         events = []
         for row in rows:
             event_id = row["id"]
-            # The ones `person` matched first, so a cut list still shows them.
             # Events average 48 attendees and reach 500: listed in full, 40
             # events came to 272,000 characters.
-            attendees = conn.execute(
-                "SELECT name, email, response_status FROM event_attendees WHERE event_id = ? "
-                "ORDER BY (? <> '' AND (sb_fold(name) LIKE ? OR LOWER(email) LIKE ?)) DESC, id",
-                (
-                    event_id,
-                    person,
-                    f"%{search_fold(person)}%",
-                    f"%{person.strip().lower()}%",
-                ),
-            ).fetchall()
+            attendees, attendees_total = capped_attendees(
+                conn, event_id, limit=max_attendees, person=person
+            )
             events.append(
                 {
                     "id": event_id,
                     "subject": row["subject"],
                     "start_at": row["start_at"],
                     "end_at": row["end_at"],
-                    "start_local": local(row["start_at"]),
-                    "end_local": local(row["end_at"]),
+                    "start_local": athens_time(row["start_at"]),
+                    "end_local": athens_time(row["end_at"]),
                     "location": row["location"],
                     "organizer": row["organizer_name"] or row["organizer_email"],
                     "body_summary": row["body_summary"],
                     "is_self_organized": bool(row["is_self_organized"]),
+                    "is_recurring": bool(row["is_recurring"]),
                     "response_status": row["response_status"],
-                    "attendees_total": len(attendees),
-                    "attendees": [
-                        {
-                            "name": a["name"],
-                            "email": a["email"],
-                            "status": a["response_status"],
-                        }
-                        for a in attendees[:ATTENDEES_SHOWN]
-                    ],
+                    "attendees_total": attendees_total,
+                    "attendees": attendees,
                 }
             )
             if partial:

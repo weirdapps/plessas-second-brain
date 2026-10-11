@@ -1275,6 +1275,20 @@ def meeting_prep(
 
         result["attendees"].append(dossier)
 
+    # The meetings the people resolved share with the owner, the next and the last,
+    # each with a dozen of its attendees: it listed none, the one thing a meeting
+    # prep cannot do without.
+    from src.store.calendar_query import shared_meetings
+
+    try:
+        result["meetings"] = shared_meetings(
+            conn,
+            [d["resolved_email"] for d in result["attendees"] if d.get("resolved_email")],
+            days=days,
+        )
+    except sqlite3.OperationalError:  # a store with no calendar
+        result["meetings"] = {"next": [], "last": []}
+
     # Topic context (if provided)
     if topic:
         topic_normalized = normalize_topic(topic)

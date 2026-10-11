@@ -224,7 +224,9 @@ def test_search_attachments_is_budgeted(tmp_path, monkeypatch):
     assert len(out["result"]) == out["truncated"]["result"]["kept"]
 
 
-def test_a_calendar_event_lists_ten_attendees_and_counts_them_all(tmp_path, monkeypatch):
+def test_a_calendar_event_lists_a_dozen_attendees_and_counts_them_all(tmp_path, monkeypatch):
+    from src.store.calendar_query import ATTENDEES_SHOWN
+
     path = tmp_path / "brain.db"
     conn = create_database(str(path))
     conn.execute(
@@ -247,7 +249,7 @@ def test_a_calendar_event_lists_ten_attendees_and_counts_them_all(tmp_path, monk
     event = mcp_server.query_calendar_events(person="Zeta")["events"][0]
 
     assert event["attendees_total"] == 30
-    assert len(event["attendees"]) == 10
+    assert len(event["attendees"]) == ATTENDEES_SHOWN == 12
     # The attendee the filter matched is listed, though 24 others came first.
     assert event["attendees"][0]["name"] == "Zeta Late"
     assert event["response_status"] == "Accepted"

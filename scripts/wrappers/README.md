@@ -50,6 +50,20 @@ directory was re-laid on 2026-08-28, which is exactly why
 evidence and added a second, timestamped one (a freshly received replica). Treat
 the marker as a convention that may or may not be present, never as the test.
 
+## What the three sync wrappers ask of `src.cli sync`
+
+| Wrapper | When | Flags that change what runs |
+| --- | --- | --- |
+| `sb-outlook-sync.sh` | hourly | `--skip-conversations`: Step 7, the Claude Code conversations, is left to the others |
+| `sb-noon-catchup.sh` | noon | none: the whole sync, conversations included |
+| `sb-daily-sync.sh` | morning | none: the whole sync, conversations included |
+
+`sb-conversation-sync.sh` exports and extracts the conversations three times a day; the
+noon and daily syncs load and embed them. `--skip-conversations` came with #148: copy
+`sb-outlook-sync.sh` into `~/.local/bin` on the producer after pulling it (docs/DEPLOY.md,
+section 6). `sync --full-dedup` is for a hand run: `sync` already takes the whole people
+table once a day.
+
 ## What is deliberately absent
 
 **The systemd entry-point shims** (`~/scripts/run-sb-*.sh` on the VPS). Each

@@ -94,7 +94,9 @@ IMAGE_CLASSIFY_SYNC_BUDGET_S = 90.0
 # 23:28 the previous evening was SIGTERMed seconds after printing "Sync
 # complete". 30 s holds the previously assumed sum exactly, so the margin tests
 # keep the same headroom they were written against; the remainder drains on
-# sb-conversation-sync, which has 900 s.
+# sb-conversation-sync, which has 900 s. The hourly unit now skips the step
+# (--skip-conversations), and the allowance stays in the sum for the daily and
+# noon units, which run it.
 CONVERSATION_SYNC_DEADLINE_S = 30.0
 
 # Step 2 (email extraction) had no bound either, and could sleep an hour
@@ -2204,41 +2206,46 @@ def cmd_sync(args):
     elif not (p1_stats.get("processed", 0) or deferred or heavy):
         print("  No new attachments to process")
 
-    # Step 7: Sync conversations from Claude Code sessions
+    # Step 7: Sync conversations from Claude Code sessions. The hourly mail unit passes
+    # --skip-conversations: sb-conversation-sync exports and extracts them, and the daily
+    # and noon syncs, which run this step, load them.
     print("\nStep 7: Syncing Claude Code conversations...")
-    from src.export.conversation_export import export_conversations
-    from src.store.loader import load_conversations as load_convs
-
-    conn_conv = get_conn(db_path)
-    run_mig(conn_conv)
-    loaded = {
-        r["session_id"]: (r["ended_at"], r["turn_count"])
-        for r in conn_conv.execute("SELECT session_id, ended_at, turn_count FROM conversations")
-    }
-    conn_conv.close()
-
     conv_loaded = 0
-    conv_export = export_conversations(days=7, loaded=loaded)
-    # Staged before and not loaded yet: the export no longer stages those again, and
-    # one sb-conversation-sync extracted waits for a load here.
-    waiting = conv_export.get("pending", 0)
-    if conv_export["exported"] > 0 or waiting > 0:
-        print(f"  Exported {conv_export['exported']} new or grown conversations")
-        if waiting:
-            print(f"  {waiting} staged before and not loaded yet")
-        from src.extract.local import run_conversation_extraction
-
-        run_conversation_extraction(deadline_s=CONVERSATION_SYNC_DEADLINE_S)
-        if stop_requested():  # as after Step 2
-            print(
-                "Stop requested during conversation extraction; the later steps did not run",
-                file=sys.stderr,
-            )
-            return 143
-        conv_loaded = load_convs(db_path)
-        print(f"  Loaded {conv_loaded} conversations")
+    if getattr(args, "skip_conversations", False):
+        print("  Skipped (--skip-conversations)")
     else:
-        print("  No new conversations to sync")
+        from src.export.conversation_export import export_conversations
+        from src.store.loader import load_conversations as load_convs
+
+        conn_conv = get_conn(db_path)
+        run_mig(conn_conv)
+        loaded = {
+            r["session_id"]: (r["ended_at"], r["turn_count"])
+            for r in conn_conv.execute("SELECT session_id, ended_at, turn_count FROM conversations")
+        }
+        conn_conv.close()
+
+        conv_export = export_conversations(days=7, loaded=loaded)
+        # Staged before and not loaded yet: the export no longer stages those again, and
+        # one sb-conversation-sync extracted waits for a load here.
+        waiting = conv_export.get("pending", 0)
+        if conv_export["exported"] > 0 or waiting > 0:
+            print(f"  Exported {conv_export['exported']} new or grown conversations")
+            if waiting:
+                print(f"  {waiting} staged before and not loaded yet")
+            from src.extract.local import run_conversation_extraction
+
+            run_conversation_extraction(deadline_s=CONVERSATION_SYNC_DEADLINE_S)
+            if stop_requested():  # as after Step 2
+                print(
+                    "Stop requested during conversation extraction; the later steps did not run",
+                    file=sys.stderr,
+                )
+                return 143
+            conv_loaded = load_convs(db_path)
+            print(f"  Loaded {conv_loaded} conversations")
+        else:
+            print("  No new conversations to sync")
 
     # Step 8: Classify new inline images (Stage 1 heuristic + Stage 3 vision LLM)
     print("\nStep 8: Classifying new inline images...")
@@ -4064,6 +4071,12 @@ def main():
         metavar="SECONDS",
         help="If another sync is running, wait up to this long for it, then skip "
         "with exit 0 (default: 0, skip at once)",
+    )
+    parser_sync.add_argument(
+        "--skip-conversations",
+        action="store_true",
+        help="Leave out Step 7, the Claude Code conversations: the hourly mail unit passes it, "
+        "and sb-conversation-sync and the daily and noon syncs take them",
     )
     parser_sync.add_argument(
         "--full-dedup",

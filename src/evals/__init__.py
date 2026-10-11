@@ -8,7 +8,10 @@ summary.py reads their results back for the health check.
 
 The sets are the owner's own mail and questions, and their gold labels are the owner's
 judgement, so neither ever enters the repository: everything lives under
-``${BRAIN_DATA_DIR:-~/.second-brain}/evals``, with the results beside the sets.
+``${BRAIN_DATA_DIR:-~/.second-brain}/evals``, with the results beside the sets. Every
+directory made there is 0700 and every file 0600, and a path inside the checkout is
+refused. Nothing here prints an item, a label or an extraction: output names case ids,
+counts and rates, and the files hold the rest.
 """
 
 import hashlib
@@ -21,6 +24,10 @@ from pathlib import Path
 # A drop larger than this many percentage points against the previous comparable run
 # is reported as a warning by summary.latest_eval_summary.
 DROP_POINTS = 5.0
+
+# The checkout this code runs from. Nothing under it may hold a set or a result: a
+# path there is one `git add` away from a public repository.
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def eval_base() -> Path:
@@ -81,26 +88,63 @@ def read_jsonl(path: Path | str, *, strict: bool = True) -> list[dict]:
     return out
 
 
+def inside_repo(path: Path | str) -> bool:
+    """Whether `path` lies inside this checkout, where no set or result may go."""
+    return Path(path).expanduser().resolve().is_relative_to(REPO_ROOT)
+
+
+def _private_dir(path: Path) -> None:
+    """Make `path` a directory, each part it creates owner-only (0700).
+
+    mkdir(parents=True) gives the parents it creates the default mode, so the missing
+    parts are made one at a time. Refuses a path inside the checkout before making any.
+    """
+    if inside_repo(path):
+        raise ValueError(f"refusing to write eval files inside the repository: {path}")
+    missing = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+
+
+def _open_private(path: Path, flags: int) -> int:
+    """os.open with 0600 for a new file; a file left with another mode is set to 0600."""
+    fd = os.open(path, flags | os.O_CREAT, 0o600)
+    os.fchmod(fd, 0o600)
+    return fd
+
+
 def _line(record: dict) -> str:
     return json.dumps(record, ensure_ascii=False) + "\n"
 
 
 def append_jsonl(path: Path | str, record: dict) -> None:
-    """Append one record, creating the directory on first use."""
+    """Append one record, creating the file (0600) and its directories (0700) on first use."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
+    _private_dir(path.parent)
+    with os.fdopen(_open_private(path, os.O_WRONLY | os.O_APPEND), "a", encoding="utf-8") as f:
         f.write(_line(record))
 
 
 def write_jsonl(path: Path | str, records: list[dict]) -> None:
     """Replace `path` with `records`, through a temporary file, so a reader never sees half."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _private_dir(path.parent)
     tmp = path.with_name(f".{path.name}.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
+    with os.fdopen(_open_private(tmp, os.O_WRONLY | os.O_TRUNC), "w", encoding="utf-8") as f:
         f.writelines(_line(r) for r in records)
     tmp.replace(path)
+
+
+def write_private(path: Path | str, text: str) -> None:
+    """Replace `path` with `text`, readable by its owner only."""
+    path = Path(path)
+    _private_dir(path.parent)
+    with os.fdopen(_open_private(path, os.O_WRONLY | os.O_TRUNC), "w", encoding="utf-8") as f:
+        f.write(text)
 
 
 def text_sha(text: str) -> str:

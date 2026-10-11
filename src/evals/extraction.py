@@ -32,7 +32,6 @@ runs/<run_id>.jsonl keeps every graded row with the model's own text.
 
 import json
 import math
-import os
 import random
 import re
 import threading
@@ -48,7 +47,15 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from src.evals import append_jsonl, eval_home, read_jsonl, stamp, text_sha, write_jsonl
+from src.evals import (
+    append_jsonl,
+    eval_home,
+    read_jsonl,
+    stamp,
+    text_sha,
+    write_jsonl,
+    write_private,
+)
 
 # --- the label vocabulary -------------------------------------------------------------
 
@@ -162,10 +169,12 @@ def _one_of(value: Any, allowed: tuple[str, ...]) -> bool:
 
 
 def _gold_problems(gold: dict) -> list[str]:
+    """What is wrong with one gold, by field. A message names the field and what it may
+    hold, never the value written there: problems are printed, and labels stay in files."""
     problems = []
     for key, allowed in (("item_kind", ITEM_KINDS), ("language", LANGUAGES)):
         if not _one_of(gold.get(key), allowed):
-            problems.append(f"gold.{key} {gold.get(key)!r} is not one of {', '.join(allowed)}")
+            problems.append(f"gold.{key} is not one of {', '.join(allowed)}")
     lists: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         ("decisions", "owner_role", OWNER_ROLES),
         ("actions", "direction", DIRECTIONS),
@@ -183,19 +192,12 @@ def _gold_problems(gold: dict) -> list[str]:
             if not isinstance(item.get("text"), str) or not item["text"].strip():
                 problems.append(f"{where} has no text")
             if not _one_of(item.get(role_key), roles):
-                problems.append(
-                    f"{where}.{role_key} {item.get(role_key)!r} is not one of {', '.join(roles)}"
-                )
+                problems.append(f"{where}.{role_key} is not one of {', '.join(roles)}")
             if name == "decisions" and not _one_of(item.get("status"), DECISION_STATUSES):
-                problems.append(
-                    f"{where}.status {item.get('status')!r} is not one of"
-                    f" {', '.join(DECISION_STATUSES)}"
-                )
+                problems.append(f"{where}.status is not one of {', '.join(DECISION_STATUSES)}")
             if name == "actions" and item.get("deadline") is not None:
                 if not _is_date(item["deadline"]):
-                    problems.append(
-                        f"{where}.deadline {item['deadline']!r} is not YYYY-MM-DD or null"
-                    )
+                    problems.append(f"{where}.deadline is not YYYY-MM-DD or null")
     must_not = gold.get("must_not")
     if not isinstance(must_not, list) or not all(
         isinstance(s, str) and s.strip() for s in must_not
@@ -518,21 +520,14 @@ def render_cases_md(cases: list[dict]) -> str:
     return "\n".join(out) + "\n"
 
 
-def _write_private(path: Path, text: str) -> None:
-    """Write `text` to `path`, readable by its owner only: these files hold mail."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
-
-
 def write_new_set(files: Files, cases: list[dict], *, owner_name: str = "") -> None:
-    """cases.jsonl and its reading copy; owner.json only when there is none to keep."""
+    """cases.jsonl and its reading copy, owner-only; owner.json only when there is none to
+    keep. Refuses a directory inside the checkout before writing anything."""
     write_jsonl(files.cases, cases)
-    _write_private(files.cases_md, render_cases_md(cases))
+    write_private(files.cases_md, render_cases_md(cases))
     if not files.owner.exists():
         aliases = {"aliases": default_owner_aliases(owner_name)}
-        _write_private(files.owner, json.dumps(aliases, ensure_ascii=False, indent=2) + "\n")
+        write_private(files.owner, json.dumps(aliases, ensure_ascii=False, indent=2) + "\n")
 
 
 # --- the programmatic checks -----------------------------------------------------------
@@ -888,10 +883,25 @@ def _failure_class(error: BaseException | None) -> str:
     return "harness_error"
 
 
-def _describe(error: BaseException | None) -> str:
+_QUOTE_WIDTH = 24
+
+
+def _describe(error: BaseException | None, item: dict | None = None) -> str:
+    """An error as errors.jsonl keeps it: its type and the first line of its message.
+
+    The messages on these paths name status codes, positions and stop reasons, but a
+    message that quotes the item (24 characters of its subject or body) is withheld:
+    error records carry no mail.
+    """
     if error is None:
         return "the extraction made no model call"
-    return f"{type(error).__name__}: {str(error)[:300]}"
+    message = str(error).split("\n", 1)[0][:200]
+    if item:
+        text = f"{item.get('subject') or ''}\n{item.get('content') or ''}"
+        windows = range(len(message) - _QUOTE_WIDTH + 1)
+        if any(message[i : i + _QUOTE_WIDTH] in text for i in windows):
+            message = "(message withheld: it quotes the item)"
+    return f"{type(error).__name__}: {message}"
 
 
 _calls = threading.local()
@@ -956,7 +966,9 @@ def _attempt(run: _Run, case: dict, rep: int) -> tuple[dict | None, dict | None]
     latency = round(time.monotonic() - began, 2)
     where = {"case_id": case["id"], "rep": rep, "stage": "extract"}
     if not responses:
-        return None, run.error({**where, "class": _failure_class(error), "error": _describe(error)})
+        return None, run.error(
+            {**where, "class": _failure_class(error), "error": _describe(error, case["item"])}
+        )
     response = responses[-1]
     model, usage = getattr(response, "model", None), _usage(response)
     if _base_model(model) != _base_model(run.model):
@@ -980,7 +992,7 @@ def _attempt(run: _Run, case: dict, rep: int) -> tuple[dict | None, dict | None]
         "latency_s": latency,
         "raw_text": raw,
         "extraction": extraction if status == "ok" else None,
-        "parse_error": _describe(error) if error is not None else None,
+        "parse_error": _describe(error, case["item"]) if error is not None else None,
     }
     if status == "ok":
         row["checks"] = grade(case, extraction, raw, run.aliases)
@@ -1185,7 +1197,7 @@ def _judge_row(run: _Run, case: dict, row: dict) -> None:
         run.error({**where, "class": e.kind, "error": str(e), "model": e.model, "usage": e.usage})
         return
     except Exception as e:  # a failed call: recorded, the row stays without judge scores
-        run.error({**where, "class": _failure_class(e), "error": _describe(e)})
+        run.error({**where, "class": _failure_class(e), "error": _describe(e, case["item"])})
         return
     row["judge"] = {
         "decisions": set_scores(
@@ -1599,7 +1611,7 @@ def calibrate(
                 "case_id": case["id"],
                 "stage": "calibrate",
                 "class": e.kind if isinstance(e, JudgeError) else _failure_class(e),
-                "error": str(e)[:300] if isinstance(e, JudgeError) else _describe(e),
+                "error": _describe(e, case["item"]),
             }
             append_jsonl(files.errors, error)
             return kind, False, getattr(e, "model", None), getattr(e, "usage", None)

@@ -25,7 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.config import DEFAULT_DB  # noqa: E402
-from src.evals import connect_read_only, file_sha  # noqa: E402
+from src.evals import connect_read_only, file_sha, inside_repo  # noqa: E402
 from src.evals import extraction as ev  # noqa: E402
 
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -284,6 +284,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     files = ev.Files(args.dir or ev.default_root())
+    if inside_repo(files.root):
+        print(
+            f"refusing {files.root}: eval sets and results never go inside the repository;"
+            " pass --dir elsewhere",
+            file=sys.stderr,
+        )
+        return 2
     if args.build:
         return _build(args, files)
     cases, code = _load(files)

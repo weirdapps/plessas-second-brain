@@ -96,6 +96,58 @@ def test_writing_jsonl_replaces_the_whole_file(tmp_path):
     ]
 
 
+def mode(path):
+    import stat
+
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def test_every_directory_made_and_every_file_written_is_private(tmp_path):
+    """The sets and results hold mail: owner-only, whatever the umask leaves."""
+    appended = tmp_path / "evals" / "retrieval" / "results.jsonl"
+    replaced = tmp_path / "evals" / "extraction" / "runs" / "r.jsonl"
+    text = tmp_path / "evals" / "extraction" / "cases.md"
+
+    evals.append_jsonl(appended, {"a": 1})
+    evals.write_jsonl(replaced, [{"a": 1}])
+    evals.write_private(text, "body")
+
+    for directory in (
+        tmp_path / "evals",
+        tmp_path / "evals" / "retrieval",
+        tmp_path / "evals" / "extraction",
+        tmp_path / "evals" / "extraction" / "runs",
+    ):
+        assert mode(directory) == 0o700, directory
+    for written in (appended, replaced, text):
+        assert mode(written) == 0o600, written
+
+
+def test_a_stale_temporary_file_does_not_lend_the_set_its_mode(tmp_path):
+    path = tmp_path / "cases.jsonl"
+    stale = tmp_path / ".cases.jsonl.tmp"
+    stale.write_text("old")
+    stale.chmod(0o644)
+
+    evals.write_jsonl(path, [{"a": 1}])
+
+    assert mode(path) == 0o600
+
+
+def test_nothing_is_written_inside_the_repository():
+    inside = evals.REPO_ROOT / "evals-should-not-exist" / "results.jsonl"
+
+    with pytest.raises(ValueError, match="repository"):
+        evals.append_jsonl(inside, {"a": 1})
+    with pytest.raises(ValueError, match="repository"):
+        evals.write_jsonl(inside, [])
+    with pytest.raises(ValueError, match="repository"):
+        evals.write_private(inside, "x")
+    assert not inside.parent.exists()
+    assert evals.inside_repo(inside)
+    assert not evals.inside_repo(evals.eval_home())
+
+
 def test_a_file_sha_changes_with_its_content(tmp_path):
     path = tmp_path / "set.jsonl"
     path.write_text("one\n")

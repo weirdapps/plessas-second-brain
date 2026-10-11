@@ -346,6 +346,8 @@ def test_validation_names_each_problem():
     for cid in "bcdef":
         assert any(p.startswith(f"{cid}:") for p in problems), cid
     assert any("duplicate" in p for p in problems)
+    # Problems are printed; the labels they are about stay in the file.
+    assert not any("memo" in p or "Friday" in p for p in problems)
 
 
 # --- the programmatic checks --------------------------------------------------------
@@ -776,16 +778,68 @@ def write_set(files, cases):
     write_jsonl(files.cases, cases)
 
 
-def test_build_writes_the_set_and_never_overwrites_it(cli, files, store, monkeypatch):
+def mode(path):
+    import stat
+
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def test_build_writes_the_set_privately_and_never_overwrites_it(
+    cli, files, store, monkeypatch, capsys
+):
     monkeypatch.setenv("BRAIN_USER_EMAIL_PATTERN", "owner@example.com")
     argv = ["--build", "--dir", str(files.root), "--db", str(store)]
 
     assert cli(argv) == 0
-    assert files.cases.exists() and files.cases_md.exists() and files.owner.exists()
+    assert mode(files.root) == 0o700
+    for written in (files.cases, files.cases_md, files.owner):
+        assert mode(written) == 0o600, written
     first = files.cases.read_bytes()
     assert cli(argv) == 2
     assert files.cases.read_bytes() == first
     assert cli([*argv, "--force"]) == 0
+    out = capsys.readouterr()
+    for subject in ("Need your approval", "Regulation update", "Θέμα συνάντησης", "Budget"):
+        assert subject not in out.out + out.err
+
+
+def test_what_a_run_prints_holds_no_item_label_or_extraction(cli, files, model, capsys):
+    model({"subject a": GOOD_A, "subject b": reply()}, verdict=exact_judge)
+    write_set(files, labelled_cases())
+
+    assert cli(["--run", "--judge", "--yes", "--reps", "1", "--dir", str(files.root)]) == 0
+    assert cli(["--dry-run", "--dir", str(files.root)]) == 0
+    assert cli(["--calibrate", "--yes", "--dir", str(files.root)]) == 0
+
+    out = capsys.readouterr()
+    for text in ("subject a", "Body.", "approve the vendor", "send the plan", "2026-10-16"):
+        assert text not in out.out + out.err
+
+
+def test_every_mode_refuses_a_directory_inside_the_repository(cli, store):
+    from src.evals import REPO_ROOT
+
+    inside = REPO_ROOT / "evals-should-not-exist"
+    for argv in (
+        ["--build", "--db", str(store)],
+        ["--dry-run"],
+        ["--run", "--yes"],
+        ["--calibrate", "--yes"],
+    ):
+        assert cli([*argv, "--dir", str(inside)]) == 2
+    assert not inside.exists()
+
+
+def test_an_error_that_quotes_the_item_is_kept_without_the_quote(files, model):
+    content = "The quarterly zebrafinch figures are attached for review."
+    model({"subject a": RuntimeError(f"upstream rejected: {content}")})
+
+    ev.run(files, [email_case("a", content)], reps=1, workers=1, set_sha="s", now=NOW)
+
+    text = files.errors.read_text(encoding="utf-8")
+    assert "zebrafinch" not in text
+    assert "RuntimeError" in text
+    assert mode(files.errors) == 0o600
 
 
 def test_dry_run_calls_no_model_and_records_nothing(cli, files, model):

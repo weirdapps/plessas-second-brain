@@ -3637,6 +3637,9 @@ def main():
     parser_reextract.add_argument(
         "--ocr", action="store_true", help="scans and images whose OCR found too little text"
     )
+    parser_reextract.add_argument(
+        "--garbled", action="store_true", help="OCR text marked as Greek read as Latin letters"
+    )
     parser_reextract.add_argument("--limit", type=int, default=0, help="Max rows (0 = all)")
     parser_reextract.add_argument(
         "--after-id",

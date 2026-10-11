@@ -50,18 +50,35 @@ the email.
             again. The flag is a sync_metadata row per attachment (attachment_summary_full:<id>);
             delete the row to lift it
 
+    no spreadsheets  --no-spreadsheets: leave workbooks out of whatever the selectors choose,
+            by the test Phase 2 routes them by (attachment_digest.is_spreadsheet, the reader's
+            extraction method). A row with no text yet is judged by its re-read, and one that
+            turns out a workbook is left as it was (counted as spreadsheets)
+
+Copies of one document are summarised once. The rows to summarise again are grouped by their
+content (duplicate_groups: the attachment's sha256, or the stored text when it has none), and
+only the lowest content id of each group goes to Phase 2; the others are never set pending. Once
+that one has its new summary, the others take it (copy_summaries, counted as duplicates), as
+Phase 1 gives a copy of a file the content of the first (attachment_pipeline._reuse_content),
+key facts aside, and their vectors are dropped too. A copy whose representative failed or was
+left pending keeps its old summary; one read again with it keeps its new text and the summary
+status it had. A batch job records its groups, and its collect copies the same way. --dry-run
+and --estimate count one row per group, and the others as duplicates.
+
 --token-budget bounds the Phase 2 run (src/llm_cost.py TokenBudget); --estimate prints the calls,
 tokens and cost the chosen rows would take and changes nothing (estimate_reextract). --batch sends
 the summaries as a Vertex AI batch job at half price, --batch-collect stores its replies, and
 --batch --probe sends ten requests and stores nothing (src/extract/vertex_batch.py).
 """
 
+import hashlib
 import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from src.config import ATTACHMENTS_DIR, DEFAULT_DB
+from src.extract.attachment_digest import is_spreadsheet
 from src.extract.attachment_extractors import extract_text_from_file
 from src.extract.attachment_pipeline import (
     LONG_TEXT_CHARS,
@@ -150,11 +167,13 @@ def select_rows(
     limit: int | None = None,
     after_id: int | None = None,
     full_parts: list[int] | None = None,
+    no_spreadsheets: bool = False,
 ) -> list[tuple]:
     """(content id, attachment id, file path, mime type, whether Phase 1 runs, whether the row
     holds text) per chosen row, lowest content id first, above `after_id` when given.
 
-    `full_parts` adds those attachments' rows that hold text, to be summarised again."""
+    `full_parts` adds those attachments' rows that hold text, to be summarised again.
+    `no_spreadsheets` leaves out the rows a workbook reader read (is_spreadsheet)."""
     rows: dict[int, tuple] = {}
     chosen = [SELECTORS[name] for name in sorted(which)]
     if full_parts:
@@ -163,13 +182,15 @@ def select_rows(
             (f"ac.attachment_id IN ({ids}) AND ac.extraction_status = 'extracted'", False)
         )
     for where, reread in chosen:
-        for ac_id, att_id, file_path, mime, has_text in conn.execute(
-            "SELECT ac.id, a.id, a.file_path, a.mime_type, ac.extracted_text IS NOT NULL"
-            " FROM attachment_content ac"
+        for ac_id, att_id, file_path, mime, has_text, method in conn.execute(
+            "SELECT ac.id, a.id, a.file_path, a.mime_type, ac.extracted_text IS NOT NULL,"
+            " ac.extraction_method FROM attachment_content ac"
             f" JOIN attachments a ON a.id = ac.attachment_id WHERE ({where}) AND ac.id > ?"
             " AND COALESCE(ac.extraction_method, '') != 'vision'",
             (after_id or 0,),
         ):
+            if no_spreadsheets and is_spreadsheet(method):
+                continue
             prior = rows.get(ac_id)
             rows[ac_id] = (
                 ac_id,
@@ -181,6 +202,59 @@ def select_rows(
             )
     ordered = [rows[k] for k in sorted(rows)]
     return ordered[:limit] if limit else ordered
+
+
+def duplicate_groups(conn, ac_ids) -> dict[int, list[int]]:
+    """The content rows grouped by identical content: the attachment's sha256, or, for one
+    recorded without it, a hash of the text it holds now (a row with neither is alone).
+    Returns {lowest content id of a group: the others in it, lowest first} for every group."""
+    ids = sorted(set(ac_ids))
+    groups: dict[tuple, list[int]] = {}
+    # In chunks: an estimate can take tens of thousands of rows, more than one statement binds.
+    for start in range(0, len(ids), 500):
+        chunk = ids[start : start + 500]
+        marks = ",".join("?" * len(chunk))
+        for ac_id, sha256, text in conn.execute(
+            "SELECT ac.id, a.sha256, ac.extracted_text FROM attachment_content ac"
+            f" JOIN attachments a ON a.id = ac.attachment_id WHERE ac.id IN ({marks})",
+            chunk,
+        ):
+            if sha256:
+                key: tuple = ("sha256", sha256)
+            elif text is not None:
+                key = ("text", hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest())
+            else:
+                key = ("row", ac_id)
+            groups.setdefault(key, []).append(ac_id)
+    return {min(members): sorted(members)[1:] for members in groups.values()}
+
+
+def copy_summaries(conn, groups: dict[int, list[int]]) -> list[int]:
+    """Give the other rows of each group the new summary of its representative, when it has one
+    (llm_status 'extracted'), as Phase 1 gives a copy of a file the first one's content
+    (attachment_pipeline._reuse_content). Key facts, decisions and action items are not copied:
+    the representative's email carries them. Returns the rows that took a copy, whose vectors
+    the caller drops."""
+    copied: list[int] = []
+    for rep, others in groups.items():
+        if not others:
+            continue
+        found = conn.execute(
+            "SELECT summary, language, llm_status, llm_extracted_at FROM attachment_content"
+            " WHERE id = ? AND llm_status = 'extracted'",
+            (rep,),
+        ).fetchone()
+        if found is None:
+            continue
+        for ac_id in others:
+            if conn.execute(
+                "UPDATE attachment_content SET summary = ?, language = ?, llm_status = ?,"
+                f" llm_extracted_at = ?, llm_error = NULL WHERE id = ? AND {NOT_VISION}",
+                (*found, ac_id),
+            ).rowcount:
+                copied.append(ac_id)
+    conn.commit()
+    return copied
 
 
 def ocr_close(old_method: str | None, new_method: str | None, stored: str, text: str) -> bool:
@@ -201,6 +275,7 @@ def reextract(
     full_parts: list[int] | None = None,
     token_budget: TokenBudget | None = None,
     batch: bool = False,
+    no_spreadsheets: bool = False,
 ) -> dict:
     """Read again and summarise again the rows the selectors choose. See the module docstring.
 
@@ -209,7 +284,8 @@ def reextract(
     again. `token_budget` bounds the Phase 2 run at the end: a row it leaves pending keeps its
     summary and its vector, and the nightly pass takes it. With `batch` the summaries go as a
     Vertex AI batch job (src/extract/vertex_batch.py), described in stats["batch"]; its collect
-    stores them and drops the vectors of what it stores."""
+    stores them and drops the vectors of what it stores. `no_spreadsheets` leaves workbooks out.
+    Copies of one document are summarised once (duplicate_groups, copy_summaries)."""
     db_path = str(db_path or DEFAULT_DB)
     root = Path(root) if root else ATTACHMENTS_DIR
     stats: dict[str, Any] = dict.fromkeys(
@@ -223,7 +299,9 @@ def reextract(
             "unchanged",
             "relabelled",
             "ocr_close",
+            "spreadsheets",
             "summarised",
+            "duplicates",
             "failed",
             "over_budget",
             "highest_id",
@@ -231,6 +309,11 @@ def reextract(
         0,
     )
     touched: list[tuple[int, int]] = []
+    # The rows to summarise again without reading them, set pending once grouped, and the
+    # summary status each row read again had, for a copy that waits for its representative.
+    resummarise: list[tuple[int, int]] = []
+    llm_before: dict[int, tuple] = {}
+    copies: dict[int, list[int]] = {}
     conn = _connect(db_path)
     try:
         now = datetime.now().isoformat()
@@ -250,21 +333,12 @@ def reextract(
             ]
             mark_full_parts(conn, known)
             stats["flagged"] = len(known)
-        rows = select_rows(conn, which or set(), limit, after_id, full_parts)
+        rows = select_rows(conn, which or set(), limit, after_id, full_parts, no_spreadsheets)
         stats["selected"] = len(rows)
         stats["highest_id"] = rows[-1][0] if rows else 0
         for ac_id, att_id, file_path, mime, reread, has_text in rows:
             if not reread:
-                stats["resummarise"] += 1
-                if not dry_run:
-                    done = conn.execute(
-                        "UPDATE attachment_content SET llm_status = 'pending', llm_error = NULL"
-                        f" WHERE id = ? AND {NOT_VISION}",
-                        (ac_id,),
-                    ).rowcount
-                    conn.commit()
-                    if done:
-                        touched.append((ac_id, att_id))
+                resummarise.append((ac_id, att_id))
                 continue
             path = None
             if file_path and not file_path.startswith("text:"):
@@ -274,10 +348,14 @@ def reextract(
                 continue
             stats["reread"] += 1
             if dry_run:
+                touched.append((ac_id, att_id))
                 continue
             result = extract_text_from_file(
                 str(path), mime or "", zip_seconds=math.inf, ocr_seconds=math.inf
             )
+            if no_spreadsheets and is_spreadsheet(result["method"]):
+                stats["spreadsheets"] += 1
+                continue
             # A re-read with no text, or with less than was stored (a reader that suddenly reads
             # less), replaces no text and does not mark a row with text read.
             if not result["text"]:
@@ -304,9 +382,9 @@ def reextract(
                     stats["unchanged" if tuple(before) == verdict else "relabelled"] += 1
                 continue
             text = redact_secrets(result["text"])
-            stored, stored_method, stored_error = conn.execute(
-                "SELECT extracted_text, extraction_method, extraction_error"
-                " FROM attachment_content WHERE id = ?",
+            stored, stored_method, stored_error, *llm_status = conn.execute(
+                "SELECT extracted_text, extraction_method, extraction_error, llm_status,"
+                " llm_error FROM attachment_content WHERE id = ?",
                 (ac_id,),
             ).fetchone()
             # A reading no longer marked as Greek read as Latin look-alikes replaces one that was,
@@ -355,7 +433,38 @@ def reextract(
                 stats["kept"] += 1
                 continue
             touched.append((ac_id, att_id))
+            llm_before[ac_id] = tuple(llm_status)
         conn.commit()
+        # One row per document goes to Phase 2. A copy read again goes back to the summary
+        # status it had, until its representative's new summary reaches it.
+        groups = duplicate_groups(conn, dict(resummarise + touched))
+        copies = {rep: others for rep, others in groups.items() if others}
+        waiting = {ac_id for others in copies.values() for ac_id in others}
+        stats["resummarise"] = sum(1 for ac_id, _ in resummarise if ac_id not in waiting)
+        if dry_run:
+            stats["duplicates"] = len(waiting)
+            touched = []
+        else:
+            for ac_id in waiting & llm_before.keys():
+                conn.execute(
+                    "UPDATE attachment_content SET llm_status = ?, llm_error = ?"
+                    f" WHERE id = ? AND {NOT_VISION}",
+                    (*llm_before[ac_id], ac_id),
+                )
+            for ac_id, att_id in resummarise:
+                if (
+                    ac_id not in waiting
+                    and conn.execute(
+                        "UPDATE attachment_content SET llm_status = 'pending', llm_error = NULL"
+                        f" WHERE id = ? AND {NOT_VISION}",
+                        (ac_id,),
+                    ).rowcount
+                ):
+                    touched.append((ac_id, att_id))
+            conn.commit()
+            touched = sorted(row for row in touched if row[0] not in waiting)
+            sent = {ac_id for ac_id, _ in touched}
+            copies = {rep: others for rep, others in copies.items() if rep in sent}
     finally:
         conn.close()
     if touched and batch:
@@ -366,7 +475,10 @@ def reextract(
             attachment_ids=[att for _, att in touched],
             token_budget=token_budget,
             origin="reextract",
+            copies=copies,
         )
+        # Copied when the collect stores their representatives' summaries.
+        stats["duplicates_waiting"] = sum(len(others) for others in copies.values())
     elif touched:
         from src.store.embeddings import remove_vectors
 
@@ -393,8 +505,11 @@ def reextract(
                     [ac_id for ac_id, _ in touched],
                 )
             ]
+            copied = copy_summaries(conn, copies)
         finally:
             conn.close()
+        stats["duplicates"] = len(copied)
+        redone += copied
         if redone:
             remove_vectors([-ac_id for ac_id in redone])
     return stats
@@ -407,6 +522,7 @@ def estimate_reextract(
     after_id: int | None = None,
     full_parts: list[int] | None = None,
     chars_per_token: float | None = None,
+    no_spreadsheets: bool = False,
 ) -> dict:
     """What reextract would spend on the rows it would take now: their calls, tokens and cost
     (src/extract/attachment_pipeline.py estimate_rows). Writes nothing, flags nothing and asks
@@ -414,13 +530,20 @@ def estimate_reextract(
 
     A row is estimated from the text it holds now. A row to be read again first may come back
     longer, so for those the estimate is a floor; one that holds no text yet is not estimated
-    and is counted in `unknown`."""
+    and is counted in `unknown`. Copies of one document are estimated once and counted in
+    `duplicates` (duplicate_groups); `no_spreadsheets` leaves workbooks out."""
     db_path = str(db_path or DEFAULT_DB)
     conn = _connect(db_path)
     try:
-        rows = select_rows(conn, which or set(), limit, after_id, full_parts)
+        rows = select_rows(conn, which or set(), limit, after_id, full_parts, no_spreadsheets)
+        with_text = [row[0] for row in rows if row[5]]
+        reps = sorted(duplicate_groups(conn, with_text))
     finally:
         conn.close()
-    with_text = [row[0] for row in rows if row[5]]
-    est = estimate_summaries(db_path, with_text, full_parts or (), chars_per_token)
-    return {**est, "selected": len(rows), "unknown": len(rows) - len(with_text)}
+    est = estimate_summaries(db_path, reps, full_parts or (), chars_per_token)
+    return {
+        **est,
+        "selected": len(rows),
+        "unknown": len(rows) - len(with_text),
+        "duplicates": len(with_text) - len(reps),
+    }

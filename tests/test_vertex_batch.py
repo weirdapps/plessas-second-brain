@@ -974,6 +974,57 @@ def test_reextract_batch_reads_again_then_sends_the_summaries_as_a_job(
     assert "resummarise" in out and cloud.jobs.job()["name"] in out
 
 
+def test_reextract_batch_sends_one_row_per_document_and_copies_at_collect(
+    cloud, store, tmp_path, monkeypatch, capsys
+):
+    path, conn = store
+    first, second, other = (
+        add(conn, SHORT, llm="extracted"),
+        add(conn, SHORT, llm="extracted"),
+        add(conn, SHORT + " B", llm="extracted"),
+    )
+    atts = [a for (a,) in conn.execute("SELECT id FROM attachments ORDER BY id")]
+    removed: list = []
+    monkeypatch.setattr(
+        "src.store.embeddings.remove_vectors", lambda ids: removed.append(sorted(ids))
+    )
+
+    assert cli.cmd_reextract(_rx_args(path, tmp_path, full_parts=atts, batch=True)) == 0
+
+    assert holds(conn) == 2
+    assert [line["custom_id"] for line in cloud.jobs.requests()] == [
+        f"ac{first}-s",
+        f"ac{other}-s",
+    ]
+    assert status(conn, second) == ("extracted", "old summary", None)
+    [(_key, record)] = vertex_batch.open_jobs(conn)
+    assert record["copies"] == {str(first): [second]}
+    capsys.readouterr()
+
+    cloud.jobs.finish(
+        cloud.jobs.job()["name"],
+        [ok(f"ac{first}-s", reply("Policy summary")), ok(f"ac{other}-s")],
+    )
+    assert vertex_batch.cli_collect(str(path)) == 0
+
+    assert status(conn, second) == ("extracted", "Policy summary", None)
+    assert removed == [sorted([-first, -second, -other])]
+    assert "  duplicates    : 1 (took the summary of their copy)" in capsys.readouterr().out
+
+
+def test_a_failed_representative_in_a_batch_job_copies_nothing(cloud, store, tmp_path):
+    path, conn = store
+    first, second = add(conn, SHORT, llm="extracted"), add(conn, SHORT, llm="extracted")
+    atts = [a for (a,) in conn.execute("SELECT id FROM attachments ORDER BY id")]
+    assert cli.cmd_reextract(_rx_args(path, tmp_path, full_parts=atts, batch=True)) == 0
+    cloud.jobs.finish(cloud.jobs.job()["name"], [failed(f"ac{first}-s")])
+
+    [job] = vertex_batch.collect(str(path))["jobs"]
+
+    assert status(conn, second) == ("extracted", "old summary", None)
+    assert "duplicates" not in job["counts"]
+
+
 def test_reextract_probe_prints_the_results_and_the_cost(
     cloud, store, tmp_path, monkeypatch, capsys
 ):

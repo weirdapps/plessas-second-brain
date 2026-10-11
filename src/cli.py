@@ -398,6 +398,9 @@ def cmd_reextract(args):
         )
         return 2
     chosen = ", ".join(sorted(which) + (["full parts"] if full_parts else []))
+    no_spreadsheets = getattr(args, "no_spreadsheets", False)
+    if no_spreadsheets:
+        chosen += ", no spreadsheets"
     if getattr(args, "estimate", False):
         est = estimate_reextract(
             args.db,
@@ -405,10 +408,13 @@ def cmd_reextract(args):
             limit=args.limit or None,
             after_id=getattr(args, "after_id", 0) or None,
             full_parts=full_parts,
+            no_spreadsheets=no_spreadsheets,
         )
         print(f"reextract ({chosen}) ESTIMATE (no model call made, nothing changed):")
         print(f"  selected      : {est['selected']:,}")
         print(f"  no text yet   : {est['unknown']:,} (read first, so not estimated)")
+        if "duplicates" in est:
+            print(f"  duplicates    : {est['duplicates']:,} (take a copy, so not estimated)")
         _print_estimate(est)
         return 0
     try:
@@ -435,6 +441,7 @@ def cmd_reextract(args):
         full_parts=full_parts,
         token_budget=budget,
         batch=batch,
+        no_spreadsheets=no_spreadsheets,
     )
     print(f"reextract ({chosen}){' DRY RUN' if args.dry_run else ''}:")
     for key in (
@@ -447,17 +454,24 @@ def cmd_reextract(args):
         "unchanged",
         "relabelled",
         "ocr_close",
+        "spreadsheets",
         "summarised",
+        "duplicates",
         "failed",
         "over_budget",
     ):
-        print(f"  {key:<12}: {stats[key]:,}")
+        print(f"  {key:<12}: {stats.get(key, 0):,}")
     # No thousands separator: a batch runner passes this back as --after-id.
     print(f"  {'highest id':<12}: {stats['highest_id']}")
     if "batch" in stats:
         from src.extract.vertex_batch import print_submit
 
         print_submit(stats["batch"])
+        if stats.get("duplicates_waiting"):
+            print(
+                f"  duplicates    : {stats['duplicates_waiting']:,} take the summary of their copy"
+                " when the job is collected"
+            )
     return 0
 
 
@@ -2049,6 +2063,12 @@ def main():
     )
     parser_reextract.add_argument(
         "--garbled", action="store_true", help="OCR text marked as Greek read as Latin letters"
+    )
+    parser_reextract.add_argument(
+        "--no-spreadsheets",
+        action="store_true",
+        dest="no_spreadsheets",
+        help="Leave workbooks (rows a spreadsheet reader read) out of the chosen rows",
     )
     parser_reextract.add_argument("--limit", type=int, default=0, help="Max rows (0 = all)")
     parser_reextract.add_argument(

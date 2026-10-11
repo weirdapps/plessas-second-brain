@@ -567,6 +567,8 @@ python -m src.cli maint ocr-regarble [--apply]              # find stored OCR te
 python -m src.cli maint refetch-garbled --limit 200         # producer: fetch back from the mailbox the swept originals of marked texts, by id, then by folder, time and subject; repeat until none is left to try
 python -m src.cli maint reextract --garbled                 # read marked scans again, Greek first, and summarise the ones that now read
 python -m src.cli maint reextract --long --estimate          # price a re-summary before running it; changes nothing
+python -m src.cli maint reextract --long --no-spreadsheets   # documents only: leave workbooks out of the chosen rows and the estimate
+# reextract summarises copies of one document (same sha256, else same text) once and copies the summary to the rest (duplicates)
 python -m src.cli maint reextract --batch --probe            # ten requests as a batch job: prints the replies and the cost, stores nothing
 python -m src.cli maint reextract --long --batch --limit 500 # read again, then send the summaries as a batch job; --batch-collect stores them
 python -m src.cli maint reextract --full-parts 1234 5678     # summarise these attachments from up to 50 parts, now and on every later summary

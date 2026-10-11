@@ -409,9 +409,9 @@ def test_a_name_filter_folds_each_person_once_not_each_email_link(conn):
         lambda c: __import__("src.store.query", fromlist=["x"]).meeting_prep(
             c, ["Καραγιάννης"], topic="Προϋπολογισμός", days=100000
         )["topic_context"]["decisions"],
-        lambda c: __import__("src.store.recall", fromlist=["x"]).recall(c, "Προϋπολογισμός")[
-            "topic_context"
-        ],
+        lambda c: __import__("src.store.recall", fromlist=["x"]).recall(
+            c, "Προϋπολογισμός", include_context=True
+        )["topic_context"],
     ],
     ids=["query_by_topic", "query_decisions", "query_combined", "meeting_prep", "recall"],
 )

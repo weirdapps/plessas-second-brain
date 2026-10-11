@@ -4,6 +4,7 @@ import sqlite3
 from unittest.mock import patch
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 
 @pytest.fixture
@@ -112,8 +113,8 @@ def test_refetch_requires_url(mock_get_conn, mock_conn):
     mock_get_conn.return_value = mock_conn
     from src.mcp_server import sharepoint_index
 
-    result = sharepoint_index(operation="refetch")
-    assert "error" in result
+    with pytest.raises(ToolError, match="url is required"):
+        sharepoint_index(operation="refetch")
 
 
 @patch("src.mcp_server._get_conn")
@@ -160,8 +161,8 @@ def test_refetch_refuses_url_not_in_the_store(mock_fetch, mock_get_conn, mock_co
     mock_get_conn.return_value = mock_conn
     from src.mcp_server import sharepoint_index
 
-    result = sharepoint_index(operation="refetch", url="https://dummy.sharepoint.com/x/evil.docx")
-    assert "error" in result
+    with pytest.raises(ToolError, match="not present"):
+        sharepoint_index(operation="refetch", url="https://dummy.sharepoint.com/x/evil.docx")
     mock_fetch.assert_not_called()
 
 
@@ -179,8 +180,8 @@ def test_refetch_refuses_foreign_host_even_when_recorded(mock_fetch, mock_get_co
     mock_get_conn.return_value = mock_conn
     from src.mcp_server import sharepoint_index
 
-    result = sharepoint_index(operation="refetch", url="https://test.sharepoint.com/f.docx")
-    assert "error" in result
+    with pytest.raises(ToolError, match="managed SharePoint host"):
+        sharepoint_index(operation="refetch", url="https://test.sharepoint.com/f.docx")
     mock_fetch.assert_not_called()
 
 
@@ -189,5 +190,5 @@ def test_unknown_operation(mock_get_conn, mock_conn):
     mock_get_conn.return_value = mock_conn
     from src.mcp_server import sharepoint_index
 
-    result = sharepoint_index(operation="bogus")
-    assert "error" in result
+    with pytest.raises(ToolError, match="list_stale"):
+        sharepoint_index(operation="bogus")

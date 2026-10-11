@@ -152,11 +152,19 @@ class TestRecallTextSearch:
             "actions",
             "commitments",
             "inline_images",
-            "person_context",
-            "topic_context",
             "summary",
         ):
             assert kind in result, f"missing key: {kind}"
+
+    def test_the_dossiers_come_only_when_asked_for(self, recall_db):
+        """They were always attached: 27% of an average payload, often for the
+        wrong entity, a topic word resolved to a person."""
+        plain = recall(recall_db, UNIQUE_KW)
+        full = recall(recall_db, UNIQUE_KW, include_context=True)
+
+        assert "person_context" not in plain and "topic_context" not in plain
+        assert "has_person_context" not in plain["summary"]
+        assert "person_context" in full and "topic_context" in full
 
     def test_emails_includes_regular_mail(self, recall_db):
         result = recall(recall_db, UNIQUE_KW)
@@ -208,18 +216,18 @@ class TestRecallContextAutoDetection:
     """recall must auto-pull person/topic context when query matches one."""
 
     def test_person_context_populated_for_matching_name(self, recall_db):
-        result = recall(recall_db, "PolitiTest")
+        result = recall(recall_db, "PolitiTest", include_context=True)
         assert result["person_context"] is not None
         assert result["person_context"].get("person") is not None
         assert result["person_context"]["person"]["name"] == "PolitiTest"
 
     def test_topic_context_populated_for_matching_topic(self, recall_db):
-        result = recall(recall_db, "StrategyTopic")
+        result = recall(recall_db, "StrategyTopic", include_context=True)
         assert result["topic_context"] is not None
         assert result["topic_context"].get("topic") is not None
 
     def test_no_person_context_when_query_doesnt_match(self, recall_db):
-        result = recall(recall_db, UNIQUE_KW)
+        result = recall(recall_db, UNIQUE_KW, include_context=True)
         # UNIQUE_KW isn't a person name, so person_context should be None or empty
         pc = result["person_context"]
         assert pc is None or pc.get("person") is None

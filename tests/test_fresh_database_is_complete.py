@@ -17,6 +17,8 @@ stayed green: they tested a database production never builds.
 import inspect
 import sqlite3
 
+from mcp.server.mcpserver.exceptions import ToolError
+
 from src.config import CURRENT_SCHEMA_VERSION
 from src.store.schema import create_database, get_schema_version
 
@@ -121,7 +123,10 @@ def test_every_mcp_tool_runs_against_a_fresh_database(tmp_path, monkeypatch):
                 ok = False
         if not ok:
             continue
-        fn(**kwargs)  # must not raise
+        try:
+            fn(**kwargs)
+        except ToolError:
+            pass  # an answer the model reads (an unknown id), not a crash
         checked += 1
 
     assert checked >= 15, f"only exercised {checked} tools; the sweep is not finding them"

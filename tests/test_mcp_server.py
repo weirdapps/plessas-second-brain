@@ -114,7 +114,7 @@ def test_search_emails_keyword(mock_get_conn, mock_conn):
     # exist and this must actually work. It used to be wrapped in a bare
     # `except Exception: pass` because the hand-rolled schema had no FTS, which
     # meant the test passed whether search worked or raised.
-    result = search_emails("cards", search_type="keyword")
+    result = search_emails("cards", search_type="keyword")["result"]
     assert isinstance(result, list)
     assert any("cards" in (r.get("subject", "") + r.get("summary", "")).lower() for r in result)
 
@@ -122,7 +122,7 @@ def test_search_emails_keyword(mock_get_conn, mock_conn):
 @patch("src.mcp_server._get_conn")
 def test_query_decisions_all(mock_get_conn, mock_conn):
     mock_get_conn.return_value = mock_conn
-    result = query_decisions(days=365)
+    result = query_decisions(days=365)["result"]
     assert len(result) >= 1
     assert result[0]["decision"] == "Proceed with phase 2"
 
@@ -130,7 +130,7 @@ def test_query_decisions_all(mock_get_conn, mock_conn):
 @patch("src.mcp_server._get_conn")
 def test_query_decisions_by_topic(mock_get_conn, mock_conn):
     mock_get_conn.return_value = mock_conn
-    result = query_decisions(topic="cards")
+    result = query_decisions(topic="cards")["result"]
     assert isinstance(result, list)
 
 
@@ -184,7 +184,7 @@ def test_meeting_prep_multiple(mock_get_conn, mock_conn):
 @patch("src.mcp_server._get_conn")
 def test_search_attachments_found(mock_get_conn, mock_conn):
     mock_get_conn.return_value = mock_conn
-    result = search_attachments("consumer loans")
+    result = search_attachments("consumer loans")["result"]
     assert len(result) >= 1
     assert result[0]["filename"] == "Q1_2026_Report.pdf"
     assert (
@@ -195,7 +195,7 @@ def test_search_attachments_found(mock_get_conn, mock_conn):
 @patch("src.mcp_server._get_conn")
 def test_search_attachments_with_summary(mock_get_conn, mock_conn):
     mock_get_conn.return_value = mock_conn
-    result = search_attachments("retail banking")
+    result = search_attachments("retail banking")["result"]
     assert len(result) >= 1
     assert result[0]["summary"] is not None
     assert "16.9M" in result[0]["summary"]
@@ -204,7 +204,7 @@ def test_search_attachments_with_summary(mock_get_conn, mock_conn):
 @patch("src.mcp_server._get_conn")
 def test_search_attachments_not_found(mock_get_conn, mock_conn):
     mock_get_conn.return_value = mock_conn
-    result = search_attachments("nonexistent_topic_xyz")
+    result = search_attachments("nonexistent_topic_xyz")["result"]
     assert result == []
 
 

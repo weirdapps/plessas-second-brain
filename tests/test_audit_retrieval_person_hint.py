@@ -37,7 +37,7 @@ def conn():
 
 @pytest.mark.parametrize("query", ["AI", "EU", "ess", "kapidou"])
 def test_a_query_inside_a_word_of_a_name_attaches_no_one(conn, query):
-    result = recall(conn, query)
+    result = recall(conn, query, include_context=True)
 
     assert result["person_context"] is None
     assert result["summary"]["has_person_context"] is False
@@ -45,7 +45,7 @@ def test_a_query_inside_a_word_of_a_name_attaches_no_one(conn, query):
 
 @pytest.mark.parametrize("query", ["Iris", "Okapidou", "okapid", "iris okapidou", "Michail"])
 def test_a_query_at_the_start_of_a_word_still_attaches_the_person(conn, query):
-    result = recall(conn, query)
+    result = recall(conn, query, include_context=True)
 
     assert result["person_context"] is not None
 
@@ -77,7 +77,7 @@ def test_the_person_attached_is_the_one_resolve_person_finds():
     c.execute("INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (1, 2, 'cc')")
     c.commit()
 
-    result = recall(c, "AI")
+    result = recall(c, "AI", include_context=True)
 
     assert result["person_context"]["person"]["name"] == "AI Compliance"
     assert result["summary"]["has_person_context"] is True
@@ -104,10 +104,12 @@ def test_a_topic_word_that_starts_an_address_attaches_no_one():
     attached whoever held a data-studio-noreply address."""
     c = _one_person("Alex Poe", "data-studio-noreply@example.com")
 
-    assert recall(c, "data")["person_context"] is None
+    assert recall(c, "data", include_context=True)["person_context"] is None
 
 
 def test_a_surname_and_an_initial_attach_the_person():
     c = _one_person("ROE JANE", "jroe@example.com")
 
-    assert recall(c, "Roe J")["person_context"]["person"]["name"] == "ROE JANE"
+    assert (
+        recall(c, "Roe J", include_context=True)["person_context"]["person"]["name"] == "ROE JANE"
+    )

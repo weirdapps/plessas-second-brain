@@ -9,6 +9,7 @@ meeting at 00:30 Athens time was filed under the day before.
 import sqlite3
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from src.config import CURRENT_SCHEMA_VERSION
 from src.export.calendar_export import parse_event
@@ -182,9 +183,8 @@ def test_a_date_time_with_an_offset_is_taken_at_its_word(mcp):
 def test_a_malformed_date_is_an_error_not_a_string_compare(mcp, field, value):
     _conn, mcp_server = mcp
 
-    out = mcp_server.query_calendar_events(**{field: value})
-
-    assert "error" in out and field in out["error"]
+    with pytest.raises(ToolError, match=field):
+        mcp_server.query_calendar_events(**{field: value})
 
 
 def test_the_limit_is_clamped(mcp):

@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from src.store import sql_readonly
 
@@ -374,7 +375,8 @@ def test_sql_query_tool_refuses_writes(db, monkeypatch):
     from src import mcp_server
 
     monkeypatch.setattr(sql_readonly, "DEFAULT_DB", db)
-    assert "error" in mcp_server.sql_query("DELETE FROM emails")
+    with pytest.raises(ToolError, match="refused"):
+        mcp_server.sql_query("DELETE FROM emails")
     assert _email_count(db) == 3
 
 
@@ -398,11 +400,9 @@ def test_the_sql_query_docstring_states_the_live_limits():
     # A constant changed without the docstring would have agents trust stale caps.
     # Each number is matched in its phrase: a bare "100" is also in "100,000", so
     # MAX_ROWS = 100 passed a substring check.
-    import inspect
+    from tests.mcp_listing import advertised_text
 
-    from src import mcp_server
-
-    doc = " ".join(inspect.getdoc(mcp_server.sql_query).split())
+    doc = advertised_text("sql_query")
     s = sql_readonly
     for phrase in (
         f"rows (cap {s.MAX_ROWS})",

@@ -289,16 +289,17 @@ def test_a_real_server_refuses_without_the_token_and_lists_tools_with_it(tmp_pat
         refused.value.close()
         assert refused.value.code == 401
 
-        async def list_tools() -> list[str]:
+        async def list_tools() -> dict:
             with anyio.fail_after(30):
                 headers = {"Authorization": f"Bearer {token}"}
                 async with create_mcp_http_client(headers=headers) as http:
                     async with streamable_http_client(url, http_client=http) as (read, write):
                         async with ClientSession(read, write) as session:
                             await session.initialize()
-                            return [tool.name for tool in (await session.list_tools()).tools]
+                            listed = (await session.list_tools()).tools
+                            return {tool.name: tool.annotations for tool in listed}
 
-        names = anyio.run(list_tools)
+        hints = anyio.run(list_tools)
     finally:
         server.terminate()
         try:
@@ -306,5 +307,10 @@ def test_a_real_server_refuses_without_the_token_and_lists_tools_with_it(tmp_pat
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait()
-    assert len(names) == 27, names
-    assert {"sql_query", "sql_schema"} <= set(names)
+    assert len(hints) == 27, sorted(hints)
+    assert {"sql_query", "sql_schema"} <= set(hints)
+    # The annotations reach a client over the wire: read-only everywhere but the
+    # SharePoint refetch, which is what lets Claude Code run brain calls in parallel.
+    assert all(h is not None for h in hints.values())
+    assert hints["recall"].read_only_hint is True
+    assert hints["sharepoint_index"].read_only_hint is False

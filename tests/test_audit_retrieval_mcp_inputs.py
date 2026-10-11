@@ -11,6 +11,7 @@ nothing, and a date that is not ISO excluded every email. Each read as
 import importlib
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from src import mcp_server
 from src.store.schema import create_database, get_connection
@@ -153,15 +154,13 @@ def test_a_negative_or_zero_limit_returns_one_row_not_all_or_none(db, limit):
     ],
 )
 def test_an_unknown_search_type_is_an_error_naming_the_allowed_values(db, call):
-    out = call()
-
-    assert "keyword" in out["error"] and "semantic" in out["error"]
+    with pytest.raises(ToolError, match="keyword, semantic"):
+        call()
 
 
 def test_an_unknown_teams_kind_is_an_error_naming_the_allowed_values(db):
-    out = mcp_server.search_teams("okapi", kind="bogus")
-
-    assert all(k in out["error"] for k in ("thread", "message", "both"))
+    with pytest.raises(ToolError, match="thread, message, both"):
+        mcp_server.search_teams("okapi", kind="bogus")
 
 
 @pytest.mark.parametrize(
@@ -178,10 +177,8 @@ def test_an_unknown_teams_kind_is_an_error_naming_the_allowed_values(db):
     ],
 )
 def test_query_emails_rejects_a_date_that_is_not_iso(db, dates):
-    out = mcp_server.query_emails(keyword="okapi", **dates)
-
-    assert isinstance(out, dict)
-    assert "YYYY-MM-DD" in out["error"]
+    with pytest.raises(ToolError, match="YYYY-MM-DD"):
+        mcp_server.query_emails(keyword="okapi", **dates)
 
 
 @pytest.mark.parametrize(

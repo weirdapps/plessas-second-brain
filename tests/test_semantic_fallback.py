@@ -10,6 +10,7 @@ still runs by meaning around them, and every row says it was ranked that way.
 
 import numpy as np
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from src.store.schema import create_database
 
@@ -85,7 +86,5 @@ def test_no_keyword_match_returns_the_cause_instead_of_a_bare_tool_error(
     monkeypatch.setattr(embeddings, "embed_query", _refusing_embedder)
     monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
 
-    out = getattr(mcp_server, tool)("zeppelin", search_type="semantic")
-
-    assert isinstance(out, dict)
-    assert "allowedModels" in out["error"]
+    with pytest.raises(ToolError, match="allowedModels"):
+        getattr(mcp_server, tool)("zeppelin", search_type="semantic")

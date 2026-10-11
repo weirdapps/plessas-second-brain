@@ -194,6 +194,22 @@ def test_a_text_pdf_whose_scanned_pages_cannot_be_ocrd_keeps_its_text_and_its_fi
     assert "left unread" in out["error"]
 
 
+def test_a_text_pdf_whose_pages_cannot_be_inspected_keeps_its_text(tmp_path, monkeypatch):
+    """A fault in looking for scanned pages must not cost the text layer already read."""
+    calls = _tesseract(monkeypatch, {ax.OCR_LANGS: GREEK})
+
+    def broken(self, *args, **kwargs):
+        raise RuntimeError("cannot read the page's resources")
+
+    monkeypatch.setattr(fitz.Page, "get_image_info", broken)
+
+    out = ax.extract_text_from_file(_pdf(tmp_path, ENGLISH[:120], "scan"), "application/pdf")
+
+    assert (out["status"], out["method"], calls) == ("extracted", "pymupdf", [])
+    assert ENGLISH[:60] in out["text"]
+    assert "left unread" in out["error"]
+
+
 # --- the mark --------------------------------------------------------------------------------
 
 

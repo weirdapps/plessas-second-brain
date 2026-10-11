@@ -417,41 +417,39 @@ def _read_scanned_pages(path: str, pages: list[str], seconds: float) -> dict:
     of a scan, and its reading takes the page's place when it is longer. A blank page, or one
     with only a short heading, shows no image and is not read. The pages share the scan budget,
     `seconds`: once it is spent the error says "pages left unread", as a scan's does, and
-    reextract with no budget reads the rest. A page this host cannot OCR (no tesseract) says
-    the same, and the text layer is kept as it was.
+    reextract with no budget reads the rest. A fault while looking for or reading those pages
+    (no tesseract on this host, a page PyMuPDF cannot render) says the same, and the text layer
+    is kept as it was.
     """
-    import fitz
-    from PIL import Image
-
     read = list(pages)
     ocrd = 0
     note = None
-    doc = fitz.open(path)
-    try:
-        scanned = [
-            n
-            for n, text in enumerate(pages)
-            if len(text.strip()) < MIN_TEXT_CHARS and doc[n].get_image_info()
-        ]
-        started = time.monotonic()
-        for i, n in enumerate(scanned):
-            if i and time.monotonic() - started > seconds:
-                note = f"time budget spent, {len(scanned) - i} pages left unread"
-                break
+    thin = [n for n, page in enumerate(pages) if len(page.strip()) < MIN_TEXT_CHARS]
+    left = len(thin)
+    if thin:
+        import fitz
+        from PIL import Image
+
+        try:
+            doc = fitz.open(path)
             try:
-                pix = doc[n].get_pixmap(dpi=200)
-                reading = _read_page(Image.open(io.BytesIO(pix.tobytes("png")))).strip()
-            except Exception as e:
-                note = (
-                    f"{len(scanned) - i} scanned pages left unread: "
-                    f"{type(e).__name__}: {str(e)[:200]}"
-                )
-                break
-            if len(reading) > len(pages[n].strip()):
-                read[n] = reading
-                ocrd += 1
-    finally:
-        doc.close()
+                scanned = [n for n in thin if doc[n].get_image_info()]
+                left = len(scanned)
+                started = time.monotonic()
+                for i, n in enumerate(scanned):
+                    if i and time.monotonic() - started > seconds:
+                        note = f"time budget spent, {left} pages left unread"
+                        break
+                    pix = doc[n].get_pixmap(dpi=200)
+                    reading = _read_page(Image.open(io.BytesIO(pix.tobytes("png")))).strip()
+                    left -= 1
+                    if len(reading) > len(pages[n].strip()):
+                        read[n] = reading
+                        ocrd += 1
+            finally:
+                doc.close()
+        except Exception as e:
+            note = f"{left} pages left unread: {type(e).__name__}: {str(e)[:200]}"
     return {
         "text": _truncate("\n\n".join(read)),
         "method": "pymupdf+tesseract" if ocrd else "pymupdf",

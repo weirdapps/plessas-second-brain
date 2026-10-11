@@ -13,9 +13,9 @@ it to one of those locations, or into a plugin, if you want it to load. Until
 then it is documentation of the intended workflow.
 
 > **Primary path: `mcp__second-brain__recall(query)`.** One fan-out call across
-> every text-bearing index, plus auto-pulled person and topic context. Use it
-> first; drop to the per-kind tools only when you need a filter it does not
-> expose.
+> every text-bearing index; `include_context=true` adds the person and topic
+> dossiers the query matches. Use it first; drop to the per-kind tools only when
+> you need a filter it does not expose.
 >
 > Per-kind tools: `search_emails`, `search_attachments`, `search_teams`,
 > `search_whatsapp`, `search_conversations`, `query_calendar_events`,
@@ -72,9 +72,10 @@ ranking; the rest are keyword-only.
 
 **Check freshness before answering about anything recent.** The database is
 usually a replica of a machine that builds it elsewhere, so it lags. `recall`
-attaches `_stale_warning` and `data_as_of` when the copy is behind, and `stats`
-always returns `data_as_of`, `age_hours` and `stale`. For mail newer than the
-replica, use `outlook_live_search`.
+opens with `summary`, `data_as_of` and `stale`, plus `_stale_warning` when the
+copy is behind, and `stats` always returns `data_as_of`, `age_hours` and
+`stale`. For mail newer than the replica, use `outlook_live_search`. A list cut
+to fit the 40,000-character answer budget is named in `truncated`.
 
 The CLI mirrors the same queries when no MCP session is available:
 

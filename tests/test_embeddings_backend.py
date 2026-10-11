@@ -1,4 +1,4 @@
-"""Which service embeds: Vertex (the default) or the Gemini API with a key.
+"""Which service embeds: the Gemini API when asked for or when a key is set, else Vertex.
 
 The same model, gemini-embedding-001, is served by both. When the Vertex
 project stopped serving it, the store needed a way to reach it through
@@ -45,9 +45,26 @@ def test_gemini_backend_without_a_key_fails_before_any_call(env):
         _get_client()
 
 
-def test_the_default_stays_on_vertex(env):
+def test_the_default_stays_on_vertex_without_a_key(env):
     from src.store.embeddings import _get_client
 
+    assert _get_client().kwargs == {"vertexai": True, "project": "proj", "location": "europe-west1"}
+
+
+def test_a_key_with_no_backend_set_uses_the_gemini_api(env):
+    """A server that had the key but not the switch called Vertex, which can
+    refuse the model, and its semantic search went quiet."""
+    from src.store.embeddings import _get_client
+
+    env.setenv("GEMINI_API_KEY", "k-123")
+
+    assert _get_client().kwargs == {"api_key": "k-123"}
+
+
+def test_an_explicit_vertex_backend_wins_over_a_key(env):
+    from src.store.embeddings import _get_client
+
+    env.setenv("BRAIN_EMBED_BACKEND", "vertex")
     env.setenv("GEMINI_API_KEY", "k-123")
 
     assert _get_client().kwargs == {"vertexai": True, "project": "proj", "location": "europe-west1"}

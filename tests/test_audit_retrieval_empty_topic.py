@@ -28,11 +28,11 @@ def conn():
 def test_no_alphanumeric_character_is_no_topic(conn, topic):
     assert get_topic_context(conn, topic)["topic"] is None
 
-    result = recall(conn, topic)
+    result = recall(conn, topic, include_context=True)
     assert result["topic_context"] is None
     assert result["summary"]["has_topic_context"] is False
 
 
 def test_a_real_topic_still_resolves(conn):
     assert get_topic_context(conn, "okapi")["topic"]["name"] == "okapi banking"
-    assert recall(conn, "okapi")["topic_context"] is not None
+    assert recall(conn, "okapi", include_context=True)["topic_context"] is not None

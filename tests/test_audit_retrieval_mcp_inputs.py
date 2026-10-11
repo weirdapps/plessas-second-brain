@@ -11,6 +11,7 @@ nothing, and a date that is not ISO excluded every email. Each read as
 import importlib
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from src import mcp_server
 from src.store.schema import create_database, get_connection
@@ -92,6 +93,10 @@ CASES = [
 ]
 
 
+# recall fans out to ten kinds, so it holds each to 10 rows rather than 200.
+CEILING = {"recall": 10}
+
+
 @pytest.mark.parametrize("given, expected", [(-1, 1), (0, 1), (10_000, 200)])
 @pytest.mark.parametrize(
     "handler, args, target, arg", CASES, ids=[f"{c[0]}-{i}" for i, c in enumerate(CASES)]
@@ -105,13 +110,16 @@ def test_every_limit_is_clamped_to_1_to_200(
 
     def spy(*a, **kw):
         seen.append(kw[arg] if isinstance(arg, str) else a[arg])
-        return {} if function in ("get_person_context", "get_topic_context", "recall") else []
+        if function == "recall":
+            return {"query": "", "summary": {}, **dict.fromkeys(mcp_server._RECALL_KINDS, [])}
+        return {} if function in ("get_person_context", "get_topic_context") else []
 
     monkeypatch.setattr(module, function, spy)
     limit_name = "limit_per_kind" if handler == "recall" else "limit"
 
     getattr(mcp_server, handler)(**args, **{limit_name: given})
 
+    expected = min(expected, CEILING.get(handler, 200))
     assert seen and all(value == expected for value in seen)
 
 
@@ -134,8 +142,8 @@ def test_the_limit_helper_covers_every_handler_that_takes_one():
 
 @pytest.mark.parametrize("limit", [-1, 0])
 def test_a_negative_or_zero_limit_returns_one_row_not_all_or_none(db, limit):
-    assert len(mcp_server.search_emails("okapi", limit=limit)) == 1
-    assert len(mcp_server.search_attachments("okapi", limit=limit)) == 1
+    assert len(mcp_server.search_emails("okapi", limit=limit)["result"]) == 1
+    assert len(mcp_server.search_attachments("okapi", limit=limit)["result"]) == 1
 
 
 @pytest.mark.parametrize(
@@ -146,15 +154,13 @@ def test_a_negative_or_zero_limit_returns_one_row_not_all_or_none(db, limit):
     ],
 )
 def test_an_unknown_search_type_is_an_error_naming_the_allowed_values(db, call):
-    out = call()
-
-    assert "keyword" in out["error"] and "semantic" in out["error"]
+    with pytest.raises(ToolError, match="keyword, semantic"):
+        call()
 
 
 def test_an_unknown_teams_kind_is_an_error_naming_the_allowed_values(db):
-    out = mcp_server.search_teams("okapi", kind="bogus")
-
-    assert all(k in out["error"] for k in ("thread", "message", "both"))
+    with pytest.raises(ToolError, match="thread, message, both"):
+        mcp_server.search_teams("okapi", kind="bogus")
 
 
 @pytest.mark.parametrize(
@@ -171,10 +177,8 @@ def test_an_unknown_teams_kind_is_an_error_naming_the_allowed_values(db):
     ],
 )
 def test_query_emails_rejects_a_date_that_is_not_iso(db, dates):
-    out = mcp_server.query_emails(keyword="okapi", **dates)
-
-    assert isinstance(out, dict)
-    assert "YYYY-MM-DD" in out["error"]
+    with pytest.raises(ToolError, match="YYYY-MM-DD"):
+        mcp_server.query_emails(keyword="okapi", **dates)
 
 
 @pytest.mark.parametrize(
@@ -188,4 +192,4 @@ def test_query_emails_rejects_a_date_that_is_not_iso(db, dates):
 def test_query_emails_accepts_iso_dates_and_empty_ones(db, dates):
     out = mcp_server.query_emails(keyword="okapi", **dates)
 
-    assert isinstance(out, list) and out
+    assert out["result"]

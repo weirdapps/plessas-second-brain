@@ -399,9 +399,9 @@ def test_attachment_search_finds_an_image_by_its_description_and_its_text(
 
     # The tool closes its connection after every call, as it does in production.
     with patch("src.mcp_server._get_conn", side_effect=lambda: get_connection(str(_db(conn)))):
-        by_description = mcp_server.search_attachments("card spend segment")
+        by_description = mcp_server.search_attachments("card spend segment")["result"]
         # Greek from the transcription, typed without accents.
-        by_text = mcp_server.search_attachments("πωλησεις καρτων")
+        by_text = mcp_server.search_attachments("πωλησεις καρτων")["result"]
 
     for hits in (by_description, by_text):
         assert [h["attachment_id"] for h in hits] == [att_id]

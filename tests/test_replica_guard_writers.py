@@ -8,6 +8,7 @@ which the next pull replaces, the failure behind the 2026-08-29 corruption.
 import sys
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 
 @pytest.fixture
@@ -28,9 +29,8 @@ def test_the_mcp_refetch_refuses_a_replica(replica, monkeypatch):
         lambda *a, **k: pytest.fail("fetched on a replica"),
     )
 
-    out = mcp_server.sharepoint_index("refetch", url="https://contoso.sharepoint.com/x")
-
-    assert "Refusing" in out["error"]
+    with pytest.raises(ToolError, match="Refusing"):
+        mcp_server.sharepoint_index("refetch", url="https://contoso.sharepoint.com/x")
 
 
 def test_the_mcp_listings_still_work_on_a_replica(replica, monkeypatch):
@@ -212,9 +212,8 @@ def test_the_producer_refetches_a_recorded_link(monkeypatch):
     conn = create_database(":memory:")
     monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
 
-    out = mcp_server.sharepoint_index("refetch", url="https://contoso.sharepoint.com/x")
-
-    assert out == {"error": "refetch: url is not present in sharepoint_links"}
+    with pytest.raises(ToolError, match="not present in sharepoint_links"):
+        mcp_server.sharepoint_index("refetch", url="https://contoso.sharepoint.com/x")
 
 
 _STATS = {

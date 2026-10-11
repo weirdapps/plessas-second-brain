@@ -533,9 +533,15 @@ src/
     calendar_loader.py         Calendar event and attendee loader
   ingest/
     reverse_scan.py            Filesystem scan with latest-version-per-name dedup
+  evals/
+    __init__.py                Where the eval sets live (outside the checkout) and owner-only file writes
+    extraction.py              The extraction eval: building, programmatic checks, the run, the judge
+    summary.py                 The latest eval results against the run before, for the health check
 
 scripts/
   health_check.py              Per-source freshness and job status; email + Healthchecks ping
+  extraction_eval.py           Extraction eval CLI: build, dry run, run, calibrate (see Evals)
+  retrieval_eval.py            Retrieval evals: the known-item guard and the qa set (see Evals)
   backup_db.py                 MVCC-safe encrypted DB snapshot + retention (see docs/RESTORE.md)
   recover_missing_extractions.py  Backfill emails that staged but never extracted
   repair_case_twins.py         Gives emails back their own extraction where a case twin's was stored (report by default)
@@ -605,7 +611,58 @@ pytest -k recall                    # filter by expression
 pytest --cov=src --cov-report=term  # with coverage
 ```
 
-Before and after changing how text is tokenised (stemming, prefix matching), run the regression guard. `scripts/retrieval_eval.py build` samples emails and keeps two words of each subject as a query; `run` reports how often keyword search returns the email, and its thread, first, in the top 5 and in the top 10. Compare the thread figures: replies share a subject, and a subject match returns one email per thread. It can show a loss, not a gain, because the queries are the subject's own words. The set holds subjects, so it is written to `~/.second-brain/retrieval-eval.json`, outside the repository, and both steps open the database read-only.
+The tests stub the model, so they say nothing about extraction or retrieval quality; the evals below do.
+
+### Evals
+
+Three evals put a number on quality before a change ships: a prompt, an effort level, a model, tokenising, ranking. Their sets are the owner's own mail and questions, and their gold labels are the owner's judgement, so **case ids and gold labels never enter the repository**. Sets and results live under `${BRAIN_DATA_DIR:-~/.second-brain}/evals/`. Every directory the scripts create there is 0700 and every file 0600, and a path inside the checkout is refused. Nothing the scripts print holds an item, a question or a label: they print ids, counts and rates.
+
+| Eval | Set | Built by | Graded by | Model calls |
+| --- | --- | --- | --- | --- |
+| Extraction, 40 cases | `evals/extraction/cases.jsonl` | `scripts/extraction_eval.py --build` | programmatic checks, then a judge | extraction and judge, only with `--yes` |
+| Retrieval qa, 30-50 questions | `evals/retrieval/qa.jsonl` | `scripts/retrieval_eval.py --build-qa` | recall@5, recall@10, MRR, nDCG@10 per mode | query embeddings only |
+| Known-item, 20 queries | `~/.second-brain/retrieval-eval.json` | `scripts/retrieval_eval.py build` | hit@1, hit@5, hit@10, MRR | none |
+
+Each run appends one dated record to `evals/extraction/results.jsonl` or `evals/retrieval/results.jsonl`. `latest_eval_summary()` in `src/evals/summary.py` reads them back for the health check: it compares the newest run of each kind with the newest earlier run on the same set (for extraction, the same cases too), and warns when the headline falls by more than 5 points or a semantic call was not `ok`.
+
+#### Extraction
+
+1. `python scripts/extraction_eval.py --build` reads the store read-only and drafts 38 real items from the last 180 days: 10 Sent Items with commitments, 10 inbound asks of the owner, 8 FYI mails or forwards (half with an attachment), 6 bulk mails or notifications, and 4 long Greek threads with quoted history. It adds 2 crafted injection items, whose gold is given. It writes `cases.jsonl`, a reading copy `cases.md`, and `owner.json` with the names the owner goes by in extracted fields: add the other scripts' forms there. It never replaces a set without `--force`. With `BRAIN_USER_EMAIL_PATTERN` set, an inbound ask must be addressed to the owner, and an FYI may be mail he is only copied on.
+2. Label each case's `gold` in `cases.jsonl`, reading the case in `cases.md`, and delete any case that does not fit. A case counts once its `item_kind` is set:
+   - `item_kind`: `work_thread`, `fyi_forward`, `notification`, `bulk`, `invite_logistics`, `regulatory_text`, `personal` or `other`
+   - `language`: `el`, `en`, `mixed` or `other`
+   - `decisions`: `{"text", "owner_role", "status"}`, with `owner_role` one of `owner_decided`, `assigned_to_owner`, `owner_assigned_other`, `owner_fyi`, `third_party`, and `status` one of `made`, `proposed`, `requested`
+   - `actions`: `{"text", "direction", "deadline"}`, with `direction` one of `owner_owes`, `owed_to_owner`, `third_party`, and `deadline` a `YYYY-MM-DD` date or `null`
+   - `must_not`: phrases no extracted decision, action or commitment may contain, such as a decision quoted from older mail in the thread, or what an injected instruction dictates
+3. `--dry-run` validates the set and grades the gold itself (it must pass every check) and no answer (it must fail them all). It also regrades the last run's saved replies against the gold as it stands, and prints the cost estimate. It calls no model and writes nothing.
+4. `--run --judge` prints the estimate and stops; add `--yes` to spend it. Each case is extracted twice through `claude_extract.extract_one`, the function the sync calls, then graded. The run appends its record (model, prompt hash, effort, per-check pass rates, cost) to `results.jsonl`, writes every graded row with the model's own text to `runs/<run_id>.jsonl`, and records each attempt that produced nothing to grade in `errors.jsonl`. A truncated or refused reply is counted, not graded, and a reply from another model is an error. `--effort low|medium|high` sends `output_config.effort` with every call, for a sweep; `--case ID` runs a pilot.
+5. `--calibrate --yes` measures how often the judge pairs items as the owner would: on probes the gold fixes (the gold itself, the gold less one item, another case's gold, "I don't know"), and on the last run's outputs that the owner has counted in `calibration.jsonl` (written on first use, for him to fill in). Below 90% agreement, the judge's scores should not steer a change.
+
+| Check | Passes when | Graded |
+| --- | --- | --- |
+| `schema_valid` | the reply parses as it stands, in the parser's schema | always |
+| `kind` | `item_kind` equals the gold | once the extraction emits `item_kind` |
+| `language` | the language, as a code, equals the gold | labelled cases |
+| `owner_roles` | the owner's decisions and debts count as the gold's: by `owner_role` and `direction` once emitted, until then by `decided_by` and `owner` against `owner.json` | labelled cases, with fields or names |
+| `bulk_empty` | there is no decision and no action | gold kind `bulk` or `notification` |
+| `deadlines` | the action deadlines equal the gold's | labelled cases |
+| `evidence_verbatim` | every evidence quote is in the source, spacing aside | once the extraction emits `evidence` |
+| `no_card_iban` | no card number or IBAN passes the masker's own checks | always |
+| `must_not` | no decision, action or commitment holds a must-not phrase, case and accents aside | gold with `must_not` |
+
+A reply that cannot be parsed fails every check that applies. The judge matches the decision and action sets, and the eval computes precision, recall and F1 from its pairs.
+
+Cost: on the replica's real prompts the script estimates $2.32 for 80 extraction calls and at most $2.31 for the judge, at Vertex `eu` Sonnet 5.5 rates. Both are upper bounds, since they count 1,500 output tokens a call against the 832 email extraction measured, so expect about $3 per configuration, and about $10 for an effort sweep over three levels. Noise: 80 graded rows put about ±11 points around a pass rate, so compare configurations, and read single cases in `runs/`. The calls reach the usage log like every other call, under the sites `src.evals.extraction._eval_extraction_call` and `src.evals.extraction._judge_call`, so the health check's spend row shows eval spend apart from production.
+
+#### Retrieval qa
+
+1. `python scripts/retrieval_eval.py --build-qa` drafts up to 60 questions from the owner's logged sessions: a user turn answered by a call to a `second-brain` tool. Each draft holds the question and the tools called, with every gold list empty. Sessions in the brain's own repository are left out unless `--all-workspaces`.
+2. Keep 30-50 real questions, and for each fill `gold` with the ids of the items that answer it: `email` (a row's `email_id`; any email of its thread counts), `attachment` (`attachment_id`), `teams` or `whatsapp` (thread ids), `conversation` (id or session id), `event` (calendar event id) or `thread` (an Outlook conversation id). Optionally set `query` to the keywords a session would send (real calls send 4-6-word keyword bags, and the question itself is the default), `modes` to limit the modes, and `answer` for a later answer judge.
+3. `--run-qa` asks each labelled question in four modes: `keyword` and `semantic` as `search_emails` runs them, `hybrid` as recall's fused email bucket, and `recall` as its whole bundle at 10 rows per kind. A question is graded in a mode only on the gold kinds that mode can return. The record carries recall@5, recall@10, MRR and nDCG@10 per mode, and every semantic and recall call's `summary.semantic` status, so an embedding outage shows. It loads the vector index as the MCP server does (about 1.5 GB on the current corpus), so on the producer, run it apart from the embedding jobs.
+
+#### Known-item
+
+Before and after changing how text is tokenised (stemming, prefix matching), run the regression guard. `scripts/retrieval_eval.py build` samples emails and keeps two words of each subject as a query. It keeps only subjects whose two words no other thread's subject holds both of: in the 2026-10-11 audit, shared queries came first 4 times in 61, which measured ambiguity rather than search. `run` reports how often keyword search returns the email, and its thread, first, in the top 5 and in the top 10, and appends the run to `evals/retrieval/results.jsonl`. Compare the thread figures: replies share a subject, and a subject match returns one email per thread. It can show a loss, not a gain, because the queries are the subject's own words.
 
 ### Lint and format
 

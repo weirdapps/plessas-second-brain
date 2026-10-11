@@ -8,8 +8,11 @@ on a single host or split across two (see "Topology" below).
 
 - Python 3.12+, and [`uv`](https://docs.astral.sh/uv/), which installs from the
   committed `uv.lock`.
-- `sqlite3` on `PATH`. `scripts/health_check.py` and the replica pull both shell
-  out to it.
+- `sqlite3` on `PATH`, on both hosts of a two-host setup: the replica pull runs
+  `.backup` on the producer and `PRAGMA quick_check` on the replica, and the
+  manual restore in [`RESTORE.md`](RESTORE.md) uses it. Everything else opens the
+  database through Python's own `sqlite3` module.
+- `curl`, for the health check's Healthchecks pings (section 7).
 - `unzip` on a replica. The pull checks a new `embeddings.npz` with `unzip -t`
   before it replaces the old one. macOS ships it.
 - `tesseract`, plus the language data for the languages your attachments are
@@ -67,12 +70,15 @@ source .venv/bin/activate     # the commands below run its python
 For a venv outside the checkout (the reference producer keeps it in
 `~/.venvs/second-brain`), set `UV_PROJECT_ENVIRONMENT` to its path first. A venv
 uv builds has no `pip`, so a deploy script should run `uv sync`, not
-`pip install`. `--no-build` refuses to run a package's `setup.py`, as CI does. (`pip install -e ".[dev]"` into a Python 3.12+ venv of your own
-also works.)
+`pip install`. `--no-build` refuses to run a package's `setup.py`, as CI does.
+`pyproject.toml` declares no build system, so the project itself is not
+installed: everything runs from the checkout (`./brain`, `./run_mcp.sh`, or the
+venv's `python -m src.cli` from the checkout's root). `pip install -e .` would
+ignore `uv.lock` and put `src/` itself, not the checkout, on the module path.
 
-The `dev` extra installs `pytest` and `pytest-cov` only. `ruff` is deliberately
-not in it because CI pins an exact version; run it with
-`uvx ruff@0.16.8 check .` (see `README.md`, "Lint and format").
+The `dev` extra holds the test tools. `ruff` is deliberately not in it because
+CI pins an exact version; run it with `uvx ruff@0.16.8 check .` (see
+`README.md`, "Lint and format").
 
 ## 3. Configure
 
@@ -86,13 +92,17 @@ extraction path: Vertex ADC with `VERTEX_SDK_PROJECT`, `CLAUDE_EXTRACT_MODEL` an
 Claude call stops with a message naming them until both are set); `GEMINI_API_KEY`
 with `BRAIN_EXTRACT_ENGINE=gemini`; or the direct Anthropic API, which takes
 `ANTHROPIC_API_KEY` together with `BRAIN_ALLOW_DIRECT_API=1` and is used only where
-no Vertex project is set. See `.env.example` for the full list.
+no Vertex project is set. The README's "Configuration" lists every setting the
+pipeline and the server read; `.env.example` is a starting point with the common
+ones, and sections 7 and 9 below list the health check's.
 
 `BRAIN_USER_EMAIL_PATTERN` lists every address the owner sends from, primary and
 aliases, separated by commas: `BRAIN_USER_EMAIL_PATTERN=first.last@example.com,alias@example.com`.
-Each is matched whole and case-blind, so an alias that is not listed is not the
-owner's. After changing it, run `python -m src.cli classify-sources` on the
-producer; the next calendar sync refreshes the meetings' self flags.
+Each is matched whole and case-blind, never as a substring, so an alias that is
+not listed is not the owner's (README, "Identity"). After changing it, run
+`python -m src.cli maint classify-sources` on the producer; the next calendar sync
+refreshes the self flags of the meetings it lists (the week behind and the 30 days
+ahead); `python -m src.cli maint calendar-backfill` re-lists older months.
 
 Nothing in the code reads `.env`: the scheduling recipes in section 6 source it
 (`set -a; . ./.env`, `EnvironmentFile=`). The MCP server inherits the
@@ -100,7 +110,10 @@ environment `claude` was launched with, which sources no `.env` and, from a GUI
 or an IDE, no shell profile, so put the identity settings
 (`BRAIN_USER_NAME`, `BRAIN_USER_ROLE`, `BRAIN_USER_EMAIL_PATTERN`,
 `SHAREPOINT_HOST`) in `~/.config/second-brain/env` too; `src/config.py` reads
-that file at import, and ignores any other key in it.
+that file at import, and ignores any other key in it. The server's own settings,
+such as `GEMINI_API_KEY` and `BRAIN_EMBED_BACKEND`, go in the owner-only file
+`run_mcp.sh` sources, `$BRAIN_DATA_DIR/env` or else `~/.second-brain/env`
+(README, "Run the MCP server").
 
 **Data home.** By default the DB and all ingested data live in `<repo>/data`. For
 a scheduled deployment, point them at a stable, checkout-independent location so
@@ -139,8 +152,8 @@ copying across any newer cursor from `$BRAIN_DATA_DIR/state`.
 
 ```bash
 mkdir -p "$BRAIN_DATA_DIR/staging" "$BRAIN_DATA_DIR/extracted"
-python -m src.cli load    # creates brain.db, then runs every migration
-python -m src.cli stats   # opens it; every count is 0 on a fresh host
+python -m src.cli load         # creates brain.db, then runs every migration
+python -m src.cli tool stats   # opens it; every count is 0 on a fresh host
 ```
 
 Mail reaches the store in two steps, and `sync` is only the second:
@@ -160,8 +173,8 @@ Mail reaches the store in two steps, and `sync` is only the second:
 `load` is the only command that creates the database. It stamps schema version 0
 and calls `run_migrations`, so a store built this way ends up with exactly the
 tables a store that grew through the migrations has. Everything else assumes the
-file already exists: `stats`, `sync` and `migrate` all print `Database not
-found` and exit 1 against a data home that has never been loaded.
+file already exists: `tool`, `sync` and `maint migrate` all report the database
+not found and exit 1 against a data home that has never been loaded.
 
 Create `staging/` and `extracted/` first. Without them `load` still creates the
 database, but then exits 1 because it has nothing to read, which is a confusing
@@ -185,7 +198,11 @@ Everything above describes one host that ingests and serves from the same
   `unzip -t`, and only beside a database that passed. A copy that fails its
   check is discarded and the replica stays as it was; the run logs the
   `ERROR`, exits 1 and leaves the stamp alone. On success it writes a UTC
-  timestamp to `~/.second-brain/db-pull.stamp`.
+  timestamp to `~/.second-brain/db-pull.stamp`. The same run copies the
+  producer's encrypted backup archives (`backups/offsite/brain-*.db.zst.enc`
+  under its data home) to `~/second-brain-backups/offsite` and prunes them to
+  the same retention, which is what the weekly restore drill decrypts
+  ([`RESTORE.md`](RESTORE.md), "Exercise it").
 
 **An unchanged producer costs no snapshot.** The `.backup` rewrites the whole
 database on the producer. When the producer's `brain.db` has the mtime and size
@@ -292,30 +309,90 @@ of `~/.claude/projects` to the producer can go too once the stamp shows the hook
 working; note that `ingest-session-notes` then no longer sees subagent
 transcripts, which only such a copy carried.
 
-Conversations stored before this change hold every user-role turn as the
-owner's. Relabel them once, on the producer:
+Conversations stored before 2026-10-11 hold every user-role turn as the owner's:
+`relabel-conversations` sorts them once (section 12).
+
+### WhatsApp from the Mac that runs the bridge
+
+The README's "WhatsApp" section says what the snapshot holds and where it goes.
+Two pieces run it: a LaunchAgent on the Mac that runs the bridge, at :50, and a
+timer on the producer, at :55. The WhatsApp tables arrive with schema v26, which
+any command that writes applies.
+
+On the **producer**, after pulling this repository:
 
 ```bash
-python -m src.cli relabel-conversations --dry-run   # counts only, writes nothing
-python -m src.cli relabel-conversations
+install -m 755 scripts/wrappers/systemd/sb-whatsapp-sync.sh ~/.local/bin/
+# ~/scripts/run-sb-whatsapp-sync.sh: a copy of run-sb-teams-sync.sh that execs sb-whatsapp-sync.sh
 ```
 
-It reads each session's transcript where the producer still holds one, and the
-stored turn's text otherwise. A conversation left with no owner turn is an agent
-session, which every conversation read leaves out by default; nothing is deleted.
+```ini
+# ~/.config/systemd/user/sb-whatsapp-sync.service
+[Unit]
+Description=second-brain WhatsApp sync
+
+[Service]
+Type=oneshot
+ExecStart=%h/scripts/run-sb-whatsapp-sync.sh
+TimeoutStartSec=600
+
+# ~/.config/systemd/user/sb-whatsapp-sync.timer
+[Unit]
+Description=second-brain WhatsApp sync, after the Mac's :50 push
+
+[Timer]
+OnCalendar=*-*-* 01,07,08,09,10,11,12,13,14,15,16,17,18,19,20,21,22:55:00 Europe/Athens
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
+
+# ~/.config/systemd/user/sb-whatsapp-sync.service.d/healthcheck.conf
+[Unit]
+OnSuccess=hc-success@sb-whatsapp-sync.service
+OnFailure=hc-fail@sb-whatsapp-sync.service
+```
+
+The Healthchecks check `sb-whatsapp-sync` must exist before the first run. Install
+the Mac side first, so the first run finds a snapshot rather than exiting 66, then
+`systemctl --user daemon-reload && systemctl --user enable --now sb-whatsapp-sync.timer`.
+
+On the **Mac that runs the bridge**, after pulling this repository:
+
+```bash
+install -m 755 scripts/wrappers/launchd/sync-whatsapp-to-vps.sh scripts/wrappers/launchd/sb-db-pull.sh ~/.local/bin/
+sed -e "s|__HOME__|$HOME|g" -e "s|__WHATSAPP_STORE__|/path/to/the/bridge/store/messages.db|g" \
+  scripts/wrappers/launchd/com.plessas.whatsapp-sync-vps.plist \
+  > ~/Library/LaunchAgents/com.plessas.whatsapp-sync-vps.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.plessas.whatsapp-sync-vps.plist
+launchctl kickstart gui/$(id -u)/com.plessas.whatsapp-sync-vps   # the first push
+```
+
+**First backfill**: `systemctl --user start sb-whatsapp-sync.service` on the
+producer once the first push has landed. Extraction is deadline-bounded (300 s a
+run), so a large first backlog drains over a few hourly runs; starting the
+service again drains it faster. Check with `python -m src.cli tool stats`
+(`coverage.whatsapp`: the first and last message held, and how many) and the
+nightly health report's WhatsApp line.
 
 ## 6. Schedule
 
 The pipeline is just CLI commands, so schedule them however you like. Source your
 `.env` first so the job inherits `BRAIN_DATA_DIR` and credentials.
 
-**cron** (hourly staging and sync, daily embed):
+**cron** (hourly staging and sync, a nightly attachment pass):
 
 ```cron
 5 * * * *  cd /path/to/repo && set -a && . ./.env && set +a && .venv/bin/python -m src.export.outlook_export --folder Inbox >> ~/.second-brain/logs/sync.log 2>&1
 7 * * * *  cd /path/to/repo && set -a && . ./.env && set +a && .venv/bin/python -m src.cli sync  >> ~/.second-brain/logs/sync.log 2>&1
-23 3 * * * cd /path/to/repo && set -a && . ./.env && set +a && .venv/bin/python -m src.cli embed >> ~/.second-brain/logs/embed.log 2>&1
+17 2 * * * cd /path/to/repo && set -a && . ./.env && set +a && ( .venv/bin/python -m src.cli register-attachments; .venv/bin/python -m src.cli process-attachments --workers 4 --deadline-s 1800 ) >> ~/.second-brain/logs/attachments.log 2>&1
 ```
+
+`sync` ends with an embedding pass, so no `embed` job is needed. The nightly pass
+registers every attachment outlook-cli downloaded (the hourly sync registers 50 a
+run, from the last 48 hours) and summarises what the hourly slice leaves: a text
+over 50,000 characters waits for it (README, "Attachments in the hourly sync").
+`--deadline-s` bounds each of its two phases.
 
 **Linux, systemd (user) timer.** A wrapper that sources `.env` and runs the CLI:
 
@@ -343,16 +420,41 @@ Enable: `systemctl --user enable --now sb-sync.timer`, then confirm linger is on
 **macOS, launchd.** A `LaunchAgent` in `~/Library/LaunchAgents/` running a
 wrapper that `cd`s into `$BRAIN_REPO`, sources `.env`, and runs
 `python -m src.export.outlook_export` then `python -m src.cli sync` on
-`StartInterval` (or `StartCalendarInterval`). Set `BRAIN_LABEL_PREFIX` to
-namespace the labels.
+`StartInterval` (or `StartCalendarInterval`). Give the labels a common prefix
+(`<prefix>.attachments`, `<prefix>.auth-watch` and so on): the health check reads
+it off the installed plists to find the jobs, and `BRAIN_LABEL_PREFIX` sets it
+when it cannot.
 
-`sync` covers staged mail: extraction, load, attachments, people dedup,
-embeddings, Claude Code conversations and inline images. It stages no mail
-itself; `outlook_export` does, one run per folder (Inbox, Archive, Sent Items),
-and `python -m src.export.inbox_reconcile` records Inbox mail you have since
-moved, and where stored mail you have since deleted or junked now is (the
-README's Database schema has the `mail_location:` rows it writes).
+`sync` stages no mail itself; `outlook_export` does, one run per folder (Inbox,
+Archive, Sent Items), and `python -m src.export.inbox_reconcile` records Inbox mail
+you have since moved, and where stored mail you have since deleted or junked now
+is (the README's Database schema has the `mail_location:` rows it writes).
 `scripts/wrappers/systemd/sb-outlook-sync.sh` runs all of these hourly.
+
+**What `sync` does, in order** (`src/pipeline/sync.py`). Each slice is wall-clock,
+checked before an item starts, and what does not fit waits for the next run:
+
+1. Extract the staged mail: 300 s under the hourly unit or any other scheduler,
+   900 s under `sb-daily-sync` and `sb-noon-catchup`, no limit at a terminal.
+2. Load it, then register the attachments outlook-cli downloaded with it: at most
+   50 a run, from the last 48 hours, and only when mail loaded.
+3. Dedup the people the load added or changed, when mail loaded (the whole table
+   once a day, or with `--full-dedup` whether or not mail loaded).
+4. Attachments: Phase 1 reads text, newest mail first, for 90 s; Phase 2
+   summarises, starting with what Phase 1 has just read, for 90 s, texts of up to
+   50,000 characters only (README, "Attachments in the hourly sync").
+5. Claude Code conversations: export the sessions of the last 7 days that changed,
+   extract for 30 s, load (`--skip-conversations` leaves this out).
+6. Inline images: classify and describe new ones, for 90 s.
+7. One embedding pass over what the run stored, when it loaded mail or
+   conversations.
+8. Record `last_sync_date` and `mail_export_ok_at`, which `stats` reports.
+
+It exits 0; 75 when extraction ended on a quota pause, or when the model extracted
+none of the new mail sent to it (`last_sync_date` is then held back, so the run
+cannot read as fresh); 143 on a stop signal; 1 when the database is missing; and 0
+with a `skip:` line when another sync holds `state/sync.lock` (`--lock-wait` seconds
+to wait for it).
 
 **What one `sync` reads.** A run pays for what it brought, not for the whole store. The
 people dedup takes the groups of the people its load added or changed and of any added
@@ -363,7 +465,7 @@ directories written since its last complete scan began (`attachment_scan_started
 and those of the mail the run loaded; the nightly `register-attachments` still walks
 every directory. The embedding index is saved once, at the end of the run. Conversation
 staging holds one file per session and version, and a load removes what nothing can use
-any more: the first load after this change also splits the multi-session
+any more: the first load on code from 2026-10-11 or later also splits the multi-session
 `conversation-batch-*.json` files, so expect it to free most of `staging/conversations`.
 The export reads a transcript again only when it changed, or when the store lost what
 it held (`staging/conversations/transcripts-read.json`; any change to the exporter
@@ -373,8 +475,7 @@ reads them all once).
 `sb-outlook-sync.sh` included, run the whole `sync`, so a session reaches the store
 within the hour; `sb-conversation-sync` also exports and extracts conversations three
 times a day. With staging pruned and an unchanged transcript not read again, that step is
-cheap. `sync --skip-conversations` leaves it out of a run; no wrapper passes it. No
-wrapper or unit changes with this, and nothing to migrate.
+cheap. `sync --skip-conversations` leaves it out of a run; no wrapper passes it.
 
 Each `outlook_export` run lists its folder from six hours before its cursor, so
 mail that turned visible after newer mail was listed (a scanner hold, a release
@@ -394,11 +495,34 @@ files), `last_gave_up_at`, `quarantined` (unreadable staging batches), per-folde
 counts, and the reconcile's outcome with `ok_at`, when one last succeeded. The
 stage is skipped, and logged, while `~/.second-brain/needs_reauth` exists. It is
 the pass's last stage and its only outlook-cli caller, so a slow night cannot
-starve the stages before it. Copy both wrappers into `~/.local/bin` after
-pulling this change.
-It does not cover Teams, calendar,
-news or SharePoint, so `calendar-sync`, `teams-sync`, `news-sync` and
-`process-sharepoint` each want their own schedule. `python -m src.cli --help` lists every subcommand.
+starve the stages before it.
+
+`sync` does not cover Teams, WhatsApp, calendar, news or SharePoint, so
+`teams-sync`, `whatsapp-sync`, `calendar-sync`, `news-sync` and
+`process-sharepoint` each want their own schedule. `python -m src.cli --help` lists
+every subcommand.
+
+**What runs when on the reference producer**, an example of a split that works
+(times are Europe/Athens; each unit runs its archived wrapper (`sb-attachments` runs
+`sb-attachment-pass.sh`) through a host-local shim, see `scripts/wrappers/README.md`):
+
+| Unit | When | What it runs |
+| --- | --- | --- |
+| `sb-outlook-sync` | :10 at 01 and 07 to 22 | `sb-auth-watch.sh`, the Inbox, Archive and Sent Items exports, `inbox_reconcile`, `sync`, `sweep-files --policy` |
+| `sb-teams-sync` | :30 at 01 and 07 to 22 | `teams-sync` |
+| `sb-whatsapp-sync` | :55 at 01 and 07 to 22 | `whatsapp-sync`, after the Mac's :50 push (section 5) |
+| `sb-calendar-sync` | :48 at 07 to 22 | `calendar-sync` |
+| `sb-news-sync` | :50 at even hours | `news-sync` |
+| `sb-conversation-sync` | 08:45, 14:45, 20:45 | `export-conversations --days 7`, `extract-conversations`, `ingest-session-notes` |
+| `sb-daily-sync` | 07:05 | `scripts/backup_db.py` (section 8), `sync` with a 900 s extraction slice, `action_lifecycle` |
+| `sb-noon-catchup` | 13:17 | `sync` with a 900 s extraction slice |
+| `sb-attachments` | 02:00 | `sb-attachment-pass.sh`: `register-attachments`, Phase 1 (900 s), Phase 2 (1,800 s), `process-images --limit 500`, `process-sharepoint`, the orphan reaper, `sweep-files`, `mail-reconcile --since 7d` |
+| `sb-auth-watch` | every 4 hours, and before each `sb-outlook-sync` run | `sb-auth-watch.sh`: checks the Outlook and Teams sessions and renews them |
+| `sb-health-check` | 23:50 | `scripts/health_check.py --fix --email-if-issues`, then the freshness ping (section 7) |
+| `sb-mcp` | always on | `python -m src.mcp_server --http` (section 9) |
+
+The Mac that holds a replica pulls it at :45 (section 5), pushes WhatsApp at :50 if
+it runs the bridge, and runs the weekly restore drill ([`RESTORE.md`](RESTORE.md)).
 
 Nor does it close action items: extraction only appends, so run
 `python -m src.store.action_lifecycle` after a successful sync. It drops
@@ -416,9 +540,11 @@ HEALTH_EMAIL_TO=you@example.com python scripts/health_check.py --email
 ```
 
 Other flags: `--email-if-issues` (silent on a healthy run), `--fix` (attempt the
-auto-fixes), `--hc-ping`, and `--mcp-probe` (section 9). `--fix` restarts only the
-loader (the daily sync) and queues auth-watch for a re-auth sentinel; any other failed
-unit is reported and left to its own timer.
+auto-fixes), `--hc-ping` (below), and `--mcp-probe` (section 9). `--fix` starts the
+loader (the daily sync) when it failed or when mail is going stale, and auth-watch
+when the re-auth sentinel is set; any other failed unit is reported and left to its
+own timer. The report also lists, under WRAPPER DRIFT, every archived wrapper that
+differs from the copy in `~/.local/bin` (section 12).
 
 **What it asserts beyond counts.** Besides each source's age, these rows look at the
 pipeline itself. STALE in any of them fails the freshness ping, like any other STALE.
@@ -444,19 +570,26 @@ line per call site below the table. It warns above `BRAIN_DAILY_SPEND_WARN_USD`
 day but the log holds no call, which fails the freshness ping like any other STALE.
 To cap what one nightly attachment pass can spend, put `BRAIN_ATTACHMENT_TOKEN_BUDGET`
 in the environment its unit starts with: a pass that reaches the budget leaves the
-rest pending and exits 0. What a long document costs is set the same way:
-`BRAIN_ATTACHMENT_FULL_PARTS_UPTO` (default 8) is how many 40,000-character parts a
-text may have and still be summarised from every one, a call each plus the merge; a
-longer one takes three parts and the merge, and `0` takes three from every long text.
-`python -m src.cli process-attachments --phase 2 --estimate` prices the pending work
-first. The README's "Attachment summaries and spend" has the details.
+rest pending and exits 0. `BRAIN_ATTACHMENT_FULL_PARTS_UPTO` sets what a long
+document costs, and `python -m src.cli process-attachments --phase 2 --estimate`
+prices the pending work first; both are explained in the README's "Attachment
+summaries and spend".
 
 **Wire up the dead man's switch.** A health check that emails you is worth
 exactly as much as the scheduler that runs it. If the host is off, or the timer
-never fires, silence is indistinguishable from health. `--hc-ping` reports data
-freshness to a [Healthchecks](https://healthchecks.io) check, which alarms on
-the *absence* of a ping, so a dead scheduler becomes loud instead of invisible.
-It needs `HC_PING_URL` in the environment: the ping base URL for your project.
+never fires, silence is indistinguishable from health. A
+[Healthchecks](https://healthchecks.io) check alarms on the *absence* of a ping,
+so a dead scheduler becomes loud instead of invisible. Both ways below ping the
+check `sb-brain-freshness` under `HC_PING_URL`, the ping base URL for your
+project, read from the environment. Use one of them, not both:
+
+- `--hc-ping` on the scheduled run: `health_check.py` pings it, and pings its
+  `/fail` when any data source reads STALE.
+- The archived wrapper `scripts/wrappers/systemd/sb-health-check.sh`, which the
+  reference producer runs: it calls the check with `--fix --email-if-issues` and
+  no `--hc-ping`, reads the report's DATA SOURCES block, and pings `/fail` on a
+  STALE or a FAIL there, sourcing `HC_PING_URL` from
+  `~/.config/healthchecks-ping.env`.
 
 Two rules for that variable. Treat it as a secret, because anyone holding it can
 mark your checks green; this is why `health_check.py` logs curl's exit code and
@@ -464,226 +597,24 @@ never its stderr, which contains the URL. And read it from the environment only,
 never as a CLI argument, so it cannot leak into a process listing or a committed
 wrapper.
 
-Pass `--hc-ping` from the scheduled run and never from an ad hoc one: a manual
-invocation that pings resets the switch and hides a scheduler that has already
-stopped. That is why the flag is off by default. `scripts/backup_db.py --hc-slug
-<slug>` reports the nightly backup on its own separate check, for the same
-reason: "the sync ran" and "a backup was written" are different facts, and only
-the second one is worth a green check on the backup.
-
-**Upgrading to schema v23.** From v23 an HTML body is stored as the text a
-reader sees, each link's address after its text (bar an image's, and a long
-query string), with the HTML kept compressed in `email_html`. Emails loaded
-before it keep their HTML body until `python -m src.cli split-html` converts
-them, on the producer. It reads and converts a batch with no lock held and
-writes it in one short transaction, so it can run beside the timers; it redacts
-credentials on the way, as the ingest path does, and zeroes the pages it frees,
-so no copy of a redacted key is left for a pull or a snapshot to take; and it
-ends by optimizing the full-text index. `--dry-run` opens the database
-read-only, so it changes nothing, the schema included. Run it once more after
-every timer that started before the deploy has exited (or the next day): a job
-still running the old code loads HTML bodies as before, and a re-run converts
-only those. On a copy of a 3.5 GB store it converted 19,780 bodies (964 MB of
-HTML to 155 MB of text, the HTML kept in 123 MB) in 131 s, and the body index
-went from 425 to 226 MB. The file shrinks only after a `VACUUM`, which needs the
-writers stopped and about twice the database free: 3.5 GB became 2.6 GB.
-`scripts/scrub_secrets.py --apply --vacuum` does both jobs in one quiet window,
-and scrubs the kept HTML as well.
-
-**Upgrading to schema v24.** From v24 a Teams call record, and a notice that a
-call was recorded or transcribed, is a system message, as the service writes it;
-ingest took them for messages, counted them as their sender's, and put their XML
-into the threads the model reads. The migration marks the ones stored, counts
-again without them each thread that also holds other messages, and sends back to
-extraction those whose remaining messages clear extraction's floor, which the
-next teams-sync runs, one model call and one new vector each. On a copy of the
-replica on 2026-09-24: 1,261 rows marked, 123 threads counted again, 95 queued,
-in 0.2 s. A thread of calls alone, or with too little else, keeps its summary. Stop
-`sb-teams-sync.timer`, and let a running sync exit, before the pull: a sync still
-running the old code stores call records unmarked, and the migration runs once.
-Then run `python -m src.cli migrate` and start the timer again.
-
-**Upgrading to schema v25.** From v25 calendar `start_at` and `end_at` carry a
-trailing `Z`. Graph returns them in UTC, and without the zone a 16:00 Athens
-meeting read as 13:00. The migration appends it to the stored rows, about 1,100,
-in milliseconds, and changes nothing else. Stop `sb-calendar-sync.timer`, and let
-a running sync exit, before the pull: a sync still running the old code writes
-bare times after the migration has run. Then run `python -m src.cli migrate` and
-start the timer again. The same release lists every event of the window, where
-the old listing kept the ten earliest of each month, so run
-`python -m src.cli calendar-sync --backfill` once to fill the months it capped,
-best after outlook-access pages list-calendar itself.
-
-**Channel replies.** teams-sync stores each channel post's replies as messages of the
-post's thread; until then they stayed inside the post's stored payload, out of search and
-extraction. It also brings up to date a message edited or deleted after it was stored. To
-store the replies already held, run `python -m src.cli teams-backfill-replies` once on the
-producer after the pull. It calls no Teams API: it reads the stored payloads and stores the
-replies through the pull's own path, credential redaction included. It also dates each post by
-when it was written rather than by its newest reply, and sends the threads that gained replies
-back to extraction. The next teams-sync runs extract them, newest first, one model call each,
-within their deadline. A second run stores nothing. On a copy of the replica's Teams tables
-on 2026-10-11: 3,135 replies from 1,961 posts, 897 posts re-dated, 893 threads queued, in
-two seconds. No schema change, and it can run beside the timers.
-
-**Teams message text.** teams-sync stores a message's text as a reader sees it whenever its
-content holds markup, whatever type the payload declares. It used to wait for a declared
-"html", which the chat service never sends, so the text of every HTML message was its markup.
-To convert the rows stored before, run `python -m src.cli teams-strip-html` once on the
-producer after the pull (`--dry-run` counts first, read-only). It calls neither Teams nor a
-model: it converts each row from the HTML the row keeps, redacting credentials as ingest
-does, writes only the rows whose text changes, 500 to a transaction, so it can run beside
-the timers, and the full-text index follows through its trigger. System messages keep their
-XML. A second run changes nothing, and `--limit N` caps the rows one run changes. Run it once
-more after a teams-sync that started before the pull has exited, since that job stores
-markup as before. Until it has run, a reaction to a message stored before sends its thread
-back to extraction, as an edit does, because the new text differs from the stored markup.
-On a copy of the replica's Teams tables on 2026-10-11: 37,741 of 79,127 messages converted
-in 5 s, a second run changed none, and a search for `itemtype` went from 8,871 messages to
-0. No schema change.
-
-It sends nothing back to extraction, which is where the cost is: the summaries, titles,
-decisions, actions and facts of the threads concerned stay as extracted from the markup, and
-their vectors, which embed the summaries, with them. To refresh them, send those threads back
-to extraction; the following teams-sync runs extract them, newest first, one model call each
-within their deadline, and embed each again, since it was extracted after it was embedded
-(6,648 threads on that copy):
-
-```sql
-UPDATE teams_threads SET extraction_status = 'pending'
-WHERE extraction_status = 'extracted' AND id IN (
-  SELECT thread_id FROM teams_messages
-  WHERE is_system = 0 AND content_text IS NOT content_html);
-```
-
-**Teams raw payloads.** Each Teams message also keeps the payload teams-cli returned
-(`teams_messages.raw_json`): 133 MB of the 244 MB table on the producer. The pull compares a
-message it reads again with it to tell an edit or a delete, so new messages keep writing it, and
-`teams-backfill-replies` reads the replies a post's payload holds. Nothing else reads it. Run
-`python -m src.cli teams-drop-raw-json` once on the producer, after `teams-backfill-replies` and
-`teams-strip-html`, with `--dry-run` first to see the count and the size. It sets the payload to
-NULL oldest first, 500 messages per short transaction, so it can run beside the timers, and
-`--limit N` stops it after N. A channel post whose payload still holds a reply that is not a
-message of its own keeps its payload (the command says how many and to run the backfill), as
-does one whose payload does not parse. It migrates first: from v34 dropping a payload leaves
-the full-text index alone. A message whose payload was dropped gets it back the next time a
-pull reads it, one rewrite of the same text with no model call. The file shrinks only after a
-`VACUUM`. It refuses to run on a replica.
-
-**Upgrading to schema v32.** From v32 `attachment_content` has three small indexes that
-answer the file sweep's classification and two health-check queries without reading the
-stored text. `extracted_text` (3 GB on the producer) sits ahead of the columns those queries
-read, and SQLite reaches a column behind a long text by reading all of it: the sweep took
-160 s with a cold cache inside every hourly sync, and the nightly check 8.5 minutes against a
-300 s unit limit. On a copy of the replica on 2026-10-08 the sweep's query went from 14 s
-cold (3.8 s warm) to 0.3 s and the other two from 0.5 s to under 10 ms; the three indexes
-take 6.5 MiB. Each is built by reading the table once, so on the producer with a cold cache
-expect a few minutes each, with the write lock held meanwhile (the migration waits up to
-thirty minutes for it, the other units only sixty seconds). Stop the `sb-*` timers, let the
-running syncs exit, pull, run `python -m src.cli migrate`, and start the timers again. A
-store that has not migrated yet sweeps as before, only slower: the index hint is given only
-when the index exists.
-
-**Upgrading to schema v34.** From v34 each full-text index's update trigger fires only when an
-UPDATE sets the row's id or a column the index reads; before, any UPDATE re-indexed the row's
-whole text, so a mailbox move re-tokenised a body and every `llm_status` write of an attachment
-up to 2M characters. Address lookups (`LOWER(email) = ?`, for every sender, recipient and cc
-loaded) and the loader's name lookups get an index each on `people`, and keep their meaning.
-The migration recreates ten triggers and builds two indexes on a table of 34K rows: on a
-synthetic 530 MB store with 60K emails and 34K people it took 0.013 s, and afterwards 2,000
-mailbox moves took 0.08 s instead of 0.66 s and 2,000 address lookups 0.004 s instead of 1.8 s.
-It reads no row of the indexed tables and rebuilds no index. Any command that migrates applies
-it (`sync`, `teams-sync`, `migrate`), so no timer needs stopping: a job still running the old
-code works with the new triggers, and its own migrations end at v33.
-
-The same release records in `embeddings.npz` the embedding space its vectors are in (model,
-dimension, task type, text template): see Vector index in the README's Database schema. Nothing
-to run: an index without it is taken as the current space and tagged on its next save, by
-`sync`, `teams-sync` or `whatsapp-sync`. A job still running the old code saves the index
-without it again, and the next save puts it back. From then on a writer refuses vectors of
-another space, and a search that would embed its query into another space ranks around its
-keyword matches instead and says why on stderr, on the producer and on a replica alike. After a
-deliberate change of model, task type, dimension or text template, start the index over with
-`python -m src.cli embed --force` on the producer, apart from the embedding jobs: it embeds
-every email, attachment and conversation summary again (mind the API quota), and the next
-`teams-sync` and `whatsapp-sync` add their vectors back.
-
-**Calendar months the first load capped.** The first calendar load kept ten events of each
-month, and the `--backfill` run after v25 listed the 365 days before it ran, which began after
-them: on the replica on 2026-10-11, May to August 2025 held 10 events each and September 2025
-held 34, against a usual month of 228. `stats` now counts the calendar per month and names such
-months in `coverage.calendar.incomplete`, and `calendar-sync --backfill`, given no window, fills
-exactly those, oldest first, a month at a time: it lists the month in full, fetches each event
-it does not hold (one get-event call each, and a model call where an invitation has text beyond
-its joining details, once per series), marks cancelled what Outlook no longer lists, and
-records the month in `sync_metadata`. A run that stops leaves its month flagged `partial`, and
-the next run resumes there; a recorded month is never listed again unless one of its events
-still owes an extraction, and coverage stops flagging it. No schema change. Once, on the
-producer after the pull, with calendar-sync's environment loaded (Outlook and the model):
-
-```bash
-python -m src.cli calendar-sync --backfill --dry-run   # lists the flagged months; counts what it would fetch; writes nothing
-python -m src.cli calendar-sync --backfill             # fills them; run it again until the dry run counts 0
-```
-
-Each month's listing is bounded at 250 list-calendar calls, and a busy month takes a few dozen
-at most, one when outlook-access pages list-calendar itself. It can run beside the timer: it
-lists only months already over and leaves the hourly unit's heartbeat and fetch-failure counts
-alone. To go back before the first month held, give the window, for example
-`--backfill --since 2025-03-01 --until 2025-05-01`; a window is walked the same way, and the
-months a backfill recorded are skipped.
-
-From the same release a recurring occurrence carries `is_recurring` (it was 0 on every row:
-the field read was one Outlook never sends) and its series in `recurrence_master_id`; every
-calendar-sync sets the flag on the occurrences already stored, about 2,000 rows the first
-time. And an invitation is read as one: a meeting still to come, and every occurrence of a
-series, gets its purpose, agenda and who is expected, and no decisions or actions, while only
-a single meeting already over is asked for decisions, from its notes. An event is extracted
-again under the new prompt the next time it changes, and an occurrence whose series'
-invitation was already read takes that reading without a model call. The decisions and actions
-extracted from invitations before stay in the store until you clear them: on the replica on
-2026-10-11, 477 of the 519 calendar decisions and 253 of the 367 calendar actions (66 still
-open) sit on occurrences of a series or on single meetings extracted before they took place.
-No command clears them; to do it on the producer:
-
-```sql
-DELETE FROM decisions WHERE event_id IN (SELECT id FROM calendar_events
-  WHERE recurrence_master_id IS NOT NULL OR body_extracted_at < start_at);
-DELETE FROM action_items WHERE event_id IN (SELECT id FROM calendar_events
-  WHERE recurrence_master_id IS NOT NULL OR body_extracted_at < start_at);
-```
+Ping from the scheduled run and never from an ad hoc one: a manual invocation that
+pings resets the switch and hides a scheduler that has already stopped. That is why
+`--hc-ping` is off by default. `scripts/backup_db.py --hc-slug <slug>` reports the
+nightly backup on its own separate check, for the same reason: "the sync ran" and
+"a backup was written" are different facts, and only the second one is worth a
+green check on the backup.
 
 ## 8. Backup and restore
 
 `scripts/backup_db.py` takes an MVCC-consistent snapshot of a live `brain.db`,
 verifies it, and optionally writes a zstd-compressed, AES-256-encrypted offsite
-copy. The restore path, its prerequisites, and the checks that tell a good
-archive from a corrupt one are in [`RESTORE.md`](RESTORE.md).
-
-**A file-level backup of the producer takes the snapshot, not the live file.**
-restic, or anything like it, reads `brain.db` while the timers write it, and a
-WAL-mode database copied that way can be torn. Keep the data home in its paths,
-so the daily `backups/brain-YYYYMMDD.db` is what it stores, and exclude the live
-file, its sidecars and the encrypted archives. For restic, these lines in the
-excludes file (with your data home's absolute path), and no line excluding
-`backups/` as a whole:
-
-```text
-/path/to/data-home/brain.db
-/path/to/data-home/brain.db-wal
-/path/to/data-home/brain.db-shm
-/path/to/data-home/backups/offsite
-```
-
-Restoring from it is in [`RESTORE.md`](RESTORE.md), "restic: the copy off both
-hosts".
-
-**Drill the restore weekly.** `python scripts/backup_db.py --drill` decrypts the
-newest archive into a temporary directory, runs `PRAGMA quick_check`, compares row
-counts with a database you name, and records a pass in
-`~/.second-brain/restore-drill.stamp`, which the health check's Backups row ages
-(section 7). [`RESTORE.md`](RESTORE.md), "Exercise it", has the command and a
-LaunchAgent for the consumer that pulls the archives.
+copy. On the reference producer `sb-daily-sync.sh` runs it every morning with seven
+local snapshots and a 14-daily, 8-weekly set of archives under the data home's
+`backups/`, reporting on its own Healthchecks slug (section 7). Everything else
+about backups is in [`RESTORE.md`](RESTORE.md): the artefacts and the key, the
+restore and the checks that tell a good copy from a corrupt one, a file-level
+backup such as restic (which takes the daily snapshot, never the live file), and
+the weekly restore drill that the health check's Backups row ages (section 7).
 
 ## 9. Serve to Claude Code
 
@@ -753,7 +684,8 @@ curl --retry 5 --retry-connrefused --retry-delay 1 -s -o /dev/null -w '%{http_co
 
 Updating the checkout restarts nothing, and sb-mcp, unlike the scheduled jobs,
 keeps running the code it started with: after each update run
-`systemctl --user try-restart sb-mcp.service`.
+`systemctl --user try-restart sb-mcp.service` (section 12 has the rest of an
+update).
 
 After a start-limit failure the unit stays failed: fix the cause, then run
 `systemctl --user reset-failed sb-mcp.service && systemctl --user start sb-mcp.service`.
@@ -812,8 +744,9 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-It reads the token from `BRAIN_MCP_TOKEN_FILE`, else `~/.config/second-brain/mcp-token`,
-and never prints it. It pings `sb-mcp-stats` (`BRAIN_MCP_PROBE_SLUG`), creating the
+It asks `http://127.0.0.1:8765/mcp` (`BRAIN_MCP_URL` to change it), reads the token
+from `BRAIN_MCP_TOKEN_FILE`, else `~/.config/second-brain/mcp-token`, and never
+prints it. It pings `sb-mcp-stats` (`BRAIN_MCP_PROBE_SLUG`), creating the
 check on its first ping, so set that check's period to one hour. The ping fails when
 the server does not answer, refuses the token, or answers on data more than 7 hours
 old (`BRAIN_MCP_PROBE_MAX_AGE_HOURS`; the server's own `stale` flag turns at 3 hours,
@@ -828,13 +761,13 @@ summaries, facts and vectors. Three commands and one file control it:
 
 | Piece | What it does |
 | --- | --- |
-| `python -m src.cli hash-attachments` | Records `attachments.sha256` for files still on disk. Run it before deletion starts: afterwards the hash is the only evidence of what a file held |
+| `python -m src.cli maint hash-attachments` | Records `attachments.sha256` for files still on disk. Run it before deletion starts: afterwards the hash is the only evidence of what a file held |
 | `python -m src.cli sweep-files [--apply] [--only-newer-than ISO] [--policy]` | Deletes registered files whose content is stored. Report-only by default |
 | `scripts/reap_orphan_attachments.py [--apply] [--adopt-only] [--policy]` | Unregistered directories: stored duplicates go after a day, unique files are adopted after 7 days. Unregistered files inside a registered directory: stored duplicates go, unique ones stay |
 | `data/state/sweep-policy.json` | `{"apply": true or false, "only_newer_than": ISO or null}`. Absent means report-only. The wrappers pass `--policy`, so this file alone decides whether anything is deleted |
 
-The wrappers under `scripts/wrappers/systemd/` call the sweep and the reaper; copy them into
-`~/.local/bin` after changing them (they are an archive, see section 3). The health check's
+The wrappers under `scripts/wrappers/systemd/` call the sweep and the reaper; install them into
+`~/.local/bin` after changing them (they are an archive, see section 12). The health check's
 "Files on disk" row shows what is still held and warns when the sweep stops.
 
 **Documents without files.** A SharePoint file linked from mail and a note a Claude session
@@ -842,25 +775,25 @@ wrote (`.md`, `.txt`, `.csv`) are stored as text only: `attachments.file_path` r
 `text:<source>:<key>`, and no file is kept. `process-sharepoint` fetches into a temporary
 directory, within the nightly pass's `--deadline-s`; the conversation sync runs
 `ingest-session-notes` over the transcripts new or changed since they were last read (subagent
-transcripts included). Copy `sb-conversation-sync.sh` and `sb-attachment-pass.sh` into
-`~/.local/bin` after this change. Zip
-archives are unpacked in a temporary directory, the same file is extracted once, and long texts
-are stored in full and summarised in parts. The one-time backfills are
-`process-sharepoint --ingest-fetched` (the files earlier fetches left in `data/sharepoint`,
-which `sweep-files` then also covers), `ingest-session-notes --all`, and
-`reextract --capped --long --zip --unread`, each with a count first (`reextract --dry-run`).
+transcripts included). Zip archives are unpacked in a temporary directory, the same file is
+extracted once, and long texts are stored in full and summarised in parts. The one-time
+backfills are `python -m src.cli maint sharepoint-ingest-fetched` (the files earlier fetches
+left in `data/sharepoint`, which `sweep-files` then also covers), `ingest-session-notes --all`,
+and `python -m src.cli maint reextract --capped --long --zip --unread`, each with a count first
+(`reextract --dry-run`).
 
 **Files are read in full.** Every sheet and row of a spreadsheet, and every page of a scan or a
 multi-page TIFF, OCR'd inside a two-minute budget per file; a scan it cuts short says "pages left
 unread", and `reextract` with no budget finishes it. Text stops at the 2,000,000-character
 ceiling, kept after a review measured 50,000,000 (3.3 GB of memory for every write to such a row,
 search snippets that never finished). A file cut there, or stopped by an archive's safety limits,
-says "file kept", and the sweep keeps it for good. Phase 2 summarises a text of more than 50
-parts from 50 parts spread evenly across it; the whole text stays stored and searchable.
+says "file kept", and the sweep keeps it for good. Phase 2 summarises a long text from some or
+all of its parts, as the README's "Attachment summaries and spend" sets out; the whole text
+stays stored and searchable.
 
 Rows the old readers read in part (spreadsheets to 20 sheets of 51 rows, scans to 30 pages,
 multi-page TIFFs to the first page, archives with all of these, texts at the old 100,000 storage
-cap or at the 2,000,000 ceiling) count as not stored until `reextract --partial` reads them again:
+cap or at the 2,000,000 ceiling) count as not stored until `maint reextract --partial` reads them again:
 the sweep and the reaper keep their files, and Phase 1 does not copy them to another attachment
 with the same bytes. Before its first run, pull the checkout the timers run and let running `sb-*`
 units finish: its first run records when it began (`sync_metadata` row
@@ -874,49 +807,20 @@ that comes back shorter or empty keeps the stored row. Count first with
 page with under 50 characters of text that shows an image) are OCR'd inside the file's budget.
 An OCR reading that is Greek in Latin look-alike letters ("kal" for «και») is stored with the
 `ocr_garbled` mark in `extraction_error` and `llm_status = 'skipped'`: Phase 2 does not summarise
-it and the sweep keeps its file (README, "Greek read as Latin letters"). For the texts read before
-this change, on the producer, in this order, each with a count first (`--dry-run`):
-
-1. `python -m src.cli ocr-regarble` counts them and lists the attachment ids whose files are on
-   disk or swept; `ocr-regarble --apply` marks them and clears their summaries, decisions,
-   actions, facts and vectors.
-2. `python -m src.cli refetch-garbled --limit 200`, repeated until both its `to try` lines read
-   0, fetches the swept originals back from the mailbox in two halves: at most 200 messages a
-   run in all, two `outlook-cli` calls at a time, oldest mail first, since the mailbox keeps
-   about a year and older mail is gone for good.
-   - By id: each message is asked for under its ids. A message the mailbox no longer holds is
-     recorded as gone and not asked for again; a failed download is asked for again on the next
-     run, three attempts in all.
-   - By folder, time and subject, within what the id half leaves of the limit: mail the retired
-     Apple Mail exporter stored carries no id the mailbox knows, unless an Archive copy of it was
-     recorded. Its folder (then Archive, Sent Items and Inbox) is listed over its received time,
-     two minutes either side, read as Athens time; the subject must match, and a file goes back
-     only when its sha256 is the row's. Several matching messages are counted as ambiguous and
-     skipped for good. With no match, mail over a year old is recorded as gone, and younger mail
-     as not found, looked up again on the next run, three attempts in all. `--no-lookup` runs the
-     id half alone.
-
-   Count first with `--dry-run`, which shows both halves. Exit 4 means `outlook-cli` needs a
-   login: log in and run it again. The sweep keeps a fetched original until it has been read
-   again.
-3. `python -m src.cli reextract --garbled` reads the marked scans and images on disk again, Greek
-   first, and summarises the ones that now read.
-4. The nightly image pass, or `transcribe-images --limit 0` at once, transcribes the marked
-   content images, and the transcription replaces the garbled text.
-
-`ocr-regarble --apply` changes only what it has not changed before, so it can be run again: do so
-after a large `reextract` pass, since a re-read that newly marks a row summarised earlier leaves
-that summary for it to clear (Phase 2 never makes a new one).
+it and the sweep keeps its file, and keeps an original fetched back from the mailbox until it has
+been read again (README, "Greek read as Latin letters"). The texts read before 2026-10-11 are
+marked, fetched back and read again by four commands, in the order step 6 of section 12 gives.
 
 **SharePoint links by kind.** A file behind a sharing or viewer link is downloaded by
 `sharepoint-cli get`, which resolves the link through its viewer page; an intranet page is read
 by `sharepoint-cli page` as text; a link with nothing to read is recorded `not-content` and
 never fetched. A file link whose page names no file is recorded `not-a-file`: a failure the
-health row shows and the retry pass offers again, since a viewer format change looks the same. Both commands need a `sharepoint-access` build that has them (`git pull && npm ci
-&& npm run build` in `~/SourceCode/sharepoint-access`, or wait for repo-autoupdate). The one-time
-backfill for links recorded `ok` with no text stored (mostly viewer pages saved as the file) is
-`process-sharepoint --refetch-content --max-fetches 0 --deadline-s 1800`, with a count first
-(`--dry-run`). It is resumable: the `sync_metadata` row `sharepoint_refetch_since` marks when it
+health row shows and the retry pass offers again, since a viewer format change looks the same.
+Both commands need a `sharepoint-access` build that has them (`git pull && npm ci && npm run build`
+in its checkout, `~/SourceCode/sharepoint-access` unless `SHAREPOINT_CLI_PATH` points elsewhere).
+The one-time backfill for links recorded `ok` with no text stored (mostly viewer pages saved as
+the file) is `python -m src.cli maint sharepoint-refetch-content --max-fetches 0 --deadline-s 1800`,
+with a count first (`--dry-run`). It is resumable: the `sync_metadata` row `sharepoint_refetch_since` marks when it
 began, a link attempted since is done, and a finished pass finds nothing. Delete that row to read
 them all again.
 
@@ -969,7 +873,7 @@ the producer runs on).
 **The probe first.** On the producer, with the same environment as the timers:
 
 ```bash
-python -m src.cli reextract --batch --probe
+python -m src.cli maint reextract --batch --probe
 ```
 
 It sends ten requests built from the newest stored texts (or from the rows a selector chooses, as
@@ -988,10 +892,10 @@ job runs on, and `reextract --batch-collect` prints the replies later. What it s
 - under `BRAIN_EXTRACT_CALL_SHAPE=v2`, run it a second time: cache reads in the usage log and
   `parsed` replies say that batch jobs take the cached system prompt and the structured outputs.
 
-**The backfill.** Price it first: `python -m src.cli reextract --long --estimate` prints the online
-and the batch cost. Then, on the producer:
+**The backfill.** Price it first: `python -m src.cli maint reextract --long --estimate` prints the
+online and the batch cost. Then, on the producer:
 
-1. Send a job: `python -m src.cli reextract --long --batch --limit 500` (or `--capped`,
+1. Send a job: `python -m src.cli maint reextract --long --batch --limit 500` (or `--capped`,
    `--partial`, ... as before), which reads the rows again as usual and sends their summaries.
    A job takes 2,000 requests, and a long document takes one per part it summarises (its merge
    goes in a later job), so choose `--limit` for the rows of a run to fit one job; the command
@@ -1016,3 +920,212 @@ and the batch cost. Then, on the producer:
 
 The usage log names each batch reply's job (`batch_job`), and the health check's spend row prices
 it at batch rates.
+
+## 12. Upgrading a producer
+
+A `git pull` changes the code and nothing else. After one, on the producer:
+
+1. `uv sync --frozen` when `uv.lock` changed (with `UV_PROJECT_ENVIRONMENT` set for
+   a venv outside the checkout, section 2).
+2. `systemctl --user try-restart sb-mcp.service`, if you run it: the HTTP server
+   keeps serving the code it started with (section 9). A scheduled job starts the
+   new code on its next run.
+3. Install each wrapper the pull changed:
+   `install -m 755 scripts/wrappers/systemd/<name>.sh ~/.local/bin/`
+   (`scripts/wrappers/README.md`). Until then the timers run the old copy, and the
+   nightly report lists it under WRAPPER DRIFT.
+4. The schema. A new version applies when the first job that writes opens the
+   store (`sync`, `teams-sync`, `whatsapp-sync`, `calendar-sync`,
+   `process-sharepoint`, `load` and most one-off commands), or by hand with
+   `python -m src.cli maint migrate`. Readers never migrate: `brain tool`, the MCP
+   server and a replica read the file as it is, and a replica gets the new version
+   with its next pull. Most migrations take well under a second and need nothing
+   stopped. The few that rewrite many rows or index a large table want the timers
+   stopped while they run (the notes below say which):
+   `systemctl --user stop 'sb-*.timer'`, let the running `sb-*` jobs exit, pull,
+   `python -m src.cli maint migrate`, then `systemctl --user start 'sb-*.timer'`.
+   A host that pulls on a schedule of its own (a hook or a timer) needs that
+   schedule held as well, or its next pull is migrated by whichever job starts
+   first, with the timers running.
+5. The one-off commands the release lists, below.
+
+On a checkout from before 2026-10-11, which has no `maint`, drop `maint` from the
+commands in this section and spell `maint calendar-backfill` as
+`calendar-sync --backfill` and `maint scrub` as `scripts/scrub_secrets.py`.
+
+### One-off commands after 2026-10-11
+
+A store built before the 2026-10-11 release holds rows that today's code would
+have stored differently. These commands bring it level, once, on the producer, in
+this order, with the environment the timers run with (the Vertex settings, and
+Outlook for the two that call it). Count first: `--dry-run` writes nothing, and for
+`ocr-regarble`, `person_aliases` and `scrub` the dry run is the default. A store first built on
+today's code needs none of them. The figures are the reference deployment's, as
+examples of scale; the steps are written for any store that crosses the release.
+
+1. **Sources and the owner.** `python -m src.cli maint classify-sources` sets every
+   email's `source_class` again by today's rules and writes only the rows that
+   change. The v33 migration classified the store when it upgraded; run this if
+   `BRAIN_USER_EMAIL_PATTERN` did not list every address of the owner then, or has
+   changed since, because the owner's addresses decide what is `automation`
+   (README, "Identity"). It has no dry run.
+2. **Conversations.** `python -m src.cli maint relabel-conversations --dry-run`,
+   then without: the stored turns the owner did not type become `agent`. It reads
+   each session's transcript where the producer still holds one, and the stored
+   turn's text otherwise. A conversation left with no owner turn is an agent
+   session, which every conversation read leaves out by default; nothing is
+   deleted.
+3. **People.** `python -m src.store.person_aliases` prints, for each mention row,
+   the identity it stands for; `--apply` records them as `person_alias:` rows
+   (README, "People and topics"). Optional: names resolve to identities first
+   without it, and the map adds the spellings the model extracted. Delete a row to
+   undo an alias. The reference store recorded 3,258.
+4. **Teams**, three commands, in this order. None calls Teams or the model, and each
+   can run beside the timers.
+   - `python -m src.cli maint teams-backfill-replies` stores the channel replies
+     that stored posts hold in their payload, through the pull's own path,
+     credential redaction included; it dates each post by when it was written
+     rather than by its newest reply, and sends the threads that gained replies
+     back to extraction, which the next teams-sync runs work through, newest
+     first, one model call each. It has no dry run, and a second run stores
+     nothing. On a copy of the reference store: 3,135 replies from 1,961 posts,
+     897 posts re-dated, 893 threads queued, in two seconds.
+   - `python -m src.cli maint teams-strip-html --dry-run`, then without, converts
+     the text of the messages stored as markup from the HTML each row keeps,
+     redacting credentials as ingest does, 500 rows to a transaction; `--limit N`
+     caps one run, and system messages keep their XML. Run it once more after any
+     teams-sync that started before the pull has exited, since that job still
+     stores markup. Until it has run, a reaction to a message stored before sends
+     its thread back to extraction, because the new text differs from the stored
+     markup. On a copy of the reference store: 37,741 of 79,127 messages in 5 s,
+     and a search for `itemtype` went from 8,871 messages to 0. It sends nothing
+     back to extraction, so the summaries, decisions, actions and facts of those
+     threads, and their vectors, stay as extracted from the markup. To refresh
+     them, send the threads back to extraction; the following teams-sync runs
+     extract them, newest first, and embed each again (6,648 threads on that copy):
+
+     ```sql
+     UPDATE teams_threads SET extraction_status = 'pending'
+     WHERE extraction_status = 'extracted' AND id IN (
+       SELECT thread_id FROM teams_messages
+       WHERE is_system = 0 AND content_text IS NOT content_html);
+     ```
+
+   - `python -m src.cli maint teams-drop-raw-json --dry-run`, then without, sets
+     the stored payload (`teams_messages.raw_json`) to NULL, oldest first, 500
+     messages to a transaction; `--limit N` stops it after N. A channel post whose
+     payload still holds a reply that is not a message of its own keeps it (the
+     command says how many, and to run the backfill), as does one whose payload
+     does not parse. The pull still compares a message it reads again with its
+     payload, so a message whose payload was dropped is written once more, the
+     same text and no model call, the next time a pull reads it. It migrates
+     first, since from v34 dropping a payload leaves the full-text index alone,
+     and it refuses to run on a replica. About 133 MB of the 244 MB table on the
+     reference producer; the file shrinks only after a `VACUUM` (step 7).
+5. **Calendar.** `python -m src.cli maint calendar-backfill --dry-run`, then
+   without, again until the dry run counts 0. The first calendar load kept ten
+   events of each month, and `stats` names the months not held in full in
+   `coverage.calendar.incomplete` (on the reference store, May to August 2025 held
+   10 events each against a usual month of 228). Given no window, it fills exactly
+   those, oldest first, a month at a time: it lists the month in full, fetches each
+   event it does not hold (one get-event call each, and a model call where an
+   invitation has text beyond its joining details, once per series), marks
+   cancelled what Outlook no longer lists, and records the month in
+   `sync_metadata`. A run that stops leaves its month flagged `partial`, and the
+   next run resumes there. Each month's listing is bounded at 250 list-calendar
+   calls. It lists only months already over, so it can run beside the hourly
+   timer. To go back before the first month held, give the window:
+   `--since 2025-03-01 --until 2025-05-01`.
+
+   Invitations are now read as invitations, but the decisions and actions taken
+   from them before stay in the store until you clear them: on the reference store,
+   477 of 519 calendar decisions and 253 of 367 calendar actions sat on occurrences
+   of a series or on single meetings extracted before they took place. No command
+   clears them; to do it:
+
+   ```sql
+   DELETE FROM decisions WHERE event_id IN (SELECT id FROM calendar_events
+     WHERE recurrence_master_id IS NOT NULL OR body_extracted_at < start_at);
+   DELETE FROM action_items WHERE event_id IN (SELECT id FROM calendar_events
+     WHERE recurrence_master_id IS NOT NULL OR body_extracted_at < start_at);
+   ```
+
+6. **Greek read as Latin letters** (README, "Greek read as Latin letters", has what
+   each command does), in this order:
+   1. `python -m src.cli maint ocr-regarble` counts the stored OCR texts the
+      detector flags and lists their attachment ids, on disk or swept;
+      `--apply` marks them and clears their summaries, decisions, actions, facts
+      and vectors.
+   2. `python -m src.cli maint refetch-garbled --dry-run`, then `--limit 200`,
+      repeated until both its `to try` lines read 0, fetches the swept originals
+      back from the mailbox: by id, then by folder, time and subject. Exit 4 means
+      `outlook-cli` needs a login: log in and run it again. Mail over a year old is
+      gone from the mailbox and recorded as such.
+   3. `python -m src.cli maint reextract --garbled --dry-run`, then without, reads
+      the marked scans on disk again, Greek first, and summarises the ones that now
+      read.
+   4. The nightly image pass, or `python -m src.cli maint transcribe-images --limit 0`
+      at once, transcribes the marked content images; the transcription replaces
+      the garbled text.
+
+   `ocr-regarble --apply` changes only what it has not changed before: run it again
+   after a large `reextract` pass, since a re-read that newly marks a row
+   summarised earlier leaves that summary for it to clear.
+7. **Credentials stored before masking.** `python -m src.cli maint scrub` counts
+   the credentials, card numbers, IBANs and passwords stored before ingest masked
+   them; with the jobs that write the store stopped, `--apply` masks them as ingest
+   does now, and `--apply --vacuum` also gives back the space the steps above
+   freed, given about twice the database's size free on disk (README, "Security").
+8. **Batch jobs, only to use them.** The bucket, the roles and `BRAIN_BATCH_BUCKET`
+   of section 11, then `python -m src.cli maint reextract --batch --probe` before
+   any backfill.
+
+On the reference deployment, `relabel-conversations`, `person_aliases --apply`,
+`teams-backfill-replies`, `teams-strip-html`, the calendar backfill,
+`ocr-regarble --apply` and `refetch-garbled` ran with the release on 2026-10-11, so
+their figures above are what they did there, not work still pending there;
+`teams-drop-raw-json` and the batch probe had not run.
+
+### Schema notes
+
+A store that missed several releases takes every migration since its version in
+one pass, at the first job that writes. The versions that ask for a step:
+
+- **v23.** An HTML body is stored as the text a reader sees, the HTML kept
+  compressed in `email_html`. Emails loaded before keep their HTML body until
+  `python -m src.cli maint split-html` converts them, on the producer. It can run
+  beside the timers (`--dry-run` is read-only), redacts credentials as ingest does,
+  zeroes the pages it frees and ends by optimizing the full-text index. Run it once
+  more after every timer that started before the deploy has exited. On a 3.5 GB
+  store it converted 19,780 bodies in 131 s; the file shrinks only after a
+  `VACUUM` (`maint scrub --apply --vacuum` does both jobs in one quiet window).
+- **v24.** A Teams call record, and a notice that a call was recorded or
+  transcribed, is a system message. The migration marks the stored ones and sends
+  back to extraction the threads whose other messages clear extraction's floor (on
+  a copy: 1,261 rows marked, 95 threads queued, in 0.2 s). Stop
+  `sb-teams-sync.timer`, and let a running sync exit, before the pull: a sync still
+  running the old code stores call records unmarked after the migration has run.
+- **v25.** Calendar `start_at` and `end_at` carry a trailing `Z` (UTC). Stop
+  `sb-calendar-sync.timer` before the pull, for the same reason. The months the old
+  listing capped are step 5 above.
+- **v26.** The WhatsApp tables (section 5).
+- **v32.** Three indexes on `attachment_content` let the file sweep and two
+  health-check queries skip the stored text (the sweep's query went from 14 s cold
+  to 0.3 s on a copy). Each is built by reading the table once, minutes on a large
+  store with a cold cache, with the write lock held: the migration waits up to
+  thirty minutes for it, the other units sixty seconds. Stop the `sb-*` timers, let
+  the running syncs exit, pull, `maint migrate`, start them again. Until it has
+  run, the sweep works as before, only slower.
+- **v33.** `emails.source_class` (README, "News and automation are left out by
+  default"); the migration classifies the stored rows. Step 1 above when the
+  owner's addresses were not all listed.
+- **v34.** Each full-text index's update trigger fires only when an UPDATE sets the
+  row's id or a column the index reads, and two indexes on `people` serve the
+  address and name lookups (0.013 s on a synthetic 530 MB store; no index is
+  rebuilt). Nothing needs stopping: a job still running the old code works with the
+  new triggers. The same release records the embedding space in `embeddings.npz` on
+  its next save (README, "Database schema", Vector index), with nothing to run.
+  After a deliberate change of model, task type, dimension or text template, start
+  the index over with `python -m src.cli embed --force` on the producer, apart from
+  the embedding jobs (mind the API quota); `teams-sync` and `whatsapp-sync` add
+  their vectors back, 500 a run.

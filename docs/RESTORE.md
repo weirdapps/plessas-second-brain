@@ -1,8 +1,10 @@
 # Backup and restore
 
-`scripts/backup_db.py` is the only thing that copies `brain.db` safely. This
-page is the other half: how to get a database back out of what it wrote, and how
-to know the copy you got back is sound.
+`scripts/backup_db.py` writes the backups of `brain.db` (`docs/DEPLOY.md`, section 8,
+says where the reference producer runs it). This page is the other half: how to
+get a database back out of what it wrote, how to know the copy you got back is
+sound, how a file-level backup such as restic should take it, and the weekly drill
+that proves a restore still works.
 
 ## What the backup produces
 
@@ -181,6 +183,9 @@ cursor of its own.
 ```bash
 # 6. Start the writers again. On the producer:
 systemctl --user start 'sb-*.timer'
+# Step 0 stopped the long-running services too: start the HTTP MCP server
+# (DEPLOY section 9) and anything else that reads the store, if you run them.
+systemctl --user start sb-mcp.service
 # On each replica, load the pull again:
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/<db-pull plist>
 ```
@@ -245,9 +250,11 @@ An untested restore is a hypothesis, so the drill is a scheduled job.
 `scripts/backup_db.py --drill` decrypts the newest archive in `--offsite-dir` into
 a private temporary directory, runs `PRAGMA quick_check` on it, and compares the
 row counts of `emails`, `attachments`, `teams_messages` and `decisions` with the
-database named by `--db`, each within 10% of it (`--drill-tolerance`; the archive
-is up to a day older, so the counts are close, not equal). It only reads that
-database, and removes the decrypted copy however it ends.
+database named by `--db`, each within 10% of the larger of the two
+(`--drill-tolerance`, a share of at least 0 and below 1; the archive is up to a
+day older, so the counts are close, not equal). It only reads that database
+(`mode=ro`, and `immutable=1` on a replica), and removes the decrypted copy
+however it ends.
 
 A pass writes `~/.second-brain/restore-drill.stamp` (or `--drill-stamp`, or
 `$BRAIN_RESTORE_DRILL_STAMP`): the time on line 1, which the health check's

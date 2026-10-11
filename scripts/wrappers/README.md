@@ -7,37 +7,73 @@ liveness stamps the health check reads.
 
 ## This is an archive, not a deploy source
 
-**Editing a file here changes nothing.** The live copies are `~/.local/bin/*.sh`
-on each host, and that is what runs. These committed copies exist to answer
-"what is production actually running, and what did it look like last month?" —
-questions that were previously unanswerable because the scripts lived only on
-one laptop's disk.
-
-To change a wrapper: edit the deployed copy, verify it under its real scheduler
-(see below), then refresh the archive and commit.
+**Pulling the repository changes nothing that runs.** The live copies are
+`~/.local/bin/*.sh` on each host, and that is what the units and LaunchAgents
+execute. A change is made here, reviewed and merged like any other, and then
+installed by hand on the host that runs it:
 
 ```bash
-# refresh from the hosts after a verified change
-scp '<vps-host>:~/.local/bin/sb-*.sh' scripts/wrappers/systemd/
-cp ~/.local/bin/sb-db-pull.sh ~/.local/bin/wait-for-vps.sh \
-   ~/.local/bin/sync-whatsapp-to-vps.sh ~/.local/bin/sync-transcripts-to-vps.sh \
-   scripts/wrappers/launchd/
+# on the producer, after pulling a change to a systemd wrapper
+install -m 755 scripts/wrappers/systemd/sb-outlook-sync.sh ~/.local/bin/
+# on the Mac, after pulling a change to a launchd wrapper
+install -m 755 scripts/wrappers/launchd/sb-db-pull.sh ~/.local/bin/
 ```
+
+Until it is installed the host runs the old copy, and the nightly health check
+lists each archived wrapper of its own host's flavour (launchd on a Mac, systemd
+elsewhere) whose installed copy differs, under WRAPPER DRIFT.
+Verify the installed copy under its real scheduler (below). A fix made on a host
+in an emergency goes the other way: copy it back here and commit it, so the
+archive never trails what runs. `docs/DEPLOY.md`, section 12, has the rest of an
+upgrade.
 
 ## Layout
 
 | Directory | Host | Scheduler | Count |
 | --- | --- | --- | --- |
-| `systemd/` | VPS | `systemctl --user` timers, plus one long-running service | 13 |
-| `launchd/` | Mac | LaunchAgents, and one Claude Code hook | 4, plus one plist template |
+| `systemd/` | the producer (a Linux VPS) | `systemctl --user` timers, plus one long-running service | 13 |
+| `launchd/` | a Mac that holds a replica | LaunchAgents, and one Claude Code hook | 4, plus one plist template |
 
-The VPS runs all ingestion. A Mac is a read replica: `sb-db-pull.sh` pulls the
-database and embeddings hourly, `wait-for-vps.sh` is the readiness gate it calls
-first, and `sync-whatsapp-to-vps.sh` pushes the minimized WhatsApp snapshot (its LaunchAgent
-template, `com.plessas.whatsapp-sync-vps.plist`, sits beside it).
-`sync-transcripts-to-vps.sh` pushes a Claude Code transcript when its session ends; no
-LaunchAgent runs it, the SessionEnd hook `scripts/hooks/session-end-push.sh` does
-(docs/DEPLOY.md, section 5).
+What each one runs, and when on the reference deployment (Europe/Athens; the unit
+files are host configuration and not in this repository, and `docs/DEPLOY.md`
+section 6 shows the same schedule from the pipeline's side):
+
+| Wrapper | Started by | When | What it runs |
+| --- | --- | --- | --- |
+| `systemd/sb-outlook-sync.sh` | `sb-outlook-sync` | :10 at 01 and 07 to 22 | `sb-auth-watch.sh`, the Inbox, Archive and Sent Items exports, `inbox_reconcile`, `sync` (which loads Claude Code conversations every hour), `sweep-files --policy` |
+| `systemd/sb-teams-sync.sh` | `sb-teams-sync` | :30 at 01 and 07 to 22 | `teams-sync` |
+| `systemd/sb-whatsapp-sync.sh` | `sb-whatsapp-sync` | :55 at 01 and 07 to 22 | `whatsapp-sync`, after the Mac's :50 push |
+| `systemd/sb-calendar-sync.sh` | `sb-calendar-sync` | :48 at 07 to 22 | `calendar-sync` |
+| `systemd/sb-news-sync.sh` | `sb-news-sync` | :50 at even hours | `news-sync` |
+| `systemd/sb-conversation-sync.sh` | `sb-conversation-sync` | 08:45, 14:45, 20:45 | `export-conversations --days 7`, `extract-conversations`, `ingest-session-notes` |
+| `systemd/sb-daily-sync.sh` | `sb-daily-sync` | 07:05 | `scripts/backup_db.py`, `sync`, `src.store.action_lifecycle`, and the mail plugin's style-sync when installed |
+| `systemd/sb-noon-catchup.sh` | `sb-noon-catchup` | 13:17 | `sync --lock-wait 600` |
+| `systemd/sb-attachment-pass.sh` | `sb-attachments` | 02:00 | the nightly attachment pass: registration, Phase 1, Phase 2, images, SharePoint, the orphan reaper, the file sweep, `mail-reconcile --since 7d` |
+| `systemd/sb-auth-watch.sh` | `sb-auth-watch`, and `sb-outlook-sync.sh` before each run | every 4 hours | checks the Outlook and Teams sessions, renews them, and sets or clears the re-auth sentinels |
+| `systemd/sb-health-check.sh` | `sb-health-check` | 23:50 | `scripts/health_check.py --fix --email-if-issues`, then the `sb-brain-freshness` ping (`docs/DEPLOY.md`, section 7) |
+| `systemd/sb-mcp.sh` | `sb-mcp` | always on | `python -m src.mcp_server --http` with `BRAIN_ROLE=replica` (`docs/DEPLOY.md`, section 9) |
+| `systemd/sb-db-pull.sh` | nothing | | an old copy of the pull, kept as history: the producer runs no pull |
+| `launchd/sb-db-pull.sh` | a LaunchAgent | :45 every hour | the replica pull, and the copy of the encrypted backup archives (`docs/DEPLOY.md`, section 5) |
+| `launchd/wait-for-vps.sh` | `sb-db-pull.sh` | before each pull | waits up to 180 s for the producer to answer ssh |
+| `launchd/sync-whatsapp-to-vps.sh` | the LaunchAgent template beside it, `com.plessas.whatsapp-sync-vps.plist` | :50 every hour | the WhatsApp snapshot push (`docs/DEPLOY.md`, section 5) |
+| `launchd/sync-transcripts-to-vps.sh` | the SessionEnd hook `scripts/hooks/session-end-push.sh` | when a session ends | that session's transcript, to the producer (`docs/DEPLOY.md`, section 5) |
+
+The Mac also runs the weekly restore drill, Sundays at 10:15 in the LaunchAgent
+`docs/RESTORE.md` gives; it calls `scripts/backup_db.py --drill` directly, with no
+wrapper.
+
+**Environment.** Each systemd unit's `ExecStart` is a host-local shim,
+`~/scripts/run-sb-*.sh`, which sets `PATH`, sources the Vertex environment file and
+execs the wrapper archived here. The shims hold absolute home paths and recipient
+addresses, so they stay host-local, which is the right place for machine-specific
+configuration and credentials. `sb-daily-sync.sh`, `sb-health-check.sh` and
+`sb-auth-watch.sh` also source `~/.config/healthchecks-ping.env` for `HC_PING_URL`.
+
+**Old headers.** Several systemd wrappers still open with the name of the launchd
+job they were before the producer moved to Linux ("launchd surface for ..."), and
+several source `~/.zprofile` when it exists. All of `systemd/` runs under systemd on
+the producer, where that file may be absent and is then skipped.
+
 The Mac's other `sb-*` wrappers correspond to jobs retired to the VPS and are
 deliberately not archived, because committing retired duplicates would only make
 it harder to tell which copy matters.
@@ -53,38 +89,28 @@ the marker as a convention that may or may not be present, never as the test.
 ## What the three sync wrappers ask of `src.cli sync`
 
 `sb-outlook-sync.sh` (hourly), `sb-noon-catchup.sh` (noon) and `sb-daily-sync.sh`
-(morning) each run the whole sync, Claude Code conversations (Step 7) included, and
-`sb-conversation-sync.sh` exports and extracts conversations three times a day besides.
-`sync --skip-conversations` (Step 7 left out) and `sync --full-dedup` (the people dedup
-over the whole table, which `sync` already takes once a day) are for a hand run: no
-wrapper passes either.
-
-## What is deliberately absent
-
-**The systemd entry-point shims** (`~/scripts/run-sb-*.sh` on the VPS). Each
-service's `ExecStart` points at one of those, which sets PATH, `DISPLAY`, and
-sources environment files before exec'ing the wrapper archived here. They hold
-absolute home paths and recipient addresses, so they stay host-local — which is
-the right place for machine-specific configuration and credentials anyway.
+(morning) each run the whole sync, Claude Code conversations included, and
+`sb-conversation-sync.sh` exports and extracts conversations three times a day
+besides. `sync --skip-conversations` (conversations left out) and
+`sync --full-dedup` (the people dedup over the whole table, which `sync` already
+takes once a day) are for a hand run: no wrapper passes either.
 
 ## Two families, not one
 
 `systemd/` and `launchd/` are independent lineages. Exactly one name appears in
-both, `sb-db-pull.sh`, and the two copies differ by 153 diff lines: the launchd
-one is the live consumer script, the systemd one is a much older relic. Nothing
-is shared between the families, so do not read a matching filename as a matching
-script. (This paragraph previously said `sb-reverse-ingest.sh` was the one name
-in common and was identical. It is wrong twice: that file exists only under
-`systemd/`, and the set it described has one member which is not identical.) Some
-of that is legitimate (macOS and Linux differ on `launchctl`/`systemctl`, `stat`,
-`date`), some is probably rot. They are archived as-is rather than reconciled;
-unifying them is a separate exercise with live ingestion at stake.
+both, `sb-db-pull.sh`, and the two copies differ: the launchd one is the live
+replica pull, the systemd one an old copy that no unit runs. Nothing is shared
+between the families, so do not read a matching filename as a matching script.
+Some of the differences are legitimate (macOS and Linux differ on
+`launchctl`/`systemctl`, `stat`, `date`), some are probably rot. They are archived
+as-is rather than reconciled; unifying them is a separate exercise with live
+ingestion at stake.
 
 ## Verifying a change
 
 CI parses every script with the interpreter named in its shebang, and fails on a
 missing or unrecognised one. That catches syntax breakage; it cannot catch
-behaviour. Before refreshing the archive, exercise the real scheduler path:
+behaviour. After installing a change, exercise the real scheduler path:
 
 ```bash
 launchctl kickstart -k "gui/$(id -u)/<label>"   # macOS
@@ -93,5 +119,5 @@ systemctl --user start <unit>                   # VPS
 
 Running the script yourself is the test that lies. A launchd job inherits none of
 your terminal's environment or its TCC grants, so a wrapper can pass by hand and
-fail on every scheduled run — which is exactly how a document push failed 56
+fail on every scheduled run, which is exactly how a document push failed 56
 consecutive times over 8 days while every manual check looked fine.

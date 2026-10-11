@@ -336,6 +336,29 @@ Used in extraction prompts and stale-thread detection.
 - `CLAUDE_EXTRACT_MODEL` or `VERTEX_MODEL_EXTRACT`: the Claude model, required with the `claude` engine, and with no default. A model your Vertex project's allowlist does not hold fails every call, and the old default had become one, so a host that sets none now stops at its first Claude call with a message naming these variables. Work met before that stays pending, and the read-only tools and the tests never need it.
 - `BRAIN_GEMINI_MODEL`: Gemini model override (default `gemini-2.5-flash`).
 - `BRAIN_TEAMS_MODEL`: override for Teams thread extraction.
+- `BRAIN_EXTRACT_CALL_SHAPE`: `v1` (default) or `v2`, how the Claude extraction calls are built; see the next section. Off until the extraction eval says otherwise.
+
+### Extraction call shape
+
+`BRAIN_EXTRACT_CALL_SHAPE` picks how the Claude extraction calls are built. **`v1`, the default, builds them byte for byte as before; `v2` stays off until the extraction eval, run under both shapes on the owner's set, says otherwise** (`scripts/extraction_eval.py --run --yes --call-shape v1`, then `--call-shape v2`, and compare the two records; see [Evals](#evals)). Any other value stops the calls with a message naming the variable, and the work stays pending, as for an unset model. The Gemini engine is not affected.
+
+| | v1 | v2 |
+| --- | --- | --- |
+| Instructions | in the user turn, after the fenced item | in `system`: the instructions and two worked examples (one Greek, one English), the same bytes on every call of a route, cached for one hour at the last block |
+| The item | fenced in the user turn | fenced in the user turn after the cached prefix; the pipeline's notes (a part, a digest, a merge) outside the fence |
+| Output | JSON asked for in prose, parsed and repaired by hand | `output_config.format` with schema v2 (`src/extract/schema_v2.py`), then validated and normalised by `parse_extraction_v2` |
+| Effort | the model's default | pinned per route in `src/extract/call_shape.py`, `high` on every route for now (the model's default, so v1 against v2 measures the shape alone) |
+| `max_tokens` | 8,192 for email and attachments, 2,048 for Teams and WhatsApp | 8,192 on every route, and a reply stopped at `max_tokens` is asked once more at twice that |
+
+Email (`extract_one`) and attachments (a single text, a spreadsheet digest, a part of a long document, the merge of its parts) take the whole v2 shape. Teams and WhatsApp keep their prompts and parsers and take the pinned effort, the larger budget and the retry: their system prompts are under the 512 tokens Sonnet 5.5 caches, so a cache marker would do nothing. The calendar route stays on v1 for now; Claude Code conversations and image transcription are unchanged.
+
+Schema v2, against v1: `people` is an array of `name_as_written`, `name_latin`, `email` and `role` (v1's `people_roles` was an object keyed by name, which structured outputs cannot express); each decision carries `owner_role` and `status` (`made`, `proposed`, `requested`) and each action item a `direction`; each decision, action item and commitment starts with an `evidence` quote, which the parser looks for in the text the model read and marks `evidence_found`; `item_kind` says what the email is; `language` is an ISO 639-1 code (`el`, `en`, or `mixed`, `other`); `references` is gone. The instructions ask for what is extracted in the email's own language, and for topic tags in English, since topics are shared by every item.
+
+The loader takes v1 and v2 extractions side by side, for good: staging and extraction files from before still load. A v2 extraction fills the same columns, its ISO `language` going in `emails.language` as Teams and WhatsApp store theirs, and a person's address is taken from the model only when it is one of the email's own header addresses, the person then being the header's. The fields with no column yet (`owner_role`, `status`, `direction`, `evidence` and `evidence_found`, `item_kind`, `name_latin`) stay in the extraction file under `data/extracted/`; their columns are deferred to a schema change of their own.
+
+On Vertex AI, for `claude-sonnet-5-5`: `output_config.effort` is live (image transcription pins it in production); prompt caching with a one-hour `cache_control` and structured outputs through `output_config.format` are documented as available there but not yet exercised by this code, and the eval's first v2 run is the check: its usage shows the cache reads, its rows the schema-valid replies.
+
+Every Claude call's line in the usage log (`llm-usage-YYYY-MM.jsonl`) records, besides the tokens, its thinking tokens, its cache writes by time to live, the refusal category, the request and response ids, its `max_tokens`, its effort, and `prompt_hash`, the hash of its system prompt and schema: equal hashes mean byte-identical instructions. A field the platform did not report is null.
 
 ### Vertex AI
 
@@ -390,7 +413,7 @@ Phase 2 of the attachment pipeline (`process-attachments --phase 2`, the nightly
 
 A run can be given a token budget, input and output tokens together: `--token-budget N` on `process-attachments` and `reextract`, or `BRAIN_ATTACHMENT_TOKEN_BUDGET` in the environment, which is how the nightly pass picks it up without a wrapper change (`--token-budget 0` lifts it for one run). Each call is estimated before it is sent, its prompt's characters at `BRAIN_CHARS_PER_TOKEN` characters a token (default 1.6, measured on this corpus's attachment prompts) plus 1,500 output tokens, and charged what the response reports once answered. The run stops before the first call that would pass the budget, leaves the rest pending for the next run (a long document keeps the parts it finished), prints how many it left, and exits 0. Calls already in flight finish, so with several workers a run can end a little over.
 
-`--estimate` on either command prints how many calls and tokens the pending work (or the rows `reextract` would choose) would take, and its cost, without calling the model or changing anything. Rows `reextract` must read again first are estimated from the text they hold now, and rows that hold none yet are counted apart. Prices come from one rate table, `src/llm_cost.py`: Claude Sonnet 5.5 on Vertex AI's `eu` endpoint, in USD per million tokens 2.20 input, 11.00 output, 1.10 and 5.50 as a batch job, 0.11 for a cache read.
+`--estimate` on either command prints how many calls and tokens the pending work (or the rows `reextract` would choose) would take, and its cost, without calling the model or changing anything. Rows `reextract` must read again first are estimated from the text they hold now, and rows that hold none yet are counted apart. Prices come from one rate table, `src/llm_cost.py`: Claude Sonnet 5.5 on Vertex AI's `eu` endpoint, in USD per million tokens 2.20 input, 11.00 output, 1.10 and 5.50 as a batch job, 0.11 for a cache read, 2.75 and 4.40 for a five-minute and a one-hour cache write. Under call shape v2 an estimate counts each call's system prompt in full, an upper bound: the cache serves it after the first call.
 
 The nightly health check reports yesterday's spend (UTC) from the usage log every call writes, `llm-usage-YYYY-MM.jsonl` under the data home: an `LLM spend` row with calls, tokens and cost, and a line per call site. It is WARN above `BRAIN_DAILY_SPEND_WARN_USD` (default 60) or when a call used a model the rate table cannot price, and STALE when the store shows model work that day (mail that received a summary, attachment summaries written) but the log holds no call, which also fails the freshness ping. On a replica it reads N/A: the calls, and their log, are the producer's.
 
@@ -549,7 +572,9 @@ src/
     local.py                   Concurrent extraction dispatcher
     extraction_files.py        Where an email's extraction file lives; read back by the exact id
     news_extract.py            News items without the model: the synthesis brief or the article's opening
-    parser.py                  Tolerant LLM JSON parser
+    parser.py                  Tolerant LLM JSON parser, schema v1 and schema v2
+    call_shape.py              BRAIN_EXTRACT_CALL_SHAPE: v1 or v2 calls, routes, pinned effort, prompt hash
+    schema_v2.py               Schema v2 of the extraction JSON, the shape structured outputs hold v2 replies to
     claude_extract.py          Claude via Vertex AI (model and region required); direct API only with BRAIN_ALLOW_DIRECT_API=1
     vertex_auth.py             Vertex AI credential resolution
     vertex_fallback.py         Model and region fallback on policy refusals
@@ -696,12 +721,12 @@ Each run appends one dated record to `evals/extraction/results.jsonl` or `evals/
    - `actions`: `{"text", "direction", "deadline"}`, with `direction` one of `owner_owes`, `owed_to_owner`, `third_party`, and `deadline` a `YYYY-MM-DD` date or `null`
    - `must_not`: phrases no extracted decision, action or commitment may contain, such as a decision quoted from older mail in the thread, or what an injected instruction dictates
 3. `--dry-run` validates the set and grades the gold itself (it must pass every check) and no answer (it must fail them all). It also regrades the last run's saved replies against the gold as it stands, and prints the cost estimate. It calls no model and writes nothing.
-4. `--run --judge` prints the estimate and stops; add `--yes` to spend it. Each case is extracted twice through `claude_extract.extract_one`, the function the sync calls, then graded. The run appends its record (model, prompt hash, effort, per-check pass rates, cost) to `results.jsonl`, writes every graded row with the model's own text to `runs/<run_id>.jsonl`, and records each attempt that produced nothing to grade in `errors.jsonl`. A truncated or refused reply is counted, not graded, and a reply from another model is an error. `--effort low|medium|high` sends `output_config.effort` with every call, for a sweep; `--case ID` runs a pilot.
+4. `--run --judge` prints the estimate and stops; add `--yes` to spend it. Each case is extracted twice through `claude_extract.extract_one`, the function the sync calls, then graded. The run appends its record (model, prompt hash, effort, per-check pass rates, cost) to `results.jsonl`, writes every graded row with the model's own text to `runs/<run_id>.jsonl`, and records each attempt that produced nothing to grade in `errors.jsonl`. A truncated or refused reply is counted, not graded, and a reply from another model is an error. `--effort low|medium|high` sends `output_config.effort` with every call, for a sweep; `--case ID` runs a pilot. `--call-shape v1|v2` builds every extraction call of the run in that shape ([Extraction call shape](#extraction-call-shape)); without it the run takes `BRAIN_EXTRACT_CALL_SHAPE`'s, as the sync would. The record names the shape, and a v2 attempt asked twice after a `max_tokens` stop is priced whole. `--synthetic` runs, or dry-runs, six labelled cases the eval builds itself in place of the set: the two crafted injection items and four synthetic emails (an owner's commitment in Greek under quoted history, an inbound ask in English, a newsletter, a forwarded regulation in Greek), addressed to the owner as `BRAIN_USER_NAME` and `BRAIN_USER_EMAIL_PATTERN` give him. They need no labelling, so the programmatic checks run on a host without the owner's set, and a few cents compare the shapes; they do not replace the set.
 5. `--calibrate --yes` measures how often the judge pairs items as the owner would: on probes the gold fixes (the gold itself, the gold less one item, another case's gold, "I don't know"), and on the last run's outputs that the owner has counted in `calibration.jsonl` (written on first use, for him to fill in). Below 90% agreement, the judge's scores should not steer a change.
 
 | Check | Passes when | Graded |
 | --- | --- | --- |
-| `schema_valid` | the reply parses as it stands, in the parser's schema | always |
+| `schema_valid` | the reply parses as it stands, in the schema it was asked in: the v1 parser's, or schema v2 | always |
 | `kind` | `item_kind` equals the gold | once the extraction emits `item_kind` |
 | `language` | the language, as a code, equals the gold | labelled cases |
 | `owner_roles` | the owner's decisions and debts count as the gold's: by `owner_role` and `direction` once emitted, until then by `decided_by` and `owner` against `owner.json` | labelled cases, with fields or names |

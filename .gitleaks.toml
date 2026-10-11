@@ -9,13 +9,14 @@ useDefault = true
 [allowlist]
 description = "Allowlist for non-sensitive patterns"
 
-# Ignore .env.example and similar template files
-paths = [
-  '''\.env\.example$''',
-  '''\.env\.template$''',
-  '''config\.example\.''',
-  '''\.sample$''',
-]
+# No file is exempt by path. This list used to skip .env.example and three
+# other template names, and an example file is exactly where a real key gets
+# pasted. Removing it changed no verdict: the default rules find nothing in the
+# tracked tree or in any commit of .env.example. An example value that trips a
+# rule gets a placeholder that does not (`sk-ant-...`), or an inline
+# `gitleaks:allow` where the line can carry a comment. The assignment lines of
+# .env.example cannot: they are copied into systemd EnvironmentFile=, which has
+# no trailing comments (tests/test_audit_extract_engine_config.py).
 
 # Ignore test fixtures and mock data
 regexes = [

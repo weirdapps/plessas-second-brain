@@ -32,7 +32,7 @@ match_count is how many people the name can mean, rows the map or the owner rule
 counting once, and other_candidates the next three, each with its identifier kind
 ('email', 'mri', 'jid', or None for a mention).
 
-The words of every name are indexed once per store and process (about 0.1 s for 34K
+The words of every name are indexed once per store and process (about 0.2 s for 34K
 people) and reused until the people table changes, so a lookup takes milliseconds
 where the folded scan took 45-55 ms.
 """

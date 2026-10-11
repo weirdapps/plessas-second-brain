@@ -751,6 +751,14 @@ def cmd_ocr_regarble(args):
     return cmd(args)
 
 
+def cmd_refetch_garbled(args):
+    """Fetch again from the mailbox the swept originals of garbled OCR texts
+    (src/export/refetch_garbled.py)."""
+    from src.export.refetch_garbled import cmd
+
+    return cmd(args)
+
+
 def cmd_sweep_files(args):
     """Delete attachment files whose content is already stored (src/store/file_sweep.py).
 
@@ -4014,6 +4022,24 @@ def main():
         "--root", default=str(ATTACHMENTS_DIR), help="Attachments root, for rows recorded elsewhere"
     )
     parser_regarble.set_defaults(func=cmd_ocr_regarble)
+
+    parser_refetch_garbled = subparsers.add_parser(
+        "refetch-garbled",
+        help="Fetch again from the mailbox the swept originals of garbled OCR texts",
+    )
+    parser_refetch_garbled.add_argument(
+        "--dry-run", action="store_true", help="Count only: download nothing, write nothing"
+    )
+    parser_refetch_garbled.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Most messages to ask the mailbox for in this run (default 200)",
+    )
+    parser_refetch_garbled.add_argument(
+        "--root", default=str(ATTACHMENTS_DIR), help="Attachments root, where the files go back"
+    )
+    parser_refetch_garbled.set_defaults(func=cmd_refetch_garbled)
 
     parser_notes = subparsers.add_parser(
         "ingest-session-notes",

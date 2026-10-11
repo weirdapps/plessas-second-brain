@@ -98,6 +98,8 @@ def test_descriptions_are_short_and_carry_no_history():
     for name, tool in listed_tools().items():
         text = tool.description or ""
         assert len(text) < 1000, name
+        # Python 3.12 keeps a docstring's indentation; the client gets it dedented.
+        assert "\n    " not in text, name
         assert "TODO" not in text, name
         assert not re.search(r"\b(?:until|since|on) 20\d\d-\d\d-\d\d", text), name
 

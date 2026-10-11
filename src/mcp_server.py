@@ -5,11 +5,13 @@ Run: python -m src.mcp_server
 """
 
 import argparse
+import inspect
 import os
 import re
 import sys
+from collections.abc import Callable
 from datetime import UTC
-from typing import Annotated, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -123,6 +125,21 @@ SHAREPOINT = ToolAnnotations(
     read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True
 )
 
+
+def _tool[F: Callable[..., Any]](annotations: ToolAnnotations = READ_ONLY) -> Callable[[F], F]:
+    """Register a tool with its annotations and its docstring, dedented, as its description.
+
+    The SDK sends __doc__ as it is, and Python 3.12 keeps each line's indentation in
+    it (3.13 strips it): on 3.12 every description carried four spaces a line.
+    """
+
+    def register(fn: F) -> F:
+        description = inspect.cleandoc(fn.__doc__ or "")
+        return mcp.tool(annotations=annotations, description=description)(fn)
+
+    return register
+
+
 MAX_LIMIT = 200
 RECALL_MAX_PER_KIND = 10
 
@@ -213,7 +230,7 @@ _NO_WORD = (
 )
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def person_context(
     name_or_email: Annotated[
         str,
@@ -252,7 +269,7 @@ def person_context(
     return cast(PersonContext, out)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def topic_context(
     topic: Annotated[str, Field(description="A topic name; part of one matches.")],
     days: Days = 365,
@@ -278,7 +295,7 @@ def topic_context(
     return cast(TopicContext, out)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def sender_brief(
     name_or_email: Annotated[
         str, Field(description="The sender's name or address, matched as person_context does.")
@@ -298,7 +315,7 @@ def sender_brief(
         conn.close()
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def email_thread(
     email_id: Annotated[
         int, Field(description="emails.id of any email in the thread, as a search row gives it.")
@@ -332,7 +349,7 @@ def email_thread(
         conn.close()
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def search_emails(
     query: Annotated[str, Field(description="Plain words; quotes and operators are ignored.")],
     search_type: SearchType = "keyword",
@@ -388,7 +405,7 @@ _RECALL_KINDS = (
 # The description must keep naming all ten buckets: it is what tells a caller the
 # tool covers Teams, calendar and commitments at all. It named seven until
 # 2026-09-09, which made three whole kinds invisible.
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def recall(
     query: Annotated[str, Field(description="Plain words: a name, a topic, a phrase.")],
     limit_per_kind: Annotated[
@@ -466,7 +483,7 @@ def recall(
     return cast(RecallResult, out)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def query_emails(
     person: Annotated[
         str | None,
@@ -522,7 +539,7 @@ def query_emails(
     )
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def query_decisions(
     topic: Annotated[str | None, Field(description="An extracted topic tag.")] = None,
     person: Annotated[
@@ -566,7 +583,7 @@ def query_decisions(
     )
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def query_actions(
     owner: Annotated[
         str | None,
@@ -608,7 +625,7 @@ def query_actions(
         conn.close()
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def stale_threads(
     days: Annotated[int, Field(description="Days since your last message (default 5).")] = 5,
     limit: Annotated[
@@ -653,7 +670,7 @@ def stale_threads(
         conn.close()
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def meeting_prep(
     people: Annotated[str, Field(description="Attendee names or addresses, separated by commas.")],
     topic: Annotated[str | None, Field(description="The meeting's topic, to focus on.")] = None,
@@ -674,7 +691,7 @@ def meeting_prep(
         conn.close()
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def search_attachments(
     query: Annotated[
         str,
@@ -706,7 +723,7 @@ def search_attachments(
 ATTENDEES_SHOWN = 10
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def query_calendar_events(
     person: Annotated[
         str, Field(description="An attendee's name or address; part of one matches.")
@@ -892,7 +909,7 @@ def query_calendar_events(
     return cast(CalendarEvents, out)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def stats() -> Stats:
     """How big and how fresh is the brain: counts per source, freshness (data_as_of, age_hours, stale), and `coverage`, the first and last date held per mailbox, Teams, WhatsApp, calendar and conversations.
 
@@ -961,7 +978,7 @@ def stats() -> Stats:
         conn.close()
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def search_conversations(
     query: Annotated[
         str,
@@ -1030,7 +1047,7 @@ def search_conversations(
     )
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def conversation_context(
     session_id: Annotated[
         str, Field(description="The session's id (a UUID), as search_conversations gives it.")
@@ -1049,7 +1066,7 @@ def conversation_context(
     return cast(ConversationContext, out)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def recall_preference(
     topic: Annotated[str, Field(description="A topic, tool, pattern or approach.")],
     limit: Annotated[
@@ -1066,7 +1083,7 @@ def recall_preference(
         conn.close()
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def recent_conversations(
     workspace: Annotated[
         str | None, Field(description="Only sessions whose workspace path contains this.")
@@ -1086,7 +1103,7 @@ def recent_conversations(
         conn.close()
 
 
-@mcp.tool(annotations=SHAREPOINT)
+@_tool(SHAREPOINT)
 def sharepoint_index(
     operation: Annotated[
         Literal["list_stale", "list_unfetched", "refetch"],
@@ -1189,7 +1206,7 @@ def sharepoint_index(
         conn.close()
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def attachment_image_search(
     query: Annotated[str, Field(description="Words to find in the images' descriptions.")],
     limit: Annotated[
@@ -1255,7 +1272,7 @@ def attachment_image_search(
         conn.close()
 
 
-@mcp.tool(annotations=READ_ONLY_LIVE)
+@_tool(READ_ONLY_LIVE)
 def outlook_live_search(
     folder: Annotated[str, Field(description="Mailbox folder name (default Inbox).")] = "Inbox",
     since_minutes: Annotated[
@@ -1324,7 +1341,7 @@ _LIVE_MAIL_FIELDS = (
 )
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def search_teams(
     query: Annotated[
         str,
@@ -1363,7 +1380,7 @@ def search_teams(
     )
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def search_whatsapp(
     query: Annotated[
         str,
@@ -1405,7 +1422,7 @@ def search_whatsapp(
     return cast(ResultsResult, out)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def teams_thread_context(
     thread_id: Annotated[
         int, Field(description="teams_threads.id, as a search_teams row gives it.")
@@ -1424,7 +1441,7 @@ def teams_thread_context(
     return cast(TeamsThread, out)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def teams_chat_summary(
     chat_id: Annotated[int, Field(description="teams_chats.id, as a search_teams row gives it.")],
     days: Annotated[int, Field(description="Lookback in days (default 30).")] = 30,
@@ -1442,7 +1459,7 @@ def teams_chat_summary(
     return cast(TeamsChat, out)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def sql_query(
     sql: Annotated[
         str, Field(description="A single SELECT. Inline the literals; there are no parameters.")
@@ -1476,7 +1493,7 @@ def sql_query(
     return cast(SqlResult, out)
 
 
-@mcp.tool(annotations=READ_ONLY)
+@_tool()
 def sql_schema(
     table: Annotated[
         str | None,

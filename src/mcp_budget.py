@@ -75,7 +75,6 @@ def budget_response(obj: dict, max_chars: int = RESPONSE_BUDGET_CHARS) -> dict:
     row_chars = {path: [_row_chars(row, len(path) + 1) for row in rows] for path, rows in buckets}
     kept = {path: len(rows) for path, rows in buckets}
     weight = {path: sum(sizes) for path, sizes in row_chars.items()}
-    out = obj
     while True:
         over = size - max_chars
         while over > 0:

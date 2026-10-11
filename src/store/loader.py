@@ -627,32 +627,24 @@ def replace_extraction(
     _write_extraction(conn, email_id, metadata, right)
 
 
-def stored_email(
-    conn: sqlite3.Connection, email_id: int, leave_out: set[str] | frozenset[str] = frozenset()
-) -> dict:
+def stored_email(conn: sqlite3.Connection, email_id: int) -> dict:
     """The email as the loader was given it, rebuilt from the store: what the
     extraction prompt reads, and the header people replace_extraction names from.
 
-    A header person always has an address, so one without is the model's. `leave_out`
-    drops the names, lowercased, that must not be offered as recipients
-    (scripts/repair_case_twins.py passes those a twin's extraction called recipients).
+    A header person always has an address, so one without is the model's.
     """
     row = conn.execute(
         "SELECT message_id, subject, date_received, sender_name, sender_address, content,"
         " mailbox_name FROM emails WHERE id = ?",
         (email_id,),
     ).fetchone()
-    people = [
-        (role, name, address)
-        for role, name, address in conn.execute(
-            "SELECT ep.role_in_email, p.name, p.email FROM email_people ep"
-            " JOIN people p ON p.id = ep.person_id"
-            " WHERE ep.email_id = ? AND ep.role_in_email IN ('recipient', 'cc')"
-            " AND COALESCE(p.email, '') != '' ORDER BY ep.rowid",
-            (email_id,),
-        )
-        if (name or "").lower() not in leave_out
-    ]
+    people = conn.execute(
+        "SELECT ep.role_in_email, p.name, p.email FROM email_people ep"
+        " JOIN people p ON p.id = ep.person_id"
+        " WHERE ep.email_id = ? AND ep.role_in_email IN ('recipient', 'cc')"
+        " AND COALESCE(p.email, '') != '' ORDER BY ep.rowid",
+        (email_id,),
+    ).fetchall()
     return {
         "message_id": row[0],
         "subject": row[1],

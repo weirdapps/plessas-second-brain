@@ -7,6 +7,7 @@ Ingest: Import standalone documents (not from email) into the knowledge store.
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -35,8 +36,10 @@ from src.llm_cost import (
 )
 from src.redact import redact_secrets
 from src.store.file_hashes import sha256_of_file
-from src.store.file_sweep import NOT_FULLY_READ_SQL, OCR_GARBLED_SQL
+from src.store.file_sweep import FULLY_HELD_SQL, NOT_FULLY_READ_SQL, OCR_GARBLED_SQL
 from src.store.source_class import stored_class
+
+logger = logging.getLogger(__name__)
 
 # Processing constants
 PHASE2_BATCH_SIZE = 10
@@ -1136,7 +1139,9 @@ def ingest_document(
         source_url: Original URL if fetched from the web.
 
     Returns:
-        Dict with email_id, attachment_id, message_id, or 'skipped' if duplicate.
+        Dict with email_id, attachment_id, message_id; or 'skipped' with its 'reason' when
+        the store already holds these bytes, as this document or as an attachment whose
+        content is held, with the 'file_path' of that copy.
     """
     db_path = db_path or str(DEFAULT_DB)
     file_path = str(Path(file_path).resolve())
@@ -1192,6 +1197,33 @@ def ingest_document(
             "file_path": held[0]
             if held
             else str(ATTACHMENTS_DIR / str(abs(message_id)) / filename),
+        }
+
+    # The same bytes held as another attachment: a file saved from mail into a folder that is
+    # then ingested was stored a second time, and search returned both
+    # (scripts/forget_duplicate_documents.py). Only a twin whose content is held counts, the
+    # rule the sweep and the orphan reaper use: one that failed, was skipped, is encrypted or
+    # was read in part holds nothing this would repeat, and this file may be the only readable
+    # copy of its bytes.
+    twin = conn.execute(
+        "SELECT a.id, a.email_id, a.message_id, a.file_path FROM attachments a"
+        " JOIN attachment_content ac ON ac.attachment_id = a.id"
+        f" WHERE a.sha256 = ? AND COALESCE({FULLY_HELD_SQL}, 0)"
+        " ORDER BY a.id LIMIT 1",
+        (sha256,),
+    ).fetchone()
+    if twin:
+        conn.close()
+        twin_id, twin_email_id, twin_message_id, twin_path = twin
+        reason = f"already held as attachment {twin_id} of email {twin_email_id}"
+        logger.info("Not ingesting %s: %s", filename, reason)
+        return {
+            "skipped": True,
+            "message_id": twin_message_id,
+            "reason": reason,
+            "attachment_id": twin_id,
+            "email_id": twin_email_id,
+            "file_path": twin_path,
         }
 
     # Create synthetic email entry, with its class (src/store/source_class.py)

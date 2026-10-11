@@ -91,13 +91,6 @@ def test_fuzzy_people_applies_nothing_on_a_replica(replica, monkeypatch):
     assert fuzzy_people._cli() == 2
 
 
-def test_recovering_extractions_refuses_a_replica(replica, monkeypatch):
-    module = _script("recover_missing_extractions")
-    monkeypatch.setattr(module, "get_connection", lambda *a, **k: pytest.fail("opened"))
-
-    assert module.main() == 2
-
-
 def test_the_secret_scrub_applies_nothing_on_a_replica(replica, monkeypatch):
     module = _script("scrub_secrets")
     monkeypatch.setattr(module.sqlite3, "connect", lambda *a, **k: pytest.fail("opened"))
@@ -172,10 +165,6 @@ def test_the_producer_reconciles_the_inbox(monkeypatch, tmp_path):
 def test_the_producer_gets_past_the_script_guards(monkeypatch, tmp_path):
     """A missing database is the next check after each guard, so its answer shows
     the guard let the run through."""
-    recover = _script("recover_missing_extractions")
-    monkeypatch.setattr(recover, "DB", tmp_path / "missing.db")
-    assert recover.main() == 1
-
     scrub = _script("scrub_secrets")
     monkeypatch.setattr(scrub, "DEFAULT_DB", tmp_path / "missing.db")
     assert scrub.main(["--apply"]) == 2

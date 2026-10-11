@@ -18,7 +18,7 @@ import google.auth.exceptions as gauth
 import httpx
 from google.genai import errors as genai_errors
 
-from src.extract.claude_extract import reset_client_cache
+from src.extract.claude_extract import ClaudeNotConfigured, reset_client_cache
 from src.extract.vertex_auth import is_vertex_auth_error
 from src.llm_policy import Outcome, register_post_reauth
 
@@ -122,6 +122,10 @@ def is_transient(exc: BaseException) -> bool:
     itself. A reply the caller cannot use (unparseable, truncated) raises
     ValueError there, and trying again would get the same reply.
     """
+    # A model, region or credential this host has not set (claude_extract): no item is
+    # at fault, and each is offered again once it is set.
+    if isinstance(exc, ClaudeNotConfigured):
+        return True
     # Whatever its message says: a parser's column number can read as a '429'.
     # google-auth's own ValueErrors are credentials, and are judged below.
     if isinstance(exc, ValueError) and not isinstance(exc, gauth.GoogleAuthError):

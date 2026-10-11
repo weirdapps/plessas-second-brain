@@ -6,6 +6,7 @@ call the production entry point, so the fake sits exactly where the SDK call doe
 
 import importlib.util
 import json
+import os
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -91,7 +92,7 @@ class FakeModel:
 
 @pytest.fixture
 def model(monkeypatch):
-    monkeypatch.setattr(claude_extract, "CLAUDE_MODEL_BASE", MODEL)
+    monkeypatch.setenv("CLAUDE_EXTRACT_MODEL", MODEL)
 
     def install(replies, verdict=None, served=MODEL):
         fake = FakeModel(replies, verdict, served)
@@ -561,7 +562,7 @@ def test_the_run_goes_through_the_real_complete_and_logs_its_own_sites(
         "_get_client_and_model",
         lambda: (SimpleNamespace(messages=Messages()), MODEL),
     )
-    monkeypatch.setattr(claude_extract, "CLAUDE_MODEL_BASE", MODEL)
+    monkeypatch.setenv("CLAUDE_EXTRACT_MODEL", MODEL)
     monkeypatch.setattr(claude_extract, "USAGE_LOG_DIR", tmp_path)
 
     record = ev.run(
@@ -957,3 +958,20 @@ def test_calibrate_with_nothing_to_judge_is_refused(cli, files, model):
     write_set(files, [email_case("a", gold_=gold(kind="bulk"))])
 
     assert cli(["--calibrate", "--yes", "--dir", str(files.root)]) == 2
+
+
+@pytest.mark.parametrize("mode_", ["--run", "--calibrate"])
+def test_without_a_model_nothing_is_spent_or_recorded(
+    cli, files, model, monkeypatch, capsys, mode_
+):
+    """Unset, every case would fail its first call and leave a results record of nothing."""
+    fake = model({"subject a": GOOD_A, "subject b": reply()}, verdict=exact_judge)
+    for name in ("CLAUDE_EXTRACT_MODEL", "VERTEX_MODEL_EXTRACT"):
+        if name in os.environ:
+            monkeypatch.delenv(name)
+    write_set(files, labelled_cases())
+
+    assert cli([mode_, "--yes", "--dir", str(files.root)]) == 2
+    assert fake.calls == []
+    assert not files.results.exists()
+    assert "CLAUDE_EXTRACT_MODEL" in capsys.readouterr().err

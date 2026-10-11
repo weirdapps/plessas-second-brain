@@ -114,8 +114,8 @@ def test_a_copy_waits_while_another_copy_is_extracted_and_not_yet_loaded(run, db
 
 
 def test_a_copy_is_not_held_behind_one_whose_extraction_was_lost(run, db, tmp_path):
-    """Recorded as processed, with no file on disk, the first copy never loads
-    (scripts/recover_missing_extractions.py); the second must not wait for it."""
+    """Recorded as processed, with no file on disk, the first copy never loads; the
+    second must not wait for it."""
     run([_mail("AAMk-inbox-4", "<four@example.com>", "Inbox")], db_path=db)
     for path in (tmp_path / "extracted").glob("AAMk-inbox-4*"):
         path.unlink()

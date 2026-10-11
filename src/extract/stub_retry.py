@@ -9,11 +9,11 @@ refused every request.
 A stub is a mail row (not news, not a document) whose summary is empty. Each is
 rebuilt from the store as the extraction prompt reads it (loader.stored_email), sent
 through the normal extraction (local.extract_inline), and given the extraction in
-place of the stub (loader.replace_extraction), the way scripts/repair_case_twins.py
-repairs a crossed one: the row keeps its id, attachments, HTML and thread, and the
-extraction file on disk is rewritten. A stub has no vector (the index embeds only
-rows with a summary), so the next index build embeds the new summary. A failure
-leaves the stub as it was; quota or an expired credential ends the run.
+place of the stub (loader.replace_extraction): the row keeps its id, attachments,
+HTML and thread, and the extraction file on disk is rewritten. A stub has no vector
+(the index embeds only rows with a summary), so the next index build embeds the new
+summary. A failure leaves the stub as it was; quota or an expired credential ends the
+run.
 """
 
 from __future__ import annotations

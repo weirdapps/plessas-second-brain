@@ -26,12 +26,21 @@ index and its queries drift apart.
 
 Folding is 1:1 per character, which is what makes it safe here: snippet() offsets
 computed against the folded text still line up with the original.
+
+Inflection is handled on the query side only: query_stem gives a Greek query word's
+Snowball stem, which the full-text queries (src/store/query.py) search as a prefix
+beside the word, and sb_match_args hands sb_match the same stems.
 """
 
+import logging
 import re
 import sqlite3
 import unicodedata
-from functools import lru_cache
+from functools import lru_cache, partial
+
+from src.config import query_stemming
+
+logger = logging.getLogger(__name__)
 
 # Precomposed Greek vowels carrying tonos or dialytika, mapped to their bare form.
 # Uppercase entries are included because Greek all-caps legitimately keeps the
@@ -187,6 +196,65 @@ def search_words(text: str | None) -> list[str]:
     return list(dict.fromkeys(words))
 
 
+# The fewest letters a word, and the stem it is also searched by, may have. A shorter
+# stem starts too many other words: τιμ- of τιμή also starts τιμολόγιο.
+STEM_MIN = 4
+_GREEK_LETTERS = frozenset("αβγδεζηθικλμνξοπρστυφχψω")
+
+
+@lru_cache(maxsize=1)
+def _snowball():
+    """A maker of Snowball Greek stemmers, or None when snowballstemmer is missing.
+
+    One stemmer per word: a stemmer holds the word it works on, and the MCP server
+    runs tools on several threads. A checkout pulled without `uv sync` searches the
+    form typed, as before stemming, and says so once.
+    """
+    try:
+        import snowballstemmer
+    except ImportError:
+        logger.warning(
+            "snowballstemmer is not installed, so Greek words are searched only in the "
+            "form typed; run `uv sync` to install it"
+        )
+        return None
+    return partial(snowballstemmer.stemmer, "greek")
+
+
+def query_stem(word: str) -> str | None:
+    """The stem a query word is also searched by, as a prefix, or None to search it as typed.
+
+    Greek inflects every noun, adjective and verb, and a search matched the form typed:
+    on one store "καρτες" was in 3,966 emails and some form of the word in 13,243. So a
+    Greek word of STEM_MIN letters or more, folded, is also searched by its Snowball
+    stem (κάρτα, κάρτες and καρτών all stem to καρτ), when that stem is a shorter prefix
+    of the word with STEM_MIN letters or more. A stem that changed a letter is a prefix
+    of no other form, a word the stemmer left whole has no ending to drop, and a shorter
+    stem starts too many unrelated words. A stopword, a Latin word, a code or a number
+    is searched as typed, and so is every word when BRAIN_QUERY_STEMMING is 0.
+
+    A stem can still start a different word: πλήρης (πληρ-) also finds πληροφορία, and
+    a name finds the names that start like it.
+    """
+    if not query_stemming():
+        return None
+    token = search_fold(_strip_punctuation(word))
+    if len(token) < STEM_MIN or token in STOPWORDS or not _GREEK_LETTERS.issuperset(token):
+        return None
+    make = _snowball()
+    if make is None:
+        return None
+    stem = make().stemWord(token)
+    if STEM_MIN <= len(stem) < len(token) and token.startswith(stem):
+        return stem
+    return None
+
+
+def _with_stems(words: list[str]) -> list[str]:
+    """Each folded word as its stem where it has one; two forms of a word count once."""
+    return list(dict.fromkeys(query_stem(word) or word for word in words))
+
+
 # sb_match's score for a row holding the whole query: above any token count.
 PHRASE_MATCH = 1 << 20
 
@@ -277,6 +345,25 @@ def _match_score(text: str | None, phrase: str, words: str, joined_tokens: str) 
         if all(p.search(folded) for p in _word_patterns(words)):
             return PHRASE_MATCH
     return len(tokens)
+
+
+def sb_match_args(keyword: str | None) -> tuple[str, str, str]:
+    """(phrase, words, tokens) for sb_match(text, phrase, words, tokens).
+
+    The folded query; the words a row must hold, U+001F-joined; and the tokens a
+    partial row is counted by. A word with a stem (query_stem) is given as its stem:
+    sb_match finds a word at the start of a longer one, so the stem finds every form
+    it starts, as the prefix term does in the full-text index. A one-word query is
+    matched by its phrase, and by its stem when it has one; no tokens, since "any"
+    would equal "all".
+    """
+    phrase = search_phrase(keyword)
+    several = len(phrase.split()) >= 2
+    words = search_words(keyword)
+    forms = _with_stems(words)
+    tokens = _with_stems(search_tokens(keyword)) if several else []
+    joined = "\x1f".join(forms) if several or forms != words else ""
+    return phrase, joined, "\x1f".join(tokens)
 
 
 def register_sql_functions(conn) -> None:

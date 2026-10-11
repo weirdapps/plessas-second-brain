@@ -29,6 +29,9 @@ dependencies = [
     # Legacy Excel (.xls); xlrd 2.0+ dropped .xlsx support, focuses exclusively on .xls
     "xlrd>=2.0.1",
     "pillow-heif>=1.5.0",
+    # Snowball's Greek stemmer, pure Python: a Greek query word is also searched by its
+    # stem as a prefix, so κάρτες finds κάρτα and καρτών (src/store/greek.py, query_stem).
+    "snowballstemmer>=3.1.1",
     # Security pin. Not needed by anything here directly: anyio arrives transitively
     # via anthropic and mcp, and uv.lock has held a fixed version since #70 bumped it
     # to 4.14.2. It is declared anyway because the VPS deploy hook is

@@ -142,8 +142,12 @@ def test_recall_falls_back_to_any_token_and_marks_it(conn):
 
     out = recall(conn, "παρουσίαση κάρτες εξωτερικός ελεγκτής")
 
-    assert len(out["actions"]) == 1
-    assert out["actions"][0]["partial_match"] is True
+    # Two of the words first; καρτών, another form of κάρτες, is one (stemming).
+    assert [a["task"] for a in out["actions"]] == [
+        "Ετοιμασία παρουσίασης για τις κάρτες",
+        "Αποστολή του προϋπολογισμού καρτών",
+    ]
+    assert all(a["partial_match"] is True for a in out["actions"])
 
 
 def test_keyword_search_retries_with_any_token_when_every_token_misses(conn):

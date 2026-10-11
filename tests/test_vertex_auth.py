@@ -83,6 +83,64 @@ class TestTouchSentinel:
         vertex_auth.touch_sentinel()
         assert fake.exists()
 
+    def test_names_the_process_and_the_caller(self, tmp_path, monkeypatch, caplog):
+        """On 2026-10-10 the sentinel went up between two healthy probes, and auth-watch
+        took its clearing for a recovery; no log line said which job had set it."""
+        import os
+
+        from src.extract import vertex_auth
+
+        monkeypatch.setattr(vertex_auth, "GCLOUD_SENTINEL", tmp_path / "needs_gcloud_reauth")
+        monkeypatch.setattr(vertex_auth, "_LOGGED", False)
+
+        with caplog.at_level("WARNING", logger="src.extract.vertex_auth"):
+            vertex_auth.touch_sentinel()
+
+        assert "set needs_gcloud_reauth" in caplog.text
+        assert f"pid {os.getpid()}" in caplog.text
+        assert __name__ in caplog.text, "the call site is the reason when none is given"
+
+    def test_a_given_reason_is_logged(self, tmp_path, monkeypatch, caplog):
+        from src.extract import vertex_auth
+
+        monkeypatch.setattr(vertex_auth, "GCLOUD_SENTINEL", tmp_path / "needs_gcloud_reauth")
+        monkeypatch.setattr(vertex_auth, "_LOGGED", False)
+
+        with caplog.at_level("WARNING", logger="src.extract.vertex_auth"):
+            vertex_auth.touch_sentinel("RefreshError in phase 2")
+
+        assert "RefreshError in phase 2" in caplog.text
+
+    def test_keeps_the_time_it_went_up(self, tmp_path, monkeypatch):
+        """auth-watch's restore reads that time to tell a daily sync that ran before the
+        outage from one that skipped during it, and the health report prints it."""
+        import os
+        import time
+
+        from src.extract import vertex_auth
+
+        fake = tmp_path / "needs_gcloud_reauth"
+        monkeypatch.setattr(vertex_auth, "GCLOUD_SENTINEL", fake)
+        fake.touch()
+        went_up = time.time() - 3600
+        os.utime(fake, (went_up, went_up))
+
+        vertex_auth.touch_sentinel()
+
+        assert abs(fake.stat().st_mtime - went_up) < 1
+
+    def test_logs_once_per_process_while_it_stays_up(self, tmp_path, monkeypatch, caplog):
+        from src.extract import vertex_auth
+
+        monkeypatch.setattr(vertex_auth, "GCLOUD_SENTINEL", tmp_path / "needs_gcloud_reauth")
+        monkeypatch.setattr(vertex_auth, "_LOGGED", False)
+
+        with caplog.at_level("WARNING", logger="src.extract.vertex_auth"):
+            for _ in range(5):
+                vertex_auth.touch_sentinel()
+
+        assert len(caplog.records) == 1
+
 
 class TestAttachmentPipelineDefersOnAuthError:
     """Auth-error must mark llm_status='pending' (not 'failed') AND touch sentinel.

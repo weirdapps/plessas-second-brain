@@ -18,9 +18,18 @@ See ``docs/superpowers/specs/2026-05-05-vertex-auth-detection-design.md``.
 
 from __future__ import annotations
 
+import logging
+import os
+import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 GCLOUD_SENTINEL = Path.home() / ".second-brain" / "needs_gcloud_reauth"
+
+# Whether this process has already said that it set, or found, the sentinel.
+_LOGGED = False
 
 _AUTH_PATTERNS = (
     "reauthentication is needed",
@@ -36,7 +45,41 @@ def is_vertex_auth_error(err: object) -> bool:
     return any(p in msg for p in _AUTH_PATTERNS)
 
 
-def touch_sentinel() -> None:
-    """Touch the gcloud-reauth sentinel that auth-watch and wrapper scripts check."""
+def _process() -> str:
+    """This process, briefly: the script and its subcommand, as in "cli.py sync"."""
+    argv = sys.argv or ["python"]
+    return " ".join([Path(argv[0]).name or "python", *argv[1:2]])
+
+
+def touch_sentinel(reason: str | None = None) -> None:
+    """Set the gcloud-reauth sentinel that auth-watch and wrapper scripts check.
+
+    Says who set it: the process, and the call site unless `reason` says more. On
+    2026-10-10 the sentinel went up between two auth-watch probes that both found
+    ADC healthy, the next probe's clearing restarted five jobs as if after an
+    outage, and no log line named the job that had set it. Created only when
+    absent, so its mtime stays the moment it went up, which the health report
+    prints and auth-watch's restore reads. Said once per process, and again
+    whenever this process is the one that creates it.
+    """
+    global _LOGGED
     GCLOUD_SENTINEL.parent.mkdir(parents=True, exist_ok=True)
-    GCLOUD_SENTINEL.touch(exist_ok=True)
+    try:
+        GCLOUD_SENTINEL.touch(exist_ok=False)
+        created = True
+    except FileExistsError:
+        created = False
+    if created or not _LOGGED:
+        if reason is None:
+            caller = sys._getframe(1)
+            reason = f"{caller.f_globals.get('__name__', '?')}:{caller.f_lineno}"
+        logger.warning(
+            "%s %s at %s by %s (pid %d): %s",
+            "set" if created else "already set",
+            GCLOUD_SENTINEL.name,
+            datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            _process(),
+            os.getpid(),
+            reason,
+        )
+        _LOGGED = True

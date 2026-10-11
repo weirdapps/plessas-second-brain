@@ -616,10 +616,13 @@ def _keyword_waterfall(
 
         take(conn.execute(query_summaries, (safe_keyword, taken(), limit)))
 
-    # Search in email content
+    # Search in email content. Here and below, the page's picks are MATERIALIZED:
+    # as a co-routine SQLite ran them again for every row the outer MATCH yields, so
+    # a stage cost the square of its matches (17 s for one query on a replica whose
+    # picks took 15 ms), which Greek stems, matching more forms, made common.
     if len(results) < limit:
         query_content = f"""
-            WITH picked AS (
+            WITH picked AS MATERIALIZED (
                 SELECT email_id FROM (
                     SELECT
                         e.id as email_id,
@@ -658,7 +661,7 @@ def _keyword_waterfall(
     # partial rows holding one word each.
     if len(results) < limit and not search_content_only:
         query_mixed = f"""
-            WITH picked AS (
+            WITH picked AS MATERIALIZED (
                 SELECT email_id FROM (
                     SELECT
                         e.id as email_id,
@@ -721,7 +724,7 @@ def _keyword_waterfall(
     # source='attachment' and the matched filename for caller transparency.
     if len(results) < limit and not search_content_only and _has_attachment_fts(conn):
         query_attachments = f"""
-            WITH picked AS (
+            WITH picked AS MATERIALIZED (
                 SELECT content_id FROM (
                     SELECT
                         ac.id as content_id,

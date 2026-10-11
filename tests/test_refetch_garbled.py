@@ -5,8 +5,10 @@ pass.
 `ocr-regarble` found about a thousand such texts on the producer, nearly all of whose files the
 sweep had already deleted (data-quality-03), and a marked text is only read better from its file.
 Mail older than about a year is no longer in the mailbox (code-ingest-03), so a message that is
-gone is recorded as gone and never asked for again. outlook-cli is never called: a stub of the
-adapter serves a mailbox each test fills.
+gone is recorded as gone and never asked for again. Mail the retired Apple Mail exporter stored
+carries no id the mailbox knows: it is looked up by folder, received time and subject, and a file
+is put back only when its sha256 is the row's. outlook-cli is never called: a stub of the adapter
+serves a mailbox each test fills.
 """
 
 import hashlib
@@ -15,10 +17,14 @@ import random
 import subprocess
 import sys
 import threading
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
+from src.export import mail_reconcile as mr
 from src.export import refetch_garbled as rg
 from src.export.outlook_cli import OutlookCliAuthRequired, OutlookCliError
 from src.extract import attachment_pipeline
@@ -73,24 +79,68 @@ def _unavailable() -> OutlookCliError:
 
 
 class Mailbox:
-    """A stub of the adapter's `download-attachments`: it writes a message's files into --out."""
+    """A stub of the adapter. `download-attachments` writes a message's files into --out, and
+    `list-mail` lists the messages a folder holds received in [--since, --until)."""
 
     def __init__(self):
         self.messages: dict[str, list[tuple[str, bytes]]] = {}
+        self.folders: dict[str, list[dict]] = {}
         self.errors: dict[str, Exception] = {}
+        self.list_errors: dict[str, Exception] = {}
         self.calls: list[list[str]] = []
+        self.delay = 0.0
+        self.running = 0
+        self.peak = 0
         self._lock = threading.Lock()
 
     def holds(self, message_id: str, *files: tuple[str, bytes]) -> None:
         self.messages[message_id] = list(files)
 
+    def files(
+        self, folder: str, message_id: str, received: str, subject: str, *files: tuple[str, bytes]
+    ) -> None:
+        """A message in `folder`, received at `received` as the mailbox lists it (UTC)."""
+        self.folders.setdefault(folder, []).append(
+            {
+                "Id": message_id,
+                "InternetMessageId": None,
+                "ReceivedDateTime": received,
+                "Subject": subject,
+            }
+        )
+        self.holds(message_id, *files)
+
     def asked(self) -> list[str]:
-        return [args[1] for args in self.calls]
+        """The message ids whose attachments were asked for."""
+        return [args[1] for args in self.calls if args[0] == "download-attachments"]
+
+    def listed(self) -> list[str]:
+        """The folders listed, in order."""
+        return [args[args.index("--folder") + 1] for args in self.calls if args[0] == "list-mail"]
 
     def __call__(self, args, timeout_sec=60):
-        assert args[0] == "download-attachments"
         with self._lock:
             self.calls.append(list(args))
+            self.running += 1
+            self.peak = max(self.peak, self.running)
+        try:
+            time.sleep(self.delay)
+            if args[0] == "list-mail":
+                return self._list(args)
+            return self._download(args)
+        finally:
+            with self._lock:
+                self.running -= 1
+
+    def _list(self, args):
+        folder = args[args.index("--folder") + 1]
+        if folder in self.list_errors:
+            raise self.list_errors[folder]
+        since, until = args[args.index("--since") + 1], args[args.index("--until") + 1]
+        return [m for m in self.folders.get(folder, []) if since <= m["ReceivedDateTime"] < until]
+
+    def _download(self, args):
+        assert args[0] == "download-attachments"
         message_id = args[1]
         if message_id in self.errors:
             raise self.errors[message_id]
@@ -108,6 +158,8 @@ class Mailbox:
 def mailbox(monkeypatch):
     box = Mailbox()
     monkeypatch.setattr(rg, "run_outlook_cli", box)
+    # The lookup lists a folder as mail-reconcile does, through that module's adapter.
+    monkeypatch.setattr(mr, "run_outlook_cli", box)
     return box
 
 
@@ -119,11 +171,18 @@ def store(tmp_path):
     conn.close()
 
 
-def _email(conn, message_id, received="2026-01-15T09:00:00Z", aliases=()) -> int:
+def _email(
+    conn,
+    message_id,
+    received="2026-01-15T09:00:00Z",
+    aliases=(),
+    *,
+    subject="mail",
+    folder="Archive",
+) -> int:
     email_id = conn.execute(
-        "INSERT INTO emails (message_id, date_received, subject, mailbox_name)"
-        " VALUES (?, ?, 'mail', 'Archive')",
-        (message_id, received),
+        "INSERT INTO emails (message_id, date_received, subject, mailbox_name) VALUES (?, ?, ?, ?)",
+        (message_id, received, subject, folder),
     ).lastrowid
     for alias in aliases:
         conn.execute(
@@ -421,11 +480,12 @@ def test_a_failure_then_a_success_fetches_it(store, mailbox):
 
 def test_an_apple_mail_number_is_never_sent_to_outlook(store, mailbox):
     """Mail the retired Apple Mail exporter stored carries Mail.app's numbers, not Graph ids, and
-    such an email holds no copy id either: it is counted, and not asked for."""
+    such an email holds no copy id either: it is counted, and not asked for by id (the lookup,
+    turned off here, finds it by folder, time and subject)."""
     path, conn, root = store
     att = _garbled(conn, root, _email(conn, 48213), "48213")
 
-    stats = _run(path, root)
+    stats = _run(path, root, lookup=False)
 
     assert mailbox.calls == []
     assert (stats["no_mailbox_id"], stats["messages_tried"]) == (1, 0)
@@ -665,6 +725,379 @@ def test_a_malformed_fetch_record_counts_as_none_and_does_not_stop_the_sweep(sto
     assert _registered(conn)[(MESSAGE, "letter.pdf")][1] == DELETABLE
 
 
+# --- the lookup: mail with no mailbox id, found by folder, time and subject --------------------
+
+# Made-up ids of messages the lookup finds by listing a folder.
+LISTED = "AAMkAGQ0TESTLISTEDMESSAGE00000000001AAA="
+LISTED_2 = "AAMkAGQ0TESTLISTEDMESSAGE00000000002AAA="
+
+ATHENS = ZoneInfo("Europe/Athens")
+# A message received at 08:15:30 UTC in winter, which the retired Apple Mail exporter stored as
+# Athens time with no zone, two hours ahead.
+WHEN = datetime(2026, 2, 10, 8, 15, 30, tzinfo=UTC)
+RECEIVED = "2026-02-10T08:15:30Z"
+STORED = "2026-02-10T10:15:30"
+# Mail.app's number for the email, which names its attachments' directory.
+NUMBER = 48213
+
+
+def _naive(when: datetime) -> str:
+    """`when` as the Apple Mail exporter stored it: Athens time, with no zone."""
+    return when.astimezone(ATHENS).replace(tzinfo=None).isoformat()
+
+
+def _utc(when: datetime) -> str:
+    """`when` as the mailbox lists a message's ReceivedDateTime."""
+    return when.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _apple(
+    conn, root, number=NUMBER, stored=STORED, subject="Scanned letter", folder="Archive", **kw
+) -> int:
+    """A garbled row of an email the Apple Mail exporter stored: Mail.app's number for its id, no
+    copy id, and the attachments' directory named for the number."""
+    email = _email(conn, number, stored, subject=subject, folder=folder)
+    return _garbled(conn, root, email, str(number), **kw)
+
+
+def test_mail_with_no_mailbox_id_is_found_by_folder_time_and_subject(store, mailbox):
+    path, conn, root = store
+    att = _apple(conn, root)
+    mailbox.files(
+        "Archive", LISTED, RECEIVED, "Scanned letter", ("scan.png", SCAN), ("logo.png", LOGO)
+    )
+
+    stats = _run(path, root)
+
+    restored = root / str(NUMBER) / "scan.png"
+    assert restored.read_bytes() == SCAN
+    assert _files(root) == [f"{NUMBER}/scan.png"]
+    assert _attachment(conn, att) == {
+        "file_path": str(restored),
+        "file_removed_at": None,
+        "sha256": sha256_of_bytes(SCAN),
+    }
+    assert (mailbox.listed(), mailbox.asked()) == (["Archive"], [LISTED])
+    lookup = stats["lookup"]
+    assert (lookup["messages_tried"], lookup["found"], lookup["fetched"]) == (1, 1, 1)
+    record = rg.fetch_states(conn)[att]
+    assert (record["state"], record["by"], record["via"]) == ("fetched", "lookup", LISTED)
+    # Mail.app's number is never sent to outlook-cli.
+    assert not any(str(NUMBER) in args for args in mailbox.calls)
+
+
+def test_a_found_message_without_the_rows_bytes_puts_nothing_back(store, mailbox):
+    """The sha256 alone decides: a file of the same name and size is not the row's."""
+    path, conn, root = store
+    att = _apple(conn, root)
+    mailbox.files("Archive", LISTED, RECEIVED, "Scanned letter", ("scan.png", _bytes("another")))
+
+    stats = _run(path, root)
+    again = _run(path, root)
+
+    assert _files(root) == []
+    lookup = stats["lookup"]
+    assert (lookup["found"], lookup["unmatched"], lookup["fetched"]) == (1, 1, 0)
+    assert rg.fetch_states(conn)[att]["state"] == "unmatched"
+    assert _attachment(conn, att)["file_removed_at"] is not None
+    assert again["unmatched_before"] == 1
+    assert mailbox.asked() == [LISTED]
+
+
+def test_several_matching_messages_are_ambiguous_and_none_is_guessed(store, mailbox):
+    path, conn, root = store
+    att = _apple(conn, root, subject="Scan")
+    mailbox.files("Archive", LISTED, RECEIVED, "Scan", ("scan.png", SCAN))
+    # A reply forty seconds later has the same subject once normalised.
+    later = _utc(WHEN + timedelta(seconds=40))
+    mailbox.files("Archive", LISTED_2, later, "RE: scan", ("scan.png", SCAN))
+
+    stats = _run(path, root)
+    again = _run(path, root)
+
+    assert (mailbox.asked(), _files(root)) == ([], [])
+    assert (stats["lookup"]["ambiguous"], stats["lookup"]["ambiguous_files"]) == (1, 1)
+    record = rg.fetch_states(conn)[att]
+    assert (record["state"], record["folder"], record["candidates"]) == ("ambiguous", "Archive", 2)
+    assert (again["ambiguous_before"], again["lookup"]["messages_tried"]) == (1, 0)
+    assert mailbox.listed() == ["Archive"]
+
+
+def test_no_match_past_the_retention_edge_is_gone_and_not_looked_up_again(store, mailbox):
+    path, conn, root = store
+    att = _apple(conn, root, stored="2024-05-10T11:00:00")
+
+    stats = _run(path, root)
+    again = _run(path, root)
+
+    assert mailbox.listed() == ["Archive", "Sent Items", "Inbox"]
+    assert (stats["lookup"]["gone"], stats["lookup"]["gone_files"]) == (1, 1)
+    record = rg.fetch_states(conn)[att]
+    assert (record["state"], record["by"]) == ("gone", "lookup")
+    assert record["gone_at"]
+    assert again["gone_before"] == 1
+
+
+def test_no_match_within_the_retention_edge_is_looked_up_again_three_times(store, mailbox):
+    path, conn, root = store
+    recent = datetime.now(UTC).replace(microsecond=0) - timedelta(days=30)
+    att = _apple(conn, root, stored=_naive(recent))
+
+    runs = [_run(path, root) for _ in range(4)]
+
+    assert [r["lookup"]["not_found"] for r in runs] == [1, 1, 1, 0]
+    assert runs[3]["given_up"] == 1
+    assert len(mailbox.listed()) == 3 * 3
+    record = rg.fetch_states(conn)[att]
+    assert (record["state"], record["attempts"]) == ("not_found", 3)
+
+
+def test_a_failed_lookup_is_looked_up_again_three_attempts_in_all(store, mailbox):
+    path, conn, root = store
+    att = _apple(conn, root)
+    mailbox.list_errors["Archive"] = _unavailable()
+
+    runs = [_run(path, root) for _ in range(4)]
+
+    assert [r["lookup"]["failed"] for r in runs] == [1, 1, 1, 0]
+    assert runs[3]["given_up"] == 1
+    record = rg.fetch_states(conn)[att]
+    assert (record["state"], record["attempts"], record["by"]) == ("failed", 3, "lookup")
+
+
+def test_a_second_run_looks_up_nothing(store, mailbox):
+    path, conn, root = store
+    _apple(conn, root)
+    mailbox.files("Archive", LISTED, RECEIVED, "Scanned letter", ("scan.png", SCAN))
+    _run(path, root)
+    calls = len(mailbox.calls)
+
+    again = _run(path, root)
+
+    assert len(mailbox.calls) == calls
+    assert again["already_fetched"] == 1
+    assert (again["lookup"]["to_try"], again["lookup"]["messages_tried"]) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("stored", "received"),
+    [
+        ("2026-02-10T10:15:30", "2026-02-10T08:15:30Z"),
+        ("2026-07-10T10:15:30", "2026-07-10T07:15:30Z"),
+        # The hour the clocks go back happens twice: this is its second time round.
+        ("2025-10-26T03:30:00", "2025-10-26T01:30:00Z"),
+    ],
+    ids=["winter", "summer", "clocks-back"],
+)
+def test_a_stored_time_with_no_zone_is_read_as_athens_time(store, mailbox, stored, received):
+    path, conn, root = store
+    _apple(conn, root, stored=stored, subject="Scan")
+    mailbox.files("Archive", LISTED, received, "Scan", ("scan.png", SCAN))
+    # The same subject at the stored time read as UTC, two or three hours off: another message.
+    mailbox.files("Archive", LISTED_2, stored + "Z", "Scan", ("scan.png", LOGO))
+
+    stats = _run(path, root)
+
+    assert mailbox.asked() == [LISTED]
+    assert stats["lookup"]["fetched"] == 1
+
+
+def test_only_a_message_in_the_window_with_the_subject_is_a_candidate(store, mailbox):
+    path, conn, root = store
+    _apple(conn, root)
+    inside = WHEN + rg.LOOKUP_WINDOW - timedelta(seconds=30)
+    before = WHEN - rg.LOOKUP_WINDOW - timedelta(minutes=1)
+    after = WHEN + rg.LOOKUP_WINDOW + timedelta(minutes=1)
+    mailbox.files("Archive", LISTED, _utc(inside), "Scanned letter", ("scan.png", SCAN))
+    mailbox.files("Archive", OTHER, _utc(before), "Scanned letter", ("scan.png", LOGO))
+    mailbox.files("Archive", THIRD, _utc(after), "Scanned letter", ("scan.png", LOGO))
+    mailbox.files("Archive", LISTED_2, RECEIVED, "Invoice", ("scan.png", LOGO))
+
+    stats = _run(path, root)
+
+    assert mailbox.asked() == [LISTED]
+    assert stats["lookup"]["fetched"] == 1
+
+
+def test_mail_filed_from_the_inbox_is_found_in_archive(store, mailbox):
+    path, conn, root = store
+    att = _apple(conn, root, folder="Inbox")
+    mailbox.files("Archive", LISTED, RECEIVED, "Scanned letter", ("scan.png", SCAN))
+
+    stats = _run(path, root)
+
+    assert mailbox.listed() == ["Inbox", "Archive"]
+    assert stats["lookup"]["fetched"] == 1
+    assert rg.fetch_states(conn)[att]["folder"] == "Archive"
+
+
+def test_the_folder_the_email_records_decides_first(store, mailbox):
+    """Sent mail copied to its sender lies in Sent Items and, received, in Archive: the folder
+    the email records is looked in first, and a match there is not weighed against the other."""
+    path, conn, root = store
+    _apple(conn, root, folder="Sent Items")
+    mailbox.files("Sent Items", LISTED, RECEIVED, "Scanned letter", ("scan.png", SCAN))
+    mailbox.files("Archive", LISTED_2, RECEIVED, "Scanned letter", ("scan.png", SCAN))
+
+    stats = _run(path, root)
+
+    assert (mailbox.listed(), mailbox.asked()) == (["Sent Items"], [LISTED])
+    assert stats["lookup"]["fetched"] == 1
+
+
+def test_a_folder_the_mailbox_lacks_is_looked_past(store, mailbox):
+    path, conn, root = store
+    _apple(conn, root)
+    mailbox.list_errors["Archive"] = _not_found()
+    mailbox.files("Sent Items", LISTED, RECEIVED, "Scanned letter", ("scan.png", SCAN))
+
+    stats = _run(path, root)
+
+    assert mailbox.listed() == ["Archive", "Sent Items"]
+    assert (stats["lookup"]["fetched"], stats["lookup"]["failed"]) == (1, 0)
+
+
+def test_a_row_with_nothing_to_look_it_up_by_is_counted_and_not_looked_up(store, mailbox):
+    """A file is accepted by its sha256 alone, so a row with no hash is not looked up; nor is an
+    email with no subject, or a file with no email."""
+    path, conn, root = store
+    _apple(conn, root, subject="")
+    _apple(conn, root, number=48214, hashed=False)
+    _garbled(conn, root, None, "48215")
+
+    stats = _run(path, root)
+
+    assert mailbox.calls == []
+    lookup = stats["lookup"]
+    assert (stats["no_mailbox_id"], lookup["no_key"], lookup["to_try"]) == (3, 3, 0)
+    assert rg.fetch_states(conn) == {}
+
+
+def test_no_lookup_leaves_mail_with_no_mailbox_id_alone(store, mailbox):
+    path, conn, root = store
+    att = _apple(conn, root)
+    mailbox.files("Archive", LISTED, RECEIVED, "Scanned letter", ("scan.png", SCAN))
+
+    stats = _run(path, root, lookup=False)
+
+    assert mailbox.calls == []
+    assert (stats["no_mailbox_id"], stats["lookup"]) == (1, None)
+    assert att not in rg.fetch_states(conn)
+
+
+def test_the_dry_run_counts_both_halves_and_asks_for_nothing(store, mailbox):
+    """It counts what a run with the same limit would ask for, and leave: the id half goes first."""
+    path, conn, root = store
+    _garbled(conn, root, _email(conn, MESSAGE), MESSAGE)
+    mailbox.holds(MESSAGE, ("scan.png", SCAN))
+    _apple(conn, root)
+    mailbox.files("Archive", LISTED, RECEIVED, "Scanned letter", ("scan.png", SCAN))
+
+    stats = _run(path, root, dry_run=True, limit=1)
+
+    assert mailbox.calls == []
+    assert (_files(root), rg.fetch_states(conn)) == ([], {})
+    assert (stats["to_try"], stats["messages_to_try"], stats["left"]) == (1, 1, 0)
+    lookup = stats["lookup"]
+    assert (lookup["to_try"], lookup["messages_to_try"], lookup["messages_tried"]) == (1, 1, 0)
+    assert lookup["left"] == 1
+
+
+def test_the_limit_bounds_both_halves_together(store, mailbox):
+    path, conn, root = store
+    for message_id, received in (
+        (MESSAGE, "2026-01-01T00:00:00Z"),
+        (OTHER, "2026-01-02T00:00:00Z"),
+    ):
+        _garbled(conn, root, _email(conn, message_id, received), message_id)
+        mailbox.holds(message_id, ("scan.png", SCAN))
+    _apple(conn, root)
+    _apple(conn, root, number=48214, stored="2026-03-10T10:15:30", subject="Second scan")
+    mailbox.files("Archive", LISTED, RECEIVED, "Scanned letter", ("scan.png", SCAN))
+    mailbox.files("Archive", LISTED_2, "2026-03-10T08:15:30Z", "Second scan", ("scan.png", SCAN))
+
+    stats = _run(path, root, limit=3)
+
+    assert (stats["messages_tried"], stats["lookup"]["messages_tried"]) == (2, 1)
+    assert (stats["left"], stats["lookup"]["left"]) == (0, 1)
+    assert mailbox.asked() == [MESSAGE, OTHER, LISTED]
+
+
+@pytest.mark.parametrize("call", ["list-mail", "download-attachments"])
+def test_reauthentication_in_the_lookup_stops_the_run_and_counts_no_attempt(store, mailbox, call):
+    path, conn, root = store
+    first = _apple(conn, root)
+    second = _apple(conn, root, number=48214, stored="2026-03-10T10:15:30", subject="Second scan")
+    mailbox.files("Archive", LISTED, RECEIVED, "Scanned letter", ("scan.png", SCAN))
+    mailbox.files("Archive", LISTED_2, "2026-03-10T08:15:30Z", "Second scan", ("scan.png", SCAN))
+    if call == "list-mail":
+        mailbox.list_errors["Archive"] = OutlookCliAuthRequired("session expired")
+    else:
+        mailbox.errors[LISTED] = OutlookCliAuthRequired("session expired")
+
+    stats = _run(path, root)
+
+    assert (stats["stopped"], stats["stop_exit_code"]) == (True, 4)
+    assert mailbox.calls[-1][0] == call
+    assert (stats["lookup"]["messages_tried"], stats["lookup"]["left"]) == (0, 2)
+    states = rg.fetch_states(conn)
+    assert first not in states and second not in states
+
+
+def test_the_lookup_does_not_start_once_the_id_half_stopped(store, mailbox):
+    path, conn, root = store
+    _garbled(conn, root, _email(conn, MESSAGE), MESSAGE)
+    mailbox.errors[MESSAGE] = OutlookCliAuthRequired("session expired")
+    _apple(conn, root)
+    mailbox.files("Archive", LISTED, RECEIVED, "Scanned letter", ("scan.png", SCAN))
+
+    stats = _run(path, root)
+
+    assert stats["stopped"] is True
+    assert mailbox.listed() == []
+    assert stats["lookup"]["left"] == 1
+
+
+def test_both_halves_make_at_most_two_calls_at_once(store, mailbox):
+    path, conn, root = store
+    for day, message_id in enumerate((MESSAGE, OTHER, THIRD), start=1):
+        _garbled(conn, root, _email(conn, message_id, f"2026-01-0{day}T00:00:00Z"), message_id)
+        mailbox.holds(message_id, ("scan.png", SCAN))
+    for i in range(3):
+        _apple(conn, root, number=NUMBER + i, stored=f"2026-02-1{i}T10:15:30", subject=f"Scan {i}")
+        listed = f"AAMkAGQ0TESTLISTEDMESSAGE0000000001{i}AAA="
+        mailbox.files("Archive", listed, f"2026-02-1{i}T08:15:30Z", f"Scan {i}", ("scan.png", SCAN))
+    mailbox.delay = 0.02
+
+    stats = _run(path, root, workers=8)
+
+    assert mailbox.peak <= rg.MAX_CONCURRENCY
+    assert (stats["fetched"], stats["lookup"]["fetched"]) == (3, 3)
+
+
+def test_the_sweep_keeps_a_looked_up_original_until_it_is_read(store, mailbox):
+    """The lookup keeps its record under the same key as the id half, so the sweep's keep-rule
+    holds for its files too."""
+    path, conn, root = store
+    conn.execute(
+        "INSERT INTO sync_metadata (key, value) VALUES ('reextract_partial_since', '2026-01-01')"
+    )
+    att = _apple(conn, root, name="letter.pdf", mime="application/pdf", method="pymupdf+tesseract")
+    mailbox.files("Archive", LISTED, RECEIVED, "Scanned letter", ("letter.pdf", SCAN))
+    _run(path, root)
+    letter = root / str(NUMBER) / "letter.pdf"
+
+    kept = sweep_files(conn, root, SweepPolicy(apply=True))
+
+    assert letter.exists()
+    assert (kept["not-held"], kept["deleted"]) == (1, 0)
+    conn.execute(
+        "UPDATE attachment_content SET extraction_error = NULL WHERE attachment_id = ?", (att,)
+    )
+    conn.commit()
+    assert _registered(conn)[(str(NUMBER), "letter.pdf")][1] == NOT_HELD
+
+
 # --- the command -------------------------------------------------------------------------------
 
 
@@ -738,3 +1171,65 @@ def test_the_limit_must_be_positive(store, mailbox, monkeypatch):
     path, _conn, root = store
 
     assert _cli(monkeypatch, path, "--limit", "0", "--root", str(root)) == 2
+
+
+def test_the_command_prints_both_halves(store, mailbox, monkeypatch, capsys):
+    path, conn, root = store
+    _garbled(conn, root, _email(conn, MESSAGE), MESSAGE)
+    mailbox.holds(MESSAGE, ("scan.png", SCAN))
+    _apple(conn, root)
+    mailbox.files("Archive", LISTED, RECEIVED, "Scanned letter", ("scan.png", SCAN))
+
+    code = _cli(monkeypatch, path, "--root", str(root))
+
+    out = capsys.readouterr().out
+    assert code == 0
+    for label in (
+        "By id",
+        "By folder, time and subject",
+        "messages looked up",
+        "several messages matched",
+        "not found",
+    ):
+        assert label in out
+
+
+def test_the_command_dry_run_prints_both_halves_and_asks_for_nothing(
+    store, mailbox, monkeypatch, capsys
+):
+    path, conn, root = store
+    _garbled(conn, root, _email(conn, MESSAGE), MESSAGE)
+    _apple(conn, root)
+
+    code = _cli(monkeypatch, path, "--dry-run", "--root", str(root))
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert mailbox.calls == []
+    for label in ("DRY RUN", "By id", "By folder, time and subject", "to try"):
+        assert label in out
+
+
+def test_the_command_no_lookup_asks_by_id_only(store, mailbox, monkeypatch, capsys):
+    path, conn, root = store
+    _apple(conn, root)
+    mailbox.files("Archive", LISTED, RECEIVED, "Scanned letter", ("scan.png", SCAN))
+
+    code = _cli(monkeypatch, path, "--no-lookup", "--root", str(root))
+
+    assert code == 0
+    assert mailbox.calls == []
+    assert "no mailbox id" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [(OutlookCliAuthRequired("session expired"), 4), (_unavailable(), 5)],
+    ids=["login", "service-error"],
+)
+def test_the_command_exit_code_covers_the_lookup(store, mailbox, monkeypatch, error, code):
+    path, conn, root = store
+    _apple(conn, root)
+    mailbox.list_errors["Archive"] = error
+
+    assert _cli(monkeypatch, path, "--root", str(root)) == code

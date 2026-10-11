@@ -57,10 +57,14 @@ class TestFoldAgreement:
 
 
 class TestQuerySideFolding:
-    def test_the_sanitizer_folds(self):
+    # The form typed, folded. Stemming adds the stem beside it (test_greek_stemming.py);
+    # BRAIN_QUERY_STEMMING=0 leaves the form alone, which is what these pin.
+    def test_the_sanitizer_folds(self, monkeypatch):
+        monkeypatch.setenv("BRAIN_QUERY_STEMMING", "0")
         assert _sanitize_fts5_query("παρουσίαση") == '"παρουσιαση"'
 
-    def test_an_unaccented_query_is_unchanged(self):
+    def test_an_unaccented_query_is_unchanged(self, monkeypatch):
+        monkeypatch.setenv("BRAIN_QUERY_STEMMING", "0")
         assert _sanitize_fts5_query("παρουσιαση") == '"παρουσιαση"'
 
     def test_accented_and_unaccented_produce_the_same_match_expression(self):

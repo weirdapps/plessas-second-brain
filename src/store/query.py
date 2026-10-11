@@ -55,29 +55,44 @@ def _sanitize_fts5_query(keyword: str) -> str:
     drop them: a question holds words no row does ('what', 'the', 'για'), and
     requiring them flagged every full-text answer partial.
 
+    A Greek word with a stem (greek.query_stem) is the word or its stem as a
+    prefix term, and the terms are then joined by an explicit AND.
+
     Examples:
         "Mylonas"             -> '"Mylonas"'
         "earnings release"    -> '"earnings" "release"'   (both required)
         "ACME Q1 2026"         -> '"ACME" "Q1" "2026"'      (all three required)
         "what about the ACME" -> '"ACME"'
+        "ACME κάρτες"         -> '"ACME" AND ("καρτες" OR "καρτ"*)'
         ""                    -> '""'                     (matches nothing)
     """
-    # Fold Greek accents to match how the index stores them (schema v20). Both
-    # sides fold, so an accented query still works: folding it yields the same
-    # form the index holds. Without this the index would be folded and the query
-    # would not, which is the strictly worse version of the bug being fixed.
-    from src.store.greek import fold, is_stopword
+    from src.store.greek import is_stopword
 
     words = keyword.split()
     if not words:
         return '""'
-    tokens = [fold(w) for w in ([w for w in words if not is_stopword(w)] or words)]
-    quoted = []
-    for token in tokens:
-        # Escape any internal double quotes per FTS5 phrase syntax
-        escaped = token.replace('"', '""')
-        quoted.append(f'"{escaped}"')
-    return " ".join(quoted)
+    return _all_of([_fts5_word(w) for w in ([w for w in words if not is_stopword(w)] or words)])
+
+
+def _fts5_word(word: str) -> str:
+    """One query word in FTS5 syntax: its folded form quoted, with its stem beside it
+    as a prefix term when it has one (greek.query_stem), either one matching."""
+    # Fold Greek accents to match how the index stores them (schema v20). Both
+    # sides fold, so an accented query still works: folding it yields the same
+    # form the index holds. Without this the index would be folded and the query
+    # would not, which is the strictly worse version of the bug being fixed.
+    from src.store.greek import fold, query_stem
+
+    # Escape any internal double quotes per FTS5 phrase syntax
+    exact = '"' + fold(word).replace('"', '""') + '"'
+    stem = query_stem(word)
+    return f'({exact} OR "{stem}"*)' if stem else exact
+
+
+def _all_of(terms: list[str]) -> str:
+    """Every term required. FTS5 reads two phrases side by side as AND, but a group in
+    parentheses after a phrase is a syntax error, so a group asks for an explicit AND."""
+    return (" AND " if any(term.startswith("(") for term in terms) else " ").join(terms)
 
 
 def _any_token_fts5_query(keyword: str) -> str | None:
@@ -96,7 +111,7 @@ def _any_token_fts5_query(keyword: str) -> str | None:
     tokens = search_tokens(keyword)
     if not tokens:
         return None
-    return " OR ".join('"' + token.replace('"', '""') + '"' for token in tokens)
+    return " OR ".join(_fts5_word(token) for token in tokens)
 
 
 def fts5_query_variants(keyword: str) -> list[tuple[str, bool]]:
@@ -110,6 +125,26 @@ def fts5_query_variants(keyword: str) -> list[tuple[str, bool]]:
     if loose:
         variants.append((loose, True))
     return variants
+
+
+def fts5_phrase(keyword: str) -> str:
+    """The query as one FTS5 phrase: its words side by side, in order.
+
+    A word with a stem (greek.query_stem) is its stem as a prefix, so the phrase holds
+    in any inflection: "πιστωτικές κάρτες" finds "πιστωτικών καρτών". Without a stem
+    the phrase is the folded query quoted whole, as it always was. A word with no
+    letter or digit is left out: a phrase element holding no token matches nothing.
+    """
+    from src.store.greek import fold, query_stem
+
+    words = [w for w in keyword.split() if any(c.isalnum() for c in w)]
+    stems = [query_stem(w) for w in words]
+    if not any(stems):
+        return '"' + fold(keyword).replace('"', '""') + '"'
+    return " + ".join(
+        f'"{stem}"*' if stem else '"' + fold(word).replace('"', '""') + '"'
+        for word, stem in zip(words, stems, strict=True)
+    )
 
 
 def _mark_partial(rows: list[dict], partial: bool) -> list[dict]:
@@ -581,10 +616,13 @@ def _keyword_waterfall(
 
         take(conn.execute(query_summaries, (safe_keyword, taken(), limit)))
 
-    # Search in email content
+    # Search in email content. Here and below, the page's picks are MATERIALIZED:
+    # as a co-routine SQLite ran them again for every row the outer MATCH yields, so
+    # a stage cost the square of its matches (17 s for one query on a replica whose
+    # picks took 15 ms), which Greek stems, matching more forms, made common.
     if len(results) < limit:
         query_content = f"""
-            WITH picked AS (
+            WITH picked AS MATERIALIZED (
                 SELECT email_id FROM (
                     SELECT
                         e.id as email_id,
@@ -623,7 +661,7 @@ def _keyword_waterfall(
     # partial rows holding one word each.
     if len(results) < limit and not search_content_only:
         query_mixed = f"""
-            WITH picked AS (
+            WITH picked AS MATERIALIZED (
                 SELECT email_id FROM (
                     SELECT
                         e.id as email_id,
@@ -686,7 +724,7 @@ def _keyword_waterfall(
     # source='attachment' and the matched filename for caller transparency.
     if len(results) < limit and not search_content_only and _has_attachment_fts(conn):
         query_attachments = f"""
-            WITH picked AS (
+            WITH picked AS MATERIALIZED (
                 SELECT content_id FROM (
                     SELECT
                         ac.id as content_id,

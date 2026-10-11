@@ -147,10 +147,14 @@ def test_a_missing_proxy_file_is_reported_not_silent(caplog):
 
 
 def test_is_self_organized_direct_match():
-    """User email pattern matches organizer."""
-    assert _is_self_organized("nikos.papadopoulos@example.com", "papadopoulos") is True
-    assert _is_self_organized("nikos.papadopoulos@example.com", "PAPADOPOULOS") is True
-    assert _is_self_organized("other@example.com", "papadopoulos") is False
+    """User email pattern matches organizer: one of the listed addresses, whole."""
+    owner = "nikos.papadopoulos@example.com"
+    assert _is_self_organized("nikos.papadopoulos@example.com", owner) is True
+    assert _is_self_organized("NIKOS.PAPADOPOULOS@example.com", owner.upper()) is True
+    assert _is_self_organized("nikos.papadopoulos@example.com", "np@example.org " + owner) is True
+    assert _is_self_organized("other@example.com", owner) is False
+    # The surname alone no longer reaches into a colleague's address.
+    assert _is_self_organized("nikos.papadopoulos@example.com", "papadopoulos") is False
 
 
 def test_is_self_organized_via_proxy():
@@ -199,7 +203,7 @@ def test_load_event_creates_rows(db_conn):
         db_conn,
         SAMPLE_EVENT,
         SAMPLE_EXTRACTION,
-        user_email_pattern="papadopoulos",
+        user_email_pattern="nikos.papadopoulos@example.com",
         llm_status="extracted",
     )
 
@@ -248,7 +252,7 @@ def test_upsert_updates_modified(db_conn):
         db_conn,
         SAMPLE_EVENT,
         SAMPLE_EXTRACTION,
-        user_email_pattern="papadopoulos",
+        user_email_pattern="nikos.papadopoulos@example.com",
         llm_status="extracted",
     )
 
@@ -261,7 +265,7 @@ def test_upsert_updates_modified(db_conn):
         db_conn,
         updated_event,
         SAMPLE_EXTRACTION,
-        user_email_pattern="papadopoulos",
+        user_email_pattern="nikos.papadopoulos@example.com",
         llm_status="extracted",
     )
 
@@ -302,7 +306,7 @@ def test_proxy_organizer(db_conn, proxy_config):
         db_conn,
         proxy_event,
         SAMPLE_EXTRACTION,
-        user_email_pattern="papadopoulos",
+        user_email_pattern="nikos.papadopoulos@example.com",
         proxy_emails=proxy_emails,
         llm_status="extracted",
     )

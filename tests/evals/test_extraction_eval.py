@@ -296,6 +296,25 @@ def test_build_draws_each_stratum_from_the_store_and_adds_the_crafted_items(stor
     assert sum(1 for c in cases if c["stratum"] == "injection") == 2
 
 
+def test_build_reads_the_owner_from_a_list_of_his_addresses(store):
+    """BRAIN_USER_EMAIL_PATTERN lists the owner's addresses; the strata do not change."""
+    from src.evals import connect_read_only
+
+    conn = connect_read_only(store)
+    try:
+        listed, _ = ev.build_cases(
+            conn, days=180, seed=7, owner_pattern="alias@example.org, owner@example.com", now=NOW
+        )
+    finally:
+        conn.close()
+    single, _ = build(store)
+
+    def drawn(cases):
+        return sorted((c["stratum"], str(c["source"].get("email_id"))) for c in cases)
+
+    assert drawn(listed) == drawn(single)
+
+
 def test_built_cases_carry_the_item_as_extraction_reads_it_and_empty_gold(store):
     cases, _ = build(store)
     ask = next(c for c in cases if c["stratum"] == "inbound_ask")

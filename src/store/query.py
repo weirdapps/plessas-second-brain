@@ -23,6 +23,7 @@ from src.store.ordering import (
     fact_order,
     parent_dates,
 )
+from src.store.owner import owner_address_sql
 from src.store.schema import subject_to_conversation_id
 from src.store.source_class import class_counts, visible_sql, with_source_class
 
@@ -1370,7 +1371,10 @@ def _stale_threads_sql(
     now = datetime.now(UTC)
     cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
     oldest = (now - timedelta(days=max_days)).strftime("%Y-%m-%dT%H:%M:%S")
-    owner = f"%{USER_EMAIL_PATTERN}%"
+    # The owner's listed addresses, each whole (src/store/owner.py): a substring test
+    # took a colleague's thread for his, and could not read a list.
+    sent_by_owner, sent_params = owner_address_sql("e.sender_address", USER_EMAIL_PATTERN)
+    to_owner, to_params = owner_address_sql("p.email", USER_EMAIL_PATTERN)
     not_a_response = " ".join(
         "AND COALESCE(e.subject, '') NOT LIKE ?" for _ in _MEETING_RESPONSE_PREFIXES
     )
@@ -1390,11 +1394,11 @@ def _stale_threads_sql(
         FROM latest_per_thread lpt
         JOIN emails e ON e.conversation_id = lpt.conversation_id
                      AND e.date_received = lpt.last_date
-        WHERE LOWER(e.sender_address) LIKE LOWER(?)
+        WHERE {sent_by_owner}
           AND EXISTS (
               SELECT 1 FROM email_people ep JOIN people p ON p.id = ep.person_id
               WHERE ep.email_id = e.id AND ep.role_in_email IN ('recipient', 'cc')
-                AND LOWER(COALESCE(p.email, '')) NOT LIKE LOWER(?)
+                AND NOT {to_owner}
           )
           {not_a_response}
           AND lpt.last_date < ?
@@ -1403,8 +1407,8 @@ def _stale_threads_sql(
     """
     return sql, (
         _BLANK_SUBJECT_THREAD,
-        owner,
-        owner,
+        *sent_params,
+        *to_params,
         *(f"{prefix}%" for prefix in _MEETING_RESPONSE_PREFIXES),
         cutoff,
         oldest,

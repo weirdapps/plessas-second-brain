@@ -11,8 +11,10 @@ month's meeting attendees resolved to no one, against 26% by address
 (retrieval-quality-02, consumers-03, code-store-11). So, in order:
 
 1. An address resolves exactly (resolved_by 'email', or 'jid' for a WhatsApp JID), and
-   so does a Teams MRI ('mri'). Every address and spelling of the owner resolves to the
-   owner's one row (src/store/owner.py), by 'email' or by 'alias'.
+   so does a Teams MRI ('mri'). Every address BRAIN_USER_EMAIL_PATTERN lists and every
+   spelling of BRAIN_USER_NAME resolves to the owner's one row (src/store/owner.py), by
+   'email' or by 'alias'. That row is one at a listed address, never one found by name,
+   and only address-less rows join it by name: a display name is anyone's to write.
 2. A name finds every row whose words it starts, in either script and in the common
    romanisations of Greek (transliterate.spelling_key), in any order. With local_part,
    one Latin word of four letters or more also finds the addresses whose local part it
@@ -187,8 +189,11 @@ def _build(conn: sqlite3.Connection) -> _Index:
         elif pid in mri:
             kinds[pid] = "mri"
     rows_by_form = {form: tuple(dict.fromkeys(ids)) for form, ids in by_form.items()}
-    owner_by_name = _owner_named(names, rows_by_form)
-    owner_id = owner_person_id(conn, owner_by_address, owner_by_name)
+    # The owner's row is one at an address he lists, never one found by name: a display
+    # name is anyone's to write. Rows named as him join it only as mentions, with no
+    # address, MRI or JID of their own; one at another address is someone else's.
+    owner_id = owner_person_id(conn, owner_by_address)
+    owner_by_name = [pid for pid in _owner_named(names, rows_by_form) if pid not in kinds]
     return _Index(
         names=names,
         emails=emails,

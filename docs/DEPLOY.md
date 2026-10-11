@@ -88,6 +88,12 @@ with `BRAIN_EXTRACT_ENGINE=gemini`; or the direct Anthropic API, which takes
 `ANTHROPIC_API_KEY` together with `BRAIN_ALLOW_DIRECT_API=1` and is used only where
 no Vertex project is set. See `.env.example` for the full list.
 
+`BRAIN_USER_EMAIL_PATTERN` lists every address the owner sends from, primary and
+aliases, separated by commas: `BRAIN_USER_EMAIL_PATTERN=first.last@example.com,alias@example.com`.
+Each is matched whole and case-blind, so an alias that is not listed is not the
+owner's. After changing it, run `python -m src.cli classify-sources` on the
+producer; the next calendar sync refreshes the meetings' self flags.
+
 Nothing in the code reads `.env`: the scheduling recipes in section 6 source it
 (`set -a; . ./.env`, `EnvironmentFile=`). The MCP server inherits the
 environment `claude` was launched with, which sources no `.env` and, from a GUI

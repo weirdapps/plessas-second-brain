@@ -100,3 +100,36 @@ def test_the_cutoff_is_computed_in_utc():
     cutoff = datetime.strptime(params[-2], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=UTC)
 
     assert abs(cutoff - (datetime.now(UTC) - timedelta(days=1))) < timedelta(minutes=1)
+
+
+def test_the_owner_is_each_listed_address_whole(monkeypatch):
+    """BRAIN_USER_EMAIL_PATTERN lists the owner's addresses. A thread he sent last from
+    his alias is his; one a colleague at k.owner@ sent last is not, and mail he sent
+    only to his own alias waits on no one."""
+    import src.store.query as query
+
+    monkeypatch.setattr(query, "USER_EMAIL_PATTERN", "owner@example.com, alias@example.org")
+    c = create_database(":memory:")
+    for i, sender, to in (
+        (1, "alias@example.org", "colleague@example.com"),
+        (2, "k.owner@example.com", "colleague@example.com"),
+        (3, "owner@example.com", "alias@example.org"),
+    ):
+        c.execute(
+            "INSERT INTO emails (id, message_id, date_received, sender_address, subject, "
+            "conversation_id) VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-7 days'), "
+            "?, 'Question', ?)",
+            (i, i, sender, f"conv{i}"),
+        )
+        c.execute("INSERT OR IGNORE INTO people (name, email) VALUES (?, ?)", (to, to))
+        pid = c.execute("SELECT id FROM people WHERE email = ?", (to,)).fetchone()[0]
+        c.execute(
+            "INSERT INTO email_people (email_id, person_id, role_in_email) "
+            "VALUES (?, ?, 'recipient')",
+            (i, pid),
+        )
+
+    rows = query.find_stale_threads(c, days=5, limit=20)
+
+    assert [r["conversation_id"] for r in rows] == ["conv1"]
+    assert query.count_stale_threads(c, days=5) == 1

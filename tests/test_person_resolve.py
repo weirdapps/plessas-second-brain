@@ -269,15 +269,18 @@ class TestOwner:
     @pytest.fixture
     def owner(self, monkeypatch):
         monkeypatch.setattr("src.config.USER_NAME", "Theano Okapidou")
-        monkeypatch.setattr("src.config.USER_EMAIL_PATTERN", "owner@example.com")
+        monkeypatch.setattr(
+            "src.config.USER_EMAIL_PATTERN", "owner@example.com, t.okapidou@example.net"
+        )
         conn = create_database(":memory:")
         ids = {
             "owner": _person(conn, "Okapidou Theano", "owner@example.com", links=8),
-            "alias_address": _person(conn, "Theano Okapidou", "t.okapidou@example.net", links=4),
-            "pattern_address": _person(conn, "theano.owner", "theano.owner@example.com", links=1),
+            "alias_address": _person(conn, "T. Okapidou", "t.okapidou@example.net", links=4),
             "honorific": _person(conn, "κα Οκαπίδου", links=12),
             "greek": _person(conn, "Θεανώ Οκαπίδου", links=3),
             "relative": _person(conn, "Danae Okapidou", "danae@example.org", links=2),
+            # Anyone can be named 'Theano Okapidou': this address is not one she lists.
+            "impostor": _person(conn, "Theano Okapidou", "theano@example.org", links=20),
         }
         conn.commit()
         return conn, ids
@@ -292,25 +295,34 @@ class TestOwner:
             ("OKAPIDOU T.", "alias"),
             ("κα Οκαπίδου", "alias"),
             ("owner@example.com", "email"),
-            ("theano.owner@example.com", "email"),
-            ("t.okapidou@example.net", "email"),
+            ("T.Okapidou@example.net", "email"),
         ],
     )
-    def test_every_owner_spelling_maps_to_the_owner_row(self, owner, query, how):
+    def test_every_owner_spelling_and_listed_address_maps_to_the_owner_row(self, owner, query, how):
         conn, ids = owner
 
         res = resolve_identity(conn, query)
 
         assert (res.row["id"], res.resolved_by) == (ids["owner"], how)
 
+    def test_an_address_he_does_not_list_is_someone_else_whatever_its_name(self, owner):
+        conn, ids = owner
+
+        res = resolve_identity(conn, "theano@example.org")
+
+        assert (res.row["id"], res.resolved_by) == (ids["impostor"], "email")
+
     def test_the_owner_counts_once_however_many_rows_spell_him(self, owner):
         conn, ids = owner
 
         res = resolve_identity(conn, "Okapidou")
 
-        # The owner and the relative: two people, not six rows.
-        assert res.match_count == 2
-        assert [c["email"] for c in res.other_candidates] == ["danae@example.org"]
+        # The owner (four rows), the relative and the impostor: three people.
+        assert res.match_count == 3
+        assert [c["email"] for c in res.other_candidates] == [
+            "theano@example.org",
+            "danae@example.org",
+        ]
 
     def test_a_relative_with_the_surname_is_not_the_owner(self, owner):
         conn, ids = owner
@@ -318,6 +330,16 @@ class TestOwner:
         res = resolve_identity(conn, "Danae Okapidou")
 
         assert (res.row["id"], res.resolved_by) == (ids["relative"], "name")
+
+    def test_with_no_row_at_his_addresses_a_name_pins_no_one(self, owner, monkeypatch):
+        conn, ids = owner
+        monkeypatch.setattr("src.config.USER_EMAIL_PATTERN", "elsewhere@example.com")
+
+        res = resolve_identity(conn, "Theano Okapidou")
+
+        # An ordinary name lookup: the busiest identity so named, by name.
+        assert (res.row["id"], res.resolved_by) == (ids["impostor"], "name")
+        assert res.match_count > 1
 
 
 class TestCompatibility:

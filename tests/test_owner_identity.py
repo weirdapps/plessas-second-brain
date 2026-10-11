@@ -8,9 +8,43 @@ src/store/person_resolve.py maps all of them to one row. Names are invented.
 
 import pytest
 
-from src.store.owner import is_owner_name
+from src.store.owner import is_owner_name, owner_person_id
+from src.store.schema import create_database
 
 OWNER = "Theano Okapidou"
+
+
+def _person(conn, name, email, links):
+    pid = conn.execute("INSERT INTO people (name, email) VALUES (?, ?)", (name, email)).lastrowid
+    for _ in range(links):
+        n = conn.execute("SELECT COUNT(*) FROM emails").fetchone()[0] + 1
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received) VALUES (?, ?, '2026-09-01')",
+            (n, n),
+        )
+        conn.execute(
+            "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, 'to')",
+            (n, pid),
+        )
+    return pid
+
+
+def test_the_owner_row_is_the_busiest_of_the_rows_at_his_addresses():
+    conn = create_database(":memory:")
+    primary = _person(conn, "T. Okapidou", "owner@example.com", 2)
+    alias = _person(conn, "Okapidou Theano", "alias@example.org", 5)
+
+    assert owner_person_id(conn, [primary, alias]) == alias
+
+
+def test_a_name_alone_never_makes_a_row_the_owner():
+    """A display name is anyone's to write; an address under the owner's control is not.
+    With no row at one of his addresses there is no owner row, however the busiest
+    row named 'Theano Okapidou' is spelled."""
+    conn = create_database(":memory:")
+    _person(conn, "Theano Okapidou", "theano@example.net", 50)
+
+    assert owner_person_id(conn, []) is None
 
 
 @pytest.mark.parametrize(

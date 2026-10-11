@@ -28,11 +28,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import (  # noqa: E402
     ATTACHMENTS_DIR,
+    DATA_ROOT,
     DEFAULT_DB,
     NEWS_DB_PATH,
     SHAREPOINT_DATA_DIR,
     SHAREPOINT_HOST,
     WHATSAPP_SNAPSHOT,
+    is_replica,
 )
 from src.export.outlook_attachments import (  # noqa: E402
     ORPHAN_GRACE_DAYS,
@@ -709,6 +711,130 @@ def check_attachments(db):
         if stale
         else ("WARN" if llm_failed > 200 or unregistered > ATTACHMENT_UNREGISTERED_WARN else "OK"),
     }
+
+
+# Yesterday's model spend above this many US dollars is a WARN; BRAIN_DAILY_SPEND_WARN_USD
+# overrides it. Steady state is $20-27 a weekday at Vertex eu prices (audit 2026-10-11), so 60
+# is a backfill or a runaway, not a busy day.
+SPEND_WARN_USD = 60.0
+
+
+def _spend_warn_usd() -> float:
+    raw = os.environ.get("BRAIN_DAILY_SPEND_WARN_USD", "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return SPEND_WARN_USD
+    return value if value > 0 else SPEND_WARN_USD
+
+
+def _model_work_on(db, day) -> tuple[int, int]:
+    """Mail received that day that carries a summary, and attachment summaries written that day:
+    the store's own evidence that the model was called. Both read through an index."""
+    start, end = day.isoformat(), (day + timedelta(days=1)).isoformat()
+    try:
+        emails = db.execute(
+            "SELECT COUNT(*) FROM emails WHERE date_received >= ? AND date_received < ?"
+            " AND COALESCE(summary, '') != '' AND message_id > 0"
+            " AND (mailbox_name IS NULL OR mailbox_name <> 'News')",
+            (start, end),
+        ).fetchone()[0]
+        attachments = db.execute(
+            "SELECT COUNT(*) FROM attachment_content WHERE llm_status = 'extracted'"
+            " AND llm_extracted_at >= ? AND llm_extracted_at < ?",
+            (start, end),
+        ).fetchone()[0]
+    except sqlite3.Error:
+        return 0, 0
+    return emails, attachments
+
+
+def check_llm_spend(db, log_dir: Path | None = None, now: datetime | None = None, warn_usd=None):
+    """Yesterday's (UTC) model calls, tokens and cost by call site, from the usage log that
+    src/extract/claude_extract.py writes, priced by src/llm_cost.py.
+
+    WARN above the daily threshold, or when a call used a model the rate table cannot price.
+    STALE when the log holds no call for a day on which the store shows model work: a log that
+    stopped being written must not read as a cheap day. N/A on a replica: the calls are the
+    producer's, and so is the log. Never raises: main() runs the checks unguarded."""
+    from src.llm_cost import newest_usage_at, usage_for_day
+
+    now = now or datetime.now(UTC)
+    day = (now.astimezone(UTC) - timedelta(days=1)).date()
+    warn = _spend_warn_usd() if warn_usd is None else warn_usd
+    row = {"name": "LLM spend", "day": day.isoformat(), "warn_usd": warn, "stale": False}
+    if is_replica():
+        return {
+            **row,
+            "total": "?",
+            "age": None,
+            "status": "N/A",
+            "note": "the usage log is kept on the producer",
+        }
+    log_dir = Path(log_dir or DATA_ROOT)
+    try:
+        usage = usage_for_day(log_dir, day)
+        newest = newest_usage_at(log_dir, now)
+    except OSError as e:
+        return {**row, "total": "?", "age": None, "status": "WARN", "note": f"unreadable: {e}"}
+    usage = usage or {
+        "calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": 0.0,
+        "unpriced_calls": 0,
+        "sites": {},
+    }
+    # Never negative, as in _age: a skewed clock must not print "-170m".
+    age = max(timedelta(0), now - newest) if newest else None
+    row.update(usage, total=usage["calls"], age=age)
+    if usage["calls"] == 0:
+        emails, attachments = _model_work_on(db, day)
+        if emails or attachments:
+            row.update(
+                status="STALE",
+                stale=True,
+                note=(
+                    f"no call logged, though {emails:,} emails and {attachments:,} attachment"
+                    " summaries came in that day: is the usage log being written?"
+                ),
+            )
+            return row
+    problems = []
+    if usage["cost_usd"] > warn:
+        problems.append(f"over the ${warn:,.0f} daily threshold")
+    if usage["unpriced_calls"]:
+        problems.append(f"{usage['unpriced_calls']:,} calls on a model with no rate")
+    row["status"] = "WARN" if problems else "OK"
+    if problems:
+        row["note"] = "; ".join(problems)
+    return row
+
+
+def llm_spend_detail(c: dict) -> str:
+    """The report's parenthesis for the LLM spend row."""
+    if "cost_usd" not in c:
+        return f" ({c.get('note', '')})"
+    extra = (
+        f" ({c['day']} UTC: ${c['cost_usd']:,.2f}, {c['input_tokens']:,} in and"
+        f" {c['output_tokens']:,} out tokens"
+    )
+    if c.get("note"):
+        extra += f"; {c['note']}"
+    return extra + ")"
+
+
+def llm_spend_lines(c: dict) -> list[str]:
+    """One line per call site, the costliest first."""
+    out = []
+    for site, s in sorted(c.get("sites", {}).items(), key=lambda kv: -kv[1]["cost_usd"]):
+        name = site.removeprefix("src.").removeprefix("extract.")
+        cost = f"${s['cost_usd']:,.2f}"
+        out.append(
+            f"  {name:<44} {s['calls']:>6,} calls {s['input_tokens']:>13,} in"
+            f" {s['output_tokens']:>11,} out {cost:>10}"
+        )
+    return out
 
 
 def check_files_on_disk(db):
@@ -1756,6 +1882,8 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
                 extra = extra[:-1] + f"; {c['copies']:,} only copies of held files)"
         elif c["name"] == "Files on disk":
             extra = files_on_disk_detail(c)
+        elif c["name"] == "LLM spend":
+            extra = llm_spend_detail(c)
         elif c["name"] == "Inline Images":
             # Counts, not a percentage. The old "87% classified" was a ceiling,
             # not a shortfall: its denominator included the signature and noise
@@ -1841,6 +1969,13 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
 
         if status in ("STALE", "FAIL", "WARN"):
             issues.append(f"{c['name']}: {status}")
+
+    spend = next((c for c in checks if c["name"] == "LLM spend" and c.get("sites")), None)
+    if spend:
+        lines.append("")
+        lines.append(f"LLM SPEND BY SITE, {spend['day']} UTC")
+        lines.append("-" * 55)
+        lines.extend(llm_spend_lines(spend))
 
     # LaunchD jobs
     lines.append("")
@@ -2136,6 +2271,7 @@ def main():
         check_news(db),
         check_sharepoint(db),
         check_sharepoint_token(),
+        check_llm_spend(db),
     ]
     db.close()
 

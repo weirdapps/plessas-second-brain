@@ -7,6 +7,7 @@ automation unless the caller passes include_news or include_automation. Document
 notes stay in, and every row that comes back says its class.
 """
 
+import logging
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -373,30 +374,43 @@ def test_a_stored_document_file_is_a_document(tmp_path):
     assert row[0] == "document"
 
 
-def test_a_writer_on_a_store_from_before_v33_still_stores(tmp_path):
-    """A writer can reach a store before anything migrated it: it stores what it always did."""
+def test_a_writer_on_a_store_from_before_v33_is_refused(tmp_path):
+    """Writers run where the store is built, after the migrations (load_extractions and every
+    command that writes run them first). A store without the class there is an error to fix by
+    migrating, said plainly, not a row stored without its class."""
     from src.extract.attachment_pipeline import ingest_text_document
     from src.store.loader import load_single_email
 
     conn = _as_v32(tmp_path / "old.db")
-    assert load_single_email(conn, _metadata(9, "plain mail", COLLEAGUE), _extraction("old"))
-    ingest_text_document(
-        conn,
-        source="sharepoint",
-        key="k",
-        filename="f.md",
-        mime_type="text/markdown",
-        text="t",
-        sha256="c" * 64,
-        method=None,
-        status="extracted",
-        error=None,
-        subject="[SharePoint] f",
-        sender_name="SharePoint",
-        date=_ago(1),
-    )
-    conn.commit()
-    assert conn.execute("SELECT COUNT(*) FROM emails").fetchone()[0] == 2
+    with pytest.raises(sc.SourceClassMissing, match="migrate"):
+        load_single_email(conn, _metadata(9, "plain mail", COLLEAGUE), _extraction("old"))
+    conn.rollback()
+    with pytest.raises(sc.SourceClassMissing, match="migrate"):
+        ingest_text_document(
+            conn,
+            source="sharepoint",
+            key="k",
+            filename="f.md",
+            mime_type="text/markdown",
+            text="t",
+            sha256="c" * 64,
+            method=None,
+            status="extracted",
+            error=None,
+            subject="[SharePoint] f",
+            sender_name="SharePoint",
+            date=_ago(1),
+        )
+    assert conn.execute("SELECT COUNT(*) FROM emails").fetchone()[0] == 0
+    conn.close()
+
+
+def test_classifying_again_needs_the_column(tmp_path):
+    """reclassify(), behind classify-sources, sets the stored class: on a store without the
+    column it says to migrate rather than set nothing."""
+    conn = _as_v32(tmp_path / "old.db")
+    with pytest.raises(sc.SourceClassMissing, match="migrate"):
+        sc.reclassify(conn)
     conn.close()
 
 
@@ -795,23 +809,117 @@ def test_semantic_search(store, tmp_path):
     assert set(candidates(include_news=True, include_automation=True)) == set(expected)
 
 
-def test_a_store_without_the_class_is_refused_with_a_clear_error(store):
-    """One implementation: a read never works the class out a second way. A store without the
-    column says what to run, rather than answer by other rules."""
-    from src.store.query import query_by_keyword, query_decisions
+# --- a store older than v33: reads leave out news alone until it is migrated ---------------
 
-    conn, _, _ = store
+
+@pytest.fixture
+def v32_store(store, monkeypatch):
+    """The store as a replica holds it from the new code's arrival to its next pull, which
+    brings the column: a v32 file, read by code that knows the classes."""
+    conn, expected, path = store
     conn.execute("DROP INDEX idx_emails_source_class")
     conn.execute("ALTER TABLE emails DROP COLUMN source_class")
     conn.commit()
+    monkeypatch.setattr(sc, "_warned", False)
+    return conn, expected, path
 
-    for read in (
-        lambda: query_by_keyword(conn, WORD, limit=50),
-        lambda: query_decisions(conn, limit=50),
-        lambda: query_by_keyword(conn, WORD, include_news=True, include_automation=True),
-    ):
-        with pytest.raises(sc.SourceClassMissing, match="schema v33"):
-            read()
+
+def _email_ids(rows) -> set:
+    return {row["email_id"] for row in rows} - {None}
+
+
+def _of(expected, cls) -> set:
+    return {email_id for email_id, c in expected.items() if c == cls}
+
+
+def test_a_store_before_v33_answers_the_tools_leaving_out_news_alone(
+    v32_store, monkeypatch, caplog
+):
+    """A replica reads its v32 file with new code until the next pull, an hour or more. The
+    tools answer as they did before the class: the News mailbox left out, nothing else, and
+    the automation switch has nothing to tell apart. They say so: once in the log, in recall's
+    summary, and in stats."""
+    from src import mcp_server
+
+    conn, expected, path = v32_store
+    monkeypatch.setattr(mcp_server, "_get_conn", lambda: get_connection(str(path)))
+    news, automation = _of(expected, "news"), _of(expected, "automation")
+    tools = {
+        "recall": lambda **kw: mcp_server.recall(WORD, limit_per_kind=10, **kw)["emails"],
+        "search_emails": lambda **kw: mcp_server.search_emails(WORD, limit=50, **kw)["result"],
+        "person_context": lambda **kw: mcp_server.person_context("Colleague", **kw)["decisions"],
+        "query_decisions": lambda **kw: mcp_server.query_decisions(limit=50, **kw)["result"],
+    }
+    with caplog.at_level(logging.WARNING, logger=sc.__name__):
+        for name, tool in tools.items():
+            shown = _email_ids(tool())
+            assert automation <= shown, name
+            assert not news & shown, name
+            assert news <= _email_ids(tool(include_news=True)), name
+            everything = tool(include_news=True, include_automation=True)
+            assert "automation" not in _classes(everything), name
+        assert mcp_server.recall(WORD)["summary"]["source_class"] == sc.MISSING
+        assert mcp_server.stats()["source_class"] == "pending migration"
+    assert [r.getMessage() for r in caplog.records if r.name == sc.__name__] == [sc.MISSING]
+
+
+def test_every_read_path_answers_a_store_before_v33(v32_store, tmp_path):
+    from src.store.context import get_person_context, get_topic_context
+    from src.store.embeddings import query_semantic, semantic_email_candidates
+    from src.store.query import (
+        count_overdue_actions,
+        find_overdue_actions,
+        query_action_items,
+        query_by_date_range,
+        query_by_keyword,
+        query_by_topic,
+        query_combined,
+        query_decisions,
+        search_attachments,
+    )
+    from src.store.recall import recall
+
+    conn, expected, _ = v32_store
+    news, automation = _of(expected, "news"), _of(expected, "automation")
+    index = _index(conn, tmp_path / "embeddings.npz")
+    start, end = _day(-30), _day(1)
+
+    def semantic(**kw):
+        rows = query_semantic(conn, WORD, limit=50, embed_fn=_embed, index_path=index, **kw)
+        return [r for r in rows if r["type"] == "email"]
+
+    def candidates(**kw):
+        found = semantic_email_candidates(conn, WORD, 50, embed_fn=_embed, index_path=index, **kw)
+        return [{"email_id": email_id} for email_id in found]
+
+    reads = {
+        "keyword": lambda **kw: query_by_keyword(conn, WORD, limit=50, **kw),
+        "topic": lambda **kw: query_by_topic(conn, WORD, limit=50, **kw),
+        "dates": lambda **kw: query_by_date_range(conn, start, end, limit=50, **kw),
+        "combined": lambda **kw: query_combined(conn, keyword=WORD, limit=50, **kw),
+        "decisions": lambda **kw: query_decisions(conn, limit=50, **kw),
+        "actions": lambda **kw: query_action_items(conn, limit=50, **kw),
+        "overdue": lambda **kw: find_overdue_actions(conn, limit=50, **kw),
+        "person": lambda **kw: get_person_context(conn, "Colleague", **kw)["decisions"],
+        "topic dossier": lambda **kw: get_topic_context(conn, f"{WORD} pilot", **kw)["key_facts"],
+        "recall": lambda **kw: recall(conn, WORD, limit_per_kind=20, **kw)["actions"],
+        "semantic": semantic,
+        "candidates": candidates,
+    }
+    for name, read in reads.items():
+        shown = _email_ids(read())
+        assert automation <= shown, name
+        assert not news & shown, name
+        assert news <= _email_ids(read(include_news=True)), name
+    attached = {row[0] for row in conn.execute("SELECT email_id FROM attachments")}
+    assert automation & attached <= _email_ids(search_attachments(conn, WORD, limit=50))
+    assert count_overdue_actions(conn) == 6  # all but the news item's
+    assert count_overdue_actions(conn, include_news=True) == 7
+    # Each row still says what it is, as far as its mailbox tells: automation reads as mail.
+    rows = query_by_keyword(conn, WORD, limit=50, include_news=True)
+    assert {r["email_id"]: r["source_class"] for r in rows} == {
+        email_id: "mail" if cls == "automation" else cls for email_id, cls in expected.items()
+    }
 
 
 # --- the MCP tools pass the switches through ------------------------------------------------

@@ -28,14 +28,24 @@ is mail someone may answer.
 
 There is one implementation: classify(), used when a row is stored and by the v33 backfill.
 Every read path leaves out news and automation unless the caller passes include_news or
-include_automation, reading the stored class only; documents and session notes stay in. The
-rows that come back say their class.
+include_automation, reading the stored class; documents and session notes stay in. The rows
+that come back say their class.
+
+A store older than v33 has no class to read, and a replica holds one from the new code's
+arrival to its next pull, an hour or more. Its reads do what they did before the class: they
+leave out the News mailbox (classify()'s first rule, which needs no column) and nothing else,
+and label each row by classify() without its recipients, which never makes one automation. A
+process logs that once (MISSING), recall's summary carries the same sentence, and stats says
+'pending migration'. The writers and reclassify() refuse such a store (SourceClassMissing):
+they run where the store is built, after the migrations.
 """
 
 import json
+import logging
 import re
 import sqlite3
 import sys
+import threading
 from collections import defaultdict
 from collections.abc import Iterable
 
@@ -62,9 +72,22 @@ _STAMP_DATE = re.compile(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)")
 # Rows the backfill reads, classifies and writes at a time.
 BACKFILL_CHUNK = 5000
 
+logger = logging.getLogger(__name__)
+
+# What a store without the class says while its reads leave out news alone: once per process in
+# the log and in every recall summary. stats says PENDING.
+MISSING = "source_class column missing; run migrate on the producer; news-only exclusion in effect"
+PENDING = "pending migration"
+_warned = False
+_warned_lock = threading.Lock()
+
+# Until a store has the class: the News mailbox, classify()'s first rule, which needs no column.
+_NEWS_IDS = f"SELECT id FROM emails WHERE mailbox_name = '{NEWS_MAILBOX}'"
+
 
 class SourceClassMissing(RuntimeError):
-    """The store has no emails.source_class: it is older than schema v33."""
+    """The store has no emails.source_class: it is older than schema v33. Raised where a class
+    is stored or set (the writers, reclassify()); reads fall back instead (column_missing())."""
 
 
 def hidden_classes(include_news: bool = False, include_automation: bool = False) -> tuple[str, ...]:
@@ -132,8 +155,22 @@ def has_column(conn: sqlite3.Connection) -> bool:
     return any(r[1] == "source_class" for r in conn.execute("PRAGMA table_info(emails)"))
 
 
+def column_missing(conn: sqlite3.Connection) -> bool:
+    """Whether the store lacks emails.source_class, as a replica's v32 file does until its next
+    pull. Its reads then leave out the News mailbox alone. The first time a process finds such
+    a store, it logs MISSING; never again after."""
+    global _warned
+    if has_column(conn):
+        return False
+    with _warned_lock:
+        first, _warned = not _warned, True
+    if first:
+        logger.warning(MISSING)
+    return True
+
+
 def _require_column(conn: sqlite3.Connection) -> None:
-    """Refuse a store without the class, rather than work it out a second way."""
+    """Refuse a store without the class where a class is stored or set."""
     if not has_column(conn):
         raise SourceClassMissing(
             "emails.source_class is missing: this store is older than schema v33. Run "
@@ -146,13 +183,15 @@ def hidden_ids_sql(
     conn: sqlite3.Connection, include_news: bool = False, include_automation: bool = False
 ) -> str | None:
     """A SELECT of the ids of the emails rows a read path leaves out; None when it leaves out
-    none. Raises SourceClassMissing on a store without the class.
+    none. On a store without the class, the News mailbox's unless include_news: nothing there
+    tells automation apart.
 
     Answered from idx_emails_source_class, never from the rows: source_class is the table's last
     column, and a column behind the body is reached through the body's overflow pages, so testing
     it row by row read the whole body of every email a query looked at.
     """
-    _require_column(conn)
+    if column_missing(conn):
+        return None if include_news else _NEWS_IDS
     classes = hidden_classes(include_news, include_automation)
     if not classes:
         return None
@@ -168,7 +207,20 @@ def visible_sql(
 ) -> str:
     """A WHERE condition that holds unless `email_id`, an SQL expression for an emails.id, names
     a row of a class the read path leaves out. NULL passes: a Teams, WhatsApp, calendar or
-    conversation item has no email."""
+    conversation item has no email.
+
+    On a store without the class it tests the News mailbox row by row, as reads did before the
+    class: the mailbox sits ahead of the body, so each test is one lookup by id, where the set
+    of News ids took a scan of the table in every statement: a keyword search on a replica's
+    v32 file took 50 ms that way, 6 ms this way, as before.
+    """
+    if column_missing(conn):
+        if include_news:
+            return "1"
+        return (
+            f"NOT EXISTS (SELECT 1 FROM emails AS sc_news WHERE sc_news.id = {email_id}"
+            f" AND sc_news.mailbox_name = '{NEWS_MAILBOX}')"
+        )
     ids = hidden_ids_sql(conn, include_news, include_automation)
     return "1" if ids is None else f"IFNULL({email_id}, 0) NOT IN ({ids})"
 
@@ -194,15 +246,22 @@ def visible_ids(
 
 
 def classes_of(conn: sqlite3.Connection, email_ids: Iterable) -> dict:
-    """email id -> its class, for the ids given. Raises SourceClassMissing on a store without
-    the class."""
-    _require_column(conn)
+    """email id -> its class, for the ids given. On a store without the class, what classify()
+    makes of the row's mailbox, sender and subject without its recipients: news, a document, a
+    session note or mail, never automation."""
     ids = sorted({int(i) for i in email_ids if i is not None})
     if not ids:
         return {}
+    wanted = (json.dumps(ids),)
+    if column_missing(conn):
+        rows = conn.execute(
+            "SELECT id, mailbox_name, sender_address, subject FROM emails"
+            " WHERE id IN (SELECT value FROM json_each(?))",
+            wanted,
+        )
+        return {row[0]: classify(row[1], row[2], row[3]) for row in rows}
     rows = conn.execute(
-        "SELECT id, source_class FROM emails WHERE id IN (SELECT value FROM json_each(?))",
-        (json.dumps(ids),),
+        "SELECT id, source_class FROM emails WHERE id IN (SELECT value FROM json_each(?))", wanted
     )
     return {row[0]: row[1] for row in rows}
 
@@ -217,23 +276,34 @@ def with_source_class(conn: sqlite3.Connection, rows: list, key: str = "email_id
     return rows
 
 
+def class_counts(conn: sqlite3.Connection) -> dict | str:
+    """How many emails rows each class holds, from idx_emails_source_class; PENDING on a store
+    without the class."""
+    if column_missing(conn):
+        return PENDING
+    counts = {
+        row[0]: row[1]
+        for row in conn.execute("SELECT source_class, COUNT(*) FROM emails GROUP BY source_class")
+    }
+    return {name: counts.get(name, 0) for name in CLASSES}
+
+
 # --- storing it -----------------------------------------------------------------------------
 
 
-def class_insert(
+def stored_class(
     conn: sqlite3.Connection,
     mailbox: str | None,
     sender_address: str | None,
     subject: str | None,
     recipients: Iterable[str | None] = (),
-) -> tuple[str, str, tuple]:
-    """The column, the placeholder and the value an INSERT INTO emails adds to store the row's
-    class: (", source_class", ", ?", (class,)). Nothing on a store from before v33, which has no
-    column for it yet: a writer that reaches one before any migration still stores its row, and
-    the migration classifies it with the rest."""
-    if not has_column(conn):
-        return "", "", ()
-    return ", source_class", ", ?", (classify(mailbox, sender_address, subject, recipients),)
+) -> str:
+    """The class a writer stores with a new emails row. Raises SourceClassMissing on a store
+    without the column: writers run where the store is built, after the migrations
+    (load_extractions and every command that writes run them first), so there it means the
+    store was never migrated."""
+    _require_column(conn)
+    return classify(mailbox, sender_address, subject, recipients)
 
 
 def _recipients(conn: sqlite3.Connection, email_ids: list) -> dict:

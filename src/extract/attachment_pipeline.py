@@ -35,7 +35,7 @@ from src.llm_cost import (
 from src.redact import redact_secrets
 from src.store.file_hashes import sha256_of_file
 from src.store.file_sweep import NOT_FULLY_READ_SQL
-from src.store.source_class import class_insert
+from src.store.source_class import stored_class
 
 # Processing constants
 PHASE2_BATCH_SIZE = 10
@@ -1180,14 +1180,12 @@ def ingest_document(
         }
 
     # Create synthetic email entry, with its class (src/store/source_class.py)
-    class_column, class_slot, class_value = class_insert(
-        conn, "External", "external@documents.local", f"[Document] {label}"
-    )
+    source_class = stored_class(conn, "External", "external@documents.local", f"[Document] {label}")
     conn.execute(
-        f"""INSERT INTO emails
+        """INSERT INTO emails
            (message_id, date_received, sender_name, sender_address,
-            subject, mailbox_name, content{class_column})
-           VALUES (?, ?, ?, ?, ?, ?, ?{class_slot})""",
+            subject, mailbox_name, content, source_class)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             message_id,
             file_mtime,
@@ -1196,7 +1194,7 @@ def ingest_document(
             f"[Document] {label}",
             "External",
             content_text,
-            *class_value,
+            source_class,
         ),
     )
     email_id = conn.execute("SELECT id FROM emails WHERE message_id = ?", (message_id,)).fetchone()[
@@ -1285,15 +1283,13 @@ def ingest_text_document(
         return {"skipped": True, "message_id": message_id, "email_id": existing[0]}
     now = datetime.now().isoformat()
     # Its class (src/store/source_class.py): a session note or a document
-    class_column, class_slot, class_value = class_insert(
-        conn, "External", f"{source}@documents.local", subject
-    )
+    source_class = stored_class(conn, "External", f"{source}@documents.local", subject)
     with conn:
         email_id = conn.execute(
-            f"""INSERT INTO emails
+            """INSERT INTO emails
                (message_id, date_received, sender_name, sender_address, subject,
-                mailbox_name, content{class_column})
-               VALUES (?, ?, ?, ?, ?, 'External', ?{class_slot})""",
+                mailbox_name, content, source_class)
+               VALUES (?, ?, ?, ?, ?, 'External', ?, ?)""",
             (
                 message_id,
                 date,
@@ -1301,7 +1297,7 @@ def ingest_text_document(
                 f"{source}@documents.local",
                 subject,
                 f"Ingested document: {filename}\nSource: {source}",
-                *class_value,
+                source_class,
             ),
         ).lastrowid
         attachment_id = conn.execute(

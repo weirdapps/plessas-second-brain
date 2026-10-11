@@ -24,7 +24,7 @@ from src.store.ordering import (
     parent_dates,
 )
 from src.store.schema import subject_to_conversation_id
-from src.store.source_class import visible_sql, with_source_class
+from src.store.source_class import class_counts, visible_sql, with_source_class
 
 # The loader threads an email with no conversation id and no references by the
 # hash of its normalized subject, so every blank subject shares this id: 92
@@ -1559,7 +1559,8 @@ def get_stats(conn: sqlite3.Connection) -> dict:
     Returns:
         Dict with keys: total_emails, total_news_articles, total_documents,
         total_topics, total_people, total_decisions, total_action_items,
-        earliest_email, latest_email
+        earliest_email, latest_email, source_class (emails per class, or
+        'pending migration' on a store older than the class)
     """
     stats = {}
 
@@ -1603,6 +1604,7 @@ def get_stats(conn: sqlite3.Connection) -> dict:
     row = cursor.fetchone()
     stats["earliest_email"] = row["earliest"]
     stats["latest_email"] = row["latest"]
+    stats["source_class"] = class_counts(conn)
     stats["coverage"] = get_coverage(conn)
     stats.update(get_freshness(conn))
 

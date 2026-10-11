@@ -477,7 +477,8 @@ def recall(
     and semantic ranking. A bucket where nothing held the whole query falls back
     to rows holding some of its words, flagged partial_match, and
     `summary.partial_kinds` names it. News and the owner's automation mail are
-    left out unless included. Summaries are cut to about 300 characters.
+    left out unless included; on a store older than the class only news is, and
+    `summary.source_class` says so. Summaries are cut to about 300 characters.
     """
     from functools import partial
 
@@ -1011,7 +1012,9 @@ def stats() -> Stats:
     `earliest_email` is the oldest row of any kind, a stray old document
     included; where mail really starts is in `coverage`. `embed_backend` names
     the service that embeds search queries and `last_embed_error` its last
-    failure in this server ({type, at}, or null).
+    failure in this server ({type, at}, or null). `source_class` counts the
+    emails of each class, or says 'pending migration' on a store older than
+    the class, whose reads leave out news alone.
     """
     from src.store.query import get_stats
 

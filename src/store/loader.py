@@ -17,7 +17,7 @@ from src.redact import redact_secrets
 from .email_html import save_html, split_body
 from .normalizer import find_or_create_person, find_or_create_topic, normalize_topic
 from .schema import normalize_subject
-from .source_class import class_insert
+from .source_class import stored_class
 
 
 def load_extractions(db_path: str, extracted_dir: str, staging_dir: str) -> int:
@@ -322,18 +322,18 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
 
     # What the row is (src/store/source_class.py), stored with it so no read has to work it out.
     mailbox = metadata.get("mailbox_name", metadata.get("mailbox"))
-    class_column, class_slot, class_value = class_insert(
+    source_class = stored_class(
         conn, mailbox, sender_address, metadata.get("subject"), _header_addresses(metadata)
     )
 
     # Insert email record
     cursor = conn.execute(
-        f"""
+        """
         INSERT INTO emails (
             message_id, internet_message_id, date_received, sender_name, sender_address,
             subject, summary, sentiment, urgency, language, mailbox_name, content,
-            in_reply_to, "references", conversation_id{class_column}
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{class_slot})
+            in_reply_to, "references", conversation_id, source_class
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             message_id,
@@ -351,7 +351,7 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
             in_reply_to or None,
             references or None,
             conversation_id,
-            *class_value,
+            source_class,
         ),
     )
     email_id = cursor.lastrowid

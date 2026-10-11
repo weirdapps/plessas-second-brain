@@ -30,7 +30,13 @@ from src.store.query import (
     search_attachments,
     thread_keys,
 )
-from src.store.source_class import visible_ids, visible_sql, with_source_class
+from src.store.source_class import (
+    MISSING,
+    column_missing,
+    visible_ids,
+    visible_sql,
+    with_source_class,
+)
 from src.store.teams_query import search_teams as _search_teams_q
 from src.store.whatsapp_query import search_whatsapp as _search_whatsapp_q
 
@@ -414,7 +420,8 @@ def recall(
             is keyword-only.
         include_news, include_automation: Include news items and the owner's
             automation mail, which every bucket and dossier leaves out by
-            default (src/store/source_class.py)
+            default (src/store/source_class.py). On a store older than the
+            class only news is left out, and summary.source_class says so.
 
     Returns:
         Dict with categorized hits across emails (incl. standalone docs),
@@ -500,6 +507,9 @@ def recall(
 
     # The semantic status leads: it says how far to trust everything after it.
     summary: dict = {} if semantic is None else {"semantic": semantic}
+    if column_missing(conn):
+        # So does this: a store older than the class leaves out news alone.
+        summary["source_class"] = MISSING
     summary.update(
         total_hits=total_hits,
         kinds_with_results=kinds_with_results,

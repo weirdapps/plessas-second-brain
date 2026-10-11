@@ -3,8 +3,9 @@
 Some Opus versions occasionally raise a spurious `stop_reason == "refusal"` on benign
 work. This helper retries such a call ONCE on the VERTEX_MODEL_FALLBACK_SDK /
 VERTEX_REGION_FALLBACK tier — model AND region together, since region is a function of
-model version (>=4.7 -> eu, <=4.6 -> europe-west1; a mismatched pair 429s). Shared by
-every second-brain SDK extraction call site.
+model version (>=4.7 -> eu, <=4.6 -> europe-west1; a mismatched pair 429s). The tier is
+optional and has no default: unset, a refusal comes back as it is. Shared by every
+second-brain SDK extraction call site.
 """
 
 import logging
@@ -36,25 +37,23 @@ def create_with_refusal_fallback(
     if getattr(response, "stop_reason", None) != "refusal":
         return response
 
-    # Defaults are the Opus 4.6 escape-hatch tier (owner decision 2026-09-23). The
-    # REGION default moves with the model on purpose: 4.6 is a <=4.6 model, so it
-    # belongs in europe-west1 and an "eu" default would 429 every retry.
-    fb_model = os.environ.get("VERTEX_MODEL_FALLBACK_SDK", "claude-opus-4-6")
-    fb_region = os.environ.get("VERTEX_REGION_FALLBACK", "europe-west1")
+    # No default for either. The tier is a model AND its region, and the defaults this
+    # carried (an Opus 4.6 model in europe-west1) came to be a pair the allowlist
+    # rejects, so a refusal would have been answered with an error. Unset, or half set,
+    # there is no second call (below) and the refusal comes back as it is.
+    fb_model = os.environ.get("VERTEX_MODEL_FALLBACK_SDK", "").strip()
+    fb_region = os.environ.get("VERTEX_REGION_FALLBACK", "").strip()
     project = os.environ.get("VERTEX_SDK_PROJECT") or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
 
-    # The fallback tier is ALLOWED to equal the primary, and between 2026-08-03 and
-    # 2026-09-23 it did: VERTEX_MODEL_EXTRACT and VERTEX_MODEL_FALLBACK_SDK were both
-    # claude-opus-5 in region eu, so the guard below fired constantly and
-    # sb-outlook-sync logged 7,124 skipped retries. A refusal is a property of the
-    # model and the prompt, so replaying the identical pair cannot change stop_reason:
-    # it only spends a second call, and up to another max_call_seconds of the caller's
-    # deadline, to be told the same thing.
-    #
-    # Since 2026-09-23 the pair genuinely differs (extract claude-opus-5-5 @ eu,
-    # fallback claude-opus-4-6 @ europe-west1), so this guard should now be quiet and
-    # the retry is live again. Keep the guard: it is what makes it safe to point the
-    # fallback back at the primary in future without re-introducing those 7,124 calls.
+    # The fallback tier is ALLOWED to equal the primary, and it does wherever the
+    # allowlist holds one model: from 2026-08-03 to 2026-09-23, and again since
+    # 2026-10-06, VERTEX_MODEL_EXTRACT and VERTEX_MODEL_FALLBACK_SDK name the same model
+    # in the same region, so the guard below returns every refusal. In the first of
+    # those periods sb-outlook-sync logged 7,124 skipped retries. A refusal is a property
+    # of the model and the prompt, so replaying the identical pair cannot change
+    # stop_reason: it only spends a second call, and up to another max_call_seconds of
+    # the caller's deadline, to be told the same thing. Keep the guard: it is what makes
+    # it safe to point the fallback at the primary.
     #
     # Only when the region is KNOWN to match. A client that does not expose
     # `.region` leaves the pair unproven, and dropping a retry on an unproven
@@ -69,8 +68,15 @@ def create_with_refusal_fallback(
         return response
 
     if not project:
-        # Direct-API path (ANTHROPIC_API_KEY): no Vertex project to build a fallback on.
+        # The direct API (BRAIN_ALLOW_DIRECT_API=1): no Vertex project to build a fallback on.
         logger.error("No Vertex project available for fallback; returning the refusal.")
+        return response
+    if not (fb_model and fb_region):
+        logger.warning(
+            "Vertex policy refusal on %s; no fallback tier is set (VERTEX_MODEL_FALLBACK_SDK"
+            " and VERTEX_REGION_FALLBACK, together), returning the refusal",
+            model,
+        )
         return response
     logger.warning(
         "Vertex policy refusal on %s — downgrading to fallback %s @ %s",

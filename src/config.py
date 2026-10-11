@@ -137,10 +137,9 @@ if EXTRACT_ENGINE not in ("claude", "gemini"):
         f"BRAIN_EXTRACT_ENGINE must be 'claude' or 'gemini', got {EXTRACT_ENGINE!r}. "
         "An inline comment after the value counts as part of it under systemd."
     )
-CLAUDE_MODEL = os.environ.get("CLAUDE_EXTRACT_MODEL") or os.environ.get(
-    "VERTEX_MODEL_EXTRACT", "claude-sonnet-4-6"
-)
 GEMINI_MODEL = os.environ.get("BRAIN_GEMINI_MODEL", "gemini-2.5-flash")
+
+# The Claude model and its Vertex region have no default: src/extract/claude_extract.py.
 
 # Schema version — bump when adding migrations (must match number of migrations in schema.py)
 CURRENT_SCHEMA_VERSION = 33

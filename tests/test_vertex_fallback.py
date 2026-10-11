@@ -1,6 +1,9 @@
 """Tests for create_with_refusal_fallback (SDK policy-refusal auto-downgrade)."""
 
+import os
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from src.extract.vertex_fallback import create_with_refusal_fallback
 
@@ -153,3 +156,28 @@ def test_without_a_project_it_logs_no_downgrade_it_cannot_make(monkeypatch, capl
     mk_vertex.assert_not_called()
     assert "downgrading" not in caplog.text
     assert "No Vertex project" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "tier",
+    [{}, {"VERTEX_MODEL_FALLBACK_SDK": "claude-fallback"}, {"VERTEX_REGION_FALLBACK": "eu"}],
+    ids=["neither", "model only", "region only"],
+)
+def test_without_a_whole_fallback_tier_the_refusal_comes_back(monkeypatch, caplog, tier):
+    """The tier defaulted to a model and region an allowlist can reject. It has no
+    default now: a model and its region, set together, or no second call."""
+    monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-proj")
+    for name in ("VERTEX_MODEL_FALLBACK_SDK", "VERTEX_REGION_FALLBACK"):
+        if name in os.environ:
+            monkeypatch.delenv(name)
+    for name, value in tier.items():
+        monkeypatch.setenv(name, value)
+    primary = MagicMock()
+    primary.messages.create.return_value = _resp("refused", stop_reason="refusal")
+
+    with patch("anthropic.AnthropicVertex") as mk_vertex:
+        out = create_with_refusal_fallback(primary, model="m", max_tokens=10, messages=[])
+
+    assert out.stop_reason == "refusal"
+    mk_vertex.assert_not_called()
+    assert "VERTEX_MODEL_FALLBACK_SDK" in caplog.text

@@ -41,6 +41,8 @@ def test_get_client_and_model_reuses_same_client(monkeypatch):
     """Repeated calls return the SAME client instance (built once, reused)."""
     # Direct-API branch avoids Vertex/gcloud/network entirely.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    monkeypatch.setenv("BRAIN_ALLOW_DIRECT_API", "1")
+    monkeypatch.setenv("CLAUDE_EXTRACT_MODEL", "claude-test-model")
     monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
     monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
 
@@ -70,6 +72,8 @@ def _fake_sdk(monkeypatch):
 def test_a_vertex_project_wins_over_an_api_key(monkeypatch, name):
     """A key left in a shell profile sent work mail to the direct API, not Vertex."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    monkeypatch.setenv("BRAIN_ALLOW_DIRECT_API", "1")
+    monkeypatch.setenv("CLAUDE_EXTRACT_MODEL", "claude-test-model")
     monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
     monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
     monkeypatch.setenv(name, "test-project")
@@ -84,6 +88,8 @@ def test_a_vertex_project_wins_over_an_api_key(monkeypatch, name):
 
 def test_the_api_key_is_used_only_without_a_vertex_project(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    monkeypatch.setenv("BRAIN_ALLOW_DIRECT_API", "1")
+    monkeypatch.setenv("CLAUDE_EXTRACT_MODEL", "claude-test-model")
     monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
     monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
     _, direct = _fake_sdk(monkeypatch)
@@ -97,6 +103,8 @@ def test_the_api_key_is_used_only_without_a_vertex_project(monkeypatch):
 def test_the_backend_in_use_is_logged(monkeypatch, capsys, vertex):
     """The sync logs could not tell which backend had run. Names no credential."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    monkeypatch.setenv("BRAIN_ALLOW_DIRECT_API", "1")
+    monkeypatch.setenv("CLAUDE_EXTRACT_MODEL", "claude-test-model")
     if vertex:
         monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
         monkeypatch.setenv("VERTEX_SDK_REGION", "eu")
@@ -104,7 +112,6 @@ def test_the_backend_in_use_is_logged(monkeypatch, capsys, vertex):
         monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
         monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
     _fake_sdk(monkeypatch)
-    monkeypatch.setattr(claude_extract, "CLAUDE_MODEL_BASE", "claude-test-model")
 
     claude_extract._build_client_and_model()
 
@@ -125,6 +132,8 @@ def test_the_sdk_makes_one_request_per_attempt(monkeypatch, vertex):
     two retries with timeouts among them, made one attempt up to three 120 s
     requests, and the policy then retried the lot."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
+    monkeypatch.setenv("BRAIN_ALLOW_DIRECT_API", "1")
+    monkeypatch.setenv("CLAUDE_EXTRACT_MODEL", "claude-test-model")
     if vertex:
         monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
         monkeypatch.setenv("VERTEX_SDK_REGION", "eu")
@@ -138,10 +147,17 @@ def test_the_sdk_makes_one_request_per_attempt(monkeypatch, vertex):
     assert client.kwargs["max_retries"] == 0
 
 
+def _fallback_tier(monkeypatch):
+    """A fallback tier, model and region together: it has no default."""
+    monkeypatch.setenv("VERTEX_MODEL_FALLBACK_SDK", "claude-fallback")
+    monkeypatch.setenv("VERTEX_REGION_FALLBACK", "eu")
+
+
 def test_complete_retries_a_refusal_on_the_fallback_tier(monkeypatch):
     """Attachments, images and calendar called the SDK themselves, so a refusal
     failed the item where extract_one retried it on the fallback tier."""
     monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+    _fallback_tier(monkeypatch)
     refusal = types.SimpleNamespace(content=[], stop_reason="refusal")
     primary = MagicMock()
     primary.messages.create.return_value = refusal
@@ -160,6 +176,7 @@ def test_complete_does_not_replay_a_refusal_the_fallback_tier_saw(monkeypatch):
     the fallback again: six calls and 90 s of sleep for an answer that could not
     change. The fallback tier is the one retry a refusal gets."""
     monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+    _fallback_tier(monkeypatch)
     refusal = types.SimpleNamespace(content=[], stop_reason="refusal")
     primary = MagicMock()
     primary.messages.create.return_value = refusal
@@ -567,6 +584,7 @@ def test_after_a_refusal_the_policy_retries_the_fallback_tier_alone(monkeypatch)
     whose retry replayed the primary that had already refused: a billed call that
     cannot change its answer, and one of the four attempts."""
     monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
+    _fallback_tier(monkeypatch)
     primary = MagicMock()
     primary.messages.create.return_value = types.SimpleNamespace(content=[], stop_reason="refusal")
     fallback = MagicMock()

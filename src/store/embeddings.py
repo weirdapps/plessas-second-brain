@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
-from src.config import DATA_ROOT
+from src.config import DATA_ROOT, embed_backend
 from src.store.schema import SUMMARISED_ATTACHMENT_IDS_SQL
 
 # Summaries fetched per query for the attachments missing from the index; under SQLite's
@@ -191,8 +191,9 @@ def _atomic_savez(path, ids, vectors) -> None:
 
 
 def _get_client():
-    """Get a Google GenAI client: Vertex AI (ADC auth) by default, or the Gemini
-    API with GEMINI_API_KEY when BRAIN_EMBED_BACKEND=gemini.
+    """Get a Google GenAI client: the Gemini API with GEMINI_API_KEY when
+    BRAIN_EMBED_BACKEND=gemini, or when the key is set and the switch is not
+    (src.config.embed_backend); Vertex AI (ADC auth) otherwise.
 
     The Gemini API serves the same gemini-embedding-001, so its vectors join the
     existing index. The switch exists because the Vertex project can refuse the
@@ -202,7 +203,7 @@ def _get_client():
 
     from google import genai
 
-    backend = os.environ.get("BRAIN_EMBED_BACKEND", "vertex").strip().lower() or "vertex"
+    backend = embed_backend()
     if backend not in ("vertex", "gemini"):
         raise ValueError(f"BRAIN_EMBED_BACKEND must be vertex or gemini; got {backend!r}")
     if backend == "gemini":
@@ -325,12 +326,35 @@ def _worth_a_retry(exc: Exception) -> bool:
     return not (isinstance(code, int) and 400 <= code < 500 and code != 429)
 
 
+# The last failed query embedding in this process, for `stats`: the exception's
+# type and when, never its message, which can quote the query or a credential.
+_LAST_EMBED_ERROR: dict | None = None
+
+
+def last_embed_error() -> dict | None:
+    """The last failed query embedding in this process, {"type", "at"}, or None."""
+    return dict(_LAST_EMBED_ERROR) if _LAST_EMBED_ERROR else None
+
+
 def embed_query(texts: list[str], client=None) -> np.ndarray:
     """Embed search queries: 4 s per call and at most one retry, then raise.
 
     Same contract as generate_embeddings (one row per text), so either serves as
-    a search's `embed_fn`. The caller falls back to the keyword-seeded vector.
+    a search's `embed_fn`. The caller falls back to the keyword-seeded vector. A
+    failure is recorded for `stats` (last_embed_error) before it is raised.
     """
+    global _LAST_EMBED_ERROR
+    try:
+        return _embed_query(texts, client)
+    except Exception as e:
+        _LAST_EMBED_ERROR = {
+            "type": type(e).__name__,
+            "at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        raise
+
+
+def _embed_query(texts: list[str], client) -> np.ndarray:
     from google.genai import types
 
     if client is None:

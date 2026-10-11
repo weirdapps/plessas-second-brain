@@ -152,6 +152,8 @@ The MCP server exposes 27 tools (all defined in `src/mcp_server.py`). Register t
 
   It also returns `data_as_of`, `age_hours` and `stale`. `data_as_of` is the older of two stamps, both returned as stored: `last_sync_date`, which every `sync` writes, and `mail_export_ok_at`, the Inbox export's last success, which `sync` copies in. `stale_warning` names the one that is behind. On a read replica that is the only way to tell a live corpus from one whose feed stopped, because both answer queries identically.
 
+  `embed_backend` names the service that embeds this server's search queries (`gemini` or `vertex`, see `BRAIN_EMBED_BACKEND`), and `last_embed_error` the last query embedding that failed in this server process, as `{"type": <exception type>, "at": <UTC time>}`, or `null`. It carries no message text, which can quote a query or a credential error.
+
 ### SQL (read-only)
 
 - `sql_schema(table=None)`. Without a table, every table and view with its row count; with one, its columns and indexes. `rows` is null for full-text (virtual) tables, which are marked `"virtual": true`, and also where counting ran out of the shared time budget (or a view cannot be counted). Full-text shadow tables are left out of the list.
@@ -297,7 +299,7 @@ Preferred credential path. Uses Application Default Credentials, no API key requ
 
 - `ANTHROPIC_API_KEY`: direct Anthropic API. Used only when no Vertex project is set; a key left in the environment never overrides Vertex. The backend in use is printed on stderr when the client is built.
 - `GEMINI_API_KEY`: required when `BRAIN_EXTRACT_ENGINE=gemini` or `BRAIN_EMBED_BACKEND=gemini`.
-- `BRAIN_EMBED_BACKEND`: `vertex` (default) or `gemini`. `gemini` reaches the same `gemini-embedding-001` through the Gemini API with `GEMINI_API_KEY`, even where a Vertex project is set, so its vectors join the existing index. Use it when the Vertex project refuses the embedding model. On a free-tier key Google may use the submitted text to improve its products; a key on a project with billing enabled is not used that way.
+- `BRAIN_EMBED_BACKEND`: `vertex` or `gemini`. Unset, it is `gemini` when `GEMINI_API_KEY` is set and `vertex` otherwise; set it to `vertex` to keep embeddings on Vertex on a host that holds a Gemini key for other reasons, such as `BRAIN_EXTRACT_ENGINE=gemini`. `gemini` reaches the same `gemini-embedding-001` through the Gemini API with `GEMINI_API_KEY`, even where a Vertex project is set, so its vectors join the existing index. Use it when the Vertex project refuses the embedding model. On a free-tier key Google may use the submitted text to improve its products; a key on a project with billing enabled is not used that way. The MCP server prints the backend it uses on stderr at startup, and `stats` returns it as `embed_backend`.
 
 ### Paths and hosts
 
@@ -325,6 +327,8 @@ python -m src.mcp_server
 
 `run_mcp.sh` auto-detects the venv in this order: `$SECOND_BRAIN_VENV_PYTHON`, `./.venv/bin/python`, `./venv/bin/python`, `~/.venvs/second-brain/bin/python`, then `python3`. The script is portable across hosts (in-repo venv on macOS, out-of-repo `~/.venvs/` on the VPS).
 
+Before it starts Python, `run_mcp.sh` sources the server's own environment file, `$BRAIN_DATA_DIR/env`, or `~/.second-brain/env` when `BRAIN_DATA_DIR` is unset. Put the settings the server needs whatever launched it there, one `KEY=value` per line (`export` is accepted), for example `GEMINI_API_KEY` and `BRAIN_EMBED_BACKEND`: Claude Code starts the server with the environment it was itself started with, which in an agent-team session or from an IDE holds no shell profile, and semantic search then fails quietly. Its values replace inherited ones. Because it holds keys, the file is read only when its mode gives group and others nothing (`chmod 600`); otherwise the server starts without it and says why on stderr. A symlink is judged by the file it points at.
+
 To serve it over HTTP instead, for a client that cannot spawn it (one process then holds the embedding index for every request):
 
 ```bash
@@ -341,7 +345,7 @@ claude mcp add --scope user second-brain -- /absolute/path/to/second-brain/run_m
 claude mcp list    # second-brain should be listed as connected
 ```
 
-`--scope user` makes the server available in every project. The server inherits the environment `claude` was launched with, which sources no `.env` and, from a GUI or an IDE, no shell profile, so put the identity settings in `~/.config/second-brain/env` (see [Configuration](#configuration)).
+`--scope user` makes the server available in every project. The server inherits the environment `claude` was launched with, which sources no `.env` and, from a GUI or an IDE, no shell profile, so put the identity settings in `~/.config/second-brain/env` (see [Configuration](#configuration)) and the embedding key and backend in the server's own owner-only environment file (see [Run the MCP server](#run-the-mcp-server)).
 
 In any Claude Code session, ask "what do we know about X" and the agent calls `recall`. The `mail`, `meetings`, `chat`, and `decks` marketplace plugins consume these tools automatically.
 

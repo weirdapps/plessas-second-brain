@@ -12,7 +12,7 @@ from datetime import UTC
 
 from mcp.server import MCPServer
 
-from src.config import DEFAULT_DB, REPLICA_STAMP
+from src.config import DEFAULT_DB, REPLICA_STAMP, embed_backend
 from src.store.schema import get_connection
 
 # Routing text, not marketing. Under tool search only the tool NAMES and this
@@ -764,6 +764,12 @@ def stats() -> dict:
         except Exception:
             pass
 
+        # Which service embeds this server's queries, and its last failure, so
+        # a semantic search that went quiet says why without reading a log.
+        from src.store.embeddings import last_embed_error
+
+        s["embed_backend"] = embed_backend()
+        s["last_embed_error"] = last_embed_error()
         return s
     finally:
         conn.close()
@@ -1269,6 +1275,8 @@ def main(argv: list[str] | None = None) -> int:
         "needs BRAIN_MCP_TOKEN_FILE",
     )
     args = parser.parse_args(argv)
+    # stderr: on stdio, stdout is the protocol. Names the service, never the key.
+    print(f"second-brain MCP: query embeddings through {embed_backend()}", file=sys.stderr)
     if args.http is None:
         mcp.run()
         return 0

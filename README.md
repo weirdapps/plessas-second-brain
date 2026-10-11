@@ -51,7 +51,7 @@ graph TD
 | Standalone documents | `src/cli.py ingest`, `reverse-ingest`, `src/ingest/reverse_scan.py` | Latest-version-per-logical-name dedup. `reverse-ingest` scans only the directories you name with `--root`; nothing schedules a scan. |
 | Web and YouTube | `src/extract/web_ingest.py` | URL fetch plus transcript pull via `youtube-transcript-api`. |
 | News digests | `src/export/news_export.py` | Reads an external news-reader SQLite DB (`BRAIN_NEWS_DB`) read-only. Digest syntheses plus articles at or above `--relevance`. Landed under `mailbox_name = 'News'`, so mail counts exclude them. Not sent to the model: the summary is the synthesis's brief or the article's opening, the topics its section categories or the article's categories (`src/extract/news_extract.py`). |
-| Claude Code sessions | `src/export/conversation_export.py` | Reads `~/.claude/projects`. |
+| Claude Code sessions | `src/export/conversation_export.py` | Reads `~/.claude/projects`, sent there from a workstation when each session ends (`scripts/hooks/session-end-push.sh`, see DEPLOY). A turn is the owner's only when he typed it; agent sessions are left out unless `--include-agents`. |
 
 ### Bring your own source
 
@@ -80,7 +80,7 @@ See [`examples/example_exporter.py`](examples/example_exporter.py) for a ~40-lin
 
 ## MCP tools
 
-The MCP server exposes 27 tools (all defined in `src/mcp_server.py`). Register the server once with `claude mcp add` (see [Register with Claude Code](#register-with-claude-code)), then every session picks them up.
+The MCP server exposes 25 tools (all defined in `src/mcp_server.py`). Register the server once with `claude mcp add` (see [Register with Claude Code](#register-with-claude-code)), then every session picks them up.
 
 **Response budget.** Claude Code saves a tool result longer than 50,000 characters to a file and hands the model a path instead. `recall`, `search_emails`, `query_emails`, `search_attachments`, `search_conversations`, `search_teams`, `query_decisions` and `query_calendar_events` therefore hold their answer to 40,000 characters, measured on the indented JSON the server sends (`src/mcp_budget.py`). Over that, rows are cut from the tail of whichever list holds the most characters, and `truncated` names each list that lost rows as `{"kept": n, "total": m}`; ask again with a narrower query or a lower `limit` for the rest. `search_emails`, `query_emails`, `search_attachments`, `search_conversations` and `query_decisions` return their rows as `{"result": [...]}`, which is also what their structured content always was.
 
@@ -162,10 +162,12 @@ A channel thread holds the post and its replies, each reply a message of its own
 
 ### Claude Code conversation memory
 
-- `search_conversations(query, search_type, workspace, limit)`.
-- `conversation_context(session_id)`.
-- `recall_preference(topic, limit)`. Surface prior user preferences and corrections extracted from past sessions.
-- `recent_conversations(workspace, days, limit)`.
+Conversation memory is the owner's own sessions. Each turn's `speaker` says who wrote it: `user` only for what the owner typed, `agent` for the rest of what Claude Code puts in the user role (skill and command bodies, compaction summaries, task notifications, command output, messages from teammates and other sessions), `assistant` for the session's own answers. An agent session (a teammate's or subagent's, a scripted run, any with no turn the owner typed) is left out of every read below unless `include_agents=true`; a new one reaches the store only through `export-conversations --include-agents`, and `relabel-conversations` tags those stored before. Stored harness tags (`<system-reminder>`, `<task-notification>`, `<teammate-message>` and the like) come back with their `<` escaped, here and in `sql_query`, so recalled text cannot read as a live harness message.
+
+- `search_conversations(query, search_type, workspace, limit, include_agents)`. With `include_agents`, each row says its `kind`, `owner` or `agent`.
+- `conversation_context(session_id, include_agents)`. An agent session is an error unless `include_agents`; the result says its `kind`.
+
+`recall_preference` and `recent_conversations` are retired. Standing preferences belong in `CLAUDE.md` and Claude Code's own memory, where they can be read and edited, and `/resume` lists recent sessions; the brain's copies repeated one rule up to 162 times and mixed in agent instructions. Their store functions in `src/store/conversation_query.py` stay one release, deprecated. A `[PREFERENCE]` fact that still comes back (in `conversation_context`) comes back once, and none is taken from a turn the owner did not type.
 
 ### Stats
 
@@ -449,6 +451,7 @@ python -m src.cli reextract --long --estimate          # price a re-summary befo
 python -m src.cli reextract --full-parts 1234 5678     # summarise these attachments from every part, now and on every later summary
 python scripts/relabel_attachment_status.py [--apply]  # give old failed/skipped rows today's unread verdicts: encrypted kinds, skip reasons
 python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents
+python -m src.cli relabel-conversations [--dry-run]    # once, on the producer: stored turns the owner did not type become 'agent' (see DEPLOY)
 python -m src.cli process-sharepoint --ingest-fetched  # store the files earlier SharePoint fetches left on disk
 python -m src.cli process-sharepoint --refetch-content --max-fetches 0 --deadline-s 1800  # read again the links recorded ok with no text
 python -m src.cli mail-reconcile --since 2025-03-16 --json gaps.json   # Outlook messages the store lacks; read-only, so it runs on a replica
@@ -465,7 +468,7 @@ Full subcommand list: `python -m src.cli --help`.
 src/
   cli.py                       Command-line entry (`brain` wrapper points here)
   config.py                    Paths, env-driven settings, schema version
-  mcp_server.py                MCP server (MCPServer, mcp SDK v2), 27 tools
+  mcp_server.py                MCP server (MCPServer, mcp SDK v2), 25 tools
   bridge.py                    Legacy JSON-over-CLI bridge (superseded by MCP)
   llm_policy.py                Shared Vertex retry and auth policy (vendored, SHA256 drift-checked)
   llm_deadline.py              Derives PTS_LLM_DEADLINE from the calling unit's own budget
@@ -475,7 +478,8 @@ src/
     outlook_cli.py             outlook-cli subprocess wrapper
     outlook_attachments.py     Attachment fetch for Outlook messages
     calendar_export.py         Outlook calendar events
-    conversation_export.py     Claude Code session transcripts
+    conversation_export.py     Claude Code session transcripts, each turn labelled by who wrote it
+    conversation_relabel.py    Relabels conversations stored before that, once (relabel-conversations)
     news_export.py             News-reader digests and articles into staging batches
     teams_cli.py               teams-cli subprocess wrapper
     teams_export.py            Teams chats, threads, messages
@@ -549,7 +553,7 @@ scripts/
   scrub_secrets.py             Redacts credentials, card numbers, IBANs and passwords already in the DB or, with --files, in files (dry run by default)
   repair_people.py             Mends garbled people names and unsaved sender addresses (dry run by default)
   backfill-all.sh              One-shot backfill across all sources
-  conversation-capture.sh      Helper to snapshot Claude Code sessions
+  hooks/session-end-push.sh    Claude Code SessionEnd hook: sends the ended session's transcript to the producer
   pii-gauntlet.sh              Guards tracked files (and, with --mode=history, published history) against personal-data leaks
   wrappers/                    Archive of the scheduler wrappers each host runs
 

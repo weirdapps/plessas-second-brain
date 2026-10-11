@@ -25,7 +25,8 @@ from tests.mcp_listing import listed_tools, registered_tool
 
 
 def test_the_tool_count_is_unchanged():
-    assert len(listed_tools()) == 27
+    # 27 until recall_preference and recent_conversations were retired.
+    assert len(listed_tools()) == 25
 
 
 def test_every_tool_says_whether_it_reads_or_writes():
@@ -195,8 +196,6 @@ CALLS = {
     "stats": {},
     "search_conversations": {"query": "okapi"},
     "conversation_context": {"session_id": "s1"},
-    "recall_preference": {"topic": "okapi"},
-    "recent_conversations": {},
     "sharepoint_index": {"operation": "list_stale"},
     "attachment_image_search": {"query": "okapi"},
     "outlook_live_search": {},

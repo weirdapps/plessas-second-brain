@@ -190,6 +190,7 @@ class Stats(TypedDict, total=False):
 @with_config(_OPEN)
 class ConversationContext(TypedDict, total=False):
     session_id: str
+    kind: str
     summary: Any
     turns: Rows
     decisions: Rows

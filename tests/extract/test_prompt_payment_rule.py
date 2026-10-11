@@ -60,9 +60,16 @@ def _calendar():
     return _PROMPT_TEMPLATE.format(invite=fence(_invite_text({"subject": "Sync"}, DATA)))
 
 
+def _calendar_invitation():
+    from src.extract.calendar_extractor import _INVITATION_TEMPLATE, _invite_text
+    from src.extract.untrusted import fence
+
+    return _INVITATION_TEMPLATE.format(invite=fence(_invite_text({"subject": "Sync"}, DATA)))
+
+
 @pytest.mark.parametrize(
     "build",
-    [_email, _conversation, _attachment, _teams, _whatsapp, _calendar],
+    [_email, _conversation, _attachment, _teams, _whatsapp, _calendar, _calendar_invitation],
     ids=lambda b: b.__name__,
 )
 def test_the_rule_is_given_once_and_outside_the_fence(build):

@@ -370,6 +370,84 @@ def refresh_self_flags(
     return changed
 
 
+def mark_series(conn: sqlite3.Connection) -> int:
+    """Set is_recurring on stored occurrences that name their series. Returns rows changed.
+
+    parse_event read `IsRecurring`, which Outlook never sends, so every row was
+    stored 0 beside the series id that came with two thirds of them, and an
+    occurrence is fetched again only when it changes. Idempotent, and about two
+    thousand rows the first time.
+    """
+    changed = conn.execute(
+        "UPDATE calendar_events SET is_recurring = 1 "
+        "WHERE recurrence_master_id IS NOT NULL AND is_recurring = 0"
+    ).rowcount
+    conn.commit()
+    return changed
+
+
+def series_extraction(
+    conn: sqlite3.Connection, event: dict, prompt_hash: str | None
+) -> dict | None:
+    """Another occurrence's extraction, made from this very prompt, or None.
+
+    An occurrence of a series is read as the series' invitation, without its
+    date, so its siblings share one prompt while their invitation stays the
+    same; one daily call was read 296 times. The same prompt gives the same
+    reading, and an invitation has no decisions or action items.
+    """
+    series = event.get("recurrence_master_id")
+    if not series or not prompt_hash:
+        return None
+    row = conn.execute(
+        "SELECT body_summary FROM calendar_events WHERE recurrence_master_id = ? "
+        "AND extraction_hash = ? AND llm_status = 'extracted' AND outlook_event_id <> ? "
+        "LIMIT 1",
+        (series, prompt_hash, event.get("outlook_event_id", "")),
+    ).fetchone()
+    if row is None:
+        return None
+    return {"body_summary": row[0] or "", "decisions": [], "action_items": []}
+
+
+def adopt_reissued_occurrence(conn: sqlite3.Connection, event: dict, listed_ids: set[str]) -> bool:
+    """Give a stored occurrence the new id Outlook lists it under. Returns whether it did.
+
+    An occurrence is its series and its start. A series holds two at one moment
+    only when one was moved onto the other's slot, and then Outlook lists both.
+    So a stored row of the same series and start, whose own id is no longer
+    listed, is this very occurrence under the id it had before its series was
+    sent again. Keyed to the new id, that row is updated in place, its
+    extraction with it, where the upsert would have stored the meeting twice.
+    Only for an event with no row of its own, and only when one row fits.
+    """
+    series = event.get("recurrence_master_id")
+    start = event.get("start_at")
+    event_id = event.get("outlook_event_id")
+    if not series or not start or not event_id:
+        return False
+    if conn.execute(
+        "SELECT 1 FROM calendar_events WHERE outlook_event_id = ?", (event_id,)
+    ).fetchone():
+        return False
+    stale = [
+        row_id
+        for row_id, stored_id in conn.execute(
+            "SELECT id, outlook_event_id FROM calendar_events "
+            "WHERE recurrence_master_id = ? AND start_at = ?",
+            (series, start),
+        ).fetchall()
+        if stored_id not in listed_ids
+    ]
+    if len(stale) != 1:
+        return False
+    conn.execute(
+        "UPDATE calendar_events SET outlook_event_id = ? WHERE id = ?", (event_id, stale[0])
+    )
+    conn.commit()
+    return True
+
+
 def cancel_unlisted(
     conn: sqlite3.Connection, listed_ids: set[str], window_start: str, window_end: str
 ) -> int:

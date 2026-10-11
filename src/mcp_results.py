@@ -152,6 +152,7 @@ class StaleThreads(TypedDict):
 @with_config(_OPEN)
 class MeetingPrep(TypedDict, total=False):
     attendees: Rows
+    meetings: dict[str, Rows]
     topic_context: dict[str, Any] | None
 
 

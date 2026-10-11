@@ -398,6 +398,7 @@ def test_a_run_over_a_busy_window_lists_it_all(monkeypatch, tmp_path):
 
 
 def test_backfill_gets_the_larger_call_bound(monkeypatch, tmp_path):
+    """A backfill lists a month at a time, each month on the larger bound."""
     bounds: list = []
 
     def record(since, until, failures=None, max_calls=calendar_export.DEFAULT_LIST_CALLS):
@@ -408,4 +409,6 @@ def test_backfill_gets_the_larger_call_bound(monkeypatch, tmp_path):
     _sync(monkeypatch, tmp_path, lambda args: [], backfill=True)
     _sync(monkeypatch, tmp_path, lambda args: [])
 
-    assert bounds == [calendar_export.BACKFILL_LIST_CALLS, calendar_export.DEFAULT_LIST_CALLS]
+    assert len(bounds) > 2
+    assert set(bounds[:-1]) == {calendar_export.BACKFILL_LIST_CALLS}
+    assert bounds[-1] == calendar_export.DEFAULT_LIST_CALLS

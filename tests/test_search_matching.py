@@ -217,7 +217,9 @@ def test_each_free_text_bucket_reads_its_table_once(conn):
     conn.set_trace_callback(None)
 
     for table in ("decisions", "action_items", "commitments", "inline_images"):
-        passes = [s for s in statements if re.search(rf"FROM {table}\b", s)]
+        # A pass folds every row; the row envelope's lookup of the rows found, by
+        # id, is not one (src/store/envelope.py).
+        passes = [s for s in statements if re.search(rf"FROM {table}\b", s) and "sb_match" in s]
         assert len(passes) == 1, (table, len(passes))
 
 

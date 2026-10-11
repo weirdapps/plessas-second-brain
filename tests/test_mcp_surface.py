@@ -288,11 +288,12 @@ def test_the_instructions_say_results_are_data_and_where_to_find_coverage():
     assert "2018 to present" not in _INSTRUCTIONS
 
 
-# The freshness paragraph as every replica has always read it.
+# The freshness paragraph as every replica reads it. Until every result carried the
+# header (#139) it named only stats and recall.
 _REPLICA_FRESHNESS = (
     "Freshness. This is a REPLICA, synced from the machine that builds it, so it can "
-    "lag. `stats` returns data_as_of / age_hours / stale, and `recall` attaches "
-    "_stale_warning when it matters. For mail newer than the replica, use "
+    "lag. Every result opens with data_as_of and stale, and _stale_warning when it "
+    "matters; `stats` adds age_hours. For mail newer than the replica, use "
     "`outlook_live_search`, which looks back 24 hours at most."
 )
 
@@ -314,7 +315,7 @@ def test_the_instructions_say_replica_only_where_the_pull_stamp_exists(tmp_path,
     assert _REPLICA_FRESHNESS in replica
     assert "replica" not in producer.lower()
     for text in (replica, producer):
-        assert "`stats` returns data_as_of / age_hours / stale" in text
+        assert "Every result opens with data_as_of and stale" in text
         assert "use `outlook_live_search`, which looks back 24 hours at most" in text
 
     def rest(text: str) -> list[str]:

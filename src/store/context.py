@@ -7,6 +7,7 @@ to retrieve person, topic, conversation, and decision context from the knowledge
 import sqlite3
 from datetime import datetime, timedelta
 
+from src.store import envelope
 from src.store.greek import (
     PHRASE_MATCH,
     register_sql_functions,
@@ -87,7 +88,9 @@ def get_person_context(
         'alias'; None when no one matched), match_count, other_candidates (each
         with its identifier kind), email_count, recent_emails, topics,
         sentiment_distribution, decisions, open_actions, communication_pattern;
-        every email, decision and action row carries its email_id and source_class
+        every email, decision and action row carries its email_id and source_class,
+        and every row of those and of the Teams and WhatsApp threads the row
+        envelope (src/store/envelope.py)
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
 
@@ -259,7 +262,8 @@ def get_person_context(
         (person_id, cutoff),
     ).fetchone()["cnt"]
     for rows in (recent_emails, decisions, open_actions):
-        with_source_class(conn, rows)
+        # Each says what it stands for: its email, or the one it was taken from.
+        envelope.emails(conn, with_source_class(conn, rows))
 
     # Communication pattern
     pattern_row = conn.execute(
@@ -443,16 +447,19 @@ def _person_whatsapp(conn: sqlite3.Connection, name: str | None, cutoff: str, li
     return {
         "message_count": count,
         "last_message_at": last,
-        "recent_threads": [
-            {
-                "thread_id": r["thread_id"],
-                "title": r["title"],
-                "chat": r["chat"],
-                "messages": r["messages"],
-                "last_message_at": r["last_message_at"],
-            }
-            for r in threads
-        ],
+        "recent_threads": envelope.whatsapp(
+            conn,
+            [
+                {
+                    "thread_id": r["thread_id"],
+                    "title": r["title"],
+                    "chat": r["chat"],
+                    "messages": r["messages"],
+                    "last_message_at": r["last_message_at"],
+                }
+                for r in threads
+            ],
+        ),
         "recent_threads_total": total,
     }
 
@@ -511,16 +518,20 @@ def _person_teams(conn: sqlite3.Connection, person_id: int, cutoff: str, limit: 
     return {
         "message_count": count,
         "last_message_at": last,
-        "recent_threads": [
-            {
-                "thread_id": r["thread_id"],
-                "title": r["title"],
-                "chat": " / ".join(p for p in (r["team_name"], r["topic"]) if p) or r["chat_kind"],
-                "messages": r["messages"],
-                "last_message_at": r["last_message_at"],
-            }
-            for r in threads
-        ],
+        "recent_threads": envelope.teams(
+            conn,
+            [
+                {
+                    "thread_id": r["thread_id"],
+                    "title": r["title"],
+                    "chat": " / ".join(p for p in (r["team_name"], r["topic"]) if p)
+                    or r["chat_kind"],
+                    "messages": r["messages"],
+                    "last_message_at": r["last_message_at"],
+                }
+                for r in threads
+            ],
+        ),
         "recent_threads_total": total,
     }
 
@@ -549,7 +560,8 @@ def get_topic_context(
     Returns:
         Dict with topic info, email_count, recent_emails, key_people,
         decisions, open_actions, key_facts; every email, decision, action and
-        fact row carries its email_id and source_class
+        fact row carries its email_id, source_class and the row envelope
+        (src/store/envelope.py)
     """
 
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
@@ -735,7 +747,7 @@ def get_topic_context(
         (topic_id, cutoff),
     ).fetchone()["cnt"]
     for rows in (recent_emails, decisions, open_actions, key_facts):
-        with_source_class(conn, rows)
+        envelope.emails(conn, with_source_class(conn, rows))
 
     return {
         "topic": topic_info,

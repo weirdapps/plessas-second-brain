@@ -137,7 +137,7 @@ def test_query_decisions_by_topic(mock_get_conn, mock_conn):
 @patch("src.mcp_server._get_conn")
 def test_query_actions_open(mock_get_conn, mock_conn):
     mock_get_conn.return_value = mock_conn
-    result = query_actions(owner="Alice", status="open")
+    result = query_actions(owner="Alice", status="open")["result"]
     assert len(result) >= 1
     assert result[0]["task"] == "Send updated timeline"
 
@@ -145,7 +145,7 @@ def test_query_actions_open(mock_get_conn, mock_conn):
 @patch("src.mcp_server._get_conn")
 def test_query_actions_empty(mock_get_conn, mock_conn):
     mock_get_conn.return_value = mock_conn
-    result = query_actions(owner="Nobody", status="open")
+    result = query_actions(owner="Nobody", status="open")["result"]
     assert result == []
 
 

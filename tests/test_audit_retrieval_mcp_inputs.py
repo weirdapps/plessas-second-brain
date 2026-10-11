@@ -41,6 +41,8 @@ def db(tmp_path, monkeypatch):
     conn.commit()
     conn.close()
     monkeypatch.setattr(mcp_server, "_get_conn", lambda: get_connection(str(path)))
+    # sql_query and sql_schema open the store themselves, the header too.
+    monkeypatch.setattr("src.store.sql_readonly.DEFAULT_DB", path)
     return path
 
 
@@ -100,6 +102,8 @@ def test_every_limit_is_clamped_to_1_to_200(
         seen.append(kw[arg] if isinstance(arg, str) else a[arg])
         if function == "recall":
             return {"query": "", "summary": {}, **dict.fromkeys(mcp_server._RECALL_KINDS, [])}
+        if function == "run_query":
+            return {"columns": [], "rows": [], "row_count": 0, "truncated": False}
         return {} if function in ("get_person_context", "get_topic_context") else []
 
     monkeypatch.setattr(module, function, spy)

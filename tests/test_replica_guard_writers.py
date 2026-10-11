@@ -40,7 +40,7 @@ def test_the_mcp_listings_still_work_on_a_replica(replica, monkeypatch):
     conn = create_database(":memory:")
     monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
 
-    assert mcp_server.sharepoint_index("list_stale") == {"links": []}
+    assert mcp_server.sharepoint_index("list_stale")["links"] == []
 
 
 def test_the_people_dedup_refuses_a_replica(replica, monkeypatch):

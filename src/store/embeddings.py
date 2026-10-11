@@ -772,22 +772,36 @@ def _top_indices(
 
 
 def _hidden_vector_ids(
-    conn: sqlite3.Connection, include_news: bool = False, include_automation: bool = False
+    conn: sqlite3.Connection,
+    include_news: bool = False,
+    include_automation: bool = False,
+    classes: tuple[str, ...] | None = None,
 ) -> np.ndarray | None:
     """The index ids of the emails a read path leaves out (src/store/source_class.py) and of
     their attachments; None when it leaves out none. 16,320 News vectors stood among the
-    semantic candidates, and the owner's automation mail beside them."""
+    semantic candidates, and the owner's automation mail beside them. `classes`, a search's
+    `kinds`, leaves out the emails of the other classes too, but not their attachments,
+    which are a kind of their own."""
     hidden = hidden_ids_sql(conn, include_news, include_automation)
-    if hidden is None:
+    narrowed = (
+        hidden
+        if classes is None
+        else hidden_ids_sql(conn, include_news, include_automation, classes)
+    )
+    if narrowed is None:
         return None
-    emails = [row[0] for row in conn.execute(hidden)]
-    attachments = [
-        -row[0]
-        for row in conn.execute(
-            "SELECT ac.id FROM attachment_content ac JOIN attachments a ON a.id = ac.attachment_id"
-            f" WHERE a.email_id IN ({hidden})"
-        )
-    ]
+    emails = [row[0] for row in conn.execute(narrowed)]
+    attachments = (
+        [
+            -row[0]
+            for row in conn.execute(
+                "SELECT ac.id FROM attachment_content ac JOIN attachments a"
+                f" ON a.id = ac.attachment_id WHERE a.email_id IN ({hidden})"
+            )
+        ]
+        if hidden is not None
+        else []
+    )
     return np.array(emails + attachments, dtype=np.int64)
 
 
@@ -888,6 +902,7 @@ def query_semantic(
     *,
     include_news: bool = False,
     include_automation: bool = False,
+    classes: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Semantic search across email summaries using cosine similarity.
 
@@ -904,10 +919,13 @@ def query_semantic(
         include_news, include_automation: Include the vectors of news items and
             of the owner's automation mail, and of their attachments, left out by
             default (src/store/source_class.py)
+        classes: Only the email vectors of these source classes (a search's
+            `kinds`); attachments are left to `kinds`
 
     Returns:
         List of dicts with keys: email_id, date, subject, summary, similarity;
-        email and attachment rows carry their email's source_class
+        email and attachment rows carry their email's source_class, and an
+        attachment row its attachment_id
     """
     # Index load + unit-normalization is cached across calls (see _load_index_and_space),
     # so a long-lived process pays the ~1 GB read once, not per query.
@@ -928,7 +946,7 @@ def query_semantic(
 
     # News and automation vectors, and their attachments', leave the ranking first.
     excluded = (
-        _hidden_vector_ids(conn, include_news, include_automation)
+        _hidden_vector_ids(conn, include_news, include_automation, classes)
         if kinds is None or {"email", "attachment"} & set(kinds)
         else None
     )
@@ -1018,8 +1036,8 @@ def query_semantic(
             # Attachment (negative ID = attachment_content.id)
             row = conn.execute(
                 """
-                SELECT ac.id as attachment_content_id, a.filename,
-                       ac.summary, a.email_id, e.subject as email_subject,
+                SELECT ac.id as attachment_content_id, a.id as attachment_id,
+                       a.filename, ac.summary, a.email_id, e.subject as email_subject,
                        e.date_received as date
                 FROM attachment_content ac
                 JOIN attachments a ON a.id = ac.attachment_id
@@ -1074,6 +1092,7 @@ def semantic_email_candidates(
     *,
     include_news: bool = False,
     include_automation: bool = False,
+    classes: tuple[str, ...] | None = None,
 ) -> list[int]:
     """Ranked, de-duplicated email ids for `query` from the vector index, best-first.
 
@@ -1082,7 +1101,9 @@ def semantic_email_candidates(
     `embed_fn` / `index_path` are injection points for testing. The ids come back
     as SemanticCandidates, whose `semantic` says whether the query was embedded or
     stood in for by its keyword matches. News items and the owner's automation mail,
-    and their attachments, are left out unless included (src/store/source_class.py).
+    and their attachments, are left out unless included (src/store/source_class.py),
+    and with `classes` (recall's `kinds`) the emails of the other classes; recall drops
+    a candidate an attachment folds onto one of those.
     """
     ids, normalized, space = _load_index_and_space(index_path)
     query_norm, seeded = _query_vector(conn, query, ids, normalized, embed_fn or embed_query, space)
@@ -1095,7 +1116,7 @@ def semantic_email_candidates(
         ids,
         max(limit * 4, limit),
         {"email", "attachment"},
-        excluded_ids=_hidden_vector_ids(conn, include_news, include_automation),
+        excluded_ids=_hidden_vector_ids(conn, include_news, include_automation, classes),
     )
     out: list[int] = []
     seen: set[int] = set()

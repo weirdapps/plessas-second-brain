@@ -8,6 +8,10 @@ The types name the keys a caller can rely on and stay loose inside them: rows ar
 dicts of any shape, and keys not listed here still go through (`extra="allow"`),
 so a key a store function adds later is never dropped. Every key is optional
 (`total=False`) unless the tool always returns it.
+
+Every type but recall's inherits Fresh, so every result opens with `data_as_of`
+and `stale`, required: a tool that left them out would fail its own output
+validation rather than drift. recall declares them itself, after its summary.
 """
 
 from typing import Any, NotRequired, TypedDict
@@ -31,7 +35,21 @@ _OPEN = ConfigDict(extra="allow")
 
 
 @with_config(_OPEN)
-class RowsResult(TypedDict):
+class Fresh(TypedDict):
+    """What every result opens with: how current the store it was read from is.
+
+    `data_as_of` and `stale` as src/store/query.py get_freshness reads them (the older
+    of the last sync and the last mail export), and `_stale_warning`, the sentence to
+    pass on, when the store is behind. A live read is as of the call.
+    """
+
+    data_as_of: str | None
+    stale: bool
+    _stale_warning: NotRequired[str]
+
+
+@with_config(_OPEN)
+class RowsResult(Fresh):
     """A list tool's rows, with `truncated` when the budget cut them and `reason`
     when nothing matched."""
 
@@ -41,7 +59,7 @@ class RowsResult(TypedDict):
 
 
 @with_config(_OPEN)
-class ResultsResult(TypedDict):
+class ResultsResult(Fresh):
     """search_teams and search_whatsapp: rows under `results`."""
 
     results: Rows
@@ -50,7 +68,7 @@ class ResultsResult(TypedDict):
 
 
 @with_config(_OPEN)
-class PersonContext(TypedDict, total=False):
+class PersonContext(Fresh, total=False):
     person: dict[str, Any] | None
     resolved_by: str | None
     match_count: int
@@ -74,7 +92,7 @@ class PersonContext(TypedDict, total=False):
 
 
 @with_config(_OPEN)
-class TopicContext(TypedDict, total=False):
+class TopicContext(Fresh, total=False):
     topic: dict[str, Any] | None
     email_count: int
     recent_emails: Rows
@@ -90,7 +108,7 @@ class TopicContext(TypedDict, total=False):
 
 
 @with_config(_OPEN)
-class SenderBrief(TypedDict, total=False):
+class SenderBrief(Fresh, total=False):
     known: bool
     query: str
     name: Any
@@ -108,7 +126,7 @@ class SenderBrief(TypedDict, total=False):
 
 
 @with_config(_OPEN)
-class EmailThread(TypedDict):
+class EmailThread(Fresh):
     email_id: int
     emails: Rows
     thread_total: int
@@ -141,7 +159,7 @@ class RecallResult(TypedDict):
 
 
 @with_config(_OPEN)
-class StaleThreads(TypedDict):
+class StaleThreads(Fresh):
     stale_threads: Rows
     stale_threads_total: int
     overdue_actions: Rows
@@ -150,14 +168,14 @@ class StaleThreads(TypedDict):
 
 
 @with_config(_OPEN)
-class MeetingPrep(TypedDict, total=False):
+class MeetingPrep(Fresh, total=False):
     attendees: Rows
     meetings: dict[str, Rows]
     topic_context: dict[str, Any] | None
 
 
 @with_config(_OPEN)
-class CalendarEvents(TypedDict):
+class CalendarEvents(Fresh):
     events: Rows
     count: int
     truncated: NotRequired[Truncated]
@@ -165,7 +183,7 @@ class CalendarEvents(TypedDict):
 
 
 @with_config(_OPEN)
-class Stats(TypedDict, total=False):
+class Stats(Fresh, total=False):
     total_emails: int
     total_news_articles: int
     total_documents: int
@@ -177,9 +195,8 @@ class Stats(TypedDict, total=False):
     latest_email: Any
     source_class: dict[str, int] | str
     coverage: dict[str, Any]
-    data_as_of: Any
+    # data_as_of and stale come from Fresh, first.
     age_hours: Any
-    stale: bool
     stale_warning: str
     total_attachments: int
     attachments_extracted: int
@@ -195,7 +212,7 @@ class Stats(TypedDict, total=False):
 
 
 @with_config(_OPEN)
-class ConversationContext(TypedDict, total=False):
+class ConversationContext(Fresh, total=False):
     session_id: str
     kind: str
     summary: Any
@@ -207,21 +224,21 @@ class ConversationContext(TypedDict, total=False):
 
 
 @with_config(_OPEN)
-class SharepointIndex(TypedDict, total=False):
+class SharepointIndex(Fresh, total=False):
     links: Rows
     status: str
     document_message_id: Any
 
 
 @with_config(_OPEN)
-class ImageSearch(TypedDict):
+class ImageSearch(Fresh):
     results: Rows
     count: int
     reason: NotRequired[str]
 
 
 @with_config(_OPEN)
-class LiveMail(TypedDict):
+class LiveMail(Fresh):
     messages: Rows
     count: int
     since_minutes: int
@@ -229,7 +246,7 @@ class LiveMail(TypedDict):
 
 
 @with_config(_OPEN)
-class TeamsThread(TypedDict, total=False):
+class TeamsThread(Fresh, total=False):
     thread: dict[str, Any]
     messages: Rows
     decisions: Rows
@@ -238,7 +255,7 @@ class TeamsThread(TypedDict, total=False):
 
 
 @with_config(_OPEN)
-class TeamsChat(TypedDict, total=False):
+class TeamsChat(Fresh, total=False):
     chat: dict[str, Any]
     threads: Rows
     last_messages: Rows
@@ -247,7 +264,7 @@ class TeamsChat(TypedDict, total=False):
 
 
 @with_config(_OPEN)
-class SqlResult(TypedDict):
+class SqlResult(Fresh):
     columns: list[str]
     rows: list[list[Any]]
     row_count: int
@@ -255,7 +272,7 @@ class SqlResult(TypedDict):
 
 
 @with_config(_OPEN)
-class SqlSchema(TypedDict, total=False):
+class SqlSchema(Fresh, total=False):
     tables: Rows
     table: str
     columns: Rows

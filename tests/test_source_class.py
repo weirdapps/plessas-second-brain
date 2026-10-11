@@ -955,7 +955,7 @@ def test_the_tools_take_the_switches(store, monkeypatch):
         lambda **kw: mcp_server.search_emails(WORD, **kw)["result"],
         lambda **kw: mcp_server.query_emails(keyword=WORD, **kw)["result"],
         lambda **kw: mcp_server.query_decisions(**kw)["result"],
-        lambda **kw: mcp_server.query_actions(**kw),
+        lambda **kw: mcp_server.query_actions(**kw)["result"],
         lambda **kw: mcp_server.search_attachments(WORD, **kw)["result"],
         lambda **kw: mcp_server.recall(WORD, **kw)["decisions"],
         lambda **kw: mcp_server.person_context("Colleague", **kw)["decisions"],

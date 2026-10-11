@@ -10,6 +10,7 @@ import sqlite3
 from typing import Any
 
 from src.config import USER_EMAIL_PATTERN
+from src.store import envelope
 from src.store.greek import register_sql_functions, search_fold
 from src.store.normalizer import normalize_topic
 from src.store.ordering import (
@@ -194,8 +195,9 @@ def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> li
 
     Returns:
         List of dicts with keys: email_id, date, subject, summary,
-        sender_name, sender_address, sentiment, source_class. A thread asked for
-        by id comes back whole, whatever its class.
+        sender_name, sender_address, sentiment, source_class, and the row
+        envelope (src/store/envelope.py). A thread asked for by id comes back
+        whole, whatever its class.
     """
     row = conn.execute(f"SELECT {_THREAD} FROM emails e WHERE e.id = ?", (email_id,)).fetchone()
     if not row:
@@ -233,7 +235,7 @@ def query_thread(conn: sqlite3.Connection, email_id: int, limit: int = 50) -> li
         """,
         (json.dumps(ids),),
     )
-    return with_source_class(conn, [dict(r) for r in cursor.fetchall()])
+    return envelope.emails(conn, with_source_class(conn, [dict(r) for r in cursor.fetchall()]))
 
 
 def count_thread(conn: sqlite3.Connection, email_id: int) -> int:
@@ -405,6 +407,7 @@ def query_by_keyword(
     *,
     include_news: bool = False,
     include_automation: bool = False,
+    classes: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Full-text search using FTS5 on email subjects, summaries, content, key facts
     and attachments.
@@ -416,6 +419,8 @@ def query_by_keyword(
         search_content_only: When True, only match against the content column
         include_news, include_automation: Include news items and the owner's
             automation mail, left out by default (src/store/source_class.py)
+        classes: Only emails of these source classes (a search's `kinds`,
+            envelope.classes_for), applied in the query before its limit
 
     Returns:
         List of dicts with keys: email_id, date, subject, summary, snippet, source,
@@ -424,13 +429,14 @@ def query_by_keyword(
         a row whose thread has more than one email matching across its subject,
         summary and body adds thread_matches, that count. When no row carries
         every token, rows matching any meaningful token come back instead, each
-        flagged partial_match.
+        flagged partial_match. Each row carries the envelope
+        (src/store/envelope.py), matched_in repeating source.
     """
-    visible = visible_sql(conn, "e.id", include_news, include_automation)
+    visible = visible_sql(conn, "e.id", include_news, include_automation, classes)
     for expression, partial in fts5_query_variants(keyword):
         results = _keyword_waterfall(conn, expression, limit, search_content_only, visible)
         if results:
-            return with_source_class(conn, _mark_partial(results, partial))
+            return envelope.emails(conn, with_source_class(conn, _mark_partial(results, partial)))
     return []
 
 
@@ -861,7 +867,8 @@ def query_decisions(
         List of dicts with keys: decision_id, decision, decided_by, date (its own
         ISO date, else its parent's), parent_date, email_id, email_subject,
         source, source_class (None when the parent is not an email), topics
-        (comma-separated); newest first
+        (comma-separated), and the envelope of the item it was taken from
+        (src/store/envelope.py); newest first
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
     # Build query with optional filters
@@ -936,7 +943,8 @@ def query_decisions(
     params.append(limit)
 
     cursor = conn.execute(query, params)
-    return with_source_class(conn, [dict(row) for row in cursor.fetchall()])
+    rows = with_source_class(conn, [dict(row) for row in cursor.fetchall()])
+    return envelope.extracted(conn, rows, "decisions", "decision_id")
 
 
 # An ISO date this store can actually sort and compare. 3,157 open action items
@@ -979,7 +987,8 @@ def query_action_items(
     Returns:
         List of dicts with keys: action_id, task, owner, deadline, status,
         email_id, email_subject, date and parent_date (both its parent's date),
-        source, source_class (None when the parent is not an email)
+        source, source_class (None when the parent is not an email), and the
+        envelope of the item it was taken from (src/store/envelope.py)
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
     # LEFT JOIN every parent, then COALESCE for display. `source` tells the
@@ -1059,7 +1068,8 @@ def query_action_items(
     params.append(limit)
 
     cursor = conn.execute(query, params)
-    return with_source_class(conn, [dict(row) for row in cursor.fetchall()])
+    rows = with_source_class(conn, [dict(row) for row in cursor.fetchall()])
+    return envelope.extracted(conn, rows, "action_items", "action_id")
 
 
 def query_combined(
@@ -1073,6 +1083,7 @@ def query_combined(
     *,
     include_news: bool = False,
     include_automation: bool = False,
+    classes: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Combined query with multiple filters (AND logic).
 
@@ -1088,10 +1099,12 @@ def query_combined(
         limit: Maximum number of results to return
         include_news, include_automation: Include news items and the owner's
             automation mail, left out by default (src/store/source_class.py)
+        classes: Only emails of these source classes (envelope.classes_for)
 
     Returns:
         List of dicts with keys: email_id, date, subject, summary, sender,
-        topics (comma-separated), relevance_score, source_class
+        topics (comma-separated), relevance_score, source_class, and the row
+        envelope (src/store/envelope.py)
 
     Raises:
         ValueError: If no filters are provided
@@ -1149,7 +1162,7 @@ def query_combined(
         where_clauses.append("DATE(e.date_received) <= DATE(?)")
         params.append(end_date)
 
-    where_clauses.append(visible_sql(conn, "e.id", include_news, include_automation))
+    where_clauses.append(visible_sql(conn, "e.id", include_news, include_automation, classes))
 
     # The newest `limit` matching emails are picked first, then their topics are
     # joined: grouping every match by topic before the LIMIT sorted them all.
@@ -1179,7 +1192,7 @@ def query_combined(
     params = cte_params + params + [limit]
 
     cursor = conn.execute(query, params)
-    return with_source_class(conn, [dict(row) for row in cursor.fetchall()])
+    return envelope.emails(conn, with_source_class(conn, [dict(row) for row in cursor.fetchall()]))
 
 
 def meeting_prep(
@@ -1391,6 +1404,16 @@ def meeting_prep(
 
         result["topic_context"] = topic_ctx
 
+    # Each row says what it stands for (src/store/envelope.py): its email, or the email
+    # a decision, fact or action was taken from; a meeting its own.
+    for dossier in result["attendees"]:
+        for key in ("emails", "decisions", "open_actions"):
+            envelope.emails(conn, dossier[key])
+    if result["topic_context"]:
+        for key in ("decisions", "key_facts", "action_items"):
+            envelope.emails(conn, result["topic_context"][key])
+    for meetings in result["meetings"].values():
+        envelope.calendar(conn, meetings)
     return result
 
 
@@ -1494,7 +1517,8 @@ def find_stale_threads(
 
     Returns:
         List of dicts with keys: email_id, conversation_id, subject,
-        date_received, sender_address, days_waiting, source_class
+        date_received, sender_address, days_waiting, source_class, and the row
+        envelope (src/store/envelope.py)
     """
     if not USER_EMAIL_PATTERN:
         return []
@@ -1506,7 +1530,7 @@ def find_stale_threads(
         visible_sql(conn, "e.id", include_news, include_automation),
     )
     rows = conn.execute(sql + " ORDER BY e.date_received DESC LIMIT ?", (*params, limit))
-    return with_source_class(conn, [dict(r) for r in rows.fetchall()])
+    return envelope.emails(conn, with_source_class(conn, [dict(r) for r in rows.fetchall()]))
 
 
 def count_stale_threads(
@@ -1578,7 +1602,8 @@ def find_overdue_actions(
     Returns:
         List of dicts with keys: action_id, task, owner, deadline, email_id,
         email_subject, date and parent_date (both its parent's date), source,
-        days_overdue, source_class (None when the parent is not an email)
+        days_overdue, source_class (None when the parent is not an email), and
+        the envelope of the item it was taken from (src/store/envelope.py)
     """
     results = conn.execute(
         f"""
@@ -1610,7 +1635,8 @@ def find_overdue_actions(
     """,
         (limit,),
     ).fetchall()
-    return with_source_class(conn, [dict(r) for r in results])
+    rows = with_source_class(conn, [dict(r) for r in results])
+    return envelope.extracted(conn, rows, "action_items", "action_id")
 
 
 def get_stats(conn: sqlite3.Connection) -> dict:
@@ -1827,7 +1853,8 @@ def search_attachments(
 
     Returns:
         List of dicts with: attachment_id, filename, mime_type, email_id,
-        email_subject, email_date, snippet, summary, source_class (the email's).
+        email_subject, email_date, snippet, summary, source_class (the email's),
+        and the row envelope (src/store/envelope.py), ingested_at the export.
         Rows from the any-token fallback carry partial_match.
     """
     # Check if attachment_content_fts exists
@@ -1872,5 +1899,7 @@ def search_attachments(
                 }
                 for r in rows
             ]
-            return with_source_class(conn, _mark_partial(found, partial))
+            return envelope.attachments(
+                conn, with_source_class(conn, _mark_partial(found, partial))
+            )
     return []

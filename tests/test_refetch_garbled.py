@@ -432,6 +432,19 @@ def test_an_apple_mail_number_is_never_sent_to_outlook(store, mailbox):
     assert att not in rg.fetch_states(conn)
 
 
+def test_an_apple_mail_email_with_a_recorded_copy_is_asked_for_by_the_copy_id(store, mailbox):
+    path, conn, root = store
+    att = _garbled(conn, root, _email(conn, 48213, aliases=[ARCHIVED]), "48213")
+    mailbox.holds(ARCHIVED, ("scan.png", SCAN))
+
+    stats = _run(path, root)
+
+    assert mailbox.asked() == [ARCHIVED]
+    assert (stats["no_mailbox_id"], stats["fetched"]) == (0, 1)
+    assert (root / "48213" / "scan.png").read_bytes() == SCAN
+    assert _attachment(conn, att)["file_removed_at"] is None
+
+
 def test_reauthentication_stops_the_run_and_counts_no_attempt(store, mailbox):
     path, conn, root = store
     first = _garbled(conn, root, _email(conn, MESSAGE, "2026-01-01T00:00:00Z"), MESSAGE)

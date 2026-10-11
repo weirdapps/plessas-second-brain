@@ -163,6 +163,35 @@ IncludeAutomation = Annotated[
         "automation), left out by default."
     ),
 ]
+# Conversation memory is the owner's sessions (src/export/conversation_export.py).
+IncludeAgents = Annotated[
+    bool,
+    Field(
+        description="Include agent sessions (a teammate's or subagent's, or one with no turn "
+        "the owner typed), left out by default; each session then says its kind."
+    ),
+]
+
+# The tags Claude Code writes into a session: its reminders, task notifications,
+# teammates' and other sessions' messages, command echoes. Stored conversations
+# hold them verbatim, and served back as they are they could read as a live
+# harness event in the session reading them, so their '<' goes out escaped.
+_HARNESS_TAG = re.compile(
+    r"<(?=\s*/?\s*(?:system-reminder|teammate-message|task-notification|"
+    r"cross-session-message|command-[a-z-]+|local-command-[a-z-]+)\b)",
+    re.IGNORECASE,
+)
+
+
+def _inert(value: Any) -> Any:
+    """`value` with the '<' of every harness tag in its text escaped, at any depth."""
+    if isinstance(value, str):
+        return _HARNESS_TAG.sub("&lt;", value)
+    if isinstance(value, list | tuple):
+        return type(value)(_inert(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _inert(v) for k, v in value.items()}
+    return value
 
 
 def _get_conn():
@@ -522,6 +551,7 @@ def recall(
     out["query"] = found["query"]
     for kind in _RECALL_KINDS:
         out[kind] = compact_rows(found[kind])
+    out["conversations"] = _inert(out["conversations"])
     for dossier in ("person_context", "topic_context"):
         if dossier in found:
             out[dossier] = found[dossier]
@@ -1091,6 +1121,7 @@ def search_conversations(
     limit: Annotated[
         int, Field(ge=1, le=MAX_LIMIT, description="Maximum rows, 1 to 200 (default 20).")
     ] = 20,
+    include_agents: IncludeAgents = False,
 ) -> RowsResult:
     """What did we work out before: search this user's past Claude Code conversations by keyword or by meaning.
 
@@ -1103,7 +1134,7 @@ def search_conversations(
     conn = _get_conn()
     try:
         if search_type == "semantic":
-            from src.store.conversation_query import conversation_ids_in_workspace
+            from src.store.conversation_query import conversation_ids_in_workspace, with_kinds
             from src.store.embeddings import (
                 CONVERSATION_ID_OFFSET,
                 SemanticUnavailable,
@@ -1113,34 +1144,41 @@ def search_conversations(
             # The workspace filter goes in before the ranking, as the keyword
             # search's goes in the SQL. Applied to the global top 2 x limit, it
             # returned nothing whenever the best matches sat in other projects.
+            # Agent sessions leave the ranking the same way.
             allowed = None
-            if workspace:
+            if workspace or not include_agents:
                 allowed = {
                     CONVERSATION_ID_OFFSET - cid
-                    for cid in conversation_ids_in_workspace(conn, workspace)
-                }
-                if not allowed:
-                    return cast(
-                        RowsResult,
-                        _rows(
-                            [], f"No conversation was held in a workspace matching {workspace!r}."
-                        ),
+                    for cid in conversation_ids_in_workspace(
+                        conn, workspace or "", include_agents=include_agents
                     )
+                }
+                if workspace and not allowed:
+                    reason = f"No conversation was held in a workspace matching {workspace!r}."
+                    if not include_agents:
+                        reason += " Agent sessions are left out unless include_agents."
+                    return cast(RowsResult, _rows([], reason))
             try:
                 rows = query_semantic(
                     conn, query, limit=limit, kinds={"conversation"}, allowed_ids=allowed
                 )
             except SemanticUnavailable as e:
                 raise ToolError(str(e)) from e
+            if include_agents:
+                with_kinds(conn, rows, "id")
         else:
             from src.store.conversation_query import search_conversations_keyword
 
-            rows = search_conversations_keyword(conn, query, workspace=workspace, limit=limit)
+            rows = search_conversations_keyword(
+                conn, query, workspace=workspace, limit=limit, include_agents=include_agents
+            )
     finally:
         conn.close()
     return cast(
         RowsResult,
-        _rows(rows, "No past conversation matched; try other words, or no workspace filter."),
+        _rows(
+            _inert(rows), "No past conversation matched; try other words, or no workspace filter."
+        ),
     )
 
 
@@ -1149,18 +1187,21 @@ def conversation_context(
     session_id: Annotated[
         str, Field(description="The session's id (a UUID), as search_conversations gives it.")
     ],
+    include_agents: IncludeAgents = False,
 ) -> ConversationContext:
     """Read one past Claude Code conversation: its turns, decisions, action items, key facts and topics."""
     from src.store.conversation_query import get_conversation_context
 
     conn = _get_conn()
     try:
-        out = get_conversation_context(conn, session_id)
+        out = get_conversation_context(conn, session_id, include_agents=include_agents)
     finally:
         conn.close()
     if "error" in out:
+        if out.get("kind") == "agent":
+            raise ToolError(out["error"])
         raise ToolError(f"{out['error']}; take session_id from a search_conversations row")
-    return cast(ConversationContext, out)
+    return cast(ConversationContext, _inert(out))
 
 
 @_tool()
@@ -1587,7 +1628,8 @@ def sql_query(
     out = run_query(sql, limit=_cap(limit))
     if "error" in out:
         raise ToolError(out["error"])
-    return cast(SqlResult, out)
+    # conversation_turns.content is read here in full, harness tags and all.
+    return cast(SqlResult, _inert(out))
 
 
 @_tool()

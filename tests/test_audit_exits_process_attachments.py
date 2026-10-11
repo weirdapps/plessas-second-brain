@@ -36,7 +36,7 @@ def phases(tmp_path, monkeypatch):
         calls.append(1)
         return result[1]
 
-    def _phase2(db_path, limit, file_type, workers, deadline_s):
+    def _phase2(db_path, limit, file_type, workers, deadline_s, token_budget=None):
         calls.append(2)
         return result[2]
 

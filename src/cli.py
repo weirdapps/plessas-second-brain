@@ -69,6 +69,10 @@ SYNC_WRAPPER_FETCH_OBSERVED_S = 140.0
 PHASE1_SYNC_DEADLINE_S = 90.0
 PHASE2_SYNC_DEADLINE_S = 90.0
 
+# Set to 1, Step 6 reads images and zip archives in the hourly slice, as it did before
+# 2026-10-11. Unset, it leaves them to the nightly pass while one runs: see Step 6.
+SYNC_HEAVY_ATTACHMENTS_ENV = "BRAIN_SYNC_HEAVY_ATTACHMENTS"
+
 # Step 8's default (IMAGE_CLASSIFY_BUDGET_S, 480 s) was sized for sb-daily-sync,
 # whose timeout is 30 minutes. Inherited here it claims 80% of the unit on its
 # own, which is why runs still died after Step 6 was bounded.
@@ -361,7 +365,12 @@ def _print_estimate(est: dict) -> None:
 
 def cmd_process_attachments(args):
     """Extract text and structured data from attachments."""
-    from src.extract.attachment_pipeline import estimate_phase2, run_phase1, run_phase2
+    from src.extract.attachment_pipeline import (
+        estimate_phase2,
+        record_text_pass,
+        run_phase1,
+        run_phase2,
+    )
     from src.store.schema import get_connection, run_migrations
 
     db_path = str(args.db)
@@ -418,6 +427,14 @@ def cmd_process_attachments(args):
         if stats.get("deferred"):
             print(f"  Deferred (out of time): {stats['deferred']}")
         phase_failed |= stats["failed"] > 0 and stats["extracted"] == 0
+        if file_type is None:
+            # A pass over every kind: while one runs, the hourly sync leaves it the images and
+            # archives (attachment_pipeline.TEXT_PASS_KEY).
+            conn = get_connection(db_path)
+            try:
+                record_text_pass(conn)
+            finally:
+                conn.close()
 
     if phase is None or phase == 2:
         workers = getattr(args, "workers", 1) or 1
@@ -2063,7 +2080,6 @@ def cmd_sync(args):
     print(f"Loaded {count} new emails")
 
     # Step 3b: record the attachments outlook-cli downloaded with the mail.
-    new_attachment_ids = []
     if count > 0:
         # outlook-cli fetched the BINARIES hourly; it never recorded them. Every
         # downstream stage reads the attachments table, not the disk, so without
@@ -2088,7 +2104,6 @@ def cmd_sync(args):
             )
         finally:
             conn_reg.close()
-        new_attachment_ids = reg["ids"]
         print(
             f"Attachments: {reg['registered']} registered from {reg['scanned']} message dirs"
             f" ({reg['deferred']} awaiting their email)"
@@ -2115,45 +2130,68 @@ def cmd_sync(args):
         print("\nNo new emails — skipping dedup and embeddings")
 
     # Step 6: Process new attachment content
-    from src.extract.attachment_pipeline import LONG_TEXT_CHARS, run_phase1, run_phase2
+    from src.extract.attachment_pipeline import (
+        LONG_TEXT_CHARS,
+        run_phase1,
+        run_phase2,
+        text_pass_is_recent,
+    )
 
     # Ensure attachment_content table exists
     from src.store.schema import run_migrations as run_mig
 
     conn_mig = get_conn(db_path)
     run_mig(conn_mig)
+    # Images and zip archives wait for the nightly pass while one runs: one of them can take
+    # minutes (OCR_MAX_SECONDS, ZIP_MAX_SECONDS) against this 90 s slice, and they took the
+    # slice from the day's documents. Where no pass reads them, as on a host that runs `sync`
+    # alone, they are read here. BRAIN_SYNC_HEAVY_ATTACHMENTS=1 reads them here regardless.
+    read_heavy = os.environ.get(SYNC_HEAVY_ATTACHMENTS_ENV, "").strip() == "1"
+    defer_heavy = not read_heavy and text_pass_is_recent(conn_mig)
     conn_mig.close()
 
     print("\nStep 6: Processing new attachment content...")
-    # Scope to newly registered attachments only — avoids competing with background backfill
-    scope_ids = new_attachment_ids or None
-    # Phase 1 runs UNSCOPED so the deadline can converge. Scoped to this run's
-    # own registrations, anything deferred for time would never be offered
-    # again — the next run scopes to its own new ids — and would sit without a
-    # content row forever. Unscoped, `ac.id IS NULL` re-selects it, and the
-    # `ORDER BY a.id` puts the leftovers first.
-    p1_stats = run_phase1(db_path, deadline_s=PHASE1_SYNC_DEADLINE_S)
-    if p1_stats["processed"] > 0:
-        deferred = p1_stats.get("deferred", 0)
+    # Phase 1 runs UNSCOPED so the deadline can converge: anything deferred for time has no
+    # content row, and `ac.id IS NULL` offers it again next run. Newest mail first: in
+    # registration order the day's documents waited behind the backlog for the 02:00 pass, and
+    # 15-63% of a day's attachments got their text more than six hours after download
+    # (2026-10-05 to 10-09). The nightly pass keeps registration order.
+    p1_stats = run_phase1(
+        db_path,
+        deadline_s=PHASE1_SYNC_DEADLINE_S,
+        newest_first=True,
+        defer_heavy=defer_heavy,
+    )
+    deferred = p1_stats.get("deferred", 0)
+    heavy = p1_stats.get("heavy", 0)
+    if p1_stats.get("processed", 0) or deferred or heavy:
         encrypted = p1_stats.get("encrypted", 0)
         print(
-            f"  Phase 1: {p1_stats['extracted']} text extracted, "
-            f"{p1_stats['failed']} failed, {p1_stats['skipped']} skipped"
+            f"  Phase 1: {p1_stats.get('extracted', 0)} text extracted, "
+            f"{p1_stats.get('failed', 0)} failed, {p1_stats.get('skipped', 0)} skipped"
             + (f", {encrypted} encrypted" if encrypted else "")
             + (f", {deferred} deferred (out of time)" if deferred else "")
+            + (f", {heavy} images and archives left for the nightly pass" if heavy else "")
         )
-        p2_stats = run_phase2(
-            db_path,
-            attachment_ids=scope_ids,
-            deadline_s=PHASE2_SYNC_DEADLINE_S,
-            max_text_chars=LONG_TEXT_CHARS,
-        )
-        p2_deferred = p2_stats.get("deferred", 0)
+    # What Phase 1 has just read first, then any text an earlier run left awaiting its summary,
+    # newest first, in Phase 2's own slice. It was scoped to this run's registrations, which
+    # Phase 1 had seldom reached, and ran only when Phase 1 had read something: summaries came
+    # 4-19 hours late on average (audit 2026-10-11).
+    p2_stats = run_phase2(
+        db_path,
+        first_ids=p1_stats.get("ids"),
+        newest_first=True,
+        deadline_s=PHASE2_SYNC_DEADLINE_S,
+        max_text_chars=LONG_TEXT_CHARS,
+    )
+    p2_deferred = p2_stats.get("deferred", 0)
+    if p2_stats.get("processed", 0) or p2_deferred:
         print(
-            f"  Phase 2: {p2_stats['extracted']} LLM extracted, {p2_stats['failed']} failed"
+            f"  Phase 2: {p2_stats.get('extracted', 0)} LLM extracted,"
+            f" {p2_stats.get('failed', 0)} failed"
             + (f", {p2_deferred} deferred (out of time)" if p2_deferred else "")
         )
-    else:
+    elif not (p1_stats.get("processed", 0) or deferred or heavy):
         print("  No new attachments to process")
 
     # Step 7: Sync conversations from Claude Code sessions
@@ -2430,6 +2468,47 @@ def cmd_teams_backfill_replies(args):
         )
     finally:
         conn.close()
+    return 0
+
+
+def cmd_teams_strip_html(args):
+    """Convert Teams message text still stored as HTML; no Teams or model call.
+
+    Ingest converted a message only when its payload declared "html", which the chat
+    service never sends, so until #187 the text of every HTML message was its HTML.
+    One-off, on the producer: it converts those rows from the HTML each keeps, by the
+    rule ingest now uses, and the full-text index follows (see
+    teams_export.strip_stored_html). A second run changes nothing. --dry-run opens the
+    database read-only and counts; --limit caps the rows changed. It prints counts,
+    never message text, and sends nothing back to extraction.
+    """
+    import sqlite3
+
+    from src.export.teams_export import strip_stored_html
+    from src.store.schema import get_connection
+
+    if not Path(args.db).exists():
+        print(f"Error: database not found: {args.db}", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+    else:
+        conn = get_connection(str(args.db))
+    try:
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'teams_messages'"
+        ).fetchone():
+            print("No Teams tables in this store: nothing to convert.")
+            return 0
+        c = strip_stored_html(conn, limit=args.limit, dry_run=args.dry_run)
+    finally:
+        conn.close()
+    print(f"teams-strip-html: {'DRY RUN (nothing written)' if args.dry_run else 'APPLIED'}")
+    print(f"  {'scanned':<12}: {c['scanned']:,} (text holding '<' or '&')")
+    print(f"  {'would change' if args.dry_run else 'changed':<12}: {c['changed']:,}")
+    print(f"  {'unchanged':<12}: {c['unchanged']:,}")
+    if c["stopped_at_limit"]:
+        print(f"  stopped at --limit {args.limit:,}: run it again for the rest")
     return 0
 
 
@@ -4001,6 +4080,19 @@ def main():
         help="Store the channel replies stored posts hold (one-off, producer only, no Teams call)",
     )
     parser_teams_backfill.set_defaults(func=cmd_teams_backfill_replies)
+
+    parser_teams_strip = subparsers.add_parser(
+        "teams-strip-html",
+        help="Convert the stored text of Teams messages still held as HTML "
+        "(one-off, producer only, no Teams or model call)",
+    )
+    parser_teams_strip.add_argument(
+        "--dry-run", action="store_true", help="Count only, read-only: nothing written"
+    )
+    parser_teams_strip.add_argument(
+        "--limit", type=int, default=0, help="Change at most this many rows (0 = all)"
+    )
+    parser_teams_strip.set_defaults(func=cmd_teams_strip_html)
 
     parser_teams_search = subparsers.add_parser("teams-search", help="Search Teams content")
     parser_teams_search.add_argument("query", help="Search query")

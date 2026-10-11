@@ -182,6 +182,10 @@ class Stats(TypedDict, total=False):
     stale_warning: str
     total_attachments: int
     attachments_extracted: int
+    attachments_awaiting_text: int
+    attachments_awaiting_text_oldest_hours: float | None
+    attachments_awaiting_summary: int
+    attachments_awaiting_summary_oldest_hours: float | None
     total_key_facts: int
     total_conversations: int
     total_conversation_turns: int

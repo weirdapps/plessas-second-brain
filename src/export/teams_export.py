@@ -3,15 +3,17 @@
 Phase 1 supports channel scope only. Group / 1-on-1 chats land in Phase 2/3.
 """
 
-import html as html_mod
 import json
 import re
 import sqlite3
 import time
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from html.entities import html5
 from typing import Literal
 
 from src.export.teams_cli import TeamsCliAuthRequired, run_teams_cli
+from src.extract.html_text import html_to_text
 from src.redact import redact_payload, redact_secrets
 
 Scope = Literal["channel", "all"]
@@ -93,15 +95,33 @@ def _discover_channel_chats(conn: sqlite3.Connection) -> dict:
     }
 
 
-def _strip_html(html_str: str | None) -> str:
-    """Cheap HTML→text. Good enough for FTS; raw HTML is preserved in content_html."""
-    if not html_str:
-        return ""
-    text = re.sub(r"<br\s*/?>", "\n", html_str, flags=re.IGNORECASE)
-    # Only strip when '<' is followed by a tag-like char — otherwise it's a literal '<'.
-    text = re.sub(r"<(?=[a-zA-Z/!?])[^>]+>", "", text)
-    text = html_mod.unescape(text)
-    return text.strip()
+# What says a message's content is HTML: an end tag, a void element (it has no
+# end tag to find) or a character reference that HTML decodes. Every message the
+# services send as HTML holds one, and plain text holds none unless it quotes
+# markup, so "a < b", "x<y and y>z", "R&D" and "AT&T;" stay as they are. The
+# shape decides, not the declared type: chats declare "text", "Text" or nothing
+# and channel posts "Text" for an HTML body, and the code that waited for "html"
+# stored the markup of every message as its text (#187). html_text's
+# looks_like_html cannot decide it: it reads how a body opens, which suits a mail,
+# and a message can open with text and then a mention.
+_END_TAG = re.compile(r"</[A-Za-z][A-Za-z0-9:_-]*\s*>")
+_VOID_TAG = re.compile(r"<(?:br|hr|img)\b[^<>]*>", re.IGNORECASE)
+_CHAR_REF = re.compile(r"&(#[0-9]+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);")
+
+
+def _holds_markup(content: str) -> bool:
+    if _END_TAG.search(content) or _VOID_TAG.search(content):
+        return True
+    return any(ref[0] == "#" or f"{ref};" in html5 for ref in _CHAR_REF.findall(content))
+
+
+def _message_text(content: str) -> str:
+    """The text a reader sees of a message's content: converted when it holds
+    markup, as it is otherwise. The conversion is a mail body's (html_text): no
+    tags, entities decoded, a block or a <br> on a line of its own, and the
+    visible text of a mention, a link (its address after it) and an emoji kept.
+    The HTML itself is kept beside it, in content_html."""
+    return html_to_text(content) if _holds_markup(content) else content
 
 
 # Written by the service, not said by anyone: membership and topic changes, call
@@ -602,14 +622,14 @@ def _store_message(
     envelope, or the message for anything else.
     """
     msg_type = msg.get("messageType") or msg.get("messagetype")
+    system = _is_system_message(msg_type)
     deleted = _is_deleted(msg)
     # The service empties a deleted message; blank it whatever this copy carries.
     content_html = "" if deleted else (msg.get("content") or "")
-    content_text = (
-        _strip_html(content_html)
-        if (msg.get("contentType") or msg.get("contenttype")) == "html"
-        else content_html
-    )
+    # A system message is a record the service writes (a call, a member joining)
+    # and keeps its XML: as text its fields would run together, and system
+    # messages stay out of threads, extraction and vectors.
+    content_text = content_html if system else _message_text(content_html)
     sender_display = msg.get("imDisplayName") or msg.get("imdisplayname")
     sender_mri = _extract_mri(msg.get("from"))
     composite_id = f"{chat_id}::{upstream_id}"
@@ -638,7 +658,7 @@ def _store_message(
                 content_text,
                 content_html,
                 parent_id,
-                1 if _is_system_message(msg_type) else 0,
+                1 if system else 0,
                 raw_json,
             ),
         )
@@ -774,4 +794,81 @@ def backfill_channel_replies(conn: sqlite3.Connection) -> dict:
         if n % 100 == 0:
             conn.commit()
     conn.commit()
+    return counts
+
+
+# strip_stored_html reads and converts this many rows at a time, then writes the
+# ones that change in one short transaction: the timers' writers wait on it.
+STRIP_HTML_BATCH = 500
+
+
+def _rows_by_id(conn: sqlite3.Connection, ids: list[int]) -> Iterator[tuple[int, str, str]]:
+    """(id, content_text, content_html) of each row in `ids`, a batch at a time."""
+    for start in range(0, len(ids), STRIP_HTML_BATCH):
+        batch = ids[start : start + STRIP_HTML_BATCH]
+        marks = ", ".join("?" * len(batch))
+        yield from conn.execute(
+            "SELECT id, content_text, content_html FROM teams_messages"
+            f" WHERE id IN ({marks}) ORDER BY id",
+            batch,
+        ).fetchall()
+
+
+def strip_stored_html(conn: sqlite3.Connection, *, limit: int = 0, dry_run: bool = False) -> dict:
+    """Convert the text of stored messages that still hold markup; no Teams or model call.
+
+    Until the content's shape decided (#187), a message's text was converted only
+    when its payload declared "html", which the chat service never does, so the
+    text of every HTML message was the HTML. This converts each such row from the
+    HTML it keeps (content_html), by the rule ingest now uses, credentials redacted
+    as there, and writes only the rows whose text changes; the full-text index
+    follows through its update trigger. It reads the kept HTML, never the text it
+    wrote, so a second run changes nothing, even where the visible text holds
+    markup someone typed. System messages keep their XML, as at ingest.
+
+    Nothing goes back to extraction: thread summaries, titles and vectors stay as
+    they were extracted. `limit` caps the rows changed (0 = all); a row left as it
+    is does not count against it, so each run gets further than the one before. A
+    dry run counts and writes nothing.
+    """
+    counts = {"scanned": 0, "changed": 0, "unchanged": 0, "stopped_at_limit": False}
+    # Ids first, so the scan never reads what it has rewritten. Only a text that
+    # holds a '<' or a '&' can hold markup; _holds_markup decides.
+    ids = [
+        row[0]
+        for row in conn.execute(
+            "SELECT id FROM teams_messages WHERE is_system = 0 AND content_html IS NOT NULL"
+            " AND (instr(content_text, '<') > 0 OR instr(content_text, '&') > 0) ORDER BY id"
+        )
+    ]
+    pending: list[tuple[str, int, str, str]] = []
+
+    def write() -> None:
+        if dry_run:
+            counts["changed"] += len(pending)
+        else:
+            for new_text, row_id, text, html in pending:
+                # Unless a pull rewrote the row since it was read: its copy wins.
+                written = conn.execute(
+                    "UPDATE teams_messages SET content_text = ?"
+                    " WHERE id = ? AND content_text = ? AND content_html = ?",
+                    (new_text, row_id, text, html),
+                ).rowcount
+                counts["changed" if written else "unchanged"] += 1
+            conn.commit()
+        pending.clear()
+
+    for row_id, text, html in _rows_by_id(conn, ids):
+        if limit > 0 and counts["changed"] + len(pending) >= limit:
+            counts["stopped_at_limit"] = True
+            break
+        counts["scanned"] += 1
+        new_text = redact_secrets(_message_text(html)) if _holds_markup(text) else text
+        if new_text == text:
+            counts["unchanged"] += 1
+            continue
+        pending.append((new_text, row_id, text, html))
+        if len(pending) == STRIP_HTML_BATCH:
+            write()
+    write()
     return counts

@@ -150,6 +150,8 @@ Every dossier dates and orders its rows the same way (`src/store/ordering.py`): 
 
 A channel thread holds the post and its replies, each reply a message of its own, and a post is dated by when it was written, not by its newest reply. A message edited or deleted after it was first stored is brought up to date on a later pull: the edit replaces the text, a deletion blanks it, and either sends the thread back to extraction. Before this, replies stayed inside the post's stored payload, out of search and extraction, and the first draft of an edited message and the text of a deleted one were kept. `python -m src.cli teams-backfill-replies` stores the replies already held in stored posts, once (see `docs/DEPLOY.md`).
 
+A message's text is what a reader sees of it: no tags, entities decoded, a block or a line break on a line of its own, and the visible text of a mention, a link (its address after it, as in a mail body) and an emoji kept. The HTML is kept beside it. The content's shape decides, not the type the payload declares: the services declare an HTML body as text, and until this change the text of every HTML message was its markup, so `search_teams` matched words such as `itemtype` and `nbsp` and the model read the tags. System messages (calls, membership changes) keep the service's XML. `python -m src.cli teams-strip-html` converts the text stored before, once (see `docs/DEPLOY.md`).
+
 ### WhatsApp
 
 - `search_whatsapp(query, chat, days, limit)`. Session summaries and raw message text, newest first, one row per session. `chat` narrows to chats whose name contains it (or one exact JID); `days` to sessions active in the window.
@@ -178,6 +180,8 @@ Conversation memory is the owner's own sessions. Each turn's `speaker` says who 
   It also returns `data_as_of`, `age_hours` and `stale`. `data_as_of` is the older of two stamps, both returned as stored: `last_sync_date`, which every `sync` writes, and `mail_export_ok_at`, the Inbox export's last success, which `sync` copies in. `stale_warning` names the one that is behind. On a read replica that is the only way to tell a live corpus from one whose feed stopped, because both answer queries identically.
 
   `embed_backend` names the service that embeds this server's search queries (`gemini` or `vertex`, see `BRAIN_EMBED_BACKEND`), and `last_embed_error` the last query embedding that failed in this server process, as `{"type": <exception type>, "at": <UTC time>}`, or `null`. It carries no message text, which can quote a query or a credential error.
+
+  `attachments_awaiting_text` counts the attachments whose text has not been read yet, which `search_attachments` cannot find at all, and `attachments_awaiting_summary` the texts still waiting for their summary. `attachments_awaiting_text_oldest_hours` and `attachments_awaiting_summary_oldest_hours` say how long the oldest of each has waited, in hours, or `null` when none waits. They are the health check's Attachment lag queues; see [Attachments in the hourly sync](#attachments-in-the-hourly-sync).
 
 ### SQL (read-only)
 
@@ -340,6 +344,16 @@ Preferred credential path. Uses Application Default Credentials, no API key requ
 
 No credentials are printed by the code. All secrets are read from environment or (for Google) from ADC.
 
+### Attachments in the hourly sync
+
+`sync` reads attachment text (Phase 1) and asks the model for summaries (Phase 2) in a 90-second slice each; what does not fit waits for the next run or for the nightly `process-attachments` pass. Since 2026-10-11:
+
+- **Newest mail first.** Phase 1 takes attachments by their email's received time, newest first, compared as instants whatever the stored format. Taken in registration order, the day's documents waited behind the backlog until the nightly pass, which keeps that order.
+- **Phase 2 follows Phase 1.** It starts with the documents Phase 1 has just read, then any other text awaiting a summary, newest first, within its own slice, and it runs whether or not Phase 1 read anything. A document mailed in the morning is normally searchable by its text and its summary after the next hourly run; on a busy morning the summaries of the rest follow over the next runs. Texts over 50,000 characters still wait for the nightly pass.
+- **Images and zip archives wait for the nightly pass, while one runs.** One of them can take two minutes (OCR, or every member of an archive) against the 90-second slice. The hourly slice leaves them only while a `process-attachments` run over every kind (no `--type`) has stamped the `sync_metadata` row `attachment_text_pass_at` in the last 48 hours, so a host that runs `sync` alone, as the cron example in [`docs/DEPLOY.md`](docs/DEPLOY.md) does, keeps reading them hourly. An image whose bytes another attachment already holds is copied at once either way. `BRAIN_SYNC_HEAVY_ATTACHMENTS=1` reads them hourly regardless, as before.
+
+`stats` and the health check's Attachment lag row say how many attachments wait and for how long.
+
 ### Attachment summaries and spend
 
 Phase 2 of the attachment pipeline (`process-attachments --phase 2`, the nightly pass, `reextract`) asks the model for one summary per document. Text up to 50,000 characters goes in one call, as before. A longer text is summarised from part of it, and the full extracted text stays stored for keyword search:
@@ -413,6 +427,7 @@ python -m src.cli calendar-sync --since 2026-01-01
 python -m src.cli news-sync --relevance 60
 python -m src.cli teams-sync --workers 4
 python -m src.cli teams-backfill-replies    # once, on the producer: store the channel replies stored posts hold; no Teams call
+python -m src.cli teams-strip-html          # once, on the producer: convert message text stored as HTML (--dry-run counts); no Teams or model call
 python -m src.cli whatsapp-sync             # the snapshot at BRAIN_WHATSAPP_SNAPSHOT (see WhatsApp below)
 python -m src.cli process-attachments --phase 2 --workers 2
 python -m src.cli process-attachments --phase 2 --estimate             # calls, tokens and cost of the pending summaries; no model call

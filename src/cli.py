@@ -2880,10 +2880,15 @@ def cmd_calendar_sync(args):
         print("Error: Database not found.")
         sys.exit(1)
 
-    # A dry run reads: it neither migrates the store nor writes to it.
+    # A dry run reads: it neither migrates the store nor writes to it, not even the
+    # journal mode a writer's connection sets on open.
     dry_run = getattr(args, "dry_run", False)
-    conn = get_connection(db_path)
-    if not dry_run:
+    if dry_run:
+        from src.store.sql_readonly import connect_read_only
+
+        conn = connect_read_only(db_path)
+    else:
+        conn = get_connection(db_path)
         run_migrations(conn)
 
     proxy_emails = None

@@ -299,6 +299,19 @@ def test_a_plain_dry_run_fetches_and_writes_nothing(monkeypatch, tmp_path, calen
     assert _held(path) == {}
 
 
+def test_a_dry_run_opens_the_store_read_only(monkeypatch, store, calendar):
+    """Not even the journal mode a writer's connection sets on open is written."""
+    conn = sqlite3.connect(store)
+    conn.execute("PRAGMA journal_mode = DELETE")
+    conn.close()
+
+    assert _backfill(monkeypatch, store, Outlook(calendar), dry_run=True) == 0
+
+    conn = sqlite3.connect(store)
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    conn.close()
+
+
 def test_a_replica_refuses_a_backfill_even_a_dry_run(monkeypatch, tmp_path, capsys):
     from src import cli, config
 

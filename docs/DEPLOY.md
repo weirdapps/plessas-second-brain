@@ -330,6 +330,18 @@ the old listing kept the ten earliest of each month, so run
 `python -m src.cli calendar-sync --backfill` once to fill the months it capped,
 best after outlook-access pages list-calendar itself.
 
+**Channel replies.** teams-sync stores each channel post's replies as messages of the
+post's thread; until then they stayed inside the post's stored payload, out of search and
+extraction. It also brings up to date a message edited or deleted after it was stored. To
+store the replies already held, run `python -m src.cli teams-backfill-replies` once on the
+producer after the pull. It calls no Teams API: it reads the stored payloads and stores the
+replies through the pull's own path, credential redaction included. It also dates each post by
+when it was written rather than by its newest reply, and sends the threads that gained replies
+back to extraction. The next teams-sync runs extract them, newest first, one model call each,
+within their deadline. A second run stores nothing. On a copy of the replica's Teams tables
+on 2026-10-11: 3,135 replies from 1,961 posts, 897 posts re-dated, 893 threads queued, in
+two seconds. No schema change, and it can run beside the timers.
+
 **Upgrading to schema v32.** From v32 `attachment_content` has three small indexes that
 answer the file sweep's classification and two health-check queries without reading the
 stored text. `extracted_text` (3 GB on the producer) sits ahead of the columns those queries

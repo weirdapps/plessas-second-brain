@@ -2397,6 +2397,46 @@ def cmd_teams_sync(args):
     return 0
 
 
+def cmd_teams_backfill_replies(args):
+    """Store the replies stored channel posts hold in their payloads; no Teams call.
+
+    Channel replies came with every post and were dropped until #146, so they sit
+    only in the posts' raw_json. One-off, on the producer: it stores them through
+    the pull's own path, redaction included, and the threads that gain replies go
+    back to extraction, which the next teams-sync runs under its deadline.
+    """
+    from src.export.teams_export import backfill_channel_replies
+    from src.extract.teams_threads import bound_threads
+    from src.store.schema import get_connection
+
+    if not Path(args.db).exists():
+        print(f"Error: database not found: {args.db}", file=sys.stderr)
+        return 1
+    conn = get_connection(str(args.db))
+    try:
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'teams_messages'"
+        ).fetchone():
+            print("No Teams tables in this store: nothing to backfill.")
+            return 0
+        c = backfill_channel_replies(conn)
+        print(f"Channel posts read: {c['posts_read']:,} ({c['unreadable']:,} unreadable)")
+        print(
+            f"Replies found: {c['replies_found']:,}; {c['replies_stored']:,} stored, "
+            f"{c['replies_updated']:,} updated to a later version, "
+            f"{c['replies_found'] - c['replies_stored'] - c['replies_updated']:,} already stored"
+        )
+        print(f"Posts dated by their own compose time: {c['posts_redated']:,}")
+        b = bound_threads(conn)
+        print(
+            f"Threads: {b['threads_created']:,} new, {b['threads_updated']:,} queued for "
+            "extraction (the next teams-sync extracts them)"
+        )
+    finally:
+        conn.close()
+    return 0
+
+
 def cmd_whatsapp_sync(args):
     """Ingest the pushed WhatsApp snapshot, then bound, extract and embed sessions.
 
@@ -3889,6 +3929,12 @@ def main():
     )
     parser_teams_sync.add_argument("--limit", type=int, help="Max threads to extract this run")
     parser_teams_sync.set_defaults(func=cmd_teams_sync)
+
+    parser_teams_backfill = subparsers.add_parser(
+        "teams-backfill-replies",
+        help="Store the channel replies stored posts hold (one-off, producer only, no Teams call)",
+    )
+    parser_teams_backfill.set_defaults(func=cmd_teams_backfill_replies)
 
     parser_teams_search = subparsers.add_parser("teams-search", help="Search Teams content")
     parser_teams_search.add_argument("query", help="Search query")

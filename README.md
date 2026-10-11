@@ -125,6 +125,8 @@ The MCP server exposes 27 tools (all defined in `src/mcp_server.py`). Register t
 - `teams_thread_context(thread_id)`. Full thread with decisions, actions, facts.
 - `teams_chat_summary(chat_id, days)`. Recent activity per chat or channel.
 
+A channel thread holds the post and its replies, each reply a message of its own, and a post is dated by when it was written, not by its newest reply. A message edited or deleted after it was first stored is brought up to date on a later pull: the edit replaces the text, a deletion blanks it, and either sends the thread back to extraction. Before this, replies stayed inside the post's stored payload, out of search and extraction, and the first draft of an edited message and the text of a deleted one were kept. `python -m src.cli teams-backfill-replies` stores the replies already held in stored posts, once (see `docs/DEPLOY.md`).
+
 ### WhatsApp
 
 - `search_whatsapp(query, chat, days, limit)`. Session summaries and raw message text, newest first, one row per session. `chat` narrows to chats whose name contains it (or one exact JID); `days` to sessions active in the window.
@@ -371,6 +373,7 @@ python -m src.cli sync --engine claude --workers 4
 python -m src.cli calendar-sync --since 2026-01-01
 python -m src.cli news-sync --relevance 60
 python -m src.cli teams-sync --workers 4
+python -m src.cli teams-backfill-replies    # once, on the producer: store the channel replies stored posts hold; no Teams call
 python -m src.cli whatsapp-sync             # the snapshot at BRAIN_WHATSAPP_SNAPSHOT (see WhatsApp below)
 python -m src.cli process-attachments --phase 2 --workers 2
 python -m src.cli process-attachments --phase 2 --estimate             # calls, tokens and cost of the pending summaries; no model call

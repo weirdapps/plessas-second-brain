@@ -27,8 +27,8 @@ from src.extract.vertex_auth import touch_sentinel
 from src.llm_policy import Outcome
 
 # A "substantive" message is a non-system message above MIN_SUBSTANTIVE_LENGTH chars.
-# Channel posts are commonly single-message announcements (chatsvcagg /posts returns
-# top-level only — replies aren't fetched in Phase 1), so the rule is "at least one
+# Channel posts are commonly single-message announcements (a post nobody replied to;
+# replies are stored as rows of the post's thread), so the rule is "at least one
 # substantive message AND total content above the floor". A 200-char announcement
 # passes; an "ok"+"lgtm" exchange (40 chars total) doesn't.
 MIN_SUBSTANTIVE_MESSAGES = 1

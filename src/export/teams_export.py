@@ -475,10 +475,11 @@ def pull_messages(
 
 
 def _persist_messages(conn: sqlite3.Connection, chat_id: int, payload: dict) -> int:
-    """Insert channel posts (or chat messages — Phase 2+) from one teams-cli payload.
+    """Store the channel posts or chat messages of one teams-cli payload.
 
-    Returns count of newly-inserted rows. UNIQUE on teams_message_id makes it
-    idempotent — duplicates silently dropped.
+    Returns the count of newly inserted rows. UNIQUE on teams_message_id makes it
+    idempotent; a message already stored is updated only when this copy is a
+    later version of it (an edit or a delete, see _store_message).
     """
     inserted = 0
     items = payload.get("posts") or payload.get("messages") or []
@@ -487,16 +488,12 @@ def _persist_messages(conn: sqlite3.Connection, chat_id: int, payload: dict) -> 
         # Channel posts wrap the message in an outer envelope; chat messages are flat.
         msg = item.get("message", item)
         upstream_id = item.get("id") or msg.get("id")
-        composed_at = msg.get("composetime") or item.get("latestMessageTime") or ""
-        msg_type = msg.get("messageType") or msg.get("messagetype")
-        content_html = msg.get("content") or ""
-        content_text = (
-            _strip_html(content_html)
-            if (msg.get("contentType") or msg.get("contenttype")) == "html"
-            else content_html
+        # A post's envelope spells it composeTime; chat messages composetime.
+        # latestMessageTime is the newest reply's time, so a post dated by it
+        # sorted after its own answers once they were stored.
+        composed_at = (
+            msg.get("composetime") or msg.get("composeTime") or item.get("latestMessageTime") or ""
         )
-        sender_display = msg.get("imDisplayName") or msg.get("imdisplayname")
-        sender_mri = _extract_mri(msg.get("from"))
 
         # Channel: replyChainId in properties pins the parent post.
         parent_id = None
@@ -504,38 +501,20 @@ def _persist_messages(conn: sqlite3.Connection, chat_id: int, payload: dict) -> 
         if isinstance(props, dict):
             parent_id = props.get("replyChainId")
 
-        composite_id = f"{chat_id}::{upstream_id}"
-        # Teams never passes through data/staging, so the redaction that
-        # write_json_atomic applies to every staging batch never saw it. All
-        # three stored copies of the message are covered: text, HTML and raw.
-        content_text = redact_secrets(content_text)
-        content_html = redact_secrets(content_html)
-        try:
-            conn.execute(
-                """
-                INSERT INTO teams_messages(
-                    teams_message_id, chat_id, sender_mri, sender_display_name,
-                    composed_at, message_type, content_text, content_html,
-                    parent_message_id, is_system, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    composite_id,
-                    chat_id,
-                    sender_mri,
-                    sender_display,
-                    composed_at,
-                    msg_type,
-                    content_text,
-                    content_html,
-                    parent_id,
-                    1 if _is_system_message(msg_type) else 0,
-                    json.dumps(redact_payload(item)),
-                ),
-            )
+        stored = _store_message(conn, chat_id, upstream_id, msg, item, composed_at, parent_id)
+        if stored == "inserted":
             inserted += 1
-        except sqlite3.IntegrityError:
-            pass  # Already present; idempotent.
+
+        # chatsvcagg /posts returns each post with its replies inside it. Only
+        # the post used to be kept, which left most channel content in raw_json,
+        # out of search, threads and extraction. Each reply is a row of the same
+        # chat whose parent is the post, which is how bound_threads puts it in
+        # the post's thread and sends that thread back to extraction.
+        for reply in _replies_of(item):
+            reply_at = reply.get("composeTime") or reply.get("composetime") or ""
+            stored = _store_message(conn, chat_id, reply["id"], reply, reply, reply_at, upstream_id)
+            if stored == "inserted":
+                inserted += 1
 
     # Update chat's last_message_at + sync_state cursor.
     if items:
@@ -557,3 +536,242 @@ def _persist_messages(conn: sqlite3.Connection, chat_id: int, payload: dict) -> 
         )
 
     return inserted
+
+
+StoreOutcome = Literal["inserted", "updated", "unchanged"]
+
+
+def _replies_of(item: dict) -> list[dict]:
+    """The replies a channel post carries (chatsvcagg /posts); none for a chat message."""
+    if not isinstance(item.get("message"), dict):
+        return []
+    replies = item.get("replies")
+    messages = replies.get("messages") if isinstance(replies, dict) else None
+    if not isinstance(messages, list):
+        return []
+    return [m for m in messages if isinstance(m, dict) and m.get("id")]
+
+
+def _version_stamp(msg: dict) -> int:
+    """When a message last changed, in ms since the epoch: the newest of its
+    version, edit and delete times, 0 when it carries none.
+
+    The service bumps `version` on every change and stamps `edittime` or
+    `deletetime` in properties. Channels give `version` as an int, chats as a
+    string of digits.
+    """
+    props = msg.get("properties")
+    if not isinstance(props, dict):
+        props = {}
+    newest = 0
+    for value in (msg.get("version"), props.get("edittime"), props.get("deletetime")):
+        if not isinstance(value, int | str):
+            continue
+        try:
+            newest = max(newest, int(value))
+        except ValueError:
+            continue
+    return newest
+
+
+def _is_deleted(msg: dict) -> bool:
+    props = msg.get("properties")
+    return isinstance(props, dict) and bool(props.get("deletetime"))
+
+
+def _without_content(raw: dict) -> dict:
+    """`raw` with the message's own text emptied: the envelope's message for a
+    post (its replies are messages of their own), the payload itself otherwise."""
+    if isinstance(raw.get("message"), dict):
+        return {**raw, "message": {**raw["message"], "content": ""}}
+    return {**raw, "content": ""}
+
+
+def _store_message(
+    conn: sqlite3.Connection,
+    chat_id: int,
+    upstream_id: str,
+    msg: dict,
+    raw: dict,
+    composed_at: str,
+    parent_id: str | None,
+) -> StoreOutcome:
+    """Insert one message, or apply a later version of one already stored.
+
+    `msg` is the message itself and `raw` what raw_json keeps: a channel post's
+    envelope, or the message for anything else.
+    """
+    msg_type = msg.get("messageType") or msg.get("messagetype")
+    deleted = _is_deleted(msg)
+    # The service empties a deleted message; blank it whatever this copy carries.
+    content_html = "" if deleted else (msg.get("content") or "")
+    content_text = (
+        _strip_html(content_html)
+        if (msg.get("contentType") or msg.get("contenttype")) == "html"
+        else content_html
+    )
+    sender_display = msg.get("imDisplayName") or msg.get("imdisplayname")
+    sender_mri = _extract_mri(msg.get("from"))
+    composite_id = f"{chat_id}::{upstream_id}"
+    # Teams never passes through data/staging, so the redaction that
+    # write_json_atomic applies to every staging batch never saw it. All
+    # three stored copies of the message are covered: text, HTML and raw.
+    content_text = redact_secrets(content_text)
+    content_html = redact_secrets(content_html)
+    raw_json = json.dumps(redact_payload(_without_content(raw) if deleted else raw))
+    try:
+        conn.execute(
+            """
+            INSERT INTO teams_messages(
+                teams_message_id, chat_id, sender_mri, sender_display_name,
+                composed_at, message_type, content_text, content_html,
+                parent_message_id, is_system, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                composite_id,
+                chat_id,
+                sender_mri,
+                sender_display,
+                composed_at,
+                msg_type,
+                content_text,
+                content_html,
+                parent_id,
+                1 if _is_system_message(msg_type) else 0,
+                raw_json,
+            ),
+        )
+        return "inserted"
+    except sqlite3.IntegrityError:
+        pass  # Already stored; a later version of it is applied below.
+    return _apply_later_version(
+        conn, composite_id, msg, composed_at, msg_type, content_text, content_html, raw_json
+    )
+
+
+def _apply_later_version(
+    conn: sqlite3.Connection,
+    composite_id: str,
+    msg: dict,
+    composed_at: str,
+    msg_type: str | None,
+    content_text: str,
+    content_html: str,
+    raw_json: str,
+) -> StoreOutcome:
+    """Bring a stored message up to this copy when it is a later version of it.
+
+    Every run reads each chat's newest page again, so an edit or a delete arrives
+    as a copy of a message already stored, and insert-or-ignore dropped it: the
+    store kept the first draft of an edited message and the text of a deleted
+    one. A later version replaces the stored text, HTML and payload, and sends
+    the thread back to extraction when what the message says changed. A change
+    that says nothing new, such as a reaction, updates the payload alone and
+    costs no model call. A same or older version changes nothing.
+    """
+    row = conn.execute(
+        "SELECT id, thread_id, content_text, raw_json FROM teams_messages"
+        " WHERE teams_message_id = ?",
+        (composite_id,),
+    ).fetchone()
+    # The common case: the newest page read again, unchanged.
+    if row is None or row["raw_json"] == raw_json:
+        return "unchanged"
+    try:
+        stored = json.loads(row["raw_json"]) if row["raw_json"] else {}
+    except ValueError:
+        stored = {}
+    stored_msg = stored.get("message", stored) if isinstance(stored, dict) else {}
+    if not isinstance(stored_msg, dict):
+        stored_msg = {}
+    if _version_stamp(msg) <= _version_stamp(stored_msg):
+        return "unchanged"
+    is_system = None if msg_type is None else (1 if _is_system_message(msg_type) else 0)
+    conn.execute(
+        """
+        UPDATE teams_messages
+        SET composed_at = COALESCE(NULLIF(?, ''), composed_at),
+            message_type = COALESCE(?, message_type),
+            is_system = COALESCE(?, is_system),
+            content_text = ?, content_html = ?, raw_json = ?
+        WHERE id = ?
+        """,
+        (composed_at, msg_type, is_system, content_text, content_html, raw_json, row["id"]),
+    )
+    if row["thread_id"] is not None and content_text != row["content_text"]:
+        conn.execute(
+            "UPDATE teams_threads SET extraction_status = 'pending' WHERE id = ?",
+            (row["thread_id"],),
+        )
+    return "updated"
+
+
+def backfill_channel_replies(conn: sqlite3.Connection) -> dict:
+    """Store the replies that stored channel posts hold in raw_json; no Teams call.
+
+    Until replies were stored as rows, each channel post kept them only inside
+    its stored payload. This reads those payloads once and stores every reply
+    through the path a pull takes, redaction included. It also dates each post
+    by its own compose time, where the old code took latestMessageTime, the
+    newest reply's time. Idempotent: a second run stores nothing. Run
+    bound_threads afterwards, which puts the replies in their posts' threads and
+    sends those threads back to extraction.
+    """
+    counts = {
+        "posts_read": 0,
+        "unreadable": 0,
+        "replies_found": 0,
+        "replies_stored": 0,
+        "replies_updated": 0,
+        "posts_redated": 0,
+    }
+    # Ids first, so the replies written below never join the scan.
+    post_ids = [
+        r[0]
+        for r in conn.execute(
+            "SELECT m.id FROM teams_messages m JOIN teams_chats c ON c.id = m.chat_id"
+            " WHERE c.chat_kind = 'channel' AND m.parent_message_id IS NULL"
+            " AND m.raw_json IS NOT NULL ORDER BY m.id"
+        ).fetchall()
+    ]
+    for n, post_id in enumerate(post_ids, start=1):
+        row = conn.execute(
+            "SELECT chat_id, teams_message_id, composed_at, raw_json FROM teams_messages"
+            " WHERE id = ?",
+            (post_id,),
+        ).fetchone()
+        try:
+            item = json.loads(row["raw_json"])
+        except ValueError:
+            item = None
+        if not isinstance(item, dict):
+            counts["unreadable"] += 1
+            continue
+        counts["posts_read"] += 1
+        msg = item.get("message")
+        own_time = (
+            (msg.get("composeTime") or msg.get("composetime")) if isinstance(msg, dict) else None
+        )
+        if own_time and own_time != row["composed_at"]:
+            conn.execute(
+                "UPDATE teams_messages SET composed_at = ? WHERE id = ?", (own_time, post_id)
+            )
+            counts["posts_redated"] += 1
+        # The anchor bound_threads gives the post's thread.
+        upstream_id = row["teams_message_id"].split("::", 1)[-1]
+        for reply in _replies_of(item):
+            counts["replies_found"] += 1
+            reply_at = reply.get("composeTime") or reply.get("composetime") or ""
+            outcome = _store_message(
+                conn, row["chat_id"], reply["id"], reply, reply, reply_at, upstream_id
+            )
+            if outcome == "inserted":
+                counts["replies_stored"] += 1
+            elif outcome == "updated":
+                counts["replies_updated"] += 1
+        # Short transactions: the timers' writers wait on this one.
+        if n % 100 == 0:
+            conn.commit()
+    conn.commit()
+    return counts

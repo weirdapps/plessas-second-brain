@@ -30,22 +30,19 @@ import pytest
 
 _WRAPPER = Path(__file__).parent.parent / "scripts" / "wrappers" / "launchd" / "sb-db-pull.sh"
 
-# The sidecar cleanup that has to bracket the rsync. `rm -f` on a file that is
-# already gone is a no-op, so running it twice costs nothing and closes the gap
-# where a reader recreates a -wal against the newly renamed file.
+# The sidecar cleanup that has to bracket the moment the new copy takes the name
+# brain.db. `rm -f` on a file that is already gone is a no-op, so running it
+# twice costs nothing and closes the gap where a reader recreates a -wal against
+# the newly renamed file.
 _SIDECAR_RM = 'rm -f "$LOCAL_DATA/brain.db-wal" "$LOCAL_DATA/brain.db-shm"'
-# The snapshot filename is per-consumer now ($SNAP_NAME, built from hostname),
-# because two Macs pulling from one producer were both writing the same shared
-# path. Match the line by its fixed ends rather than by the interpolated middle,
-# so this test pins the sidecar ORDERING it is about and stops re-breaking every
-# time the source path changes.
-_DB_RSYNC_HEAD = '"$RSYNC" $DB_RSYNC_OPTS "$VPS:~/.second-brain/'
-_DB_RSYNC_TAIL = '" "$LOCAL_DATA/brain.db"'
+# The copy lands under a new name, is checked there, and only then is renamed
+# over the replica (issue #149). The rename is the line that replaces brain.db.
+_SWAP = 'mv -f "$NEW_DB" "$LOCAL_DATA/brain.db"'
 
 # Captures whatever sits between `sqlite3` and the database path, i.e. the flags
 # the wrapper actually passes. An empty capture (a plain open) is the fix.
 _INTEGRITY_RE = re.compile(
-    r"INTEGRITY=\$\(\s*sqlite3\s+(?P<flags>.*?)\"\$LOCAL_DATA/brain\.db\"\s+'PRAGMA quick_check;'"
+    r"INTEGRITY=\$\(\s*sqlite3\s+(?P<flags>.*?)\"\$NEW_DB\"\s+'PRAGMA quick_check;'"
 )
 
 pytestmark = pytest.mark.skipif(shutil.which("sqlite3") is None, reason="sqlite3 CLI not installed")
@@ -200,21 +197,20 @@ class TestStaleSidecarRemoval:
     still lying beside the new one when anything opens it.
     """
 
-    def test_sidecars_are_cleared_on_both_sides_of_the_rsync(self):
+    def test_sidecars_are_cleared_on_both_sides_of_the_swap(self):
         """Before, because the old -wal must not survive the swap; after, because
         a reader holding the old inode can recreate one against the new file
-        between the rename and the integrity check."""
+        straight after the rename."""
         text = _WRAPPER.read_text()
-        rsync_at = text.find(_DB_RSYNC_HEAD)
-        assert rsync_at != -1, f"could not find the brain.db rsync in {_WRAPPER}"
-        assert _DB_RSYNC_TAIL in text[rsync_at : rsync_at + 200], (
-            "the brain.db rsync no longer writes to $LOCAL_DATA/brain.db"
-        )
+        swap_at = text.find(_SWAP)
+        assert swap_at != -1, f"could not find the rename that replaces brain.db in {_WRAPPER}"
+        check_at = text.find("INTEGRITY=$(sqlite3")
+        assert -1 < check_at < swap_at, "the new copy must be checked before it replaces brain.db"
 
-        before = text.rfind(_SIDECAR_RM, 0, rsync_at)
-        after = text.find(_SIDECAR_RM, rsync_at)
-        assert before != -1, "no sidecar cleanup before the rsync: a stale -wal survives the swap"
-        assert after != -1, "no sidecar cleanup after the rsync: a reader can recreate one"
+        before = text.rfind(_SIDECAR_RM, check_at, swap_at)
+        after = text.find(_SIDECAR_RM, swap_at)
+        assert before != -1, "no sidecar cleanup before the swap: a stale -wal survives it"
+        assert after != -1, "no sidecar cleanup after the swap: a reader can recreate one"
 
     def test_cleanup_removes_sidecars_and_spares_the_database(self, tmp_path):
         """Run the wrapper's own line, not a paraphrase of it."""

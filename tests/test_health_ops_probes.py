@@ -23,6 +23,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from tests.patching import unset_env
+
 HEALTH_CHECK_PATH = Path(__file__).parent.parent / "scripts" / "health_check.py"
 REPO = HEALTH_CHECK_PATH.parent.parent
 
@@ -619,7 +621,7 @@ def test_a_recent_restore_drill_is_reported(hc, tmp_path):
 
 def test_a_replica_does_not_judge_the_producer_s_snapshots(hc, tmp_path, monkeypatch):
     monkeypatch.setenv("BRAIN_ROLE", "replica")
-    monkeypatch.delenv("BRAIN_BACKUP_OFFSITE_DIR", raising=False)
+    unset_env(monkeypatch, "BRAIN_BACKUP_OFFSITE_DIR")
     r = hc.check_backups(
         _backups(tmp_path, snapshot=timedelta(days=5)), drill_stamp=tmp_path / "none"
     )

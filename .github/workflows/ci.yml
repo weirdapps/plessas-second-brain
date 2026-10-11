@@ -70,9 +70,14 @@ jobs:
       # --cov-fail-under is the coverage gate. SonarCloud reported this figure
       # (86.8% when it was removed) and gated nothing; here a drop below 85
       # fails the job.
+      # -n auto runs one pytest worker per CPU (pytest-xdist); the serial suite spent
+      # most of its time waiting on the subprocesses tests start. --dist loadfile
+      # keeps each file on one worker, so a module-scoped fixture is built once and
+      # a file's tests run in their written order. tests/conftest.py gives each
+      # worker a data root of its own, and pytest-cov merges the workers' coverage.
       - run: >-
-          uv run --frozen --no-build pytest -q -rs --cov=src --cov=scripts
-          --cov-report=term-missing --cov-fail-under=85
+          uv run --frozen --no-build pytest -q -rs -n auto --dist loadfile
+          --cov=src --cov=scripts --cov-report=term-missing --cov-fail-under=85
   types:
     # mypy ran only in pre-commit, on changed files, with imports followed
     # silently and without the project's dependencies, so it could not see a

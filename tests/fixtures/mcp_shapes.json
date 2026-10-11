@@ -1,5 +1,14 @@
 {
   "attachment_image_search": {
+    "input_schema": {
+      "properties": [
+        "limit",
+        "query"
+      ],
+      "required": [
+        "query"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -40,6 +49,15 @@
     }
   },
   "conversation_context": {
+    "input_schema": {
+      "properties": [
+        "include_agents",
+        "session_id"
+      ],
+      "required": [
+        "session_id"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -91,6 +109,15 @@
     }
   },
   "email_thread": {
+    "input_schema": {
+      "properties": [
+        "email_id",
+        "limit"
+      ],
+      "required": [
+        "email_id"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -133,6 +160,18 @@
     }
   },
   "meeting_prep": {
+    "input_schema": {
+      "properties": [
+        "days",
+        "include_automation",
+        "include_news",
+        "people",
+        "topic"
+      ],
+      "required": [
+        "people"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -301,6 +340,14 @@
     }
   },
   "outlook_live_search": {
+    "input_schema": {
+      "properties": [
+        "folder",
+        "since_minutes",
+        "subject_contains"
+      ],
+      "required": []
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -331,6 +378,18 @@
     "rows": {}
   },
   "person_context": {
+    "input_schema": {
+      "properties": [
+        "days",
+        "include_automation",
+        "include_news",
+        "limit",
+        "name_or_email"
+      ],
+      "required": [
+        "name_or_email"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -453,6 +512,16 @@
     }
   },
   "query_actions": {
+    "input_schema": {
+      "properties": [
+        "include_automation",
+        "include_news",
+        "limit",
+        "owner",
+        "status"
+      ],
+      "required": []
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -495,6 +564,17 @@
     }
   },
   "query_calendar_events": {
+    "input_schema": {
+      "properties": [
+        "keyword",
+        "limit",
+        "max_attendees",
+        "person",
+        "since",
+        "until"
+      ],
+      "required": []
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -548,6 +628,17 @@
     }
   },
   "query_decisions": {
+    "input_schema": {
+      "properties": [
+        "days",
+        "include_automation",
+        "include_news",
+        "limit",
+        "person",
+        "topic"
+      ],
+      "required": []
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -588,6 +679,20 @@
     }
   },
   "query_emails": {
+    "input_schema": {
+      "properties": [
+        "end_date",
+        "include_automation",
+        "include_news",
+        "keyword",
+        "kinds",
+        "limit",
+        "person",
+        "start_date",
+        "topic"
+      ],
+      "required": []
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -626,6 +731,20 @@
     }
   },
   "recall": {
+    "input_schema": {
+      "properties": [
+        "days",
+        "include_automation",
+        "include_context",
+        "include_news",
+        "kinds",
+        "limit_per_kind",
+        "query"
+      ],
+      "required": [
+        "query"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -894,6 +1013,17 @@
     }
   },
   "search_attachments": {
+    "input_schema": {
+      "properties": [
+        "include_automation",
+        "include_news",
+        "limit",
+        "query"
+      ],
+      "required": [
+        "query"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -935,6 +1065,18 @@
     }
   },
   "search_conversations": {
+    "input_schema": {
+      "properties": [
+        "include_agents",
+        "limit",
+        "query",
+        "search_type",
+        "workspace"
+      ],
+      "required": [
+        "query"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -974,6 +1116,19 @@
     }
   },
   "search_emails": {
+    "input_schema": {
+      "properties": [
+        "include_automation",
+        "include_news",
+        "kinds",
+        "limit",
+        "query",
+        "search_type"
+      ],
+      "required": [
+        "query"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -1013,6 +1168,16 @@
     }
   },
   "search_teams": {
+    "input_schema": {
+      "properties": [
+        "kind",
+        "limit",
+        "query"
+      ],
+      "required": [
+        "query"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -1056,6 +1221,17 @@
     }
   },
   "search_whatsapp": {
+    "input_schema": {
+      "properties": [
+        "chat",
+        "days",
+        "limit",
+        "query"
+      ],
+      "required": [
+        "query"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -1099,6 +1275,15 @@
     }
   },
   "sender_brief": {
+    "input_schema": {
+      "properties": [
+        "days",
+        "name_or_email"
+      ],
+      "required": [
+        "name_or_email"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -1144,6 +1329,15 @@
     "rows": {}
   },
   "sharepoint_index": {
+    "input_schema": {
+      "properties": [
+        "operation",
+        "url"
+      ],
+      "required": [
+        "operation"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -1166,6 +1360,15 @@
     "rows": {}
   },
   "sql_query": {
+    "input_schema": {
+      "properties": [
+        "limit",
+        "sql"
+      ],
+      "required": [
+        "sql"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -1196,6 +1399,12 @@
     "rows": {}
   },
   "sql_schema": {
+    "input_schema": {
+      "properties": [
+        "table"
+      ],
+      "required": []
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -1232,6 +1441,16 @@
     }
   },
   "stale_threads": {
+    "input_schema": {
+      "properties": [
+        "days",
+        "include_automation",
+        "include_news",
+        "limit",
+        "max_days"
+      ],
+      "required": []
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -1281,6 +1500,10 @@
     }
   },
   "stats": {
+    "input_schema": {
+      "properties": [],
+      "required": []
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -1351,6 +1574,15 @@
     "rows": {}
   },
   "teams_chat_summary": {
+    "input_schema": {
+      "properties": [
+        "chat_id",
+        "days"
+      ],
+      "required": [
+        "chat_id"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -1406,6 +1638,14 @@
     }
   },
   "teams_thread_context": {
+    "input_schema": {
+      "properties": [
+        "thread_id"
+      ],
+      "required": [
+        "thread_id"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",
@@ -1455,6 +1695,18 @@
     }
   },
   "topic_context": {
+    "input_schema": {
+      "properties": [
+        "days",
+        "include_automation",
+        "include_news",
+        "limit",
+        "topic"
+      ],
+      "required": [
+        "topic"
+      ]
+    },
     "output_schema": {
       "properties": [
         "_stale_warning",

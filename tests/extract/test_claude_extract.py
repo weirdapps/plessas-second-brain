@@ -18,6 +18,7 @@ import pytest
 
 from src.extract import claude_extract
 from src.llm_policy import ReauthResult
+from tests.patching import unset_env
 
 
 @pytest.fixture(autouse=True)
@@ -43,8 +44,7 @@ def test_get_client_and_model_reuses_same_client(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
     monkeypatch.setenv("BRAIN_ALLOW_DIRECT_API", "1")
     monkeypatch.setenv("CLAUDE_EXTRACT_MODEL", "claude-test-model")
-    monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
-    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    unset_env(monkeypatch, "VERTEX_SDK_PROJECT", "ANTHROPIC_VERTEX_PROJECT_ID")
 
     client1, model1 = claude_extract._get_client_and_model()
     client2, model2 = claude_extract._get_client_and_model()
@@ -74,8 +74,7 @@ def test_a_vertex_project_wins_over_an_api_key(monkeypatch, name):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
     monkeypatch.setenv("BRAIN_ALLOW_DIRECT_API", "1")
     monkeypatch.setenv("CLAUDE_EXTRACT_MODEL", "claude-test-model")
-    monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
-    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    unset_env(monkeypatch, "VERTEX_SDK_PROJECT", "ANTHROPIC_VERTEX_PROJECT_ID")
     monkeypatch.setenv(name, "test-project")
     monkeypatch.setenv("VERTEX_SDK_REGION", "eu")
     vertex, _ = _fake_sdk(monkeypatch)
@@ -90,8 +89,7 @@ def test_the_api_key_is_used_only_without_a_vertex_project(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-dummy")
     monkeypatch.setenv("BRAIN_ALLOW_DIRECT_API", "1")
     monkeypatch.setenv("CLAUDE_EXTRACT_MODEL", "claude-test-model")
-    monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
-    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+    unset_env(monkeypatch, "VERTEX_SDK_PROJECT", "ANTHROPIC_VERTEX_PROJECT_ID")
     _, direct = _fake_sdk(monkeypatch)
 
     client, _ = claude_extract._build_client_and_model()
@@ -109,8 +107,7 @@ def test_the_backend_in_use_is_logged(monkeypatch, capsys, vertex):
         monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
         monkeypatch.setenv("VERTEX_SDK_REGION", "eu")
     else:
-        monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
-        monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+        unset_env(monkeypatch, "VERTEX_SDK_PROJECT", "ANTHROPIC_VERTEX_PROJECT_ID")
     _fake_sdk(monkeypatch)
 
     claude_extract._build_client_and_model()
@@ -138,8 +135,7 @@ def test_the_sdk_makes_one_request_per_attempt(monkeypatch, vertex):
         monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
         monkeypatch.setenv("VERTEX_SDK_REGION", "eu")
     else:
-        monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
-        monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
+        unset_env(monkeypatch, "VERTEX_SDK_PROJECT", "ANTHROPIC_VERTEX_PROJECT_ID")
     _fake_sdk(monkeypatch)
 
     client, _ = claude_extract._build_client_and_model()

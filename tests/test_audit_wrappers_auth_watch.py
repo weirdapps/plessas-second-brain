@@ -74,9 +74,9 @@ def _restoration_home(home: Path, *, systemctl_ok: bool, systemd_run_ok: bool = 
     """A HOME where the Outlook sentinel is latched and the probe now passes.
 
     That is a restoration, so every Outlook-gated wrapper is re-fired, mail sync
-    included. The gcloud probe is not the trigger here because it resolves a
-    Homebrew gcloud ahead of any stub on a Mac. systemd-run is always a stub: a
-    Linux runner has a real one, which must never be reached from a test.
+    included. The gcloud probe passes and restores nothing: gcloud was never
+    blocked. systemd-run is always a stub: a Linux runner has a real one, which
+    must never be reached from a test.
     """
     sb = home / ".second-brain"
     sb.mkdir(parents=True)
@@ -125,6 +125,8 @@ def _run_watcher(home: Path, *args: str, platform: str | None = None, **env: str
             "SHELL": "/bin/bash",
             "UID": "501",
             "OSASCRIPT": str(home / "osascript"),
+            # The stub each home writes; a real gcloud is found ahead of it otherwise.
+            "AUTH_WATCH_GCLOUD": str(home / ".local" / "bin" / "gcloud"),
             **({"AUTH_WATCH_PLATFORM": platform} if platform else {}),
             **env,
         },
@@ -418,6 +420,21 @@ def test_setting_a_sentinel_logs_who_set_it(tmp_path):
 
     line = next((ln for ln in log.splitlines() if "set needs_reauth" in ln), "")
     assert "auth-watch pid" in line and "run by" in line, log
+
+
+def test_the_gcloud_probe_runs_the_gcloud_the_environment_names(tmp_path):
+    """A Homebrew or SDK gcloud is found ahead of any stub on PATH, and a real one
+    took 11 s to fail from a throwaway HOME on a Mac: most of this file's run time,
+    spent on a real binary. AUTH_WATCH_GCLOUD names the one to run."""
+    home = _failing_auth_home(tmp_path)
+    named = home / "named-gcloud"
+    _write_stub(named, 'echo "$*" >> "$HOME/gcloud-calls"\nexit 0\n')
+
+    log = _run_watcher(home, platform="Linux", AUTH_WATCH_GCLOUD=str(named))
+
+    calls = (home / "gcloud-calls").read_text().splitlines()
+    assert calls == ["auth application-default print-access-token"]
+    assert "gcloud ADC ok" in log, log
 
 
 def test_a_sentinel_keeps_the_time_it_went_up(tmp_path):

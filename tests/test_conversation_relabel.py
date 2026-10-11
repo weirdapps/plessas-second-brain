@@ -17,6 +17,7 @@ import pytest
 
 from src.export.conversation_relabel import relabel_conversations
 from src.store.schema import create_database
+from tests.patching import unset_env
 
 TS = "2026-10-01T10:00:00Z"
 
@@ -225,7 +226,7 @@ def test_the_command_refuses_a_replica_even_for_a_dry_run(tmp_path, monkeypatch,
     stamp = tmp_path / "db-pull.stamp"
     stamp.write_text("x")
     monkeypatch.setattr(config, "REPLICA_STAMP", stamp)
-    monkeypatch.delenv("BRAIN_ROLE", raising=False)
+    unset_env(monkeypatch, "BRAIN_ROLE")
     monkeypatch.setattr(cli, "cmd_relabel_conversations", lambda args: pytest.fail("ran"))
     argv = ["brain", "--db", str(tmp_path / "b.db"), "relabel-conversations", "--dry-run"]
     monkeypatch.setattr(sys, "argv", argv)

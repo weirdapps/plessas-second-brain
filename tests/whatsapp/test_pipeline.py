@@ -10,6 +10,7 @@ from src.export.whatsapp_export import ingest_snapshot
 from src.extract.whatsapp_pipeline import extract_threads
 from src.extract.whatsapp_prompt import build_prompt
 from src.extract.whatsapp_threads import bound_threads
+from tests.patching import unset_env
 from tests.whatsapp.conftest import ALICE, DIRECT_JID, OWNER, build_snapshot
 
 REPLY = json.dumps(
@@ -135,8 +136,7 @@ def test_the_prompt_says_whatsapp_and_fences_the_messages():
 
 
 def test_extraction_refuses_to_start_without_a_vertex_project(db, tmp_path, monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_VERTEX_PROJECT_ID", raising=False)
-    monkeypatch.delenv("VERTEX_SDK_PROJECT", raising=False)
+    unset_env(monkeypatch, "ANTHROPIC_VERTEX_PROJECT_ID", "VERTEX_SDK_PROJECT")
     _chat(tmp_path, db)
     with pytest.raises(RuntimeError):
         extract_threads(db)

@@ -46,8 +46,18 @@ import pytest
 # Respect an explicit override so a developer can still point the suite at a
 # real tree on purpose; otherwise nothing under the repo's own data/ is
 # reachable from a test.
-if not os.environ.get("BRAIN_DATA_DIR"):
-    os.environ["BRAIN_DATA_DIR"] = tempfile.mkdtemp(prefix="brain-test-data-")
+#
+# Under pytest-xdist (`-n`) the controller imports this file first and every
+# worker starts with the controller's environment, so a worker finds the variable
+# already set. BRAIN_TEST_DATA_DIR records the root this file made, so a worker can
+# tell an inherited one from a developer's and make its own: workers sharing a root
+# share one brain.db, one staging area and one state directory, at the same time.
+# (See tests/test_parallel_isolation.py.)
+_made_here = os.environ.get("BRAIN_TEST_DATA_DIR")
+if not os.environ.get("BRAIN_DATA_DIR") or os.environ["BRAIN_DATA_DIR"] == _made_here:
+    os.environ["BRAIN_DATA_DIR"] = os.environ["BRAIN_TEST_DATA_DIR"] = tempfile.mkdtemp(
+        prefix="brain-test-data-"
+    )
 # src/config.py applies the per-host settings file at import. A developer's real
 # one would hand every test this machine's identity and tenant, which CI never
 # has, so point it at a path that cannot exist, and drop a tenant exported in the
@@ -101,6 +111,4 @@ def _own_attachment_parts(tmp_path, monkeypatch):
     test that uses the same id and text, so each test gets a directory of its own."""
     from src.extract import attachment_pipeline
 
-    monkeypatch.setattr(
-        attachment_pipeline, "PARTS_DIR", tmp_path / "attachment_parts", raising=False
-    )
+    monkeypatch.setattr(attachment_pipeline, "PARTS_DIR", tmp_path / "attachment_parts")

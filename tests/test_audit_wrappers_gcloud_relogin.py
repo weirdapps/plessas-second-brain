@@ -26,10 +26,9 @@ def test_the_relogin_token_on_stdout_never_reaches_the_log(tmp_path):
     home = tmp_path / "home"
     (home / ".second-brain").mkdir(parents=True)
     bin_dir = home / ".local" / "bin"
-    # Only a failing probe reaches the relogin. A Homebrew gcloud wins over these
-    # stubs on a Mac, and fails too: the throwaway HOME holds no credentials.
-    for gcloud in (bin_dir / "gcloud", home / "google-cloud-sdk" / "bin" / "gcloud"):
-        _write_stub(gcloud, "exit 1\n")
+    # Only a failing probe reaches the relogin.
+    gcloud = bin_dir / "gcloud"
+    _write_stub(gcloud, "exit 1\n")
     _write_stub(
         bin_dir / "outlook-cli",
         'case "$1" in auth-check) echo \'{"status":"ok","tokenExpiresAt":"2999-01-01T00:00:00.000Z"}\';; esac\nexit 0\n',
@@ -59,6 +58,8 @@ def test_the_relogin_token_on_stdout_never_reaches_the_log(tmp_path):
             "SHELL": "/bin/bash",
             "UID": "501",
             "OSASCRIPT": str(home / "osascript"),
+            # The stub above; a real gcloud is found ahead of it otherwise.
+            "AUTH_WATCH_GCLOUD": str(gcloud),
         },
         capture_output=True,
         text=True,

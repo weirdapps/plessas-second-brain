@@ -774,16 +774,19 @@ Thread identity: primary anchor is Outlook `ConversationId`; fallback is subject
 
 ### Tests
 
-pytest suite under `tests/`, grouped into top-level tests plus focused subpackages (`tests/export`, `tests/extract`, `tests/mcp`, `tests/store`, `tests/teams`).
+pytest suite under `tests/`, grouped into top-level tests plus focused subpackages (`tests/evals`, `tests/export`, `tests/extract`, `tests/mcp`, `tests/pipeline`, `tests/store`, `tests/teams`, `tests/whatsapp`); `tests/fixtures` holds data.
 
-`tests/conftest.py` enforces two things for the whole session, so no individual test has to remember them. It redirects the data root to a temp dir in `pytest_configure` (before collection, because `src/config.py` resolves its paths at import time and an eagerly-importing test module would otherwise capture the developer's real `data/`), and it blocks socket creation outright. A test that genuinely needs the network marks itself `@pytest.mark.allow_network`; none does today. Both rules exist because tests that silently borrowed the maintainer's machine passed locally and failed on CI, twice.
+`tests/conftest.py` enforces two things for the whole session, so no individual test has to remember them. It redirects the data root to a temp dir when it is imported (before collection, because `src/config.py` resolves its paths at import time and an eagerly-importing test module would otherwise capture the developer's real `data/`), and it blocks socket creation outright. Under `pytest -n` each worker gets a data root of its own. A test that genuinely needs the network marks itself `@pytest.mark.allow_network`; two loopback tests do. Both rules exist because tests that silently borrowed the maintainer's machine passed locally and failed on CI, twice.
 
 ```bash
-pytest                              # full suite
+pytest -n auto --dist loadfile      # full suite, one worker per CPU, as CI runs it
+pytest                              # full suite, one process
 pytest tests/test_mcp_server.py     # single file
 pytest -k recall                    # filter by expression
 pytest --cov=src --cov-report=term  # with coverage
 ```
+
+`--dist loadfile` keeps each file on one worker, so a module-scoped fixture is built once and a file's tests run in their written order. For new rows, `tests/factories.py` writes an email with its people and thread, an attachment with its content, a Teams message, a calendar event, a decision or an action item in one call, with defaults and keyword overrides. A patch must fail when its target is gone: `raising=False` and `create=True` are refused by `tests/test_strict_patches.py`, and `tests.patching.unset_env` clears a variable a shell may or may not export.
 
 The tests stub the model, so they say nothing about extraction or retrieval quality; the evals below do.
 

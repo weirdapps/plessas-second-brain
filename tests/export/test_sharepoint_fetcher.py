@@ -10,6 +10,7 @@ from src.export.sharepoint_fetcher import (
     record_link_in_db,
 )
 from src.store.schema import create_database, run_migrations
+from tests.patching import unset_env
 
 # The tenant the fetcher unit tests treat as ours. The process-sharepoint tests
 # further down use the config placeholder, contoso, through the environment.
@@ -548,7 +549,7 @@ def test_process_sharepoint_refuses_to_fetch_without_a_configured_tenant(tmp_pat
     from src.cli import cmd_process_sharepoint
     from src.store.schema import get_connection
 
-    monkeypatch.delenv("SHAREPOINT_HOST", raising=False)
+    unset_env(monkeypatch, "SHAREPOINT_HOST")
     db_path = tmp_path / "test.db"
     conn = _setup_db(tmp_path)
     conn.execute(
@@ -575,7 +576,7 @@ def test_process_sharepoint_dry_run_needs_no_configured_tenant(tmp_path, monkeyp
 
     from src.cli import cmd_process_sharepoint
 
-    monkeypatch.delenv("SHAREPOINT_HOST", raising=False)
+    unset_env(monkeypatch, "SHAREPOINT_HOST")
     _setup_db(tmp_path).close()
     args = argparse.Namespace(db=str(tmp_path / "test.db"), since=None, limit=0, dry_run=True)
     cmd_process_sharepoint(args)  # must not raise

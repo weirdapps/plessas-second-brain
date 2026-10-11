@@ -17,6 +17,7 @@ import pytest
 
 from src.export.outlook_cli import OutlookCliError, _resolve_outlook_cli, run_outlook_cli
 from src.store.query import STALE_AFTER_HOURS, get_freshness
+from tests.patching import unset_env
 
 
 def _db(last_sync=None, with_table=True):
@@ -87,13 +88,13 @@ class TestResolveOutlookCli:
         assert _resolve_outlook_cli() == "/custom/outlook-cli"
 
     def test_falls_back_to_which(self, monkeypatch):
-        monkeypatch.delenv("OUTLOOK_CLI_PATH", raising=False)
+        unset_env(monkeypatch, "OUTLOOK_CLI_PATH")
         with patch("src.export.outlook_cli.shutil.which", return_value="/opt/bin/outlook-cli"):
             assert _resolve_outlook_cli() == "/opt/bin/outlook-cli"
 
     def test_falls_back_to_the_known_location_when_path_is_sanitized(self, monkeypatch):
         """The whole point: a daemon whose PATH lacks ~/.local/bin still resolves."""
-        monkeypatch.delenv("OUTLOOK_CLI_PATH", raising=False)
+        unset_env(monkeypatch, "OUTLOOK_CLI_PATH")
         with patch("src.export.outlook_cli.shutil.which", return_value=None):
             resolved = _resolve_outlook_cli()
         assert resolved.endswith("/.local/bin/outlook-cli")

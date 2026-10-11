@@ -10,12 +10,14 @@ import importlib
 
 import pytest
 
+from tests.patching import unset_env
+
 
 def _reload(monkeypatch, value):
     import src.config as cfg
 
     if value is None:
-        monkeypatch.delenv("BRAIN_EXTRACT_ENGINE", raising=False)
+        unset_env(monkeypatch, "BRAIN_EXTRACT_ENGINE")
     else:
         monkeypatch.setenv("BRAIN_EXTRACT_ENGINE", value)
     return importlib.reload(cfg)

@@ -46,6 +46,10 @@ dependencies = [
 dev = [
     "pytest>=9.1.1",
     "pytest-cov>=4.0",
+    # Runs the suite across processes (`pytest -n auto --dist loadfile`, as CI does).
+    # Most of its wall time was waiting on subprocesses, one test at a time.
+    # tests/conftest.py gives each worker a data root of its own.
+    "pytest-xdist>=3.8.0",
 ]
 
 [project.scripts]

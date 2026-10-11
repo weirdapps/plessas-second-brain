@@ -11,6 +11,8 @@ import sys
 
 import pytest
 
+from tests.patching import unset_env
+
 
 @pytest.fixture
 def stamp(tmp_path, monkeypatch):
@@ -18,7 +20,7 @@ def stamp(tmp_path, monkeypatch):
 
     path = tmp_path / "db-pull.stamp"
     monkeypatch.setattr(config, "REPLICA_STAMP", path)
-    monkeypatch.delenv("BRAIN_ROLE", raising=False)
+    unset_env(monkeypatch, "BRAIN_ROLE")
     return path
 
 

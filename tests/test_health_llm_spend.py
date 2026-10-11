@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from src.store.schema import create_database
+from tests.patching import unset_env
 
 HEALTH_CHECK_PATH = Path(__file__).resolve().parent.parent / "scripts" / "health_check.py"
 NOW = datetime(2026, 10, 11, 20, 50, tzinfo=UTC)  # the nightly run; "yesterday" is 2026-10-10
@@ -90,7 +91,7 @@ def test_spend_above_the_threshold_warns(hc, db, tmp_path):
 def test_the_threshold_defaults_to_60_and_comes_from_the_environment(hc, db, tmp_path, monkeypatch):
     _log(tmp_path, *[_line(f"2026-10-10T{h:02d}:00:00+00:00") for h in range(4)])  # $13.20
 
-    monkeypatch.delenv("BRAIN_DAILY_SPEND_WARN_USD", raising=False)
+    unset_env(monkeypatch, "BRAIN_DAILY_SPEND_WARN_USD")
     assert hc.check_llm_spend(db, log_dir=tmp_path, now=NOW)["status"] == "OK"
     monkeypatch.setenv("BRAIN_DAILY_SPEND_WARN_USD", "10")
     assert hc.check_llm_spend(db, log_dir=tmp_path, now=NOW)["status"] == "WARN"

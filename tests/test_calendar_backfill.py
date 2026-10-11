@@ -17,6 +17,7 @@ import pytest
 from src.export import calendar_export
 from src.export.outlook_cli import OutlookCliAuthRequired
 from src.store.calendar_coverage import density, listed_months
+from tests.patching import unset_env
 from tests.test_audit_calendar_listing import _FMT, _span, _utc
 
 _FULL = 48  # events in a month held in full
@@ -318,7 +319,7 @@ def test_a_replica_refuses_a_backfill_even_a_dry_run(monkeypatch, tmp_path, caps
     stamp = tmp_path / "db-pull.stamp"
     stamp.write_text("x")
     monkeypatch.setattr(config, "REPLICA_STAMP", stamp)
-    monkeypatch.delenv("BRAIN_ROLE", raising=False)
+    unset_env(monkeypatch, "BRAIN_ROLE")
     called: list = []
     monkeypatch.setattr(cli, "cmd_calendar_sync", lambda args: called.append(args))
     monkeypatch.setattr(cli, "install_llm_deadline_for_this_process", lambda: None)

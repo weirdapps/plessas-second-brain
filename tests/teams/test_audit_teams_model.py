@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.extract import teams_pipeline
+from tests.patching import unset_env
 
 
 @pytest.fixture
@@ -27,8 +28,7 @@ def sent_model(monkeypatch):
         lambda: ("shared-client", "configured-extract-model"),
     )
     monkeypatch.setattr("src.extract.vertex_fallback.create_with_refusal_fallback", fake_create)
-    monkeypatch.delenv("BRAIN_TEAMS_MODEL", raising=False)
-    monkeypatch.delenv("VERTEX_MODEL_EXTRACT", raising=False)
+    unset_env(monkeypatch, "BRAIN_TEAMS_MODEL", "VERTEX_MODEL_EXTRACT")
     monkeypatch.setenv("CLAUDE_EXTRACT_MODEL", "configured-extract-model")
     return captured
 

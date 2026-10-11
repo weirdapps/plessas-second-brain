@@ -10,6 +10,7 @@ ran without BRAIN_USER_EMAIL_PATTERN, which switched stale_threads off.
 import importlib
 
 from src.config import load_config_file
+from tests.patching import unset_env
 
 
 def _write(tmp_path, text):
@@ -93,8 +94,7 @@ def test_a_nul_byte_in_a_value_is_skipped_not_fatal(tmp_path, monkeypatch):
     """os.environ refuses embedded NULs with ValueError, at import of every entry point."""
     import os
 
-    monkeypatch.delenv("BRAIN_USER_ROLE", raising=False)
-    monkeypatch.delenv("BRAIN_USER_NAME", raising=False)
+    unset_env(monkeypatch, "BRAIN_USER_ROLE", "BRAIN_USER_NAME")
     path = _write(tmp_path, "BRAIN_USER_ROLE=CF\x00O\nBRAIN_USER_NAME=Jane\n")
 
     load_config_file(path)  # the real environment, which is what refuses NULs
@@ -131,11 +131,11 @@ def test_importing_config_applies_the_file(monkeypatch, tmp_path):
 
     path = _write(tmp_path, "BRAIN_USER_EMAIL_PATTERN=owner@example.com\n")
     monkeypatch.setenv("BRAIN_CONFIG_FILE", str(path))
-    monkeypatch.delenv("BRAIN_USER_EMAIL_PATTERN", raising=False)
+    unset_env(monkeypatch, "BRAIN_USER_EMAIL_PATTERN")
     try:
         importlib.reload(cfg)
         assert cfg.USER_EMAIL_PATTERN == "owner@example.com"
     finally:
         monkeypatch.setenv("BRAIN_CONFIG_FILE", str(tmp_path / "absent"))
-        monkeypatch.delenv("BRAIN_USER_EMAIL_PATTERN", raising=False)
+        unset_env(monkeypatch, "BRAIN_USER_EMAIL_PATTERN")
         importlib.reload(cfg)

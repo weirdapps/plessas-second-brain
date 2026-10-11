@@ -473,7 +473,7 @@ scripts/
   recover_missing_extractions.py  Backfill emails that staged but never extracted
   repair_case_twins.py         Gives emails back their own extraction where a case twin's was stored (report by default)
   reap_orphan_attachments.py   Resolves attachment dirs the registrar can never claim
-  scrub_secrets.py             Redacts credentials already in the DB (dry run by default)
+  scrub_secrets.py             Redacts credentials, card numbers, IBANs and passwords already in the DB or, with --files, in files (dry run by default)
   repair_people.py             Mends garbled people names and unsaved sender addresses (dry run by default)
   backfill-all.sh              One-shot backfill across all sources
   conversation-capture.sh      Helper to snapshot Claude Code sessions
@@ -563,7 +563,7 @@ Typical cadence: staging and `sync` hourly, `embed` daily. `sync` stages no mail
 
 Report vulnerabilities via GitHub's private vulnerability reporting. See `SECURITY.md`.
 
-Credentials are redacted on the way in (`src/redact.py`): every staging batch, extracted attachment text, Teams and WhatsApp messages, and calendar bodies before they reach the model. Rows stored before that existed are cleaned with `python scripts/scrub_secrets.py --apply` on the host that builds the database, with the jobs that write it stopped. It rewrites them under `secure_delete` and optimizes every full-text index, which removes what the run itself frees; `--vacuum` also drops copies freed by earlier churn, and needs free space of about twice the database. Snapshots taken before the scrub keep the old rows until retention ages them out. `scripts/pii-gauntlet.sh --mode=history` scans every line and filename ever committed, on every ref and on the pull-request heads fetched from `origin`, against the same checks as CI plus the private denylist.
+Credentials are redacted on the way in (`src/redact.py`): every staging batch, extracted attachment text, Teams and WhatsApp messages, and calendar bodies before they reach the model. Card numbers (issuer range, length and Luhn check), IBANs (mod-97 check) and password values after a password key are masked at the same points, to the first six and last four digits, the country and last four characters, and the key; at load the decision, action item, commitment and key fact texts the model writes are masked again, and every extraction prompt tells the model not to copy such values. Rows stored before that existed are cleaned with `python scripts/scrub_secrets.py --apply` on the host that builds the database, with the jobs that write it stopped. It rewrites them under `secure_delete` and optimizes every full-text index, which removes what the run itself frees; `--vacuum` also drops copies freed by earlier churn, and needs free space of about twice the database. Snapshots taken before the scrub keep the old rows until retention ages them out. `scrub_secrets.py --files DIR ... --apply` masks the staged batches, extracted outputs and notes under each directory the same way. `scripts/pii-gauntlet.sh --mode=history` scans every line and filename ever committed, on every ref and on the pull-request heads fetched from `origin`, against the same checks as CI plus the private denylist.
 
 ## License
 

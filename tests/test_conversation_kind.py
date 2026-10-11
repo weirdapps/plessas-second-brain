@@ -140,15 +140,17 @@ def test_an_agent_session_is_read_only_when_asked_for(db):
 
 
 def test_recent_conversations_leaves_agent_sessions_out(conn):
-    assert _sessions(cq.recent_conversations(conn)) == ["owner-session"]
-    assert _sessions(cq.recent_conversations(conn, include_agents=True)) == [
-        "agent-session",
-        "owner-session",
-    ]
+    with pytest.deprecated_call():
+        assert _sessions(cq.recent_conversations(conn)) == ["owner-session"]
+        assert _sessions(cq.recent_conversations(conn, include_agents=True)) == [
+            "agent-session",
+            "owner-session",
+        ]
 
 
 def test_preference_facts_come_from_owner_sessions_only(conn):
-    facts = [r["preference"] for r in cq.recall_preferences(conn, "okapi")]
+    with pytest.deprecated_call():
+        facts = [r["preference"] for r in cq.recall_preferences(conn, "okapi")]
 
     assert facts == ["[PREFERENCE] Okapi tables stay small"]
 

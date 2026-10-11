@@ -6,7 +6,11 @@ and context retrieval for Claude Code conversation history.
 
 import logging
 import sqlite3
+import warnings
+from collections.abc import Callable
+from typing import Any
 
+from src.store.greek import register_sql_functions, search_fold, search_phrase
 from src.store.query import _sanitize_fts5_query, fts5_query_variants
 
 logger = logging.getLogger(__name__)
@@ -38,6 +42,27 @@ _AGENT_SESSION = (
 def _owner_sessions(include_agents: bool) -> str:
     """The SQL condition, from AND, that leaves agent sessions out unless included."""
     return "" if include_agents else f" AND NOT {_AGENT_SESSION}"
+
+
+# Rows read per row returned where repeats are dropped after the read.
+_REPEATS_HEADROOM = 10
+
+
+def unique_facts(facts: list, text: Callable[[Any], str] = str) -> list:
+    """`facts` less each one whose text, folded, repeats an earlier one's.
+
+    A standing preference was extracted again in every session it came up in,
+    once up to 162 times, the copies apart only in case, accents, spacing and
+    punctuation.
+    """
+    seen: set[str] = set()
+    kept = []
+    for fact in facts:
+        key = search_phrase(text(fact))
+        if key not in seen:
+            seen.add(key)
+            kept.append(fact)
+    return kept
 
 
 def _workspace_args(workspace: str | None) -> tuple[str, str, str]:
@@ -293,7 +318,7 @@ def get_conversation_context(
     """,
         (conv_id,),
     ).fetchall()
-    result["key_facts"] = [f["fact"] for f in facts]
+    result["key_facts"] = unique_facts([f["fact"] for f in facts])
 
     # Get topics
     topics = conn.execute(
@@ -330,37 +355,49 @@ def recall_preferences(
             are a lead agent's orders and a skill's instructions
 
     Returns:
-        List of preferences with source conversation context
+        List of preferences with source conversation context, each text once
+
+    Deprecated: the recall_preference MCP tool is retired. Preferences belong in
+    CLAUDE.md and Claude Code's own memory; this stays one release for callers.
     """
+    warnings.warn(
+        "recall_preferences is deprecated: preferences belong in CLAUDE.md and "
+        "Claude Code's own memory",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    register_sql_functions(conn)
     results = []
     owner_sessions = _owner_sessions(include_agents)
+    on_topic = f"%{search_fold(topic)}%"
 
-    # Search prefixed key_facts first (highest signal)
+    # Search prefixed key_facts first (highest signal), on the topic before the
+    # LIMIT: the newest were taken first and matched after, which left most
+    # topics nothing here and the full-text branch below the whole page.
     rows = conn.execute(
         f"""
         SELECT kf.fact, c.session_id, c.started_at, c.project_name, c.summary
         FROM key_facts kf
         JOIN conversation_turns ct ON ct.id = kf.conversation_turn_id
         JOIN conversations c ON c.id = ct.conversation_id
-        WHERE (kf.fact LIKE '%[PREFERENCE]%' OR kf.fact LIKE '%[TECHNICAL]%'){owner_sessions}
+        WHERE (kf.fact LIKE '%[PREFERENCE]%' OR kf.fact LIKE '%[TECHNICAL]%')
+          AND (sb_fold(kf.fact) LIKE ? OR sb_fold(c.summary) LIKE ?){owner_sessions}
         ORDER BY c.started_at DESC
         LIMIT ?
     """,
-        (limit,),
+        (on_topic, on_topic, limit * _REPEATS_HEADROOM),
     ).fetchall()
 
     for r in rows:
-        # Check if topic is relevant (simple substring match)
-        if topic.lower() in r["fact"].lower() or topic.lower() in (r["summary"] or "").lower():
-            results.append(
-                {
-                    "preference": r["fact"],
-                    "session_id": r["session_id"],
-                    "date": r["started_at"],
-                    "project": r["project_name"],
-                    "conversation_summary": r["summary"],
-                }
-            )
+        results.append(
+            {
+                "preference": r["fact"],
+                "session_id": r["session_id"],
+                "date": r["started_at"],
+                "project": r["project_name"],
+                "conversation_summary": r["summary"],
+            }
+        )
 
     # Also search FTS for broader matches
     try:
@@ -375,7 +412,7 @@ def recall_preferences(
             ORDER BY rank
             LIMIT ?
         """,
-            (_sanitize_fts5_query(topic), limit),
+            (_sanitize_fts5_query(topic), limit * _REPEATS_HEADROOM),
         ).fetchall()
 
         seen = {r["preference"] for r in results}
@@ -408,7 +445,7 @@ def recall_preferences(
             ORDER BY c.started_at DESC
             LIMIT ?
         """,
-            (limit,),
+            (limit * _REPEATS_HEADROOM,),
         ).fetchall()
 
         # Mark them. These rows are the most RECENT preferences, not preferences
@@ -432,7 +469,7 @@ def recall_preferences(
                 }
             )
 
-    return results[:limit]
+    return unique_facts(results, lambda row: row["preference"])[:limit]
 
 
 def recent_conversations(
@@ -454,7 +491,15 @@ def recent_conversations(
 
     Returns:
         List of recent conversations with summaries
+
+    Deprecated: the recent_conversations MCP tool is retired (Claude Code's
+    /resume lists recent sessions); this stays one release for callers.
     """
+    warnings.warn(
+        "recent_conversations is deprecated: Claude Code's /resume lists recent sessions",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     # datetime() on both sides: started_at is stored as '2026-09-27T00:27:13Z'
     # and datetime('now', ...) renders a space, so compared as strings every
     # session from earlier on the cutoff day counted as newer than the cutoff.

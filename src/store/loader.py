@@ -899,7 +899,12 @@ def load_single_conversation(
     # Conversation extractions are read from disk without parse_extraction, and
     # files written before it normalised these lists hold dict items (stored as
     # a repr) or nulls (which stopped every conversation load).
-    for pref in _as_string_list(extraction.get("preferences_expressed")):
+    # Only the owner states his preferences: a session with no turn he typed (an
+    # agent session, staged only with --include-agents) keeps none, whatever the
+    # model returned, since the prompt's rule is an instruction and not a control.
+    owner_spoke = any(turn.get("speaker") == "user" for turn in metadata.get("turns", []))
+    preferences = extraction.get("preferences_expressed") if owner_spoke else None
+    for pref in _as_string_list(preferences):
         if pref:
             conn.execute(
                 """

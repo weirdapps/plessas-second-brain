@@ -3343,8 +3343,138 @@ READ_ONLY_COMMANDS = frozenset(
         # Its writes (--refetch, --record-aliases) refuse on a replica themselves.
         "mail-reconcile",
         "sharepoint-refused",
+        # `brain maint scrub`: the dry run reads; --apply refuses on a replica itself (exit 3).
+        "scrub",
     }
 )
+
+# One-off maintenance, grouped under `brain maint NAME` on 2026-10-11 so the jobs the
+# timers run stand apart from what is run once, by hand, and can be retired on a
+# schedule. NAME: (the command it runs, the flags it sets, its help). The old spelling,
+# that command with those flags, works for one release with a deprecation line;
+# docs/DEPLOY.md keeps it, since it also runs on code from before. `brain maint scrub`
+# runs scripts/scrub_secrets.py (cmd_scrub).
+MAINT_COMMANDS: dict[str, tuple[str, dict[str, bool], str]] = {
+    "migrate": ("migrate", {}, "Run the database migrations"),
+    "classify-sources": (
+        "classify-sources",
+        {},
+        "Set every email's source_class again by today's rules",
+    ),
+    "split-html": ("split-html", {}, "Keep the HTML of emails loaded before schema v23"),
+    "relabel-conversations": (
+        "relabel-conversations",
+        {},
+        "Relabel the stored conversation turns the owner did not write as 'agent'",
+    ),
+    "teams-backfill-replies": (
+        "teams-backfill-replies",
+        {},
+        "Store the channel replies stored posts hold (no Teams call)",
+    ),
+    "teams-strip-html": (
+        "teams-strip-html",
+        {},
+        "Convert Teams message text stored as HTML (no Teams or model call)",
+    ),
+    "teams-drop-raw-json": (
+        "teams-drop-raw-json",
+        {},
+        "Drop the raw Teams payloads nothing needs, after teams-backfill-replies",
+    ),
+    "ocr-regarble": (
+        "ocr-regarble",
+        {},
+        "Find stored OCR text that is Greek read as Latin letters",
+    ),
+    "refetch-garbled": (
+        "refetch-garbled",
+        {},
+        "Fetch again from the mailbox the swept originals of garbled OCR texts",
+    ),
+    "reextract": (
+        "reextract",
+        {},
+        "Read and summarise again rows earlier code capped, skipped or missed",
+    ),
+    "retry-stubs": (
+        "retry-stubs",
+        {},
+        "Extract again the emails loaded without an extraction",
+    ),
+    "transcribe-images": (
+        "transcribe-images",
+        {},
+        "Transcribe content images whose attachments hold no text",
+    ),
+    "hash-attachments": (
+        "hash-attachments",
+        {},
+        "Record a content hash for every attachment file still on disk",
+    ),
+    "prune-staged": (
+        "prune-staged",
+        {},
+        "Delete the staged batches whose message ids are all in the database",
+    ),
+    "import-people": ("import-people", {}, "Import canonical people from JSON"),
+    "calendar-backfill": (
+        "calendar-sync",
+        {"backfill": True},
+        "List the calendar a month at a time, the months stats coverage flags, resuming "
+        "where the last backfill stopped (calendar-sync --backfill)",
+    ),
+    "sharepoint-ingest-fetched": (
+        "process-sharepoint",
+        {"ingest_fetched": True},
+        "Store the files earlier SharePoint fetches left on disk "
+        "(process-sharepoint --ingest-fetched)",
+    ),
+    "sharepoint-refetch-content": (
+        "process-sharepoint",
+        {"refetch_content": True},
+        "Read again the SharePoint links recorded ok with no text stored "
+        "(process-sharepoint --refetch-content)",
+    ),
+    "sharepoint-repair-links": (
+        "process-sharepoint",
+        {"repair_links": True},
+        "Queue again the SharePoint links the old scanner mangled and the pages read "
+        "without their text (process-sharepoint --repair-links)",
+    ),
+}
+
+
+def _maint_name(args) -> str | None:
+    """The `brain maint` name of what `args` ran under its old spelling, or None."""
+    for name, (command, implied, _) in MAINT_COMMANDS.items():
+        if args.command == command and all(
+            getattr(args, key, None) == value for key, value in implied.items()
+        ):
+            return name
+    return None
+
+
+def cmd_scrub(args) -> int:
+    """`brain maint scrub`: scripts/scrub_secrets.py with the arguments after it."""
+    import importlib.util
+
+    from src.config import REPO_ROOT
+
+    if Path(args.db) != DEFAULT_DB:
+        print(
+            "Error: scrub takes no --db: it scrubs the configured database. Point "
+            "BRAIN_DATA_DIR at a copy's directory to rehearse on the copy.",
+            file=sys.stderr,
+        )
+        return 2
+    spec = importlib.util.spec_from_file_location(
+        "scrub_secrets", REPO_ROOT / "scripts" / "scrub_secrets.py"
+    )
+    assert spec is not None and spec.loader is not None
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    return script.main(args.script_args)
 
 
 def main():
@@ -4231,6 +4361,39 @@ def main():
     parser_stats = subparsers.add_parser("stats", help="Deprecated: brain tool stats")
     parser_stats.set_defaults(func=cmd_stats)
 
+    # One-off maintenance (MAINT_COMMANDS), added once every other parser exists: each
+    # alias copies the parser of the command it runs (argparse parents), so it takes the
+    # same arguments, the ones added to that command later included.
+    parser_maint = subparsers.add_parser(
+        "maint", help="One-off maintenance commands, run by hand: brain maint --help"
+    )
+    maint_subparsers = parser_maint.add_subparsers(
+        dest="maint_command", metavar="COMMAND", help="Run by hand, once or now and then"
+    )
+    for name, (command, implied, help_text) in MAINT_COMMANDS.items():
+        alias = maint_subparsers.add_parser(
+            name,
+            parents=[subparsers.choices[command]],
+            add_help=False,
+            help=help_text,
+            description=help_text,
+        )
+        if implied:
+            # Not set_defaults(**implied): the alias shares its command's argument
+            # objects, and a default set here would become the job's own, so every
+            # plain calendar-sync would backfill. main() applies these after parsing.
+            alias.set_defaults(_maint_implies=implied)
+    # The script parses what follows. prefix_chars="+" leaves every '-' word to it.
+    parser_scrub = maint_subparsers.add_parser(
+        "scrub",
+        add_help=False,
+        prefix_chars="+",
+        help="Remove credentials stored before redaction (scripts/scrub_secrets.py; "
+        "brain maint scrub --help for its options)",
+    )
+    parser_scrub.add_argument("script_args", nargs="*", help="The script's own arguments")
+    parser_scrub.set_defaults(func=cmd_scrub)
+
     # Parse and execute
     args = parser.parse_args()
 
@@ -4242,10 +4405,29 @@ def main():
         parser_query.print_help()
         sys.exit(1)
 
+    if args.command == "maint" and not args.maint_command:
+        parser_maint.print_help()
+        sys.exit(1)
+
+    for key, value in getattr(args, "_maint_implies", {}).items():
+        setattr(args, key, value)
+    command = args.maint_command if args.command == "maint" else args.command
+    maint_name = _maint_name(args)
+    if maint_name:
+        old, implied, _ = MAINT_COMMANDS[maint_name]
+        flags = [f"--{key.replace('_', '-')}" for key in implied]
+        print(
+            f"brain {' '.join([old, *flags])} is deprecated (removed in the next release), "
+            "with the same arguments"
+            + (f" but {' '.join(flags)}" if flags else "")
+            + f": use brain maint {maint_name}",
+            file=sys.stderr,
+        )
+
     from src import config
 
-    if args.command not in READ_ONLY_COMMANDS and config.is_replica():
-        print(config.replica_refusal(f"'{args.command}'"), file=sys.stderr)
+    if command not in READ_ONLY_COMMANDS and config.is_replica():
+        print(config.replica_refusal(f"'{command}'"), file=sys.stderr)
         sys.exit(2)
 
     # Execute command

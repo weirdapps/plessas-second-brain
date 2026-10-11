@@ -131,10 +131,16 @@ def test_every_read_only_name_is_a_real_command():
     commands = set()
     original = argparse.ArgumentParser.parse_args
 
-    def capture(self, *args, **kwargs):
-        for action in self._actions:
+    def walk(parser):
+        # Every level: `brain maint scrub` is a command of its own.
+        for action in parser._actions:
             if isinstance(action, argparse._SubParsersAction):
                 commands.update(action.choices)
+                for child in action.choices.values():
+                    walk(child)
+
+    def capture(self, *args, **kwargs):
+        walk(self)
         raise SystemExit(0)
 
     argparse.ArgumentParser.parse_args = capture

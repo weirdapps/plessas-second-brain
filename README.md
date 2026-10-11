@@ -100,7 +100,7 @@ This changes results: decisions, actions and key facts from news items and from 
 
   The answer leads with what decides how far to trust it: `summary` (its first key `semantic`), then `data_as_of` and `stale`, then `_stale_warning` when the local database is behind, then `truncated` when the budget cut rows, and only then the buckets. A result too big to show inline used to end with these, where the preview of the saved file could not see them. `limit_per_kind` is 1 to 10 (default 5). Rows carry summaries cut to about 300 characters, and no `snippet` that only repeats the row's subject, title or summary.
 
-  `include_context` (default `false`) attaches the person and topic dossiers the query matches, as `person_context` and `topic_context`, with `summary.has_person_context` and `has_topic_context`. They used to be attached to every call: 27% of an average payload, often for the wrong entity, since a topic word can start a person's name. Call `person_context` or `topic_context` directly for a full dossier.
+  `include_context` (default `false`) attaches the person and topic dossiers the query matches, as `person_context` and `topic_context`, with `summary.has_person_context` and `has_topic_context`. They used to be attached to every call: 27% of an average payload, often for the wrong entity, since a topic word can start a person's name. The person dossier comes only when the query is an address, a Teams MRI or a WhatsApp JID, or a name that fits one person (`match_count` 1, rows the alias map joins counting once); a surname that fits several people used to attach whichever was most emailed. Call `person_context` or `topic_context` directly for a full dossier.
 
   Only the `emails` bucket is a keyword plus semantic fusion (reciprocal rank fusion over FTS5 and embedding hits, degrading to keyword-only if the index or credentials are absent). Every other bucket is keyword-only. News and automation are left out of every bucket, the semantic candidates and both dossiers unless included (see above).
 
@@ -119,10 +119,12 @@ Mail deleted or junked in Outlook keeps the folder it had, where it used to be r
 
 ### People and topics
 
-- `person_context(name_or_email, days, limit, include_news, include_automation)`. History, sentiment, decisions, open actions, communication pattern, `teams`: the messages they wrote in the window and the threads they wrote in (`recent_threads`, with `recent_threads_total`), and `whatsapp`, the same for WhatsApp, matched on a name of two words or more against sender names, since WhatsApp has no address to join on. Each list is capped at `limit` (default 20) and carries a `<name>_total` sibling with the real count, so a truncated answer is distinguishable from a complete one. A name is matched ignoring case and accents; when several people match, the most-emailed one is used and `match_count` / `other_candidates` say who else it could be (`sender_brief` and `meeting_prep` resolve names the same way).
+- `person_context(name_or_email, days, limit, include_news, include_automation)`. History, sentiment, decisions, open actions, communication pattern, `teams`: the messages they wrote in the window and the threads they wrote in (`recent_threads`, with `recent_threads_total`), and `whatsapp`, the same for WhatsApp, matched on a name of two words or more against sender names, since WhatsApp has no address to join on. Each list is capped at `limit` (default 20) and carries a `<name>_total` sibling with the real count, so a truncated answer is distinguishable from a complete one. An address, a Teams MRI or a WhatsApp JID resolves exactly; pass one when you have it. A name is matched ignoring case, accents and script, in the common romanisations of Greek ('Mprostopoulou', 'Brostopulu' and 'Μπροστοπούλου' are one name), each word at the start of a word in any order. A person known by an address, MRI or JID (an identity) is preferred over a name the model only extracted from text (a mention, 78% of the people rows on a large store), and an identity whose name shares the surname and contradicts no word of the query counts as a match ('Evi Surname' is 'E. Surname (Evanthia)' at `surname.evi@`); among those, the most-emailed is used. Every spelling of the owner (`BRAIN_USER_NAME`) and every address he lists (`BRAIN_USER_EMAIL_PATTERN`) resolves to one row, the busiest at a listed address; a name alone never makes a row the owner, and a row at an address he does not list is someone else. `resolved_by` says how the person was found (`email`, `mri`, `jid`, `name`, or `alias` for the alias map and the owner rule), `match_count` how many people the query fits, and `other_candidates` the next three with each one's `identifier` kind (`null` for a mention) (`sender_brief` and `meeting_prep` resolve names the same way).
 - `topic_context(topic, days, limit, include_news, include_automation)`. Key people, decisions, actions, facts. Same `limit` and `<name>_total` contract.
 - `sender_brief(name_or_email, days)`. Compact briefing suitable for inline display.
-- `meeting_prep(people, topic, days, include_news, include_automation)`. Per-attendee dossiers, optionally scoped to a topic.
+- `meeting_prep(people, topic, days, include_news, include_automation)`. Per-attendee dossiers, optionally scoped to a topic. Pass each attendee's address when you have it: by display name, 42% of a month's attendees resolved to no one and a third of the rest to someone other than their address, before name resolution preferred identities (18% and 10% after).
+
+The alias map joins mention rows to the identity they stand for, so that a name fitting a person's identity and their extracted spellings counts as one person. `python -m src.store.person_aliases` proposes, for each mention row, the one identity whose name agrees with it and with which it shares threads (at least half of them for a one-word name), and prints the proposals; `--apply` records them as `sync_metadata` rows (`person_alias:<mention id>` to the identity's id) on the host that builds the store. No people row is merged or changed, and a replica gets the rows with its next pull. Delete a row to undo an alias.
 
 Every dossier dates and orders its rows the same way (`src/store/ordering.py`): decisions newest first by their own date when it is an ISO date, else by their parent's (the email, Teams or WhatsApp session, meeting or conversation they came from); key facts newest parent first; open actions upcoming first, soonest first, then undated, then overdue, most recently missed first. Every decision, fact and action row carries `date` and `parent_date`.
 
@@ -149,6 +151,8 @@ Every dossier dates and orders its rows the same way (`src/store/ordering.py`): 
 - `teams_chat_summary(chat_id, days)`. Recent activity per chat or channel.
 
 A channel thread holds the post and its replies, each reply a message of its own, and a post is dated by when it was written, not by its newest reply. A message edited or deleted after it was first stored is brought up to date on a later pull: the edit replaces the text, a deletion blanks it, and either sends the thread back to extraction. Before this, replies stayed inside the post's stored payload, out of search and extraction, and the first draft of an edited message and the text of a deleted one were kept. `python -m src.cli teams-backfill-replies` stores the replies already held in stored posts, once (see `docs/DEPLOY.md`).
+
+A message's text is what a reader sees of it: no tags, entities decoded, a block or a line break on a line of its own, and the visible text of a mention, a link (its address after it, as in a mail body) and an emoji kept. The HTML is kept beside it. The content's shape decides, not the type the payload declares: the services declare an HTML body as text, and until this change the text of every HTML message was its markup, so `search_teams` matched words such as `itemtype` and `nbsp` and the model read the tags. System messages (calls, membership changes) keep the service's XML. `python -m src.cli teams-strip-html` converts the text stored before, once (see `docs/DEPLOY.md`).
 
 Each message also keeps the payload teams-cli returned (`raw_json`), which the pull compares to tell an edit or a delete; nothing else reads it once the replies are stored. `python -m src.cli teams-drop-raw-json` drops it from the stored messages, once, after `teams-backfill-replies` and `teams-strip-html`: about 133 MB of the 244 MB table on the producer. A channel post whose payload still holds a reply that is not a message of its own keeps its payload, and `--dry-run` counts what would go. New messages keep their payload, and one whose payload was dropped gets it back, with the same text and no new extraction, the next time a pull reads it.
 
@@ -180,6 +184,8 @@ Conversation memory is the owner's own sessions. Each turn's `speaker` says who 
   It also returns `data_as_of`, `age_hours` and `stale`. `data_as_of` is the older of two stamps, both returned as stored: `last_sync_date`, which every `sync` writes, and `mail_export_ok_at`, the Inbox export's last success, which `sync` copies in. `stale_warning` names the one that is behind. On a read replica that is the only way to tell a live corpus from one whose feed stopped, because both answer queries identically.
 
   `embed_backend` names the service that embeds this server's search queries (`gemini` or `vertex`, see `BRAIN_EMBED_BACKEND`), and `last_embed_error` the last query embedding that failed in this server process, as `{"type": <exception type>, "at": <UTC time>}`, or `null`. It carries no message text, which can quote a query or a credential error.
+
+  `attachments_awaiting_text` counts the attachments whose text has not been read yet, which `search_attachments` cannot find at all, and `attachments_awaiting_summary` the texts still waiting for their summary. `attachments_awaiting_text_oldest_hours` and `attachments_awaiting_summary_oldest_hours` say how long the oldest of each has waited, in hours, or `null` when none waits. They are the health check's Attachment lag queues; see [Attachments in the hourly sync](#attachments-in-the-hourly-sync).
 
 ### SQL (read-only)
 
@@ -304,7 +310,7 @@ Used in extraction prompts and stale-thread detection.
 
 - `BRAIN_USER_NAME`
 - `BRAIN_USER_ROLE`
-- `BRAIN_USER_EMAIL_PATTERN` (case-insensitive substring, matched against `sender_address` to detect your sent mail)
+- `BRAIN_USER_EMAIL_PATTERN`: every address you send from, primary and aliases, separated by commas (`first.last@example.com,alias@example.com`). Each is matched whole and case-blind; an entry without a domain (`first.last`) matches that local part at any domain. Nothing else matches: not `k.last@example.com` for `last@example.com`, and not a bare `@example.com`, which would make every colleague you. It decides your sent mail (stale threads, automation mail), your meetings' self flags, and the people row that is you.
 
 ### Extraction engine
 
@@ -341,6 +347,16 @@ Preferred credential path. Uses Application Default Credentials, no API key requ
 `scripts/health_check.py` reads three more: `HEALTH_EMAIL_TO` and `HC_PING_URL`, documented in [`docs/DEPLOY.md`](docs/DEPLOY.md), and `BRAIN_DAILY_SPEND_WARN_USD` (below).
 
 No credentials are printed by the code. All secrets are read from environment or (for Google) from ADC.
+
+### Attachments in the hourly sync
+
+`sync` reads attachment text (Phase 1) and asks the model for summaries (Phase 2) in a 90-second slice each; what does not fit waits for the next run or for the nightly `process-attachments` pass. Since 2026-10-11:
+
+- **Newest mail first.** Phase 1 takes attachments by their email's received time, newest first, compared as instants whatever the stored format. Taken in registration order, the day's documents waited behind the backlog until the nightly pass, which keeps that order.
+- **Phase 2 follows Phase 1.** It starts with the documents Phase 1 has just read, then any other text awaiting a summary, newest first, within its own slice, and it runs whether or not Phase 1 read anything. A document mailed in the morning is normally searchable by its text and its summary after the next hourly run; on a busy morning the summaries of the rest follow over the next runs. Texts over 50,000 characters still wait for the nightly pass.
+- **Images and zip archives wait for the nightly pass, while one runs.** One of them can take two minutes (OCR, or every member of an archive) against the 90-second slice. The hourly slice leaves them only while a `process-attachments` run over every kind (no `--type`) has stamped the `sync_metadata` row `attachment_text_pass_at` in the last 48 hours, so a host that runs `sync` alone, as the cron example in [`docs/DEPLOY.md`](docs/DEPLOY.md) does, keeps reading them hourly. An image whose bytes another attachment already holds is copied at once either way. `BRAIN_SYNC_HEAVY_ATTACHMENTS=1` reads them hourly regardless, as before.
+
+`stats` and the health check's Attachment lag row say how many attachments wait and for how long.
 
 ### Attachment summaries and spend
 
@@ -415,6 +431,7 @@ python -m src.cli calendar-sync --since 2026-01-01
 python -m src.cli news-sync --relevance 60
 python -m src.cli teams-sync --workers 4
 python -m src.cli teams-backfill-replies    # once, on the producer: store the channel replies stored posts hold; no Teams call
+python -m src.cli teams-strip-html          # once, on the producer: convert message text stored as HTML (--dry-run counts); no Teams or model call
 python -m src.cli teams-drop-raw-json [--dry-run] [--limit N]   # once, on the producer, after teams-backfill-replies and teams-strip-html: drop the raw Teams payloads (see DEPLOY)
 python -m src.cli whatsapp-sync             # the snapshot at BRAIN_WHATSAPP_SNAPSHOT (see WhatsApp below)
 python -m src.cli process-attachments --phase 2 --workers 2
@@ -462,6 +479,7 @@ python -m src.cli mail-reconcile --since 2025-03-16 --json gaps.json   # Outlook
 python -m src.cli mail-reconcile --since 2026-05-01 --refetch --record-aliases  # producer: stage them for the next sync, note the ids of Archive copies
 python -m src.cli mail-reconcile --since 7d --refetch --limit 100 --health-json  # producer, nightly: the week's missing mail, and data/state/mail_loss.json for the health check
 python -m src.cli retry-stubs [--dry-run]   # extract again the emails loaded without an extraction after failing three runs
+python -m src.store.person_aliases [--apply]           # propose which identity each mention row stands for; --apply records them (producer)
 ```
 
 Full subcommand list: `python -m src.cli --help`.
@@ -523,16 +541,18 @@ src/
     loader.py                  Extracted JSON to SQLite
     query.py                   Person, topic, keyword, date, decisions, actions, FTS, combined
     source_class.py            What an emails row is (mail, automation, news, document, session note) and the default filter
-    owner.py                   Whether an address is the owner's (BRAIN_USER_EMAIL_PATTERN), for the calendar and the source classes
+    owner.py                   Whether an address or a name is the owner's, and the one people row every spelling of him resolves to
     ordering.py                How decisions, key facts and actions are dated and ordered in every list
     context.py                 Rich person and topic context aggregations
+    person_resolve.py          Who a name or an address means: identities first, both scripts, the alias map
+    person_aliases.py          Proposes and records which identity a mention row stands for; never merges
     embeddings.py              Embedding index build and query
     recall.py                  Unified `recall` fan-out
     fusion.py                  Reciprocal rank fusion over keyword and semantic result lists
     normalizer.py              Greek-aware topic and people normalization
     dedup_people.py            Seven-phase people deduplication
     dedup_topics.py            One-time merge of topics differing only by case, accents, separators
-    transliterate.py           Greek to Latin transliteration and name canonicalization
+    transliterate.py           Greek to Latin transliteration, spelling keys and name agreement
     fuzzy_people.py            Review-gated fuzzy name candidates; never auto-merges
     action_lifecycle.py        Dedups action items and ages out stale ones
     conversation_query.py      Claude Code conversation search
@@ -587,7 +607,7 @@ skill/
   | `automation` | mail the owner (`BRAIN_USER_EMAIL_PATTERN`) sent to no one but himself, not a reply or forward, whose subject starts with a bracketed tag (`[VPS] ...`, `[nightly] ...`) or holds an ISO date, and names something besides that stamp. A tag alone is not enough: from anyone else, or also sent to someone else, it is `mail` |
   | `mail` | everything else, including whatever the rules are unsure of |
 
-  The v33 migration classifies existing rows in one transaction, writing only the rows that are not `mail`. The owner rule needs `BRAIN_USER_EMAIL_PATTERN`, matched case-blind at the end of the address (its domain whole, its local part after a separator: `owner@example.com` matches `first.owner@example.com` but not `owner@example.com.example.net`), the same rule the calendar's self flags use. If it was unset when the migration ran, set it and run `python -m src.cli classify-sources`, which sets every row's class again by today's rules and writes only the rows that change. Reads use the stored class. A store without the column (older than v33), as a replica's file is from the new code's arrival to its next pull, is read as before the class: the `News` mailbox is left out and nothing else, rows are labelled from their mailbox (never `automation`), the process logs `source_class column missing; run migrate on the producer; news-only exclusion in effect` once, `recall`'s `summary.source_class` carries the same sentence and `stats` reports `source_class: "pending migration"`. Storing or setting a class needs the column: the writers and `reclassify()` (behind `classify-sources`, which migrates first) refuse such a store with an error that says to run `migrate`.
+  The v33 migration classifies existing rows in one transaction, writing only the rows that are not `mail`. The owner rule needs `BRAIN_USER_EMAIL_PATTERN`, the owner's addresses each matched whole and case-blind (`owner@example.com` is neither `first.owner@example.com` nor `owner@example.com.example.net`), the same rule the calendar's self flags use. If it was unset when the migration ran, set it and run `python -m src.cli classify-sources`, which sets every row's class again by today's rules and writes only the rows that change. Reads use the stored class. A store without the column (older than v33), as a replica's file is from the new code's arrival to its next pull, is read as before the class: the `News` mailbox is left out and nothing else, rows are labelled from their mailbox (never `automation`), the process logs `source_class column missing; run migrate on the producer; news-only exclusion in effect` once, `recall`'s `summary.source_class` carries the same sentence and `stats` reports `source_class: "pending migration"`. Storing or setting a class needs the column: the writers and `reclassify()` (behind `classify-sources`, which migrates first) refuse such a store with an error that says to run `migrate`.
 - **Attachments and images**: `attachments`, `attachment_content`, `inline_images`, `inline_image_occurrences`, `sender_signature_index`
 - **Calendar**: `calendar_events`, `event_attendees`
 - **Teams**: `teams_chats`, `teams_threads`, `teams_messages`, `teams_mri_resolution`

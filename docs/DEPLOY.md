@@ -88,6 +88,12 @@ with `BRAIN_EXTRACT_ENGINE=gemini`; or the direct Anthropic API, which takes
 `ANTHROPIC_API_KEY` together with `BRAIN_ALLOW_DIRECT_API=1` and is used only where
 no Vertex project is set. See `.env.example` for the full list.
 
+`BRAIN_USER_EMAIL_PATTERN` lists every address the owner sends from, primary and
+aliases, separated by commas: `BRAIN_USER_EMAIL_PATTERN=first.last@example.com,alias@example.com`.
+Each is matched whole and case-blind, so an alias that is not listed is not the
+owner's. After changing it, run `python -m src.cli classify-sources` on the
+producer; the next calendar sync refreshes the meetings' self flags.
+
 Nothing in the code reads `.env`: the scheduling recipes in section 6 source it
 (`set -a; . ./.env`, `EnvironmentFile=`). The MCP server inherits the
 environment `claude` was launched with, which sources no `.env` and, from a GUI
@@ -399,7 +405,7 @@ pipeline itself. STALE in any of them fails the freshness ping, like any other S
 | --- | --- | --- |
 | Emails | Each folder's newest mail against its own limit: Inbox and Archive 6 h, Sent Items 24 h, News 12 h. Triage relabels Inbox mail Archive, so the Inbox also counts its export's last success. STALE past a limit, or when an export would list from the future (its cursor ahead of the clock by more than the six-hour listing overlap). | `BRAIN_HEALTH_FOLDER_LAG_HOURS="Sent Items=48,News=12"`; 0 stops judging a folder |
 | Golden query | One keyword and one semantic search for a fixed phrase, through the store's own search functions. STALE when the semantic half falls back to keyword matches or cannot run, WARN when the phrase finds nothing. | `BRAIN_HEALTH_QUERY`, else `BRAIN_USER_ROLE`, else `BRAIN_USER_NAME` |
-| Attachment lag | The oldest attachment waiting for its text, and the oldest text waiting for a summary. WARN past a day. | |
+| Attachment lag | The oldest attachment waiting for its text, and the oldest text waiting for a summary. WARN past a day. The MCP `stats` tool returns the same counts and ages. | |
 | Backups | The newest `brain-*.db` snapshot and the newest `brain-*.db.zst.enc` archive, STALE past 26 h; the last restore drill, WARN past 35 days ([`RESTORE.md`](RESTORE.md)). Not judged on a replica. | `BRAIN_BACKUP_DIR` (default `$BRAIN_DATA_DIR/backups`), `BRAIN_BACKUP_OFFSITE_DIR` (default its `offsite`), `BRAIN_RESTORE_DRILL_STAMP` |
 | Mail loss | Messages the export gave up fetching, and staging batches quarantined as unreadable. WARN on any quarantined batch, and on a message given up in the last week; the cursor files keep their give-ups for good, so older ones are reported, not warned on. | Read from `state/mail_loss.json` while it is under two days old, else counted from the cursor files |
 
@@ -494,6 +500,36 @@ back to extraction. The next teams-sync runs extract them, newest first, one mod
 within their deadline. A second run stores nothing. On a copy of the replica's Teams tables
 on 2026-10-11: 3,135 replies from 1,961 posts, 897 posts re-dated, 893 threads queued, in
 two seconds. No schema change, and it can run beside the timers.
+
+**Teams message text.** teams-sync stores a message's text as a reader sees it whenever its
+content holds markup, whatever type the payload declares. It used to wait for a declared
+"html", which the chat service never sends, so the text of every HTML message was its markup.
+To convert the rows stored before, run `python -m src.cli teams-strip-html` once on the
+producer after the pull (`--dry-run` counts first, read-only). It calls neither Teams nor a
+model: it converts each row from the HTML the row keeps, redacting credentials as ingest
+does, writes only the rows whose text changes, 500 to a transaction, so it can run beside
+the timers, and the full-text index follows through its trigger. System messages keep their
+XML. A second run changes nothing, and `--limit N` caps the rows one run changes. Run it once
+more after a teams-sync that started before the pull has exited, since that job stores
+markup as before. Until it has run, a reaction to a message stored before sends its thread
+back to extraction, as an edit does, because the new text differs from the stored markup.
+On a copy of the replica's Teams tables on 2026-10-11: 37,741 of 79,127 messages converted
+in 5 s, a second run changed none, and a search for `itemtype` went from 8,871 messages to
+0. No schema change.
+
+It sends nothing back to extraction, which is where the cost is: the summaries, titles,
+decisions, actions and facts of the threads concerned stay as extracted from the markup, and
+their vectors, which embed the summaries, with them. To refresh them, send those threads back
+to extraction; the following teams-sync runs extract them, newest first, one model call each
+within their deadline, and embed each again, since it was extracted after it was embedded
+(6,648 threads on that copy):
+
+```sql
+UPDATE teams_threads SET extraction_status = 'pending'
+WHERE extraction_status = 'extracted' AND id IN (
+  SELECT thread_id FROM teams_messages
+  WHERE is_system = 0 AND content_text IS NOT content_html);
+```
 
 **Teams raw payloads.** Each Teams message also keeps the payload teams-cli returned
 (`teams_messages.raw_json`): 133 MB of the 244 MB table on the producer. The pull compares a

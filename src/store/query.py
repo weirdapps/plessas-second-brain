@@ -1157,7 +1157,8 @@ def meeting_prep(
 
     Args:
         conn: Database connection
-        people: List of attendee names or emails
+        people: List of attendee names or emails; an address is exact, a name
+            may fit several people
         topic: Optional meeting topic to focus on
         days: How far back to look (default: 90 days)
         limit_per_person: Max emails per person (default: 10)
@@ -1166,7 +1167,8 @@ def meeting_prep(
 
     Returns:
         Dict with keys:
-        - attendees: list of per-person dossiers
+        - attendees: list of per-person dossiers, each with resolved_by,
+          match_count and other_candidates as person_context gives them
         - topic_context: topic-related context (if topic provided)
         Every email, decision, fact and action row carries its source_class.
     """
@@ -1178,7 +1180,7 @@ def meeting_prep(
 
     result: dict[str, Any] = {"attendees": [], "topic_context": None}
 
-    from src.store.context import resolve_person
+    from src.store.person_resolve import resolve_identity
 
     for person in people:
         dossier: dict[str, Any] = {
@@ -1192,9 +1194,11 @@ def meeting_prep(
 
         # One person per attendee, resolved as person_context resolves a name. A
         # folded LIKE in every query merged every namesake into one dossier.
-        person_row, match_count, others = resolve_person(conn, person)
-        dossier["match_count"] = match_count
-        dossier["other_candidates"] = others
+        resolution = resolve_identity(conn, person)
+        person_row = resolution.row
+        dossier["resolved_by"] = resolution.resolved_by
+        dossier["match_count"] = resolution.match_count
+        dossier["other_candidates"] = resolution.other_candidates
         if person_row is None:
             result["attendees"].append(dossier)
             continue

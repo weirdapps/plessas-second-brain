@@ -542,6 +542,40 @@ def test_a_run_extracts_through_extract_one_and_appends_one_record(files, model)
     assert all(r["checks"] and r["raw_text"] for r in rows)
 
 
+def test_the_run_goes_through_the_real_complete_and_logs_its_own_sites(
+    files, monkeypatch, tmp_path
+):
+    """Only the client is fake here: the retry policy, the refusal fallback and the usage
+    log are production's, and the eval's spend shows in that log apart from the sync's."""
+
+    class Messages:
+        def create(self, **kw):
+            prompt = kw["messages"][0]["content"]
+            if "system" in kw:
+                return response(json.dumps(exact_judge(prompt)))
+            assert re.search(r"Subject: (.*)", prompt).group(1) == "subject a"
+            return response(GOOD_A)
+
+    monkeypatch.setattr(
+        claude_extract,
+        "_get_client_and_model",
+        lambda: (SimpleNamespace(messages=Messages()), MODEL),
+    )
+    monkeypatch.setattr(claude_extract, "CLAUDE_MODEL_BASE", MODEL)
+    monkeypatch.setattr(claude_extract, "USAGE_LOG_DIR", tmp_path)
+
+    record = ev.run(
+        files, labelled_cases()[:1], reps=1, workers=1, judge=True, set_sha="s", now=NOW
+    )
+
+    assert (record["rows"]["scored"], record["judge"]["judged"]) == (1, 1)
+    logged = [json.loads(line) for p in tmp_path.glob("llm-usage-*.jsonl") for line in p.open()]
+    assert sorted(entry["site"] for entry in logged) == [
+        "src.evals.extraction._eval_extraction_call",
+        "src.evals.extraction._judge_call",
+    ]
+
+
 def test_the_extraction_prompt_is_the_production_one(files, model):
     fake = model({"subject a": GOOD_A, "subject b": reply()})
 

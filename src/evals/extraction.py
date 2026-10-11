@@ -963,7 +963,9 @@ def _attempt(run: _Run, case: dict, rep: int) -> tuple[dict | None, dict | None]
         error = e
     finally:
         responses, _calls.responses = _calls.responses, None
-    latency = round(time.monotonic() - began, 2)
+    # The whole extraction, the policy's retries and backoff included: complete() hides them,
+    # so this is not the model's latency.
+    wall = round(time.monotonic() - began, 2)
     where = {"case_id": case["id"], "rep": rep, "stage": "extract"}
     if not responses:
         return None, run.error(
@@ -989,7 +991,7 @@ def _attempt(run: _Run, case: dict, rep: int) -> tuple[dict | None, dict | None]
         "model": model,
         "stop_reason": stop,
         "usage": usage,
-        "latency_s": latency,
+        "wall_s": wall,
         "raw_text": raw,
         "extraction": extraction if status == "ok" else None,
         "parse_error": _describe(error, case["item"]) if error is not None else None,

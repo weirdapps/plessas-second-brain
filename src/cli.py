@@ -401,6 +401,10 @@ def cmd_process_attachments(args):
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             return 2
+    if getattr(args, "batch", False) or getattr(args, "batch_collect", False):
+        from src.extract.vertex_batch import cli_process_attachments
+
+        return cli_process_attachments(args, db_path, budget)
 
     # Bounds the run for a caller under an external timeout — the nightly job
     # has TimeoutStartSec=1h and now carries the whole backfill, where a count
@@ -685,6 +689,10 @@ def cmd_reextract(args):
 
     which = {name for name in SELECTORS if getattr(args, name, False)}
     full_parts = getattr(args, "full_parts", None) or None
+    if getattr(args, "batch_collect", False) or getattr(args, "probe", False):
+        from src.extract.vertex_batch import cli_reextract
+
+        return cli_reextract(args, which)
     if not which and not full_parts:
         print(
             "Error: choose at least one of "
@@ -712,6 +720,14 @@ def cmd_reextract(args):
     except ValueError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2
+    batch = getattr(args, "batch", False)
+    if batch:
+        from src.extract.vertex_batch import config_problem
+
+        problem = config_problem()
+        if problem:
+            print(f"Error: {problem}", file=sys.stderr)
+            return 2
     stats = reextract(
         args.db,
         which,
@@ -722,6 +738,7 @@ def cmd_reextract(args):
         after_id=getattr(args, "after_id", 0) or None,
         full_parts=full_parts,
         token_budget=budget,
+        batch=batch,
     )
     print(f"reextract ({chosen}){' DRY RUN' if args.dry_run else ''}:")
     for key in (
@@ -741,6 +758,10 @@ def cmd_reextract(args):
         print(f"  {key:<12}: {stats[key]:,}")
     # No thousands separator: a batch runner passes this back as --after-id.
     print(f"  {'highest id':<12}: {stats['highest_id']}")
+    if "batch" in stats:
+        from src.extract.vertex_batch import print_submit
+
+        print_submit(stats["batch"])
     return 0
 
 
@@ -3845,6 +3866,17 @@ def main():
         action="store_true",
         help="Print the calls, tokens and cost Phase 2's pending work would take; run nothing",
     )
+    parser_process_att.add_argument(
+        "--batch",
+        action="store_true",
+        help="With --phase 2: send the calls as a Vertex AI batch job at half price"
+        " (BRAIN_BATCH_BUCKET); --batch-collect stores the replies",
+    )
+    parser_process_att.add_argument(
+        "--batch-collect",
+        action="store_true",
+        help="Store the replies of every finished batch job; the rest stay pending",
+    )
     parser_process_att.set_defaults(func=cmd_process_attachments)
 
     # Bulk attachment registration (nightly counterpart to the sync's Step 3b)
@@ -4002,6 +4034,22 @@ def main():
         "--estimate",
         action="store_true",
         help="Print the calls, tokens and cost the chosen rows would take; change nothing",
+    )
+    parser_reextract.add_argument(
+        "--batch",
+        action="store_true",
+        help="Send the summaries as a Vertex AI batch job at half price (BRAIN_BATCH_BUCKET)",
+    )
+    parser_reextract.add_argument(
+        "--probe",
+        action="store_true",
+        help="With --batch: send ten requests from stored text, wait, print the replies and"
+        " the cost; store nothing",
+    )
+    parser_reextract.add_argument(
+        "--batch-collect",
+        action="store_true",
+        help="Store the replies of every finished batch job; the rest stay pending",
     )
     parser_reextract.add_argument("--dry-run", action="store_true", help="Count only")
     parser_reextract.add_argument("--workers", type=int, default=4, help="Phase 2 workers")

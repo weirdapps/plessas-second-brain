@@ -51,12 +51,15 @@ the email.
             delete the row to lift it
 
 --token-budget bounds the Phase 2 run (src/llm_cost.py TokenBudget); --estimate prints the calls,
-tokens and cost the chosen rows would take and changes nothing (estimate_reextract).
+tokens and cost the chosen rows would take and changes nothing (estimate_reextract). --batch sends
+the summaries as a Vertex AI batch job at half price, --batch-collect stores its replies, and
+--batch --probe sends ten requests and stores nothing (src/extract/vertex_batch.py).
 """
 
 import math
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from src.config import ATTACHMENTS_DIR, DEFAULT_DB
 from src.extract.attachment_extractors import extract_text_from_file
@@ -197,16 +200,19 @@ def reextract(
     after_id: int | None = None,
     full_parts: list[int] | None = None,
     token_budget: TokenBudget | None = None,
+    batch: bool = False,
 ) -> dict:
     """Read again and summarise again the rows the selectors choose. See the module docstring.
 
     `full_parts` flags those attachments to be summarised from every part, now and on every
     later summary (src/extract/attachment_pipeline.py CAPPED_SUMMARY_PARTS), and summarises them
     again. `token_budget` bounds the Phase 2 run at the end: a row it leaves pending keeps its
-    summary and its vector, and the nightly pass takes it."""
+    summary and its vector, and the nightly pass takes it. With `batch` the summaries go as a
+    Vertex AI batch job (src/extract/vertex_batch.py), described in stats["batch"]; its collect
+    stores them and drops the vectors of what it stores."""
     db_path = str(db_path or DEFAULT_DB)
     root = Path(root) if root else ATTACHMENTS_DIR
-    stats = dict.fromkeys(
+    stats: dict[str, Any] = dict.fromkeys(
         (
             "selected",
             "flagged",
@@ -352,7 +358,16 @@ def reextract(
         conn.commit()
     finally:
         conn.close()
-    if touched:
+    if touched and batch:
+        from src.extract.vertex_batch import submit
+
+        stats["batch"] = submit(
+            db_path,
+            attachment_ids=[att for _, att in touched],
+            token_budget=token_budget,
+            origin="reextract",
+        )
+    elif touched:
         from src.store.embeddings import remove_vectors
 
         p2 = run_phase2(

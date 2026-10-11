@@ -70,6 +70,18 @@ def claude_model() -> str:
     return model
 
 
+def vertex_model_id(model: str) -> str:
+    """A model id as Vertex AI names it: '@' before a date snapshot, e.g.
+    claude-sonnet-4-5-20250929 -> claude-sonnet-4-5@20250929. The len>=8 guard makes this
+    fire ONLY for a trailing YYYYMMDD date; version-only ids like claude-opus-4-8 pass
+    through unchanged and are valid date-less on Vertex (verified: opus-4-8 @ eu returns 200)."""
+    if "@" not in model:
+        parts = model.rsplit("-", 1)
+        if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) >= 8:
+            return f"{parts[0]}@{parts[1]}"
+    return model
+
+
 def vertex_region() -> str:
     """The Vertex region of the Claude calls: VERTEX_SDK_REGION, else CLOUD_ML_REGION."""
     region = _first_set(VERTEX_REGION_VARS)
@@ -112,6 +124,8 @@ def _log_usage(
     max_tokens: int | None = None,
     effort: str | None = None,
     prompt_hash: str | None = None,
+    batch_job: str | None = None,
+    custom_id: str | None = None,
 ) -> None:
     """Append the call's token usage. Never raises: a full disk must not cost an
     extraction.
@@ -122,6 +136,10 @@ def _log_usage(
     budget, its effort (None when the model's default ran) and the hash of its system
     prompt and schema (src/extract/call_shape.py). A field the platform did not report
     is None, never 0: Vertex is not known to return every one of them.
+
+    A call answered in a Vertex AI batch job (src/extract/vertex_batch.py) also names the
+    job, `batch_job`, and its line, `custom_id`, and is priced at batch rates when the log
+    is read (src/llm_cost.py usage_for_day).
     """
     try:
         usage = getattr(response, "usage", None)
@@ -150,6 +168,9 @@ def _log_usage(
             "effort": effort,
             "prompt_hash": prompt_hash,
         }
+        if batch_job is not None:
+            record["batch_job"] = batch_job
+            record["custom_id"] = custom_id
         path = Path(USAGE_LOG_DIR) / f"llm-usage-{now.strftime('%Y-%m')}.jsonl"
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
@@ -210,15 +231,7 @@ def _build_client_and_model():
         from anthropic import AnthropicVertex
 
         region = vertex_region()
-        # Vertex AI wants '@' before a date snapshot, e.g.
-        # claude-sonnet-4-5-20250929 -> claude-sonnet-4-5@20250929.
-        # The len>=8 guard makes this fire ONLY for a trailing YYYYMMDD date;
-        # version-only ids like claude-opus-4-8 pass through unchanged and are
-        # valid date-less on Vertex (verified: opus-4-8 @ eu returns 200).
-        if "@" not in model:
-            parts = model.rsplit("-", 1)
-            if len(parts) == 2 and parts[1].isdigit() and len(parts[1]) >= 8:
-                model = f"{parts[0]}@{parts[1]}"
+        model = vertex_model_id(model)
         print(
             f"second-brain: Claude via Vertex AI, region {region}, model {model}", file=sys.stderr
         )

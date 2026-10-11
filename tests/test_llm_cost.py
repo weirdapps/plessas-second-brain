@@ -54,6 +54,13 @@ def test_cost_is_tokens_times_rate_per_million():
     assert cost_usd(r, cache_read_tokens=1_000_000) == pytest.approx(0.11)
 
 
+def test_a_one_hour_cache_write_costs_more_than_a_five_minute_one():
+    """Call shape v2 caches its system prompt for an hour: 2x input against 1.25x."""
+    r = RATES["claude-sonnet-5-5"]
+    assert cost_usd(r, cache_write_tokens=1_000_000) == pytest.approx(2.75)
+    assert cost_usd(r, cache_write_1h_tokens=1_000_000) == pytest.approx(4.40)
+
+
 @pytest.mark.parametrize(
     "model",
     ["claude-sonnet-5-5", "claude-sonnet-5-5@20261001", "claude-sonnet-5-5[1m]"],
@@ -206,6 +213,42 @@ def test_one_day_of_the_log_by_site(tmp_path):
     assert att["cost_usd"] == pytest.approx(2 * (2.20 + 1.10))
     assert day["cost_usd"] == pytest.approx(2 * 3.30 + 2.20)
     assert day["unpriced_calls"] == 0
+
+
+def test_cache_writes_are_priced_by_their_time_to_live(tmp_path):
+    """A line that splits its writes prices the one-hour part at the one-hour rate; a line
+    written before the split was logged prices them all as five-minute writes."""
+    split = json.loads(_line("2026-10-10T01:00:00+00:00", "s", i=0, o=0, write=1_000_000))
+    split.update(cache_write_5m_tokens=0, cache_write_1h_tokens=1_000_000)
+    _log(
+        tmp_path,
+        "2026-10",
+        [json.dumps(split), _line("2026-10-10T02:00:00+00:00", "s", i=0, o=0, write=1_000_000)],
+    )
+
+    day = usage_for_day(tmp_path, date(2026, 10, 10))
+
+    assert day is not None
+    assert day["cost_usd"] == pytest.approx(4.40 + 2.75)
+    assert day["cache_write_tokens"] == 2_000_000
+    assert day["cache_write_1h_tokens"] == 1_000_000
+    assert day["sites"]["s"]["cost_usd"] == pytest.approx(4.40 + 2.75)
+
+
+def test_a_days_thinking_tokens_are_counted(tmp_path):
+    """Thinking is billed inside output_tokens; the total says what share it takes."""
+    lines = []
+    for hour, thinking in ((1, 100), (2, 50), (3, None)):
+        record = json.loads(_line(f"2026-10-10T0{hour}:00:00+00:00", "s"))
+        record["thinking_tokens"] = thinking
+        lines.append(json.dumps(record))
+    _log(tmp_path, "2026-10", lines)
+
+    day = usage_for_day(tmp_path, date(2026, 10, 10))
+
+    assert day is not None
+    assert day["thinking_tokens"] == 150
+    assert day["output_tokens"] == 300_000
 
 
 def test_a_model_without_a_rate_is_counted_and_left_unpriced(tmp_path):

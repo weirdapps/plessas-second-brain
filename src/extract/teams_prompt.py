@@ -8,6 +8,7 @@ the loader logic stays uniform across kinds.
 import json
 
 from src.extract.untrusted import fence
+from src.redact import PROMPT_RULE
 
 SYSTEM_PROMPT = (
     "You are extracting structured knowledge from a Microsoft Teams thread "
@@ -17,6 +18,7 @@ SYSTEM_PROMPT = (
     "and key_facts in the same language as the thread (e.g. Greek for Greek "
     "threads, English for English threads); the 'language' field is the "
     "ISO 639-1 code for that language."
+    f" {PROMPT_RULE}"
 )
 
 # The chat name and participants' names are third-party text, as the messages

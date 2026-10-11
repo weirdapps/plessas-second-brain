@@ -10,6 +10,7 @@ from typing import Any
 from src.config import USER_NAME, USER_ROLE
 from src.extract.html_text import html_to_text, looks_like_html
 from src.extract.untrusted import fence
+from src.redact import PROMPT_RULE
 
 # Cap on email body chars sent to the LLM. Long bodies (newsletters, deep reply
 # chains) can push the JSON response past max_tokens and fail extraction entirely;
@@ -127,6 +128,7 @@ Rules:
 8. For language, choose based on primary language of content
 9. Extract key_facts only if they are substantive (not just pleasantries)
 10. References should be explicit mentions of docs/links/prior decisions
+11. {PROMPT_RULE}
 
 Return ONLY the JSON object, nothing else."""
 
@@ -234,6 +236,7 @@ Rules:
 6. Ignore tool use details (Read, Write, Bash calls) — focus on the substance of what was discussed and decided
 7. The summary should capture the arc of the conversation, not just list topics
 8. For sentiment, choose the best match from the enum values
+9. {PROMPT_RULE}
 
 Return ONLY the JSON object, nothing else."""
 

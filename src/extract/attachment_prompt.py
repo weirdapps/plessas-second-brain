@@ -4,6 +4,7 @@ import json
 
 from src.config import USER_NAME, USER_ROLE
 from src.extract.untrusted import fence
+from src.redact import PROMPT_RULE
 
 # Phase 2 sends a longer text in parts (src/extract/attachment_pipeline.py). A part stays under
 # the prompt's own 50,000-character guard, with room for the instructions.
@@ -114,7 +115,8 @@ Rules:
 2. Return empty lists for fields with no data
 3. Only extract information actually present in the document
 4. For key_facts, focus on substantive data points, not formatting
-5. For summary, describe what the document IS and what it SAYS, not just the topic"""
+5. For summary, describe what the document IS and what it SAYS, not just the topic
+6. {PROMPT_RULE}"""
 
 
 def build_merge_prompt(

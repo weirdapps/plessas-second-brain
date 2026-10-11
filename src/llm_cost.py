@@ -27,8 +27,10 @@ class Rates:
     batch_input: float
     batch_output: float
     cache_read: float
-    # A five-minute cache write, the only kind the code would ask for.
+    # A five-minute cache write.
     cache_write: float
+    # A one-hour cache write, which call shape v2 asks for (src/extract/call_shape.py).
+    cache_write_1h: float
 
 
 # Vertex AI, `eu` multi-region (10% over the global endpoint), from Google's Vertex AI pricing
@@ -42,6 +44,7 @@ RATES: dict[str, Rates] = {
         batch_output=5.50,
         cache_read=0.11,
         cache_write=2.75,
+        cache_write_1h=4.40,
     ),
 }
 # The rates a dry-run estimate is priced at.
@@ -71,15 +74,18 @@ def cost_usd(
     output_tokens: int = 0,
     cache_read_tokens: int = 0,
     cache_write_tokens: int = 0,
+    cache_write_1h_tokens: int = 0,
     batch: bool = False,
 ) -> float:
-    """The cost of these tokens at these rates, online or as a batch job."""
+    """The cost of these tokens at these rates, online or as a batch job.
+    `cache_write_tokens` are five-minute writes, `cache_write_1h_tokens` one-hour ones."""
     i, o = (rates.batch_input, rates.batch_output) if batch else (rates.input, rates.output)
     return (
         input_tokens * i
         + output_tokens * o
         + cache_read_tokens * rates.cache_read
         + cache_write_tokens * rates.cache_write
+        + cache_write_1h_tokens * rates.cache_write_1h
     ) / 1_000_000
 
 
@@ -184,6 +190,11 @@ def usage_for_day(log_dir: Path, day: date) -> dict | None:
     month has no log. A line that does not parse is skipped; a model with no rate is counted
     in `unpriced_calls` and adds no cost.
 
+    `cache_write_tokens` counts every cache write and `cache_write_1h_tokens` the one-hour
+    ones among them, priced at their own rate; a line from before the split was logged
+    prices its writes as five-minute ones. `thinking_tokens` is the share of the output
+    tokens a line says was thinking.
+
     Only lines that mention the day are parsed, so a month of backfill (hundreds of
     thousands of lines) is read in about a second."""
     path = usage_log_path(log_dir, day)
@@ -192,7 +203,16 @@ def usage_for_day(log_dir: Path, day: date) -> dict | None:
     stamp = day.isoformat()
     sites: dict[str, dict] = {}
     totals = dict.fromkeys(
-        ("calls", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"), 0
+        (
+            "calls",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "cache_write_1h_tokens",
+            "thinking_tokens",
+        ),
+        0,
     )
     cost = 0.0
     unpriced = 0
@@ -211,18 +231,22 @@ def usage_for_day(log_dir: Path, day: date) -> dict | None:
                 "output_tokens": _tokens(record, "output_tokens"),
                 "cache_read_tokens": _tokens(record, "cache_read_input_tokens"),
                 "cache_write_tokens": _tokens(record, "cache_creation_input_tokens"),
+                "cache_write_1h_tokens": _tokens(record, "cache_write_1h_tokens"),
+                "thinking_tokens": _tokens(record, "thinking_tokens"),
             }
             rates = rates_for(record.get("model"))
             call_cost = 0.0
             if rates is None:
                 unpriced += 1
             else:
+                one_hour = min(used["cache_write_1h_tokens"], used["cache_write_tokens"])
                 call_cost = cost_usd(
                     rates,
                     input_tokens=used["input_tokens"],
                     output_tokens=used["output_tokens"],
                     cache_read_tokens=used["cache_read_tokens"],
-                    cache_write_tokens=used["cache_write_tokens"],
+                    cache_write_tokens=used["cache_write_tokens"] - one_hour,
+                    cache_write_1h_tokens=one_hour,
                 )
             site = sites.setdefault(
                 str(record.get("site")),

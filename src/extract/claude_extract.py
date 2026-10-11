@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from src.config import DATA_ROOT
+from src.extract.call_shape import call_shape, max_tokens_attempts, prompt_hash
 from src.llm_policy import (
     Action,
     Attempt,
@@ -99,13 +100,36 @@ MAX_OUTPUT_TOKENS = 8192
 USAGE_LOG_DIR = DATA_ROOT
 
 
-def _log_usage(response: Any, site: str) -> None:
+def _reported(value: Any) -> int | None:
+    """A token count the response reported, or None when it reported none."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _log_usage(
+    response: Any,
+    site: str,
+    *,
+    max_tokens: int | None = None,
+    effort: str | None = None,
+    prompt_hash: str | None = None,
+) -> None:
     """Append the call's token usage. Never raises: a full disk must not cost an
-    extraction."""
+    extraction.
+
+    Besides the tokens: the thinking tokens within output_tokens, the cache writes by
+    time to live (a one-hour write costs more than a five-minute one), the refusal
+    category, the request and response ids, and what the request pinned: its output
+    budget, its effort (None when the model's default ran) and the hash of its system
+    prompt and schema (src/extract/call_shape.py). A field the platform did not report
+    is None, never 0: Vertex is not known to return every one of them.
+    """
     try:
         usage = getattr(response, "usage", None)
         if usage is None:
             return
+        details = getattr(usage, "output_tokens_details", None)
+        ttl = getattr(usage, "cache_creation", None)
+        stop_details = getattr(response, "stop_details", None)
         now = datetime.now(UTC)
         record = {
             "ts": now.isoformat(timespec="seconds"),
@@ -116,6 +140,15 @@ def _log_usage(response: Any, site: str) -> None:
             "output_tokens": getattr(usage, "output_tokens", None),
             "cache_creation_input_tokens": getattr(usage, "cache_creation_input_tokens", None),
             "cache_read_input_tokens": getattr(usage, "cache_read_input_tokens", None),
+            "cache_write_5m_tokens": _reported(getattr(ttl, "ephemeral_5m_input_tokens", None)),
+            "cache_write_1h_tokens": _reported(getattr(ttl, "ephemeral_1h_input_tokens", None)),
+            "thinking_tokens": _reported(getattr(details, "thinking_tokens", None)),
+            "refusal_category": getattr(stop_details, "category", None),
+            "request_id": getattr(response, "_request_id", None),
+            "response_id": getattr(response, "id", None),
+            "max_tokens": max_tokens,
+            "effort": effort,
+            "prompt_hash": prompt_hash,
         }
         path = Path(USAGE_LOG_DIR) / f"llm-usage-{now.strftime('%Y-%m')}.jsonl"
         with open(path, "a", encoding="utf-8") as f:
@@ -471,12 +504,34 @@ def complete(*, max_tokens: int, messages: list, model: str | None = None, **kwa
 
     response = call_with_policy(_do_call, max_call_seconds=120.0, refusal_is_final=True)
     caller = sys._getframe(1)
-    _log_usage(response, f"{caller.f_globals.get('__name__')}.{caller.f_code.co_name}")
+    output_config = kwargs.get("output_config") or {}
+    _log_usage(
+        response,
+        f"{caller.f_globals.get('__name__')}.{caller.f_code.co_name}",
+        max_tokens=max_tokens,
+        effort=output_config.get("effort"),
+        prompt_hash=prompt_hash(kwargs.get("system"), output_config.get("format")),
+    )
     return response
 
 
+class ExtractionRefused(ValueError):
+    """The model refused the item. A ValueError, so the email path counts it as an
+    unusable reply (src/extract/local.py), as it counted a refusal without text."""
+
+
+def refusal_error(response: Any) -> ExtractionRefused:
+    """The error a refused reply raises, naming its category when the platform gave one."""
+    category = getattr(getattr(response, "stop_details", None), "category", None)
+    return ExtractionRefused(f"the model refused the item (category {category or 'unknown'})")
+
+
 def extract_one(email: dict) -> dict | None:
-    """Extract structured data from a single email using Claude."""
+    """Extract structured data from a single email using Claude, in the call shape
+    BRAIN_EXTRACT_CALL_SHAPE picks (src/extract/call_shape.py)."""
+    if call_shape() == "v2":
+        return _extract_one_v2(email)
+
     from src.extract.parser import parse_extraction
     from src.extract.prompt import build_extraction_prompt
 
@@ -495,6 +550,29 @@ def extract_one(email: dict) -> dict | None:
         raise ValueError(f"LLM response truncated at max_tokens={response.usage.output_tokens}")
 
     extraction = parse_extraction(text)
+    extraction["message_id"] = email["message_id"]
+    return extraction
+
+
+def _extract_one_v2(email: dict) -> dict:
+    """extract_one in call shape v2: the cached system prompt, the fenced email, schema v2
+    and a pinned effort; a reply stopped at max_tokens is asked once more at twice the
+    budget. Each billed call is logged on its own. Raises ExtractionRefused for a refusal
+    and ValueError for a reply still cut short or holding no JSON object."""
+    from src.extract.parser import parse_extraction_v2
+    from src.extract.prompt import build_email_request_v2
+
+    request = build_email_request_v2(email)
+    for max_tokens in max_tokens_attempts(request.route):
+        response = complete(**request.kwargs(max_tokens))
+        if getattr(response, "stop_reason", None) != "max_tokens":
+            break
+    stop = getattr(response, "stop_reason", None)
+    if stop == "refusal":
+        raise refusal_error(response)
+    if stop == "max_tokens":
+        raise ValueError(f"LLM response truncated at max_tokens={max_tokens}")
+    extraction = parse_extraction_v2(_response_text(response), kind="email", source=request.source)
     extraction["message_id"] = email["message_id"]
     return extraction
 

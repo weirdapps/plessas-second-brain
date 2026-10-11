@@ -193,12 +193,20 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
     BRAIN_WHATSAPP_MODEL overrides the model; unset, complete() uses the
     configured one, as every other call site does.
     """
+    from src.extract.call_shape import thread_call
     from src.extract.claude_extract import _response_text, complete
 
-    resp = complete(
-        model=os.environ.get("BRAIN_WHATSAPP_MODEL") or None,
-        max_tokens=2048,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
+    # Call shape v1: one call at 2,048. v2: 8,192 at a pinned effort, and once more at
+    # twice that when the reply stops at max_tokens (src/extract/call_shape.py).
+    budgets, pinned = thread_call("whatsapp", 2048)
+    for max_tokens in budgets:
+        resp = complete(
+            model=os.environ.get("BRAIN_WHATSAPP_MODEL") or None,
+            max_tokens=max_tokens,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            **pinned,
+        )
+        if getattr(resp, "stop_reason", None) != "max_tokens":
+            break
     return _response_text(resp)

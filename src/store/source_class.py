@@ -179,23 +179,55 @@ def _require_column(conn: sqlite3.Connection) -> None:
         )
 
 
+def _hidden(
+    include_news: bool, include_automation: bool, classes: Iterable[str] | None
+) -> list[str]:
+    """The classes a read path leaves out: news and automation unless asked for, and, when
+    `classes` is given, every class not in it (the `kinds` a search was asked for)."""
+    hidden = list(hidden_classes(include_news, include_automation))
+    if classes is not None:
+        kept = set(classes)
+        hidden += [name for name in CLASSES if name not in kept and name not in hidden]
+    return hidden
+
+
+def _mailbox_conditions(hidden: list[str], column: str) -> list[str]:
+    """Without the class only the mailbox tells: News is news, External a document or a
+    session note, any other mail (classify() without recipients never says automation)."""
+    conditions = []
+    if NEWS in hidden:
+        conditions.append(f"{column} = '{NEWS_MAILBOX}'")
+    if DOCUMENT in hidden and SESSION_NOTE in hidden:
+        conditions.append(f"{column} = '{DOCUMENT_MAILBOX}'")
+    if MAIL in hidden and AUTOMATION in hidden:
+        conditions.append(f"COALESCE({column}, '') NOT IN ('{NEWS_MAILBOX}', '{DOCUMENT_MAILBOX}')")
+    return conditions
+
+
 def hidden_ids_sql(
-    conn: sqlite3.Connection, include_news: bool = False, include_automation: bool = False
+    conn: sqlite3.Connection,
+    include_news: bool = False,
+    include_automation: bool = False,
+    classes: Iterable[str] | None = None,
 ) -> str | None:
     """A SELECT of the ids of the emails rows a read path leaves out; None when it leaves out
     none. On a store without the class, the News mailbox's unless include_news: nothing there
-    tells automation apart.
+    tells automation apart. `classes`, when given, keeps only rows of those classes (a search's
+    `kinds`), by the mailbox alone on a store without the class.
 
     Answered from idx_emails_source_class, never from the rows: source_class is the table's last
     column, and a column behind the body is reached through the body's overflow pages, so testing
     it row by row read the whole body of every email a query looked at.
     """
+    hidden = _hidden(include_news, include_automation, classes)
     if column_missing(conn):
-        return None if include_news else _NEWS_IDS
-    classes = hidden_classes(include_news, include_automation)
-    if not classes:
+        if classes is None:
+            return None if include_news else _NEWS_IDS
+        conditions = _mailbox_conditions(hidden, "mailbox_name")
+        return "SELECT id FROM emails WHERE " + " OR ".join(conditions) if conditions else None
+    if not hidden:
         return None
-    listed = ", ".join(f"'{name}'" for name in classes)
+    listed = ", ".join(f"'{name}'" for name in hidden)
     return f"SELECT id FROM emails WHERE source_class IN ({listed})"
 
 
@@ -204,24 +236,35 @@ def visible_sql(
     email_id: str,
     include_news: bool = False,
     include_automation: bool = False,
+    classes: Iterable[str] | None = None,
 ) -> str:
     """A WHERE condition that holds unless `email_id`, an SQL expression for an emails.id, names
-    a row of a class the read path leaves out. NULL passes: a Teams, WhatsApp, calendar or
-    conversation item has no email.
+    a row of a class the read path leaves out, or, when `classes` is given, of a class not in
+    it. NULL passes: a Teams, WhatsApp, calendar or conversation item has no email.
 
-    On a store without the class it tests the News mailbox row by row, as reads did before the
+    On a store without the class it tests the mailbox row by row, as reads did before the
     class: the mailbox sits ahead of the body, so each test is one lookup by id, where the set
     of News ids took a scan of the table in every statement: a keyword search on a replica's
     v32 file took 50 ms that way, 6 ms this way, as before.
     """
     if column_missing(conn):
-        if include_news:
+        if classes is None:
+            if include_news:
+                return "1"
+            return (
+                f"NOT EXISTS (SELECT 1 FROM emails AS sc_news WHERE sc_news.id = {email_id}"
+                f" AND sc_news.mailbox_name = '{NEWS_MAILBOX}')"
+            )
+        conditions = _mailbox_conditions(
+            _hidden(include_news, include_automation, classes), "sc_news.mailbox_name"
+        )
+        if not conditions:
             return "1"
         return (
             f"NOT EXISTS (SELECT 1 FROM emails AS sc_news WHERE sc_news.id = {email_id}"
-            f" AND sc_news.mailbox_name = '{NEWS_MAILBOX}')"
+            f" AND ({' OR '.join(conditions)}))"
         )
-    ids = hidden_ids_sql(conn, include_news, include_automation)
+    ids = hidden_ids_sql(conn, include_news, include_automation, classes)
     return "1" if ids is None else f"IFNULL({email_id}, 0) NOT IN ({ids})"
 
 
@@ -230,9 +273,11 @@ def visible_ids(
     email_ids: list,
     include_news: bool = False,
     include_automation: bool = False,
+    classes: Iterable[str] | None = None,
 ) -> list:
-    """The email ids, in their order, less those of a class the read path leaves out."""
-    hidden_sql = hidden_ids_sql(conn, include_news, include_automation)
+    """The email ids, in their order, less those of a class the read path leaves out or, when
+    `classes` is given, not in it."""
+    hidden_sql = hidden_ids_sql(conn, include_news, include_automation, classes)
     if hidden_sql is None or not email_ids:
         return list(email_ids)
     hidden = {

@@ -7,17 +7,31 @@ Ingest: Import standalone documents (not from email) into the knowledge store.
 
 import hashlib
 import json
+import math
 import os
+import re
 import shutil
 import sqlite3
 import threading
 import time
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 from src.config import ATTACHMENTS_DIR, DATA_ROOT, DEFAULT_DB
+from src.extract.attachment_digest import is_spreadsheet, spreadsheet_digest
 from src.extract.attachment_extractors import extract_text_from_file
 from src.extract.vertex_auth import touch_sentinel
+from src.llm_cost import (
+    ESTIMATE_MODEL,
+    OUTPUT_TOKENS_PER_CALL,
+    RATES,
+    OverBudget,
+    TokenBudget,
+    configured_chars_per_token,
+    cost_usd,
+)
 from src.redact import redact_secrets
 from src.store.file_hashes import sha256_of_file
 from src.store.file_sweep import NOT_FULLY_READ_SQL
@@ -39,10 +53,26 @@ LONG_TEXT_CHARS = 50_000
 # long document: left pending for the next run, neither a failure nor a re-auth.
 DEFERRED = "deferred"
 
-# A longer text is summarised from this many parts, spread evenly across it (2,000,000
-# characters at 40,000 a part). Every part of a 40M-character log would be 1,000 calls in a
-# row, more than a night's budget. The whole text is still stored and searchable.
+# A row flagged for full parts (reextract --full-parts) is summarised from this many parts,
+# spread evenly across it (2,000,000 characters at 40,000 a part). Every part of a
+# 40M-character log would be 1,000 calls in a row, more than a night's budget. The whole text
+# is still stored and searchable.
 MAX_SUMMARY_PARTS = 50
+
+# Any other long text is summarised from this many: its first part, its last, and the part
+# richest in headings or table-of-contents lines between them (the middle part when none has
+# any), then the merge. Fifty parts and a merge cost about $3.40 a document at Vertex eu prices,
+# and their key facts were mostly cell and line dumps (audit 2026-10-11). A long spreadsheet
+# takes one call over its digest instead (src/extract/attachment_digest.py).
+CAPPED_SUMMARY_PARTS = 3
+
+# The flag that lifts the cap for one attachment, a sync_metadata key per attachment id, so
+# it needs no schema change: set by reextract --full-parts, it holds for every later summary.
+FULL_PARTS_KEY = "attachment_summary_full:"
+
+# The last element of a phase-2 worker's result when the run's token budget refused its next
+# call: left pending for the next run, neither a failure nor a re-auth.
+OVER_BUDGET = "over budget"
 
 # Each finished part of a long document is kept here, one JSON file per attachment_content
 # row, so a document the budget cuts short resumes where it stopped. Until 2026-10-04 a
@@ -278,20 +308,32 @@ def run_phase1(
     return stats
 
 
-def _complete_and_parse(prompt: str) -> dict:
-    """One Phase 2 model call, parsed into an extraction."""
+def _complete_and_parse(prompt: str, budget: TokenBudget | None = None) -> dict:
+    """One Phase 2 model call, parsed into an extraction.
+
+    With a budget the call is held against it before it is sent, and raises OverBudget instead
+    of being sent when it does not fit; once answered it is charged what the response reports.
+    """
     from src.extract.claude_extract import _response_text, complete
     from src.extract.parser import parse_extraction
 
-    response = complete(
-        # Dense documents (large spreadsheets/decks) yield long extraction
-        # JSON; 2048 truncated it mid-structure on ~40K-char docs, so every
-        # such attachment failed with "Expecting ',' delimiter". Give the
-        # structured output room to complete; parse_extraction additionally
-        # salvages any residual truncation rather than dropping the summary.
-        max_tokens=8192,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    held = budget.reserve(len(prompt)) if budget is not None else 0
+    try:
+        response = complete(
+            # Dense documents (large spreadsheets/decks) yield long extraction
+            # JSON; 2048 truncated it mid-structure on ~40K-char docs, so every
+            # such attachment failed with "Expecting ',' delimiter". Give the
+            # structured output room to complete; parse_extraction additionally
+            # salvages any residual truncation rather than dropping the summary.
+            max_tokens=8192,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except BaseException:
+        if budget is not None:
+            budget.release(held)
+        raise
+    if budget is not None:
+        budget.settle(held, getattr(response, "usage", None))
 
     # _response_text, never content[0]. With extended thinking the model leads the
     # content list with a ThinkingBlock, which carries .thinking and no .text, so
@@ -350,13 +392,23 @@ def _drop_parts(ac_id) -> None:
 
 
 def _extract_in_parts(
-    text, filename, mime_type, email_subject, email_date, out_of_time, ac_id=None
+    text,
+    filename,
+    mime_type,
+    email_subject,
+    email_date,
+    out_of_time,
+    ac_id=None,
+    full=False,
+    budget=None,
 ):
     """Summarise a long text part by part, then once over the parts. None when time ran out.
 
+    The parts are the ones _choose_parts picks: three, or up to MAX_SUMMARY_PARTS when `full`.
     With ``ac_id`` every finished part is saved as it lands, and a part saved by an
     earlier run is reused while its text and place are unchanged, so a document the
-    budget cut short resumes instead of starting over."""
+    budget cut short resumes instead of starting over. A token budget that refuses a
+    part raises OverBudget, with the finished parts saved."""
     from src.extract.attachment_prompt import (
         build_attachment_prompt,
         build_merge_prompt,
@@ -364,7 +416,7 @@ def _extract_in_parts(
     )
 
     parts = split_text(text)
-    chosen = _spread(len(parts), MAX_SUMMARY_PARTS)
+    chosen = _choose_parts(parts, full)
     saved = _load_parts(ac_id)
     extractions = []
     for i in chosen:
@@ -383,7 +435,8 @@ def _extract_in_parts(
                 email_subject=email_subject,
                 email_date=email_date,
                 part=(i + 1, len(parts)),
-            )
+            ),
+            budget,
         )
         extractions.append(extraction)
         saved[str(i)] = {"key": key, "extraction": extraction}
@@ -398,7 +451,8 @@ def _extract_in_parts(
             email_subject=email_subject,
             email_date=email_date,
             covered=(len(chosen), len(parts)),
-        )
+        ),
+        budget,
     )
     _drop_parts(ac_id)
     return merged
@@ -411,13 +465,117 @@ def _spread(n: int, k: int) -> list[int]:
     return [round(j * (n - 1) / (k - 1)) for j in range(k)]
 
 
-def _extract_one_attachment(row, out_of_time=None):
+# What marks a part as the document's outline: a contents title, dotted contents lines ending
+# in a page number, and headings (numbered, Markdown, or a short line in capitals).
+_CONTENTS_TITLE = re.compile(
+    r"^\s*(?:table of contents|contents|περιεχόμενα|πίνακας περιεχομένων)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_CONTENTS_LINE = re.compile(r"^.{3,120}?(?:\.{3,}|…+)\s*\d{1,4}\s*$", re.MULTILINE)
+_HEADING = re.compile(
+    r"^\s*(?:#{1,6}\s+\S.{0,100}|(?:\d{1,2}(?:\.\d{1,2}){0,3}|[IVX]{1,5})[.)]?\s+\S.{0,100})$",
+    re.MULTILINE,
+)
+
+
+def _outline_score(text: str) -> int:
+    """How much of a part reads as headings or a table of contents."""
+    capitals = sum(
+        1
+        for line in text.splitlines()
+        if 4 <= len(line.strip()) <= 80 and line.isupper() and sum(c.isalpha() for c in line) >= 3
+    )
+    return (
+        10 * len(_CONTENTS_TITLE.findall(text))
+        + 2 * len(_CONTENTS_LINE.findall(text))
+        + len(_HEADING.findall(text))
+        + capitals
+    )
+
+
+def _choose_parts(parts: list[str], full: bool) -> list[int]:
+    """The parts of a long text that are summarised, by index, in order.
+
+    Flagged (`full`): up to MAX_SUMMARY_PARTS spread evenly. Otherwise CAPPED_SUMMARY_PARTS:
+    the first part, the last, and between them the one richest in headings or contents lines,
+    the earliest on a tie and the middle one when none has any."""
+    n = len(parts)
+    if full:
+        return _spread(n, MAX_SUMMARY_PARTS)
+    if n <= CAPPED_SUMMARY_PARTS:
+        return list(range(n))
+    scores = {i: _outline_score(parts[i]) for i in range(1, n - 1)}
+    best = max(scores, key=lambda i: (scores[i], -i))
+    return [0, best if scores[best] else n // 2, n - 1]
+
+
+class _Phase2Row(NamedTuple):
+    """A Phase 2 candidate as run_phase2 selects it. The last two have defaults, so a bare
+    eight-column row (an older caller's) reads as a text of unknown method, not flagged."""
+
+    ac_id: int
+    att_id: int
+    text: str
+    filename: str
+    mime_type: str | None
+    email_id: int | None
+    email_subject: str | None
+    email_date: str | None
+    method: str | None = None
+    full: bool = False
+
+
+def _route(row: _Phase2Row) -> str:
+    """How a row is summarised: 'single' (one call over the text), 'digest' (one call over a
+    long spreadsheet's digest) or 'parts' (chosen parts, then a merge)."""
+    if len(row.text or "") <= LONG_TEXT_CHARS:
+        return "single"
+    if not row.full and is_spreadsheet(row.method):
+        return "digest"
+    return "parts"
+
+
+def _attachment_prompt(row: _Phase2Row, text: str, **kwargs) -> str:
+    from src.extract.attachment_prompt import build_attachment_prompt
+
+    return build_attachment_prompt(
+        extracted_text=text,
+        filename=row.filename,
+        mime_type=row.mime_type or "",
+        email_subject=row.email_subject,
+        email_date=row.email_date,
+        **kwargs,
+    )
+
+
+def mark_full_parts(conn: sqlite3.Connection, attachment_ids: Iterable[int]) -> None:
+    """Flag attachments to be summarised from every part (up to MAX_SUMMARY_PARTS)."""
+    now = datetime.now().isoformat()
+    conn.executemany(
+        "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES (?, ?)",
+        [(f"{FULL_PARTS_KEY}{int(att)}", now) for att in attachment_ids],
+    )
+    conn.commit()
+
+
+def full_parts_ids(conn: sqlite3.Connection) -> set[int]:
+    """The attachment ids flagged for full parts."""
+    return {
+        int(key[len(FULL_PARTS_KEY) :])
+        for (key,) in conn.execute(
+            "SELECT key FROM sync_metadata WHERE key LIKE ?", (f"{FULL_PARTS_KEY}%",)
+        )
+    }
+
+
+def _extract_one_attachment(row, out_of_time=None, budget=None):
     """Worker: call LLM for a single attachment.
 
     Returns ``(ac_id, email_id, extraction, error, auth_error)``. On success ``error`` is
     None and ``extraction`` is the parsed dict; on failure the reverse, with ``error``
     serialised for the DB column. ``auth_error`` is True for a re-authable failure,
-    ``TRANSIENT`` for a failure of the service, and False otherwise.
+    ``TRANSIENT`` for a failure of the service, ``OVER_BUDGET`` when the run's token budget
+    refused a call, and False otherwise.
 
     ``auth_error`` EXISTS BECAUSE THE VERDICT CANNOT BE RECOVERED FROM THE STRING. The
     caller writes ``pending`` for a re-authable failure and ``failed`` for a permanent
@@ -429,33 +587,44 @@ def _extract_one_attachment(row, out_of_time=None):
     so a string test applied downstream calls a recoverable 401 permanent. Decide it here,
     with the exception in hand, and hand the answer on.
     """
-    from src.extract.attachment_prompt import build_attachment_prompt
     from src.extract.policy_bridge import classify_exception, is_item_timeout, is_transient
     from src.llm_policy import Outcome
 
-    ac_id, att_id, text, filename, mime_type, email_id, email_subject, email_date = row
+    r = _Phase2Row(*row)
 
     try:
+        route = _route(r)
         # A long text goes in parts, and `out_of_time` is asked between them: the deadline is
         # checked before an item is dispatched, and a long document is many calls long.
-        if len(text or "") > LONG_TEXT_CHARS:
+        if route == "parts":
             extraction = _extract_in_parts(
-                text, filename, mime_type, email_subject, email_date, out_of_time, ac_id=ac_id
+                r.text,
+                r.filename,
+                r.mime_type,
+                r.email_subject,
+                r.email_date,
+                out_of_time,
+                ac_id=r.ac_id,
+                full=r.full,
+                budget=budget,
             )
             if extraction is None:
-                return (ac_id, email_id, None, "deferred: out of time between parts", DEFERRED)
-            return (ac_id, email_id, extraction, None, False)
+                return (r.ac_id, r.email_id, None, "deferred: out of time between parts", DEFERRED)
+            return (r.ac_id, r.email_id, extraction, None, False)
 
-        prompt = build_attachment_prompt(
-            extracted_text=text,
-            filename=filename,
-            mime_type=mime_type,
-            email_subject=email_subject,
-            email_date=email_date,
-        )
-        extraction = _complete_and_parse(prompt)
-        return (ac_id, email_id, extraction, None, False)
+        if route == "digest":
+            extraction = _complete_and_parse(
+                _attachment_prompt(r, spreadsheet_digest(r.text), digest=True), budget
+            )
+            # Parts an older run saved for this row, when long spreadsheets still went in parts.
+            _drop_parts(r.ac_id)
+            return (r.ac_id, r.email_id, extraction, None, False)
 
+        extraction = _complete_and_parse(_attachment_prompt(r, r.text), budget)
+        return (r.ac_id, r.email_id, extraction, None, False)
+
+    except OverBudget as e:
+        return (r.ac_id, r.email_id, None, f"deferred: {e}", OVER_BUDGET)
     except Exception as e:
         verdict: bool | str = classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED
         # The service failed, not the item, the same split as the calendar path in
@@ -467,7 +636,7 @@ def _extract_one_attachment(row, out_of_time=None):
         # nightly stage every night, so it stays terminal as before.
         if not verdict and is_transient(e) and not is_item_timeout(e):
             verdict = TRANSIENT
-        return (ac_id, email_id, None, f"{type(e).__name__}: {str(e)[:500]}", verdict)
+        return (r.ac_id, r.email_id, None, f"{type(e).__name__}: {str(e)[:500]}", verdict)
 
 
 def _held(conn: sqlite3.Connection, table: str, column: str, email_id: int, value: str) -> bool:
@@ -481,6 +650,61 @@ def _held(conn: sqlite3.Connection, table: str, column: str, email_id: int, valu
     )
 
 
+_PHASE2_FROM = """
+        FROM attachment_content ac
+        JOIN attachments a ON a.id = ac.attachment_id
+        LEFT JOIN emails e ON e.id = a.email_id
+"""
+# The columns of a _Phase2Row, bar the flag.
+_PHASE2_SELECT = (
+    """
+        SELECT ac.id, ac.attachment_id, ac.extracted_text,
+               a.filename, a.mime_type, a.email_id,
+               e.subject, e.date_received, ac.extraction_method"""
+    + _PHASE2_FROM
+)
+
+
+def _phase2_candidates(
+    file_type: str | None,
+    attachment_ids: list[int] | None,
+    max_text_chars: int | None,
+    limit: int,
+    select: str = _PHASE2_SELECT,
+) -> tuple[str, list]:
+    """The query (and its parameters) for the rows Phase 2 summarises, in the order it takes
+    them. `select` is the SELECT and FROM it starts with."""
+    type_condition, type_params = _build_mime_type_conditions(file_type)
+
+    query = (
+        select
+        + """        WHERE ac.extraction_status = 'extracted'
+          AND ac.llm_status = 'pending'
+    """
+    )
+
+    params = list(type_params)
+
+    # Scope to specific attachment IDs if provided
+    if attachment_ids:
+        placeholders = ",".join("?" * len(attachment_ids))
+        query += f"\n        AND ac.attachment_id IN ({placeholders})"
+        params.extend(attachment_ids)
+
+    if type_condition:
+        query += f"\n        {type_condition}"
+    if max_text_chars is not None:
+        query += "\n        AND length(ac.extracted_text) <= ?"
+        params.append(max_text_chars)
+    # Short texts first, then by id. A long document is many calls long, and in id order
+    # the long rows of 10-01 came first every night, so 743 short rows waited behind them
+    # for days (2026-10-04). A long one cut short now resumes, so going last costs it nothing.
+    query += f"\n        ORDER BY length(ac.extracted_text) > {LONG_TEXT_CHARS}, ac.id"
+    if limit > 0:
+        query += f"\n        LIMIT {int(limit)}"
+    return query, params
+
+
 def run_phase2(
     db_path: str | None = None,
     limit: int = 0,
@@ -489,6 +713,7 @@ def run_phase2(
     attachment_ids: list[int] | None = None,
     workers: int = 1,
     max_text_chars: int | None = None,
+    token_budget: TokenBudget | None = None,
 ) -> dict:
     """Run Phase 2: Vertex AI structured extraction on extracted text.
 
@@ -513,9 +738,13 @@ def run_phase2(
         max_text_chars: Leave texts longer than this pending. The hourly sync passes
             LONG_TEXT_CHARS: a long text is summarised in many calls, which belong in the
             nightly pass's budget, not in a 600 s unit.
+        token_budget: Optional TokenBudget, input and output tokens together. Each call is
+            estimated before it is sent, and the first that would pass the budget stops the
+            run: nothing further is dispatched, and the rest are returned as `over_budget`,
+            left at llm_status='pending' for the next run. None = no limit.
 
     Returns:
-        Dict with processing stats: processed, extracted, failed, deferred.
+        Dict with processing stats: processed, extracted, failed, deferred, over_budget.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -524,47 +753,18 @@ def run_phase2(
     db_path = db_path or str(DEFAULT_DB)
     conn = _connect(db_path)
 
-    type_condition, type_params = _build_mime_type_conditions(file_type)
+    query, params = _phase2_candidates(file_type, attachment_ids, max_text_chars, limit)
+    flagged = full_parts_ids(conn)
+    rows = [_Phase2Row._make((*r, r[1] in flagged)) for r in conn.execute(query, params)]
 
-    # Build query for Phase 2 candidates
-    query = """
-        SELECT ac.id, ac.attachment_id, ac.extracted_text,
-               a.filename, a.mime_type, a.email_id,
-               e.subject, e.date_received
-        FROM attachment_content ac
-        JOIN attachments a ON a.id = ac.attachment_id
-        LEFT JOIN emails e ON e.id = a.email_id
-        WHERE ac.extraction_status = 'extracted'
-          AND ac.llm_status = 'pending'
-    """
-
-    params = list(type_params)
-
-    # Scope to specific attachment IDs if provided
-    if attachment_ids:
-        placeholders = ",".join("?" * len(attachment_ids))
-        query += f"\n        AND ac.attachment_id IN ({placeholders})"
-        params.extend(attachment_ids)
-
-    if type_condition:
-        query += f"\n        {type_condition}"
-    if max_text_chars is not None:
-        query += "\n        AND length(ac.extracted_text) <= ?"
-        params.append(max_text_chars)
-    # Short texts first, then by id. A long document is many calls long, and in id order
-    # the long rows of 10-01 came first every night, so 743 short rows waited behind them
-    # for days (2026-10-04). A long one cut short now resumes, so going last costs it nothing.
-    query += f"\n        ORDER BY length(ac.extracted_text) > {LONG_TEXT_CHARS}, ac.id"
-    if limit > 0:
-        query += f"\n        LIMIT {int(limit)}"
-
-    rows = conn.execute(query, params).fetchall()
-
-    stats = {"processed": 0, "extracted": 0, "failed": 0, "deferred": 0}
+    stats = {"processed": 0, "extracted": 0, "failed": 0, "deferred": 0, "over_budget": 0}
     deadline = None if deadline_s is None else time.monotonic() + deadline_s
 
     def _out_of_time() -> bool:
         return deadline is not None and time.monotonic() >= deadline
+
+    def _over_budget() -> bool:
+        return token_budget is not None and token_budget.exhausted
 
     def _store_result(ac_id, email_id, extraction, error, auth_error):
         """Store a single result in the DB (called from main thread).
@@ -577,6 +777,11 @@ def run_phase2(
             # Out of time between the parts of a long document: still pending, and not a
             # failure, so the next run takes it from the start.
             stats["deferred"] += 1
+            return
+        if auth_error == OVER_BUDGET:
+            # The run's token budget refused its next call: still pending, and not a failure.
+            # The parts a long document finished are saved, so the next run resumes it.
+            stats["over_budget"] += 1
             return
         now = datetime.now().isoformat()
         if error:
@@ -703,8 +908,11 @@ def run_phase2(
             if _out_of_time():
                 stats["deferred"] += 1
                 continue
+            if _over_budget():
+                stats["over_budget"] += 1
+                continue
             ac_id, email_id, extraction, error, auth_error = _extract_one_attachment(
-                row, _out_of_time
+                row, _out_of_time, token_budget
             )
             _store_result(ac_id, email_id, extraction, error, auth_error)
             if stats["processed"] % PHASE2_BATCH_SIZE == 0:
@@ -721,7 +929,9 @@ def run_phase2(
             def _run_or_defer(row):
                 if _out_of_time():
                     return None
-                return _extract_one_attachment(row, _out_of_time)
+                if _over_budget():
+                    return (row[0], row[5], None, "deferred: token budget spent", OVER_BUDGET)
+                return _extract_one_attachment(row, _out_of_time, token_budget)
 
             futures = {executor.submit(_run_or_defer, row): row for row in rows}
             for future in as_completed(futures):
@@ -735,6 +945,109 @@ def run_phase2(
     conn.commit()
     conn.close()
     return stats
+
+
+def _planned_calls(row: _Phase2Row) -> list[tuple[int, int]]:
+    """Each call Phase 2 would make for a row, as (prompt characters, part answers it carries).
+
+    The prompts are built as the run builds them; the merge's carries the chosen parts'
+    answers, which do not exist before the run and are counted at OUTPUT_TOKENS_PER_CALL each.
+    """
+    from src.extract.attachment_prompt import build_merge_prompt, split_text
+
+    route = _route(row)
+    if route == "single":
+        return [(len(_attachment_prompt(row, row.text)), 0)]
+    if route == "digest":
+        return [(len(_attachment_prompt(row, spreadsheet_digest(row.text), digest=True)), 0)]
+    parts = split_text(row.text)
+    chosen = _choose_parts(parts, row.full)
+    calls = [(len(_attachment_prompt(row, parts[i], part=(i + 1, len(parts)))), 0) for i in chosen]
+    merge = build_merge_prompt(
+        [],
+        filename=row.filename,
+        mime_type=row.mime_type or "",
+        email_subject=row.email_subject,
+        email_date=row.email_date,
+        covered=(len(chosen), len(parts)),
+    )
+    return [*calls, (len(merge), len(chosen))]
+
+
+def estimate_rows(rows: Iterable[_Phase2Row], chars_per_token: float | None = None) -> dict:
+    """The calls, tokens and cost of summarising these rows, asking the model nothing.
+
+    Input tokens are the prompts' characters at `chars_per_token` (BRAIN_CHARS_PER_TOKEN,
+    1.6 by default); output tokens are OUTPUT_TOKENS_PER_CALL a call. Priced at ESTIMATE_MODEL,
+    online and as a batch job. A cut-short document's saved parts are counted again, so for
+    one of those the estimate is an upper bound."""
+    cpt = chars_per_token or configured_chars_per_token()
+    count = calls = input_tokens = 0
+    for row in rows:
+        count += 1
+        for chars, answers in _planned_calls(row):
+            calls += 1
+            input_tokens += math.ceil(chars / cpt) + answers * OUTPUT_TOKENS_PER_CALL
+    output_tokens = calls * OUTPUT_TOKENS_PER_CALL
+    rates = RATES[ESTIMATE_MODEL]
+    return {
+        "rows": count,
+        "calls": calls,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "chars_per_token": cpt,
+        "model": ESTIMATE_MODEL,
+        "cost_usd": cost_usd(rates, input_tokens=input_tokens, output_tokens=output_tokens),
+        "batch_cost_usd": cost_usd(
+            rates, input_tokens=input_tokens, output_tokens=output_tokens, batch=True
+        ),
+    }
+
+
+def estimate_phase2(
+    db_path: str | None = None,
+    limit: int = 0,
+    file_type: str | None = None,
+    attachment_ids: list[int] | None = None,
+    chars_per_token: float | None = None,
+) -> dict:
+    """What run_phase2 would spend on the rows it would take now: see estimate_rows.
+
+    The rows are put in Phase 2's order by id alone and then read one at a time: sorting them
+    whole would hold every pending text in SQLite's sorter at once."""
+    conn = _connect(db_path or str(DEFAULT_DB))
+    try:
+        query, params = _phase2_candidates(
+            file_type, attachment_ids, None, limit, select="SELECT ac.id" + _PHASE2_FROM
+        )
+        ids = [ac_id for (ac_id,) in conn.execute(query, params)]
+    finally:
+        conn.close()
+    return estimate_summaries(db_path, ids, (), chars_per_token)
+
+
+def estimate_summaries(
+    db_path: str | None,
+    ac_ids: Iterable[int],
+    full_parts: Iterable[int] = (),
+    chars_per_token: float | None = None,
+) -> dict:
+    """What summarising these content rows again would spend, whatever their status now:
+    see estimate_rows. `full_parts` are attachment ids to count as flagged though they are
+    not flagged yet. Reads one stored text at a time."""
+    conn = _connect(db_path or str(DEFAULT_DB))
+    try:
+        flagged = full_parts_ids(conn) | set(full_parts)
+
+        def rows():
+            for ac_id in ac_ids:
+                r = conn.execute(_PHASE2_SELECT + " WHERE ac.id = ?", (ac_id,)).fetchone()
+                if r is not None and r[2]:
+                    yield _Phase2Row._make((*r, r[1] in flagged))
+
+        return estimate_rows(rows(), chars_per_token)
+    finally:
+        conn.close()
 
 
 def _sha256_to_message_id(sha256: str) -> int:

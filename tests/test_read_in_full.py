@@ -161,7 +161,7 @@ def test_a_text_cut_at_the_ceiling_says_its_file_is_kept(tmp_path, monkeypatch):
     assert "file kept" in result["error"]
 
 
-def test_a_very_long_text_is_summarised_from_fifty_parts_spread_across_it(monkeypatch):
+def test_a_flagged_very_long_text_is_summarised_from_fifty_parts_spread_across_it(monkeypatch):
     from src.extract import attachment_pipeline as ap
     from src.extract import attachment_prompt as prompt
 
@@ -175,16 +175,16 @@ def test_a_very_long_text_is_summarised_from_fifty_parts_spread_across_it(monkey
         "build_merge_prompt",
         lambda parts, **kw: merged.append((len(parts), kw["covered"])) or "m",
     )
-    monkeypatch.setattr(ap, "_complete_and_parse", lambda _prompt: {"summary": "s"})
+    monkeypatch.setattr(ap, "_complete_and_parse", lambda _prompt, _budget=None: {"summary": "s"})
 
-    ap._extract_in_parts("x", "log.txt", "text/plain", None, None, None)
+    ap._extract_in_parts("x", "log.txt", "text/plain", None, None, None, full=True)
 
     assert len(asked) == 50
     assert (asked[0], asked[-1]) == ((1, 120), (120, 120))
     assert merged == [(50, (50, 120))]
 
 
-def test_a_long_text_of_fifty_parts_or_fewer_is_summarised_whole(monkeypatch):
+def test_a_flagged_long_text_of_fifty_parts_or_fewer_is_summarised_whole(monkeypatch):
     from src.extract import attachment_pipeline as ap
     from src.extract import attachment_prompt as prompt
 
@@ -198,9 +198,9 @@ def test_a_long_text_of_fifty_parts_or_fewer_is_summarised_whole(monkeypatch):
         "build_merge_prompt",
         lambda parts, **kw: merged.append((len(parts), kw["covered"])) or "m",
     )
-    monkeypatch.setattr(ap, "_complete_and_parse", lambda _prompt: {"summary": "s"})
+    monkeypatch.setattr(ap, "_complete_and_parse", lambda _prompt, _budget=None: {"summary": "s"})
 
-    ap._extract_in_parts("x", "log.txt", "text/plain", None, None, None)
+    ap._extract_in_parts("x", "log.txt", "text/plain", None, None, None, full=True)
 
     assert len(asked) == 30
     assert merged == [(30, (30, 30))]

@@ -2433,6 +2433,47 @@ def cmd_teams_backfill_replies(args):
     return 0
 
 
+def cmd_teams_strip_html(args):
+    """Convert Teams message text still stored as HTML; no Teams or model call.
+
+    Ingest converted a message only when its payload declared "html", which the chat
+    service never sends, so until #187 the text of every HTML message was its HTML.
+    One-off, on the producer: it converts those rows from the HTML each keeps, by the
+    rule ingest now uses, and the full-text index follows (see
+    teams_export.strip_stored_html). A second run changes nothing. --dry-run opens the
+    database read-only and counts; --limit caps the rows changed. It prints counts,
+    never message text, and sends nothing back to extraction.
+    """
+    import sqlite3
+
+    from src.export.teams_export import strip_stored_html
+    from src.store.schema import get_connection
+
+    if not Path(args.db).exists():
+        print(f"Error: database not found: {args.db}", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        conn = sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)
+    else:
+        conn = get_connection(str(args.db))
+    try:
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'teams_messages'"
+        ).fetchone():
+            print("No Teams tables in this store: nothing to convert.")
+            return 0
+        c = strip_stored_html(conn, limit=args.limit, dry_run=args.dry_run)
+    finally:
+        conn.close()
+    print(f"teams-strip-html: {'DRY RUN (nothing written)' if args.dry_run else 'APPLIED'}")
+    print(f"  {'scanned':<12}: {c['scanned']:,} (text holding '<' or '&')")
+    print(f"  {'would change' if args.dry_run else 'changed':<12}: {c['changed']:,}")
+    print(f"  {'unchanged':<12}: {c['unchanged']:,}")
+    if c["stopped_at_limit"]:
+        print(f"  stopped at --limit {args.limit:,}: run it again for the rest")
+    return 0
+
+
 def cmd_whatsapp_sync(args):
     """Ingest the pushed WhatsApp snapshot, then bound, extract and embed sessions.
 
@@ -4001,6 +4042,19 @@ def main():
         help="Store the channel replies stored posts hold (one-off, producer only, no Teams call)",
     )
     parser_teams_backfill.set_defaults(func=cmd_teams_backfill_replies)
+
+    parser_teams_strip = subparsers.add_parser(
+        "teams-strip-html",
+        help="Convert the stored text of Teams messages still held as HTML "
+        "(one-off, producer only, no Teams or model call)",
+    )
+    parser_teams_strip.add_argument(
+        "--dry-run", action="store_true", help="Count only, read-only: nothing written"
+    )
+    parser_teams_strip.add_argument(
+        "--limit", type=int, default=0, help="Change at most this many rows (0 = all)"
+    )
+    parser_teams_strip.set_defaults(func=cmd_teams_strip_html)
 
     parser_teams_search = subparsers.add_parser("teams-search", help="Search Teams content")
     parser_teams_search.add_argument("query", help="Search query")

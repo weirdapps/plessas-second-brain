@@ -198,3 +198,54 @@ def test_pull_request_heads_on_origin_are_scanned_and_cleaned_up(repo, denylist,
     assert result.returncode == 1
     assert planted in result.stdout
     assert _git(repo, "for-each-ref", "refs/gauntlet-pr/") == ""
+
+
+def test_the_output_counts_the_pull_request_heads_it_scanned(repo, denylist, tmp_path):
+    """A PASS over 0 pull-request heads and a PASS over 61 read the same unless the
+    run says how many it saw."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "push", "-q", "origin", "main")
+    for n in (3, 4):
+        _git(repo, "push", "-q", "origin", f"HEAD:refs/pull/{n}/head")
+
+    result = _run(repo, denylist)
+
+    assert result.returncode == 0, result.stdout
+    assert "Pull-request heads scanned: 2" in result.stdout
+
+
+def test_a_regex_published_with_escapes_is_checked_as_the_value_it_encodes(repo, tmp_path):
+    """The old inline denylist published its entries as regexes, dots escaped. A
+    denylist pattern for the value matches the value, not its escaped spelling, so
+    the history check printed OK for an address that was in the published text."""
+    escaped = MARKER.replace("plant", r"\.plant\-")
+    value = MARKER.replace("plant", ".plant-")
+    deny = tmp_path / "escaped.conf"
+    pattern = value.replace(".", "\\.")
+    deny.write_text(f"Planted value\t{pattern}\t\n")
+    (repo / "notes.txt").write_text(f'check "Leak" "{escaped}"\n')
+    planted = _commit(repo, "a published regex")
+    (repo / "notes.txt").unlink()
+    _commit(repo, "remove it")
+
+    result = _run(repo, deny)
+
+    assert result.returncode == 1, result.stdout
+    assert "FAIL [Planted value]" in result.stdout
+    assert planted in result.stdout
+
+
+@pytest.mark.parametrize("name", ["LICENSE", "LICENSE.md", "docs/LICENSE.txt"])
+def test_a_licence_is_not_scanned(repo, denylist, name):
+    """The owner's name in the licence is intended; CI and doctor modes already
+    skip it, and history mode convicted every repository for it."""
+    path = repo / name
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(f"Copyright 2026 {MARKER}\n")
+    _commit(repo, "licence")
+
+    result = _run(repo, denylist)
+
+    assert result.returncode == 0, result.stdout

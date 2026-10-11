@@ -36,3 +36,8 @@ venv
 # so both forms are needed; a bare `htmlcov` would not match the directory.
 .coverage.*
 htmlcov/
+coverage.xml
+
+# Local session notes of the Remember plugin: personal by nature, and only the
+# plugin's own nested .gitignore kept them out until now.
+.remember/

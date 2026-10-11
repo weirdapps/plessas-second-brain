@@ -582,9 +582,16 @@ Pre-commit hooks are wired via `.pre-commit-config.yaml` (`ruff`, `mypy`, `gitle
 
 ### CI
 
-- `.github/workflows/ci.yml`, on every push and PR to `master`, five jobs: `lint` (`ruff check` and `ruff format --check`), `test` (`uv sync --frozen --no-build --extra dev`, then `pytest` with coverage over `src` and `scripts`), `types` (`mypy` over `src/` and `scripts/`, pinned), `pii-gauntlet`, and `wrappers` (parses every script in `scripts/wrappers/` with the interpreter named in its shebang).
-- `.github/workflows/sonarcloud.yml`: SonarCloud coverage upload (skipped on private repos by design; runs only when `SONAR_TOKEN` is present and the repo is public).
+- `.github/workflows/ci.yml`, on every push and PR to `master`, five jobs: `lint` (`ruff check` and `ruff format --check`), `test` (`uv sync --frozen --no-build --extra dev`, then `pytest` with coverage over `src` and `scripts`, failing below 85%), `types` (`mypy` over `src/` and `scripts/`, pinned), `pii-gauntlet` (`scripts/pii-gauntlet.sh --mode=ci`), and `wrappers` (parses every script in `scripts/wrappers/` with the interpreter named in its shebang). `test` and `types` run on Python 3.12, the floor `pyproject.toml` declares, and 3.14, what the reference hosts run, so their checks are named `test (3.12)`, `test (3.14)`, `types (3.12)` and `types (3.14)`.
 - `.github/workflows/dependabot-auto-merge.yml`: auto-merge for green Dependabot PRs.
+
+The `pii-gauntlet` job checks every tracked file and filename for the employer's name and mail domain, tenant hosts and ids, all-caps Greek names, Greek phone numbers, IBANs (mod-97 checked), card numbers (Luhn checked), public IPv4 addresses and tailnet hosts. A hit prints `path:line` and never the matched text, because the log of a public repository's run is public. The name checks (people, family, partners, private paths) need a private denylist, which the job reads from the `PII_DENYLIST` repository secret: the denylist file's text, one check per line, label, pattern and exclude separated by tabs. The job writes it to a mode-600 temporary file and passes its path in the `PII_DENYLIST` variable the script already reads. Set or update it with:
+
+```bash
+gh secret set PII_DENYLIST --repo <owner>/<repo> < ~/.claude/private/pii-denylist.conf
+```
+
+Without the secret the name checks print `SKIP` and the job still passes on the generic checks; that is what a fork, a Dependabot run or a colleague's copy gets, since GitHub hands secrets to none of them. Each check's label is printed in the log, so keep labels generic ("Peer/colleague names", never a name). A pattern must compile under GNU grep, which the runner uses: one that does not fails its check instead of passing it.
 
 Dependabot is configured for the `uv` ecosystem (see `.github/dependabot.yml`), so PRs update `uv.lock`.
 

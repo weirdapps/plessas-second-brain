@@ -100,7 +100,7 @@ This changes results: decisions, actions and key facts from news items and from 
 
   The answer leads with what decides how far to trust it: `summary` (its first key `semantic`), then `data_as_of` and `stale`, then `_stale_warning` when the local database is behind, then `truncated` when the budget cut rows, and only then the buckets. A result too big to show inline used to end with these, where the preview of the saved file could not see them. `limit_per_kind` is 1 to 10 (default 5). Rows carry summaries cut to about 300 characters, and no `snippet` that only repeats the row's subject, title or summary.
 
-  `include_context` (default `false`) attaches the person and topic dossiers the query matches, as `person_context` and `topic_context`, with `summary.has_person_context` and `has_topic_context`. They used to be attached to every call: 27% of an average payload, often for the wrong entity, since a topic word can start a person's name. Call `person_context` or `topic_context` directly for a full dossier.
+  `include_context` (default `false`) attaches the person and topic dossiers the query matches, as `person_context` and `topic_context`, with `summary.has_person_context` and `has_topic_context`. They used to be attached to every call: 27% of an average payload, often for the wrong entity, since a topic word can start a person's name. The person dossier comes only when the query is an address, a Teams MRI or a WhatsApp JID, or a name that fits one person (`match_count` 1, rows the alias map joins counting once); a surname that fits several people used to attach whichever was most emailed. Call `person_context` or `topic_context` directly for a full dossier.
 
   Only the `emails` bucket is a keyword plus semantic fusion (reciprocal rank fusion over FTS5 and embedding hits, degrading to keyword-only if the index or credentials are absent). Every other bucket is keyword-only. News and automation are left out of every bucket, the semantic candidates and both dossiers unless included (see above).
 
@@ -117,10 +117,12 @@ Mail deleted or junked in Outlook keeps the folder it had, where it used to be r
 
 ### People and topics
 
-- `person_context(name_or_email, days, limit, include_news, include_automation)`. History, sentiment, decisions, open actions, communication pattern, `teams`: the messages they wrote in the window and the threads they wrote in (`recent_threads`, with `recent_threads_total`), and `whatsapp`, the same for WhatsApp, matched on a name of two words or more against sender names, since WhatsApp has no address to join on. Each list is capped at `limit` (default 20) and carries a `<name>_total` sibling with the real count, so a truncated answer is distinguishable from a complete one. A name is matched ignoring case and accents; when several people match, the most-emailed one is used and `match_count` / `other_candidates` say who else it could be (`sender_brief` and `meeting_prep` resolve names the same way).
+- `person_context(name_or_email, days, limit, include_news, include_automation)`. History, sentiment, decisions, open actions, communication pattern, `teams`: the messages they wrote in the window and the threads they wrote in (`recent_threads`, with `recent_threads_total`), and `whatsapp`, the same for WhatsApp, matched on a name of two words or more against sender names, since WhatsApp has no address to join on. Each list is capped at `limit` (default 20) and carries a `<name>_total` sibling with the real count, so a truncated answer is distinguishable from a complete one. An address, a Teams MRI or a WhatsApp JID resolves exactly; pass one when you have it. A name is matched ignoring case, accents and script, in the common romanisations of Greek ('Mprostopoulou', 'Brostopulu' and 'Μπροστοπούλου' are one name), each word at the start of a word in any order. A person known by an address, MRI or JID (an identity) is preferred over a name the model only extracted from text (a mention, 78% of the people rows on a large store), and an identity whose name shares the surname and contradicts no word of the query counts as a match ('Evi Surname' is 'E. Surname (Evanthia)' at `surname.evi@`); among those, the most-emailed is used. Every spelling of the owner (`BRAIN_USER_NAME`, `BRAIN_USER_EMAIL_PATTERN`) resolves to one row. `resolved_by` says how the person was found (`email`, `mri`, `jid`, `name`, or `alias` for the alias map and the owner rule), `match_count` how many people the query fits, and `other_candidates` the next three with each one's `identifier` kind (`null` for a mention) (`sender_brief` and `meeting_prep` resolve names the same way).
 - `topic_context(topic, days, limit, include_news, include_automation)`. Key people, decisions, actions, facts. Same `limit` and `<name>_total` contract.
 - `sender_brief(name_or_email, days)`. Compact briefing suitable for inline display.
-- `meeting_prep(people, topic, days, include_news, include_automation)`. Per-attendee dossiers, optionally scoped to a topic.
+- `meeting_prep(people, topic, days, include_news, include_automation)`. Per-attendee dossiers, optionally scoped to a topic. Pass each attendee's address when you have it: by display name, 42% of a month's attendees resolved to no one and a third of the rest to someone other than their address, before name resolution preferred identities (18% and 10% after).
+
+The alias map joins mention rows to the identity they stand for, so that a name fitting a person's identity and their extracted spellings counts as one person. `python -m src.store.person_aliases` proposes, for each mention row, the one identity whose name agrees with it and with which it shares threads (at least half of them for a one-word name), and prints the proposals; `--apply` records them as `sync_metadata` rows (`person_alias:<mention id>` to the identity's id) on the host that builds the store. No people row is merged or changed, and a replica gets the rows with its next pull. Delete a row to undo an alias.
 
 Every dossier dates and orders its rows the same way (`src/store/ordering.py`): decisions newest first by their own date when it is an ISO date, else by their parent's (the email, Teams or WhatsApp session, meeting or conversation they came from); key facts newest parent first; open actions upcoming first, soonest first, then undated, then overdue, most recently missed first. Every decision, fact and action row carries `date` and `parent_date`.
 
@@ -457,6 +459,7 @@ python -m src.cli mail-reconcile --since 2025-03-16 --json gaps.json   # Outlook
 python -m src.cli mail-reconcile --since 2026-05-01 --refetch --record-aliases  # producer: stage them for the next sync, note the ids of Archive copies
 python -m src.cli mail-reconcile --since 7d --refetch --limit 100 --health-json  # producer, nightly: the week's missing mail, and data/state/mail_loss.json for the health check
 python -m src.cli retry-stubs [--dry-run]   # extract again the emails loaded without an extraction after failing three runs
+python -m src.store.person_aliases [--apply]           # propose which identity each mention row stands for; --apply records them (producer)
 ```
 
 Full subcommand list: `python -m src.cli --help`.
@@ -518,16 +521,18 @@ src/
     loader.py                  Extracted JSON to SQLite
     query.py                   Person, topic, keyword, date, decisions, actions, FTS, combined
     source_class.py            What an emails row is (mail, automation, news, document, session note) and the default filter
-    owner.py                   Whether an address is the owner's (BRAIN_USER_EMAIL_PATTERN), for the calendar and the source classes
+    owner.py                   Whether an address or a name is the owner's, and the one people row every spelling of him resolves to
     ordering.py                How decisions, key facts and actions are dated and ordered in every list
     context.py                 Rich person and topic context aggregations
+    person_resolve.py          Who a name or an address means: identities first, both scripts, the alias map
+    person_aliases.py          Proposes and records which identity a mention row stands for; never merges
     embeddings.py              Embedding index build and query
     recall.py                  Unified `recall` fan-out
     fusion.py                  Reciprocal rank fusion over keyword and semantic result lists
     normalizer.py              Greek-aware topic and people normalization
     dedup_people.py            Seven-phase people deduplication
     dedup_topics.py            One-time merge of topics differing only by case, accents, separators
-    transliterate.py           Greek to Latin transliteration and name canonicalization
+    transliterate.py           Greek to Latin transliteration, spelling keys and name agreement
     fuzzy_people.py            Review-gated fuzzy name candidates; never auto-merges
     action_lifecycle.py        Dedups action items and ages out stale ones
     conversation_query.py      Claude Code conversation search

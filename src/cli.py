@@ -2512,6 +2512,58 @@ def cmd_teams_strip_html(args):
     return 0
 
 
+def cmd_teams_drop_raw_json(args):
+    """Drop the raw Teams payloads nothing needs any more (src/store/teams_raw_json.py).
+
+    Once, on the producer, after teams-backfill-replies: a channel post whose payload still
+    holds a reply not stored as a row keeps it, and a run after the backfill drops it.
+    --dry-run opens the store read-only and changes nothing, the schema included.
+    """
+    import sqlite3
+
+    from src.store.schema import get_connection, run_migrations
+    from src.store.teams_raw_json import drop_raw_json
+
+    if args.limit < 0:
+        print(f"Error: --limit must be 0 or more, not {args.limit}", file=sys.stderr)
+        return 2
+    db_path = str(args.db)
+    if not Path(db_path).exists():
+        print(f"Error: database not found: {db_path}", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    else:
+        conn = get_connection(db_path)
+    try:
+        if not conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'teams_messages'"
+        ).fetchone():
+            print("No Teams tables in this store: nothing to drop.")
+            return 0
+        if not args.dry_run:
+            # v34 first: under the triggers before it, each payload dropped re-indexed its
+            # message's text.
+            run_migrations(conn)
+        c = drop_raw_json(conn, limit=args.limit, dry_run=args.dry_run)
+    finally:
+        conn.close()
+    verb = "would drop" if args.dry_run else "dropped"
+    print(f"teams-drop-raw-json: {verb} {c['dropped']:,} payloads ({c['bytes'] / 1e6:,.1f} MB)")
+    if c["kept_replies"]:
+        print(
+            f"  kept {c['kept_replies']:,} channel posts whose payload holds a reply not stored"
+            " as a row: run teams-backfill-replies, then this again"
+        )
+    if c["kept_unreadable"]:
+        print(f"  kept {c['kept_unreadable']:,} channel posts whose payload does not parse")
+    if c["left"]:
+        print(f"  {c['left']:,} left past --limit {args.limit}")
+    if c["dropped"] and not args.dry_run:
+        print("  The file shrinks only after a VACUUM; until then SQLite reuses the pages.")
+    return 0
+
+
 def cmd_whatsapp_sync(args):
     """Ingest the pushed WhatsApp snapshot, then bound, extract and embed sessions.
 
@@ -4093,6 +4145,19 @@ def main():
         "--limit", type=int, default=0, help="Change at most this many rows (0 = all)"
     )
     parser_teams_strip.set_defaults(func=cmd_teams_strip_html)
+
+    parser_teams_drop_raw = subparsers.add_parser(
+        "teams-drop-raw-json",
+        help="Drop the raw Teams payloads nothing needs (once, producer only, after "
+        "teams-backfill-replies)",
+    )
+    parser_teams_drop_raw.add_argument(
+        "--dry-run", action="store_true", help="Count what would go; change nothing"
+    )
+    parser_teams_drop_raw.add_argument(
+        "--limit", type=int, default=0, help="At most this many payloads, oldest first (0 = all)"
+    )
+    parser_teams_drop_raw.set_defaults(func=cmd_teams_drop_raw_json)
 
     parser_teams_search = subparsers.add_parser("teams-search", help="Search Teams content")
     parser_teams_search.add_argument("query", help="Search query")

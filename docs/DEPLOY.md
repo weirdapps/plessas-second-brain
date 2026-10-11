@@ -531,6 +531,20 @@ WHERE extraction_status = 'extracted' AND id IN (
   WHERE is_system = 0 AND content_text IS NOT content_html);
 ```
 
+**Teams raw payloads.** Each Teams message also keeps the payload teams-cli returned
+(`teams_messages.raw_json`): 133 MB of the 244 MB table on the producer. The pull compares a
+message it reads again with it to tell an edit or a delete, so new messages keep writing it, and
+`teams-backfill-replies` reads the replies a post's payload holds. Nothing else reads it. Run
+`python -m src.cli teams-drop-raw-json` once on the producer, after `teams-backfill-replies` and
+`teams-strip-html`, with `--dry-run` first to see the count and the size. It sets the payload to
+NULL oldest first, 500 messages per short transaction, so it can run beside the timers, and
+`--limit N` stops it after N. A channel post whose payload still holds a reply that is not a
+message of its own keeps its payload (the command says how many and to run the backfill), as
+does one whose payload does not parse. It migrates first: from v34 dropping a payload leaves
+the full-text index alone. A message whose payload was dropped gets it back the next time a
+pull reads it, one rewrite of the same text with no model call. The file shrinks only after a
+`VACUUM`. It refuses to run on a replica.
+
 **Upgrading to schema v32.** From v32 `attachment_content` has three small indexes that
 answer the file sweep's classification and two health-check queries without reading the
 stored text. `extracted_text` (3 GB on the producer) sits ahead of the columns those queries
@@ -544,6 +558,30 @@ thirty minutes for it, the other units only sixty seconds). Stop the `sb-*` time
 running syncs exit, pull, run `python -m src.cli migrate`, and start the timers again. A
 store that has not migrated yet sweeps as before, only slower: the index hint is given only
 when the index exists.
+
+**Upgrading to schema v34.** From v34 each full-text index's update trigger fires only when an
+UPDATE sets the row's id or a column the index reads; before, any UPDATE re-indexed the row's
+whole text, so a mailbox move re-tokenised a body and every `llm_status` write of an attachment
+up to 2M characters. Address lookups (`LOWER(email) = ?`, for every sender, recipient and cc
+loaded) and the loader's name lookups get an index each on `people`, and keep their meaning.
+The migration recreates ten triggers and builds two indexes on a table of 34K rows: on a
+synthetic 530 MB store with 60K emails and 34K people it took 0.013 s, and afterwards 2,000
+mailbox moves took 0.08 s instead of 0.66 s and 2,000 address lookups 0.004 s instead of 1.8 s.
+It reads no row of the indexed tables and rebuilds no index. Any command that migrates applies
+it (`sync`, `teams-sync`, `migrate`), so no timer needs stopping: a job still running the old
+code works with the new triggers, and its own migrations end at v33.
+
+The same release records in `embeddings.npz` the embedding space its vectors are in (model,
+dimension, task type, text template): see Vector index in the README's Database schema. Nothing
+to run: an index without it is taken as the current space and tagged on its next save, by
+`sync`, `teams-sync` or `whatsapp-sync`. A job still running the old code saves the index
+without it again, and the next save puts it back. From then on a writer refuses vectors of
+another space, and a search that would embed its query into another space ranks around its
+keyword matches instead and says why on stderr, on the producer and on a replica alike. After a
+deliberate change of model, task type, dimension or text template, start the index over with
+`python -m src.cli embed --force` on the producer, apart from the embedding jobs: it embeds
+every email, attachment and conversation summary again (mind the API quota), and the next
+`teams-sync` and `whatsapp-sync` add their vectors back.
 
 ## 8. Backup and restore
 

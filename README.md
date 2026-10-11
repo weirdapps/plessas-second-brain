@@ -177,6 +177,8 @@ Conversation memory is the owner's own sessions. Each turn's `speaker` says who 
 
   `embed_backend` names the service that embeds this server's search queries (`gemini` or `vertex`, see `BRAIN_EMBED_BACKEND`), and `last_embed_error` the last query embedding that failed in this server process, as `{"type": <exception type>, "at": <UTC time>}`, or `null`. It carries no message text, which can quote a query or a credential error.
 
+  `attachments_awaiting_text` counts the attachments whose text has not been read yet, which `search_attachments` cannot find at all, and `attachments_awaiting_summary` the texts still waiting for their summary. `attachments_awaiting_text_oldest_hours` and `attachments_awaiting_summary_oldest_hours` say how long the oldest of each has waited, in hours, or `null` when none waits. They are the health check's Attachment lag queues; see [Attachments in the hourly sync](#attachments-in-the-hourly-sync).
+
 ### SQL (read-only)
 
 - `sql_schema(table=None)`. Without a table, every table and view with its row count; with one, its columns and indexes. `rows` is null for full-text (virtual) tables, which are marked `"virtual": true`, and also where counting ran out of the shared time budget (or a view cannot be counted). Full-text shadow tables are left out of the list.
@@ -337,6 +339,16 @@ Preferred credential path. Uses Application Default Credentials, no API key requ
 `scripts/health_check.py` reads three more: `HEALTH_EMAIL_TO` and `HC_PING_URL`, documented in [`docs/DEPLOY.md`](docs/DEPLOY.md), and `BRAIN_DAILY_SPEND_WARN_USD` (below).
 
 No credentials are printed by the code. All secrets are read from environment or (for Google) from ADC.
+
+### Attachments in the hourly sync
+
+`sync` reads attachment text (Phase 1) and asks the model for summaries (Phase 2) in a 90-second slice each; what does not fit waits for the next run or for the nightly `process-attachments` pass. Since 2026-10-11:
+
+- **Newest mail first.** Phase 1 takes attachments by their email's received time, newest first, compared as instants whatever the stored format. Taken in registration order, the day's documents waited behind the backlog until the nightly pass, which keeps that order.
+- **Phase 2 follows Phase 1.** It starts with the documents Phase 1 has just read, then any other text awaiting a summary, newest first, within its own slice, and it runs whether or not Phase 1 read anything. A document mailed in the morning is normally searchable by its text and its summary after the next hourly run; on a busy morning the summaries of the rest follow over the next runs. Texts over 50,000 characters still wait for the nightly pass.
+- **Images and zip archives wait for the nightly pass, while one runs.** One of them can take two minutes (OCR, or every member of an archive) against the 90-second slice. The hourly slice leaves them only while a `process-attachments` run over every kind (no `--type`) has stamped the `sync_metadata` row `attachment_text_pass_at` in the last 48 hours, so a host that runs `sync` alone, as the cron example in [`docs/DEPLOY.md`](docs/DEPLOY.md) does, keeps reading them hourly. An image whose bytes another attachment already holds is copied at once either way. `BRAIN_SYNC_HEAVY_ATTACHMENTS=1` reads them hourly regardless, as before.
+
+`stats` and the health check's Attachment lag row say how many attachments wait and for how long.
 
 ### Attachment summaries and spend
 

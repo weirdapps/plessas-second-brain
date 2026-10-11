@@ -18,12 +18,17 @@ LOG_DIR="$HOME/.second-brain/logs"
 LOG_FILE="$LOG_DIR/attachments.log"
 mkdir -p "$LOG_DIR"
 
-# No needs_reauth gate here on purpose. None of the stages below calls
-# outlook-cli: registration and Phase 1 read files already on disk, Phase 2 and
-# the image pass call Vertex, and the SharePoint pass uses sharepoint-cli with
-# its own session. The check used to be here, copied from the mail wrappers, so
-# an Outlook outage stopped the nightly pass while its healthcheck read green.
+# No needs_reauth gate for the pass as a whole, on purpose. Only the mail
+# reconcile at the end calls outlook-cli, and it checks the sentinel for itself:
+# registration and Phase 1 read files already on disk, Phase 2 and the image
+# pass call Vertex, and the SharePoint pass uses sharepoint-cli with its own
+# session. The check used to be here, copied from the mail wrappers, so an
+# Outlook outage stopped the nightly pass while its healthcheck read green.
 # sb-curate-docs.sh removed the same gate for the same reason.
+OUTLOOK_SENTINEL="$HOME/.second-brain/needs_reauth"
+# outlook-cli, for the mail reconcile, lives under the fnm default node's bin, as
+# in sb-outlook-sync.sh: the alias, not a pinned version, follows node upgrades.
+export PATH="$PATH:$HOME/.local/share/fnm/aliases/default/bin"
 
 # gcloud ADC expired → Vertex AI extraction would fail. Skip until auth-watch
 # clears the sentinel (its hourly probe restores it on first successful refresh).
@@ -97,6 +102,25 @@ run_stage "orphan reap" "$PYTHON" scripts/reap_orphan_attachments.py --policy
 # Files are inputs, never stored: delete what Phase 1 and the image pass have finished with.
 echo "$(date '+%Y-%m-%d %H:%M:%S') - starting file sweep" >> "$LOG_FILE"
 run_stage "file sweep" "$PYTHON" -m src.cli sweep-files --policy
+
+# Mail reconcile, last: the one stage that calls outlook-cli, so a slow M365 night
+# cannot starve the stages above. The hourly export walks each folder forward from
+# a cursor, and mail that turned visible after newer mail was listed (a scanner
+# hold, a quarantine release) stayed lost until someone ran mail-reconcile by hand.
+# This sets the last 7 days of Inbox, Archive and Sent Items against the store and
+# stages what it lacks for the next mail sync. --limit is the call budget: three
+# listings plus at most two calls (get-mail, download-attachments) per message
+# staged. --health-json leaves data/state/mail_loss.json, the given-up and
+# quarantined counts the health check reads, written even when the reconcile
+# fails. While the Outlook session is dead the stage is skipped, and logged:
+# sb-outlook-sync is red for it already, and every call here would fail.
+if [ -f "$OUTLOOK_SENTINEL" ]; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - mail reconcile skipped: needs_reauth sentinel present" >> "$LOG_FILE"
+else
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - starting mail reconcile" >> "$LOG_FILE"
+  run_stage "mail reconcile" "$PYTHON" -m src.cli mail-reconcile --since 7d --refetch \
+    --limit "${SB_MAIL_RECONCILE_LIMIT:-100}" --health-json
+fi
 
 # Every stage has run by here, so a restart would repeat the whole hour of LLM
 # and vision calls for a failure that a retry of the whole pass is unlikely to

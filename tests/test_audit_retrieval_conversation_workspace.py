@@ -57,7 +57,7 @@ def db(tmp_path, monkeypatch):
 
     monkeypatch.setattr(embeddings, "EMBEDDINGS_FILE", index)
     monkeypatch.setattr(
-        embeddings, "generate_embeddings", lambda texts: np.array([[0.0, 1.0, 0.0]], np.float32)
+        embeddings, "embed_query", lambda texts: np.array([[0.0, 1.0, 0.0]], np.float32)
     )
     return path
 

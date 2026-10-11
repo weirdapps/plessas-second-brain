@@ -306,6 +306,54 @@ def generate_embeddings(texts: list[str], client=None) -> np.ndarray:
     return out
 
 
+# A search waits on its query's embedding, so that call gets a short timeout and
+# at most one retry. generate_embeddings' backoff (5 + 10 + 20 + 40 + 60 s on a
+# 429, on a client with no timeout) is for ingest, where waiting is cheap: on the
+# query path it stalled a search for up to 135 s before the keyword-seeded
+# fallback could run.
+QUERY_EMBED_TIMEOUT_MS = 4_000
+QUERY_EMBED_RETRY_PAUSE_S = 0.5
+
+
+def _worth_a_retry(exc: Exception) -> bool:
+    """False for a refusal a second try cannot change: a 4xx other than 429.
+
+    google-genai's errors carry the HTTP status as `code`; a timeout or a dropped
+    connection carries none and may well succeed on the second try.
+    """
+    code = getattr(exc, "code", None)
+    return not (isinstance(code, int) and 400 <= code < 500 and code != 429)
+
+
+def embed_query(texts: list[str], client=None) -> np.ndarray:
+    """Embed search queries: 4 s per call and at most one retry, then raise.
+
+    Same contract as generate_embeddings (one row per text), so either serves as
+    a search's `embed_fn`. The caller falls back to the keyword-seeded vector.
+    """
+    from google.genai import types
+
+    if client is None:
+        client = _get_client()
+    config = types.EmbedContentConfig(
+        http_options=types.HttpOptions(timeout=QUERY_EMBED_TIMEOUT_MS)
+    )
+    for attempt in range(2):
+        try:
+            result = client.models.embed_content(
+                model=EMBEDDING_MODEL, contents=texts, config=config
+            )
+            break
+        except Exception as e:
+            if attempt or not _worth_a_retry(e):
+                raise
+            time.sleep(QUERY_EMBED_RETRY_PAUSE_S)
+    returned = list(result.embeddings)
+    if len(returned) != len(texts):
+        raise RuntimeError(f"embed_content returned {len(returned)} embeddings for {len(texts)}")
+    return np.asarray([emb.values for emb in returned], dtype=np.float32)
+
+
 def _email_embed_text(subject, sender_name, date_received, summary) -> str:
     """Metadata-enriched text for embedding an email.
 
@@ -569,6 +617,34 @@ def _keyword_seed_vector(conn: sqlite3.Connection, query: str, ids, unit) -> np.
     return unit[rows].mean(axis=0)
 
 
+def _query_vector(
+    conn: sqlite3.Connection, query: str, ids, unit, embed
+) -> tuple[np.ndarray, str | None]:
+    """The query's unit vector, and how it was made: None, or 'keyword_seeded: <error type>'.
+
+    When the model cannot embed the query, the vector is the centroid of its best
+    keyword matches. Raises the embedding error when no keyword match can stand in.
+    """
+    try:
+        vector = np.asarray(embed([query])[0], dtype=np.float32)
+        seeded = None
+    except Exception as e:  # the model is unreachable; the index is not
+        seed = _keyword_seed_vector(conn, query, ids, unit)
+        if seed is None:
+            raise
+        vector, seeded = seed, f"keyword_seeded: {type(e).__name__}"
+    return vector / (np.linalg.norm(vector) or 1), seeded
+
+
+class SemanticCandidates(list):
+    """Ranked email ids, with `semantic` saying how the query vector was made:
+    'ok', or 'keyword_seeded: <error type>' when the model could not embed it."""
+
+    def __init__(self, ids=(), semantic: str = "ok"):
+        super().__init__(ids)
+        self.semantic = semantic
+
+
 def query_semantic(
     conn: sqlite3.Connection,
     query: str,
@@ -598,22 +674,14 @@ def query_semantic(
     # so a long-lived process pays the ~1 GB read once, not per query.
     ids, normalized = _load_index(index_path)
 
-    # Generate query embedding
-    embed = embed_fn or generate_embeddings
-    seeded = None
     try:
-        query_vec = np.asarray(embed([query])[0], dtype=np.float32)
-    except Exception as e:  # the model is unreachable; the index is not
-        seed = _keyword_seed_vector(conn, query, ids, normalized)
-        if seed is None:
-            raise SemanticUnavailable(
-                "semantic search unavailable: the query could not be embedded "
-                f"({type(e).__name__}: {str(e)[:300]}) and no keyword match could "
-                "stand in for it; search_type='keyword' still works"
-            ) from e
-        query_vec = seed
-        seeded = f"keyword_seeded: {type(e).__name__}"
-    query_norm = query_vec / (np.linalg.norm(query_vec) or 1)
+        query_norm, seeded = _query_vector(conn, query, ids, normalized, embed_fn or embed_query)
+    except Exception as e:
+        raise SemanticUnavailable(
+            "semantic search unavailable: the query could not be embedded "
+            f"({type(e).__name__}: {str(e)[:300]}) and no keyword match could "
+            "stand in for it; search_type='keyword' still works"
+        ) from e
 
     similarities = normalized @ query_norm
 
@@ -760,12 +828,12 @@ def semantic_email_candidates(
 
     Attachment vectors are folded onto their parent email so the semantic signal
     fuses with keyword search at email granularity. Used by recall()'s hybrid path;
-    `embed_fn` / `index_path` are injection points for testing.
+    `embed_fn` / `index_path` are injection points for testing. The ids come back
+    as SemanticCandidates, whose `semantic` says whether the query was embedded or
+    stood in for by its keyword matches.
     """
-    embed = embed_fn or generate_embeddings
     ids, normalized = _load_index(index_path)
-    query_vec = np.asarray(embed([query])[0], dtype=np.float32)
-    query_norm = query_vec / (np.linalg.norm(query_vec) or 1)
+    query_norm, seeded = _query_vector(conn, query, ids, normalized, embed_fn or embed_query)
     similarities = normalized @ query_norm
     # Over-fetch: several attachment vectors can collapse onto one email, so we
     # need headroom to fill `limit` emails. Other kinds are left out first.
@@ -780,7 +848,7 @@ def semantic_email_candidates(
         out.append(email_id)
         if len(out) >= limit:
             break
-    return out
+    return SemanticCandidates(out, semantic=seeded or "ok")
 
 
 def _append_to_index(ids: list[int], vectors) -> None:

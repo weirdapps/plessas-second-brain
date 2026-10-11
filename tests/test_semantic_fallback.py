@@ -82,7 +82,7 @@ def test_no_keyword_match_returns_the_cause_instead_of_a_bare_tool_error(
 
     conn, p = _store(tmp_path)
     monkeypatch.setattr(embeddings, "EMBEDDINGS_FILE", p)
-    monkeypatch.setattr(embeddings, "generate_embeddings", _refusing_embedder)
+    monkeypatch.setattr(embeddings, "embed_query", _refusing_embedder)
     monkeypatch.setattr(mcp_server, "_get_conn", lambda: conn)
 
     out = getattr(mcp_server, tool)("zeppelin", search_type="semantic")

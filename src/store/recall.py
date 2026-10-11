@@ -290,20 +290,24 @@ def _hybrid_emails(
     semantic failure (missing index, embed error, no ADC) degrades gracefully to
     keyword-only, so recall never breaks.
 
-    Returns the rows and the semantic half's status: 'ok', or 'unavailable:
-    <exception type>'. The fallback used to leave no trace, so a keyword-only
-    answer, when the Mac's ADC had expired, read exactly like a fused one.
+    Returns the rows and the semantic half's status: 'ok', 'keyword_seeded:
+    <exception type>' when the provider ranked around the keyword matches because
+    the query could not be embedded (its `semantic` attribute says so), or
+    'unavailable: <exception type>'. The fallback used to leave no trace, so a
+    keyword-only answer, when the Mac's ADC had expired, read exactly like a fused one.
     """
     pool = max(limit * 4, limit)
     keyword_hits = query_by_keyword(conn, query, limit=pool)
     try:
+        candidates = semantic_candidates(conn, query, pool)
+        status = getattr(candidates, "semantic", "ok")
         # Read twice below: a provider that yields would be empty the second time.
-        sem_ids = list(semantic_candidates(conn, query, pool))
+        sem_ids = list(candidates)
     except Exception as e:
         logger.warning("recall semantic fusion skipped: %s: %s", type(e).__name__, e)
         return keyword_hits[:limit], f"unavailable: {type(e).__name__}"
     if not sem_ids:
-        return keyword_hits[:limit], "ok"
+        return keyword_hits[:limit], status
 
     # Fused by thread, not by email: keyword search returns one email per thread,
     # and the email that embeds best is rarely that one, so a thread both
@@ -343,7 +347,7 @@ def _hybrid_emails(
             hit = dict(row)
             hit["source"] = "semantic"
             out.append(hit)
-    return out, "ok"
+    return out, status
 
 
 def recall(
@@ -364,7 +368,9 @@ def recall(
             email ids. When provided, the emails bucket becomes a keyword+semantic
             RRF fusion; when None (default) it stays keyword-only. Injected by the
             MCP layer so recall itself carries no embedding dependency. With a
-            provider, summary.semantic says whether its half ran: 'ok', or
+            provider, summary.semantic says whether its half ran: 'ok',
+            'keyword_seeded: <exception type>' when the query could not be
+            embedded and the provider ranked around its keyword matches, or
             'unavailable: <exception type>' when it failed and the emails bucket
             is keyword-only.
 

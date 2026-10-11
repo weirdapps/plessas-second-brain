@@ -20,9 +20,8 @@ judges it with looks_like_garbled_greek; a row already marked counts too.
 
 Then the files, by attachment id, counts and ids only. On disk: an image is transcribed by the
 nightly image pass (or `transcribe-images`), a scan is read again Greek first by
-`reextract --garbled`. Swept: the original has to be fetched from Exchange again, by hand, to the
-path its row records; that is an owner step, not something this command can do. A text-only
-document kept no file.
+`reextract --garbled`. Swept: `refetch-garbled` fetches the original back from the mailbox, to
+the path its row records (src/export/refetch_garbled.py). A text-only document kept no file.
 
 Producer only: the CLI refuses it on a replica, as it does every command that writes.
 """
@@ -42,9 +41,9 @@ DERIVED = (("decisions", "decisions"), ("action_items", "action items"), ("key_f
 FILE_STATES = ("on disk", "swept", "missing", "text only")
 
 NEXT_STEPS = """\
-Next: an image on disk is transcribed by the nightly image pass or `transcribe-images`, and a scan
-on disk is read again with `reextract --garbled`. A swept original has to be fetched from Exchange
-again, by hand, to the path its row records, before either can read it."""
+Next: `refetch-garbled` fetches the swept originals back from the mailbox. Then a scan on disk is
+read again with `reextract --garbled`, and an image on disk is transcribed by the nightly image
+pass or `transcribe-images`."""
 
 
 def _where_the_file_is(file_path: str, removed_at: str | None, root: Path) -> str:

@@ -116,6 +116,16 @@ Every row of the `emails` table has a `source_class` (schema v33, rules in `src/
 
 This changes results: decisions, actions and key facts from news items and from your automation mail no longer appear in "what did we decide" or "what do I owe" answers unless asked for. Before v33 only `query_decisions`, `query_actions` and the overdue half of `stale_threads` left out news, and nothing left out automation.
 
+### Greek words are matched in any form
+
+Every keyword search finds a Greek word in its other forms: `κάρτες` also finds `κάρτα`, `κάρτας` and `καρτών`, and `έγκριση` finds `εγκρίσεις`. Only the form typed used to match, which on one store missed half to two thirds of a word's uses (`καρτες` was in 3,966 emails, some form of the word in 13,243). This covers `search_emails` in keyword mode, `query_emails` with `keyword`, `search_attachments`, `search_teams`, `search_whatsapp`, `search_conversations`, `query_calendar_events` with `keyword`, `attachment_image_search` and every `recall` bucket.
+
+It works on the query alone; the index is unchanged. A Greek word of four letters or more is folded (case, accents, final sigma) and searched also by its Snowball stem ([`snowballstemmer`](https://pypi.org/project/snowballstemmer/)) as a prefix, `("καρτες" OR "καρτ"*)`, when the stem is shorter than the word, starts it and has four letters or more. Any other word is searched as typed, and so are stopwords, Latin words, codes and numbers. Every word is still required, and the any-word fallback (`partial_match`) uses the stems too. The decision, action, commitment and image buckets, which match in Python, look for the same stems, and the phrase `search_teams` and `search_whatsapp` try first holds in any form. The form typed stays in the query, so within each stage it ranks above the other forms.
+
+The price is precision, since a stem can start a different word: `πλήρης` (`πληρ`) also finds `πληροφορία` and `πληρωμή`, `χρήση` finds `χρήστες`, `σχέδια` finds `σχεδόν`, a first name finds the names that start like it, and a few words share a stem outright (`τράπεζα`, `τραπέζι`). Measured on one store's most frequent Greek words used as one-word queries, a search found 77% of the emails holding some form of the word before and 100% after, and 90% of what it found held one.
+
+`BRAIN_QUERY_STEMMING=0` turns it off for one deployment, and every word is searched as typed, as before. Set it where the searching process reads its environment; for the MCP server that is `$BRAIN_DATA_DIR/env` or `~/.second-brain/env` (see [Run the MCP server](#run-the-mcp-server)). A checkout updated without `uv sync`, and so without `snowballstemmer`, searches as typed too and logs a warning saying why.
+
 ### Unified recall
 
 - `recall(query, limit_per_kind, days, include_context, include_news, include_automation, kinds)`. Fan-out across every text-bearing index. This is the default "tell me everything you know about X" entry point.
@@ -161,7 +171,7 @@ Every dossier dates and orders its rows the same way (`src/store/ordering.py`): 
 ### Attachments and images
 
 - `search_attachments(query, limit, include_news, include_automation)`. FTS over extracted text and LLM summaries; each row carries its email's `source_class`. Since 2026-10-11 a long attachment's summary is built from part of it: a spreadsheet's from its structure, any other long text's from three of its parts (see [Attachment summaries and spend](#attachment-summaries-and-spend)). The full extracted text is still searched.
-  Also since 2026-10-11, an OCR text that is Greek read as Latin look-alike letters ("kal" for «και», "tnv" for «την») carries the mark `ocr_garbled` in `extraction_error` and gets no summary: its text is still searched, but no summary, decision, action or fact is made from the wrong words. An image's text is replaced by its vision transcription, a scan's by `reextract --garbled`. See [Greek read as Latin letters](#greek-read-as-latin-letters).
+  Also since 2026-10-11, an OCR text that is Greek read as Latin look-alike letters ("kal" for «και», "tnv" for «την») carries the mark `ocr_garbled` in `extraction_error` and gets no summary: its text is still searched, but no summary, decision, action or fact is made from the wrong words. An image's text is replaced by its vision transcription, a scan's by `reextract --garbled`, and an original the sweep already deleted is fetched back from the mailbox first by `refetch-garbled`. See [Greek read as Latin letters](#greek-read-as-latin-letters).
 - `attachment_image_search(query, limit)`. Case- and accent-blind match on vision descriptions of classified content images: the whole query first, then any meaningful word (`partial_match`).
 
 ### Calendar
@@ -378,6 +388,10 @@ Preferred credential path. Uses Application Default Credentials, no API key requ
 
 No credentials are printed by the code. All secrets are read from environment or (for Google) from ADC.
 
+### Search
+
+- `BRAIN_QUERY_STEMMING`: `0` searches each Greek word only in the form typed, turning off the stemming described in [Greek words are matched in any form](#greek-words-are-matched-in-any-form). On when unset.
+
 ### Attachments in the hourly sync
 
 `sync` reads attachment text (Phase 1) and asks the model for summaries (Phase 2) in a 90-second slice each; what does not fit waits for the next run or for the nightly `process-attachments` pass. Since 2026-10-11:
@@ -410,7 +424,9 @@ Tesseract with English first reads many Greek letters as the Latin letters they 
 - **The scanned pages of a text PDF.** A page whose text layer holds fewer than 50 characters and that shows an image is OCR'd, inside the existing two-minute OCR budget per file. Before, OCR ran only when the whole PDF held under 50 characters, so a scanned annex inside a text PDF was never read. Blank pages are not read.
 - **The mark.** An OCR reading (methods `ocr`, `pymupdf+tesseract`, `zip`) that `src/extract/ocr_garble.py` takes for Greek in Latin look-alikes keeps its text and gets `ocr_garbled: ...` in `extraction_error`, with `llm_status = 'skipped'`; there is no schema change. The detector wants at most 30% Greek letters and at least three Greek function words in their Latin look-alike spellings, two of them different, and two per 1,000 Latin letters. Phase 2 never summarises a marked row, the file sweep and the orphan reaper keep its file, and Phase 1 does not copy it to another attachment with the same bytes.
 - **Reading it again.** A marked image that the vision pass filed as content owes its transcription: the nightly image pass (or `transcribe-images`) transcribes it, and the transcription replaces the garbled text. A marked scan is read again Greek first by `reextract --garbled`; a reading no longer marked replaces the stored text, whatever its length, and is summarised.
-- **What was read before.** `python -m src.cli ocr-regarble` finds the stored texts the detector flags, counts them by method, and lists by attachment id which files are still on disk and which were swept. `--apply` marks them, clears their summaries, deletes the decisions, action items and key facts those summaries wrote (by `attachment_id`: rows written before schema v28 carry none and stay on the email) and drops their vectors. It refuses to run on a replica. A swept original has to be fetched from Exchange again by hand, to the path its row records, before either route can read it: that is an owner step.
+- **What was read before.** `python -m src.cli ocr-regarble` finds the stored texts the detector flags, counts them by method, and lists by attachment id which files are still on disk and which were swept. `--apply` marks them, clears their summaries, deletes the decisions, action items and key facts those summaries wrote (by `attachment_id`: rows written before schema v28 carry none and stay on the email) and drops their vectors. It refuses to run on a replica. A swept original is fetched back from the mailbox by `refetch-garbled` (next) before either route can read it.
+- **Fetching swept originals back.** `python -m src.cli refetch-garbled` takes each marked row whose file is not on disk, oldest mail first, and asks `outlook-cli download-attachments` for its message's attachments, once per message and at most two messages at a time; `--limit` bounds the messages a run asks for (default 200) and `--dry-run` counts without downloading or writing. A message is asked for under the id of the directory its file was downloaded into, then the email's own id, then the ids of its Archive copies (`email_aliases`), since a move gives a message a new id. The file whose sha256 is the row's (name and size for a row with no hash) goes back to the directory and name its path records, `attachments.file_path` names it there and `file_removed_at` is cleared; the message's other files are not kept. The mark stays, so `reextract --garbled` reads the file next, the image pass finds it by its path, and the sweep keeps it until a reading is recorded after the fetch, even if the mark is lifted first.
+  Each row's outcome is a `sync_metadata` row, key `refetch_garbled:<attachment id>`, JSON with `state`, `attempts`, `last_attempt_at` and `fetched_at` or `gone_at`: no schema change. A message every id answers 404 for is `gone`: the mailbox keeps about a year of mail, so mail older than that cannot come back, and it is not asked for again. One whose download holds no such file is `unmatched`, also final. A download that fails with exit 5, or gets no answer in 5 minutes, is `failed` and asked for again on the next run, three attempts in all. Exit 4 (log in again), or any exit but 5 (no `outlook-cli`, a usage or local error), stops the run without counting an attempt. A row already fetched is skipped, so the command can be repeated; delete its `sync_metadata` row to fetch it again. Mail stored by the retired Apple Mail exporter carries Mail.app's numbers rather than Graph ids: unless an Archive copy id was recorded for the email, its rows are counted under "no mailbox id" and never sent to `outlook-cli`. The command exits 4 when `outlook-cli` needs a login, 5 when a download failed or `outlook-cli` could not run, 0 otherwise. It refuses to run on a replica.
 
 ## Usage
 
@@ -504,6 +520,7 @@ python -m src.cli reextract --partial                  # read again in full what
 python -m src.cli reextract --stale --formats          # read with today's readers what older code skipped or failed on
 python -m src.cli reextract --ocr --limit 500          # OCR low-text scans and images again (grayscale second pass), in batches
 python -m src.cli ocr-regarble [--apply]              # find stored OCR text that is Greek read as Latin letters; --apply marks it and clears its summaries
+python -m src.cli refetch-garbled --limit 200         # producer: fetch back from the mailbox the swept originals of marked texts; repeat until none is left to try
 python -m src.cli reextract --garbled                 # read marked scans again, Greek first, and summarise the ones that now read
 python -m src.cli reextract --long --estimate          # price a re-summary before running it; changes nothing
 python -m src.cli reextract --full-parts 1234 5678     # summarise these attachments from every part, now and on every later summary
@@ -542,6 +559,7 @@ src/
     teams_cli.py               teams-cli subprocess wrapper
     teams_export.py            Teams chats, threads, messages
     inbox_reconcile.py         Inbox to Archive move detection; Deleted Items and Junk as state
+    refetch_garbled.py         `refetch-garbled`: swept originals of garbled OCR texts, from the mailbox
     sharepoint_fetcher.py      SharePoint link fetch and host classification
     sharepoint_cli.py          sharepoint-cli subprocess wrapper (cookie session, not bearer)
     state.py                   Atomic staging writes and the Outlook sync cursor

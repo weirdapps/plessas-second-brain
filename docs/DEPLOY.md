@@ -872,13 +872,25 @@ page with under 50 characters of text that shows an image) are OCR'd inside the 
 An OCR reading that is Greek in Latin look-alike letters ("kal" for «και») is stored with the
 `ocr_garbled` mark in `extraction_error` and `llm_status = 'skipped'`: Phase 2 does not summarise
 it and the sweep keeps its file (README, "Greek read as Latin letters"). For the texts read before
-this change, on the producer: `python -m src.cli ocr-regarble` counts them and lists the
-attachment ids whose files are on disk or swept; `ocr-regarble --apply` marks them and clears
-their summaries, decisions, actions, facts and vectors. Then `transcribe-images --limit 0` reads
-the marked images that are on disk, and `reextract --garbled` the marked scans, with a count first
-(`--dry-run`). **Re-fetching a swept original from Exchange is the owner's step**: put the file
-back at the path its row records (`attachments.file_path`, or the same directory and name under
-`data/attachments`), then run the same two commands. Nothing here downloads from the mailbox.
+this change, on the producer, in this order, each with a count first (`--dry-run`):
+
+1. `python -m src.cli ocr-regarble` counts them and lists the attachment ids whose files are on
+   disk or swept; `ocr-regarble --apply` marks them and clears their summaries, decisions,
+   actions, facts and vectors.
+2. `python -m src.cli refetch-garbled --limit 200`, repeated until its `to try` line reads 0,
+   fetches the swept originals back from the mailbox: at most 200 messages a run, two at a
+   time, oldest mail first, since the mailbox keeps about a year and older mail is gone for good.
+   A message the mailbox no longer holds is recorded as gone and not asked for again; a failed
+   download is asked for again on the next run, three attempts in all. Exit 4 means
+   `outlook-cli` needs a login: log in and run it again. Mail the retired Apple Mail exporter
+   stored carries no id the mailbox knows, unless an Archive copy of it was recorded: its rows
+   are counted under "no mailbox id" and cannot be fetched this way. The sweep keeps a fetched
+   original until it has been read again.
+3. `python -m src.cli reextract --garbled` reads the marked scans and images on disk again, Greek
+   first, and summarises the ones that now read.
+4. The nightly image pass, or `transcribe-images --limit 0` at once, transcribes the marked
+   content images, and the transcription replaces the garbled text.
+
 `ocr-regarble --apply` changes only what it has not changed before, so it can be run again: do so
 after a large `reextract` pass, since a re-read that newly marks a row summarised earlier leaves
 that summary for it to clear (Phase 2 never makes a new one).

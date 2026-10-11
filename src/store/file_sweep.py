@@ -12,7 +12,8 @@ granted rights or a better reader may still open it. Neither goes a picture the 
 described in place of text. And an image the transcription pass still owes (described, not
 yet transcribed) keeps its file, because run_transcription reads it. Nor a text Phase 1 marked
 as Greek read as Latin look-alike letters (OCR_GARBLED_SQL): its words are wrong, and the file
-is the way to a better reading.
+is the way to a better reading. Nor an original `refetch-garbled` fetched back from the mailbox
+for such a text, until a reading of it is recorded (REFETCHED_UNREAD_SQL).
 
 A Phase 1 row is not always proof the bytes were read. Phase 1 opens the row's recorded
 absolute path, while this module finds files by directory and name, so a row recorded on
@@ -106,15 +107,33 @@ NOT_FULLY_READ_SQL = f"({UNREAD_SQL} OR {PARTIAL_SQL})"
 # image's vision transcription), and Phase 2 does not summarise it. 1 or 0, never NULL.
 OCR_GARBLED_SQL = f"COALESCE(ac.extraction_error LIKE '%{OCR_GARBLED}%', 0)"
 
+# The sync_metadata key prefix of the record `refetch-garbled` keeps per attachment id
+# (src/export/refetch_garbled.py): a JSON object whose `fetched_at`, in the format
+# attachment_content.extracted_at keeps, says when the original was fetched back.
+REFETCH_KEY = "refetch_garbled:"
+
+# An original fetched back from the mailbox for a garbled text, and not read since: no reading of
+# the row (reextract, or the image pass writing the transcription) is recorded after the fetch.
+# Its content is not held, so the file stays until one is, even if the mark is lifted first. A
+# record that is not JSON counts as none, so it cannot stop the sweep. 1 or 0, never NULL.
+REFETCHED_UNREAD_SQL = (
+    "COALESCE((SELECT CASE WHEN json_valid(m.value)"
+    " THEN json_extract(m.value, '$.fetched_at') END"
+    f" FROM sync_metadata m WHERE m.key = '{REFETCH_KEY}' || a.id)"
+    " > COALESCE(ac.extracted_at, ''), 0)"
+)
+
 # The content is held: Phase 1 extracted the file's text, all of it, and the text is the file's
 # own rather than the image pass's description of a picture ('vision' rows keep their image).
 # Keyed on the status, never on the error text: 'failed', 'skipped' and 'encrypted' (method
 # 'rms', 'rms-message' or 'password') all leave the file as the only copy of its content. A
-# text marked as garbled Greek is not held either.
+# text marked as garbled Greek is not held either, nor one whose original was fetched back and
+# not read since.
 FULLY_HELD_SQL = (
     "(ac.extraction_status = 'extracted'"
     f" AND NOT COALESCE({NOT_FULLY_READ_SQL}, 0)"
     f" AND NOT {OCR_GARBLED_SQL}"
+    f" AND NOT {REFETCHED_UNREAD_SQL}"
     " AND COALESCE(ac.extraction_method, '') <> 'vision')"
 )
 

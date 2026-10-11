@@ -877,15 +877,25 @@ this change, on the producer, in this order, each with a count first (`--dry-run
 1. `python -m src.cli ocr-regarble` counts them and lists the attachment ids whose files are on
    disk or swept; `ocr-regarble --apply` marks them and clears their summaries, decisions,
    actions, facts and vectors.
-2. `python -m src.cli refetch-garbled --limit 200`, repeated until its `to try` line reads 0,
-   fetches the swept originals back from the mailbox: at most 200 messages a run, two at a
-   time, oldest mail first, since the mailbox keeps about a year and older mail is gone for good.
-   A message the mailbox no longer holds is recorded as gone and not asked for again; a failed
-   download is asked for again on the next run, three attempts in all. Exit 4 means
-   `outlook-cli` needs a login: log in and run it again. Mail the retired Apple Mail exporter
-   stored carries no id the mailbox knows, unless an Archive copy of it was recorded: its rows
-   are counted under "no mailbox id" and cannot be fetched this way. The sweep keeps a fetched
-   original until it has been read again.
+2. `python -m src.cli refetch-garbled --limit 200`, repeated until both its `to try` lines read
+   0, fetches the swept originals back from the mailbox in two halves: at most 200 messages a
+   run in all, two `outlook-cli` calls at a time, oldest mail first, since the mailbox keeps
+   about a year and older mail is gone for good.
+   - By id: each message is asked for under its ids. A message the mailbox no longer holds is
+     recorded as gone and not asked for again; a failed download is asked for again on the next
+     run, three attempts in all.
+   - By folder, time and subject, within what the id half leaves of the limit: mail the retired
+     Apple Mail exporter stored carries no id the mailbox knows, unless an Archive copy of it was
+     recorded. Its folder (then Archive, Sent Items and Inbox) is listed over its received time,
+     two minutes either side, read as Athens time; the subject must match, and a file goes back
+     only when its sha256 is the row's. Several matching messages are counted as ambiguous and
+     skipped for good. With no match, mail over a year old is recorded as gone, and younger mail
+     as not found, looked up again on the next run, three attempts in all. `--no-lookup` runs the
+     id half alone.
+
+   Count first with `--dry-run`, which shows both halves. Exit 4 means `outlook-cli` needs a
+   login: log in and run it again. The sweep keeps a fetched original until it has been read
+   again.
 3. `python -m src.cli reextract --garbled` reads the marked scans and images on disk again, Greek
    first, and summarises the ones that now read.
 4. The nightly image pass, or `transcribe-images --limit 0` at once, transcribes the marked

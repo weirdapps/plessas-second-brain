@@ -22,6 +22,11 @@ refetch() stages the missing messages by Graph id through the export's own path,
 so the next sync extracts and loads them, and record_aliases() notes the Graph id
 of every copy found by its Message-ID under another id, which lets the attachment
 registrar claim the directories downloaded under those ids.
+
+The producer's nightly attachment pass runs it over the last seven days with
+--refetch, and write_mail_loss() leaves what the health check reads in
+data/state/mail_loss.json: the messages the export gave up fetching, the staging
+batches quarantined as unreadable, and how the reconcile went.
 """
 
 from __future__ import annotations
@@ -37,14 +42,19 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from src.config import DATA_ROOT
 from src.export.outlook_cli import run_outlook_cli
 from src.export.outlook_export import (
     commit_messages_to_db,
     download_attachments_for_messages,
     fetch_bodies_concurrent,
 )
+from src.export.state import load_outlook_sync_state, write_json_atomic
 
 logger = logging.getLogger(__name__)
+
+# The counters the health check reads, under the data home's state directory.
+MAIL_LOSS_FILE = "mail_loss.json"
 
 DEFAULT_FOLDERS = ("Archive", "Sent Items", "Inbox")
 # The export's own spelling, which the store's mailbox_name carries.
@@ -115,6 +125,23 @@ def parse_when(value) -> datetime | None:
     except ValueError:
         return None
     return when if when.tzinfo else when.replace(tzinfo=UTC)
+
+
+# A --since or --until given as a time before now: days or hours ("7d", "36h").
+_BEFORE_NOW = re.compile(r"^\s*(\d+)\s*([dh])\s*$", re.IGNORECASE)
+
+
+def parse_since(value: str | None, now: datetime | None = None) -> datetime | None:
+    """A --since or --until: "7d" or "36h" before `now`, or an ISO time read as
+    parse_when reads it. None when it is neither."""
+    if not value:
+        return None
+    match = _BEFORE_NOW.match(value)
+    if match:
+        amount = int(match.group(1))
+        span = timedelta(days=amount) if match.group(2).lower() == "d" else timedelta(hours=amount)
+        return (now or datetime.now(UTC)) - span
+    return parse_when(value)
 
 
 def _iso(when: datetime) -> str:
@@ -370,3 +397,85 @@ def refetch(missing: list[dict], concurrency: int = MAX_CONCURRENCY, limit: int 
             stats["attachments"] += downloaded.get("downloaded_messages", 0)
             logger.info("%s: staged %d of %d", folder, len(fetched), len(chunk))
     return stats
+
+
+def mail_loss_path() -> Path:
+    """Where the mail-loss counters live: <data home>/state/mail_loss.json."""
+    return DATA_ROOT / "state" / MAIL_LOSS_FILE
+
+
+def mail_loss_counts(state_dir: Path, staging_dir: Path) -> dict:
+    """What the export has stopped chasing: per folder, the messages it gave up
+    fetching and those still on the retry list (its cursor files), and the
+    staging batches quarantined as unreadable."""
+    folders: dict[str, dict] = {}
+    for path in sorted(state_dir.glob("outlook_sync*.json")):
+        try:
+            state = load_outlook_sync_state(path)
+        except (OSError, ValueError, TypeError, AttributeError) as e:  # not JSON, or not an object
+            folders[path.name] = {"unreadable": type(e).__name__}
+            continue
+        # The cursor keeps the last FETCH_GAVE_UP_KEPT for good, so a count alone
+        # never falls back to zero; the newest give-up's time says whether it is news.
+        dated = [g.get("gave_up_at") for g in state.fetch_gave_up if isinstance(g, dict)]
+        folders[state.folder or path.name] = {
+            "fetch_gave_up": len(state.fetch_gave_up),
+            "fetch_retries": len(state.fetch_retries),
+            "last_gave_up_at": max((d for d in dated if isinstance(d, str)), default=None),
+        }
+    quarantine = staging_dir / "quarantine"
+    quarantined = sum(1 for p in quarantine.iterdir() if p.is_file()) if quarantine.is_dir() else 0
+    newest = [f["last_gave_up_at"] for f in folders.values() if f.get("last_gave_up_at")]
+    return {
+        "fetch_gave_up": sum(f.get("fetch_gave_up", 0) for f in folders.values()),
+        "quarantined": quarantined,
+        "last_gave_up_at": max(newest, default=None),
+        "folders": folders,
+    }
+
+
+def write_mail_loss(
+    path: Path | None = None,
+    report: Report | None = None,
+    refetch_stats: dict | None = None,
+    error: str | None = None,
+) -> dict:
+    """Write the counters the health check reads, atomically, and return them.
+
+    {updated_at, fetch_gave_up, quarantined} are what it judges; `folders` and
+    `reconcile` say where they come from and how the reconcile went. The counts
+    are read from disk every time, so they stay fresh when the reconcile fails;
+    `reconcile.ok_at`, when one last finished, is carried over from the file
+    until one does.
+    """
+    path = path or mail_loss_path()
+    now = _iso(datetime.now(UTC))
+    previous_ok = None
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+        previous_ok = (previous.get("reconcile") or {}).get("ok_at")
+    except (OSError, ValueError, AttributeError):
+        pass
+    status = "failed" if error else ("ok" if report is not None else "not run")
+    reconcile_part: dict = {"status": status, "ok_at": now if status == "ok" else previous_ok}
+    if error:
+        reconcile_part["error"] = error
+    if report is not None:
+        reconcile_part.update(
+            since=_iso(report.since),
+            until=_iso(report.until),
+            listed=sum(c.get("listed", 0) for c in report.counts.values()),
+            missing=len(report.missing),
+        )
+    if refetch_stats is not None:
+        reconcile_part.update(
+            refetched=refetch_stats.get("staged", 0),
+            refetch_failed=len(refetch_stats.get("failed", [])),
+        )
+    payload = {
+        "updated_at": now,
+        **mail_loss_counts(DATA_ROOT / "state", DATA_ROOT / "staging"),
+        "reconcile": reconcile_part,
+    }
+    write_json_atomic(path, payload)
+    return payload

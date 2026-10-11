@@ -95,7 +95,9 @@ cd "$PROJECT"
 #   4. Reconcile — list current Inbox via outlook-cli; any DB row still
 #      labelled 'Inbox' but no longer there has been moved (assume → Archive,
 #      matches /triage-inbox flow). Without this, mailbox_name goes stale
-#      forever the moment the user triages.
+#      forever the moment the user triages. Deleted Items and Junk are listed
+#      too (one call each): stored mail found there is recorded where it is
+#      (sync_metadata mail_location:<message_id>), not relabelled Archive.
 overall_rc=0
 # The first auth failure (4, re-authenticate) sticks. Any other non-zero code
 # replaces the one before it. The reconcile runs last, so its code used to
@@ -128,7 +130,7 @@ echo "$(ts) — start folder=Sent Items" >> "$LOG"
 rc_sent=$?
 note_rc "$rc_sent"
 
-echo "$(ts) — start reconcile (Inbox→Archive moves)" >> "$LOG"
+echo "$(ts) — start reconcile (Inbox moves, Deleted Items, Junk)" >> "$LOG"
 "$PYTHON" -m src.export.inbox_reconcile >> "$LOG" 2>&1
 rc3=$?
 note_rc "$rc3"

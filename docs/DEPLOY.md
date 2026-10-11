@@ -233,7 +233,30 @@ namespace the labels.
 embeddings, Claude Code conversations and inline images. It stages no mail
 itself; `outlook_export` does, one run per folder (Inbox, Archive, Sent Items),
 and `python -m src.export.inbox_reconcile` records Inbox mail you have since
-moved. `scripts/wrappers/systemd/sb-outlook-sync.sh` runs all of these hourly.
+moved, and where stored mail you have since deleted or junked now is (the
+README's Database schema has the `mail_location:` rows it writes).
+`scripts/wrappers/systemd/sb-outlook-sync.sh` runs all of these hourly.
+
+Each `outlook_export` run lists its folder from six hours before its cursor, so
+mail that turned visible after newer mail was listed (a scanner hold, a release
+from quarantine) is still caught. It skips, before fetching, what the store or a
+staging batch already holds, and a download of attachments that runs out of time
+puts its message back on the retry list instead of ending the run. What the
+overlap cannot reach, the nightly reconcile does:
+`scripts/wrappers/systemd/sb-attachment-pass.sh` ends with
+`python -m src.cli mail-reconcile --since 7d --refetch --limit 100 --health-json`.
+It sets the last week of Inbox, Archive and Sent Items against the store and
+stages what the store lacks for the next mail sync. `--limit` is its call budget:
+three listings, plus at most two calls per message staged; set
+`SB_MAIL_RECONCILE_LIMIT` in the unit's environment to change it. `--health-json`
+writes `data/state/mail_loss.json`, even when the reconcile fails: `updated_at`,
+`fetch_gave_up` (messages the export stopped retrying, summed over the cursor
+files), `last_gave_up_at`, `quarantined` (unreadable staging batches), per-folder
+counts, and the reconcile's outcome with `ok_at`, when one last succeeded. The
+stage is skipped, and logged, while `~/.second-brain/needs_reauth` exists. It is
+the pass's last stage and its only outlook-cli caller, so a slow night cannot
+starve the stages before it. Copy both wrappers into `~/.local/bin` after
+pulling this change.
 It does not cover Teams, calendar,
 news or SharePoint, so `calendar-sync`, `teams-sync`, `news-sync` and
 `process-sharepoint` each want their own schedule. `python -m src.cli --help` lists every subcommand.

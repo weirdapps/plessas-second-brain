@@ -97,6 +97,8 @@ The MCP server exposes 27 tools (all defined in `src/mcp_server.py`). Register t
 - `query_emails(person, topic, keyword, start_date, end_date, limit)`. Combined filters.
 - `outlook_live_search(folder, since_minutes, subject_contains)`. Bypasses the DB and queries the live Outlook mailbox directly, for mail newer than the store. `since_minutes` defaults to 60 and is capped at 1440 (24 hours); the answer's `since_minutes` and `clamped` say what was searched. This is the escape hatch when `stats` says the local copy is stale.
 
+Mail deleted or junked in Outlook keeps the folder it had, where it used to be relabelled `Archive` like mail moved there; where it went, and when it was first seen deleted, is recorded beside it (see [Database schema](#database-schema)). Nothing is removed from the store: these tools still return it.
+
 ### People and topics
 
 - `person_context(name_or_email, days, limit)`. History, sentiment, decisions, open actions, communication pattern, `teams`: the messages they wrote in the window and the threads they wrote in (`recent_threads`, with `recent_threads_total`), and `whatsapp`, the same for WhatsApp, matched on a name of two words or more against sender names, since WhatsApp has no address to join on. Each list is capped at `limit` (default 20) and carries a `<name>_total` sibling with the real count, so a truncated answer is distinguishable from a complete one. A name is matched ignoring case and accents; when several people match, the most-emailed one is used and `match_count` / `other_candidates` say who else it could be (`sender_brief` and `meeting_prep` resolve names the same way).
@@ -415,6 +417,7 @@ python -m src.cli process-sharepoint --ingest-fetched  # store the files earlier
 python -m src.cli process-sharepoint --refetch-content --max-fetches 0 --deadline-s 1800  # read again the links recorded ok with no text
 python -m src.cli mail-reconcile --since 2025-03-16 --json gaps.json   # Outlook messages the store lacks; read-only, so it runs on a replica
 python -m src.cli mail-reconcile --since 2026-05-01 --refetch --record-aliases  # producer: stage them for the next sync, note the ids of Archive copies
+python -m src.cli mail-reconcile --since 7d --refetch --limit 100 --health-json  # producer, nightly: the week's missing mail, and data/state/mail_loss.json for the health check
 python -m src.cli retry-stubs [--dry-run]   # extract again the emails loaded without an extraction after failing three runs
 ```
 
@@ -440,7 +443,7 @@ src/
     news_export.py             News-reader digests and articles into staging batches
     teams_cli.py               teams-cli subprocess wrapper
     teams_export.py            Teams chats, threads, messages
-    inbox_reconcile.py         Inbox to Archive move detection
+    inbox_reconcile.py         Inbox to Archive move detection; Deleted Items and Junk as state
     sharepoint_fetcher.py      SharePoint link fetch and host classification
     sharepoint_cli.py          sharepoint-cli subprocess wrapper (cookie session, not bearer)
     state.py                   Atomic staging writes and the Outlook sync cursor
@@ -529,7 +532,7 @@ skill/
 - **Conversations**: `conversations`, `conversation_turns`, `conversation_topics`
 - **External refs**: `sharepoint_links`
 - **FTS5**: `emails_fts` (summary, body and, from v22, subject, all accent-folded), `key_facts_fts`, `attachment_content_fts`, `conversation_turns_fts`, `conversations_fts`, `teams_messages_fts`, `teams_threads_fts`, `whatsapp_messages_fts`, `whatsapp_threads_fts`, `calendar_events_fts`
-- **Metadata**: `sync_metadata` (per-source cursors), `schema_version`
+- **Metadata**: `sync_metadata` (per-source cursors), `schema_version`. `sync_metadata` also holds a row per stored email found in Outlook's Deleted Items or Junk Email, keyed `mail_location:<emails.message_id>`, with the JSON `{location, deleted_at, internet_message_id}`: `location` is `Deleted Items` or `Junk Email`, `deleted_at` the UTC time it was first seen in Deleted Items (null for Junk), and the Message-ID is normalised (no brackets, lower case). The hourly `src/export/inbox_reconcile.py` writes it when the email is first seen there, keeps it after the folder purges the email, and removes it when the email is back in the Inbox. The email row itself is never deleted or relabelled for it. A match by Message-ID says a copy is there: mail sent with a copy to oneself keeps another in Sent Items, which this does not list
 
 `commitments` has no dedicated MCP tool and no CLI subcommand. The `commitments` bucket of `recall` is the only way to read it.
 

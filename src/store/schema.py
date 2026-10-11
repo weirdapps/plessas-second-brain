@@ -499,6 +499,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_attachment_content_indexes(conn)
     if current < 33:
         migrate_add_source_class(conn)
+    if current < 34:
+        migrate_fts_update_triggers_on_source_columns(conn)
+        migrate_index_people_lookups(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -775,6 +778,83 @@ def migrate_add_source_class(conn: sqlite3.Connection) -> None:
             raise
     finally:
         conn.execute(f"PRAGMA busy_timeout = {int(busy_ms)}")
+
+
+def migrate_fts_update_triggers_on_source_columns(conn: sqlite3.Connection) -> None:
+    """v34: each full-text index re-indexes a row only when an UPDATE sets its indexed text.
+
+    Every `*_au` trigger was AFTER UPDATE ON <table>, with no column list, so it fired on an
+    UPDATE of any column and deleted and re-inserted the row's whole text. A mailbox move
+    re-tokenised an email's body (src/store/loader.py, src/export/inbox_reconcile.py); each
+    llm_status or llm_error write of an attachment, on every retry, deferral and success
+    (src/extract/attachment_pipeline.py), up to 2M characters, through the fold's twenty
+    replace() calls, twice. Now each fires only when the UPDATE sets the id or a column the
+    index reads: the column itself, or for a folded `<column>_f` its `<column>`.
+
+    The columns come from each index as it stands, not from a list here, so the trigger body
+    always names what the index declares. SQLite takes UPDATE OF over a column the table does
+    not have and never fires for it, so an index over a column that cannot be found is refused
+    with an error instead.
+
+    Dropping and creating triggers is a change to the schema alone: no row is read, no index
+    rebuilt. One immediate transaction, so no table is ever without its trigger, and a second
+    unit starting at the same moment finds the work done; running it again changes nothing.
+    """
+    pairs = [
+        (fts, table)
+        for fts, table, _columns in _FOLDED_FTS
+        if _table_exists(conn, table) and _table_exists(conn, fts)
+    ]
+    if not pairs:
+        return
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for fts, table in pairs:
+            indexed = [r[1] for r in conn.execute(f"PRAGMA table_info({fts})")]
+            # name -> hidden: 0 for a stored column, 2 or 3 for a generated one.
+            columns = {r[1]: r[6] for r in conn.execute(f"PRAGMA table_xinfo({table})")}
+            sources = []
+            for name in indexed:
+                source = name.removesuffix("_f") if columns.get(name) else name
+                if columns.get(source) != 0:
+                    raise RuntimeError(
+                        f"{fts} indexes {name}, and {table} has no column {source} it is read "
+                        f"from; refusing to recreate {table}_au over a column it cannot watch"
+                    )
+                sources.append(source)
+            conn.execute(f"DROP TRIGGER IF EXISTS {table}_au")
+            conn.execute(_fts_update_trigger(fts, table, indexed, sources))
+        conn.execute("COMMIT")
+    except BaseException:
+        # Not an explicit ROLLBACK: see _index_email_subjects.
+        conn.rollback()
+        raise
+
+
+def migrate_index_people_lookups(conn: sqlite3.Connection) -> None:
+    """v34: indexes for the ways the loader and the people dedup look a person up.
+
+    By address, `LOWER(email) = ?`: for every sender, recipient and cc of every email loaded
+    (src/store/normalizer.py find_or_create_person), and in the people dedup, the calendar
+    loader and the Teams MRI resolution. The UNIQUE index on email cannot serve LOWER(email),
+    so each lookup read the whole table. An index on that expression serves every one of them
+    as written, so none changes and each keeps its meaning exactly: the built-in lower(), which
+    folds ASCII case only, as before. A stored lowercase column would have meant a backfill and
+    a rewrite of every lookup.
+
+    By name, `name = ?` and `name = ? AND email IS NULL`, for a person named without an
+    address: (name, email) serves both. With an index on name alone, SQLite without statistics
+    took the second from the email index's NULL range, three quarters of the table.
+
+    The table is small (34K rows on the producer), so both build in well under a second.
+    """
+    if not _table_exists(conn, "people"):
+        return
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_people_email_lower ON people(lower(email))")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_people_name_email ON people(name, email)")
+    conn.commit()
 
 
 def migrate_add_text_documents(conn: sqlite3.Connection) -> None:
@@ -2189,10 +2269,26 @@ def _fold_fts(conn: sqlite3.Connection, fts: str, table: str, columns: tuple[str
         f"INSERT INTO {fts}({fts}, rowid, {new_list}) "
         f"VALUES('delete', old.id, {old_vals}); END"
     )
-    conn.execute(
-        f"CREATE TRIGGER {table}_au AFTER UPDATE ON {table} BEGIN "
-        f"INSERT INTO {fts}({fts}, rowid, {new_list}) "
-        f"VALUES('delete', old.id, {old_vals}); "
-        f"INSERT INTO {fts}(rowid, {new_list}) VALUES (new.id, {new_vals}); END"
-    )
+    conn.execute(_fts_update_trigger(fts, table, folded, list(columns)))
     conn.execute(f"INSERT INTO {fts}({fts}) VALUES('rebuild')")
+
+
+def _fts_update_trigger(fts: str, table: str, indexed: list[str], sources: list[str]) -> str:
+    """The CREATE TRIGGER of `table`_au: re-index the row in `fts` when an UPDATE sets a column
+    its indexed text is read from (`sources`), or its id, which keys the row in the index.
+
+    `indexed` are the index's own columns, named exactly as the index declares them, or the
+    'delete' would not match what was inserted. SQLite does not check the column names of
+    UPDATE OF, and a trigger watching a name the table lacks never fires for it, so a caller
+    passes only columns it has found in the table (see v34).
+    """
+    watched = ", ".join(["id", *sources])
+    names = ", ".join(indexed)
+    new_vals = ", ".join(f"new.{c}" for c in indexed)
+    old_vals = ", ".join(f"old.{c}" for c in indexed)
+    return (
+        f"CREATE TRIGGER {table}_au AFTER UPDATE OF {watched} ON {table} BEGIN "
+        f"INSERT INTO {fts}({fts}, rowid, {names}) "
+        f"VALUES('delete', old.id, {old_vals}); "
+        f"INSERT INTO {fts}(rowid, {names}) VALUES (new.id, {new_vals}); END"
+    )

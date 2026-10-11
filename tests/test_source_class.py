@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pytest
 
+from src.config import CURRENT_SCHEMA_VERSION
 from src.store import source_class as sc
 from src.store.schema import create_database, get_connection, get_schema_version, run_migrations
 
@@ -473,7 +474,7 @@ def test_the_migration_classifies_a_v32_store(tmp_path, monkeypatch):
 
     run_migrations(conn)
 
-    assert get_schema_version(conn) == 33
+    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION
     assert dict(conn.execute("SELECT id, source_class FROM emails").fetchall()) == expected
     assert "idx_emails_source_class" in {r[1] for r in conn.execute("PRAGMA index_list(emails)")}
     # The full-text trigger was set aside for the backfill and is back as it was
@@ -501,7 +502,7 @@ def test_the_migration_is_idempotent(tmp_path, monkeypatch):
     migrate_add_source_class(conn)
     run_migrations(conn)
 
-    assert get_schema_version(conn) == 33
+    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION
     assert dict(conn.execute("SELECT id, source_class FROM emails").fetchall()) == expected
     conn.close()
 

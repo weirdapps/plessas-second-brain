@@ -509,6 +509,18 @@ running syncs exit, pull, run `python -m src.cli migrate`, and start the timers 
 store that has not migrated yet sweeps as before, only slower: the index hint is given only
 when the index exists.
 
+**Upgrading to schema v34.** From v34 each full-text index's update trigger fires only when an
+UPDATE sets the row's id or a column the index reads; before, any UPDATE re-indexed the row's
+whole text, so a mailbox move re-tokenised a body and every `llm_status` write of an attachment
+up to 2M characters. Address lookups (`LOWER(email) = ?`, for every sender, recipient and cc
+loaded) and the loader's name lookups get an index each on `people`, and keep their meaning.
+The migration recreates ten triggers and builds two indexes on a table of 34K rows: on a
+synthetic 530 MB store with 60K emails and 34K people it took 0.013 s, and afterwards 2,000
+mailbox moves took 0.08 s instead of 0.66 s and 2,000 address lookups 0.004 s instead of 1.8 s.
+It reads no row of the indexed tables and rebuilds no index. Any command that migrates applies
+it (`sync`, `teams-sync`, `migrate`), so no timer needs stopping: a job still running the old
+code works with the new triggers, and its own migrations end at v33.
+
 ## 8. Backup and restore
 
 `scripts/backup_db.py` takes an MVCC-consistent snapshot of a live `brain.db`,

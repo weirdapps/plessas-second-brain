@@ -727,6 +727,13 @@ def cmd_reextract(args):
     return 0
 
 
+def cmd_ocr_regarble(args):
+    """Find stored OCR text that is Greek read as Latin letters (src/extract/ocr_regarble.py)."""
+    from src.extract.ocr_regarble import cmd
+
+    return cmd(args)
+
+
 def cmd_sweep_files(args):
     """Delete attachment files whose content is already stored (src/store/file_sweep.py).
 
@@ -3676,6 +3683,19 @@ def main():
         "--root", default=str(ATTACHMENTS_DIR), help="Attachments root, for rows recorded elsewhere"
     )
     parser_reextract.set_defaults(func=cmd_reextract)
+
+    parser_regarble = subparsers.add_parser(
+        "ocr-regarble", help="Find stored OCR text that is Greek read as Latin letters"
+    )
+    regarble_mode = parser_regarble.add_mutually_exclusive_group()
+    regarble_mode.add_argument("--dry-run", action="store_true", help="Count only (default)")
+    regarble_mode.add_argument(
+        "--apply", action="store_true", help="Mark them and clear what their summaries wrote"
+    )
+    parser_regarble.add_argument(
+        "--root", default=str(ATTACHMENTS_DIR), help="Attachments root, for rows recorded elsewhere"
+    )
+    parser_regarble.set_defaults(func=cmd_ocr_regarble)
 
     parser_notes = subparsers.add_parser(
         "ingest-session-notes",

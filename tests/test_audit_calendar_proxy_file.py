@@ -48,7 +48,7 @@ def test_calendar_sync_leaves_the_self_flags_alone_when_the_proxy_file_is_unread
     conn.close()
 
     (tmp_path / "canonical_people.json").write_text(_BROKEN)
-    monkeypatch.setattr(cli, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr("src.pipeline.calendar_sync.DATA_ROOT", tmp_path)
     monkeypatch.setattr(src.config, "USER_EMAIL_PATTERN", "owner@example.com")
     monkeypatch.setattr(calendar_export, "list_events", lambda since, until, failures=None: [])
 
@@ -81,7 +81,7 @@ def test_a_readable_proxy_file_still_refreshes_the_flags(monkeypatch, tmp_path):
     (tmp_path / "canonical_people.json").write_text(
         json.dumps([{"email": "pa@example.com", "is_proxy_for_self": True}])
     )
-    monkeypatch.setattr(cli, "DATA_ROOT", tmp_path)
+    monkeypatch.setattr("src.pipeline.calendar_sync.DATA_ROOT", tmp_path)
     monkeypatch.setattr(src.config, "USER_EMAIL_PATTERN", "owner@example.com")
     monkeypatch.setattr(calendar_export, "list_events", lambda since, until, failures=None: [])
 

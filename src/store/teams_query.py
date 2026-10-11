@@ -1,9 +1,12 @@
 """Read-side queries over teams_chats / teams_messages / teams_threads.
 
 Used by:
-- src/cli.py — teams-search, teams-thread, teams-chat, teams-stats
 - src/store/recall.py — _search_teams branch
-- src/mcp_server.py — three new MCP tools
+- src/mcp_server.py — search_teams, teams_thread_context and teams_chat_summary, which the
+  CLI's deprecated teams-search, teams-thread and teams-chat now call
+
+`stats` answered `brain teams-stats`, which now runs the same counts as a sql_query
+(src/cli.py TEAMS_STATS_SQL); a test holds the two to the same numbers.
 """
 
 import json

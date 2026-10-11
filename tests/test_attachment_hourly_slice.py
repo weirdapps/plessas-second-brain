@@ -255,8 +255,8 @@ def test_a_file_that_outlasts_the_slice_costs_one_run_and_is_not_read_again(
     """A scan can take OCR_MAX_SECONDS against the 90 s slice. The deadline is checked before a
     file starts, so the scan runs to its own cap and its row is written, whatever it read; the
     rest wait, and the next run moves on, because a file with a row is never offered again."""
-    from src.cli import PHASE1_SYNC_DEADLINE_S
     from src.extract.attachment_extractors import OCR_MAX_SECONDS
+    from src.pipeline.sync import PHASE1_SYNC_DEADLINE_S
 
     db = _store(
         tmp_path,
@@ -324,7 +324,7 @@ def _sync(tmp_path, monkeypatch, *, phase1=None, stamp=None, loaded=0, registere
         )
     conn.commit()
     conn.close()
-    monkeypatch.setattr("src.cli.DATA_ROOT", tmp_path)
+    monkeypatch.setattr("src.pipeline.sync.DATA_ROOT", tmp_path)
     args = types.SimpleNamespace(
         db=db_path, limit=None, engine="claude", workers=1, skip_export=True
     )

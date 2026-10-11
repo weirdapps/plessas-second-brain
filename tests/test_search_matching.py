@@ -654,27 +654,6 @@ def test_the_workspace_filter_applies_before_the_limit(conn):
     assert not rows[0].get("partial_match")
 
 
-def test_the_cli_says_when_no_email_held_every_word(tmp_path, capsys):
-    import types
-
-    from src import cli
-
-    db = tmp_path / "brain.db"
-    store = create_database(str(db))
-    store.execute(
-        "INSERT INTO emails (id, message_id, date_received, subject, summary) "
-        "VALUES (1, 1, '2026-09-01T10:00:00', 'Θέμα', 'Περίληψη για τον προϋπολογισμό')"
-    )
-    store.commit()
-    store.close()
-
-    cli.cmd_query_keyword(
-        types.SimpleNamespace(db=db, keyword="προϋπολογισμό ανύπαρκτηλέξη", limit=5, verbose=False)
-    )
-
-    assert "No email held every word" in capsys.readouterr().out
-
-
 def _image(conn, sha, description):
     conn.execute(
         "INSERT INTO inline_images (sha256, classification, classification_method, "
@@ -1107,31 +1086,6 @@ def test_a_name_without_a_letter_or_digit_resolves_to_no_one(conn, name):
     assert resolve_person(conn, name) == (None, 0, [])
 
 
-def test_the_cli_meeting_prep_skips_empty_names(monkeypatch, tmp_path):
-    import types
-
-    from src import cli
-
-    seen = {}
-
-    def fake_prep(conn, people, **kwargs):
-        seen["people"] = people
-        return {"attendees": []}
-
-    monkeypatch.setattr("src.store.query.meeting_prep", fake_prep)
-    monkeypatch.setattr(
-        "src.store.schema.get_connection", lambda path: types.SimpleNamespace(close=lambda: None)
-    )
-
-    cli.cmd_prep(
-        types.SimpleNamespace(
-            db=tmp_path / "x.db", people="Καραγιάννης, ", topic=None, days=365, limit=5
-        )
-    )
-
-    assert seen["people"] == ["Καραγιάννης"]
-
-
 def test_the_person_plan_switches_above_dense_person_links(conn, monkeypatch):
     """The walk is for people on many emails and the collection for everyone
     else; on the wrong side of the line, either took up to 1.3 s on the replica."""
@@ -1284,20 +1238,3 @@ def test_a_one_word_name_claims_no_unresolved_invite(conn):
     _unresolved_invite(conn, 34, "Κλήση με άλλον Νίκο", "Νίκος Δοκιμαστικός")
 
     assert get_person_context(conn, "nikos@example.com")["last_met"] is None
-
-
-def test_the_teams_cli_says_when_no_thread_held_every_word(conn, tmp_path, capsys, monkeypatch):
-    import types
-
-    from src import cli
-
-    _teams(conn)
-    monkeypatch.setattr("src.store.schema.get_connection", lambda path: conn)
-
-    cli.cmd_teams_search(
-        types.SimpleNamespace(
-            db=tmp_path / "x.db", query="cashback ανύπαρκτηλέξη", kind="both", limit=5
-        )
-    )
-
-    assert "No thread held every word" in capsys.readouterr().out

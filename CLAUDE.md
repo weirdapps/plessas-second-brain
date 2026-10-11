@@ -13,7 +13,7 @@ Multi-modal personal knowledge base: ingests emails, attachments, calendar event
 ## Running
 
 - MCP server: `./run_mcp.sh` (auto-detects the venv: `$SECOND_BRAIN_VENV_PYTHON`, `./.venv`, `./venv`, `~/.venvs/second-brain`, then `python3`). Over HTTP: `python -m src.mcp_server --http 127.0.0.1:8765` (loopback only, bearer token from the file `BRAIN_MCP_TOKEN_FILE` names; see `README.md`).
-- CLI: `python -m src.cli --help` (or the `./brain` wrapper).
+- CLI: `python -m src.cli --help` (or the `./brain` wrapper, which runs from any directory). Reads go through `brain tool <name> '<json>'` (the MCP tools, JSON out; `brain tool --list`); one-off maintenance is under `brain maint`. The jobs with several stages (sync, teams-sync, whatsapp-sync, calendar-sync, process-sharepoint) live in `src/pipeline/`; `src/cli.py` parses their arguments.
 - Incremental sync over staged mail (extract → load → attachments → dedup → embed → conversations → images): `python -m src.cli sync`. Mail is staged by `python -m src.export.outlook_export` (outlook-cli); `sync` never exports it. Teams, calendar, news, SharePoint and the filesystem scan are separate subcommands and need their own schedule.
 
 ## Hosts
@@ -39,8 +39,8 @@ CI (`.github/workflows/ci.yml`), five jobs on every push and PR to `master`: `li
 
 1. **Ingest** → raw content into `data/staging/batch-*.json`. The staging JSON shape is the source-agnostic contract (see "Bring your own source" in `README.md` and `examples/`). Microsoft 365 sources use the external, optional `outlook-cli` / `teams-cli` / `sharepoint-cli` adapters. `news-sync` reads an external news-reader SQLite DB (`BRAIN_NEWS_DB`) and stages digests plus above-threshold articles under `mailbox_name = 'News'`.
 2. **Extract** → an LLM (Claude via Vertex AI by default, or `ANTHROPIC_API_KEY`; Gemini optional) produces structured JSON: summary, sentiment, urgency, topics, decisions, action items, people, key facts.
-3. **Load** → `src/store/loader.py` writes to SQLite with FTS5 indexes + embedding vectors + thread reconstruction. `create_database` stamps version 0 and then calls `run_migrations`, so a fresh store and a migrated one converge on the same tables; `CURRENT_SCHEMA_VERSION` lives in `src/config.py`. `python -m src.cli load` is the only command that creates the DB: `stats`, `sync` and `migrate` all exit 1 if it is absent.
-4. **Serve** → `src/mcp_server.py` (`mcp.server.MCPServer`, mcp SDK v2) exposes the store as MCP tools; `src/cli.py` mirrors some of them for the terminal (not `sql_query` or `sql_schema`, which are MCP only).
+3. **Load** → `src/store/loader.py` writes to SQLite with FTS5 indexes + embedding vectors + thread reconstruction. `create_database` stamps version 0 and then calls `run_migrations`, so a fresh store and a migrated one converge on the same tables; `CURRENT_SCHEMA_VERSION` lives in `src/config.py`. `python -m src.cli load` is the only command that creates the DB: `tool`, `sync` and `migrate` all exit 1 if it is absent.
+4. **Serve** → `src/mcp_server.py` (`mcp.server.MCPServer`, mcp SDK v2) exposes the store as MCP tools; `brain tool <name> '<json>'` calls any of them from the terminal through the server's own call (`src/mcp_call.py`), JSON out.
 
 ## Key conventions
 

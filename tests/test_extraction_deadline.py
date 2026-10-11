@@ -149,7 +149,7 @@ def _sync(tmp_path, monkeypatch, unit, extraction_result):
     )
     conn.commit()
     conn.close()
-    monkeypatch.setattr("src.cli.DATA_ROOT", tmp_path)
+    monkeypatch.setattr("src.pipeline.sync.DATA_ROOT", tmp_path)
     monkeypatch.setattr(llm_deadline, "_detect_systemd_unit", lambda: unit)
     args = type(
         "Args",
@@ -198,13 +198,14 @@ def test_cmd_sync_fails_the_run_when_extraction_ended_on_a_quota_pause(tmp_path,
 
 
 def test_a_person_at_a_terminal_keeps_the_unbounded_run(monkeypatch):
-    from src import cli, llm_deadline
+    from src import llm_deadline
+    from src.pipeline import sync
 
     monkeypatch.setattr(llm_deadline, "_detect_systemd_unit", lambda: None)
     monkeypatch.delenv("PTS_LLM_DEADLINE", raising=False)
-    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True, raising=False)
+    monkeypatch.setattr(sync.sys.stdin, "isatty", lambda: True, raising=False)
 
-    assert cli._extract_deadline_s() is None
+    assert sync._extract_deadline_s() is None
 
 
 @pytest.mark.parametrize(("left_s", "expected"), [(10_000.0, 300.0), (400.0, 20.0), (100.0, 0.0)])
@@ -212,14 +213,15 @@ def test_the_slice_is_capped_by_what_is_left_of_the_unit(monkeypatch, left_s, ex
     """A second sync in the same unit (the wrappers retry once on a database
     lock) got a fresh full slice and ran past the unit timeout. The unit-anchored
     LLM deadline says how much is left; the stages after extraction need theirs."""
-    from src import cli, llm_deadline
+    from src import llm_deadline
+    from src.pipeline import sync
 
     now = 1_000_000.0
     monkeypatch.setattr(llm_deadline, "_detect_systemd_unit", lambda: "sb-outlook-sync")
     monkeypatch.setattr("time.time", lambda: now)
     monkeypatch.setenv("PTS_LLM_DEADLINE", repr(now + left_s))
 
-    assert cli._extract_deadline_s() == pytest.approx(expected)
+    assert sync._extract_deadline_s() == pytest.approx(expected)
 
 
 def test_a_quota_pause_is_logged_as_a_quota_pause(staged, tmp_path):

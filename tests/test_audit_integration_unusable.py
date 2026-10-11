@@ -90,7 +90,7 @@ def _sync(tmp_path, monkeypatch, extraction_result):
     )
     conn.commit()
     conn.close()
-    monkeypatch.setattr("src.cli.DATA_ROOT", tmp_path)
+    monkeypatch.setattr("src.pipeline.sync.DATA_ROOT", tmp_path)
     args = types.SimpleNamespace(
         db=db_path, limit=None, engine="claude", workers=1, skip_export=True
     )

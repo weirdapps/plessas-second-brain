@@ -14,315 +14,11 @@ from src.config import (
     DATA_ROOT,
     DEFAULT_DB,
     EXTRACT_ENGINE,
-    IMAGE_CLASSIFY_BUDGET_S,
     NEWS_DB_PATH,
     SHAREPOINT_DATA_DIR,
 )
 from src.llm_deadline import install_llm_deadline_for_this_process
 from src.store.file_sweep import SWEEP_POLICY_FILE
-
-# Attachments registered per sync run. Step 6 runs Phase 1 (local parse) and
-# Phase 2 (one LLM call each) over exactly this set, inside a unit with a
-# TimeoutStartSec — so this is really a bound on that downstream work. At 200/run
-# the 7,387-file backlog left by the VPS cutover drains in under two days
-# without any pass risking a SIGTERM.
-ATTACHMENT_REGISTER_LIMIT = 50
-
-# The hourly sync only registers mail from this window. It runs under
-# TimeoutStartSec=600 and is sized for one hour of new email; carrying the
-# backfill as well is what made every scheduled run on 2026-08-18 overrun and
-# get SIGTERMed, with only the 90 s retry completing. The window has to clear
-# the overnight gap in the timer's schedule (22:00 -> 01:00 -> 07:00, so nine
-# hours) with room to spare. Bulk registration lives in `register-attachments`,
-# which the nightly job runs under a one-hour budget.
-ATTACHMENT_REGISTER_WINDOW_H = 48
-
-# --- Wall-clock budget for one sync run ------------------------------------
-#
-# sb-outlook-sync runs under TimeoutStartSec=600. Bounding stages one at a time
-# against that number failed three times over (registration, then Phase 2 by
-# count, then Phase 1), because independent per-stage limits cannot sum to a
-# guarantee — each fix stopped one overrun and exposed the next. These budgets
-# are therefore stated together and their sum is asserted against the timeout
-# in tests/test_sync_budget.py.
-#
-# Every one is wall-clock, not a count. Count was wrong for both slow stages
-# and for opposite reasons: Phase 1 varies 1000x per item (a text part vs OCR
-# vs a 30 MB workbook), and Phase 2 is network-bound, so 25 calls read as
-# modest and cost 6-8 minutes. Anything deferred stays queued for the nightly
-# job, which has an hour.
-#
-# The unit is 20 minutes since 2026-09-11 (catchup-timeout.conf: a recovery run
-# needs more than the steady state). This is the same number as
-# llm_deadline._UNIT_TIMEOUT_SECONDS, and a test holds the two together.
-SYNC_UNIT_TIMEOUT_S = 1200.0
-
-# The wrapper runs auth-watch, three outlook_export folder passes and
-# inbox_reconcile inside the same unit before it calls `sync`, so their time is
-# spent from the same timeout. p99 of 133 runs, 2026-09-16 to 09-23 (median 47 s,
-# max 364 s), measured from the Inbox export to the start of `sync`: auth-watch
-# runs before the first timestamp the wrapper logs and is not in the figure.
-# _extract_deadline_s caps Step 2 by what is actually left of the unit, so a
-# slow auth-watch comes out of the extraction slice rather than the timeout.
-SYNC_WRAPPER_FETCH_OBSERVED_S = 140.0
-
-PHASE1_SYNC_DEADLINE_S = 90.0
-PHASE2_SYNC_DEADLINE_S = 90.0
-
-# Set to 1, Step 6 reads images and zip archives in the hourly slice, as it did before
-# 2026-10-11. Unset, it leaves them to the nightly pass while one runs: see Step 6.
-SYNC_HEAVY_ATTACHMENTS_ENV = "BRAIN_SYNC_HEAVY_ATTACHMENTS"
-
-# Step 8's default (IMAGE_CLASSIFY_BUDGET_S, 480 s) was sized for sb-daily-sync,
-# whose timeout is 30 minutes. Inherited here it claims 80% of the unit on its
-# own, which is why runs still died after Step 6 was bounded.
-# Trimmed to 90 s so the stage sum keeps 20% headroom (tests/test_sync_budget.py).
-# Cheapest place to take it from: the nightly job already runs
-# `process-images --limit 500` under an hour, so a short hourly slice only has
-# to keep fresh mail's images moving.
-IMAGE_CLASSIFY_SYNC_BUDGET_S = 90.0
-
-# Step 7 (Claude Code conversation sync) was the last stage with no bound of any
-# kind: cmd_sync called run_conversation_extraction() with no arguments, so the
-# default limit=0 extracted the whole pending list one conversation at a time.
-# The sum in tests/test_sync_budget.py appeared to cover it, but only because
-# that file asserted a 30 s allowance for a stage nothing enforced, so the
-# guarantee was arithmetic over a number production was free to ignore.
-# What made it bite: pending is whatever sync-tokens-to-vps.sh has rsynced since
-# the last run, so it scales with how busy Claude Code has been, not with the
-# mailbox. On 2026-09-05 that was 32 conversations an hour, and every run from
-# 23:28 the previous evening was SIGTERMed seconds after printing "Sync
-# complete". 30 s holds the previously assumed sum exactly, so the margin tests
-# keep the same headroom they were written against; the remainder drains on
-# sb-conversation-sync, which has 900 s.
-CONVERSATION_SYNC_DEADLINE_S = 30.0
-
-# Step 2 (email extraction) had no bound either, and could sleep an hour
-# in-process on five quota errors. Measured on 2026-09-23: 7-19 new emails an
-# hour take 1.5-2.5 minutes through Steps 2-4, most of it extraction. The rest
-# of a backlog stays pending for the next run.
-EXTRACT_SYNC_DEADLINE_S = 300.0
-
-# Step 2's budget in each unit that runs `sync`. The two 30-minute units are the
-# ones that drain a backlog (the health check kicks sb-daily-sync to drain
-# staging), so they get most of their larger budget rather than the hourly
-# slice. Found by /proc/self/cgroup, as llm_deadline finds the unit: sb-noon-
-# catchup and sb-outlook-sync run identical argv.
-EXTRACT_DEADLINE_BY_UNIT_S = {
-    "sb-outlook-sync": EXTRACT_SYNC_DEADLINE_S,
-    "sb-daily-sync": 900.0,
-    "sb-noon-catchup": 900.0,
-}
-
-# Replies the model could not use (refusals, unparseable JSON), with none
-# extracted, from which a sync reads as the model being down. One or two are an
-# ordinary quiet run: about 14 emails a day were refused in September 2026, and a
-# run whose one fresh email was refused went red at 75. Three and none usable is
-# no longer ordinary.
-MODEL_UNUSABLE_ALARM = 3
-
-# Observed span for the stages that have no budget of their own: load,
-# registration (count-bounded), people dedup, and the incremental embeddings
-# update (about 10 s), made once at the end of the run (Step 9), which rewrites
-# the whole index. Mail fetch is SYNC_WRAPPER_FETCH_OBSERVED_S above.
-SYNC_FIXED_WORK_S = 80.0
-
-# What the stages after Step 2 need, held back from the unit's remaining time.
-SYNC_AFTER_EXTRACTION_S = (
-    SYNC_FIXED_WORK_S
-    + PHASE1_SYNC_DEADLINE_S
-    + PHASE2_SYNC_DEADLINE_S
-    + CONVERSATION_SYNC_DEADLINE_S
-    + IMAGE_CLASSIFY_SYNC_BUDGET_S
-)
-
-
-def _extract_deadline_s() -> float | None:
-    """Step 2's wall-clock budget for this process.
-
-    Its unit's slice when the unit is in the table; the hourly slice for any
-    other scheduler (cron, launchd or a unit off the table, all three described
-    in the docs); unbounded only for a person at a terminal. Then capped by what
-    is left of the unit, read from the unit-anchored PTS_LLM_DEADLINE, less what
-    the later stages need: a second sync in the same unit (the wrappers retry
-    once on a database lock) used to get a fresh full slice and overrun it.
-    """
-    import os
-    import time
-
-    from src.llm_deadline import _detect_systemd_unit
-
-    unit = _detect_systemd_unit()
-    if unit in EXTRACT_DEADLINE_BY_UNIT_S:
-        slice_s = EXTRACT_DEADLINE_BY_UNIT_S[unit]
-    elif sys.stdin is not None and sys.stdin.isatty():
-        return None
-    else:
-        slice_s = EXTRACT_SYNC_DEADLINE_S
-    try:
-        left = float(os.environ["PTS_LLM_DEADLINE"]) - time.time() - SYNC_AFTER_EXTRACTION_S
-    except (KeyError, ValueError):
-        return slice_s
-    return max(0.0, min(slice_s, left))
-
-
-# --- Wall-clock budget for one Teams sync run -------------------------------
-#
-# sb-teams-sync also runs under TimeoutStartSec=600, and restoring the full
-# 1,219-chat corpus turned every stage into real work at once. Bounding only
-# the pull was not enough — the run still died, because Step 5 had limit=0 and
-# 804 threads came up pending. Same rule as the Outlook budget above: state the
-# stages together and assert the sum (tests/test_sync_budget.py).
-#
-#   step 1 discover    90 s   measured 86.4 s, fixed cost, no budget of its own
-#   step 2 pull       150 s   ~330 of 1,219 chats at a measured 0.45 s each
-#   step 3 bound       10 s   measured 1.3 s, SQL only
-#   step 4 MRIs        40 s   already capped at 50 lookups/run
-#   step 5 extract    150 s   LLM per thread
-#   step 6 embed       30 s   local
-#                     ----
-#                     470 s of 600 s
-#
-# The pull rotates oldest-first, so every chat is read about every two hours,
-# and deferred threads stay pending for the next run.
-TEAMS_DISCOVER_OBSERVED_S = 90.0
-TEAMS_PULL_DEADLINE_S = 150.0
-TEAMS_BOUND_OBSERVED_S = 10.0
-TEAMS_MRI_OBSERVED_S = 40.0
-TEAMS_EXTRACT_DEADLINE_S = 150.0
-TEAMS_EMBED_OBSERVED_S = 30.0
-TEAMS_UNIT_TIMEOUT_S = 600.0
-
-# Step 6 embeds by count, capped so the 30 s above still holds when a backlog
-# appears: threads are now re-selected when their vector is missing from the
-# index, and 5,336 were missing on 2026-09-23. 500 is five embedding batches and
-# one index save; the backlog drains over a day of hourly runs.
-TEAMS_EMBED_LIMIT = 500
-
-# --- Wall-clock budget for one WhatsApp sync run ----------------------------
-#
-# sb-whatsapp-sync runs under TimeoutStartSec=600 at :55, in the gap after the
-# calendar and news runs finish and before outlook's :10, so it does not queue on
-# the brain.db write lock behind sb-teams-sync (:30, up to 11 min). Same rule as
-# the Teams budget above: state the stages and assert the sum
-# (tests/whatsapp/test_cli.py).
-#
-#   step 1 ingest      30 s   one upsert transaction over the pushed snapshot
-#   step 2 bound       10 s   SQL only
-#   step 3 extract    300 s   LLM per session, deadline-bounded, rest stays pending
-#   step 4 embed       60 s   capped by WHATSAPP_EMBED_LIMIT
-#                     ----
-#                     400 s of 600 s
-WHATSAPP_INGEST_OBSERVED_S = 30.0
-WHATSAPP_BOUND_OBSERVED_S = 10.0
-WHATSAPP_EXTRACT_DEADLINE_S = 300.0
-WHATSAPP_EMBED_OBSERVED_S = 60.0
-WHATSAPP_UNIT_TIMEOUT_S = 600.0
-WHATSAPP_EMBED_LIMIT = 500
-
-
-def format_email_result(email: dict, show_full: bool = False) -> str:
-    """Format a single email result for display.
-
-    Args:
-        email: Email dict with date, subject, summary, etc.
-        show_full: If True, show full details; otherwise show one-line summary
-
-    Returns:
-        Formatted string
-    """
-    if show_full:
-        lines = [
-            f"ID: {email.get('email_id', 'N/A')}",
-            f"Date: {email.get('date', 'N/A')}",
-            f"Subject: {email.get('subject', '(no subject)')}",
-        ]
-
-        if "sender" in email:
-            lines.append(f"From: {email['sender']}")
-
-        if "person_role" in email:
-            lines.append(f"Role: {email['person_role']}")
-
-        if "topic" in email:
-            lines.append(f"Topic: {email['topic']}")
-
-        if "topics" in email and email["topics"]:
-            lines.append(f"Topics: {email['topics']}")
-
-        if "summary" in email and email["summary"]:
-            lines.append(f"Summary: {email['summary']}")
-
-        if "snippet" in email and email["snippet"] != email.get("summary"):
-            lines.append(f"Match: {email['snippet'][:200]}...")
-
-        if "source" in email:
-            lines.append(f"Source: {email['source']}")
-
-        return "\n".join(lines)
-    else:
-        # One-line format
-        date = email.get("date", "N/A")[:10]  # Just the date part
-        subject = email.get("subject", "(no subject)")[:60]
-        return f"[{date}] {subject}"
-
-
-def format_decision_result(decision: dict) -> str:
-    """Format a decision result for display.
-
-    Args:
-        decision: Decision dict with decision, decided_by, date, etc.
-
-    Returns:
-        Formatted string
-    """
-    lines = [
-        f"ID: {decision.get('decision_id', 'N/A')}",
-        f"Decision: {decision.get('decision', 'N/A')}",
-    ]
-
-    if decision.get("decided_by"):
-        lines.append(f"Decided by: {decision['decided_by']}")
-
-    lines.append(f"Date: {decision.get('date', 'N/A')}")
-
-    if decision.get("email_subject"):
-        lines.append(f"Email: {decision['email_subject']}")
-
-    if decision.get("topics"):
-        lines.append(f"Topics: {decision['topics']}")
-
-    return "\n".join(lines)
-
-
-def format_action_result(action: dict) -> str:
-    """Format an action item result for display.
-
-    Args:
-        action: Action dict with task, owner, deadline, etc.
-
-    Returns:
-        Formatted string
-    """
-    lines = [
-        f"ID: {action.get('action_id', 'N/A')}",
-        f"Task: {action.get('task', 'N/A')}",
-    ]
-
-    if action.get("owner"):
-        lines.append(f"Owner: {action['owner']}")
-
-    if action.get("deadline"):
-        lines.append(f"Deadline: {action['deadline']}")
-
-    lines.append(f"Status: {action.get('status', 'open')}")
-
-    if action.get("email_subject"):
-        lines.append(f"Email: {action['email_subject']}")
-
-    lines.append(f"Date: {action.get('date', 'N/A')}")
-
-    return "\n".join(lines)
 
 
 def _token_budget(args):
@@ -1041,426 +737,17 @@ def cmd_split_html(args) -> int:
 
 
 def cmd_process_sharepoint(args):
-    """Scan emails for SharePoint URLs and fetch them."""
-    from src.config import SHAREPOINT_HOST
-    from src.export.sharepoint_fetcher import (
-        is_managed_sharepoint_host,
-        record_link_in_db,
-        retry_candidates,
-        target_of,
-    )
-    from src.extract.sharepoint_ingest import fetch_and_ingest
-    from src.extract.sharepoint_url_scanner import extract_sharepoint_urls
-    from src.store.email_html import markup_or_text
-    from src.store.schema import get_connection, run_migrations
+    """Scan emails for SharePoint URLs and fetch them (src/pipeline/sharepoint.py)."""
+    from src.pipeline import sharepoint
 
-    db_path = str(args.db)
-    if not Path(db_path).exists():
-        print("Error: Database not found. Run 'brain load' first.")
-        sys.exit(1)
-
-    # The files earlier fetches left on disk: stored as text, then left to the sweep. No
-    # fetching, so no tenant is needed (src/extract/sharepoint_ingest.py).
-    if getattr(args, "ingest_fetched", False):
-        from src.config import ATTACHMENTS_DIR
-        from src.extract.sharepoint_ingest import ingest_fetched_backlog
-
-        conn = get_connection(db_path)
-        run_migrations(conn)
-        try:
-            backlog = ingest_fetched_backlog(
-                conn, [SHAREPOINT_DATA_DIR, ATTACHMENTS_DIR / "sharepoint-refetch"]
-            )
-        finally:
-            conn.close()
-        print("SharePoint backlog: " + ", ".join(f"{k} {v:,}" for k, v in backlog.items()))
-        return 0
-
-    # What the old scanner and the old page fetch left in sharepoint_links: queued for the
-    # retry pass, not fetched, so no tenant is needed (src/export/sharepoint_repair.py).
-    if getattr(args, "repair_links", False):
-        from src.export.sharepoint_repair import reread_pages, rescan_links
-
-        conn = get_connection(db_path)
-        run_migrations(conn)
-        try:
-            links = rescan_links(conn, apply=not args.dry_run)
-            pages = reread_pages(conn, apply=not args.dry_run)
-        finally:
-            conn.close()
-        print(
-            f"Mangled links: {links['emails']:,} email(s) read again, {links['dropped']:,}"
-            f" dropped, {links['added']:,} recorded for the retry pass"
-        )
-        print(
-            f"Unread pages: {pages['links']:,} link(s) to {pages['pages']:,} page(s) offered again"
-        )
-        print(
-            "DRY RUN: nothing changed"
-            if args.dry_run
-            else "Run 'brain process-sharepoint' to read them now, or leave them to the nightly pass"
-        )
-        return 0
-
-    # Fetching is gated on our own tenant (fetch_sharepoint_link), so with the
-    # placeholder host every real link would be refused and parked as the
-    # permanent 'unsupported-host'. That happened on the producer, where the
-    # variable was never set; refuse loudly instead. A dry run fetches nothing.
-    import os
-
-    from src.export.sharepoint_fetcher import managed_sharepoint_hosts
-
-    if not args.dry_run and not managed_sharepoint_hosts(os.environ.get("SHAREPOINT_HOST", "")):
-        print(
-            "Error: SHAREPOINT_HOST is not set to a bare host. Set it (environment or "
-            "~/.config/second-brain/env) to the tenant sharepoint-cli is logged in to.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-
-    # Ensure schema is up to date
-    conn = get_connection(db_path)
-    run_migrations(conn)
-
-    # Build query. Links are read from the markup: an HTML body is kept in
-    # email_html, the text in content has no hrefs.
-    #
-    # The scan starts past the highest emails.id it has already read. It used
-    # to read the newest N rows by date_received, and the nightly N of 200 was
-    # a few hours of a weekday's 400-500 rows, so links in the rest of the day
-    # were never recorded, and retry_candidates only retries recorded links.
-    # An id also catches Archive and Sent mail loaded late with an old date.
-    # News carries no links and only used up the window. --since is the manual
-    # backfill: it rescans by date from the start and leaves the mark alone.
-    query = (
-        "SELECT e.id, e.message_id, e.content, e.date_received, h.html FROM emails e "
-        "LEFT JOIN email_html h ON h.email_id = e.id WHERE e.content IS NOT NULL "
-        "AND COALESCE(e.mailbox_name, '') <> 'News'"
-    )
-    params: list = []
-
-    mark_row = conn.execute(
-        "SELECT value FROM sync_metadata WHERE key = 'sharepoint_scan_last_id'"
-    ).fetchone()
-    scan_mark = int(mark_row[0]) if mark_row else 0
-
-    if args.since:
-        query += " AND e.date_received >= ?"
-        params.append(args.since)
-    else:
-        query += " AND e.id > ?"
-        params.append(scan_mark)
-
-    query += " ORDER BY e.id"
-
-    # --limit bounds a --since rescan only. repo-autoupdate pulls this code onto
-    # the producer without copying the wrappers, and the old nightly line passes
-    # --limit 200: bounding the mark scan with it would read 200 emails a night
-    # against 400-500 a weekday, and the mark would never catch up.
-    if args.since and args.limit and args.limit > 0:
-        query += " LIMIT ?"
-        params.append(args.limit)
-
-    # The regex scan is cheap; the fetches are not. With no mark yet the first
-    # run finds the whole backlog, and this keeps it inside the nightly unit's
-    # TimeoutStartSec: the mark stops before the first email it could not
-    # finish, and the next run starts there.
-    max_fetches = getattr(args, "max_fetches", 0) or 0
-    # Wall clock too: a fetch now also extracts the file, and the nightly pass has one hour for
-    # every stage. Checked before each fetch; the scan mark stops before the email it left.
-    import time
-
-    deadline_s = getattr(args, "deadline_s", None)
-    deadline = None if deadline_s is None else time.monotonic() + deadline_s
-
-    def _out_of_time() -> bool:
-        return deadline is not None and time.monotonic() >= deadline
-
-    print("Scanning emails for SharePoint URLs...")
-    if args.since:
-        print(f"  Filtering to emails after {args.since}")
-    else:
-        print(f"  Starting past email id {scan_mark}")
-    if args.since and args.limit and args.limit > 0:
-        print(f"  Limiting to {args.limit} emails")
-    if max_fetches > 0 and not args.dry_run:
-        print(f"  Fetching at most {max_fetches} new URLs")
-    if args.dry_run:
-        print("  DRY RUN — scan and count only, no fetching")
-    print()
-
-    stats = {
-        "emails_scanned": 0,
-        "urls_found": 0,
-        "urls_new": 0,
-        "urls_retried": 0,
-        "urls_fetched": 0,
-        "urls_failed": 0,
-        "urls_not_content": 0,
-        "urls_skipped_external": 0,
-        "auth_required": False,
-    }
-
-    # URLs already fetched successfully — never re-fetch these.
-    existing_urls = {
-        r[0] for r in conn.execute("SELECT url FROM sharepoint_links WHERE fetched_at IS NOT NULL")
-    }
-    # URLs attempted this run (retry pass + scan) — avoids double-fetching a URL
-    # the email scan rediscovers after the retry pass already handled it.
-    attempted: set[str] = set()
-    # One fetch per target this run: the same page is linked from hundreds of emails, under as
-    # many query strings, and every link to it records the one result (target_of).
-    by_target: dict[str, tuple] = {}
-
-    def _fetch_one(url: str, message_id: str) -> bool:
-        """Fetch + record one URL, updating outcome stats. Returns True on a
-        re-loginable (managed-host) auth failure so the caller stops the pass."""
-        print(f"  Fetching: {url}")
-        target = target_of(url)
-        if target in by_target:
-            result, document = by_target[target]
-            print("    (the same target as a link above: not fetched again)")
-        else:
-            # Fetched into a temporary directory and stored as text; no file is kept.
-            result, document = fetch_and_ingest(conn, url, message_id)
-            by_target[target] = (result, document)
-        # An auth failure on an external tenant (a host we hold no session for)
-        # can never be fixed by our re-login, so record it distinctly and keep
-        # going instead of aborting the whole pass. A foreign tenant announces
-        # itself with HTTP 403 at least as often as with exit-4 auth_required,
-        # and that landed in 'http-error', which the retry pass re-requests
-        # every night for a host our login can never open.
-        # The managed-host guard is what makes widening this safe: 403 from OUR
-        # OWN tenant is a per-item authorisation refusal that can be granted
-        # later, so it must stay 'http-error' and stay in the retry pool.
-        # 'unsupported-host' is permanent, and parking a managed link there
-        # would be the same abandonment bug in a new place.
-        # The fetcher refuses a foreign tenant itself, before any request, and
-        # says so with 'unsupported-host'; the relabel below stays as the second
-        # line for a result that reached a host we hold no session for.
-        external_auth = result.status == "unsupported-host" or (
-            (result.status == "auth-required" or result.http_status == 403)
-            and not is_managed_sharepoint_host(url, SHAREPOINT_HOST)
-        )
-        recorded_status = "unsupported-host" if external_auth else result.status
-        record_link_in_db(
-            conn,
-            url=url,
-            message_id=message_id,
-            status=recorded_status,
-            fetched_path=None,
-            file_name=result.file_name,
-            file_size=result.file_size,
-            document_message_id=document,
-        )
-        conn.commit()
-
-        if result.status == "ok":
-            print(f"    ✓ Stored: {result.file_name}")
-            stats["urls_fetched"] += 1
-        elif result.status == "not-content":
-            print("    · Not content (nothing to read): not fetched")
-            stats["urls_not_content"] += 1
-        elif external_auth:
-            print("    ⤼ External host (no session) — skipping")
-            stats["urls_skipped_external"] += 1
-        elif result.status == "auth-required":
-            print("    ✗ Auth required (session expired) — breaking")
-            stats["auth_required"] = True
-            return True
-        else:
-            print(f"    ✗ {result.status}: {result.error_message or 'unknown error'}")
-            stats["urls_failed"] += 1
-        return False
-
-    # The links earlier fetches recorded 'ok' with no text stored: most were a viewer or
-    # sign-in page saved as the file. Each is read again once, by what it points at. A link
-    # attempted since the refetch began is done, so a run stopped by its budget resumes where
-    # it stopped and a finished one finds nothing. Delete the sync_metadata row
-    # 'sharepoint_refetch_since' to read them all again.
-    if getattr(args, "refetch_content", False):
-        from datetime import UTC, datetime
-
-        mark = conn.execute(
-            "SELECT value FROM sync_metadata WHERE key = 'sharepoint_refetch_since'"
-        ).fetchone()
-        since = mark[0] if mark else datetime.now(UTC).isoformat()
-        if not mark and not args.dry_run:
-            conn.execute(
-                "INSERT INTO sync_metadata (key, value) VALUES ('sharepoint_refetch_since', ?)",
-                (since,),
-            )
-            conn.commit()
-        rows = conn.execute(
-            "SELECT l.url, l.message_id FROM sharepoint_links l "
-            "WHERE l.last_status = 'ok' AND COALESCE(l.last_attempt_at, '') < ? "
-            "AND NOT EXISTS (SELECT 1 FROM attachments a "
-            "  JOIN attachment_content ac ON ac.attachment_id = a.id "
-            "  WHERE a.message_id = l.document_message_id "
-            "  AND LENGTH(TRIM(COALESCE(ac.extracted_text, ''))) > 0) "
-            "ORDER BY l.url",
-            (since,),
-        ).fetchall()
-        targets = len({target_of(url) for url, _m in rows})
-        print(f"Refetch: {len(rows)} link(s), {targets} target(s), with no text since {since}")
-        if not args.dry_run:
-            for url, message_id in rows:
-                if max_fetches > 0 and stats["urls_retried"] >= max_fetches:
-                    print(f"  Fetch cap of {max_fetches} reached: the rest wait for the next run")
-                    break
-                if _out_of_time():
-                    print("  Time budget spent: the rest wait for the next run")
-                    break
-                stats["urls_retried"] += 1
-                if _fetch_one(url, message_id):
-                    break
-        conn.close()
-        print(
-            f"\nRefetch: {stats['urls_retried']} read, {stats['urls_fetched']} stored, "
-            f"{stats['urls_failed']} failed, {stats['urls_not_content']} not content"
-        )
-        if stats["auth_required"]:
-            print(
-                f"\n⚠ Auth required: run 'sharepoint-cli login --host {SHAREPOINT_HOST}' and retry"
-            )
-            return EXIT_REAUTH
-        return 0
-
-    # Retry pass: links seen before but never fetched OK (fetched_at NULL) or
-    # gone stale get re-attempted regardless of whether their source email is
-    # still inside the scan window — otherwise old failures never clear.
-    # 'unsupported-host' is a permanent external tenant, so it is excluded.
-    if not args.dry_run:
-        retry_rows = retry_candidates(conn, managed_host=SHAREPOINT_HOST)
-        if retry_rows:
-            print(f"Retrying {len(retry_rows)} previously unfetched/stale link(s)...")
-        for url, message_id in retry_rows:
-            # Bounded like the scan below: each fetch now extracts too, and the backlog pass
-            # can offer many lost links at once.
-            if max_fetches > 0 and stats["urls_retried"] >= max_fetches:
-                break
-            if _out_of_time():
-                print("  Time budget spent: the rest wait for the next run")
-                break
-            attempted.add(url)
-            stats["urls_retried"] += 1
-            if _fetch_one(url, message_id):
-                break
-
-    # Scan emails for new URLs (skip anything already fetched or attempted).
-    # scanned_to is the last email every link of which was dealt with.
-    scanned_to = scan_mark
-    fetches = 0
-    capped = False
-    if not stats["auth_required"]:
-        # The scan reads on a connection of its own. Its open cursor holds a read
-        # snapshot, and on the connection every fetch commits on, a commit from
-        # any other process in between left the next write on a stale snapshot:
-        # SQLite refuses that at once with 'database is locked', busy_timeout
-        # does not retry it, and the pass died with the mark unwritten.
-        scan_conn = get_connection(db_path)
-        try:
-            for row in scan_conn.execute(query, params):
-                email_id, message_id, content, date_received, html = row
-                stats["emails_scanned"] += 1
-
-                urls = extract_sharepoint_urls(markup_or_text(content, html))
-                stats["urls_found"] += len(urls)
-
-                for url in urls:
-                    if url in existing_urls or url in attempted:
-                        continue
-                    if not args.dry_run and max_fetches > 0 and fetches >= max_fetches:
-                        capped = True
-                        break
-                    if not args.dry_run and _out_of_time():
-                        capped = True
-                        break
-                    attempted.add(url)
-                    stats["urls_new"] += 1
-
-                    if args.dry_run:
-                        continue
-
-                    fetches += 1
-                    if _fetch_one(url, message_id):
-                        break
-
-                if stats["auth_required"] or capped:
-                    break
-                scanned_to = email_id
-        finally:
-            scan_conn.close()
-
-    # Only a real pass over the mark's own range moves it: a dry run fetched
-    # nothing, and a --since backfill did not read every id above the mark.
-    if not args.dry_run and not args.since and scanned_to > scan_mark:
-        conn.execute(
-            "INSERT OR REPLACE INTO sync_metadata (key, value) "
-            "VALUES ('sharepoint_scan_last_id', ?)",
-            (str(scanned_to),),
-        )
-        conn.commit()
-    conn.close()
-
-    print("\nSharePoint processing complete:")
-    print(f"  Emails scanned: {stats['emails_scanned']}")
-    print(f"  URLs found: {stats['urls_found']}")
-    print(f"  New URLs: {stats['urls_new']}")
-    if not args.dry_run:
-        print(f"  URLs fetched: {stats['urls_fetched']}")
-        print(f"  URLs failed: {stats['urls_failed']}")
-        if stats["urls_not_content"]:
-            print(f"  Not content (not fetched): {stats['urls_not_content']}")
-        if stats["urls_skipped_external"]:
-            print(f"  External hosts skipped (no session): {stats['urls_skipped_external']}")
-        if capped:
-            print(f"  Fetch cap of {max_fetches} reached; the next run continues from here")
-    if stats["auth_required"]:
-        print(f"\n⚠ Auth required — run 'sharepoint-cli login --host {SHAREPOINT_HOST}' and retry")
-        # The warning alone left the nightly stage green while new links piled
-        # up unfetched. run_stage in sb-attachment-pass.sh judges the exit code.
-        return EXIT_REAUTH
-    return 0
+    return sharepoint.run(args)
 
 
 def cmd_sharepoint_refused(args):
-    """The documents our tenant refuses and the ones on tenants we hold no login for. Read only.
-
-    One entry per document, however many emails link it, with those emails: what to name when
-    asking the owner for access.
-    """
-    from urllib.parse import unquote
-
-    from src.export.sharepoint_repair import refused_links
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    try:
-        sections = [
-            (
-                "Refused by our own tenant (http-error, mostly access denied): ask the owner",
-                refused_links(conn, "http-error"),
-            ),
-            (
-                "On another tenant (unsupported-host): this login cannot fetch them",
-                refused_links(conn, "unsupported-host"),
-            ),
-        ]
-    finally:
-        conn.close()
-    for title, docs in sections:
-        links = sum(d["links"] for d in docs)
-        print(f"{title}: {len(docs)} document(s), {links} link(s)")
-        for d in docs:
-            print(
-                f"  {unquote(d['url'])}\n"
-                f"    {d['links']} link(s), {d['attempts']} attempt(s), last {d['last_attempt'][:10]}"
-            )
-            for e in d["emails"]:
-                print(f"    {(e['date'] or '?')[:10]}  {e['sender'] or '?'}  {e['subject'] or ''}")
-        print()
-    return 0
+    """Deprecated: `brain tool sharepoint_index '{"operation": "list_stale"}'`."""
+    return _deprecated_read(
+        args, "sharepoint-refused", "sharepoint_index", {"operation": "list_stale"}
+    )
 
 
 def cmd_reverse_ingest(args):
@@ -1699,797 +986,162 @@ def cmd_prune_staged(args):
     print(f"Pruned {pruned} batch files, freed {freed / 1024 / 1024:.1f} MB")
 
 
+def cmd_tool(args):
+    """Call an MCP tool by name with JSON arguments, or list the tools (src/mcp_call.py)."""
+    from src import mcp_call
+
+    return mcp_call.command(args.name, args.arguments, list_tools=args.list, db=args.db)
+
+
+# The read commands that mirrored MCP tools by hand, deprecated on 2026-10-11 for one
+# release (README, "Deprecated read commands"). Each prints one line on stderr naming the
+# `brain tool` call that replaces it and makes that call, so its answer is the tool's JSON.
+# A limit is held to the tools' 1..200, as the server holds a caller that skips the input
+# schema; -v and prep's --limit are accepted and ignored.
+
+# What `brain teams-stats` printed, as the one row of a sql_query: no tool counts these.
+TEAMS_STATS_SQL = (
+    "SELECT (SELECT COUNT(*) FROM teams_chats) AS total_teams_chats, "
+    "(SELECT COUNT(*) FROM teams_threads) AS total_teams_threads, "
+    "(SELECT COUNT(*) FROM teams_messages) AS total_teams_messages, "
+    "(SELECT MIN(composed_at) FROM teams_messages) AS earliest_teams_message, "
+    "(SELECT MAX(composed_at) FROM teams_messages) AS latest_teams_message, "
+    "(SELECT COUNT(*) FROM teams_threads WHERE extraction_status = 'pending') "
+    "AS teams_extraction_pending, "
+    "(SELECT COUNT(*) FROM teams_threads WHERE extraction_status = 'failed') "
+    "AS teams_extraction_failed"
+)
+
+
+def _limit(value: int) -> int:
+    from src.mcp_server import MAX_LIMIT
+
+    return max(1, min(int(value), MAX_LIMIT))
+
+
+def _deprecated_read(args, old: str, tool: str, arguments: dict) -> int:
+    """Answer the deprecated read command `old` with the tool it mirrored, after one line
+    on stderr naming the `brain tool` call that replaces it. Arguments left unset are left
+    out, so the tool's own defaults apply."""
+    import json
+    import shlex
+
+    from src import mcp_call
+
+    given = {key: value for key, value in arguments.items() if value is not None}
+    words = ["brain"]
+    if Path(args.db) != DEFAULT_DB:
+        words += ["--db", str(args.db)]
+    words += ["tool", tool]
+    if given:
+        words.append(json.dumps(given, ensure_ascii=False))
+    print(
+        f"brain {old} is deprecated (removed in the next release): use {shlex.join(words)}",
+        file=sys.stderr,
+    )
+    return mcp_call.run(tool, given, db=args.db)
+
+
 def cmd_query_person(args):
-    """Query emails by person."""
-    from src.store.query import query_by_person
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    results = query_by_person(conn, args.name, limit=args.limit)
-    conn.close()
-
-    if not results:
-        print(f"No emails found for person: {args.name}")
-        return
-
-    print(f"Found {len(results)} emails for {args.name}:\n")
-
-    for i, email in enumerate(results, 1):
-        print(f"{i}. {format_email_result(email)}")
-        if args.verbose:
-            print(format_email_result(email, show_full=True))
-            print()
+    """Deprecated: `brain tool query_emails` with a person."""
+    return _deprecated_read(
+        args, "query person", "query_emails", {"person": args.name, "limit": _limit(args.limit)}
+    )
 
 
 def cmd_query_topic(args):
-    """Query emails by topic."""
-    from src.store.query import query_by_topic
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    results = query_by_topic(conn, args.topic, limit=args.limit)
-    conn.close()
-
-    if not results:
-        print(f"No emails found for topic: {args.topic}")
-        return
-
-    print(f"Found {len(results)} emails tagged with '{args.topic}':\n")
-
-    for i, email in enumerate(results, 1):
-        print(f"{i}. {format_email_result(email)}")
-        if args.verbose:
-            print(format_email_result(email, show_full=True))
-            print()
+    """Deprecated: `brain tool query_emails` with a topic."""
+    return _deprecated_read(
+        args, "query topic", "query_emails", {"topic": args.topic, "limit": _limit(args.limit)}
+    )
 
 
 def cmd_query_keyword(args):
-    """Query emails by keyword (full-text search)."""
-    from src.store.query import query_by_keyword, search_attachments
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    results = query_by_keyword(conn, args.keyword, limit=args.limit)
-
-    if not results:
-        print(f"No emails found matching: {args.keyword}")
-    else:
-        print(f"Found {len(results)} emails matching '{args.keyword}':\n")
-        if results[0].get("partial_match"):
-            print("(No email held every word; these hold some of them.)\n")
-
-        for i, email in enumerate(results, 1):
-            print(f"{i}. {format_email_result(email)}")
-            if args.verbose:
-                print(format_email_result(email, show_full=True))
-                print()
-
-    # Also search attachment content
-    att_results = search_attachments(conn, args.keyword, limit=10)
-    if att_results:
-        print(f"\n--- Attachment Results ({len(att_results)}) ---")
-        for r in att_results:
-            date = (r["email_date"] or "N/A")[:10]
-            print(f"  [{date}] {r['filename']}")
-            if r["email_subject"]:
-                print(f"    Email: {r['email_subject']}")
-            if r["snippet"]:
-                print(f"    ...{r['snippet']}...")
-            print()
-
-    conn.close()
+    """Deprecated: `brain tool search_emails`; attachments are `brain tool search_attachments`."""
+    return _deprecated_read(
+        args, "query keyword", "search_emails", {"query": args.keyword, "limit": _limit(args.limit)}
+    )
 
 
 def cmd_query_date(args):
-    """Query emails by date range."""
-    from src.store.query import query_by_date_range
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    results = query_by_date_range(conn, args.start, args.end, limit=args.limit)
-    conn.close()
-
-    if not results:
-        print(f"No emails found between {args.start} and {args.end}")
-        return
-
-    print(f"Found {len(results)} emails from {args.start} to {args.end}:\n")
-
-    for i, email in enumerate(results, 1):
-        print(f"{i}. {format_email_result(email)}")
-        if args.verbose:
-            print(format_email_result(email, show_full=True))
-            print()
+    """Deprecated: `brain tool query_emails` with a start and an end date."""
+    return _deprecated_read(
+        args,
+        "query date",
+        "query_emails",
+        {"start_date": args.start, "end_date": args.end, "limit": _limit(args.limit)},
+    )
 
 
 def cmd_query_decisions(args):
-    """Query decisions."""
-    from src.store.query import query_decisions
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    results = query_decisions(conn, topic=args.topic, person=args.person, limit=args.limit)
-    conn.close()
-
-    if not results:
-        print("No decisions found")
-        return
-
-    print(f"Found {len(results)} decisions:\n")
-
-    for i, decision in enumerate(results, 1):
-        print(f"{i}. {format_decision_result(decision)}")
-        print()
+    """Deprecated: `brain tool query_decisions`."""
+    return _deprecated_read(
+        args,
+        "query decisions",
+        "query_decisions",
+        {"topic": args.topic, "person": args.person, "limit": _limit(args.limit)},
+    )
 
 
 def cmd_query_actions(args):
-    """Query action items."""
-    from src.store.query import query_action_items
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    results = query_action_items(conn, owner=args.owner, status=args.status, limit=args.limit)
-    conn.close()
-
-    if not results:
-        print("No action items found")
-        return
-
-    print(f"Found {len(results)} action items:\n")
-
-    for i, action in enumerate(results, 1):
-        print(f"{i}. {format_action_result(action)}")
-        print()
+    """Deprecated: `brain tool query_actions`."""
+    return _deprecated_read(
+        args,
+        "query actions",
+        "query_actions",
+        {"owner": args.owner, "status": args.status, "limit": _limit(args.limit)},
+    )
 
 
 def cmd_query_thread(args):
-    """Show conversation thread for an email."""
-    from src.store.query import count_thread, query_thread
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    # At least the email itself: an empty answer means no such email.
-    results = query_thread(conn, args.email_id, limit=max(1, args.limit))
-    total = count_thread(conn, args.email_id)
-    conn.close()
-
-    if not results:
-        print(f"No email with ID: {args.email_id}")
-        return
-
-    if total > len(results):
-        # query_thread returned the part of the thread around this email.
-        print(f"Thread with {total} emails, showing {len(results)} around #{args.email_id}:\n")
-    else:
-        print(f"Thread with {len(results)} emails:\n")
-
-    for i, email in enumerate(results, 1):
-        marker = ">>>" if email["email_id"] == args.email_id else "   "
-        date = (email.get("date") or "N/A")[:16]
-        sender = email.get("sender_name") or "Unknown"
-        subject = (email.get("subject") or "(no subject)")[:60]
-        print(f"{marker} {i}. [{date}] {sender}: {subject}")
-        if args.verbose and email.get("summary"):
-            print(f"       Summary: {email['summary']}")
-            print()
+    """Deprecated: `brain tool email_thread`."""
+    return _deprecated_read(
+        args,
+        "query thread",
+        "email_thread",
+        {"email_id": args.email_id, "limit": _limit(args.limit)},
+    )
 
 
 def cmd_query_combined(args):
-    """Query with combined filters."""
-    from src.store.query import query_combined
-    from src.store.schema import get_connection
-
-    conn = None
-    try:
-        conn = get_connection(str(args.db))
-        results = query_combined(
-            conn,
-            person=args.person,
-            topic=args.topic,
-            keyword=args.keyword,
-            start_date=args.start,
-            end_date=args.end,
-            limit=args.limit,
-        )
-    except ValueError as e:
-        print(f"Error: {e}")
-        return
-    finally:
-        if conn:
-            conn.close()
-
-    if not results:
-        print("No emails found matching the combined criteria")
-        return
-
-    print(f"Found {len(results)} emails:\n")
-
-    for i, email in enumerate(results, 1):
-        print(f"{i}. {format_email_result(email)}")
-        if args.verbose:
-            print(format_email_result(email, show_full=True))
-            print()
+    """Deprecated: `brain tool query_emails` with the filters given."""
+    return _deprecated_read(
+        args,
+        "query combined",
+        "query_emails",
+        {
+            "person": args.person,
+            "topic": args.topic,
+            "keyword": args.keyword,
+            "start_date": args.start,
+            "end_date": args.end,
+            "limit": _limit(args.limit),
+        },
+    )
 
 
 def cmd_prep(args):
-    """Generate meeting prep dossier."""
-    from src.store.query import meeting_prep
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    people_list = [p.strip() for p in args.people.split(",") if p.strip()]
-    result = meeting_prep(
-        conn, people_list, topic=args.topic, days=args.days, limit_per_person=args.limit
+    """Deprecated: `brain tool meeting_prep`."""
+    return _deprecated_read(
+        args,
+        "prep",
+        "meeting_prep",
+        {"people": args.people, "topic": args.topic, "days": args.days},
     )
-    conn.close()
-
-    for dossier in result["attendees"]:
-        print(f"\n{'=' * 50}")
-        print(f"  {dossier['name']}")
-        print(f"{'=' * 50}")
-
-        if dossier["emails"]:
-            print(f"\nRecent emails ({len(dossier['emails'])}):")
-            for e in dossier["emails"]:
-                date = e.get("date", "N/A")[:10]
-                role = e.get("role", "")
-                print(f"  [{date}] ({role}) {e.get('subject', '(no subject)')[:60]}")
-                if args.verbose and e.get("summary"):
-                    print(f"    {e['summary'][:120]}")
-
-        if dossier["topics"]:
-            topics_str = ", ".join(f"{t['topic']} ({t['count']})" for t in dossier["topics"])
-            print(f"\nTop topics: {topics_str}")
-
-        if dossier["sentiment_summary"]:
-            sent_str = ", ".join(f"{k}: {v}" for k, v in dossier["sentiment_summary"].items())
-            print(f"Sentiment: {sent_str}")
-
-        if dossier["decisions"]:
-            print(f"\nDecisions ({len(dossier['decisions'])}):")
-            for d in dossier["decisions"]:
-                print(f"  [{d.get('date', 'N/A')[:10]}] {d['decision'][:80]}")
-
-        if dossier["open_actions"]:
-            print(f"\nOpen actions ({len(dossier['open_actions'])}):")
-            for a in dossier["open_actions"]:
-                deadline = f" (due: {a['deadline']})" if a.get("deadline") else ""
-                print(f"  - {a['task'][:80]}{deadline}")
-
-    if result.get("topic_context"):
-        tc = result["topic_context"]
-        print(f"\n{'=' * 50}")
-        print(f"  Topic: {tc['topic']}")
-        print(f"{'=' * 50}")
-
-        if tc["decisions"]:
-            print(f"\nRelated decisions ({len(tc['decisions'])}):")
-            for d in tc["decisions"]:
-                print(f"  [{d.get('date', 'N/A')[:10]}] {d['decision'][:80]}")
-
-        if tc["key_facts"]:
-            print(f"\nKey facts ({len(tc['key_facts'])}):")
-            for f in tc["key_facts"]:
-                print(f"  - {f['fact'][:100]}")
-
-        if tc["action_items"]:
-            print(f"\nOpen actions ({len(tc['action_items'])}):")
-            for a in tc["action_items"]:
-                deadline = f" (due: {a['deadline']})" if a.get("deadline") else ""
-                print(f"  - {a['task'][:80]}{deadline}")
 
 
-def _holding_the_sync_lock(sync):
-    """Run `sync` holding DATA_ROOT/state/sync.lock, or skip if another sync has it.
-
-    Three units run `src.cli sync` (sb-outlook-sync hourly, sb-noon-catchup and
-    sb-daily-sync), and only the hourly wrapper looked for another, with a pgrep,
-    once, one way and not atomically. On 2026-09-24 the noon catch-up started
-    during the hourly load, and both extracted the same conversations and
-    rewrote the state file each from its own snapshot, where the last writer
-    drops the other's processed_ids and give-up counters.
-
-    `--lock-wait` seconds (0 by default) is how long to wait for the holder.
-    Then the run skips with exit 0: the sync holding the lock is draining the
-    same staged mail. The lock is an flock, so it goes with the process holding
-    it, and a killed sync leaves nothing to clear.
-    """
-    import fcntl
-    import functools
-    import time
-
-    @functools.wraps(sync)
-    def locked(args):
-        wait_s = float(getattr(args, "lock_wait", 0) or 0)
-        path = DATA_ROOT / "state" / "sync.lock"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as lock:
-            give_up_at = time.monotonic() + wait_s
-            while True:
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    left = give_up_at - time.monotonic()
-                    if left <= 0:
-                        print(f"skip: another sync is running (waited {wait_s:.0f} s for {path})")
-                        return 0
-                    time.sleep(min(1.0, left))
-            return sync(args)
-
-    return locked
-
-
-@_holding_the_sync_lock
 def cmd_sync(args):
-    """Incremental sync over staged mail: extract, load, and the steps after."""
-    from src.store.schema import get_connection, migrate_add_sync_metadata
+    """Incremental sync over staged mail and the steps after it (src/pipeline/sync.py)."""
+    from src.pipeline import sync
 
-    db_path = str(args.db)
-
-    if not Path(db_path).exists():
-        print("Error: Database not found. Run 'brain load' first to create it.")
-        sys.exit(1)
-
-    conn = get_connection(db_path)
-    migrate_add_sync_metadata(conn)
-
-    # Get last sync date
-    cursor = conn.execute("SELECT value FROM sync_metadata WHERE key = 'last_sync_date'")
-    row = cursor.fetchone()
-    last_sync = row[0] if row else None
-
-    if last_sync:
-        print(f"Last sync: {last_sync}")
-    else:
-        # Fallback: use latest email date in DB
-        cursor = conn.execute("SELECT MAX(date_received) FROM emails")
-        row = cursor.fetchone()
-        last_sync = row[0] if row and row[0] else None
-        if last_sync:
-            print(f"No sync history. Using latest email date: {last_sync}")
-        else:
-            print(
-                "Empty database. Stage mail, then run `python -m src.extract.local` "
-                "and `python -m src.cli load` first."
-            )
-            conn.close()
-            return
-
-    # Where the mail this run loads starts, so Step 3b finds the directories of what it loads.
-    last_email_id = conn.execute("SELECT COALESCE(MAX(id), 0) FROM emails").fetchone()[0]
-    conn.close()
-
-    # Step 1: sync stages no mail. `python -m src.export.outlook_export` does,
-    # through outlook-cli, on every host. On a Mac this step used to run the
-    # Apple Mail exporter, which force-quit Mail.app; it was removed.
-    print("\nStep 1: mail is staged by outlook_export (outlook-cli); using the staged batches.")
-
-    # Step 2: Extract (local mode)
-    engine = getattr(args, "engine", None) or EXTRACT_ENGINE
-    print(f"\nStep 2: Extracting new emails (engine: {engine})...")
-    from src.extract.local import run_extraction, stop_requested
-
-    extraction_run = run_extraction(
-        limit=args.limit or 0,
-        engine=engine,
-        workers=args.workers or 1,
-        deadline_s=_extract_deadline_s(),
-        db_path=db_path,
-    )
-    # A stop signal ends extraction at a checkpoint. The steps after it used to
-    # carry on regardless, until systemd's SIGKILL 90 s later; now they do not
-    # start. 143 is 128 + SIGTERM, which is what systemd sends.
-    if stop_requested():
-        print("Stop requested during extraction; the later steps did not run", file=sys.stderr)
-        return 143
-    # Every email that went to the model failed there: a retired model id, a 400
-    # on every request, a refusal of everything. Emails that had already failed
-    # in an earlier run are left out of the count (see run_extraction), so a run
-    # that met only those is not taken for a dead model. The rest of the sync
-    # still runs, but the run must not read as fresh or green, as it did with
-    # rc 0 and a new last_sync_date while no mail loaded. Not keyed on
-    # `extracted`, which news (extracted without the model) keeps above zero.
-    # A reply the model could not use (a refusal, unparseable JSON) is an answer,
-    # not an outage: a quiet run whose one fresh email was refused read as a dead
-    # model. Several answers and none of them usable still reads as down.
-    model_down = (
-        isinstance(extraction_run, dict)
-        and not extraction_run.get("model_successes", 0)
-        and (
-            extraction_run.get("model_failures", 0) > 0
-            or extraction_run.get("model_unusable", 0) >= MODEL_UNUSABLE_ALARM
-        )
-    )
-
-    # Step 3: Load into DB
-    print("\nStep 3: Loading into database...")
-    from src.store.loader import load_extractions
-    from src.store.schema import get_connection as get_conn
-
-    extracted_dir = DATA_ROOT / "extracted"
-    staging_dir = DATA_ROOT / "staging"
-    # The people rows this load adds or changes, which Step 4 takes.
-    touched_people: set[int] = set()
-    count = load_extractions(
-        db_path, str(extracted_dir), str(staging_dir), touched_people=touched_people
-    )
-    print(f"Loaded {count} new emails")
-
-    # Step 3b: record the attachments outlook-cli downloaded with the mail.
-    if count > 0:
-        # outlook-cli fetched the BINARIES hourly; it never recorded them. Every
-        # downstream stage reads the attachments table, not the disk, so without
-        # this the files are invisible — 7,387 of them accumulated unseen between
-        # the 2026-06-30 VPS cutover and 2026-08-17. Bounded per run because
-        # Step 6 below runs Phase 1/2 unbounded over whatever becomes visible.
-        print("\nStep 3b: Registering attachments outlook-cli downloaded...")
-        from datetime import UTC, timedelta
-
-        from src.export.outlook_attachments import register_new_downloads
-
-        window_start = (
-            datetime.now(UTC) - timedelta(hours=ATTACHMENT_REGISTER_WINDOW_H)
-        ).isoformat()
-        conn_reg = get_conn(db_path)
-        try:
-            # The directories written since the last complete scan, and those of the mail
-            # this run loaded, not every directory: the nightly pass walks them all.
-            loaded_mail = conn_reg.execute(
-                "SELECT message_id FROM emails WHERE id > ?", (last_email_id,)
-            ).fetchall()
-            reg = register_new_downloads(
-                conn_reg,
-                ATTACHMENTS_DIR,
-                [str(row[0]) for row in loaded_mail],
-                limit=ATTACHMENT_REGISTER_LIMIT,
-                since=window_start,
-            )
-        finally:
-            conn_reg.close()
-        print(
-            f"Attachments: {reg['registered']} registered from {reg['scanned']} message dirs"
-            f" ({reg['deferred']} awaiting their email)"
-        )
-
-    # Step 4: Deduplicate people: the groups of the rows this load added or changed, and of
-    # any added since the last pass (src/store/dedup_people.py run_dedup), not every person.
-    # --full-dedup takes the whole table, and runs whether or not mail loaded.
-    full_dedup = bool(getattr(args, "full_dedup", False))
-    if count > 0 or full_dedup:
-        print("\nStep 4: Deduplicating people" + (" (whole table)" if full_dedup else "") + "...")
-        from src.store.dedup_people import run_dedup
-
-        dedup_result = run_dedup(db_path=db_path, touched=None if full_dedup else touched_people)
-        reduced = dedup_result.get("total_reduced", 0)
-        print(f"Dedup: {reduced} duplicates merged")
-    else:
-        print("\nNo new emails — skipping dedup")
-
-    # Step 5, the embeddings, waits for the end of the run: Step 9.
-
-    # Step 6: Process new attachment content
-    from src.extract.attachment_pipeline import (
-        LONG_TEXT_CHARS,
-        run_phase1,
-        run_phase2,
-        text_pass_is_recent,
-    )
-
-    # Ensure attachment_content table exists
-    from src.store.schema import run_migrations as run_mig
-
-    conn_mig = get_conn(db_path)
-    run_mig(conn_mig)
-    # Images and zip archives wait for the nightly pass while one runs: one of them can take
-    # minutes (OCR_MAX_SECONDS, ZIP_MAX_SECONDS) against this 90 s slice, and they took the
-    # slice from the day's documents. Where no pass reads them, as on a host that runs `sync`
-    # alone, they are read here. BRAIN_SYNC_HEAVY_ATTACHMENTS=1 reads them here regardless.
-    read_heavy = os.environ.get(SYNC_HEAVY_ATTACHMENTS_ENV, "").strip() == "1"
-    defer_heavy = not read_heavy and text_pass_is_recent(conn_mig)
-    conn_mig.close()
-
-    print("\nStep 6: Processing new attachment content...")
-    # Phase 1 runs UNSCOPED so the deadline can converge: anything deferred for time has no
-    # content row, and `ac.id IS NULL` offers it again next run. Newest mail first: in
-    # registration order the day's documents waited behind the backlog for the 02:00 pass, and
-    # 15-63% of a day's attachments got their text more than six hours after download
-    # (2026-10-05 to 10-09). The nightly pass keeps registration order.
-    p1_stats = run_phase1(
-        db_path,
-        deadline_s=PHASE1_SYNC_DEADLINE_S,
-        newest_first=True,
-        defer_heavy=defer_heavy,
-    )
-    deferred = p1_stats.get("deferred", 0)
-    heavy = p1_stats.get("heavy", 0)
-    if p1_stats.get("processed", 0) or deferred or heavy:
-        encrypted = p1_stats.get("encrypted", 0)
-        print(
-            f"  Phase 1: {p1_stats.get('extracted', 0)} text extracted, "
-            f"{p1_stats.get('failed', 0)} failed, {p1_stats.get('skipped', 0)} skipped"
-            + (f", {encrypted} encrypted" if encrypted else "")
-            + (f", {deferred} deferred (out of time)" if deferred else "")
-            + (f", {heavy} images and archives left for the nightly pass" if heavy else "")
-        )
-    # What Phase 1 has just read first, then any text an earlier run left awaiting its summary,
-    # newest first, in Phase 2's own slice. It was scoped to this run's registrations, which
-    # Phase 1 had seldom reached, and ran only when Phase 1 had read something: summaries came
-    # 4-19 hours late on average (audit 2026-10-11).
-    p2_stats = run_phase2(
-        db_path,
-        first_ids=p1_stats.get("ids"),
-        newest_first=True,
-        deadline_s=PHASE2_SYNC_DEADLINE_S,
-        max_text_chars=LONG_TEXT_CHARS,
-    )
-    p2_deferred = p2_stats.get("deferred", 0)
-    if p2_stats.get("processed", 0) or p2_deferred:
-        print(
-            f"  Phase 2: {p2_stats.get('extracted', 0)} LLM extracted,"
-            f" {p2_stats.get('failed', 0)} failed"
-            + (f", {p2_deferred} deferred (out of time)" if p2_deferred else "")
-        )
-    elif not (p1_stats.get("processed", 0) or deferred or heavy):
-        print("  No new attachments to process")
-
-    # Step 7: Sync conversations from Claude Code sessions. --skip-conversations leaves it
-    # out; no scheduled unit passes it.
-    print("\nStep 7: Syncing Claude Code conversations...")
-    conv_loaded = 0
-    if getattr(args, "skip_conversations", False):
-        print("  Skipped (--skip-conversations)")
-    else:
-        from src.export.conversation_export import export_conversations
-        from src.store.loader import load_conversations as load_convs
-
-        conn_conv = get_conn(db_path)
-        run_mig(conn_conv)
-        loaded = {
-            r["session_id"]: (r["ended_at"], r["turn_count"])
-            for r in conn_conv.execute("SELECT session_id, ended_at, turn_count FROM conversations")
-        }
-        conn_conv.close()
-
-        conv_export = export_conversations(days=7, loaded=loaded)
-        # Staged before and not loaded yet: the export no longer stages those again, and
-        # one sb-conversation-sync extracted waits for a load here.
-        waiting = conv_export.get("pending", 0)
-        if conv_export["exported"] > 0 or waiting > 0:
-            print(f"  Exported {conv_export['exported']} new or grown conversations")
-            if waiting:
-                print(f"  {waiting} staged before and not loaded yet")
-            from src.extract.local import run_conversation_extraction
-
-            run_conversation_extraction(deadline_s=CONVERSATION_SYNC_DEADLINE_S)
-            if stop_requested():  # as after Step 2
-                print(
-                    "Stop requested during conversation extraction; the later steps did not run",
-                    file=sys.stderr,
-                )
-                return 143
-            conv_loaded = load_convs(db_path)
-            print(f"  Loaded {conv_loaded} conversations")
-        else:
-            print("  No new conversations to sync")
-
-    # Step 8: Classify new inline images (Stage 1 heuristic + Stage 3 vision LLM)
-    print("\nStep 8: Classifying new inline images...")
-    try:
-        from src.extract.image_pipeline import run_backfill
-
-        img_conn = get_conn(db_path)
-        run_mig(img_conn)
-        # Time-boxed: 200 vision calls at 4 workers is ~30min, which is the whole
-        # systemd TimeoutStartSec for sb-daily-sync / sb-noon-catchup — step 8 was
-        # spending the entire budget and getting SIGTERMed. Cap it so the sync
-        # always returns cleanly; the leftover drains on the next run.
-        #
-        # IMAGE_CLASSIFY_BUDGET_S (480 s) was sized against those 30-minute units.
-        # The hourly sync only has 600 s in total, so inheriting it let Step 8
-        # claim 80% of the run on its own — take the smaller of the two.
-        img_stats = run_backfill(
-            conn=img_conn,
-            since=None,
-            limit=200,
-            run_vision=True,
-            dry_run=False,
-            workers=4,
-            unprocessed_only=True,
-            deadline_s=min(IMAGE_CLASSIFY_BUDGET_S, IMAGE_CLASSIFY_SYNC_BUDGET_S),
-        )
-        img_conn.close()
-        classified = img_stats.get("classified", 0)
-        missing = img_stats.get("missing", 0)
-        deferred = img_stats.get("deferred", 0)
-        failed = img_stats.get("failed", 0)
-        # `missing` = file gone from disk; `deferred` = budget spent, work requeued.
-        # The old line printed `missing` under the label "remaining", which read as
-        # "backlog empty: 0" every day while the queue was 200 deep. Queue depth is
-        # reported by health_check.check_images (WARN past IMAGE_QUEUE_WARN); this
-        # line just says what THIS run did. `failed` too: without it a run in which
-        # every image failed read "No unclassified images".
-        if classified > 0 or missing > 0 or deferred > 0 or failed > 0:
-            print(
-                f"  Classified: {classified}, failed: {failed}, deferred: {deferred}, "
-                f"missing files: {missing}"
-            )
-        else:
-            print("  No unclassified images")
-    except Exception as e:
-        print(f"  Image classification skipped: {e}")
-
-    # Step 9: one embedding pass for everything this run stored: the mail of Step 3, the
-    # attachment summaries of Step 6, the conversations of Step 7 (one loaded again has a new
-    # id, which semantic search cannot find until it has a vector) and the image descriptions
-    # of Step 8. Step 5 embedded after Step 4, and Step 7 again when it loaded conversations,
-    # and each pass loads and rewrites the whole index (embeddings.npz, 1.7 GB on the
-    # producer): an hourly run saved it twice to load one email, at its 6 GB MemoryMax. Taken
-    # when mail or conversations loaded, as those two were; a run stopped before it leaves
-    # its vectors to the next run's pass.
-    if count > 0 or conv_loaded:
-        print("\nStep 9: Updating embeddings...")
-        from src.store.embeddings import build_index
-
-        conn_embed = get_conn(db_path)
-        try:
-            build_index(conn_embed)
-            print("Embeddings updated")
-        except Exception as e:
-            # A run that loaded mail fails here, as Step 5 did. One that loaded only
-            # conversations goes on, as Step 7 did, and the next pass embeds them.
-            if count > 0:
-                raise
-            print(f"  Embedding the conversations failed: {e}", file=sys.stderr)
-        finally:
-            conn_embed.close()
-
-    # Update sync metadata
-    conn = get_conn(db_path)
-    migrate_add_sync_metadata(conn)
-    now = datetime.now().isoformat()
-    if not model_down:
-        conn.execute(
-            "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('last_sync_date', ?)",
-            (now,),
-        )
-    conn.execute(
-        "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('last_sync_count', ?)",
-        (str(count),),
-    )
-    # When mail last arrived, beside when this command last ran. last_sync_date
-    # moves on every run, fetched mail or not, so alone it read fresh through an
-    # Outlook outage. The Inbox export stamps last_sync_completed_at only when it
-    # succeeds, empty runs included. Copied here because brain.db is the only
-    # file a replica receives; get_freshness reports the older of the two.
-    from src.export.state import load_outlook_sync_state
-
-    try:
-        export_ok_at = load_outlook_sync_state(
-            DATA_ROOT / "state" / "outlook_sync.json"
-        ).last_sync_completed_at
-    except (OSError, ValueError, AttributeError, TypeError):  # unreadable: no stamp
-        export_ok_at = None
-    if export_ok_at:
-        conn.execute(
-            "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('mail_export_ok_at', ?)",
-            (export_ok_at,),
-        )
-    conn.commit()
-    conn.close()
-
-    if model_down:
-        print(f"\nSync complete. {count} emails added. Sync timestamp left at {last_sync}.")
-    else:
-        print(f"\nSync complete. {count} emails added. Sync timestamp: {now}")
-
-    # Everything else ran and the rest of the mail stays pending, but extraction
-    # did not finish. Before the deadline existed the same pause slept past the
-    # unit timeout and read red. 75 is EX_TEMPFAIL. sb-daily-sync and
-    # sb-noon-catchup pass it through; sb-outlook-sync logs the sync's code and
-    # keeps it out of its own status by design, with those two units behind it.
-    if isinstance(extraction_run, dict) and extraction_run.get("quota_paused"):
-        print("Extraction ended on a quota pause; the rest stays pending", file=sys.stderr)
-        return 75
-    # The same code: the run finished and failed, and a restart would repeat it
-    # (RestartPreventExitStatus=75 on both backlog units).
-    if model_down:
-        print(
-            f"The model extracted none of the new emails sent to it "
-            f"({extraction_run.get('model_failures', 0)} failed, "
-            f"{extraction_run.get('model_unusable', 0)} unusable replies); "
-            "last_sync_date was not advanced",
-            file=sys.stderr,
-        )
-        return 75
-    return 0
+    return sync.run(args)
 
 
 def cmd_teams_sync(args):
-    """Run the Teams ingestion pipeline: channels plus 1:1, group and meeting chats."""
-    from src.export.teams_export import discover_chats, pull_messages
-    from src.extract.teams_mri import resolve_mris
-    from src.extract.teams_pipeline import extract_threads
-    from src.extract.teams_threads import bound_threads
-    from src.store.embeddings import build_teams_index
-    from src.store.schema import get_connection, run_migrations
+    """Ingest Teams channels and chats (src/pipeline/teams_sync.py)."""
+    from src.pipeline import teams_sync
 
-    db_path = str(args.db)
-    if not Path(db_path).exists():
-        print("Error: Database not found.", file=sys.stderr)
-        sys.exit(1)
-
-    conn = get_connection(db_path)
-    run_migrations(conn)
-
-    pull_failed = False
-    if not getattr(args, "skip_pull", False):
-        print("Step 1/6: discovering chats + channels...")
-        d = discover_chats(conn, scope="all")
-        print(
-            f"  {d['chats_inserted']} new, {d['chats_updated']} updated, {d['chats_discovered']} total"
-        )
-
-        print("Step 2/6: pulling messages...")
-        p = pull_messages(conn, concurrency=args.concurrency or 2, deadline_s=TEAMS_PULL_DEADLINE_S)
-        deferred = p.get("deferred", 0)
-        print(
-            f"  {p['messages_inserted']} messages inserted across {p['chats_pulled']} chats; "
-            f"{p['errors']} errors"
-            + (
-                f"; {deferred} chats deferred (out of time, next run takes them)"
-                if deferred
-                else ""
-            )
-        )
-        # pull_messages re-raises only an expired session and counts every other
-        # failure per chat, so a service-wide 403, 429 or 5xx arrives here as
-        # errors with nothing pulled. That returned 0, and sb-teams-sync.sh wrote
-        # 'ok' over a dead pull for as long as it lasted. Some chats pulled is a
-        # partial run, not a failed one.
-        pull_failed = p["errors"] > 0 and p["chats_pulled"] == 0
-    else:
-        print("Steps 1+2 SKIPPED — --skip-pull set.")
-
-    print("Step 3/6: bounding threads...")
-    b = bound_threads(conn)
-    print(f"  {b['threads_created']} new threads, {b['threads_updated']} touched")
-
-    print("Step 4/6: resolving MRIs...")
-    r = resolve_mris(conn, max_per_run=50)
-    print(
-        f"  {r['resolved']} resolved, {r['permanent_fail']} 404'd, {r['retryable_fail']} retryable"
-    )
-
-    print("Step 5/6: extracting threads...")
-    e = extract_threads(
-        conn,
-        workers=args.workers or 4,
-        limit=args.limit or 0,
-        deadline_s=TEAMS_EXTRACT_DEADLINE_S,
-    )
-    e_deferred = e.get("deferred", 0)
-    e_refused = e.get("refused", 0)
-    print(
-        f"  {e['extracted']} extracted, {e['skipped']} skipped, {e['failed']} failed"
-        + (f", {e_refused} refused" if e_refused else "")
-        + (f", {e_deferred} deferred (out of time)" if e_deferred else "")
-    )
-
-    print("Step 6/6: embedding thread summaries...")
-    n = build_teams_index(conn, limit=TEAMS_EMBED_LIMIT)
-    print(f"  {n} new/updated embeddings")
-
-    conn.close()
-    print("teams-sync complete.")
-
-    # The later steps still ran on what was already stored. 5 is "upstream
-    # misbehaved", the same code as the M365 CLIs'. Extraction failures do not
-    # count: one poison thread would otherwise keep the unit red every hour.
-    if pull_failed:
-        print(f"Every chat pull failed ({p['errors']} errors, 0 chats pulled)", file=sys.stderr)
-        return 5
-    return 0
+    return teams_sync.run(args)
 
 
 def cmd_teams_backfill_replies(args):
@@ -2626,728 +1278,46 @@ def cmd_teams_drop_raw_json(args):
 
 
 def cmd_whatsapp_sync(args):
-    """Ingest the pushed WhatsApp snapshot, then bound, extract and embed sessions.
+    """Ingest the pushed WhatsApp snapshot and its sessions (src/pipeline/whatsapp_sync.py)."""
+    from src.pipeline import whatsapp_sync
 
-    The snapshot is pushed hourly by the Mac that runs the WhatsApp bridge
-    (scripts/wrappers/launchd/sync-whatsapp-to-vps.sh). 66 (EX_NOINPUT) when it
-    is missing or unreadable, which is a broken push, not an empty chat list.
-    Extraction failures do not fail the run, as in teams-sync: one poison
-    session would otherwise keep the unit red every hour.
-    """
-    from src.config import WHATSAPP_SNAPSHOT
-    from src.export.whatsapp_export import SnapshotUnavailable, ingest_snapshot
-    from src.extract.whatsapp_pipeline import extract_threads
-    from src.extract.whatsapp_threads import bound_threads
-    from src.store.embeddings import build_whatsapp_index
-    from src.store.schema import get_connection, run_migrations
-
-    db_path = str(args.db)
-    if not Path(db_path).exists():
-        print("Error: Database not found.", file=sys.stderr)
-        sys.exit(1)
-
-    conn = get_connection(db_path)
-    run_migrations(conn)
-    try:
-        snapshot = Path(args.snapshot) if args.snapshot else WHATSAPP_SNAPSHOT
-        print("Step 1/4: ingesting the snapshot...")
-        try:
-            i = ingest_snapshot(conn, snapshot)
-        except SnapshotUnavailable as err:
-            print(f"  {err}", file=sys.stderr)
-            return 66
-        print(
-            f"  {i['messages_inserted']} new, {i['messages_updated']} updated across "
-            f"{i['chats']} chats"
-            + (f"; {i['skipped']} with no usable time" if i["skipped"] else "")
-        )
-
-        print("Step 2/4: bounding sessions...")
-        b = bound_threads(conn)
-        print(f"  {b['threads_created']} new sessions, {b['threads_updated']} touched")
-
-        print("Step 3/4: extracting sessions...")
-        e = extract_threads(conn, limit=args.limit or 0, deadline_s=WHATSAPP_EXTRACT_DEADLINE_S)
-        print(
-            f"  {e['extracted']} extracted, {e['skipped']} skipped, {e['failed']} failed"
-            + (f", {e['deferred']} deferred" if e["deferred"] else "")
-        )
-
-        print("Step 4/4: embedding session summaries...")
-        n = build_whatsapp_index(conn, limit=WHATSAPP_EMBED_LIMIT)
-        print(f"  {n} new/updated embeddings")
-    finally:
-        conn.close()
-    print("whatsapp-sync complete.")
-    return 0
+    return whatsapp_sync.run(args)
 
 
 def cmd_teams_search(args):
-    from src.store.schema import get_connection
-    from src.store.teams_query import search_teams
-
-    conn = get_connection(str(args.db))
-    results = search_teams(conn, args.query, kind=args.kind, limit=args.limit)
-    conn.close()
-    if not results:
-        print(f"No teams matches for: {args.query}")
-        return
-    if results[0].get("partial_match"):
-        print("(No thread held every word; these hold some of them.)")
-    for i, r in enumerate(results, 1):
-        print(f"\n{i}. [{r['team_name']} / {r['channel_topic']}] {r['title'] or '(untitled)'}")
-        print(
-            f"   {r['started_at'][:10]}..{r['ended_at'][:10]} ({r['message_count']} msgs, match={r['match']})"
-        )
-        if r.get("snippet"):
-            print(f"   {r['snippet']}")
+    """Deprecated: `brain tool search_teams`."""
+    return _deprecated_read(
+        args,
+        "teams-search",
+        "search_teams",
+        {"query": args.query, "kind": args.kind, "limit": _limit(args.limit)},
+    )
 
 
 def cmd_teams_thread(args):
-    from src.store.schema import get_connection
-    from src.store.teams_query import thread_context
-
-    conn = get_connection(str(args.db))
-    ctx = thread_context(conn, args.thread_id)
-    conn.close()
-    if "error" in ctx:
-        print(ctx["error"])
-        return
-    t = ctx["thread"]
-    print(f"# {t['title']}")
-    print(f"  {t['team_name']} / {t['channel_topic']}  ({t['started_at']} → {t['ended_at']})")
-    print(f"  {t['message_count']} messages\n")
-    if t.get("summary"):
-        print(f"SUMMARY: {t['summary']}\n")
-    print("MESSAGES:")
-    for m in ctx["messages"]:
-        sys_marker = " [system]" if m["is_system"] else ""
-        print(f"  [{m['composed_at']}] {m['sender_display_name']}{sys_marker}: {m['content_text']}")
-    if ctx["decisions"]:
-        print("\nDECISIONS:")
-        for d in ctx["decisions"]:
-            print(f"  - {d['decision']}  ({d['decided_by']}, {d['decision_date']})")
-    if ctx["action_items"]:
-        print("\nACTIONS:")
-        for a in ctx["action_items"]:
-            print(f"  - {a['task']}  (owner: {a['owner']}, due: {a['deadline']}, {a['status']})")
-    if ctx["key_facts"]:
-        print("\nKEY FACTS:")
-        for f in ctx["key_facts"]:
-            print(f"  - {f['fact']}")
+    """Deprecated: `brain tool teams_thread_context`."""
+    return _deprecated_read(
+        args, "teams-thread", "teams_thread_context", {"thread_id": args.thread_id}
+    )
 
 
 def cmd_teams_chat(args):
-    from src.store.schema import get_connection
-    from src.store.teams_query import chat_summary
-
-    conn = get_connection(str(args.db))
-    s = chat_summary(conn, args.chat_id, days=args.days)
-    conn.close()
-    if "error" in s:
-        print(s["error"])
-        return
-    c = s["chat"]
-    print(f"# {c['team_name']} / {c['topic']}  (chat_id={c['id']}, kind={c['chat_kind']})")
-    print(f"  Last activity: {c['last_message_at']}\n")
-    print(f"Recent threads ({len(s['threads'])}):")
-    for t in s["threads"]:
-        print(f"  [{t['ended_at'][:10]}] {t['title']}  ({t['message_count']} msgs)")
-    print(f"\nLast messages ({len(s['last_messages'])}):")
-    for m in s["last_messages"]:
-        snippet = (m["content_text"] or "")[:80]
-        print(f"  [{m['composed_at'][:16]}] {m['sender_display_name']}: {snippet}")
-    print(f"\nOpen actions ({len(s['open_actions'])}):")
-    for a in s["open_actions"]:
-        print(f"  - {a['task']} (owner: {a['owner']}, due: {a['deadline']})")
+    """Deprecated: `brain tool teams_chat_summary`."""
+    return _deprecated_read(
+        args, "teams-chat", "teams_chat_summary", {"chat_id": args.chat_id, "days": args.days}
+    )
 
 
 def cmd_teams_stats(args):
-    from src.store.schema import get_connection
-    from src.store.teams_query import stats
-
-    conn = get_connection(str(args.db))
-    s = stats(conn)
-    conn.close()
-    print("Teams Statistics")
-    print("=" * 40)
-    for k, v in s.items():
-        print(f"{k:30s} {v}")
-
-
-# Runs in a row an event may fail get-event and still fail the calendar-sync run.
-# It is retried and logged on every run after that too, but one event get-event
-# can never return would otherwise keep the unit red for as long as it sits in
-# the window, and a check that is always red is a check nobody reads.
-CALENDAR_FETCH_ALERT_RUNS = 3
-
-# The shared "re-authenticate" exit code, the same as the three M365 CLIs'.
-EXIT_REAUTH = 4
-
-
-def _read_json_dict(path: Path) -> dict:
-    import json
-
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _utc_bound(moment: datetime) -> str:
-    """A window bound as start_at compares with it: UTC, to the second. A naive
-    bound is local time, as outlook-cli reads it."""
-    from datetime import UTC
-
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-
-
-def _whole_month(start: datetime, end: datetime, now: datetime) -> str | None:
-    """YYYY-MM when [start, end) is the whole of a month already over, else None."""
-    from datetime import timedelta
-
-    first = start.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    following = (first + timedelta(days=32)).replace(day=1)
-    if start == first and end == following and end <= now:
-        return f"{start:%Y-%m}"
-    return None
-
-
-def _calendar_windows(conn, args, now: datetime) -> tuple[list[tuple[datetime, datetime]], str]:
-    """The windows calendar-sync lists, oldest first, and the line that says so.
-
-    A plain run lists one window, by default the week behind and the 30 days ahead.
-    A backfill lists a month at a time: with neither --since nor --until, the months
-    stats coverage flags as not held in full, or the last 12 when it flags none. It
-    used to list the 365 days before it ran, which on 2026-09-27 began after the
-    months the first load had capped. A whole month an earlier backfill recorded is
-    skipped, unless one of its events still owes an extraction: only a listing
-    offers it again.
-    """
-    import sqlite3
-    from datetime import timedelta
-
-    from src.export.calendar_export import chunk_date_range
-    from src.store.calendar_coverage import density, listed_months
-
-    # --since is honoured on its own, as --until is. It used to count only with
-    # --backfill, so the README's `calendar-sync --since 2026-01-01` listed the
-    # last seven days and exited 0 with the gap it was run to fill still open.
-    until = datetime.fromisoformat(args.until) if args.until else now + timedelta(days=30)
-    if args.since:
-        since = datetime.fromisoformat(args.since)
-    elif args.backfill:
-        try:
-            flagged = [] if args.until else sorted(density(conn)["incomplete"])
-        except sqlite3.OperationalError:  # a store with no calendar yet
-            flagged = []
-        if flagged:
-            months = [datetime.fromisoformat(f"{month}-01") for month in flagged]
-            windows = [(first, (first + timedelta(days=32)).replace(day=1)) for first in months]
-            return windows, (
-                f"Calendar backfill: the {len(flagged)} month(s) coverage flags, "
-                f"{flagged[0]} to {flagged[-1]}"
-            )
-        since = now - timedelta(days=365)
-    else:
-        since = now - timedelta(days=7)
-    if not args.backfill:
-        return [(since, until)], f"Calendar sync: {since.date()} to {until.date()}"
-
-    done = listed_months(conn)
-    windows, skipped = [], 0
-    for start, end in chunk_date_range(since, until):
-        if (
-            _whole_month(start, end, now) in done
-            and not conn.execute(
-                "SELECT 1 FROM calendar_events WHERE llm_status = 'pending' "
-                "AND start_at >= ? AND start_at < ? LIMIT 1",
-                (_utc_bound(start), _utc_bound(end)),
-            ).fetchone()
-        ):
-            skipped += 1
-            continue
-        windows.append((start, end))
-    header = f"Calendar backfill: {since.date()} to {until.date()}, a month at a time"
-    if skipped:
-        header += f"; {skipped} month(s) already listed in full skipped"
-    return windows, header
-
-
-def _calendar_unchanged(existing, list_change_key) -> bool:
-    """Whether a listed event needs no fetch: its stored etag is the listed one and
-    no extraction is owed on it. No etag on either side is never unchanged."""
-    return bool(
-        existing
-        and list_change_key
-        and existing["change_key"] == list_change_key
-        and existing["llm_status"] != "pending"
-    )
-
-
-def _calendar_owed(conn, raw_events: list[dict]) -> tuple[int, int]:
-    """What a run would fetch of a listing: (new events, changed or owed ones)."""
-    new = changed = 0
-    for raw in raw_events:
-        existing = conn.execute(
-            "SELECT change_key, llm_status FROM calendar_events WHERE outlook_event_id = ?",
-            (raw.get("Id", ""),),
-        ).fetchone()
-        if existing is None:
-            new += 1
-        elif not _calendar_unchanged(existing, raw.get("@odata.etag")):
-            changed += 1
-    return new, changed
+    """Deprecated: `brain tool sql_query` with TEAMS_STATS_SQL; no tool counts these."""
+    return _deprecated_read(args, "teams-stats", "sql_query", {"sql": TEAMS_STATS_SQL})
 
 
 def cmd_calendar_sync(args):
-    """Sync calendar events from Outlook into the knowledge store.
+    """Sync calendar events from Outlook into the store (src/pipeline/calendar_sync.py)."""
+    from src.pipeline import calendar_sync
 
-    With --backfill the window is listed a month at a time, oldest first, and each
-    whole month listed and stored is recorded, so a run that stops is resumed by
-    the next. With --dry-run the window is listed and compared with the store, and
-    nothing is fetched, extracted or written.
-    """
-    from datetime import UTC
-
-    from src.config import USER_EMAIL_PATTERN
-    from src.export.calendar_export import (
-        BACKFILL_LIST_CALLS,
-        get_event_body,
-        list_events,
-        parse_event,
-    )
-    from src.export.outlook_cli import OutlookCliAuthRequired
-    from src.extract.calendar_extractor import event_prompt_hash, extract_event
-    from src.extract.policy_bridge import classify_exception, is_transient
-    from src.extract.vertex_auth import touch_sentinel
-    from src.llm_policy import Outcome
-    from src.store.calendar_coverage import mark_month_started, record_listed_month
-    from src.store.calendar_loader import (
-        adopt_reissued_occurrence,
-        cancel_unlisted,
-        dedupe_event_children,
-        load_event,
-        load_proxy_emails,
-        mark_series,
-        refresh_self_flags,
-        series_extraction,
-    )
-    from src.store.schema import get_connection, migrate_add_sync_metadata, run_migrations
-
-    db_path = str(args.db)
-    if not Path(db_path).exists():
-        print("Error: Database not found.")
-        sys.exit(1)
-
-    # A dry run reads: it neither migrates the store nor writes to it, not even the
-    # journal mode a writer's connection sets on open.
-    dry_run = getattr(args, "dry_run", False)
-    if dry_run:
-        from src.store.sql_readonly import connect_read_only
-
-        conn = connect_read_only(db_path)
-    else:
-        conn = get_connection(db_path)
-        run_migrations(conn)
-
-    proxy_emails = None
-    if not dry_run:
-        proxy_emails = load_proxy_emails(str(DATA_ROOT / "canonical_people.json"))
-
-    now = datetime.now()
-    windows, header = _calendar_windows(conn, args, now)
-    print(header + (" (dry run: nothing is fetched or written)" if dry_run else ""))
-
-    stats = {
-        "loaded": 0,
-        "skipped_unchanged": 0,
-        "same_input": 0,
-        "series_shared": 0,
-        "extracted": 0,
-        "failed": 0,
-        "deferred": 0,
-        "fetch_failed": 0,
-        "fetch_failed_known": 0,
-    }
-
-    # Consecutive runs each event has failed get-event, kept beside the database.
-    # They count the hourly window's runs: a backfill or a dry run leaves them alone.
-    fetch_state = Path(db_path).parent / "state" / "calendar_fetch_failures.json"
-    track_fetches = not args.backfill and not dry_run
-    unfetched_before = _read_json_dict(fetch_state).get("events") if track_fetches else {}
-    if not isinstance(unfetched_before, dict):
-        unfetched_before = {}
-    unfetched_now: dict[str, int] = {}
-    unchanged_ids: list[str] = []
-    failed_fetch_runs: dict[str, int] = {}
-    fetched_ok = False
-    session_expired = False
-    chunk_failures: list[str] = []
-    cancelled = 0
-    to_fetch = 0
-    listed_until: datetime | None = None
-
-    for start, end in windows:
-        month = _whole_month(start, end, now) if args.backfill else None
-        if month and not dry_run:
-            # Flagged until recorded below: a month half filled when the run stopped
-            # can hold enough events to pass for a full one.
-            mark_month_started(conn, month, datetime.now(UTC).isoformat())
-        window_failures: list[str] = []
-        try:
-            if args.backfill:
-                # Each month on a bound of its own: a busy one splits into many calls.
-                raw_events = list_events(
-                    start, end, failures=window_failures, max_calls=BACKFILL_LIST_CALLS
-                )
-            else:
-                raw_events = list_events(start, end, failures=window_failures)
-        except OutlookCliAuthRequired:
-            if listed_until is None:
-                conn.close()
-                print("  Outlook needs re-authentication; nothing listed", file=sys.stderr)
-                return EXIT_REAUTH
-            # The months before this one are stored and recorded; the next run resumes here.
-            session_expired = True
-            print(
-                f"  Outlook needs re-authentication; from {start.date()} on is left to the "
-                "next run",
-                file=sys.stderr,
-            )
-            break
-        listed_until = end
-        print(
-            f"  Fetched {len(raw_events)} events"
-            + (f" for {month or start.date()}" if args.backfill else "")
-        )
-        for failure in window_failures:
-            print(f"  Could not fetch {failure}", file=sys.stderr)
-        chunk_failures.extend(window_failures)
-        listed_ids = [raw.get("Id", "") for raw in raw_events]
-        listed = set(listed_ids)
-
-        if dry_run:
-            new, changed = _calendar_owed(conn, raw_events)
-            to_fetch += new + changed
-            print(
-                f"  {month or f'{start.date()}..{end.date()}'}: {len(raw_events)} listed, "
-                f"{new} new, {changed} changed or owed an extraction"
-            )
-            continue
-
-        fetch_failures_before = len(failed_fetch_runs)
-        for index, raw in enumerate(raw_events):
-            event = parse_event(raw)
-            # Stored with the row, because the next run compares its list entry to it.
-            list_change_key = event.get("change_key")
-
-            # Skip if unchanged AND we do not still owe it an extraction.
-            #
-            # modified_at alone was not enough. An event whose extraction failed was still
-            # upserted with the new modified_at, so on the next run it matched here, scored
-            # skipped_unchanged, and its body_summary, decisions and action items were gone for
-            # good — no retry, and nothing in the row saying one was owed. llm_status='pending'
-            # is that debt, and it is the only value that re-offers an unchanged event.
-            #
-            # And modified_at never matched at all: list-calendar's $select does not include
-            # it, so every event was fetched and re-extracted on every run. The etag comes
-            # with every list entry. No etag on either side is never "unchanged".
-            existing = conn.execute(
-                "SELECT change_key, llm_status, extraction_hash FROM calendar_events "
-                "WHERE outlook_event_id = ?",
-                (event["outlook_event_id"],),
-            ).fetchone()
-            if _calendar_unchanged(existing, list_change_key):
-                stats["skipped_unchanged"] += 1
-                unchanged_ids.append(event["outlook_event_id"])
-                continue
-
-            # Fetch full event (list-calendar returns a subset without Attendees,
-            # ResponseStatus, Type, SeriesMasterId etc. — get-event has everything)
-            try:
-                body_raw = get_event_body(event["outlook_event_id"])
-            except OutlookCliAuthRequired:
-                # The session expired mid-run. Every later fetch would fail the same way,
-                # so the run stops asking and exits EXIT_REAUTH, as it does when the
-                # session is already dead at list time. Nothing is written, so the next
-                # run re-offers all of them, and their fetch-failure counts carry over.
-                remaining = listed_ids[index:]
-                stats["deferred"] += len(remaining)
-                unfetched_now.update(
-                    {eid: unfetched_before[eid] for eid in remaining if eid in unfetched_before}
-                )
-                session_expired = True
-                print(
-                    f"  Outlook needs re-authentication; {len(remaining)} event(s) deferred "
-                    "to the next run",
-                    file=sys.stderr,
-                )
-                break
-            if not isinstance(body_raw, dict):
-                # A FETCH FAILURE, NOT AN EMPTY BODY, and collapsing the two loses the event
-                # exactly the way a blank extraction did. get_event_body swallows everything
-                # and returns None, so an Outlook outage arrived here as body_html="", fell
-                # past the 50-char gate and was recorded 'skipped' — the one value that says
-                # nothing is owed and the one the change detector will never re-offer. Three
-                # runs and the summary was gone: run one defers on a dead gcloud, run two
-                # overwrites it with 'skipped' while Outlook is down, run three sees nothing
-                # to do. Not contrived either: sb-auth-watch.sh fires calendar-sync on
-                # `gcloud_or_outlook`, so the run dispatched to recover from an outage is
-                # precisely the one that can hit step two before Outlook is back.
-                #
-                # WRITING NOTHING IS THE FIX, and it is stronger than writing 'pending'.
-                # Leaving the row alone preserves its llm_status AND does not advance
-                # modified_at, so the change detector re-offers the event on both counts; a
-                # brand-new event simply has no row, which it also re-offers. It is the only
-                # option that does not DEGRADE what is already stored: `event` here is still
-                # the list-calendar subset, which carries no Attendees or ResponseStatus, and
-                # load_event replaces the attendee rows wholesale.
-                #
-                # This does not contradict the ruling that the facts are stored even when the
-                # extraction fails. That ruling is "a MODEL failure must not cost you API data
-                # you already have". This is its mirror: an API failure must not overwrite API
-                # data you already have with less of it.
-                event_id = event["outlook_event_id"]
-                previous_runs = unfetched_before.get(event_id, 0)
-                runs = (previous_runs if isinstance(previous_runs, int) else 0) + 1
-                failed_fetch_runs[event_id] = runs
-                print(
-                    f"  Body fetch failed for {event.get('subject', '???')} ({runs} run(s) in a "
-                    "row); leaving the row untouched so the next run re-offers it",
-                    file=sys.stderr,
-                )
-                continue
-
-            fetched_ok = True
-            event = parse_event(body_raw)
-            event["change_key"] = list_change_key
-            # Only get-event names the series: an occurrence Outlook re-issued under a
-            # new id takes over its stored row, extraction and all, instead of a second.
-            if existing is None and adopt_reissued_occurrence(conn, event, listed):
-                existing = conn.execute(
-                    "SELECT change_key, llm_status, extraction_hash FROM calendar_events "
-                    "WHERE outlook_event_id = ?",
-                    (event["outlook_event_id"],),
-                ).fetchone()
-            body_obj = body_raw.get("Body", {})
-            body_html = body_obj.get("Content", "") if isinstance(body_obj, dict) else ""
-
-            # Extract. 'skipped' until something is actually attempted: no body, and under
-            # the 50-char floor once the HTML and the online-meeting joining details are
-            # out (calendar_extractor decides, and gives no prompt hash then), are "nothing
-            # was owed", not "nothing came back", and the fetch above succeeded so both
-            # are authoritative.
-            #
-            # --skip-extraction IS NOT AUTHORITATIVE. A run told not to extract has no basis
-            # for discharging a debt, an earlier one or this event's own: a body worth
-            # extracting stays 'pending', or with the etag stored it would never be offered
-            # again. Latent today, because sb-calendar-sync.sh runs the command bare.
-            extraction = {"body_summary": "", "decisions": [], "action_items": []}
-            prior_status = existing["llm_status"] if existing else None
-            prompt_hash = event_prompt_hash(event, body_html)
-            long_enough = prompt_hash is not None
-            if args.skip_extraction:
-                llm_status = "pending" if long_enough or prior_status == "pending" else "skipped"
-            else:
-                llm_status = "skipped"
-            # The etag moves on edits the model never sees (an attendee answering, a room
-            # change). The same prompt hash means the extraction on record was made from
-            # this very prompt, so it stands: keep it and refresh only the facts.
-            keep_extraction = (
-                not args.skip_extraction
-                and prompt_hash is not None
-                and prior_status == "extracted"
-                and existing["extraction_hash"] == prompt_hash
-            )
-            # An occurrence whose series' invitation another occurrence was read from.
-            shared = (
-                None
-                if keep_extraction or args.skip_extraction
-                else series_extraction(conn, event, prompt_hash)
-            )
-            if keep_extraction:
-                llm_status = "extracted"
-                stats["same_input"] += 1
-            elif shared is not None:
-                extraction, llm_status = shared, "extracted"
-                stats["series_shared"] += 1
-            elif not args.skip_extraction and long_enough:
-                try:
-                    extraction = extract_event(event, body_html)
-                    llm_status = "extracted"
-                    stats["extracted"] += 1
-                except Exception as e:
-                    # Same split, and the same classifier, as attachment_pipeline: a failure
-                    # a re-auth would cure is a debt to retry, anything else needs a human.
-                    # What reaches here has already exhausted call_with_policy's retries.
-                    if classify_exception(e, None) is Outcome.AUTH_REAUTH_REQUIRED:
-                        llm_status = "pending"
-                        touch_sentinel()
-                        stats["deferred"] += 1
-                    elif is_transient(e):
-                        # The service failed, not the event: offered again next run. The
-                        # run still fails, so an outage that lasts is seen.
-                        llm_status = "pending"
-                        stats["failed"] += 1
-                    else:
-                        llm_status = "failed"
-                        # Once per event: a failure already on record was reported by the
-                        # run that recorded it. Only an edited event is offered again.
-                        if prior_status != "failed":
-                            stats["failed"] += 1
-                    print(
-                        f"  Extraction {llm_status} for {event.get('subject', '???')}: {e}",
-                        file=sys.stderr,
-                    )
-
-            # Load. The facts go in regardless — they come from the API, not the model, so
-            # they are good even when the extraction that should have accompanied them is not.
-            load_event(
-                conn,
-                event,
-                extraction,
-                user_email_pattern=USER_EMAIL_PATTERN,
-                proxy_emails=proxy_emails,
-                llm_status=llm_status,
-                extraction_hash=prompt_hash,
-                keep_extraction=keep_extraction,
-            )
-            stats["loaded"] += 1
-
-        # A complete listing also says which stored events Outlook no longer holds;
-        # nothing ever removed them, so deleted and re-created meetings stayed live.
-        # Not after a span that failed or came back full, nor once the session
-        # expired mid-run: what is missing then says nothing about Outlook. The
-        # window was local time to outlook-cli, as it is to start.astimezone().
-        if not window_failures and not session_expired:
-            cancelled += cancel_unlisted(conn, listed, _utc_bound(start), _utc_bound(end))
-            # A whole month gone by, every event of it listed and stored: the next
-            # backfill skips it, and coverage stops flagging it however few it holds.
-            if month and len(failed_fetch_runs) == fetch_failures_before:
-                record_listed_month(conn, month, datetime.now(UTC).isoformat())
-        if session_expired:
-            break
-
-    if dry_run:
-        conn.close()
-        print(f"  Dry run: {to_fetch} event(s) to fetch, nothing written")
-        return 1 if chunk_failures else 0
-
-    # All three are idempotent and cheap, and repair rows no upsert will touch
-    # again: stacked duplicates from the old append-only loader, occurrences
-    # stored without their series flag, and self flags written while
-    # BRAIN_USER_EMAIL_PATTERN was unset.
-    dup_decisions, dup_actions = dedupe_event_children(conn)
-    series_marked = mark_series(conn)
-    flags_changed = 0
-    if USER_EMAIL_PATTERN and proxy_emails is not None:
-        flags_changed = refresh_self_flags(conn, USER_EMAIL_PATTERN, proxy_emails)
-    elif proxy_emails is None:
-        # canonical_people.json exists but did not parse. Recomputed without it,
-        # every event the PA booked would be rewritten as not-self, so the flags
-        # wait for the file to be fixed.
-        print(
-            "  canonical_people.json is unreadable; leaving the stored self flags alone",
-            file=sys.stderr,
-        )
-    else:
-        # Without the pattern every stored flag would be rewritten to not-self.
-        print(
-            "  BRAIN_USER_EMAIL_PATTERN is unset; leaving the stored self flags alone",
-            file=sys.stderr,
-        )
-    # The cap needs evidence that get-event works at all, from this run. On a
-    # quiet calendar the failing events may be the only ones fetched, so fetch
-    # one unchanged event as a canary. If nothing was fetchable, every failure
-    # counts, known or not: that is an outage, not one bad event.
-    if failed_fetch_runs and not fetched_ok and unchanged_ids and not session_expired:
-        try:
-            fetched_ok = isinstance(get_event_body(unchanged_ids[0]), dict)
-        except OutlookCliAuthRequired:
-            session_expired = True
-    for runs in failed_fetch_runs.values():
-        if fetched_ok and runs > CALENDAR_FETCH_ALERT_RUNS:
-            stats["fetch_failed_known"] += 1
-        else:
-            stats["fetch_failed"] += 1
-
-    # Not either for a listing that never reached the present, as a backfill of
-    # months gone by does not: it says nothing about the hourly window.
-    reached_now = listed_until is not None and listed_until >= now
-    if not chunk_failures and not stats["fetch_failed"] and reached_now:
-        # The run itself is the liveness signal. With a working change detector an
-        # unchanged calendar writes no event row, so MAX(ingested_at) stopped
-        # proving the sync ran; scripts/health_check.py reads this as well. Not on
-        # a run where get-event failed for real, or an outage would read as fresh.
-        from datetime import UTC
-
-        migrate_add_sync_metadata(conn)
-        conn.execute(
-            "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('calendar_last_listed', ?)",
-            (datetime.now(UTC).isoformat(),),
-        )
-        conn.commit()
-    conn.close()
-
-    # Only events that failed this run (or were deferred before their turn) keep a
-    # count, so a success or an event gone from the window clears it. The file is
-    # bookkeeping: the rows are committed, so failing to write it is a warning.
-    import json
-    import os
-    import tempfile
-
-    if track_fetches:
-        unfetched_now.update(failed_fetch_runs)
-        new_state = {"events": unfetched_now}
-        try:
-            fetch_state.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                "w", dir=fetch_state.parent, prefix=fetch_state.name, delete=False
-            ) as tmp:
-                json.dump(new_state, tmp, indent=1)
-            os.replace(tmp.name, fetch_state)
-        except OSError as e:
-            print(f"  Could not write {fetch_state}: {e}", file=sys.stderr)
-
-    print(f"  Loaded:     {stats['loaded']}")
-    print(f"  Unchanged:  {stats['skipped_unchanged']}")
-    print(f"  Same input: {stats['same_input']} (etag moved, extraction kept)")
-    if stats["series_shared"]:
-        print(f"  Series:     {stats['series_shared']} (read from another occurrence)")
-    print(f"  Extracted:  {stats['extracted']}")
-    print(f"  Failed:     {stats['failed']}")
-    print(f"  Deferred:   {stats['deferred']}")
-    print(f"  Fetch fail: {stats['fetch_failed']}")
-    if stats["fetch_failed_known"]:
-        print(
-            f"  Still unfetchable after {CALENDAR_FETCH_ALERT_RUNS} runs (not failing the "
-            f"run): {stats['fetch_failed_known']}"
-        )
-    if dup_decisions or dup_actions:
-        print(f"  Removed duplicate decisions/actions: {dup_decisions}/{dup_actions}")
-    if series_marked:
-        print(f"  Occurrences flagged recurring: {series_marked}")
-    if flags_changed:
-        print(f"  Self flags corrected: {flags_changed}")
-    if cancelled:
-        print(f"  No longer in Outlook, marked cancelled: {cancelled}")
-
-    # Every one of these is already recorded so the next run re-offers or
-    # reports it; the exit code is what tells the scheduler this run did not do
-    # its job. A dead gcloud (sentinel set) is a deferral, not a failure; an
-    # expired Outlook session is EXIT_REAUTH, wherever in the run it shows.
-    if session_expired:
-        return EXIT_REAUTH
-    if chunk_failures or stats["fetch_failed"] or stats["failed"]:
-        print(
-            f"  Run incomplete: {len(chunk_failures)} window chunk(s), "
-            f"{stats['fetch_failed']} body fetch(es), {stats['failed']} extraction(s) failed",
-            file=sys.stderr,
-        )
-        return 1
-    return 0
+    return calendar_sync.run(args)
 
 
 def _staged_news_ids(staging_dir: Path) -> set[str]:
@@ -3566,34 +1536,13 @@ def cmd_import_people(args):
 
 
 def cmd_stale(args):
-    """Find stale threads and overdue actions."""
-    from src.store.query import count_stale_threads, find_overdue_actions, find_stale_threads
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-
-    stale = find_stale_threads(conn, days=args.days, max_days=args.max_days, limit=args.limit)
-    total = count_stale_threads(conn, days=args.days, max_days=args.max_days)
-    print(f"STALE THREADS (you sent last, no reply): {len(stale)} of {total}")
-    print("=" * 50)
-    if stale:
-        for i, t in enumerate(stale, 1):
-            print(f"{i}. [{t['days_waiting']}d waiting] {t['subject']}")
-    else:
-        print("  No stale threads found.")
-
-    print()
-    print("OVERDUE ACTION ITEMS")
-    print("=" * 50)
-    overdue = find_overdue_actions(conn)
-    if overdue:
-        for i, a in enumerate(overdue, 1):
-            owner = a.get("owner", "unassigned")
-            print(f"{i}. [{a['days_overdue']}d overdue] {a['task'][:80]} (owner: {owner})")
-    else:
-        print("  No overdue actions found.")
-
-    conn.close()
+    """Deprecated: `brain tool stale_threads`."""
+    return _deprecated_read(
+        args,
+        "stale",
+        "stale_threads",
+        {"days": args.days, "max_days": args.max_days, "limit": _limit(args.limit)},
+    )
 
 
 def cmd_embed(args):
@@ -3612,28 +1561,13 @@ def cmd_embed(args):
 
 
 def cmd_query_semantic(args):
-    """Semantic search across email summaries."""
-    from src.store.embeddings import query_semantic
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    results = query_semantic(conn, args.query, limit=args.limit)
-    conn.close()
-
-    if not results:
-        print(f"No results for: {args.query}")
-        return
-
-    print(f"Top {len(results)} semantic matches for '{args.query}':\n")
-
-    for i, email in enumerate(results, 1):
-        sim = email.get("similarity", 0)
-        print(
-            f"{i}. [{email.get('date', 'N/A')[:10]}] (sim: {sim:.3f}) {email.get('subject', '(no subject)')[:60]}"
-        )
-        if args.verbose and email.get("summary"):
-            print(f"   {email['summary'][:120]}")
-            print()
+    """Deprecated: `brain tool search_emails` with search_type semantic."""
+    return _deprecated_read(
+        args,
+        "query semantic",
+        "search_emails",
+        {"query": args.query, "search_type": "semantic", "limit": _limit(args.limit)},
+    )
 
 
 def cmd_ingest(args):
@@ -3712,30 +1646,8 @@ def cmd_ingest(args):
 
 
 def cmd_stats(args):
-    """Show database statistics."""
-    from src.store.query import get_stats
-    from src.store.schema import get_connection
-
-    conn = get_connection(str(args.db))
-    stats = get_stats(conn)
-    conn.close()
-
-    print("Second Brain Statistics")
-    print("=" * 50)
-    print()
-    print(f"Total Emails:        {stats['total_emails']:,}")
-    print(f"Total News:          {stats['total_news_articles']:,}")
-    print(f"Total Documents:     {stats['total_documents']:,}")
-    print(f"Total Topics:        {stats['total_topics']:,}")
-    print(f"Total People:        {stats['total_people']:,}")
-    print(f"Total Decisions:     {stats['total_decisions']:,}")
-    print(f"Total Action Items:  {stats['total_action_items']:,}")
-    print()
-
-    if stats["earliest_email"] and stats["latest_email"]:
-        earliest = stats["earliest_email"][:10]
-        latest = stats["latest_email"][:10]
-        print(f"Date Range:          {earliest} to {latest}")
+    """Deprecated: `brain tool stats`, which adds freshness, coverage and every source."""
+    return _deprecated_read(args, "stats", "stats", {})
 
 
 # Subcommands that only read, and so may run on a replica. Everything else
@@ -3743,6 +1655,9 @@ def cmd_stats(args):
 # there until it is added here.
 READ_ONLY_COMMANDS = frozenset(
     {
+        # The MCP tools read through the read-only connection; sharepoint_index's
+        # refetch, the one that writes, refuses on a replica itself, as on the server.
+        "tool",
         "query",
         "prep",
         "stale",
@@ -3755,8 +1670,138 @@ READ_ONLY_COMMANDS = frozenset(
         # Its writes (--refetch, --record-aliases) refuse on a replica themselves.
         "mail-reconcile",
         "sharepoint-refused",
+        # `brain maint scrub`: the dry run reads; --apply refuses on a replica itself (exit 3).
+        "scrub",
     }
 )
+
+# One-off maintenance, grouped under `brain maint NAME` on 2026-10-11 so the jobs the
+# timers run stand apart from what is run once, by hand, and can be retired on a
+# schedule. NAME: (the command it runs, the flags it sets, its help). The old spelling,
+# that command with those flags, works for one release with a deprecation line;
+# docs/DEPLOY.md keeps it, since it also runs on code from before. `brain maint scrub`
+# runs scripts/scrub_secrets.py (cmd_scrub).
+MAINT_COMMANDS: dict[str, tuple[str, dict[str, bool], str]] = {
+    "migrate": ("migrate", {}, "Run the database migrations"),
+    "classify-sources": (
+        "classify-sources",
+        {},
+        "Set every email's source_class again by today's rules",
+    ),
+    "split-html": ("split-html", {}, "Keep the HTML of emails loaded before schema v23"),
+    "relabel-conversations": (
+        "relabel-conversations",
+        {},
+        "Relabel the stored conversation turns the owner did not write as 'agent'",
+    ),
+    "teams-backfill-replies": (
+        "teams-backfill-replies",
+        {},
+        "Store the channel replies stored posts hold (no Teams call)",
+    ),
+    "teams-strip-html": (
+        "teams-strip-html",
+        {},
+        "Convert Teams message text stored as HTML (no Teams or model call)",
+    ),
+    "teams-drop-raw-json": (
+        "teams-drop-raw-json",
+        {},
+        "Drop the raw Teams payloads nothing needs, after teams-backfill-replies",
+    ),
+    "ocr-regarble": (
+        "ocr-regarble",
+        {},
+        "Find stored OCR text that is Greek read as Latin letters",
+    ),
+    "refetch-garbled": (
+        "refetch-garbled",
+        {},
+        "Fetch again from the mailbox the swept originals of garbled OCR texts",
+    ),
+    "reextract": (
+        "reextract",
+        {},
+        "Read and summarise again rows earlier code capped, skipped or missed",
+    ),
+    "retry-stubs": (
+        "retry-stubs",
+        {},
+        "Extract again the emails loaded without an extraction",
+    ),
+    "transcribe-images": (
+        "transcribe-images",
+        {},
+        "Transcribe content images whose attachments hold no text",
+    ),
+    "hash-attachments": (
+        "hash-attachments",
+        {},
+        "Record a content hash for every attachment file still on disk",
+    ),
+    "prune-staged": (
+        "prune-staged",
+        {},
+        "Delete the staged batches whose message ids are all in the database",
+    ),
+    "import-people": ("import-people", {}, "Import canonical people from JSON"),
+    "calendar-backfill": (
+        "calendar-sync",
+        {"backfill": True},
+        "List the calendar a month at a time, the months stats coverage flags, resuming "
+        "where the last backfill stopped (calendar-sync --backfill)",
+    ),
+    "sharepoint-ingest-fetched": (
+        "process-sharepoint",
+        {"ingest_fetched": True},
+        "Store the files earlier SharePoint fetches left on disk "
+        "(process-sharepoint --ingest-fetched)",
+    ),
+    "sharepoint-refetch-content": (
+        "process-sharepoint",
+        {"refetch_content": True},
+        "Read again the SharePoint links recorded ok with no text stored "
+        "(process-sharepoint --refetch-content)",
+    ),
+    "sharepoint-repair-links": (
+        "process-sharepoint",
+        {"repair_links": True},
+        "Queue again the SharePoint links the old scanner mangled and the pages read "
+        "without their text (process-sharepoint --repair-links)",
+    ),
+}
+
+
+def _maint_name(args) -> str | None:
+    """The `brain maint` name of what `args` ran under its old spelling, or None."""
+    for name, (command, implied, _) in MAINT_COMMANDS.items():
+        if args.command == command and all(
+            getattr(args, key, None) == value for key, value in implied.items()
+        ):
+            return name
+    return None
+
+
+def cmd_scrub(args) -> int:
+    """`brain maint scrub`: scripts/scrub_secrets.py with the arguments after it."""
+    import importlib.util
+
+    from src.config import REPO_ROOT
+
+    if Path(args.db) != DEFAULT_DB:
+        print(
+            "Error: scrub takes no --db: it scrubs the configured database. Point "
+            "BRAIN_DATA_DIR at a copy's directory to rehearse on the copy.",
+            file=sys.stderr,
+        )
+        return 2
+    spec = importlib.util.spec_from_file_location(
+        "scrub_secrets", REPO_ROOT / "scripts" / "scrub_secrets.py"
+    )
+    assert spec is not None and spec.loader is not None
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    return script.main(args.script_args)
 
 
 def main():
@@ -4212,7 +2257,7 @@ def main():
 
     parser_sp_refused = subparsers.add_parser(
         "sharepoint-refused",
-        help="List the documents our SharePoint tenant refuses, with the emails linking them",
+        help="Deprecated: brain tool sharepoint_index, operation list_stale",
     )
     parser_sp_refused.set_defaults(func=cmd_sharepoint_refused)
 
@@ -4271,55 +2316,87 @@ def main():
     )
     parser_prune_staged.set_defaults(func=cmd_prune_staged)
 
+    # Any MCP tool by name, through the server's own call (src/mcp_call.py)
+    parser_tool = subparsers.add_parser(
+        "tool",
+        help="Call an MCP tool by name with its arguments as JSON; prints its answer as JSON",
+    )
+    parser_tool.add_argument("name", nargs="?", help="The tool, as `brain tool --list` names it")
+    parser_tool.add_argument(
+        "arguments", nargs="?", default=None, help="Its arguments as one JSON object (default {})"
+    )
+    parser_tool.add_argument(
+        "--list",
+        action="store_true",
+        help="List the tools with their descriptions, input schemas and annotations",
+    )
+    parser_tool.set_defaults(func=cmd_tool)
+
     # Query subcommands
-    parser_query = subparsers.add_parser("query", help="Query the knowledge store")
+    parser_query = subparsers.add_parser(
+        "query", help="Deprecated: brain tool (query_emails, search_emails, query_decisions...)"
+    )
     query_subparsers = parser_query.add_subparsers(dest="query_type", help="Query type")
 
     # Common query options
     def add_common_query_args(p):
         p.add_argument("--limit", type=int, default=20, help="Max results (default: 20)")
-        p.add_argument("-v", "--verbose", action="store_true", help="Show full details")
+        p.add_argument("-v", "--verbose", action="store_true", help="Ignored: the answer is JSON")
 
     # Query thread
-    parser_query_thread = query_subparsers.add_parser("thread", help="Show conversation thread")
+    parser_query_thread = query_subparsers.add_parser(
+        "thread", help="Deprecated: brain tool email_thread"
+    )
     parser_query_thread.add_argument("email_id", type=int, help="Email ID")
     add_common_query_args(parser_query_thread)
     parser_query_thread.set_defaults(func=cmd_query_thread)
 
     # Query by person
-    parser_query_person = query_subparsers.add_parser("person", help="Query by person")
+    parser_query_person = query_subparsers.add_parser(
+        "person", help="Deprecated: brain tool query_emails"
+    )
     parser_query_person.add_argument("name", help="Person name or email")
     add_common_query_args(parser_query_person)
     parser_query_person.set_defaults(func=cmd_query_person)
 
     # Query by topic
-    parser_query_topic = query_subparsers.add_parser("topic", help="Query by topic")
+    parser_query_topic = query_subparsers.add_parser(
+        "topic", help="Deprecated: brain tool query_emails"
+    )
     parser_query_topic.add_argument("topic", help="Topic name")
     add_common_query_args(parser_query_topic)
     parser_query_topic.set_defaults(func=cmd_query_topic)
 
     # Query by keyword
-    parser_query_keyword = query_subparsers.add_parser("keyword", help="Full-text search")
+    parser_query_keyword = query_subparsers.add_parser(
+        "keyword", help="Deprecated: brain tool search_emails"
+    )
     parser_query_keyword.add_argument("keyword", help="Search keyword")
     add_common_query_args(parser_query_keyword)
     parser_query_keyword.set_defaults(func=cmd_query_keyword)
 
     # Query by date range
-    parser_query_date = query_subparsers.add_parser("date", help="Query by date range")
+    parser_query_date = query_subparsers.add_parser(
+        "date", help="Deprecated: brain tool query_emails"
+    )
     parser_query_date.add_argument("start", help="Start date (YYYY-MM-DD)")
     parser_query_date.add_argument("end", help="End date (YYYY-MM-DD)")
     add_common_query_args(parser_query_date)
     parser_query_date.set_defaults(func=cmd_query_date)
 
     # Query decisions
-    parser_query_decisions = query_subparsers.add_parser("decisions", help="Query decisions")
+    parser_query_decisions = query_subparsers.add_parser(
+        "decisions", help="Deprecated: brain tool query_decisions"
+    )
     parser_query_decisions.add_argument("--topic", help="Filter by topic")
     parser_query_decisions.add_argument("--person", help="Filter by person (decided_by)")
     parser_query_decisions.add_argument("--limit", type=int, default=20, help="Max results")
     parser_query_decisions.set_defaults(func=cmd_query_decisions)
 
     # Query action items
-    parser_query_actions = query_subparsers.add_parser("actions", help="Query action items")
+    parser_query_actions = query_subparsers.add_parser(
+        "actions", help="Deprecated: brain tool query_actions"
+    )
     parser_query_actions.add_argument("--owner", help="Filter by owner")
     parser_query_actions.add_argument(
         "--status", default="open", help="Filter by status (default: open)"
@@ -4329,7 +2406,7 @@ def main():
 
     # Query combined
     parser_query_combined = query_subparsers.add_parser(
-        "combined", help="Query with multiple filters"
+        "combined", help="Deprecated: brain tool query_emails"
     )
     parser_query_combined.add_argument("--person", help="Filter by person")
     parser_query_combined.add_argument("--topic", help="Filter by topic")
@@ -4340,16 +2417,18 @@ def main():
     parser_query_combined.set_defaults(func=cmd_query_combined)
 
     # Prep command (meeting preparation)
-    parser_prep = subparsers.add_parser("prep", help="Generate meeting prep dossier")
+    parser_prep = subparsers.add_parser("prep", help="Deprecated: brain tool meeting_prep")
     parser_prep.add_argument("people", help="Comma-separated list of attendee names or emails")
     parser_prep.add_argument("--topic", help="Meeting topic for focused context")
     parser_prep.add_argument(
         "--days", type=int, default=365, help="Lookback period in days (default: 365)"
     )
     parser_prep.add_argument(
-        "--limit", type=int, default=10, help="Max emails per person (default: 10)"
+        "--limit", type=int, default=10, help="Ignored: meeting_prep takes no limit"
     )
-    parser_prep.add_argument("-v", "--verbose", action="store_true", help="Show email summaries")
+    parser_prep.add_argument(
+        "-v", "--verbose", action="store_true", help="Ignored: the answer is JSON"
+    )
     parser_prep.set_defaults(func=cmd_prep)
 
     # Sync command (incremental)
@@ -4465,7 +2544,9 @@ def main():
     )
     parser_teams_drop_raw.set_defaults(func=cmd_teams_drop_raw_json)
 
-    parser_teams_search = subparsers.add_parser("teams-search", help="Search Teams content")
+    parser_teams_search = subparsers.add_parser(
+        "teams-search", help="Deprecated: brain tool search_teams"
+    )
     parser_teams_search.add_argument("query", help="Search query")
     parser_teams_search.add_argument(
         "--kind", choices=["thread", "message", "both"], default="both"
@@ -4473,18 +2554,22 @@ def main():
     parser_teams_search.add_argument("--limit", type=int, default=20)
     parser_teams_search.set_defaults(func=cmd_teams_search)
 
-    parser_teams_thread = subparsers.add_parser("teams-thread", help="Show full Teams thread")
+    parser_teams_thread = subparsers.add_parser(
+        "teams-thread", help="Deprecated: brain tool teams_thread_context"
+    )
     parser_teams_thread.add_argument("thread_id", type=int)
     parser_teams_thread.set_defaults(func=cmd_teams_thread)
 
     parser_teams_chat = subparsers.add_parser(
-        "teams-chat", help="Recent activity for a Teams chat/channel"
+        "teams-chat", help="Deprecated: brain tool teams_chat_summary"
     )
     parser_teams_chat.add_argument("chat_id", type=int)
     parser_teams_chat.add_argument("--days", type=int, default=30)
     parser_teams_chat.set_defaults(func=cmd_teams_chat)
 
-    parser_teams_stats = subparsers.add_parser("teams-stats", help="Teams ingestion statistics")
+    parser_teams_stats = subparsers.add_parser(
+        "teams-stats", help="Deprecated: brain tool sql_query (README)"
+    )
     parser_teams_stats.set_defaults(func=cmd_teams_stats)
 
     # calendar-sync command
@@ -4565,7 +2650,7 @@ def main():
     parser_import.set_defaults(func=cmd_import_people)
 
     # Stale command
-    parser_stale = subparsers.add_parser("stale", help="Find stale threads and overdue actions")
+    parser_stale = subparsers.add_parser("stale", help="Deprecated: brain tool stale_threads")
     parser_stale.add_argument(
         "--days", type=int, default=5, help="Stale threshold in days (default: 5)"
     )
@@ -4588,7 +2673,9 @@ def main():
     parser_embed.set_defaults(func=cmd_embed)
 
     # Query semantic
-    parser_query_semantic = query_subparsers.add_parser("semantic", help="Semantic search")
+    parser_query_semantic = query_subparsers.add_parser(
+        "semantic", help="Deprecated: brain tool search_emails, search_type semantic"
+    )
     parser_query_semantic.add_argument("query", help="Natural language search query")
     add_common_query_args(parser_query_semantic)
     parser_query_semantic.set_defaults(func=cmd_query_semantic)
@@ -4625,8 +2712,41 @@ def main():
     parser_ingest.set_defaults(func=cmd_ingest)
 
     # Stats command
-    parser_stats = subparsers.add_parser("stats", help="Show database statistics")
+    parser_stats = subparsers.add_parser("stats", help="Deprecated: brain tool stats")
     parser_stats.set_defaults(func=cmd_stats)
+
+    # One-off maintenance (MAINT_COMMANDS), added once every other parser exists: each
+    # alias copies the parser of the command it runs (argparse parents), so it takes the
+    # same arguments, the ones added to that command later included.
+    parser_maint = subparsers.add_parser(
+        "maint", help="One-off maintenance commands, run by hand: brain maint --help"
+    )
+    maint_subparsers = parser_maint.add_subparsers(
+        dest="maint_command", metavar="COMMAND", help="Run by hand, once or now and then"
+    )
+    for name, (command, implied, help_text) in MAINT_COMMANDS.items():
+        alias = maint_subparsers.add_parser(
+            name,
+            parents=[subparsers.choices[command]],
+            add_help=False,
+            help=help_text,
+            description=help_text,
+        )
+        if implied:
+            # Not set_defaults(**implied): the alias shares its command's argument
+            # objects, and a default set here would become the job's own, so every
+            # plain calendar-sync would backfill. main() applies these after parsing.
+            alias.set_defaults(_maint_implies=implied)
+    # The script parses what follows. prefix_chars="+" leaves every '-' word to it.
+    parser_scrub = maint_subparsers.add_parser(
+        "scrub",
+        add_help=False,
+        prefix_chars="+",
+        help="Remove credentials stored before redaction (scripts/scrub_secrets.py; "
+        "brain maint scrub --help for its options)",
+    )
+    parser_scrub.add_argument("script_args", nargs="*", help="The script's own arguments")
+    parser_scrub.set_defaults(func=cmd_scrub)
 
     # Parse and execute
     args = parser.parse_args()
@@ -4639,10 +2759,29 @@ def main():
         parser_query.print_help()
         sys.exit(1)
 
+    if args.command == "maint" and not args.maint_command:
+        parser_maint.print_help()
+        sys.exit(1)
+
+    for key, value in getattr(args, "_maint_implies", {}).items():
+        setattr(args, key, value)
+    command = args.maint_command if args.command == "maint" else args.command
+    maint_name = _maint_name(args)
+    if maint_name:
+        old, implied, _ = MAINT_COMMANDS[maint_name]
+        flags = [f"--{key.replace('_', '-')}" for key in implied]
+        print(
+            f"brain {' '.join([old, *flags])} is deprecated (removed in the next release), "
+            "with the same arguments"
+            + (f" but {' '.join(flags)}" if flags else "")
+            + f": use brain maint {maint_name}",
+            file=sys.stderr,
+        )
+
     from src import config
 
-    if args.command not in READ_ONLY_COMMANDS and config.is_replica():
-        print(config.replica_refusal(f"'{args.command}'"), file=sys.stderr)
+    if command not in READ_ONLY_COMMANDS and config.is_replica():
+        print(config.replica_refusal(f"'{command}'"), file=sys.stderr)
         sys.exit(2)
 
     # Execute command

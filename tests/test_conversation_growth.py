@@ -463,7 +463,7 @@ def test_sync_embeds_the_conversations_it_loads(tmp_path, monkeypatch):
     )
     conn.commit()
     conn.close()
-    monkeypatch.setattr("src.cli.DATA_ROOT", tmp_path)
+    monkeypatch.setattr("src.pipeline.sync.DATA_ROOT", tmp_path)
     monkeypatch.setattr(llm_deadline, "_detect_systemd_unit", lambda: None)
     args = type(
         "Args",

@@ -120,19 +120,6 @@ def test_a_negative_limit_does_not_unbound_the_tool(conn, monkeypatch):
     assert len(mcp_server.stale_threads(days=5, limit=-1)["stale_threads"]) == 1
 
 
-def test_the_stale_cli_prints_the_total(conn, monkeypatch, capsys, tmp_path):
-    import types
-
-    from src import cli
-
-    monkeypatch.setattr("src.store.schema.get_connection", lambda path: conn)
-
-    cli.cmd_stale(types.SimpleNamespace(db=tmp_path / "x.db", days=5, max_days=30, limit=2))
-
-    out = capsys.readouterr().out
-    assert "2 of 4" in out
-
-
 def test_the_stale_threads_tool_reports_a_total(conn, monkeypatch):
     from src import mcp_server
 
@@ -476,26 +463,6 @@ def test_email_thread_caps_the_limit(conn, monkeypatch):
     assert asked == [200]
 
 
-def test_the_cli_says_when_it_shows_part_of_a_thread(tmp_path, capsys):
-    """query thread centres on the email too, and said 'Thread with 5 emails' of
-    a 30-email thread, numbering the slice from 1."""
-    import argparse
-
-    from src.cli import cmd_query_thread
-
-    path = tmp_path / "b.db"
-    c = create_database(str(path))
-    for i in range(1, 31):
-        _email(c, i, 40 - i, "a@example.com", "convC")
-    c.commit()
-    c.close()
-
-    cmd_query_thread(argparse.Namespace(db=path, email_id=30, limit=5, verbose=False))
-
-    out = capsys.readouterr().out
-    assert "Thread with 30 emails, showing 5 around #30" in out
-
-
 def test_a_news_article_or_a_blank_thread_id_is_a_thread_of_one(conn):
     """Search treats both as unthreaded; the thread view showed a day's
     unrelated articles, or strangers sharing a blank id, as one exchange. Alone
@@ -531,24 +498,3 @@ def test_a_blank_subject_email_is_no_stale_thread(conn):
     reported = [r["conversation_id"] for r in find_stale_threads(conn, days=5)]
     assert blank not in reported
     assert "  " not in reported
-
-
-def test_the_cli_thread_view_survives_a_blank_subject_and_a_zero_limit(tmp_path, capsys):
-    import argparse
-
-    from src.cli import cmd_query_thread
-
-    path = tmp_path / "b.db"
-    c = create_database(str(path))
-    c.execute(
-        "INSERT INTO emails (id, message_id, date_received, subject, conversation_id) "
-        "VALUES (5, 5, '2026-09-01T00:00:00Z', NULL, NULL)"
-    )
-    c.commit()
-    c.close()
-
-    cmd_query_thread(argparse.Namespace(db=path, email_id=5, limit=0, verbose=False))
-
-    out = capsys.readouterr().out
-    assert "Thread with 1 emails" in out
-    assert "(no subject)" in out

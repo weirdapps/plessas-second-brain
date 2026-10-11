@@ -188,11 +188,11 @@ Each stored occurrence carries `is_recurring` and its series in `recurrence_mast
 - `teams_thread_context(thread_id)`. Full thread with decisions, actions, facts.
 - `teams_chat_summary(chat_id, days)`. Recent activity per chat or channel.
 
-A channel thread holds the post and its replies, each reply a message of its own, and a post is dated by when it was written, not by its newest reply. A message edited or deleted after it was first stored is brought up to date on a later pull: the edit replaces the text, a deletion blanks it, and either sends the thread back to extraction. Before this, replies stayed inside the post's stored payload, out of search and extraction, and the first draft of an edited message and the text of a deleted one were kept. `python -m src.cli teams-backfill-replies` stores the replies already held in stored posts, once (see `docs/DEPLOY.md`).
+A channel thread holds the post and its replies, each reply a message of its own, and a post is dated by when it was written, not by its newest reply. A message edited or deleted after it was first stored is brought up to date on a later pull: the edit replaces the text, a deletion blanks it, and either sends the thread back to extraction. Before this, replies stayed inside the post's stored payload, out of search and extraction, and the first draft of an edited message and the text of a deleted one were kept. `python -m src.cli maint teams-backfill-replies` stores the replies already held in stored posts, once (see `docs/DEPLOY.md`).
 
-A message's text is what a reader sees of it: no tags, entities decoded, a block or a line break on a line of its own, and the visible text of a mention, a link (its address after it, as in a mail body) and an emoji kept. The HTML is kept beside it. The content's shape decides, not the type the payload declares: the services declare an HTML body as text, and until this change the text of every HTML message was its markup, so `search_teams` matched words such as `itemtype` and `nbsp` and the model read the tags. System messages (calls, membership changes) keep the service's XML. `python -m src.cli teams-strip-html` converts the text stored before, once (see `docs/DEPLOY.md`).
+A message's text is what a reader sees of it: no tags, entities decoded, a block or a line break on a line of its own, and the visible text of a mention, a link (its address after it, as in a mail body) and an emoji kept. The HTML is kept beside it. The content's shape decides, not the type the payload declares: the services declare an HTML body as text, and until this change the text of every HTML message was its markup, so `search_teams` matched words such as `itemtype` and `nbsp` and the model read the tags. System messages (calls, membership changes) keep the service's XML. `python -m src.cli maint teams-strip-html` converts the text stored before, once (see `docs/DEPLOY.md`).
 
-Each message also keeps the payload teams-cli returned (`raw_json`), which the pull compares to tell an edit or a delete; nothing else reads it once the replies are stored. `python -m src.cli teams-drop-raw-json` drops it from the stored messages, once, after `teams-backfill-replies` and `teams-strip-html`: about 133 MB of the 244 MB table on the producer. A channel post whose payload still holds a reply that is not a message of its own keeps its payload, and `--dry-run` counts what would go. New messages keep their payload, and one whose payload was dropped gets it back, with the same text and no new extraction, the next time a pull reads it.
+Each message also keeps the payload teams-cli returned (`raw_json`), which the pull compares to tell an edit or a delete; nothing else reads it once the replies are stored. `python -m src.cli maint teams-drop-raw-json` drops it from the stored messages, once, after `teams-backfill-replies` and `teams-strip-html`: about 133 MB of the 244 MB table on the producer. A channel post whose payload still holds a reply that is not a message of its own keeps its payload, and `--dry-run` counts what would go. New messages keep their payload, and one whose payload was dropped gets it back, with the same text and no new extraction, the next time a pull reads it.
 
 ### WhatsApp
 
@@ -301,7 +301,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.plessas.whatsapp-syn
 launchctl kickstart gui/$(id -u)/com.plessas.whatsapp-sync-vps   # the first push
 ```
 
-**First backfill**: `systemctl --user start sb-whatsapp-sync.service` on the producer once the first push has landed. Extraction is deadline-bounded (300 s a run), so a large first backlog drains over a few hourly runs; starting the service again drains it faster. Check with `python -m src.cli stats` (`whatsapp_messages`, `coverage.whatsapp`) and the nightly health report's WhatsApp line.
+**First backfill**: `systemctl --user start sb-whatsapp-sync.service` on the producer once the first push has landed. Extraction is deadline-bounded (300 s a run), so a large first backlog drains over a few hourly runs; starting the service again drains it faster. Check with `python -m src.cli tool stats` (`whatsapp_messages`, `coverage.whatsapp`) and the nightly health report's WhatsApp line.
 
 ## Installation
 
@@ -402,7 +402,7 @@ Preferred credential path. Uses Application Default Credentials, no API key requ
 - `SHAREPOINT_HOST`: SharePoint tenant you hold a session for (default: the placeholder `contoso.sharepoint.com`). The session is only ever presented to this host and its `<tenant>-my` OneDrive twin: a link to any other tenant is recorded as `unsupported-host` without a request, because `sharepoint-cli` attaches the session's cookies to whatever host it is given. `process-sharepoint` refuses to fetch until this is set, and `sharepoint_index(refetch)` refuses any URL off the tenant.
 - `OUTLOOK_CLI_PATH`, `SHAREPOINT_CLI_PATH`: absolute paths to those two adapters. Set them for any process that does not inherit an interactive shell's `PATH`, which includes MCP servers, launchd agents and systemd units.
 - `BRAIN_NEWS_DB`: the external news-reader SQLite database `news-sync` reads (default `~/SourceCode/news/data/news.db`). Read-only; no news ingestion happens without it.
-- `BRAIN_ROLE`: `producer` or `replica`. A replica holds a copy of the database built on another host, and every command but the read-only ones (`query`, `stats`, `stale`, `prep`, the Teams readers) refuses to run there, as do the maintenance scripts and store modules that write and the MCP `sharepoint_index` refetch, since the next pull replaces what they would write. Without this variable a host is a replica when the pull job's stamp `~/.second-brain/db-pull.stamp` exists.
+- `BRAIN_ROLE`: `producer` or `replica`. A replica holds a copy of the database built on another host, and every command but the read-only ones (`tool`, the deprecated readers it replaces, `mail-reconcile`'s report, `maint prune-staged` and `maint scrub`'s dry run) refuses to run there, as do the maintenance scripts and store modules that write and the MCP `sharepoint_index` refetch, since the next pull replaces what they would write. Without this variable a host is a replica when the pull job's stamp `~/.second-brain/db-pull.stamp` exists.
 - `SECOND_BRAIN_VENV_PYTHON`: explicit venv override for `run_mcp.sh`.
 - `BRAIN_DATA_DIR`: data home for the DB, attachments, staging, embeddings and SharePoint files. Attachment files are deleted once their content is stored, as described in [Files are inputs](docs/DEPLOY.md#10-files-are-inputs). Defaults to `<repo>/data`. Use an **absolute** path: `src/config.py` does not call `expanduser()`, and systemd's `EnvironmentFile=` does not expand `~` either, so a tilde produces a directory literally named `~`.
 - The database file is `brain.db` inside `BRAIN_DATA_DIR`, so `<repo>/data/brain.db` by default. The global `--db` flag (placed before the subcommand, e.g. `python -m src.cli --db /path/brain.db stats`) overrides it.
@@ -431,7 +431,7 @@ Phase 2 of the attachment pipeline (`process-attachments --phase 2`, the nightly
 
 - **Spreadsheets** (text read by `openpyxl`, `pyxlsb` or `xlrd`) go in one call over a digest built from the stored cells (`src/extract/attachment_digest.py`): per sheet its name and size, header row, up to 20 sample rows (the first 15 and the last 5), each column's type with its minimum, maximum and mean or its distinct count, and up to 2,000 characters of free text; the whole digest stays under 30,000 characters. The prompt says it is a digest and asks for decisions and action items only from text that states them, not from table rows.
 - **Any other long text** is summarised from every one of its 40,000-character parts while it has at most `BRAIN_ATTACHMENT_FULL_PARTS_UPTO` of them (default 8, about 100 pages), and above that from three, its first, its last and the one richest in headings or table-of-contents lines, then a merge either way: a text of n parts up to the threshold takes n + 1 calls and a longer one four, where a long text used to take up to 51. `0` takes three parts from every long text, and a threshold above 50 still reads at most the 50 a flag does. A value that is not a whole number of 0 or more leaves these texts pending, their `llm_error` naming the variable, until it is corrected.
-- **A flagged attachment** keeps the old behaviour, up to 50 parts spread across it plus the merge, a long spreadsheet included. `python -m src.cli reextract --full-parts ID...` flags attachments by id (the `attachment_id` that `search_attachments` returns) and summarises them again now; the flag holds for every later summary. It is a `sync_metadata` row per attachment, key `attachment_summary_full:<id>`, so it needs no schema change; delete the row to lift it.
+- **A flagged attachment** keeps the old behaviour, up to 50 parts spread across it plus the merge, a long spreadsheet included. `python -m src.cli maint reextract --full-parts ID...` flags attachments by id (the `attachment_id` that `search_attachments` returns) and summarises them again now; the flag holds for every later summary. It is a `sync_metadata` row per attachment, key `attachment_summary_full:<id>`, so it needs no schema change; delete the row to lift it.
 
 A run can be given a token budget, input and output tokens together: `--token-budget N` on `process-attachments` and `reextract`, or `BRAIN_ATTACHMENT_TOKEN_BUDGET` in the environment, which is how the nightly pass picks it up without a wrapper change (`--token-budget 0` lifts it for one run). Each call is estimated before it is sent, its prompt's characters at `BRAIN_CHARS_PER_TOKEN` characters a token (default 1.6, measured on this corpus's attachment prompts) plus 1,500 output tokens, and charged what the response reports once answered. The run stops before the first call that would pass the budget, leaves the rest pending for the next run (a long document keeps the parts it finished), prints how many it left, and exits 0. Calls already in flight finish, so with several workers a run can end a little over.
 
@@ -460,8 +460,8 @@ Tesseract with English first reads many Greek letters as the Latin letters they 
 - **The scanned pages of a text PDF.** A page whose text layer holds fewer than 50 characters and that shows an image is OCR'd, inside the existing two-minute OCR budget per file. Before, OCR ran only when the whole PDF held under 50 characters, so a scanned annex inside a text PDF was never read. Blank pages are not read.
 - **The mark.** An OCR reading (methods `ocr`, `pymupdf+tesseract`, `zip`) that `src/extract/ocr_garble.py` takes for Greek in Latin look-alikes keeps its text and gets `ocr_garbled: ...` in `extraction_error`, with `llm_status = 'skipped'`; there is no schema change. The detector wants at most 30% Greek letters and at least three Greek function words in their Latin look-alike spellings, two of them different, and two per 1,000 Latin letters. Phase 2 never summarises a marked row, the file sweep and the orphan reaper keep its file, and Phase 1 does not copy it to another attachment with the same bytes.
 - **Reading it again.** A marked image that the vision pass filed as content owes its transcription: the nightly image pass (or `transcribe-images`) transcribes it, and the transcription replaces the garbled text. A marked scan is read again Greek first by `reextract --garbled`; a reading no longer marked replaces the stored text, whatever its length, and is summarised.
-- **What was read before.** `python -m src.cli ocr-regarble` finds the stored texts the detector flags, counts them by method, and lists by attachment id which files are still on disk and which were swept. `--apply` marks them, clears their summaries, deletes the decisions, action items and key facts those summaries wrote (by `attachment_id`: rows written before schema v28 carry none and stay on the email) and drops their vectors. It refuses to run on a replica. A swept original is fetched back from the mailbox by `refetch-garbled` (next) before either route can read it.
-- **Fetching swept originals back.** `python -m src.cli refetch-garbled` takes each marked row whose file is not on disk, oldest mail first, and asks `outlook-cli download-attachments` for its message's attachments, once per message and at most two messages at a time; `--limit` bounds the messages a run asks for, both halves together (default 200), and `--dry-run` counts both halves without downloading or writing. A message is asked for under the id of the directory its file was downloaded into, then the email's own id, then the ids of its Archive copies (`email_aliases`), since a move gives a message a new id. The file whose sha256 is the row's (name and size for a row with no hash) goes back to the directory and name its path records, `attachments.file_path` names it there and `file_removed_at` is cleared; the message's other files are not kept. The mark stays, so `reextract --garbled` reads the file next, the image pass finds it by its path, and the sweep keeps it until a reading is recorded after the fetch, even if the mark is lifted first.
+- **What was read before.** `python -m src.cli maint ocr-regarble` finds the stored texts the detector flags, counts them by method, and lists by attachment id which files are still on disk and which were swept. `--apply` marks them, clears their summaries, deletes the decisions, action items and key facts those summaries wrote (by `attachment_id`: rows written before schema v28 carry none and stay on the email) and drops their vectors. It refuses to run on a replica. A swept original is fetched back from the mailbox by `refetch-garbled` (next) before either route can read it.
+- **Fetching swept originals back.** `python -m src.cli maint refetch-garbled` takes each marked row whose file is not on disk, oldest mail first, and asks `outlook-cli download-attachments` for its message's attachments, once per message and at most two messages at a time; `--limit` bounds the messages a run asks for, both halves together (default 200), and `--dry-run` counts both halves without downloading or writing. A message is asked for under the id of the directory its file was downloaded into, then the email's own id, then the ids of its Archive copies (`email_aliases`), since a move gives a message a new id. The file whose sha256 is the row's (name and size for a row with no hash) goes back to the directory and name its path records, `attachments.file_path` names it there and `file_removed_at` is cleared; the message's other files are not kept. The mark stays, so `reextract --garbled` reads the file next, the image pass finds it by its path, and the sweep keeps it until a reading is recorded after the fetch, even if the mark is lifted first.
   Each row's outcome is a `sync_metadata` row, key `refetch_garbled:<attachment id>`, JSON with `state`, `attempts`, `last_attempt_at` and `fetched_at` or `gone_at`: no schema change. A message every id answers 404 for is `gone`: the mailbox keeps about a year of mail, so mail older than that cannot come back, and it is not asked for again. One whose download holds no such file is `unmatched`, also final. A download that fails with exit 5, or gets no answer in 5 minutes, is `failed` and asked for again on the next run, three attempts in all. Exit 4 (log in again), or any exit but 5 (no `outlook-cli`, a usage or local error), stops the run without counting an attempt. A row already fetched is skipped, so the command can be repeated; delete its `sync_metadata` row to fetch it again. Mail stored by the retired Apple Mail exporter carries Mail.app's numbers rather than Graph ids: unless an Archive copy id was recorded for the email, its rows have no mailbox id, the number is never sent to `outlook-cli`, and the lookup (next) finds the message instead. The command exits 4 when `outlook-cli` needs a login, 5 when a download or a lookup failed or `outlook-cli` could not run, 0 otherwise. It refuses to run on a replica.
 - **Looking up mail with no mailbox id.** Since 2026-10-11 `refetch-garbled` has a second half, on by default, that runs after the id half within what `--limit` leaves; `--no-lookup` turns it off and gives the id-only behaviour back, its rows counted under "no mailbox id". It finds a message the way `mail-reconcile` matches mail: `outlook-cli list-mail` over the email's stored received time, two minutes either side (`LOOKUP_WINDOW`), and the same subject once normalised (`normalize_subject`: reply prefixes, gateway tags, accents and case aside). A stored time with no zone, as the Apple Mail exporter wrote them, is read as Europe/Athens time (`NAIVE_TIME_ZONE`), both readings of the hour the clocks go back included: read as UTC it would be two or three hours off. The folder is the one the email records (Archive, Sent Items or Inbox), then the others of those three, since mail filed from the Inbox has moved to Archive; the first folder with a match decides. Exactly one message: its attachments are downloaded, and a row's file goes back as above only when its sha256 is the row's, so a row with no hash is not looked up, nor is an email with no subject or received time. Several messages: the row is `ambiguous`, counted and never guessed at, and not looked up again. None: `gone` when the email is more than a year old (`RETENTION`), else `not_found` and looked up again on the next run, three attempts in all. The lookup's records use the same `sync_metadata` key, so the sweep keeps a file it fetched until it is read, and add `"by": "lookup"` and the folder the message matched in (`candidates` for an ambiguous one). Each listing and download is one `outlook-cli` call, at most two at a time.
 
@@ -501,7 +501,7 @@ In any Claude Code session, ask "what do we know about X" and the agent calls `r
 
 ### CLI
 
-`./brain` (wrapper) or `python -m src.cli`. Highlights:
+`./brain` (it runs from any directory; a relative path in its arguments is read from where you ran it) or `python -m src.cli`. Three kinds of command: the jobs and ingest commands, most of them run by the timers; `tool` to read the store through the MCP tools; and `maint` for one-off maintenance run by hand. The jobs with several stages (`sync`, `teams-sync`, `whatsapp-sync`, `calendar-sync`, `process-sharepoint`) live in `src/pipeline/`.
 
 ```bash
 # Incremental sync over what `python -m src.export.outlook_export` staged: extract, load,
@@ -515,13 +515,8 @@ python -m src.cli sync --full-dedup           # the people dedup over the whole 
 
 # Ingestion by source
 python -m src.cli calendar-sync --since 2026-01-01
-python -m src.cli calendar-sync --backfill --dry-run   # the months stats coverage flags: list them, count what would be fetched; nothing written
-python -m src.cli calendar-sync --backfill             # fill them a month at a time; run again to resume (see DEPLOY)
 python -m src.cli news-sync --relevance 60
 python -m src.cli teams-sync --workers 4
-python -m src.cli teams-backfill-replies    # once, on the producer: store the channel replies stored posts hold; no Teams call
-python -m src.cli teams-strip-html          # once, on the producer: convert message text stored as HTML (--dry-run counts); no Teams or model call
-python -m src.cli teams-drop-raw-json [--dry-run] [--limit N]   # once, on the producer, after teams-backfill-replies and teams-strip-html: drop the raw Teams payloads (see DEPLOY)
 python -m src.cli whatsapp-sync             # the snapshot at BRAIN_WHATSAPP_SNAPSHOT (see WhatsApp below)
 python -m src.cli process-attachments --phase 2 --workers 2
 python -m src.cli process-attachments --phase 2 --estimate             # calls, tokens and cost of the pending summaries; no model call
@@ -530,65 +525,116 @@ python -m src.cli process-attachments --phase 2 --batch                # the pen
 python -m src.cli process-attachments --batch-collect                  # store the replies of finished batch jobs; the rest stay pending
 python -m src.cli process-images --limit 500
 python -m src.cli process-sharepoint --since 2026-06-01   # a rescan by date; the nightly run continues past the last email id it scanned, fetching at most --max-fetches (100)
-python -m src.cli split-html                # after v23, on the producer: HTML bodies loaded before it (see DEPLOY)
 python -m src.cli reverse-ingest --root ~/path/to/documents --workers 4   # only the directories you name
 python -m src.cli ingest ~/Downloads/report.pdf --source "Q2 report"
 python -m src.cli ingest --url https://example.com/article
-
-# Queries (CLI mirrors of the MCP tools)
-python -m src.cli query keyword "budget approval"
-python -m src.cli query semantic "concerns about digital transformation"
-python -m src.cli query person "Duarte"
-python -m src.cli query topic "cards migration"
-python -m src.cli query decisions --topic cards
-python -m src.cli query actions --owner Chen --status open
-python -m src.cli query combined --person "Chen" --topic "digital"
-python -m src.cli prep "Chen,Okafor" --topic digital
-python -m src.cli stale --days 5
-python -m src.cli stats
+python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents
 
 # Housekeeping
-python -m src.cli migrate
-python -m src.cli classify-sources          # set every email's source_class again, e.g. after BRAIN_USER_EMAIL_PATTERN is set
+python -m src.cli load                      # creates brain.db on a fresh host and loads what was extracted
 python -m src.cli embed --force
-python -m src.cli prune-staged
-python -m src.cli hash-attachments          # record a content hash for every attachment file still on disk
 python -m src.cli sweep-files --policy      # delete attachment files whose content is stored (report-only by default)
-python -m src.cli reextract --capped --zip --unread    # read and summarise again rows earlier code capped, skipped or never read
-python -m src.cli reextract --partial                  # read again in full what the old readers read in part (resumable)
-python -m src.cli reextract --stale --formats          # read with today's readers what older code skipped or failed on
-python -m src.cli reextract --ocr --limit 500          # OCR low-text scans and images again (grayscale second pass), in batches
-python -m src.cli ocr-regarble [--apply]              # find stored OCR text that is Greek read as Latin letters; --apply marks it and clears its summaries
-python -m src.cli refetch-garbled --limit 200         # producer: fetch back from the mailbox the swept originals of marked texts, by id, then by folder, time and subject; repeat until none is left to try
-python -m src.cli reextract --garbled                 # read marked scans again, Greek first, and summarise the ones that now read
-python -m src.cli reextract --long --estimate          # price a re-summary before running it; changes nothing
-python -m src.cli reextract --batch --probe            # ten requests as a batch job: prints the replies and the cost, stores nothing
-python -m src.cli reextract --long --batch --limit 500 # read again, then send the summaries as a batch job; --batch-collect stores them
-python -m src.cli reextract --full-parts 1234 5678     # summarise these attachments from every part, now and on every later summary
-python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents
-python -m src.cli relabel-conversations [--dry-run]    # once, on the producer: stored turns the owner did not type become 'agent' (see DEPLOY)
-python -m src.cli process-sharepoint --ingest-fetched  # store the files earlier SharePoint fetches left on disk
-python -m src.cli process-sharepoint --refetch-content --max-fetches 0 --deadline-s 1800  # read again the links recorded ok with no text
 python -m src.cli mail-reconcile --since 2025-03-16 --json gaps.json   # Outlook messages the store lacks; read-only, so it runs on a replica
 python -m src.cli mail-reconcile --since 2026-05-01 --refetch --record-aliases  # producer: stage them for the next sync, note the ids of Archive copies
 python -m src.cli mail-reconcile --since 7d --refetch --limit 100 --health-json  # producer, nightly: the week's missing mail, and data/state/mail_loss.json for the health check
-python -m src.cli retry-stubs [--dry-run]   # extract again the emails loaded without an extraction after failing three runs
 python -m src.store.person_aliases [--apply]           # propose which identity each mention row stands for; --apply records them (producer)
 ```
 
 Full subcommand list: `python -m src.cli --help`.
 
+#### Reading the store: `brain tool`
+
+`brain tool NAME 'JSON'` calls the MCP tool `NAME` with its arguments as one JSON object, through the call the server makes for `tools/call` (`src/mcp_call.py`), and prints the structured answer the server would send, as JSON: the same input schema, the same read-only connection, the freshness header first and the 40,000-character budget. `brain tool --list` prints every tool with its description, input schema and annotations, as a client lists them. `--db` (before `tool`) points the tools at another store for that call.
+
+```bash
+python -m src.cli tool --list | jq -r '.tools[].name'
+python -m src.cli tool stats                     # counts, freshness (data_as_of, age_hours, stale) and coverage per source
+python -m src.cli tool recall '{"query": "budget approval"}'
+python -m src.cli tool search_emails '{"query": "budget approval", "limit": 5}'
+python -m src.cli tool sql_query '{"sql": "SELECT COUNT(*) AS n FROM emails"}'
+python -m src.cli --db /path/to/copy.db tool stats
+```
+
+It exits 0 with the answer on stdout; 1 when the tool refuses or fails, with its message on stderr (`query_emails` with no filter, an id that is not there, a store that is not there); 2 for a tool that does not exist or arguments its input schema rejects, with the schema on stderr. It runs on a replica as the server does: reads open the pulled copy `immutable=1`, so nothing is written beside it, and `sharepoint_index`'s refetch refuses there.
+
+#### Deprecated read commands
+
+The seventeen read commands that mirrored the MCP tools by hand are deprecated and go in the next release. Each still takes its old arguments, prints one line on stderr naming the `brain tool` call that replaces it, and answers with that tool's JSON instead of text. A limit is held to 1..200, as the server holds it; `-v` and `prep --limit` are accepted and ignored.
+
+| Old command | Now answers with |
+| --- | --- |
+| `query thread ID [--limit N]` | `tool email_thread '{"email_id": ID, "limit": N}'` |
+| `query person NAME` | `tool query_emails '{"person": "NAME"}'` |
+| `query topic TOPIC` | `tool query_emails '{"topic": "TOPIC"}'` |
+| `query keyword WORDS` | `tool search_emails '{"query": "WORDS"}'`; the attachments it also listed are `tool search_attachments` |
+| `query date START END` | `tool query_emails '{"start_date": "START", "end_date": "END"}'` |
+| `query decisions [--topic T] [--person P]` | `tool query_decisions '{"topic": "T"}'`, over the tool's 365 days (`days` widens it; the old command read all time) |
+| `query actions [--owner O] [--status S]` | `tool query_actions '{"owner": "O", "status": "S"}'` (`open` or `expired`) |
+| `query combined [--person --topic --keyword --start --end]` | `tool query_emails` with the same filters (`start_date`, `end_date`) |
+| `query semantic WORDS` | `tool search_emails '{"query": "WORDS", "search_type": "semantic"}'` |
+| `prep PEOPLE [--topic T] [--days N]` | `tool meeting_prep '{"people": "PEOPLE", "topic": "T", "days": N}'` |
+| `stale [--days] [--max-days] [--limit]` | `tool stale_threads '{"days": 5, "max_days": 30}'` |
+| `stats` | `tool stats`, which adds freshness, coverage and every source |
+| `teams-search WORDS [--kind K]` | `tool search_teams '{"query": "WORDS", "kind": "K"}'` |
+| `teams-thread ID` | `tool teams_thread_context '{"thread_id": ID}'` |
+| `teams-chat ID [--days N]` | `tool teams_chat_summary '{"chat_id": ID, "days": N}'` |
+| `teams-stats` | `tool sql_query` with the counts it printed, one row (`TEAMS_STATS_SQL` in `src/cli.py`; its deprecation line prints the call whole) |
+| `sharepoint-refused` | `tool sharepoint_index '{"operation": "list_stale"}'`: every link whose last fetch did not succeed, one row a link |
+
+#### One-off maintenance: `brain maint`
+
+`brain maint --help` lists them; each takes the arguments of the command it runs. The old spellings (`brain migrate`, `brain calendar-sync --backfill`, `brain process-sharepoint --ingest-fetched`...) work for one release and print one deprecation line; `docs/DEPLOY.md` keeps them, since they also run on code from before this.
+
+```bash
+python -m src.cli maint migrate
+python -m src.cli maint classify-sources          # set every email's source_class again, e.g. after BRAIN_USER_EMAIL_PATTERN is set
+python -m src.cli maint calendar-backfill --dry-run   # the months stats coverage flags: list them, count what would be fetched; nothing written
+python -m src.cli maint calendar-backfill             # fill them a month at a time; run again to resume (see DEPLOY)
+python -m src.cli maint teams-backfill-replies    # once, on the producer: store the channel replies stored posts hold; no Teams call
+python -m src.cli maint teams-strip-html          # once, on the producer: convert message text stored as HTML (--dry-run counts); no Teams or model call
+python -m src.cli maint teams-drop-raw-json [--dry-run] [--limit N]   # once, on the producer, after teams-backfill-replies and teams-strip-html: drop the raw Teams payloads (see DEPLOY)
+python -m src.cli maint split-html                # after v23, on the producer: HTML bodies loaded before it (see DEPLOY)
+python -m src.cli maint prune-staged
+python -m src.cli maint import-people [--file canonical_people.json]
+python -m src.cli maint hash-attachments          # record a content hash for every attachment file still on disk
+python -m src.cli maint reextract --capped --zip --unread    # read and summarise again rows earlier code capped, skipped or never read
+python -m src.cli maint reextract --partial                  # read again in full what the old readers read in part (resumable)
+python -m src.cli maint reextract --stale --formats          # read with today's readers what older code skipped or failed on
+python -m src.cli maint reextract --ocr --limit 500          # OCR low-text scans and images again (grayscale second pass), in batches
+python -m src.cli maint ocr-regarble [--apply]              # find stored OCR text that is Greek read as Latin letters; --apply marks it and clears its summaries
+python -m src.cli maint refetch-garbled --limit 200         # producer: fetch back from the mailbox the swept originals of marked texts, by id, then by folder, time and subject; repeat until none is left to try
+python -m src.cli maint reextract --garbled                 # read marked scans again, Greek first, and summarise the ones that now read
+python -m src.cli maint reextract --long --estimate          # price a re-summary before running it; changes nothing
+python -m src.cli maint reextract --batch --probe            # ten requests as a batch job: prints the replies and the cost, stores nothing
+python -m src.cli maint reextract --long --batch --limit 500 # read again, then send the summaries as a batch job; --batch-collect stores them
+python -m src.cli maint reextract --full-parts 1234 5678     # summarise these attachments from every part, now and on every later summary
+python -m src.cli maint retry-stubs [--dry-run]   # extract again the emails loaded without an extraction after failing three runs
+python -m src.cli maint transcribe-images --limit 100      # transcribe content images whose attachments hold no text
+python -m src.cli maint relabel-conversations [--dry-run]    # once, on the producer: stored turns the owner did not type become 'agent' (see DEPLOY)
+python -m src.cli maint sharepoint-ingest-fetched           # store the files earlier SharePoint fetches left on disk
+python -m src.cli maint sharepoint-refetch-content --max-fetches 0 --deadline-s 1800  # read again the links recorded ok with no text
+python -m src.cli maint sharepoint-repair-links [--dry-run] # queue again the links the old scanner mangled and the pages read without their text
+python -m src.cli maint scrub [--apply] [--vacuum] [--files DIR ...]   # scripts/scrub_secrets.py, its own options; it scrubs the configured store, so --db is refused
+```
+
 ## Code layout
 
 ```text
 src/
-  cli.py                       Command-line entry (`brain` wrapper points here)
+  cli.py                       Command-line entry (`brain` wrapper points here): parsing, thin commands
+  mcp_call.py                  `brain tool`: an MCP tool called through the server's own call, JSON out
   config.py                    Paths, env-driven settings, schema version
   mcp_server.py                MCP server (MCPServer, mcp SDK v2), 25 tools
   bridge.py                    Legacy JSON-over-CLI bridge (superseded by MCP)
   llm_policy.py                Shared Vertex retry and auth policy (vendored, SHA256 drift-checked)
   llm_deadline.py              Derives PTS_LLM_DEADLINE from the calling unit's own budget
   llm_cost.py                  Rate table, a run's token budget, the usage log read back as spend
+  pipeline/                    The jobs with several stages, one module each, with their budgets
+    sync.py                    `sync`: extract, load, attachments, dedup, conversations, images, embed
+    teams_sync.py              `teams-sync`: discover, pull, bound, resolve, extract, embed
+    whatsapp_sync.py           `whatsapp-sync`: ingest the snapshot, bound, extract, embed
+    calendar_sync.py           `calendar-sync`: list, fetch, extract and load what changed
+    sharepoint.py              `process-sharepoint`: retry pass, link scan, fetch, store
   export/
     outlook_export.py          Hourly Outlook ingestion via outlook-cli
     outlook_cli.py             outlook-cli subprocess wrapper
@@ -708,7 +754,7 @@ skill/
   | `automation` | mail the owner (`BRAIN_USER_EMAIL_PATTERN`) sent to no one but himself, not a reply or forward, whose subject starts with a bracketed tag (`[VPS] ...`, `[nightly] ...`) or holds an ISO date, and names something besides that stamp. A tag alone is not enough: from anyone else, or also sent to someone else, it is `mail` |
   | `mail` | everything else, including whatever the rules are unsure of |
 
-  The v33 migration classifies existing rows in one transaction, writing only the rows that are not `mail`. The owner rule needs `BRAIN_USER_EMAIL_PATTERN`, the owner's addresses each matched whole and case-blind (`owner@example.com` is neither `first.owner@example.com` nor `owner@example.com.example.net`), the same rule the calendar's self flags use. If it was unset when the migration ran, set it and run `python -m src.cli classify-sources`, which sets every row's class again by today's rules and writes only the rows that change. Reads use the stored class. A store without the column (older than v33), as a replica's file is from the new code's arrival to its next pull, is read as before the class: the `News` mailbox is left out and nothing else, rows are labelled from their mailbox (never `automation`), the process logs `source_class column missing; run migrate on the producer; news-only exclusion in effect` once, `recall`'s `summary.source_class` carries the same sentence and `stats` reports `source_class: "pending migration"`. Storing or setting a class needs the column: the writers and `reclassify()` (behind `classify-sources`, which migrates first) refuse such a store with an error that says to run `migrate`.
+  The v33 migration classifies existing rows in one transaction, writing only the rows that are not `mail`. The owner rule needs `BRAIN_USER_EMAIL_PATTERN`, the owner's addresses each matched whole and case-blind (`owner@example.com` is neither `first.owner@example.com` nor `owner@example.com.example.net`), the same rule the calendar's self flags use. If it was unset when the migration ran, set it and run `python -m src.cli maint classify-sources`, which sets every row's class again by today's rules and writes only the rows that change. Reads use the stored class. A store without the column (older than v33), as a replica's file is from the new code's arrival to its next pull, is read as before the class: the `News` mailbox is left out and nothing else, rows are labelled from their mailbox (never `automation`), the process logs `source_class column missing; run migrate on the producer; news-only exclusion in effect` once, `recall`'s `summary.source_class` carries the same sentence and `stats` reports `source_class: "pending migration"`. Storing or setting a class needs the column: the writers and `reclassify()` (behind `classify-sources`, which migrates first) refuse such a store with an error that says to run `migrate`.
 - **Attachments and images**: `attachments`, `attachment_content`, `inline_images`, `inline_image_occurrences`, `sender_signature_index`
 - **Calendar**: `calendar_events`, `event_attendees`
 - **Teams**: `teams_chats`, `teams_threads`, `teams_messages`, `teams_mri_resolution`

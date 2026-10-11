@@ -37,6 +37,7 @@ def news_export_stub(monkeypatch):
 def staging_root(tmp_path, monkeypatch):
     """Redirect DATA_ROOT so the staging scan never reads the real data/ tree."""
     monkeypatch.setattr("src.cli.DATA_ROOT", tmp_path)
+    monkeypatch.setattr("src.pipeline.sync.DATA_ROOT", tmp_path)
     return tmp_path / "staging"
 
 

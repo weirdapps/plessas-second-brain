@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from src import cli
+from src.pipeline import whatsapp_sync
 from src.store import embeddings
 from src.store.schema import create_database, get_connection
 from tests.whatsapp.conftest import ALICE, DIRECT_JID, OWNER, build_snapshot
@@ -80,9 +81,9 @@ def test_a_replica_refuses_to_run_it(store, monkeypatch):
 
 def test_the_stage_budgets_fit_the_unit_timeout():
     stages = (
-        cli.WHATSAPP_INGEST_OBSERVED_S,
-        cli.WHATSAPP_BOUND_OBSERVED_S,
-        cli.WHATSAPP_EXTRACT_DEADLINE_S,
-        cli.WHATSAPP_EMBED_OBSERVED_S,
+        whatsapp_sync.WHATSAPP_INGEST_OBSERVED_S,
+        whatsapp_sync.WHATSAPP_BOUND_OBSERVED_S,
+        whatsapp_sync.WHATSAPP_EXTRACT_DEADLINE_S,
+        whatsapp_sync.WHATSAPP_EMBED_OBSERVED_S,
     )
-    assert sum(stages) < cli.WHATSAPP_UNIT_TIMEOUT_S
+    assert sum(stages) < whatsapp_sync.WHATSAPP_UNIT_TIMEOUT_S

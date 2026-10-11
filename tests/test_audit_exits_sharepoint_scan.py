@@ -17,6 +17,7 @@ import pytest
 
 from src import cli
 from src.export.sharepoint_fetcher import SharepointFetchResult
+from src.pipeline import EXIT_REAUTH
 from src.store.schema import create_database, get_connection
 
 MARK_KEY = "sharepoint_scan_last_id"
@@ -162,7 +163,7 @@ def test_an_auth_break_does_not_advance_past_the_email_it_stopped_on(tmp_path):
 
     rc, _ = _run(db_path, status_for=lambda url: "auth-required" if url == _url(2) else "ok")
 
-    assert rc == cli.EXIT_REAUTH
+    assert rc == EXIT_REAUTH
     assert _mark(db_path) == ids[0]
 
 

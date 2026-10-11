@@ -385,8 +385,8 @@ def synced_store(tmp_path, monkeypatch):
     )
     conn.commit()
     conn.close()
-    monkeypatch.setattr("src.cli.DATA_ROOT", tmp_path)
-    monkeypatch.setattr("src.cli.ATTACHMENTS_DIR", tmp_path / "attachments")
+    monkeypatch.setattr("src.pipeline.sync.DATA_ROOT", tmp_path)
+    monkeypatch.setattr("src.pipeline.sync.ATTACHMENTS_DIR", tmp_path / "attachments")
     monkeypatch.setattr(llm_deadline, "_detect_systemd_unit", lambda: None)
     return db_path
 

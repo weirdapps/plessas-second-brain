@@ -1537,10 +1537,13 @@ def cmd_export_conversations(args):
         limit=args.limit or 0,
         workspace_filter=getattr(args, "workspace", None),
         loaded=loaded,
+        include_agents=getattr(args, "include_agents", False),
     )
 
     print(f"\nExported: {result['exported']}")
     print(f"Skipped: {result['skipped']}")
+    if result["agents"]:
+        print(f"Agent sessions left out: {result['agents']} (--include-agents keeps them)")
     print(f"Errors: {result['errors']}")
     if result["batch_file"]:
         print(f"Batch file: {result['batch_file']}")
@@ -1558,88 +1561,48 @@ def cmd_extract_conversations(args):
     print("Conversation extraction complete.")
 
 
-def cmd_ingest_conversation_incremental(args):
-    """Ingest new conversation turns incrementally from an active session."""
-    import json
+def cmd_relabel_conversations(args) -> int:
+    """Relabel the stored conversation turns the owner did not write as 'agent'.
 
-    from src.export.conversation_export import parse_conversation
-    from src.extract.claude_extract import extract_conversation
-    from src.store.loader import load_single_conversation
-    from src.store.schema import get_connection, run_migrations
+    For what the exporter stored before it read who wrote a record; once, on the
+    producer (src/export/conversation_relabel.py). A dry run opens the database
+    read-only and only counts.
+    """
+    import sqlite3
 
-    transcript = Path(args.transcript).expanduser().resolve()
-    session_id = args.session_id
-    checkpoint_dir = Path.home() / ".claude" / "memory-checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_file = checkpoint_dir / f"{session_id}.json"
+    from src.config import CLAUDE_CODE_PROJECTS_DIR
+    from src.export.conversation_relabel import relabel_conversations
+    from src.store.schema import get_connection
 
-    if not transcript.exists():
-        print(f"Transcript not found: {transcript}", file=sys.stderr)
-        sys.exit(1)
-
-    # Read checkpoint
-    last_line = 0
-    cp = {}
-    if checkpoint_file.exists():
-        try:
-            with open(checkpoint_file) as f:
-                cp = json.load(f)
-            last_line = cp.get("last_line", 0)
-        except (json.JSONDecodeError, ValueError):
-            pass  # Corrupt checkpoint — treat as fresh
-
-    # Count current lines
-    with open(transcript) as f:
-        lines = f.readlines()
-    total_lines = len(lines)
-
-    if total_lines - last_line < 50:
-        # Not enough new content
-        return
-
-    # Parse the full conversation (we need context)
-    conv = parse_conversation(transcript)
-    if not conv or not conv.get("turns"):
-        return
-
-    conv["session_id"] = session_id
-
-    # Run extraction
-    try:
-        extraction = extract_conversation(conv)
-    except Exception as e:
-        print(f"Extraction failed: {e}", file=sys.stderr)
-        return
-
-    # Load into database
     db_path = str(args.db)
     if not Path(db_path).exists():
         print(f"Database not found: {db_path}", file=sys.stderr)
-        return
-
-    conn = get_connection(db_path)
-    run_migrations(conn)
-
-    # What it loaded before is replaced, in one transaction, under a new id.
-    load_single_conversation(conn, conv, extraction, replace=True)
-    conn.commit()
-    conn.close()
-
-    # Update checkpoint
-    with open(checkpoint_file, "w") as f:
-        json.dump(
-            {
-                "last_line": total_lines,
-                "last_at": datetime.now().isoformat(),
-                "extract_count": (cp.get("extract_count", 0) + 1)
-                if checkpoint_file.exists()
-                else 1,
-                "session_id": session_id,
-            },
-            f,
+        return 1
+    if args.dry_run:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    else:
+        conn = get_connection(db_path)
+    try:
+        counts = relabel_conversations(
+            conn, CLAUDE_CODE_PROJECTS_DIR, dry_run=args.dry_run, batch=args.batch
         )
-
-    print(f"Ingested conversation {session_id} ({total_lines} lines, {len(conv['turns'])} turns)")
+    finally:
+        conn.close()
+    print(
+        f"{counts['conversations']} conversations: {counts['by_transcript']} read against "
+        f"their transcript, {counts['by_text']} by their text ({counts['misaligned']} of "
+        "them did not match their transcript)"
+    )
+    print(
+        f"{counts['turns_relabelled']} turns relabelled as agent"
+        + (" (dry run: nothing written)" if args.dry_run else "")
+    )
+    print(
+        f"{counts['agent_sessions_before']} agent sessions before, "
+        f"{counts['agent_sessions_after']} after; their [PREFERENCE] facts, left out by "
+        f"default: {counts['agent_preferences']}"
+    )
+    return 0
 
 
 def cmd_load(args):
@@ -3450,6 +3413,12 @@ def main():
     parser_export_conv.add_argument(
         "--workspace", type=str, help="Filter by workspace path substring"
     )
+    parser_export_conv.add_argument(
+        "--include-agents",
+        action="store_true",
+        help="Also export agent sessions (a teammate's, a subagent's, or one with no turn "
+        "the owner typed), stored tagged and left out of every read by default",
+    )
     parser_export_conv.set_defaults(func=cmd_export_conversations)
 
     # Extract conversations command
@@ -3463,14 +3432,18 @@ def main():
     )
     parser_extract_conv.set_defaults(func=cmd_extract_conversations)
 
-    # Ingest conversation incremental
-    parser_ingest_conv = subparsers.add_parser(
-        "ingest-conversation-incremental",
-        help="Incrementally ingest active conversation",
+    # Relabel stored conversations by who wrote each turn
+    parser_relabel_conv = subparsers.add_parser(
+        "relabel-conversations",
+        help="Relabel the stored conversation turns the owner did not write as 'agent' (once)",
     )
-    parser_ingest_conv.add_argument("--transcript", required=True, help="Path to JSONL transcript")
-    parser_ingest_conv.add_argument("--session-id", required=True, help="Session UUID")
-    parser_ingest_conv.set_defaults(func=cmd_ingest_conversation_incremental)
+    parser_relabel_conv.add_argument(
+        "--dry-run", action="store_true", help="Count only, read-only: nothing written"
+    )
+    parser_relabel_conv.add_argument(
+        "--batch", type=int, default=500, help="Turns per transaction (default 500)"
+    )
+    parser_relabel_conv.set_defaults(func=cmd_relabel_conversations)
 
     # Process attachments command
     parser_process_att = subparsers.add_parser(

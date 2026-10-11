@@ -6,7 +6,11 @@ and context retrieval for Claude Code conversation history.
 
 import logging
 import sqlite3
+import warnings
+from collections.abc import Callable
+from typing import Any
 
+from src.store.greek import register_sql_functions, search_fold, search_phrase
 from src.store.query import _sanitize_fts5_query, fts5_query_variants
 
 logger = logging.getLogger(__name__)
@@ -21,21 +25,82 @@ _IN_WORKSPACE = (
 )
 
 
+# An agent session: none of its turns is the owner's and some are another's
+# (src/export/conversation_export.py), a teammate's or a subagent's session or one
+# the owner typed nothing into. Every read here leaves them out unless asked. A
+# conversation stored with no turns says nothing either way and is read as
+# before. The unary + keeps SQLite on the conversation_id index. `c` is the
+# conversations row.
+_AGENT_SESSION = (
+    "(NOT EXISTS (SELECT 1 FROM conversation_turns k WHERE k.conversation_id = c.id"
+    " AND +k.speaker = 'user')"
+    " AND EXISTS (SELECT 1 FROM conversation_turns k WHERE k.conversation_id = c.id"
+    " AND +k.speaker = 'agent'))"
+)
+
+
+def _owner_sessions(include_agents: bool) -> str:
+    """The SQL condition, from AND, that leaves agent sessions out unless included."""
+    return "" if include_agents else f" AND NOT {_AGENT_SESSION}"
+
+
+# Rows read per row returned where repeats are dropped after the read.
+_REPEATS_HEADROOM = 10
+
+
+def unique_facts(facts: list, text: Callable[[Any], str] = str) -> list:
+    """`facts` less each one whose text, folded, repeats an earlier one's.
+
+    A standing preference was extracted again in every session it came up in,
+    once up to 162 times, the copies apart only in case, accents, spacing and
+    punctuation.
+    """
+    seen: set[str] = set()
+    kept = []
+    for fact in facts:
+        key = search_phrase(text(fact))
+        if key not in seen:
+            seen.add(key)
+            kept.append(fact)
+    return kept
+
+
 def _workspace_args(workspace: str | None) -> tuple[str, str, str]:
     ws = workspace or ""
     return ws, f"%{ws}%", f"%{ws}%"
 
 
-def conversation_ids_in_workspace(conn: sqlite3.Connection, workspace: str) -> set[int]:
-    """The ids of the conversations in `workspace`, by the keyword search's rule.
+def conversation_ids_in_workspace(
+    conn: sqlite3.Connection, workspace: str, *, include_agents: bool = False
+) -> set[int]:
+    """The ids of the conversations in `workspace` ('' for any), by the keyword
+    search's rule, agent sessions only when included.
 
     Semantic search ranks among these, so its limit counts matches in the
     workspace, as the keyword search's does.
     """
     rows = conn.execute(
-        f"SELECT c.id FROM conversations c WHERE {_IN_WORKSPACE}", _workspace_args(workspace)
+        f"SELECT c.id FROM conversations c WHERE {_IN_WORKSPACE}{_owner_sessions(include_agents)}",
+        _workspace_args(workspace),
     )
     return {row[0] for row in rows}
+
+
+def with_kinds(conn: sqlite3.Connection, rows: list[dict], key: str) -> list[dict]:
+    """`rows` with each one's `kind`, 'agent' or 'owner', read off the conversation id at `key`."""
+    ids = sorted({row[key] for row in rows})
+    if not ids:
+        return rows
+    marks = ", ".join("?" * len(ids))
+    agents = {
+        row[0]
+        for row in conn.execute(
+            f"SELECT c.id FROM conversations c WHERE c.id IN ({marks}) AND {_AGENT_SESSION}", ids
+        )
+    }
+    for row in rows:
+        row["kind"] = "agent" if row[key] in agents else "owner"
+    return rows
 
 
 def search_conversations_keyword(
@@ -43,6 +108,8 @@ def search_conversations_keyword(
     query: str,
     workspace: str | None = None,
     limit: int = 20,
+    *,
+    include_agents: bool = False,
 ) -> list[dict]:
     """Full-text search across conversation turns and summaries.
 
@@ -51,6 +118,7 @@ def search_conversations_keyword(
         query: FTS5 search query
         workspace: Optional workspace path filter
         limit: Maximum results
+        include_agents: Search agent sessions too, each row then saying its kind
 
     Returns:
         List of matching conversations with turn excerpts. When no conversation
@@ -63,12 +131,12 @@ def search_conversations_keyword(
     # tool: a question mark is "fts5: syntax error near "?"", an ampersand the
     # same, and a bare word after a hyphen becomes "no such column".
     for safe_query, partial in fts5_query_variants(query):
-        results = _conversation_hits(conn, safe_query, workspace, limit)
+        results = _conversation_hits(conn, safe_query, workspace, limit, include_agents)
         if results:
             if partial:
                 for row in results:
                     row["partial_match"] = True
-            return results
+            return with_kinds(conn, results, "conversation_id") if include_agents else results
     return []
 
 
@@ -77,6 +145,7 @@ def _conversation_hits(
     safe_query: str,
     workspace: str | None,
     limit: int,
+    include_agents: bool = False,
 ) -> list[dict]:
     """search_conversations_keyword for one sanitized MATCH expression.
 
@@ -86,6 +155,7 @@ def _conversation_hits(
     """
     results: list[dict] = []
     in_workspace = _workspace_args(workspace)
+    owner_sessions = _owner_sessions(include_agents)
 
     # Search conversation-level summaries
     rows = conn.execute(
@@ -96,7 +166,7 @@ def _conversation_hits(
         FROM conversations_fts
         JOIN conversations c ON c.id = conversations_fts.rowid
         WHERE conversations_fts MATCH ?
-          AND {_IN_WORKSPACE}
+          AND {_IN_WORKSPACE}{owner_sessions}
         ORDER BY rank
         LIMIT ?
     """,
@@ -131,7 +201,7 @@ def _conversation_hits(
             JOIN conversation_turns ct ON ct.id = conversation_turns_fts.rowid
             JOIN conversations c ON c.id = ct.conversation_id
             WHERE conversation_turns_fts MATCH ?
-              AND {_IN_WORKSPACE}
+              AND {_IN_WORKSPACE}{owner_sessions}
             ORDER BY rank
             LIMIT ?
         """,
@@ -163,30 +233,43 @@ def _conversation_hits(
 def get_conversation_context(
     conn: sqlite3.Connection,
     session_id: str,
+    *,
+    include_agents: bool = False,
 ) -> dict:
     """Get full context for a specific conversation.
 
     Args:
         conn: Database connection
         session_id: Conversation session ID
+        include_agents: Read an agent session too; one is otherwise an error
 
     Returns:
-        Dict with conversation details, turns, decisions, actions, facts
+        Dict with conversation details and kind ('owner' or 'agent'), turns,
+        decisions, actions, facts
     """
     conv = conn.execute(
-        """
+        f"""
         SELECT id, session_id, started_at, ended_at, workspace,
-               project_name, turn_count, summary, topics_summary
-        FROM conversations WHERE session_id = ?
+               project_name, turn_count, summary, topics_summary,
+               {_AGENT_SESSION} AS agent_session
+        FROM conversations c WHERE session_id = ?
     """,
         (session_id,),
     ).fetchone()
 
     if not conv:
         return {"error": f"Conversation not found: {session_id}"}
+    if conv["agent_session"] and not include_agents:
+        return {
+            "error": f"Conversation {session_id} is an agent session (a teammate's or "
+            "subagent's, or one with no turn the owner typed); pass include_agents to read it",
+            "kind": "agent",
+        }
 
     conv_id = conv["id"]
     result = dict(conv)
+    del result["agent_session"]
+    result["kind"] = "agent" if conv["agent_session"] else "owner"
 
     # Get turns (summarized, not full content)
     turns = conn.execute(
@@ -235,7 +318,7 @@ def get_conversation_context(
     """,
         (conv_id,),
     ).fetchall()
-    result["key_facts"] = [f["fact"] for f in facts]
+    result["key_facts"] = unique_facts([f["fact"] for f in facts])
 
     # Get topics
     topics = conn.execute(
@@ -256,6 +339,8 @@ def recall_preferences(
     conn: sqlite3.Connection,
     topic: str,
     limit: int = 20,
+    *,
+    include_agents: bool = False,
 ) -> list[dict]:
     """Search for user preferences and corrections on a topic.
 
@@ -266,53 +351,68 @@ def recall_preferences(
         conn: Database connection
         topic: Topic to search for preferences about
         limit: Maximum results
+        include_agents: Take facts from agent sessions too, whose "preferences"
+            are a lead agent's orders and a skill's instructions
 
     Returns:
-        List of preferences with source conversation context
-    """
-    results = []
+        List of preferences with source conversation context, each text once
 
-    # Search prefixed key_facts first (highest signal)
+    Deprecated: the recall_preference MCP tool is retired. Preferences belong in
+    CLAUDE.md and Claude Code's own memory; this stays one release for callers.
+    """
+    warnings.warn(
+        "recall_preferences is deprecated: preferences belong in CLAUDE.md and "
+        "Claude Code's own memory",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    register_sql_functions(conn)
+    results = []
+    owner_sessions = _owner_sessions(include_agents)
+    on_topic = f"%{search_fold(topic)}%"
+
+    # Search prefixed key_facts first (highest signal), on the topic before the
+    # LIMIT: the newest were taken first and matched after, which left most
+    # topics nothing here and the full-text branch below the whole page.
     rows = conn.execute(
-        """
+        f"""
         SELECT kf.fact, c.session_id, c.started_at, c.project_name, c.summary
         FROM key_facts kf
         JOIN conversation_turns ct ON ct.id = kf.conversation_turn_id
         JOIN conversations c ON c.id = ct.conversation_id
         WHERE (kf.fact LIKE '%[PREFERENCE]%' OR kf.fact LIKE '%[TECHNICAL]%')
+          AND (sb_fold(kf.fact) LIKE ? OR sb_fold(c.summary) LIKE ?){owner_sessions}
         ORDER BY c.started_at DESC
         LIMIT ?
     """,
-        (limit,),
+        (on_topic, on_topic, limit * _REPEATS_HEADROOM),
     ).fetchall()
 
     for r in rows:
-        # Check if topic is relevant (simple substring match)
-        if topic.lower() in r["fact"].lower() or topic.lower() in (r["summary"] or "").lower():
-            results.append(
-                {
-                    "preference": r["fact"],
-                    "session_id": r["session_id"],
-                    "date": r["started_at"],
-                    "project": r["project_name"],
-                    "conversation_summary": r["summary"],
-                }
-            )
+        results.append(
+            {
+                "preference": r["fact"],
+                "session_id": r["session_id"],
+                "date": r["started_at"],
+                "project": r["project_name"],
+                "conversation_summary": r["summary"],
+            }
+        )
 
     # Also search FTS for broader matches
     try:
         fts_rows = conn.execute(
-            """
+            f"""
             SELECT kf.fact, c.session_id, c.started_at, c.project_name
             FROM key_facts_fts
             JOIN key_facts kf ON kf.id = key_facts_fts.rowid
             JOIN conversation_turns ct ON ct.id = kf.conversation_turn_id
             JOIN conversations c ON c.id = ct.conversation_id
-            WHERE key_facts_fts MATCH ?
+            WHERE key_facts_fts MATCH ?{owner_sessions}
             ORDER BY rank
             LIMIT ?
         """,
-            (_sanitize_fts5_query(topic), limit),
+            (_sanitize_fts5_query(topic), limit * _REPEATS_HEADROOM),
         ).fetchall()
 
         seen = {r["preference"] for r in results}
@@ -336,16 +436,16 @@ def recall_preferences(
     # If no specific matches, return all preferences (they're all valuable)
     if not results:
         all_prefs = conn.execute(
-            """
+            f"""
             SELECT kf.fact, c.session_id, c.started_at, c.project_name, c.summary
             FROM key_facts kf
             JOIN conversation_turns ct ON ct.id = kf.conversation_turn_id
             JOIN conversations c ON c.id = ct.conversation_id
-            WHERE kf.fact LIKE '%[PREFERENCE]%'
+            WHERE kf.fact LIKE '%[PREFERENCE]%'{owner_sessions}
             ORDER BY c.started_at DESC
             LIMIT ?
         """,
-            (limit,),
+            (limit * _REPEATS_HEADROOM,),
         ).fetchall()
 
         # Mark them. These rows are the most RECENT preferences, not preferences
@@ -369,7 +469,7 @@ def recall_preferences(
                 }
             )
 
-    return results[:limit]
+    return unique_facts(results, lambda row: row["preference"])[:limit]
 
 
 def recent_conversations(
@@ -377,6 +477,8 @@ def recent_conversations(
     workspace: str | None = None,
     days: int = 7,
     limit: int = 10,
+    *,
+    include_agents: bool = False,
 ) -> list[dict]:
     """List recent conversations, optionally filtered by workspace.
 
@@ -385,18 +487,27 @@ def recent_conversations(
         workspace: Optional workspace path substring filter
         days: Lookback period (default: 7)
         limit: Maximum results (default: 10)
+        include_agents: List agent sessions too
 
     Returns:
         List of recent conversations with summaries
+
+    Deprecated: the recent_conversations MCP tool is retired (Claude Code's
+    /resume lists recent sessions); this stays one release for callers.
     """
+    warnings.warn(
+        "recent_conversations is deprecated: Claude Code's /resume lists recent sessions",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     # datetime() on both sides: started_at is stored as '2026-09-27T00:27:13Z'
     # and datetime('now', ...) renders a space, so compared as strings every
     # session from earlier on the cutoff day counted as newer than the cutoff.
-    query = """
+    query = f"""
         SELECT id, session_id, started_at, ended_at, workspace,
                project_name, turn_count, summary, topics_summary
-        FROM conversations
-        WHERE datetime(started_at) >= datetime('now', ?)
+        FROM conversations c
+        WHERE datetime(started_at) >= datetime('now', ?){_owner_sessions(include_agents)}
     """
     params: list = [f"-{days} days"]
 

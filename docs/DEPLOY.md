@@ -913,6 +913,10 @@ online and the batch cost. Then, on the producer:
    parts saved for a merge, and the rows left pending with the reason. A job still running is left
    for the next collect; run it again later. A `reextract` job's collect drops the vectors of the
    rows it stored, so the next index build embeds the new summaries.
+   `reextract` sends one row per document (same `sha256`, or the same text when there is none) and
+   its collect copies the stored summary to the other copies (`duplicates`); a long document whose
+   merge goes in a later `process-attachments` job leaves its copies with their old summary.
+   `--no-spreadsheets` leaves workbooks out of the rows chosen, and out of `--estimate`.
 4. Repeat 1 and 3 until the selectors and the queue are empty. Long documents need one more round:
    after their parts are collected, `process-attachments --phase 2 --batch` sends their merges.
    Rows left pending (a failed line, a refusal, a reply cut short) go to the online path, which

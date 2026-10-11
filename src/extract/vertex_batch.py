@@ -30,7 +30,9 @@ missing line, a refusal (the online path has the refusal fallback), a v2 reply c
 online path asks again at twice the budget), a reply the parser cannot read, and a row changed
 since it was sent. A row's hold is released in the transaction that stores it, and only the
 collect that releases it stores it, so collecting twice stores nothing twice. Each answered
-line goes in the usage log with its job's name, priced at batch rates.
+line goes in the usage log with its job's name, priced at batch rates. A reextract job sends one
+row per document and records the copies of each (`copies`); its collect gives them the summary
+it stores for that row (reextract.copy_summaries) and drops their vectors too.
 
 Probe (`reextract --batch --probe`). Ten requests built from stored text, nothing held; it waits
 for the job and prints each parsed reply and the cost, and stores nothing.
@@ -488,9 +490,18 @@ def _estimate(planned: list[_Planned]) -> dict:
     }
 
 
-def _send(conn, s: Settings, plan: _Plan, f: IO[bytes], *, origin: str, probe: bool) -> dict:
+def _send(
+    conn,
+    s: Settings,
+    plan: _Plan,
+    f: IO[bytes],
+    *,
+    origin: str,
+    probe: bool,
+    copies: dict[int, list[int]] | None = None,
+) -> dict:
     """Upload the file `plan` wrote, record the job (holding its rows, unless a probe), and
-    create it."""
+    create it. `copies` (row -> its copies) is recorded for the rows sent."""
     key = f"{datetime.now(UTC).strftime(ap.BATCH_KEY_TIME)}-{secrets.token_hex(3)}"
     src = f"{s.base}/{key}/input.jsonl"
     dest = f"{s.base}/{key}/output"
@@ -517,6 +528,11 @@ def _send(conn, s: Settings, plan: _Plan, f: IO[bytes], *, origin: str, probe: b
         "requests": len(plan.planned),
         "call": plan.pins,
         "rows": rows,
+        **(
+            {"copies": {str(ac): others for ac, others in copies.items() if str(ac) in rows}}
+            if copies
+            else {}
+        ),
     }
     # Recorded and held before the job exists, so the online pass never takes a row the job
     # is about to answer; taken back if Vertex refuses the job.
@@ -567,11 +583,14 @@ def submit(
     attachment_ids: list[int] | None = None,
     token_budget: TokenBudget | None = None,
     origin: str = "phase2",
+    copies: dict[int, list[int]] | None = None,
 ) -> dict:
     """Send the rows Phase 2 would take now as one batch job: see the module docstring.
 
     `attachment_ids` keeps to those attachments (reextract passes the rows it read again, with
-    origin 'reextract', whose collect also drops the vectors of what it stores). Returns the
+    origin 'reextract', whose collect also drops the vectors of what it stores). `copies`
+    (content id -> the content ids of its copies) gives each copy, at collect, the summary
+    stored for its row (reextract.copy_summaries). Returns the
     job's key and name, its files, what was sent, what was left (`over_budget` by the token
     budget, `left` by MAX_REQUESTS) and the estimated cost."""
     _refuse_on_replica("sending a batch job")
@@ -589,7 +608,8 @@ def submit(
                 left[plan.stop] = len(ids) - plan.used
             if not plan.planned:
                 return _nothing(left)
-            return {**_send(conn, s, plan, f, origin=origin, probe=False), **left}
+            sent = _send(conn, s, plan, f, origin=origin, probe=False, copies=copies)
+            return {**sent, **left}
     finally:
         conn.close()
 
@@ -962,6 +982,17 @@ def _collect_job(conn, key: str, record: dict) -> dict:
         out["counts"] = dict(Counter(item["outcome"] for item in out["results"]))
     else:
         out["counts"], loaded, out["usage"] = _load(conn, key, record, replies)
+        copies = record.get("copies") or {}
+        if loaded and copies:
+            # The copies of a document reextract sent once take the summary just stored.
+            from src.extract.reextract import copy_summaries
+
+            copied = copy_summaries(
+                conn, {ac: copies[str(ac)] for ac in loaded if str(ac) in copies}
+            )
+            if copied:
+                out["counts"]["duplicates"] = len(copied)
+                loaded = loaded + copied
         if loaded and record.get("origin") == "reextract":
             # As reextract does online: a row with a new summary is embedded again.
             from src.store.embeddings import remove_vectors
@@ -1053,9 +1084,10 @@ def _print_job(job: dict) -> None:
         print(f"  loaded        : {counts.get('loaded', 0):,}")
         if counts.get("parts saved"):
             print(f"  parts saved   : {counts['parts saved']:,} (their merges go in the next job)")
-        left = {
-            k: v for k, v in counts.items() if k not in ("loaded", "parts saved", "resolved before")
-        }
+        if counts.get("duplicates"):
+            print(f"  duplicates    : {counts['duplicates']:,} (took the summary of their copy)")
+        done = ("loaded", "parts saved", "duplicates", "resolved before")
+        left = {k: v for k, v in counts.items() if k not in done}
         if left:
             reasons = ", ".join(f"{k} {v:,}" for k, v in sorted(left.items()))
             print(f"  left pending  : {sum(left.values()):,} ({reasons})")

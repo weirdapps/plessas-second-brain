@@ -594,6 +594,11 @@ def test_a_row_the_budget_left_pending_keeps_its_vector(db, monkeypatch, vectors
     path, conn = db
     atts, note = _three_notes(conn)
     conn.execute("UPDATE attachment_content SET llm_status = 'extracted'")
+    # Two different notes: reextract summarises copies of one text once.
+    conn.execute(
+        "UPDATE attachment_content SET extracted_text = ? WHERE attachment_id = ?",
+        (note + " Second.", atts[1]),
+    )
     conn.commit()
     size = len(_prompt(note, name="n0.txt"))
     calls: list[str] = []

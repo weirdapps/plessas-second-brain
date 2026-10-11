@@ -601,3 +601,238 @@ def test_the_command_passes_after_id_and_prints_the_highest_id(store, capsys):
     assert rc == 0
     assert "  selected    : 1" in out
     assert f"  highest id  : {_ac_id(conn, second)}\n" in out
+
+
+# --- --no-spreadsheets ---------------------------------------------------------
+
+
+def _method(conn, att_id, method):
+    conn.execute(
+        "UPDATE attachment_content SET extraction_method = ? WHERE attachment_id = ?",
+        (method, att_id),
+    )
+    conn.commit()
+
+
+def test_no_spreadsheets_leaves_workbooks_out_of_the_selection(store):
+    path, conn, root, _removed, summarised = store
+    doc = _row(conn, root, "plan.docx", "y" * 60_000)
+    book = _row(conn, root, "plan.xlsx", "z" * 60_000)
+    _method(conn, book, "openpyxl")
+
+    stats = _run(path, root, "long", no_spreadsheets=True)
+
+    assert (stats["selected"], summarised) == (1, [doc])
+    assert tuple(_content(conn, book, "llm_status, summary")) == ("extracted", "old summary")
+
+
+def test_no_spreadsheets_leaves_out_a_re_read_that_turns_out_a_workbook(store, monkeypatch):
+    """A row with no text yet has no method to judge by: its re-read says what it is."""
+    path, conn, root, _removed, summarised = store
+    att = _row(
+        conn,
+        root,
+        "book",
+        None,
+        status="failed",
+        error="File not found: /elsewhere/book",
+        llm="pending",
+        body=b"PK\x03\x04",
+    )
+    _method(conn, att, None)
+    _reads(monkeypatch, "--- Sheet: one ---\na | b", "openpyxl")
+
+    stats = _run(path, root, "unread", no_spreadsheets=True)
+
+    assert stats["spreadsheets"] == 1
+    assert tuple(_content(conn, att, "extracted_text, extraction_status")) == (None, "failed")
+    assert summarised == []
+
+
+def test_no_spreadsheets_holds_for_the_estimate(store):
+    path, conn, root, _removed, _summarised = store
+    _row(conn, root, "plan.docx", "y" * 60_000)
+    book = _row(conn, root, "plan.xlsx", "z" * 60_000)
+    _method(conn, book, "xlrd (fallback from .xlsb)")
+
+    every = rx.estimate_reextract(str(path), {"long"})
+    documents = rx.estimate_reextract(str(path), {"long"}, no_spreadsheets=True)
+
+    assert (every["selected"], every["rows"]) == (2, 2)
+    assert (documents["selected"], documents["rows"]) == (1, 1)
+
+
+# --- duplicates ------------------------------------------------------------------
+
+
+def _sha(conn, att_id, sha):
+    conn.execute("UPDATE attachments SET sha256 = ? WHERE id = ?", (sha, att_id))
+    conn.commit()
+
+
+def test_rows_with_the_same_bytes_are_summarised_once_and_share_the_summary(store):
+    path, conn, root, removed, summarised = store
+    first = _row(conn, root, "a.txt", "y" * 60_000)
+    # Same bytes, so the same document, whatever the stored texts say.
+    second = _row(conn, root, "b.txt", "w" * 60_000)
+    other = _row(conn, root, "c.txt", "v" * 60_000)
+    for att in (first, second):
+        _sha(conn, att, "ab" * 32)
+
+    stats = _run(path, root, "long")
+
+    assert sorted(summarised) == [first, other]
+    cols = "summary, language, llm_status, llm_error, llm_extracted_at"
+    assert _content(conn, second, cols) == _content(conn, first, cols)
+    assert _content(conn, second, "summary")[0] == "new summary"
+    assert (stats["resummarise"], stats["duplicates"], stats["summarised"]) == (2, 1, 2)
+    assert sorted(removed[0]) == sorted(-_ac_id(conn, a) for a in (first, second, other))
+
+
+def test_rows_with_no_hash_group_by_identical_text(store):
+    path, conn, root, _removed, summarised = store
+    first = _row(conn, root, "a.txt", "y" * 60_000)
+    second = _row(conn, root, "b.txt", "y" * 60_000)
+    other = _row(conn, root, "c.txt", "y" * 59_999)
+
+    stats = _run(path, root, "long")
+
+    assert sorted(summarised) == [first, other]
+    assert tuple(_content(conn, second, "summary, llm_status")) == ("new summary", "extracted")
+    assert stats["duplicates"] == 1
+
+
+def test_a_duplicate_is_never_set_pending(store, monkeypatch):
+    """Only the representative goes to Phase 2: a duplicate the nightly pass found pending
+    would be summarised all the same."""
+    path, conn, root, _removed, _summarised = store
+    first = _row(conn, root, "a.txt", "y" * 60_000)
+    second = _row(conn, root, "b.txt", "y" * 60_000)
+    seen: list = []
+    monkeypatch.setattr(
+        rx,
+        "run_phase2",
+        lambda *a, **k: (
+            seen.append((k["attachment_ids"], _content(conn, second, "llm_status")[0]))
+            or {"extracted": 0, "failed": 0}
+        ),
+    )
+
+    _run(path, root, "long")
+
+    assert seen == [([first], "extracted")]
+
+
+def test_a_failed_representative_leaves_its_duplicates_as_they_were(store, monkeypatch):
+    path, conn, root, removed, _summarised = store
+    first = _row(conn, root, "a.txt", "y" * 60_000)
+    second = _row(conn, root, "b.txt", "y" * 60_000)
+    monkeypatch.setattr(
+        attachment_pipeline,
+        "_extract_one_attachment",
+        lambda row, *a, **k: (row[0], row[5], None, "ValueError: bad json", False),
+    )
+
+    stats = _run(path, root, "long")
+
+    assert _content(conn, first, "llm_status")[0] == "failed"
+    assert tuple(_content(conn, second, "llm_status, summary, llm_error")) == (
+        "extracted",
+        "old summary",
+        None,
+    )
+    assert (stats["duplicates"], removed) == (0, [])
+
+
+def test_a_re_read_duplicate_waits_for_its_representative(store):
+    """Two copies of one capped file are both read again; one is summarised, and the other
+    keeps its old summary until it takes the new one."""
+    path, conn, root, _removed, summarised = store
+    full = WORDS * 3000
+    first = _row(conn, root, "a.txt", full[:100_000], body=full)
+    second = _row(conn, root, "b.txt", full[:100_000], body=full)
+
+    stats = _run(path, root, "capped")
+
+    assert (stats["reread"], summarised, stats["duplicates"]) == (2, [first], 1)
+    text, summary, llm = _content(conn, second, "extracted_text, summary, llm_status")
+    assert (len(text), summary, llm) == (len(full), "new summary", "extracted")
+
+
+def test_a_re_read_duplicate_keeps_its_old_summary_when_its_representative_fails(
+    store, monkeypatch
+):
+    path, conn, root, _removed, _summarised = store
+    full = WORDS * 3000
+    _row(conn, root, "a.txt", full[:100_000], body=full)
+    second = _row(conn, root, "b.txt", full[:100_000], body=full)
+    monkeypatch.setattr(
+        attachment_pipeline,
+        "_extract_one_attachment",
+        lambda row, *a, **k: (row[0], row[5], None, "ValueError: bad json", False),
+    )
+
+    _run(path, root, "capped")
+
+    assert tuple(_content(conn, second, "summary, llm_status")) == ("old summary", "extracted")
+
+
+def test_a_dry_run_and_the_estimate_count_only_representatives(store):
+    path, conn, root, removed, summarised = store
+    for name in ("a.txt", "b.txt", "c.txt"):
+        _row(conn, root, name, "y" * 60_000)
+    _row(conn, root, "d.txt", "w" * 60_000)
+
+    stats = _run(path, root, "long", dry_run=True)
+    est = rx.estimate_reextract(str(path), {"long"})
+    alone = rx.estimate_reextract(str(path), {"long"}, limit=1)
+
+    assert (stats["selected"], stats["resummarise"], stats["duplicates"]) == (4, 2, 2)
+    assert (est["selected"], est["rows"], est["duplicates"]) == (4, 2, 2)
+    assert est["calls"] == 2 * alone["calls"]
+    assert (summarised, removed) == ([], [])
+    assert {s for (s,) in conn.execute("SELECT llm_status FROM attachment_content")} == {
+        "extracted"
+    }
+
+
+def test_the_command_takes_no_spreadsheets_and_prints_the_duplicates(store, capsys):
+    from argparse import Namespace
+
+    from src.cli import cmd_reextract
+
+    path, conn, root, _removed, _summarised = store
+    _row(conn, root, "a.txt", "y" * 60_000)
+    _row(conn, root, "b.txt", "y" * 60_000)
+    book = _row(conn, root, "c.xlsx", "z" * 60_000)
+    _method(conn, book, "pyxlsb")
+    args = {
+        "db": str(path),
+        "long": True,
+        "limit": 0,
+        "after_id": 0,
+        "workers": 1,
+        "root": str(root / "att"),
+        "no_spreadsheets": True,
+    }
+
+    assert cmd_reextract(Namespace(**args, dry_run=True)) == 0
+    assert cmd_reextract(Namespace(**args, dry_run=False, estimate=True)) == 0
+
+    out = capsys.readouterr().out
+    assert "  selected    : 2" in out and "  duplicates  : 1" in out
+    assert "  duplicates    : 1" in out  # the estimate's
+
+
+def test_the_no_spreadsheets_flag_reaches_the_command(monkeypatch):
+    import sys
+
+    from src import cli
+
+    got: dict = {}
+    monkeypatch.setattr(cli, "cmd_reextract", lambda args: got.update(vars(args)))
+    monkeypatch.setattr(sys, "argv", ["brain", "reextract", "--long", "--no-spreadsheets"])
+
+    cli.main()
+
+    assert (got["long"], got["no_spreadsheets"]) == (True, True)

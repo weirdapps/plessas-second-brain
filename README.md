@@ -42,7 +42,7 @@ graph TD
 | Source | Module | Notes |
 | --- | --- | --- |
 | Microsoft 365 mail | `src/export/outlook_export.py` + `outlook_cli.py` | Primary. Hourly, one `--since` cursor per folder. |
-| Attachments | `src/export/outlook_attachments.py`, `src/extract/attachment_extractors.py` | PDF (PyMuPDF), DOCX (`python-docx`), PPTX (`python-pptx`), XLSX (`openpyxl`), XLSB (`pyxlsb`), XLS (`xlrd`), images (Tesseract OCR, a grayscale second pass when colour finds too little), EML and clear-signed `.p7m`, `.mso` object containers (the workbooks behind charts pasted into mail), `.wmz`/`.emz` drawings (their text records), and text formats routed by their bytes (ICS, VCF, XML, SVG, EPS, VTT). Files encrypted at rest (rights-protected Office files and `.rpmsg` messages, password-protected Office files and PDFs) are recognised from their bytes and recorded as `extraction_status = 'encrypted'`, method `rms`, `rms-message` or `password`: nothing reads them without the key. |
+| Attachments | `src/export/outlook_attachments.py`, `src/extract/attachment_extractors.py` | PDF (PyMuPDF), DOCX (`python-docx`), PPTX (`python-pptx`), XLSX (`openpyxl`), XLSB (`pyxlsb`), XLS (`xlrd`), images (Tesseract OCR, Greek first and English first again for a page that reads as Latin script, a grayscale second pass when colour finds too little; the scanned pages of a text PDF are OCR'd too), EML and clear-signed `.p7m`, `.mso` object containers (the workbooks behind charts pasted into mail), `.wmz`/`.emz` drawings (their text records), and text formats routed by their bytes (ICS, VCF, XML, SVG, EPS, VTT). Files encrypted at rest (rights-protected Office files and `.rpmsg` messages, password-protected Office files and PDFs) are recognised from their bytes and recorded as `extraction_status = 'encrypted'`, method `rms`, `rms-message` or `password`: nothing reads them without the key. |
 | Inline email images | `src/extract/image_classifier.py`, `image_pipeline.py`, `image_vision.py` | Dimensions plus bytes plus sender-scoped SHA256 dedup cascade; vision LLM stage for content images, cached by SHA256. |
 | Calendar events | `src/export/calendar_export.py`, `src/extract/calendar_extractor.py` | Outlook events with attendees, body summary, decisions. |
 | MS Teams | `src/export/teams_cli.py`, `teams_export.py`, `src/extract/teams_pipeline.py` | Chats, threads, messages, MRI resolution. |
@@ -133,6 +133,7 @@ Every dossier dates and orders its rows the same way (`src/store/ordering.py`): 
 ### Attachments and images
 
 - `search_attachments(query, limit, include_news, include_automation)`. FTS over extracted text and LLM summaries; each row carries its email's `source_class`. Since 2026-10-11 a long attachment's summary is built from part of it: a spreadsheet's from its structure, any other long text's from three of its parts (see [Attachment summaries and spend](#attachment-summaries-and-spend)). The full extracted text is still searched.
+  Also since 2026-10-11, an OCR text that is Greek read as Latin look-alike letters ("kal" for «και», "tnv" for «την») carries the mark `ocr_garbled` in `extraction_error` and gets no summary: its text is still searched, but no summary, decision, action or fact is made from the wrong words. An image's text is replaced by its vision transcription, a scan's by `reextract --garbled`. See [Greek read as Latin letters](#greek-read-as-latin-letters).
 - `attachment_image_search(query, limit)`. Case- and accent-blind match on vision descriptions of classified content images: the whole query first, then any meaningful word (`partial_match`).
 
 ### Calendar
@@ -254,7 +255,7 @@ launchctl kickstart gui/$(id -u)/com.plessas.whatsapp-sync-vps   # the first pus
 
 Requires Python 3.12+ and, if you ingest attachments, system packages that `pip` cannot install:
 
-- **`tesseract` plus its language data.** Attachment OCR calls `pytesseract.image_to_string(img, lang="eng+ell")`, so the English *and* Greek traineddata must both be present or every image and scanned PDF fails. `pytesseract` is a wrapper around the binary, not the binary. In a corpus with scanned documents in it, OCR ends up the most common extraction method of all.
+- **`tesseract` plus its language data.** Attachment OCR reads Greek first, `pytesseract.image_to_string(img, lang="ell+eng")`, and reads a page that comes out as Latin script again with `lang="eng+ell"`, so the English *and* Greek traineddata must both be present or every image and scanned PDF fails. `pytesseract` is a wrapper around the binary, not the binary. In a corpus with scanned documents in it, OCR ends up the most common extraction method of all.
 - **`antiword` (or `catdoc`) on Linux**, for legacy Word `.doc` attachments. macOS converts them with its built-in `textutil`; a Linux host with neither records every `.doc` as skipped, which no failure count reports.
 - **`zstd` and `openssl`**, only if you want the encrypted offsite backups from `scripts/backup_db.py`. Missing either one silently downgrades to local-snapshot-only.
 
@@ -349,6 +350,16 @@ A run can be given a token budget, input and output tokens together: `--token-bu
 
 The nightly health check reports yesterday's spend (UTC) from the usage log every call writes, `llm-usage-YYYY-MM.jsonl` under the data home: an `LLM spend` row with calls, tokens and cost, and a line per call site. It is WARN above `BRAIN_DAILY_SPEND_WARN_USD` (default 60) or when a call used a model the rate table cannot price, and STALE when the store shows model work that day (mail that received a summary, attachment summaries written) but the log holds no call, which also fails the freshness ping. On a replica it reads N/A: the calls, and their log, are the producer's.
 
+### Greek read as Latin letters
+
+Tesseract with English first reads many Greek letters as the Latin letters they look like: «και» comes out as "kal", «την» as "tnv", the capitals «ΤΟΥ» as "TOY". In one store about 800 images and scans became such text, and their summaries named the wrong programme and the wrong figure. Since 2026-10-11:
+
+- **Greek first.** Every image, scan page and TIFF frame is read `ell+eng`. A page whose reading comes out as Latin script (at most 30% of its letters Greek, figures alone included) is read again `eng+ell`, the order every page was read in before, because Greek first misreads some figures and signs in English text ("Q3" as "93", "+2.4%" as "42.48"); that reading is kept unless it is itself Greek in Latin look-alikes. An English page now costs two tesseract passes; a Greek page and a blank image cost what they did.
+- **The scanned pages of a text PDF.** A page whose text layer holds fewer than 50 characters and that shows an image is OCR'd, inside the existing two-minute OCR budget per file. Before, OCR ran only when the whole PDF held under 50 characters, so a scanned annex inside a text PDF was never read. Blank pages are not read.
+- **The mark.** An OCR reading (methods `ocr`, `pymupdf+tesseract`, `zip`) that `src/extract/ocr_garble.py` takes for Greek in Latin look-alikes keeps its text and gets `ocr_garbled: ...` in `extraction_error`, with `llm_status = 'skipped'`; there is no schema change. The detector wants at most 30% Greek letters and at least three Greek function words in their Latin look-alike spellings, two of them different, and two per 1,000 Latin letters. Phase 2 never summarises a marked row, the file sweep and the orphan reaper keep its file, and Phase 1 does not copy it to another attachment with the same bytes.
+- **Reading it again.** A marked image that the vision pass filed as content owes its transcription: the nightly image pass (or `transcribe-images`) transcribes it, and the transcription replaces the garbled text. A marked scan is read again Greek first by `reextract --garbled`; a reading no longer marked replaces the stored text, whatever its length, and is summarised.
+- **What was read before.** `python -m src.cli ocr-regarble` finds the stored texts the detector flags, counts them by method, and lists by attachment id which files are still on disk and which were swept. `--apply` marks them, clears their summaries, deletes the decisions, action items and key facts those summaries wrote (by `attachment_id`: rows written before schema v28 carry none and stay on the email) and drops their vectors. It refuses to run on a replica. A swept original has to be fetched from Exchange again by hand, to the path its row records, before either route can read it: that is an owner step.
+
 ## Usage
 
 ### Run the MCP server
@@ -432,6 +443,8 @@ python -m src.cli reextract --capped --zip --unread    # read and summarise agai
 python -m src.cli reextract --partial                  # read again in full what the old readers read in part (resumable)
 python -m src.cli reextract --stale --formats          # read with today's readers what older code skipped or failed on
 python -m src.cli reextract --ocr --limit 500          # OCR low-text scans and images again (grayscale second pass), in batches
+python -m src.cli ocr-regarble [--apply]              # find stored OCR text that is Greek read as Latin letters; --apply marks it and clears its summaries
+python -m src.cli reextract --garbled                 # read marked scans again, Greek first, and summarise the ones that now read
 python -m src.cli reextract --long --estimate          # price a re-summary before running it; changes nothing
 python -m src.cli reextract --full-parts 1234 5678     # summarise these attachments from every part, now and on every later summary
 python scripts/relabel_attachment_status.py [--apply]  # give old failed/skipped rows today's unread verdicts: encrypted kinds, skip reasons
@@ -486,6 +499,8 @@ src/
     attachment_pipeline.py     Two-phase pipeline (text extraction, then LLM)
     attachment_digest.py       A long spreadsheet's structure, summarised instead of its cells
     attachment_extractors.py   PDF, DOCX, PPTX, XLSX, XLSB, XLS, image, EML, RPMSG
+    ocr_garble.py              Detector for Greek read as Latin look-alike letters
+    ocr_regarble.py            `ocr-regarble`: finds and marks the stored ones
     image_classifier.py        Dimensions plus bytes plus SHA256 dedup cascade
     image_vision.py            Vision LLM stage
     image_pipeline.py          Orchestration and backfill

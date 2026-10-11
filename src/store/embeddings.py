@@ -20,6 +20,7 @@ import numpy as np
 
 from src.config import DATA_ROOT, embed_backend
 from src.store.schema import SUMMARISED_ATTACHMENT_IDS_SQL
+from src.store.source_class import hidden_ids_sql, with_source_class
 
 # Summaries fetched per query for the attachments missing from the index; under SQLite's
 # 999-variable limit on older builds.
@@ -599,23 +600,49 @@ def _kind_mask(ids, kinds) -> np.ndarray:
     return mask
 
 
-def _top_indices(similarities, ids, limit: int, kinds=None, allowed_ids=None) -> np.ndarray:
+def _top_indices(
+    similarities, ids, limit: int, kinds=None, allowed_ids=None, excluded_ids=None
+) -> np.ndarray:
     """The `limit` most similar vectors, best first, among `kinds` (all when None)
-    and, when given, among `allowed_ids` (index ids, as stored in the npz).
+    and, when given, among `allowed_ids` and not among `excluded_ids` (index ids,
+    as stored in the npz).
 
     The kind is chosen before the top is taken. Taking it over every vector and
     filtering after left a kind with few vectors (conversations, about 1K of
     120K) mostly empty, and cost emails their slots to other kinds. The allowed
-    ids are applied first for the same reason: a workspace filter applied after
-    the top came back empty whenever the best matches sat in other projects.
+    and excluded ids are applied first for the same reason: a workspace filter
+    applied after the top came back empty whenever the best matches sat in other
+    projects.
     """
-    if kinds is None and allowed_ids is None:
+    if kinds is None and allowed_ids is None and excluded_ids is None:
         return np.argsort(similarities)[::-1][:limit]
     mask = np.ones(len(ids), dtype=bool) if kinds is None else _kind_mask(ids, kinds)
     if allowed_ids is not None:
         mask &= np.isin(ids, np.fromiter(allowed_ids, dtype=np.int64))
+    if excluded_ids is not None:
+        mask &= ~np.isin(ids, excluded_ids)
     candidates = np.flatnonzero(mask)
     return candidates[np.argsort(similarities[candidates])[::-1][:limit]]
+
+
+def _hidden_vector_ids(
+    conn: sqlite3.Connection, include_news: bool = False, include_automation: bool = False
+) -> np.ndarray | None:
+    """The index ids of the emails a read path leaves out (src/store/source_class.py) and of
+    their attachments; None when it leaves out none. 16,320 News vectors stood among the
+    semantic candidates, and the owner's automation mail beside them."""
+    hidden = hidden_ids_sql(conn, include_news, include_automation)
+    if hidden is None:
+        return None
+    emails = [row[0] for row in conn.execute(hidden)]
+    attachments = [
+        -row[0]
+        for row in conn.execute(
+            "SELECT ac.id FROM attachment_content ac JOIN attachments a ON a.id = ac.attachment_id"
+            f" WHERE a.email_id IN ({hidden})"
+        )
+    ]
+    return np.array(emails + attachments, dtype=np.int64)
 
 
 # The index outlives the embedding model. Since 2026-10-06 an organisation
@@ -677,6 +704,9 @@ def query_semantic(
     embed_fn=None,
     index_path=None,
     allowed_ids=None,
+    *,
+    include_news: bool = False,
+    include_automation: bool = False,
 ) -> list[dict]:
     """Semantic search across email summaries using cosine similarity.
 
@@ -690,9 +720,13 @@ def query_semantic(
         allowed_ids: Only these index ids (for a conversation,
             CONVERSATION_ID_OFFSET - conversations.id), ranked among
             themselves; every id when None
+        include_news, include_automation: Include the vectors of news items and
+            of the owner's automation mail, and of their attachments, left out by
+            default (src/store/source_class.py)
 
     Returns:
-        List of dicts with keys: email_id, date, subject, summary, similarity
+        List of dicts with keys: email_id, date, subject, summary, similarity;
+        email and attachment rows carry their email's source_class
     """
     # Index load + unit-normalization is cached across calls (see _load_index),
     # so a long-lived process pays the ~1 GB read once, not per query.
@@ -709,7 +743,13 @@ def query_semantic(
 
     similarities = normalized @ query_norm
 
-    top_indices = _top_indices(similarities, ids, limit, kinds, allowed_ids)
+    # News and automation vectors, and their attachments', leave the ranking first.
+    excluded = (
+        _hidden_vector_ids(conn, include_news, include_automation)
+        if kinds is None or {"email", "attachment"} & set(kinds)
+        else None
+    )
+    top_indices = _top_indices(similarities, ids, limit, kinds, allowed_ids, excluded)
 
     # Fetch details (positive IDs = emails, negative IDs = attachments)
     results = []
@@ -796,7 +836,7 @@ def query_semantic(
             row = conn.execute(
                 """
                 SELECT ac.id as attachment_content_id, a.filename,
-                       ac.summary, e.subject as email_subject,
+                       ac.summary, a.email_id, e.subject as email_subject,
                        e.date_received as date
                 FROM attachment_content ac
                 JOIN attachments a ON a.id = ac.attachment_id
@@ -815,6 +855,7 @@ def query_semantic(
     if seeded:
         for result in results:
             result["semantic"] = seeded
+    with_source_class(conn, [r for r in results if r["type"] in ("email", "attachment")])
     return results
 
 
@@ -847,6 +888,9 @@ def semantic_email_candidates(
     limit: int = 50,
     embed_fn=None,
     index_path=None,
+    *,
+    include_news: bool = False,
+    include_automation: bool = False,
 ) -> list[int]:
     """Ranked, de-duplicated email ids for `query` from the vector index, best-first.
 
@@ -854,14 +898,22 @@ def semantic_email_candidates(
     fuses with keyword search at email granularity. Used by recall()'s hybrid path;
     `embed_fn` / `index_path` are injection points for testing. The ids come back
     as SemanticCandidates, whose `semantic` says whether the query was embedded or
-    stood in for by its keyword matches.
+    stood in for by its keyword matches. News items and the owner's automation mail,
+    and their attachments, are left out unless included (src/store/source_class.py).
     """
     ids, normalized = _load_index(index_path)
     query_norm, seeded = _query_vector(conn, query, ids, normalized, embed_fn or embed_query)
     similarities = normalized @ query_norm
     # Over-fetch: several attachment vectors can collapse onto one email, so we
-    # need headroom to fill `limit` emails. Other kinds are left out first.
-    order = _top_indices(similarities, ids, max(limit * 4, limit), {"email", "attachment"})
+    # need headroom to fill `limit` emails. Other kinds, and the classes a read
+    # leaves out, are left out first.
+    order = _top_indices(
+        similarities,
+        ids,
+        max(limit * 4, limit),
+        {"email", "attachment"},
+        excluded_ids=_hidden_vector_ids(conn, include_news, include_automation),
+    )
     out: list[int] = []
     seen: set[int] = set()
     for idx in order:

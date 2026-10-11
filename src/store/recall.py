@@ -23,12 +23,19 @@ from src.store.greek import (
     search_words,
 )
 from src.store.normalizer import normalize_topic
+from src.store.ordering import action_order, decision_dates, decision_order, parent_dates
 from src.store.query import (
-    _ISO_DATE,
     fts5_query_variants,
     query_by_keyword,
     search_attachments,
     thread_keys,
+)
+from src.store.source_class import (
+    MISSING,
+    column_missing,
+    visible_ids,
+    visible_sql,
+    with_source_class,
 )
 from src.store.teams_query import search_teams as _search_teams_q
 from src.store.whatsapp_query import search_whatsapp as _search_whatsapp_q
@@ -78,20 +85,21 @@ def _folded_bucket(conn: sqlite3.Connection, sql: str, keyword: str, limit: int)
 # matching row, and the score is a Python call.
 
 
-def _search_decisions(conn: sqlite3.Connection, keyword: str, limit: int) -> list[dict]:
+def _search_decisions(
+    conn: sqlite3.Connection, keyword: str, limit: int, visible: str = "1"
+) -> list[dict]:
     # Dated, titled and sourced like query_decisions: a decision without its own
     # date takes its parent's, so a meeting's decisions no longer sink below every
-    # dated one, and the row says which meeting or thread it came from.
-    return _folded_bucket(
+    # dated one, and the row says which meeting or thread it came from. `visible`
+    # (source_class.visible_sql on d.email_id) leaves out news and automation.
+    rows = _folded_bucket(
         conn,
-        """
+        f"""
         WITH scored AS MATERIALIZED (
             SELECT id, sb_match(decision, ?, ?, ?) AS score FROM decisions
         )
         SELECT d.id, d.email_id, d.event_id, d.teams_thread_id, d.whatsapp_thread_id,
-               d.decision, d.decided_by, d.decision_date,
-               COALESCE(d.decision_date, e.date_received, tt.started_at, wt.started_at,
-                        ce.start_at, c.started_at) AS date,
+               d.decision, d.decided_by, d.decision_date, {decision_dates()},
                COALESCE(e.subject, tt.title, wt.title, ce.subject, c.summary) AS email_subject,
                CASE
                    WHEN e.id IS NOT NULL THEN 'email'
@@ -110,57 +118,70 @@ def _search_decisions(conn: sqlite3.Connection, keyword: str, limit: int) -> lis
         LEFT JOIN calendar_events ce ON ce.id = d.event_id
         LEFT JOIN conversation_turns ct ON ct.id = d.conversation_turn_id
         LEFT JOIN conversations c ON c.id = ct.conversation_id
-        WHERE s.score > 0
-        ORDER BY s.score DESC, date DESC
+        WHERE s.score > 0 AND {visible}
+        ORDER BY s.score DESC, {decision_order()}
         LIMIT ?
         """,
         keyword,
         limit,
     )
+    return with_source_class(conn, rows)
 
 
-def _search_actions(conn: sqlite3.Connection, keyword: str, limit: int) -> list[dict]:
+def _search_actions(
+    conn: sqlite3.Connection, keyword: str, limit: int, visible: str = "1"
+) -> list[dict]:
     # Outstanding first, as query_action_items sorts: open before anything else,
     # then upcoming dates soonest first, then undated or free text, then overdue,
     # most recently missed first. Every whole match scores the same, so this
     # decides the page, and ascending deadline put the oldest dates first: items
-    # long since expired, with a free-text '2026' ahead of every real date.
-    return _folded_bucket(
+    # long since expired, with a free-text '2026' ahead of every real date. Every
+    # parent is joined, as for decisions, so a Teams, meeting or conversation
+    # action is dated, titled and sourced too.
+    rows = _folded_bucket(
         conn,
         f"""
         WITH scored AS MATERIALIZED (
             SELECT id, sb_match(task, ?, ?, ?) AS score FROM action_items
         )
         SELECT a.id, a.email_id, a.task, a.owner, a.deadline, a.status,
-               e.subject as email_subject, s.score
+               COALESCE(e.subject, tt.title, wt.title, ce.subject, c.summary) AS email_subject,
+               {parent_dates()},
+               CASE
+                   WHEN e.id IS NOT NULL THEN 'email'
+                   WHEN tt.id IS NOT NULL THEN 'teams'
+                   WHEN wt.id IS NOT NULL THEN 'whatsapp'
+                   WHEN ce.id IS NOT NULL THEN 'calendar'
+                   WHEN c.id IS NOT NULL THEN 'conversation'
+                   ELSE 'orphan'
+               END AS source,
+               s.score
         FROM scored s
         JOIN action_items a ON a.id = s.id
         LEFT JOIN emails e ON e.id = a.email_id
-        WHERE s.score > 0
-        ORDER BY s.score DESC,
-                 a.status IS NOT 'open',
-                 CASE
-                     WHEN a.deadline {_ISO_DATE} AND a.deadline >= date('now') THEN 0
-                     WHEN a.deadline {_ISO_DATE} THEN 2
-                     ELSE 1
-                 END,
-                 CASE WHEN a.deadline {_ISO_DATE} AND a.deadline >= date('now')
-                      THEN a.deadline END ASC,
-                 CASE WHEN a.deadline {_ISO_DATE} AND a.deadline < date('now')
-                      THEN a.deadline END DESC
+        LEFT JOIN teams_threads tt ON tt.id = a.teams_thread_id
+        LEFT JOIN whatsapp_threads wt ON wt.id = a.whatsapp_thread_id
+        LEFT JOIN calendar_events ce ON ce.id = a.event_id
+        LEFT JOIN conversation_turns ct ON ct.id = a.conversation_turn_id
+        LEFT JOIN conversations c ON c.id = ct.conversation_id
+        WHERE s.score > 0 AND {visible}
+        ORDER BY s.score DESC, a.status IS NOT 'open', {action_order()}
         LIMIT ?
         """,
         keyword,
         limit,
     )
+    return with_source_class(conn, rows)
 
 
-def _search_commitments(conn: sqlite3.Connection, keyword: str, limit: int) -> list[dict]:
+def _search_commitments(
+    conn: sqlite3.Connection, keyword: str, limit: int, visible: str = "1"
+) -> list[dict]:
     if not _table_exists(conn, "commitments"):
         return []
-    return _folded_bucket(
+    rows = _folded_bucket(
         conn,
-        """
+        f"""
         WITH scored AS MATERIALIZED (
             SELECT id, sb_match(commitment, ?, ?, ?) AS score FROM commitments
         )
@@ -169,13 +190,14 @@ def _search_commitments(conn: sqlite3.Connection, keyword: str, limit: int) -> l
         FROM scored s
         JOIN commitments c ON c.id = s.id
         LEFT JOIN emails e ON e.id = c.email_id
-        WHERE s.score > 0
+        WHERE s.score > 0 AND {visible}
         ORDER BY s.score DESC
         LIMIT ?
         """,
         keyword,
         limit,
     )
+    return with_source_class(conn, rows)
 
 
 def _search_inline_images(conn: sqlite3.Connection, keyword: str, limit: int) -> list[dict]:
@@ -252,8 +274,13 @@ def _search_calendar_events(conn: sqlite3.Connection, query: str, limit: int) ->
 _CONTEXT_HINT_LIMIT = 5
 
 
-def _maybe_person_context(conn: sqlite3.Connection, query: str, days: int) -> dict | None:
-    """Return person_context if the query plausibly matches a known person."""
+def _maybe_person_context(
+    conn: sqlite3.Connection, query: str, days: int, **switches: bool
+) -> dict | None:
+    """Return person_context if the query plausibly matches a known person.
+
+    `switches` are include_news and include_automation, as recall was given them.
+    """
     # resolve_person is the test, so for a name recall attaches the person
     # person_context and meeting_prep find: one with a word starting with the
     # query. A substring test found a name for most topics ('AI' inside
@@ -262,11 +289,15 @@ def _maybe_person_context(conn: sqlite3.Connection, query: str, days: int) -> di
     # address's local part, which a topic word such as 'data' or 'info' starts
     # often enough. No match-count threshold: a real surname matches about 50
     # people. An unmatched name returns early.
-    ctx = get_person_context(conn, query, days=days, limit=_CONTEXT_HINT_LIMIT, local_part=False)
+    ctx = get_person_context(
+        conn, query, days=days, limit=_CONTEXT_HINT_LIMIT, local_part=False, **switches
+    )
     return ctx if ctx.get("person") else None
 
 
-def _maybe_topic_context(conn: sqlite3.Connection, query: str, days: int) -> dict | None:
+def _maybe_topic_context(
+    conn: sqlite3.Connection, query: str, days: int, **switches: bool
+) -> dict | None:
     """Return topic_context if the query plausibly matches a known topic."""
     topic = normalize_topic(query)
     if not any(ch.isalnum() for ch in topic):
@@ -274,7 +305,7 @@ def _maybe_topic_context(conn: sqlite3.Connection, query: str, days: int) -> dic
     hit = conn.execute("SELECT 1 FROM topics WHERE name LIKE ?", (f"%{topic}%",)).fetchone()
     if not hit:
         return None
-    ctx = get_topic_context(conn, query, days=days, limit=_CONTEXT_HINT_LIMIT)
+    ctx = get_topic_context(conn, query, days=days, limit=_CONTEXT_HINT_LIMIT, **switches)
     return ctx if ctx.get("topic") else None
 
 
@@ -283,6 +314,7 @@ def _hybrid_emails(
     query: str,
     limit: int,
     semantic_candidates,
+    **switches: bool,
 ) -> tuple[list[dict], str]:
     """RRF-fuse keyword email hits with semantic email candidates.
 
@@ -290,7 +322,9 @@ def _hybrid_emails(
     and semantic rankings with Reciprocal Rank Fusion, then caps to `limit`.
     Semantic-only emails are hydrated as email rows tagged source='semantic'. Any
     semantic failure (missing index, embed error, no ADC) degrades gracefully to
-    keyword-only, so recall never breaks.
+    keyword-only, so recall never breaks. `switches` are include_news and
+    include_automation: a candidate of a class they leave out is dropped, whatever
+    the provider returned.
 
     Returns the rows and the semantic half's status: 'ok', 'keyword_seeded:
     <exception type>' when the provider ranked around the keyword matches because
@@ -299,7 +333,7 @@ def _hybrid_emails(
     keyword-only answer, when the Mac's ADC had expired, read exactly like a fused one.
     """
     pool = max(limit * 4, limit)
-    keyword_hits = query_by_keyword(conn, query, limit=pool)
+    keyword_hits = query_by_keyword(conn, query, limit=pool, **switches)
     try:
         candidates = semantic_candidates(conn, query, pool)
         status = getattr(candidates, "semantic", "ok")
@@ -308,6 +342,7 @@ def _hybrid_emails(
     except Exception as e:
         logger.warning("recall semantic fusion skipped: %s: %s", type(e).__name__, e)
         return keyword_hits[:limit], f"unavailable: {type(e).__name__}"
+    sem_ids = visible_ids(conn, sem_ids, **switches)
     if not sem_ids:
         return keyword_hits[:limit], status
 
@@ -349,7 +384,7 @@ def _hybrid_emails(
             hit = dict(row)
             hit["source"] = "semantic"
             out.append(hit)
-    return out, status
+    return with_source_class(conn, out), status
 
 
 def recall(
@@ -359,6 +394,9 @@ def recall(
     days: int = 365,
     semantic_candidates=None,
     include_context: bool = False,
+    *,
+    include_news: bool = False,
+    include_automation: bool = False,
 ) -> dict:
     """Unified search across every text-bearing index in the brain.
 
@@ -380,6 +418,10 @@ def recall(
             embedded and the provider ranked around its keyword matches, or
             'unavailable: <exception type>' when it failed and the emails bucket
             is keyword-only.
+        include_news, include_automation: Include news items and the owner's
+            automation mail, which every bucket and dossier leaves out by
+            default (src/store/source_class.py). On a store older than the
+            class only news is left out, and summary.source_class says so.
 
     Returns:
         Dict with categorized hits across emails (incl. standalone docs),
@@ -387,18 +429,22 @@ def recall(
         threads and WhatsApp sessions, plus, with include_context, person_context
         and topic_context (None when the query matches no known person or topic).
         Always includes every kind key (empty list if no matches) so callers
-        don't have to handle missing keys.
+        don't have to handle missing keys. Rows drawn from emails carry their
+        source_class.
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
+    switches = {"include_news": include_news, "include_automation": include_automation}
     # Emails (incl. attachments + standalone docs — query_by_keyword spans
     # emails_fts, key_facts_fts, and attachment_content_fts in one call). When a
     # semantic candidate provider is injected (the MCP runtime does this), fuse the
     # keyword and semantic rankings with RRF; otherwise stay keyword-only.
     semantic = None
     if semantic_candidates is None:
-        emails = query_by_keyword(conn, query, limit=limit_per_kind)
+        emails = query_by_keyword(conn, query, limit=limit_per_kind, **switches)
     else:
-        emails, semantic = _hybrid_emails(conn, query, limit_per_kind, semantic_candidates)
+        emails, semantic = _hybrid_emails(
+            conn, query, limit_per_kind, semantic_candidates, **switches
+        )
 
     # Conversations. search_conversations_keyword sanitizes the raw query itself
     # and falls back to any-token like every other bucket. It used to be handed
@@ -414,11 +460,20 @@ def recall(
     # which is the common case (a one-line "see attached" carrying the real
     # substance). This bucket surfaces the extracted text and LLM summary
     # directly, with the filename the caller needs to cite.
-    attachments = search_attachments(conn, query, limit=limit_per_kind)
+    attachments = search_attachments(conn, query, limit=limit_per_kind, **switches)
 
-    decisions = _search_decisions(conn, query, limit_per_kind)
-    actions = _search_actions(conn, query, limit_per_kind)
-    commitments = _search_commitments(conn, query, limit_per_kind)
+    decisions = _search_decisions(
+        conn, query, limit_per_kind, visible_sql(conn, "d.email_id", **switches)
+    )
+    actions = _search_actions(
+        conn, query, limit_per_kind, visible_sql(conn, "a.email_id", **switches)
+    )
+    commitments = _search_commitments(
+        conn, query, limit_per_kind, visible_sql(conn, "c.email_id", **switches)
+    )
+    # Inline images are not filtered: an image belongs to every email it appears in,
+    # and on the replica none of 7,205 described images appeared in news or
+    # automation mail alone.
     inline_images = _search_inline_images(conn, query, limit_per_kind)
     teams = _search_teams(conn, query, limit_per_kind)
     whatsapp = _search_whatsapp(conn, query, limit_per_kind)
@@ -452,6 +507,9 @@ def recall(
 
     # The semantic status leads: it says how far to trust everything after it.
     summary: dict = {} if semantic is None else {"semantic": semantic}
+    if column_missing(conn):
+        # So does this: a store older than the class leaves out news alone.
+        summary["source_class"] = MISSING
     summary.update(
         total_hits=total_hits,
         kinds_with_results=kinds_with_results,
@@ -459,8 +517,8 @@ def recall(
     )
     out: dict = {"query": query, **text_kinds}
     if include_context:
-        person_context = _maybe_person_context(conn, query, days=days)
-        topic_context = _maybe_topic_context(conn, query, days=days)
+        person_context = _maybe_person_context(conn, query, days=days, **switches)
+        topic_context = _maybe_topic_context(conn, query, days=days, **switches)
         summary["has_person_context"] = person_context is not None
         summary["has_topic_context"] = topic_context is not None
         out["person_context"] = person_context

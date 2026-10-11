@@ -64,7 +64,8 @@ mcp__second-brain__recall(query="cards migration", limit_per_kind=5)
 ```
 
 It returns ten buckets, keyed exactly as listed: `emails` (which also covers
-standalone documents and news, since they share the `emails` table),
+standalone documents, since they share the `emails` table; news and the reports
+the owner's own jobs mail him only with `include_news` / `include_automation`),
 `attachments`, `conversations`, `decisions`, `actions`, `commitments`,
 `inline_images`, `teams`, `whatsapp`, `calendar_events`. `summary.kinds_with_results` names
 the ones that matched. Only the `emails` bucket fuses keyword and semantic
@@ -161,7 +162,7 @@ which one you have.
 
 Recent decisions come from `src.store.query.query_decisions(conn, days=365,
 limit=20)`, which covers email, Teams, WhatsApp, calendar and conversation decisions and
-skips news. `days` defaults to None, all time.
+skips news and the owner's automation mail unless asked. `days` defaults to None, all time.
 
 ## Notes
 

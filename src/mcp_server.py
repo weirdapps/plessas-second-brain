@@ -148,6 +148,21 @@ SearchType = Annotated[
     Field(description="'keyword' (full-text, the default) or 'semantic' (embedding similarity)."),
 ]
 Days = Annotated[int, Field(description="Lookback in days.")]
+# The two source classes every read leaves out by default (src/store/source_class.py).
+IncludeNews = Annotated[
+    bool,
+    Field(
+        description="Include news items, left out by default. Every row drawn from an email "
+        "says its source_class: mail, automation, news, document or session_note."
+    ),
+]
+IncludeAutomation = Annotated[
+    bool,
+    Field(
+        description="Include the reports the owner's own jobs mail him (source_class "
+        "automation), left out by default."
+    ),
+]
 
 
 def _get_conn():
@@ -245,20 +260,30 @@ def person_context(
     limit: Annotated[
         int, Field(ge=1, le=MAX_LIMIT, description="Rows per list, 1 to 200 (default 20).")
     ] = 20,
+    include_news: IncludeNews = False,
+    include_automation: IncludeAutomation = False,
 ) -> PersonContext:
     """Brief me on a person: their email history, topics, sentiment, decisions, open actions, communication pattern, meetings (last_met, next_meeting, meeting_count_30d), and their Teams and WhatsApp activity.
 
     Each list is capped at `limit` and has a `<name>_total` sibling with the real
     count, so a complete answer reads apart from the head of a long one. An
     ambiguous name resolves to the most-emailed match; match_count and
-    other_candidates say who else it could be. Use sender_brief for a short card,
+    other_candidates say who else it could be. News and the owner's automation
+    mail are left out unless included. Use sender_brief for a short card,
     meeting_prep for several people at once.
     """
     from src.store.context import get_person_context
 
     conn = _get_conn()
     try:
-        out = get_person_context(conn, name_or_email, days=days, limit=_cap(limit))
+        out = get_person_context(
+            conn,
+            name_or_email,
+            days=days,
+            limit=_cap(limit),
+            include_news=include_news,
+            include_automation=include_automation,
+        )
     finally:
         conn.close()
     if out.get("person") is None:
@@ -276,18 +301,28 @@ def topic_context(
     limit: Annotated[
         int, Field(ge=1, le=MAX_LIMIT, description="Rows per list, 1 to 200 (default 20).")
     ] = 20,
+    include_news: IncludeNews = False,
+    include_automation: IncludeAutomation = False,
 ) -> TopicContext:
     """Brief me on a topic: its related emails, key people, decisions, open actions and key facts.
 
     The topic is matched against the extracted topic tags. Each list is capped at
-    `limit` and has a `<name>_total` sibling with the real count. When no tag
-    matches, recall searches the text itself.
+    `limit` and has a `<name>_total` sibling with the real count. News and the
+    owner's automation mail are left out unless included. When no tag matches,
+    recall searches the text itself.
     """
     from src.store.context import get_topic_context
 
     conn = _get_conn()
     try:
-        out = get_topic_context(conn, topic, days=days, limit=_cap(limit))
+        out = get_topic_context(
+            conn,
+            topic,
+            days=days,
+            limit=_cap(limit),
+            include_news=include_news,
+            include_automation=include_automation,
+        )
     finally:
         conn.close()
     if out.get("topic") is None:
@@ -356,6 +391,8 @@ def search_emails(
     limit: Annotated[
         int, Field(ge=1, le=MAX_LIMIT, description="Maximum rows, 1 to 200 (default 20).")
     ] = 20,
+    include_news: IncludeNews = False,
+    include_automation: IncludeAutomation = False,
 ) -> RowsResult:
     """Find emails, standalone documents and news articles (they share one table) by keyword or by meaning.
 
@@ -366,23 +403,25 @@ def search_emails(
     email_thread reads. Semantic mode can also return attachment, Teams, WhatsApp
     and conversation rows, each with its `type`; when the query cannot be
     embedded it ranks around the best keyword matches and marks each row
-    `semantic: keyword_seeded: <error>`.
+    `semantic: keyword_seeded: <error>`. News and the owner's automation mail are
+    left out unless included.
     """
     _check_choice("search_type", search_type, _SEARCH_TYPES)
     limit = _cap(limit)
+    switches = {"include_news": include_news, "include_automation": include_automation}
     conn = _get_conn()
     try:
         if search_type == "semantic":
             from src.store.embeddings import SemanticUnavailable, query_semantic
 
             try:
-                rows = query_semantic(conn, query, limit=limit)
+                rows = query_semantic(conn, query, limit=limit, **switches)
             except SemanticUnavailable as e:
                 raise ToolError(str(e)) from e
         else:
             from src.store.query import query_by_keyword
 
-            rows = query_by_keyword(conn, query, limit=limit)
+            rows = query_by_keyword(conn, query, limit=limit, **switches)
     finally:
         conn.close()
     return cast(RowsResult, _rows(rows, _NO_WORD))
@@ -424,20 +463,25 @@ def recall(
         bool,
         Field(description="Attach the person and topic dossiers the query matches."),
     ] = False,
+    include_news: IncludeNews = False,
+    include_automation: IncludeAutomation = False,
 ) -> RecallResult:
     """Tell me everything we know about X: one search across every index, the default first call.
 
     It opens with `summary` (`semantic` first: 'ok', 'keyword_seeded: <error>' or
     'unavailable: <error>'), `data_as_of`, `stale`, `_stale_warning` when behind,
     and `truncated` when the 40,000-character budget cut rows. Then ten buckets:
-    emails (with standalone documents and news), attachments, conversations,
-    decisions, actions, commitments, inline_images, teams, whatsapp,
-    calendar_events; `summary.kinds_with_results` names those with rows. Only
-    emails fuses keyword and semantic ranking. A bucket where nothing held the
-    whole query falls back to rows holding some of its words, flagged
-    partial_match, and `summary.partial_kinds` names it. Summaries are cut to
-    about 300 characters.
+    emails (with standalone documents), attachments, conversations, decisions,
+    actions, commitments, inline_images, teams, whatsapp, calendar_events;
+    `summary.kinds_with_results` names those with rows. Only emails fuses keyword
+    and semantic ranking. A bucket where nothing held the whole query falls back
+    to rows holding some of its words, flagged partial_match, and
+    `summary.partial_kinds` names it. News and the owner's automation mail are
+    left out unless included; on a store older than the class only news is, and
+    `summary.source_class` says so. Summaries are cut to about 300 characters.
     """
+    from functools import partial
+
     from src.store.embeddings import semantic_email_candidates
     from src.store.query import get_freshness
     from src.store.recall import compact_rows
@@ -452,8 +496,14 @@ def recall(
             query,
             limit_per_kind=_cap(limit_per_kind, hi=RECALL_MAX_PER_KIND),
             days=days,
-            semantic_candidates=semantic_email_candidates,
+            semantic_candidates=partial(
+                semantic_email_candidates,
+                include_news=include_news,
+                include_automation=include_automation,
+            ),
             include_context=include_context,
+            include_news=include_news,
+            include_automation=include_automation,
         )
         fresh = get_freshness(conn)
     finally:
@@ -500,12 +550,15 @@ def query_emails(
     limit: Annotated[
         int, Field(ge=1, le=MAX_LIMIT, description="Maximum rows, 1 to 200 (default 20).")
     ] = 20,
+    include_news: IncludeNews = False,
+    include_automation: IncludeAutomation = False,
 ) -> RowsResult:
     """List the emails that match every filter given: person, topic, keyword and date range.
 
     At least one filter is needed. For a date window with nothing else, add a
     person or a keyword: a busy week holds over a thousand emails and only the
-    newest come back.
+    newest come back. News and the owner's automation mail are left out unless
+    included.
     """
     from src.store.query import query_combined
 
@@ -526,6 +579,8 @@ def query_emails(
             start_date=start_date,
             end_date=end_date,
             limit=_cap(limit),
+            include_news=include_news,
+            include_automation=include_automation,
         )
     finally:
         conn.close()
@@ -552,13 +607,15 @@ def query_decisions(
     include_news: Annotated[
         bool, Field(description="Include decisions extracted from news articles.")
     ] = False,
+    include_automation: IncludeAutomation = False,
 ) -> RowsResult:
     """What was decided, recently or about a topic or by a person.
 
     Covers decisions taken in email, Teams threads, calendar events and past
-    Claude Code conversations; each row's `source` says which. Decisions
-    extracted from news articles are left out unless asked for: those are what
-    companies announced, not what this user decided.
+    Claude Code conversations; each row's `source` says which, and `source_class`
+    the class of its email. Decisions extracted from news articles and from the
+    owner's automation mail are left out unless asked for: those are what
+    companies announced or bots reported, not what this user decided.
     """
     from src.store.query import query_decisions as _qd
 
@@ -574,6 +631,7 @@ def query_decisions(
             days=days,
             limit=_cap(limit),
             include_news=include_news,
+            include_automation=include_automation,
         )
     finally:
         conn.close()
@@ -603,6 +661,7 @@ def query_actions(
     include_news: Annotated[
         bool, Field(description="Include action items extracted from news articles.")
     ] = False,
+    include_automation: IncludeAutomation = False,
 ) -> list[dict]:
     """What is still to be done, by whom: action items, optionally by owner and status.
 
@@ -611,15 +670,21 @@ def query_actions(
     carries `overdue` and a `source` of email, teams, calendar or conversation.
     Status is 'open' or 'expired' (180 days after the deadline, or 90 days after
     the source last saw activity): nothing records that an action was done, so
-    there is no other status. Items from news articles are left out unless
-    asked for.
+    there is no other status. Items from news articles and from the owner's
+    automation mail are left out unless asked for; `source_class` gives an email
+    item's class.
     """
     from src.store.query import query_action_items
 
     conn = _get_conn()
     try:
         return query_action_items(
-            conn, owner=owner, status=status, limit=_cap(limit), include_news=include_news
+            conn,
+            owner=owner,
+            status=status,
+            limit=_cap(limit),
+            include_news=include_news,
+            include_automation=include_automation,
         )
     finally:
         conn.close()
@@ -634,14 +699,17 @@ def stale_threads(
     max_days: Annotated[
         int, Field(description="Oldest thread still worth a reminder, in days (default 30).")
     ] = 30,
+    include_news: IncludeNews = False,
+    include_automation: IncludeAutomation = False,
 ) -> StaleThreads:
     """Who owes me a reply, and what is overdue: threads you sent last with no answer, and overdue action items.
 
     Both lists are capped at `limit`, newest first, each with a `_total`.
     `stale_threads` holds threads whose last message you sent between `days` and
     `max_days` ago; `overdue_actions` the most recently missed deadlines from
-    every source but news. The thread half needs BRAIN_USER_EMAIL_PATTERN; without
-    it the list is empty and `stale_threads_unavailable` says why.
+    every source but news and the owner's automation mail, unless included. The
+    thread half needs BRAIN_USER_EMAIL_PATTERN; without it the list is empty and
+    `stale_threads_unavailable` says why.
     """
     from src.config import USER_EMAIL_PATTERN
     from src.store.query import (
@@ -652,13 +720,18 @@ def stale_threads(
     )
 
     limit = _cap(limit)
+    switches = {"include_news": include_news, "include_automation": include_automation}
     conn = _get_conn()
     try:
         out: dict = {
-            "stale_threads": find_stale_threads(conn, days=days, max_days=max_days, limit=limit),
-            "stale_threads_total": count_stale_threads(conn, days=days, max_days=max_days),
-            "overdue_actions": find_overdue_actions(conn, limit=limit),
-            "overdue_actions_total": count_overdue_actions(conn),
+            "stale_threads": find_stale_threads(
+                conn, days=days, max_days=max_days, limit=limit, **switches
+            ),
+            "stale_threads_total": count_stale_threads(
+                conn, days=days, max_days=max_days, **switches
+            ),
+            "overdue_actions": find_overdue_actions(conn, limit=limit, **switches),
+            "overdue_actions_total": count_overdue_actions(conn, **switches),
         }
         if not USER_EMAIL_PATTERN:
             out["stale_threads_unavailable"] = (
@@ -675,18 +748,31 @@ def meeting_prep(
     people: Annotated[str, Field(description="Attendee names or addresses, separated by commas.")],
     topic: Annotated[str | None, Field(description="The meeting's topic, to focus on.")] = None,
     days: Days = 365,
+    include_news: IncludeNews = False,
+    include_automation: IncludeAutomation = False,
 ) -> MeetingPrep:
     """Prepare me for a meeting: a dossier per attendee (emails, decisions, open actions, topics, sentiment), and the topic's context when one is given.
 
     Each name resolves as person_context resolves it, with match_count and
-    other_candidates when it is ambiguous.
+    other_candidates when it is ambiguous. News and the owner's automation mail
+    are left out unless included.
     """
     from src.store.query import meeting_prep as _mp
 
     conn = _get_conn()
     try:
         people_list = [p.strip() for p in people.split(",") if p.strip()]
-        return cast(MeetingPrep, _mp(conn, people_list, topic=topic, days=days))
+        return cast(
+            MeetingPrep,
+            _mp(
+                conn,
+                people_list,
+                topic=topic,
+                days=days,
+                include_news=include_news,
+                include_automation=include_automation,
+            ),
+        )
     finally:
         conn.close()
 
@@ -703,18 +789,27 @@ def search_attachments(
     limit: Annotated[
         int, Field(ge=1, le=MAX_LIMIT, description="Maximum rows, 1 to 200 (default 20).")
     ] = 20,
+    include_news: IncludeNews = False,
+    include_automation: IncludeAutomation = False,
 ) -> RowsResult:
     """Find what is inside email attachments (PDF, Word, Excel, PowerPoint, images): full-text search over their extracted text and summaries.
 
-    Each row gives the filename, the parent email's subject and date, a matching
-    snippet and the summary. sql_query reads attachment_content.extracted_text
-    for the full text.
+    Each row gives the filename, the parent email's subject, date and
+    source_class, a matching snippet and the summary; attachments of news and of
+    the owner's automation mail are left out unless included. sql_query reads
+    attachment_content.extracted_text for the full text.
     """
     from src.store.query import search_attachments as _search
 
     conn = _get_conn()
     try:
-        rows = _search(conn, query, limit=_cap(limit))
+        rows = _search(
+            conn,
+            query,
+            limit=_cap(limit),
+            include_news=include_news,
+            include_automation=include_automation,
+        )
     finally:
         conn.close()
     return cast(RowsResult, _rows(rows, _NO_WORD))
@@ -917,7 +1012,9 @@ def stats() -> Stats:
     `earliest_email` is the oldest row of any kind, a stray old document
     included; where mail really starts is in `coverage`. `embed_backend` names
     the service that embeds search queries and `last_embed_error` its last
-    failure in this server ({type, at}, or null).
+    failure in this server ({type, at}, or null). `source_class` counts the
+    emails of each class, or says 'pending migration' on a store older than
+    the class, whose reads leave out news alone.
     """
     from src.store.query import get_stats
 

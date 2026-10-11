@@ -16,16 +16,28 @@ from unittest.mock import patch
 import pytest
 
 from src.store.schema import create_database
+from src.store.source_class import classify
 
 NOW = "datetime('now')"
 
 
 def _email(conn, i, days_ago, sender, conversation, mailbox="Archive", subject=None):
+    subject = subject or f"Thread {i}"
     conn.execute(
         "INSERT INTO emails (id, message_id, date_received, sender_address, subject, "
-        "conversation_id, mailbox_name) VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%S', 'now', ?), "
-        "?, ?, ?, ?)",
-        (i, i, f"-{days_ago} days", sender, subject or f"Thread {i}", conversation, mailbox),
+        "conversation_id, mailbox_name, source_class) "
+        "VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%S', 'now', ?), ?, ?, ?, ?, ?)",
+        # the class the loader stores with the row
+        (
+            i,
+            i,
+            f"-{days_ago} days",
+            sender,
+            subject,
+            conversation,
+            mailbox,
+            classify(mailbox, sender, subject),
+        ),
     )
 
 

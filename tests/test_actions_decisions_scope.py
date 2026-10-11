@@ -25,9 +25,10 @@ def db(tmp_path):
     create_database(str(path)).close()
     conn = get_connection(str(path))
     conn.executescript("""
-        INSERT INTO emails (id, message_id, date_received, subject, mailbox_name) VALUES
-            (1, 1, '2026-09-01T00:00:00Z', 'Real mail', 'Inbox'),
-            (2, 2, '2026-09-01T00:00:00Z', 'Market wrap', 'News');
+        INSERT INTO emails (id, message_id, date_received, subject, mailbox_name, source_class)
+        VALUES
+            (1, 1, '2026-09-01T00:00:00Z', 'Real mail', 'Inbox', 'mail'),
+            (2, 2, '2026-09-01T00:00:00Z', 'Market wrap', 'News', 'news');
         INSERT INTO teams_chats (id, teams_chat_id, chat_kind, first_seen_at) VALUES
             (1, 'C1', 'group', '2026-09-01T00:00:00Z');
         INSERT INTO teams_threads (id, chat_id, thread_kind, title, started_at, ended_at) VALUES
@@ -87,8 +88,8 @@ class TestNewsExclusion:
         assert "news decision" not in [r["decision"] for r in query_decisions(db, limit=50)]
 
     def test_non_email_items_survive_the_news_filter(self, db):
-        """The news predicate keys on emails.mailbox_name, and a Teams item has
-        no email row at all. A naive `e.mailbox_name <> 'News'` would drop it.
+        """The news predicate keys on the email's source_class, and a Teams item
+        has no email row at all. A naive `e.source_class <> 'news'` would drop it.
         """
         assert "from teams" in [r["task"] for r in query_action_items(db, limit=50)]
 

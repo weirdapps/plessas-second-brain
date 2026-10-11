@@ -448,6 +448,36 @@ within their deadline. A second run stores nothing. On a copy of the replica's T
 on 2026-10-11: 3,135 replies from 1,961 posts, 897 posts re-dated, 893 threads queued, in
 two seconds. No schema change, and it can run beside the timers.
 
+**Teams message text.** teams-sync stores a message's text as a reader sees it whenever its
+content holds markup, whatever type the payload declares. It used to wait for a declared
+"html", which the chat service never sends, so the text of every HTML message was its markup.
+To convert the rows stored before, run `python -m src.cli teams-strip-html` once on the
+producer after the pull (`--dry-run` counts first, read-only). It calls neither Teams nor a
+model: it converts each row from the HTML the row keeps, redacting credentials as ingest
+does, writes only the rows whose text changes, 500 to a transaction, so it can run beside
+the timers, and the full-text index follows through its trigger. System messages keep their
+XML. A second run changes nothing, and `--limit N` caps the rows one run changes. Run it once
+more after a teams-sync that started before the pull has exited, since that job stores
+markup as before. Until it has run, a reaction to a message stored before sends its thread
+back to extraction, as an edit does, because the new text differs from the stored markup.
+On a copy of the replica's Teams tables on 2026-10-11: 37,741 of 79,127 messages converted
+in 5 s, a second run changed none, and a search for `itemtype` went from 8,871 messages to
+0. No schema change.
+
+It sends nothing back to extraction, which is where the cost is: the summaries, titles,
+decisions, actions and facts of the threads concerned stay as extracted from the markup, and
+their vectors, which embed the summaries, with them. To refresh them, send those threads back
+to extraction; the following teams-sync runs extract them, newest first, one model call each
+within their deadline, and embed each again, since it was extracted after it was embedded
+(6,648 threads on that copy):
+
+```sql
+UPDATE teams_threads SET extraction_status = 'pending'
+WHERE extraction_status = 'extracted' AND id IN (
+  SELECT thread_id FROM teams_messages
+  WHERE is_system = 0 AND content_text IS NOT content_html);
+```
+
 **Upgrading to schema v32.** From v32 `attachment_content` has three small indexes that
 answer the file sweep's classification and two health-check queries without reading the
 stored text. `extracted_text` (3 GB on the producer) sits ahead of the columns those queries

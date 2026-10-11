@@ -17,10 +17,8 @@ from src.store.fusion import reciprocal_rank_fusion
 from src.store.greek import (
     PHRASE_MATCH,
     register_sql_functions,
+    sb_match_args,
     search_fold,
-    search_phrase,
-    search_tokens,
-    search_words,
 )
 from src.store.normalizer import normalize_topic
 from src.store.ordering import action_order, decision_dates, decision_order, parent_dates
@@ -65,15 +63,14 @@ def _folded_bucket(conn: sqlite3.Connection, sql: str, keyword: str, limit: int)
     some of its tokens come back, most first, flagged partial_match: the
     whole-query form alone emptied these buckets for the long queries agents
     write. A one-word query gets no token pass, since "any" would equal "all".
+    A Greek word is looked for by its stem where it has one, as the full-text
+    buckets look for it (greek.sb_match_args).
     """
     register_sql_functions(conn)  # the MCP image search calls this directly
-    stripped = search_phrase(keyword)
-    if not stripped:
+    phrase, words, tokens = sb_match_args(keyword)
+    if not phrase:
         return []
-    several = len(stripped.split()) >= 2
-    words = "\x1f".join(search_words(keyword)) if several else ""
-    tokens = "\x1f".join(search_tokens(keyword)) if several else ""
-    rows = [dict(r) for r in conn.execute(sql, (stripped, words, tokens, limit))]
+    rows = [dict(r) for r in conn.execute(sql, (phrase, words, tokens, limit))]
     whole = [r for r in rows if r["score"] >= PHRASE_MATCH]
     out = whole or [{**r, "partial_match": True} for r in rows]
     for row in out:

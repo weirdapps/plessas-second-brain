@@ -86,6 +86,15 @@ def embed_backend() -> str:
     return "gemini" if os.environ.get("GEMINI_API_KEY") else "vertex"
 
 
+def query_stemming() -> bool:
+    """Whether a Greek query word is also searched by its stem (greek.query_stem).
+
+    On unless BRAIN_QUERY_STEMMING is 0, which restores search by the form typed for
+    one deployment. Read at each call, so a test or a process can change it.
+    """
+    return os.environ.get("BRAIN_QUERY_STEMMING", "").strip() != "0"
+
+
 # A replica holds a copy of the database built on another host, and the next
 # pull replaces it. The pull job stamps this file. Writing to the copy is how a
 # local `embed` left a WAL that the next pull replayed over a fresh copy, on

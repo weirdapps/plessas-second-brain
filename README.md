@@ -94,6 +94,16 @@ Every row of the `emails` table has a `source_class` (schema v33, rules in `src/
 
 This changes results: decisions, actions and key facts from news items and from your automation mail no longer appear in "what did we decide" or "what do I owe" answers unless asked for. Before v33 only `query_decisions`, `query_actions` and the overdue half of `stale_threads` left out news, and nothing left out automation.
 
+### Greek words are matched in any form
+
+Every keyword search finds a Greek word in its other forms: `κάρτες` also finds `κάρτα`, `κάρτας` and `καρτών`, and `έγκριση` finds `εγκρίσεις`. Only the form typed used to match, which on one store missed half to two thirds of a word's uses (`καρτες` was in 3,966 emails, some form of the word in 13,243). This covers `search_emails` in keyword mode, `query_emails` with `keyword`, `search_attachments`, `search_teams`, `search_whatsapp`, `search_conversations`, `query_calendar_events` with `keyword`, `attachment_image_search` and every `recall` bucket.
+
+It works on the query alone; the index is unchanged. A Greek word of four letters or more is folded (case, accents, final sigma) and searched also by its Snowball stem ([`snowballstemmer`](https://pypi.org/project/snowballstemmer/)) as a prefix, `("καρτες" OR "καρτ"*)`, when the stem is shorter than the word, starts it and has four letters or more. Any other word is searched as typed, and so are stopwords, Latin words, codes and numbers. Every word is still required, and the any-word fallback (`partial_match`) uses the stems too. The decision, action, commitment and image buckets, which match in Python, look for the same stems, and the phrase `search_teams` and `search_whatsapp` try first holds in any form. The form typed stays in the query, so within each stage it ranks above the other forms.
+
+The price is precision, since a stem can start a different word: `πλήρης` (`πληρ`) also finds `πληροφορία` and `πληρωμή`, `χρήση` finds `χρήστες`, `σχέδια` finds `σχεδόν`, a first name finds the names that start like it, and a few words share a stem outright (`τράπεζα`, `τραπέζι`). Measured on one store's most frequent Greek words used as one-word queries, a search found 77% of the emails holding some form of the word before and 100% after, and 90% of what it found held one.
+
+`BRAIN_QUERY_STEMMING=0` turns it off for one deployment, and every word is searched as typed, as before. Set it where the searching process reads its environment; for the MCP server that is `$BRAIN_DATA_DIR/env` or `~/.second-brain/env` (see [Run the MCP server](#run-the-mcp-server)). A checkout updated without `uv sync`, and so without `snowballstemmer`, searches as typed too and logs a warning saying why.
+
 ### Unified recall
 
 - `recall(query, limit_per_kind, days, include_context, include_news, include_automation)`. Fan-out across every text-bearing index. This is the default "tell me everything you know about X" entry point.
@@ -355,6 +365,10 @@ Preferred credential path. Uses Application Default Credentials, no API key requ
 `scripts/health_check.py` reads three more: `HEALTH_EMAIL_TO` and `HC_PING_URL`, documented in [`docs/DEPLOY.md`](docs/DEPLOY.md), and `BRAIN_DAILY_SPEND_WARN_USD` (below).
 
 No credentials are printed by the code. All secrets are read from environment or (for Google) from ADC.
+
+### Search
+
+- `BRAIN_QUERY_STEMMING`: `0` searches each Greek word only in the form typed, turning off the stemming described in [Greek words are matched in any form](#greek-words-are-matched-in-any-form). On when unset.
 
 ### Attachments in the hourly sync
 

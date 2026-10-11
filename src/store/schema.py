@@ -2082,6 +2082,10 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     # synchronous is per-connection, so both are (re)applied on every open.
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
+    # Zero what a delete or an overwrite frees. Off, the text stays in free pages,
+    # where a copy of the file or a page-level read still finds it: forget,
+    # re-extraction, the dedups and the action lifecycle all free pages.
+    conn.execute("PRAGMA secure_delete = ON")
     return conn
 
 

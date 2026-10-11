@@ -1041,10 +1041,12 @@ def _named_people(extraction: dict, metadata: dict) -> list[tuple[str, str | Non
     wrote in the body never becomes anyone's name on record. Any other address is
     dropped, since a body can carry a planted one, and the person is looked up by name
     in the headers as v1 does, its name as written first, then its Latin form. The Latin
-    name has no column yet; it stays in the extraction file.
+    name has no column yet; it stays in the extraction file. A v2 extraction is known by
+    its `extraction_schema` mark, never by a `people` key: v1's parser keeps keys it does
+    not know.
     """
     people = extraction.get("people")
-    if isinstance(people, list):
+    if extraction.get("extraction_schema") == 2 and isinstance(people, list):
         headers = _header_people(metadata)
         out: list[tuple[str, str | None, list]] = []
         for person in people:

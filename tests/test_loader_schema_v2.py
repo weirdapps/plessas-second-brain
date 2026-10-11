@@ -181,6 +181,21 @@ def test_a_v1_extraction_still_loads_its_people_roles(conn):
     assert conn.execute("SELECT language FROM emails").fetchone()[0] == "english"
 
 
+def test_a_v1_extraction_with_a_stray_people_key_is_read_as_v1(conn):
+    """v1's parser keeps keys it does not know; only the v2 mark makes an extraction v2."""
+    v1 = {
+        "summary": "s",
+        "language": "english",
+        "people_roles": {"Dana Lee": "reviewer"},
+        "people": [{"name_as_written": "Not Loaded", "role": "x"}],
+    }
+
+    load_single_email(conn, _meta(), v1)
+
+    assert ("Dana Lee", "dana.lee@example.com", "reviewer") in _people(conn)
+    assert not [p for p in _people(conn) if p[0] == "Not Loaded"]
+
+
 def test_replace_extraction_takes_a_v2_extraction(conn):
     """The stub retry writes whatever extract_one returns, v2 under call shape v2."""
     meta = _meta()

@@ -516,6 +516,31 @@ verifies it, and optionally writes a zstd-compressed, AES-256-encrypted offsite
 copy. The restore path, its prerequisites, and the checks that tell a good
 archive from a corrupt one are in [`RESTORE.md`](RESTORE.md).
 
+**A file-level backup of the producer takes the snapshot, not the live file.**
+restic, or anything like it, reads `brain.db` while the timers write it, and a
+WAL-mode database copied that way can be torn. Keep the data home in its paths,
+so the daily `backups/brain-YYYYMMDD.db` is what it stores, and exclude the live
+file, its sidecars and the encrypted archives. For restic, these lines in the
+excludes file (with your data home's absolute path), and no line excluding
+`backups/` as a whole:
+
+```text
+/path/to/data-home/brain.db
+/path/to/data-home/brain.db-wal
+/path/to/data-home/brain.db-shm
+/path/to/data-home/backups/offsite
+```
+
+Restoring from it is in [`RESTORE.md`](RESTORE.md), "restic: the copy off both
+hosts".
+
+**Drill the restore weekly.** `python scripts/backup_db.py --drill` decrypts the
+newest archive into a temporary directory, runs `PRAGMA quick_check`, compares row
+counts with a database you name, and records a pass in
+`~/.second-brain/restore-drill.stamp`, which the health check's Backups row ages
+(section 7). [`RESTORE.md`](RESTORE.md), "Exercise it", has the command and a
+LaunchAgent for the consumer that pulls the archives.
+
 ## 9. Serve to Claude Code
 
 Register the MCP server once (see `README.md`, "Register with Claude Code"). It

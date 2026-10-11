@@ -12,6 +12,17 @@ from typing import Any
 from src.config import USER_EMAIL_PATTERN
 from src.store.greek import register_sql_functions, search_fold
 from src.store.normalizer import normalize_topic
+from src.store.ordering import (
+    EMAIL_DATE,
+    ISO_DATE,
+    PARENT_DATE,
+    action_order,
+    decision_date,
+    decision_dates,
+    decision_order,
+    fact_order,
+    parent_dates,
+)
 from src.store.schema import subject_to_conversation_id
 
 # The loader threads an email with no conversation id and no references by the
@@ -736,11 +747,7 @@ def query_by_date_range(
 # A decision's date: its own when it is one, else its parent's. The extractor
 # writes free text too ('null', 'Q3 2026'), which sorted after every date and
 # fell to the bound that keeps meetings still to come from deciding anything.
-_DECISION_DATE = (
-    "COALESCE(CASE WHEN d.decision_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'"
-    " THEN d.decision_date END, e.date_received, tt.started_at, wt.started_at, ce.start_at,"
-    " c.started_at)"
-)
+_DECISION_DATE = decision_date(PARENT_DATE)
 
 
 def query_decisions(
@@ -767,8 +774,9 @@ def query_decisions(
             user or their colleagues took.
 
     Returns:
-        List of dicts with keys: decision_id, decision, decided_by, date,
-        email_subject, topics (comma-separated)
+        List of dicts with keys: decision_id, decision, decided_by, date (its own
+        ISO date, else its parent's), parent_date, email_subject, source, topics
+        (comma-separated); newest first
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
     # Build query with optional filters
@@ -781,7 +789,7 @@ def query_decisions(
             d.id as decision_id,
             d.decision,
             d.decided_by,
-            {_DECISION_DATE} as date,
+            {decision_dates(PARENT_DATE)},
             COALESCE(e.subject, tt.title, wt.title, ce.subject, c.summary) as email_subject,
             CASE
                 WHEN e.id IS NOT NULL THEN 'email'
@@ -834,9 +842,9 @@ def query_decisions(
     if where_clauses:
         query += " WHERE " + " AND ".join(where_clauses)
 
-    query += """
+    query += f"""
         GROUP BY d.id
-        ORDER BY date DESC
+        ORDER BY {decision_order(PARENT_DATE)}
         LIMIT ?
     """
 
@@ -851,7 +859,7 @@ def query_decisions(
 # after the workshop"). Those are not dates, and because they are not NULL either
 # they sorted ahead of every real one: the default page of "my open actions" was
 # entirely "1 day before" and "2 days befor", with no genuine deadline visible.
-_ISO_DATE = "GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'"
+_ISO_DATE = ISO_DATE
 
 
 def query_action_items(
@@ -880,13 +888,13 @@ def query_action_items(
 
     Returns:
         List of dicts with keys: action_id, task, owner, deadline, status,
-        email_subject, date, source
+        email_subject, date and parent_date (both its parent's date), source
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
     # LEFT JOIN every parent, then COALESCE for display. `source` tells the
     # caller which kind it got, because "email_subject" on a calendar item would
     # otherwise be a quiet lie.
-    query = """
+    query = f"""
         SELECT
             a.id as action_id,
             a.task,
@@ -894,8 +902,7 @@ def query_action_items(
             a.deadline,
             a.status,
             COALESCE(e.subject, tt.title, wt.title, ce.subject, c.summary) as email_subject,
-            COALESCE(e.date_received, tt.started_at, wt.started_at, ce.start_at, c.started_at)
-                as date,
+            {parent_dates(PARENT_DATE)},
             CASE
                 WHEN e.id IS NOT NULL THEN 'email'
                 WHEN tt.id IS NOT NULL THEN 'teams'
@@ -949,26 +956,12 @@ def query_action_items(
     if where_clauses:
         query += " WHERE " + " AND ".join(where_clauses)
 
-    # Actionable first. Three buckets, in this order:
-    #   0  upcoming: a real date, today or later, soonest first
-    #   1  undated: NULL or free text, most recent parent first
-    #   2  overdue: a real date in the past, most recently missed first
-    #
-    # Nothing is hidden, because an overdue commitment is still a commitment,
-    # but most dated open items are overdue (on 2026-09-09, 16,475 of 20,518).
-    # Sorted purely by deadline they filled every page and the default view of
-    # "what do I owe" contained not one live item.
+    # Actionable first, in the three buckets every list of actions uses
+    # (ordering.action_order): upcoming soonest first, then undated, then overdue
+    # most recently missed first. Sorted purely by deadline, overdue items filled
+    # every page and "what do I owe" showed not one live item.
     query += f"""
-        ORDER BY CASE
-                     WHEN a.deadline {_ISO_DATE} AND a.deadline >= date('now') THEN 0
-                     WHEN a.deadline {_ISO_DATE} THEN 2
-                     ELSE 1
-                 END ASC,
-                 CASE WHEN a.deadline {_ISO_DATE} AND a.deadline >= date('now')
-                      THEN a.deadline END ASC,
-                 CASE WHEN a.deadline {_ISO_DATE} AND a.deadline < date('now')
-                      THEN a.deadline END DESC,
-                 date DESC
+        ORDER BY {action_order(PARENT_DATE)}
         LIMIT ?
     """
 
@@ -1170,32 +1163,32 @@ def meeting_prep(
             s = email.get("sentiment", "unknown") or "unknown"
             dossier["sentiment_summary"][s] = dossier["sentiment_summary"].get(s, 0) + 1
 
-        # Decisions involving this person
+        # Decisions involving this person, newest first (ordering.py): a free-text
+        # decision_date ('Q3 2026') sorted above every real one.
         cursor = conn.execute(
-            """
-            SELECT d.decision, d.decided_by,
-                COALESCE(d.decision_date, e.date_received) as date,
+            f"""
+            SELECT d.decision, d.decided_by, {decision_dates(EMAIL_DATE)},
                 e.subject as email_subject
             FROM decisions d
             JOIN emails e ON d.email_id = e.id
             WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
               AND e.date_received >= ?
-            ORDER BY date DESC LIMIT 10
+            ORDER BY {decision_order(EMAIL_DATE)} LIMIT 10
         """,
             (person_id, cutoff),
         )
         dossier["decisions"] = [dict(r) for r in cursor.fetchall()]
 
-        # Open action items
+        # Open action items, the actionable first
         cursor = conn.execute(
-            """
-            SELECT a.task, a.owner, a.deadline, a.status,
+            f"""
+            SELECT a.task, a.owner, a.deadline, a.status, {parent_dates(EMAIL_DATE)},
                 e.subject as email_subject
             FROM action_items a
             JOIN emails e ON a.email_id = e.id
             WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
               AND a.status = 'open'
-            ORDER BY a.deadline IS NULL, a.deadline ASC LIMIT 10
+            ORDER BY {action_order(EMAIL_DATE)} LIMIT 10
         """,
             (person_id,),
         )
@@ -1232,44 +1225,43 @@ def meeting_prep(
         # to them an email tagged with two of those repeated each of its items.
         # Filtered by email instead, each item is listed once.
         cursor = conn.execute(
-            """
-            SELECT d.decision, d.decided_by,
-                   COALESCE(d.decision_date, e.date_received) as date,
+            f"""
+            SELECT d.decision, d.decided_by, {decision_dates(EMAIL_DATE)},
                    e.subject as email_subject
             FROM decisions d
             JOIN emails e ON d.email_id = e.id
             WHERE e.id IN (SELECT et.email_id FROM email_topics et
                            JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
               AND e.date_received >= ?
-            ORDER BY date DESC LIMIT 20
+            ORDER BY {decision_order(EMAIL_DATE)} LIMIT 20
         """,
             (f"%{topic_normalized}%", cutoff),
         )
         topic_ctx["decisions"] = [dict(r) for r in cursor.fetchall()]
 
         cursor = conn.execute(
-            """
-            SELECT kf.fact, e.date_received as date, e.subject
+            f"""
+            SELECT kf.fact, {parent_dates(EMAIL_DATE)}, e.subject
             FROM key_facts kf
             JOIN emails e ON kf.email_id = e.id
             WHERE e.id IN (SELECT et.email_id FROM email_topics et
                            JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
               AND e.date_received >= ?
-            ORDER BY e.date_received DESC LIMIT 20
+            ORDER BY {fact_order(EMAIL_DATE)} LIMIT 20
         """,
             (f"%{topic_normalized}%", cutoff),
         )
         topic_ctx["key_facts"] = [dict(r) for r in cursor.fetchall()]
 
         cursor = conn.execute(
-            """
-            SELECT a.task, a.owner, a.deadline, a.status
+            f"""
+            SELECT a.task, a.owner, a.deadline, a.status, {parent_dates(EMAIL_DATE)}
             FROM action_items a
             JOIN emails e ON a.email_id = e.id
             WHERE e.id IN (SELECT et.email_id FROM email_topics et
                            JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
               AND a.status = 'open'
-            ORDER BY a.deadline IS NULL, a.deadline ASC LIMIT 20
+            ORDER BY {action_order(EMAIL_DATE)} LIMIT 20
         """,
             (f"%{topic_normalized}%",),
         )
@@ -1422,14 +1414,14 @@ def find_overdue_actions(conn: sqlite3.Connection, limit: int = 20) -> list[dict
 
     Returns:
         List of dicts with keys: action_id, task, owner, deadline,
-        email_subject, date, source, days_overdue
+        email_subject, date and parent_date (both its parent's date), source,
+        days_overdue
     """
     results = conn.execute(
-        """
+        f"""
         SELECT ai.id as action_id, ai.task, ai.owner, ai.deadline,
                COALESCE(e.subject, tt.title, wt.title, ce.subject, c.summary) as email_subject,
-               COALESCE(e.date_received, tt.started_at, wt.started_at, ce.start_at,
-                        c.started_at) as date,
+               {parent_dates(PARENT_DATE)},
                CASE
                    WHEN e.id IS NOT NULL THEN 'email'
                    WHEN tt.id IS NOT NULL THEN 'teams'

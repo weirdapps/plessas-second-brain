@@ -16,6 +16,15 @@ from src.store.greek import (
     search_words,
 )
 from src.store.normalizer import normalize_topic
+from src.store.ordering import (
+    EMAIL_DATE,
+    action_order,
+    decision_date,
+    decision_dates,
+    decision_order,
+    fact_order,
+    parent_dates,
+)
 
 # Every list in a context dossier is capped at this many rows unless the caller
 # asks for more. These functions are reached from MCP tools, so their return
@@ -235,17 +244,17 @@ def get_person_context(
     ).fetchall()
     sentiment_distribution = {r["sentiment"]: r["count"] for r in sentiment_rows}
 
-    # Decisions
+    # Decisions, newest first by their own date or their email's (src/store/ordering.py)
     decisions = [
         dict(r)
         for r in conn.execute(
-            """
-        SELECT d.decision, d.decided_by, d.decision_date as date
+            f"""
+        SELECT d.decision, d.decided_by, {decision_dates(EMAIL_DATE)}
         FROM decisions d
         JOIN emails e ON d.email_id = e.id
         WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
           AND e.date_received >= ?
-        ORDER BY d.decision_date DESC
+        ORDER BY {decision_order(EMAIL_DATE)}
         LIMIT ?
     """,
             (person_id, cutoff, limit),
@@ -262,17 +271,17 @@ def get_person_context(
         (person_id, cutoff),
     ).fetchone()["cnt"]
 
-    # Open action items
+    # Open action items, the actionable first
     open_actions = [
         dict(r)
         for r in conn.execute(
-            """
-        SELECT a.task, a.owner, a.deadline, a.status
+            f"""
+        SELECT a.task, a.owner, a.deadline, a.status, {parent_dates(EMAIL_DATE)}
         FROM action_items a
         JOIN emails e ON a.email_id = e.id
         WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
           AND a.status = 'open' AND e.date_received >= ?
-        ORDER BY a.deadline IS NULL, a.deadline ASC
+        ORDER BY {action_order(EMAIL_DATE)}
         LIMIT ?
     """,
             (person_id, cutoff, limit),
@@ -671,17 +680,17 @@ def get_topic_context(
         (topic_id, cutoff),
     ).fetchone()["cnt"]
 
-    # Decisions
+    # Decisions, newest first by their own date or their email's (src/store/ordering.py)
     decisions = [
         dict(r)
         for r in conn.execute(
-            """
-        SELECT d.decision, d.decided_by, d.decision_date as date
+            f"""
+        SELECT d.decision, d.decided_by, {decision_dates(EMAIL_DATE)}
         FROM decisions d
         JOIN emails e ON d.email_id = e.id
         JOIN email_topics et ON e.id = et.email_id
         WHERE et.topic_id = ? AND e.date_received >= ?
-        ORDER BY d.decision_date DESC
+        ORDER BY {decision_order(EMAIL_DATE)}
         LIMIT ?
     """,
             (topic_id, cutoff, limit),
@@ -698,17 +707,17 @@ def get_topic_context(
         (topic_id, cutoff),
     ).fetchone()["cnt"]
 
-    # Open action items
+    # Open action items, the actionable first
     open_actions = [
         dict(r)
         for r in conn.execute(
-            """
-        SELECT a.task, a.owner, a.deadline, a.status
+            f"""
+        SELECT a.task, a.owner, a.deadline, a.status, {parent_dates(EMAIL_DATE)}
         FROM action_items a
         JOIN emails e ON a.email_id = e.id
         JOIN email_topics et ON e.id = et.email_id
         WHERE et.topic_id = ? AND a.status = 'open' AND e.date_received >= ?
-        ORDER BY a.deadline IS NULL, a.deadline ASC
+        ORDER BY {action_order(EMAIL_DATE)}
         LIMIT ?
     """,
             (topic_id, cutoff, limit),
@@ -725,16 +734,17 @@ def get_topic_context(
         (topic_id, cutoff),
     ).fetchone()["cnt"]
 
-    # Key facts
+    # Key facts, newest email first: with no ORDER BY the cap kept whichever came first
     key_facts = [
         dict(r)
         for r in conn.execute(
-            """
-        SELECT kf.fact
+            f"""
+        SELECT kf.fact, {parent_dates(EMAIL_DATE)}
         FROM key_facts kf
         JOIN emails e ON kf.email_id = e.id
         JOIN email_topics et ON e.id = et.email_id
         WHERE et.topic_id = ? AND e.date_received >= ?
+        ORDER BY {fact_order(EMAIL_DATE)}
         LIMIT ?
     """,
             (topic_id, cutoff, limit),
@@ -837,24 +847,26 @@ def get_conversation_context(conn: sqlite3.Connection, email_id: int) -> dict:
         thread_ids,
     )
 
-    # Decisions
+    # Decisions, oldest first as the thread reads, by their own date or their email's
     decisions = _query_by_ids(
-        """
-        SELECT d.decision, d.decided_by, d.decision_date as date
+        f"""
+        SELECT d.decision, d.decided_by, {decision_dates(EMAIL_DATE)}
         FROM decisions d
+        JOIN emails e ON e.id = d.email_id
         WHERE d.email_id IN (__PH__)
-        ORDER BY d.decision_date ASC
+        ORDER BY {decision_date(EMAIL_DATE)} ASC, d.id ASC
     """,
         thread_ids,
     )
 
-    # Action items
+    # Action items, the actionable first
     action_items = _query_by_ids(
-        """
-        SELECT a.task, a.owner, a.deadline, a.status
+        f"""
+        SELECT a.task, a.owner, a.deadline, a.status, {parent_dates(EMAIL_DATE)}
         FROM action_items a
+        JOIN emails e ON e.id = a.email_id
         WHERE a.email_id IN (__PH__)
-        ORDER BY a.deadline IS NULL, a.deadline ASC
+        ORDER BY {action_order(EMAIL_DATE)}
     """,
         thread_ids,
     )

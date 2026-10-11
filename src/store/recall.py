@@ -21,8 +21,8 @@ from src.store.greek import (
     search_words,
 )
 from src.store.normalizer import normalize_topic
+from src.store.ordering import action_order, decision_dates, decision_order, parent_dates
 from src.store.query import (
-    _ISO_DATE,
     fts5_query_variants,
     query_by_keyword,
     search_attachments,
@@ -82,14 +82,12 @@ def _search_decisions(conn: sqlite3.Connection, keyword: str, limit: int) -> lis
     # dated one, and the row says which meeting or thread it came from.
     return _folded_bucket(
         conn,
-        """
+        f"""
         WITH scored AS MATERIALIZED (
             SELECT id, sb_match(decision, ?, ?, ?) AS score FROM decisions
         )
         SELECT d.id, d.email_id, d.event_id, d.teams_thread_id, d.whatsapp_thread_id,
-               d.decision, d.decided_by, d.decision_date,
-               COALESCE(d.decision_date, e.date_received, tt.started_at, wt.started_at,
-                        ce.start_at, c.started_at) AS date,
+               d.decision, d.decided_by, d.decision_date, {decision_dates()},
                COALESCE(e.subject, tt.title, wt.title, ce.subject, c.summary) AS email_subject,
                CASE
                    WHEN e.id IS NOT NULL THEN 'email'
@@ -109,7 +107,7 @@ def _search_decisions(conn: sqlite3.Connection, keyword: str, limit: int) -> lis
         LEFT JOIN conversation_turns ct ON ct.id = d.conversation_turn_id
         LEFT JOIN conversations c ON c.id = ct.conversation_id
         WHERE s.score > 0
-        ORDER BY s.score DESC, date DESC
+        ORDER BY s.score DESC, {decision_order()}
         LIMIT ?
         """,
         keyword,
@@ -122,7 +120,9 @@ def _search_actions(conn: sqlite3.Connection, keyword: str, limit: int) -> list[
     # then upcoming dates soonest first, then undated or free text, then overdue,
     # most recently missed first. Every whole match scores the same, so this
     # decides the page, and ascending deadline put the oldest dates first: items
-    # long since expired, with a free-text '2026' ahead of every real date.
+    # long since expired, with a free-text '2026' ahead of every real date. Every
+    # parent is joined, as for decisions, so a Teams, meeting or conversation
+    # action is dated, titled and sourced too.
     return _folded_bucket(
         conn,
         f"""
@@ -130,22 +130,27 @@ def _search_actions(conn: sqlite3.Connection, keyword: str, limit: int) -> list[
             SELECT id, sb_match(task, ?, ?, ?) AS score FROM action_items
         )
         SELECT a.id, a.email_id, a.task, a.owner, a.deadline, a.status,
-               e.subject as email_subject, s.score
+               COALESCE(e.subject, tt.title, wt.title, ce.subject, c.summary) AS email_subject,
+               {parent_dates()},
+               CASE
+                   WHEN e.id IS NOT NULL THEN 'email'
+                   WHEN tt.id IS NOT NULL THEN 'teams'
+                   WHEN wt.id IS NOT NULL THEN 'whatsapp'
+                   WHEN ce.id IS NOT NULL THEN 'calendar'
+                   WHEN c.id IS NOT NULL THEN 'conversation'
+                   ELSE 'orphan'
+               END AS source,
+               s.score
         FROM scored s
         JOIN action_items a ON a.id = s.id
         LEFT JOIN emails e ON e.id = a.email_id
+        LEFT JOIN teams_threads tt ON tt.id = a.teams_thread_id
+        LEFT JOIN whatsapp_threads wt ON wt.id = a.whatsapp_thread_id
+        LEFT JOIN calendar_events ce ON ce.id = a.event_id
+        LEFT JOIN conversation_turns ct ON ct.id = a.conversation_turn_id
+        LEFT JOIN conversations c ON c.id = ct.conversation_id
         WHERE s.score > 0
-        ORDER BY s.score DESC,
-                 a.status IS NOT 'open',
-                 CASE
-                     WHEN a.deadline {_ISO_DATE} AND a.deadline >= date('now') THEN 0
-                     WHEN a.deadline {_ISO_DATE} THEN 2
-                     ELSE 1
-                 END,
-                 CASE WHEN a.deadline {_ISO_DATE} AND a.deadline >= date('now')
-                      THEN a.deadline END ASC,
-                 CASE WHEN a.deadline {_ISO_DATE} AND a.deadline < date('now')
-                      THEN a.deadline END DESC
+        ORDER BY s.score DESC, a.status IS NOT 'open', {action_order()}
         LIMIT ?
         """,
         keyword,

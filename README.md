@@ -148,6 +148,8 @@ Every dossier dates and orders its rows the same way (`src/store/ordering.py`): 
 
 A channel thread holds the post and its replies, each reply a message of its own, and a post is dated by when it was written, not by its newest reply. A message edited or deleted after it was first stored is brought up to date on a later pull: the edit replaces the text, a deletion blanks it, and either sends the thread back to extraction. Before this, replies stayed inside the post's stored payload, out of search and extraction, and the first draft of an edited message and the text of a deleted one were kept. `python -m src.cli teams-backfill-replies` stores the replies already held in stored posts, once (see `docs/DEPLOY.md`).
 
+Each message also keeps the payload teams-cli returned (`raw_json`), which the pull compares to tell an edit or a delete; nothing else reads it once the replies are stored. `python -m src.cli teams-drop-raw-json` drops it from the stored messages, once, after `teams-backfill-replies` and `teams-strip-html`: about 133 MB of the 244 MB table on the producer. A channel post whose payload still holds a reply that is not a message of its own keeps its payload, and `--dry-run` counts what would go. New messages keep their payload, and one whose payload was dropped gets it back, with the same text and no new extraction, the next time a pull reads it.
+
 ### WhatsApp
 
 - `search_whatsapp(query, chat, days, limit)`. Session summaries and raw message text, newest first, one row per session. `chat` narrows to chats whose name contains it (or one exact JID); `days` to sessions active in the window.
@@ -411,6 +413,7 @@ python -m src.cli calendar-sync --since 2026-01-01
 python -m src.cli news-sync --relevance 60
 python -m src.cli teams-sync --workers 4
 python -m src.cli teams-backfill-replies    # once, on the producer: store the channel replies stored posts hold; no Teams call
+python -m src.cli teams-drop-raw-json [--dry-run] [--limit N]   # once, on the producer, after teams-backfill-replies and teams-strip-html: drop the raw Teams payloads (see DEPLOY)
 python -m src.cli whatsapp-sync             # the snapshot at BRAIN_WHATSAPP_SNAPSHOT (see WhatsApp below)
 python -m src.cli process-attachments --phase 2 --workers 2
 python -m src.cli process-attachments --phase 2 --estimate             # calls, tokens and cost of the pending summaries; no model call

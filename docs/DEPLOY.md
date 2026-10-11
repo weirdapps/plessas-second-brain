@@ -495,6 +495,20 @@ within their deadline. A second run stores nothing. On a copy of the replica's T
 on 2026-10-11: 3,135 replies from 1,961 posts, 897 posts re-dated, 893 threads queued, in
 two seconds. No schema change, and it can run beside the timers.
 
+**Teams raw payloads.** Each Teams message also keeps the payload teams-cli returned
+(`teams_messages.raw_json`): 133 MB of the 244 MB table on the producer. The pull compares a
+message it reads again with it to tell an edit or a delete, so new messages keep writing it, and
+`teams-backfill-replies` reads the replies a post's payload holds. Nothing else reads it. Run
+`python -m src.cli teams-drop-raw-json` once on the producer, after `teams-backfill-replies` and
+`teams-strip-html`, with `--dry-run` first to see the count and the size. It sets the payload to
+NULL oldest first, 500 messages per short transaction, so it can run beside the timers, and
+`--limit N` stops it after N. A channel post whose payload still holds a reply that is not a
+message of its own keeps its payload (the command says how many and to run the backfill), as
+does one whose payload does not parse. It migrates first: from v34 dropping a payload leaves
+the full-text index alone. A message whose payload was dropped gets it back the next time a
+pull reads it, one rewrite of the same text with no model call. The file shrinks only after a
+`VACUUM`. It refuses to run on a replica.
+
 **Upgrading to schema v32.** From v32 `attachment_content` has three small indexes that
 answer the file sweep's classification and two health-check queries without reading the
 stored text. `extracted_text` (3 GB on the producer) sits ahead of the columns those queries

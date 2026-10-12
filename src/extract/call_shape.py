@@ -111,11 +111,16 @@ def max_tokens_attempts(route: Route) -> tuple[int, int]:
 
 def thread_call(route_name: str, v1_max_tokens: int) -> tuple[tuple[int, ...], dict]:
     """The output budgets a call on a route with an unchanged prompt (Teams, WhatsApp) is
-    sent with, and what call shape v2 adds to it: under v1 one call at `v1_max_tokens`
-    and nothing added; under v2 the route's budgets and its output_config."""
-    if call_shape() == "v1":
-        return (v1_max_tokens,), {}
+    sent with, and what call shape v2 adds to it: under v1 one call at `v1_max_tokens`,
+    once more at the route's budget if that reply stopped at max_tokens, and nothing
+    added; under v2 the route's budgets and its output_config.
+
+    v1's first call is the request as it always was. The second exists because a thread
+    cut short at 2,048 failed its parse on every run: 18 of the 23 Teams threads left
+    failed by the 2026-10-11 re-extraction (issue 163 counted 13% of calls cut short)."""
     route = ROUTES[route_name]
+    if call_shape() == "v1":
+        return (v1_max_tokens, route.max_tokens), {}
     return max_tokens_attempts(route), {"output_config": route.output_config()}
 
 

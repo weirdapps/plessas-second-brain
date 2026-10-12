@@ -312,8 +312,8 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
     # does. The old fallback skipped CLAUDE_EXTRACT_MODEL for a hardcoded 4.6
     # model, which on an eu client configured for 4.7+ returns 429.
     model = os.environ.get("BRAIN_TEAMS_MODEL") or None
-    # Call shape v1: one call at 2,048. v2: 8,192 at a pinned effort, and once more at
-    # twice that when the reply stops at max_tokens (src/extract/call_shape.py).
+    # Call shape v1: 2,048, and once more at 8,192 when the reply stops at max_tokens.
+    # v2: 8,192 at a pinned effort, and once more at twice that (src/extract/call_shape.py).
     budgets, pinned = thread_call("teams", 2048)
     for max_tokens in budgets:
         resp = complete(

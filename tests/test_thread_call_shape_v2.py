@@ -1,8 +1,8 @@
 """Teams and WhatsApp calls under each call shape.
 
 Thinking counts toward max_tokens, and at 2,048 it cut 13% of Teams calls short; a
-thread cut short fails its parse and is sent again next run. v1 keeps the 2,048 calls as
-they were. v2 gives them 8,192, pins the effort, and asks once more at twice the budget
+thread cut short failed its parse and was sent again next run. v1 keeps the 2,048 calls as
+they were and asks once more at the route's budget after a max_tokens stop. v2 gives them 8,192, pins the effort, and asks once more at twice the budget
 after a max_tokens stop. Their prompts are unchanged, and too short to cache, so no
 schema and no cache marker are sent.
 """
@@ -56,6 +56,19 @@ def test_v1_sends_what_it_always_sent(monkeypatch, model, pipeline, _route):
             "messages": [{"role": "user", "content": "the thread"}],
         }
     ]
+
+
+@pytest.mark.parametrize(("pipeline", "route"), ROUTES)
+def test_v1_asks_once_more_at_the_route_budget_after_a_max_tokens_stop(
+    monkeypatch, model, pipeline, route
+):
+    unset_env(monkeypatch, "BRAIN_EXTRACT_CALL_SHAPE")
+    model.replies = [response('{"summary": "cu', stop="max_tokens"), response('{"summary": "s"}')]
+
+    assert pipeline._call_llm("sys", "thread") == '{"summary": "s"}'
+
+    assert [c["max_tokens"] for c in model.calls] == [2048, call_shape.ROUTES[route].max_tokens]
+    assert all("output_config" not in c for c in model.calls)
 
 
 @pytest.mark.parametrize(("pipeline", "route"), ROUTES)

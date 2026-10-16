@@ -1,4 +1,4 @@
-"""v37: topic pages and the findings research sessions file back.
+"""v36: topic pages and the findings research sessions file back.
 
 A topic page is derived: a model writes it from cited store items, so it lives in a table
 of its own, with no full-text index and no vector, and nothing reads it as a source. A
@@ -70,8 +70,8 @@ def store(tmp_path):
     conn.close()
 
 
-def test_a_fresh_store_is_at_v37(store):
-    assert CURRENT_SCHEMA_VERSION >= 37
+def test_a_fresh_store_is_at_v36(store):
+    assert CURRENT_SCHEMA_VERSION >= 36
     assert get_schema_version(store) == CURRENT_SCHEMA_VERSION
 
 

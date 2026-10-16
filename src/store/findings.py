@@ -3,7 +3,7 @@
 Research teammates make most of the brain's calls, and what they verify (a figure
 reconciled, a claim corrected) ended in hand-edited memory files or was lost. A note a
 session writes is already ingested as a text-only document (src/export/session_notes.py);
-a fenced block in it now also loads, line by line, into the `findings` table (schema v37):
+a fenced block in it now also loads, line by line, into the `findings` table (schema v36):
 
     ```findings
     {"claim": "Share of loan applications made online", "value": "64.0%", "as_of": "2026-08",
@@ -512,7 +512,7 @@ def findings_matching(
                 text = search_fold(f"{r['claim']} {r['value'] or ''}")
                 if r["id"] not in seen and all(w in text for w in folded):
                     candidates.append(r)
-    except sqlite3.OperationalError:  # a store older than v37
+    except sqlite3.OperationalError:  # a store older than v36
         return []
     rows = [_row(r) for r in _rank(candidates)[: max(int(limit), 0)]]
     _mark_superseded(conn, rows)

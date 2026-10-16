@@ -12,7 +12,7 @@ What the field learned about such pages (July-October 2026) sets the rules:
   any line whose refs were not in the evidence the model was given;
 - a page is regenerated from the sources, never edited, and only when new evidence came
   in (or the prompt changed);
-- a page is never a source: it is kept in `topic_pages` (schema v37), out of every
+- a page is never a source: it is kept in `topic_pages` (schema v36), out of every
   full-text index and the vector index, and no page or finding is built from another
   page. Findings (src/store/findings.py) appear on a page, below the primary items.
 
@@ -630,7 +630,7 @@ def gather_evidence(
 def held_page(conn: sqlite3.Connection, key: str) -> dict | None:
     try:
         cursor = conn.execute("SELECT * FROM topic_pages WHERE topic = ?", (key,))
-    except sqlite3.OperationalError:  # a store older than v37
+    except sqlite3.OperationalError:  # a store older than v36
         return None
     row = cursor.fetchone()
     if row is None:

@@ -504,8 +504,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_index_people_lookups(conn)
     if current < 35:
         migrate_add_item_state(conn)
-    # v36 is the figures registry's (pr-numbers); renumber if this merges first.
-    if current < 37:
+    if current < 36:
         migrate_add_topic_pages(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
@@ -872,7 +871,7 @@ ITEM_STATE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
 
 
 def migrate_add_topic_pages(conn: sqlite3.Connection) -> None:
-    """v37: topic pages, and the findings research sessions file back.
+    """v36: topic pages, and the findings research sessions file back.
 
     A topic page (src/store/topic_pages.py) is one model call's account of a live topic,
     every line citing a store item by its kind and ref. It is derived, so it gets a table

@@ -536,7 +536,7 @@ each exec'ing its own wrapper (the shim sources the Vertex environment both call
 
 ```bash
 install -m 755 scripts/wrappers/systemd/sb-topic-pages.sh scripts/wrappers/systemd/sb-briefs.sh ~/.local/bin/
-python -m src.cli maint migrate                  # schema v37: topic_pages and findings, two new tables
+python -m src.cli maint migrate                  # schema v36: topic_pages and findings, two new tables
 python -m src.cli topic-pages --estimate         # the topics picked and the first build's price; no call
 python -m src.cli maint topic-pages              # the first build: about $1 for 20 pages, 10-15 minutes
 ```
@@ -1295,12 +1295,12 @@ No schema change and no one-off command: the ranking is in the query code alone 
    before ranked and the `_recency` modes with it; on the reference replica's 45
    questions, recall@10 0.62 to 0.78 in `recall`, 0.80 to 0.85 in `hybrid`.
 
-### One-off commands after 2026-10-16 (topic pages, findings, brief pilot, schema v37)
+### One-off commands after 2026-10-16 (topic pages, findings, brief pilot, schema v36)
 
 On the producer, with the environment the timers run with:
 
 1. **The schema.** `python -m src.cli maint migrate`, or the first job that writes:
-   v37 adds two tables (below); nothing needs stopping.
+   v36 adds two tables (below); nothing needs stopping.
 2. **The units.** Section 6, "Topic pages and the brief pilot": install the two
    wrappers and shims, price and run the first build, write `briefs.env`, enable
    the two timers.
@@ -1365,7 +1365,6 @@ one pass, at the first job that writes. The versions that ask for a step:
   second and nothing needs stopping. A job still running the old code writes NULL in
   the new columns, as v1 rows hold. The one-off commands of 2026-10-16 above fill
   what they can.
-- **v37.** `topic_pages` and `findings` (README, "Topic pages and findings"). Two new
-  tables and an index, no row rewritten and no full-text index touched, so nothing
-  needs stopping. The figures registry's v36 is another change's; if this one is
-  merged first, it is renumbered so that every version still runs.
+- **v36.** `topic_pages` and `findings` (README, "Topic pages and findings"). Two new
+  tables and three indexes, no row rewritten and no full-text index touched, so
+  nothing needs stopping.

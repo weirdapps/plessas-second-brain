@@ -15,6 +15,7 @@ from src.store.greek import (
     search_phrase,
     search_words,
 )
+from src.store.item_cleanup import not_boilerplate_sql
 from src.store.normalizer import normalize_topic
 from src.store.ordering import (
     EMAIL_DATE,
@@ -544,6 +545,7 @@ def get_topic_context(
     *,
     include_news: bool = False,
     include_automation: bool = False,
+    include_boilerplate: bool = False,
 ) -> dict:
     """Return context for a topic.
 
@@ -556,6 +558,8 @@ def get_topic_context(
         include_news, include_automation: Count and list news items and the
             owner's automation mail too, left out by default
             (src/store/source_class.py)
+        include_boilerplate: List key facts marked boilerplate too (text that recurs
+            across threads, schema v35, src/store/item_cleanup.py), left out by default
 
     Returns:
         Dict with topic info, email_count, recent_emails, key_people,
@@ -566,6 +570,7 @@ def get_topic_context(
 
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
     visible = visible_sql(conn, "e.id", include_news, include_automation)
+    facts = not_boilerplate_sql(conn, "kf", include_boilerplate)
     # Topics are stored normalized (lower case, accents stripped), so the query
     # must be too: an accented query matched nothing. Among partial matches an
     # exact name wins, then the most-used topic, rather than whichever came first.
@@ -729,7 +734,7 @@ def get_topic_context(
         FROM key_facts kf
         JOIN emails e ON kf.email_id = e.id
         JOIN email_topics et ON e.id = et.email_id
-        WHERE et.topic_id = ? AND e.date_received >= ? AND {visible}
+        WHERE et.topic_id = ? AND e.date_received >= ? AND {visible} AND {facts}
         ORDER BY {fact_order(EMAIL_DATE)}
         LIMIT ?
     """,
@@ -742,7 +747,7 @@ def get_topic_context(
         FROM key_facts kf
         JOIN emails e ON kf.email_id = e.id
         JOIN email_topics et ON e.id = et.email_id
-        WHERE et.topic_id = ? AND e.date_received >= ? AND {visible}
+        WHERE et.topic_id = ? AND e.date_received >= ? AND {visible} AND {facts}
     """,
         (topic_id, cutoff),
     ).fetchone()["cnt"]

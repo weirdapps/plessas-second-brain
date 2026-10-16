@@ -140,10 +140,11 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
     monkeypatch.setenv("VERTEX_SDK_REGION", "eu")
     monkeypatch.setenv("CLAUDE_EXTRACT_MODEL", "claude-sonnet-5-5")
+    # The tests below are written against v1 unless they set a shape of their own.
+    monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", "v1")
     unset_env(
         monkeypatch,
         "BRAIN_BATCH_LOCATION",
-        "BRAIN_EXTRACT_CALL_SHAPE",
         "ANTHROPIC_VERTEX_PROJECT_ID",
         "CLOUD_ML_REGION",
         "VERTEX_MODEL_EXTRACT",
@@ -496,12 +497,23 @@ def test_a_reply_the_collect_was_interrupted_after_is_not_loaded_again(cloud, st
     [
         ("v2", ok("ID", "", stop="refusal")),
         ("v2", ok("ID", reply()[:40], stop="max_tokens")),
+        ("v2-text", ok("ID", "", stop="refusal")),
+        ("v2-text", ok("ID", reply()[:40], stop="max_tokens")),
         ("v1", ok("ID", "", stop="refusal")),
         ("v1", ok("ID", "I cannot summarise this.")),
         ("v1", {"custom_id": "ID", "request": {}, "response": {"type": "error", "error": {}}}),
         ("v1", {"custom_id": "ID", "request": {}, "response": {"unexpected": True}}),
     ],
-    ids=["v2 refusal", "v2 cut short", "v1 refusal", "v1 no json", "error reply", "unknown shape"],
+    ids=[
+        "v2 refusal",
+        "v2 cut short",
+        "v2-text refusal",
+        "v2-text cut short",
+        "v1 refusal",
+        "v1 no json",
+        "error reply",
+        "unknown shape",
+    ],
 )
 def test_a_reply_the_online_path_would_not_store_stays_pending(
     shape, line, cloud, store, env, monkeypatch

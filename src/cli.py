@@ -2839,6 +2839,11 @@ def main():
     )
     parser_scrub.add_argument("script_args", nargs="*", help="The script's own arguments")
     parser_scrub.set_defaults(func=cmd_scrub)
+    # forget-itemless, mark-boilerplate, reextract-stacked (src/store/item_cleanup.py):
+    # maint-only, with no old spelling.
+    from src.store.item_cleanup import add_maint_parsers
+
+    add_maint_parsers(maint_subparsers)
 
     # Parse and execute
     args = parser.parse_args()

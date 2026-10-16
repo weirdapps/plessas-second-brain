@@ -65,9 +65,26 @@ DOCUMENT_MAILBOX = "External"  # src/extract/attachment_pipeline.py
 # ingest_text_document's sender address for the source "session-note" (src/export/session_notes.py)
 SESSION_NOTE_ADDRESS = "session-note@documents.local"
 
-# A job's stamp on a subject: a bracketed tag at the start, or an ISO date anywhere in it.
+# A job's stamp on a subject: a bracketed tag at the start, or a date anywhere in it, written
+# as an ISO date, as a day, a month's name and a year ('May 27, 2026', '9 June 2026'), or as a
+# weekday, a day and a month ('Tue 9 JUN', 'sat 23 may'). A day and a month alone, or a month
+# and a year, are how a person writes about a date and stamp nothing.
 _STAMP_TAG = re.compile(r"\[[^\[\]\s]{1,24}\]")
-_STAMP_DATE = re.compile(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)")
+_MONTH = (
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
+    r"|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?"
+)
+_WEEKDAY = (
+    r"(?:mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?|thu(?:r(?:s(?:day)?)?)?|fri(?:day)?"
+    r"|sat(?:urday)?|sun(?:day)?)\.?"
+)
+_STAMP_DATE = re.compile(
+    r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)"
+    rf"|(?<![^\W\d_]){_MONTH}\s+\d{{1,2}},?\s+\d{{4}}(?!\d)"
+    rf"|(?<![\w]){r'\d'}{{1,2}}\s+{_MONTH},?\s+\d{{4}}(?!\d)"
+    rf"|(?<![^\W\d_]){_WEEKDAY},?\s+(?:\d{{1,2}}\s+{_MONTH}|{_MONTH}\s+\d{{1,2}})(?![^\W\d_])",
+    re.IGNORECASE,
+)
 
 # Rows the backfill reads, classifies and writes at a time.
 BACKFILL_CHUNK = 5000
@@ -90,6 +107,19 @@ class SourceClassMissing(RuntimeError):
     is stored or set (the writers, reclassify()); reads fall back instead (column_missing())."""
 
 
+# The classes that give no decisions, action items or commitments: a news digest or a job's
+# report decides nothing for the owner and owes no one anything. On 2026-10-16 they had left
+# 44,627 decisions, 23,190 actions and 5,113 commitments (src/store/item_cleanup.py forgets
+# them). Their key facts and topics are kept, and carry the class like any row.
+ITEMLESS_CLASSES = (NEWS, AUTOMATION)
+
+
+def takes_items(source_class: str | None) -> bool:
+    """Whether an email of this class gives decisions, action items and commitments; an
+    email whose class is unknown (None) does."""
+    return source_class not in ITEMLESS_CLASSES
+
+
 def hidden_classes(include_news: bool = False, include_automation: bool = False) -> tuple[str, ...]:
     """The classes a read path leaves out: news and automation, unless asked for."""
     return tuple(
@@ -101,8 +131,8 @@ def hidden_classes(include_news: bool = False, include_automation: bool = False)
 
 def _stamped(subject: str) -> bool:
     """Whether a subject reads as a job's report: not a reply or a forward, stamped with a
-    bracketed tag first or an ISO date, and naming something besides the stamp. A subject
-    that is only a date or a tag is how a person titles a note as easily as a job."""
+    bracketed tag first or a date (_STAMP_DATE), and naming something besides the stamp. A
+    subject that is only a date or a tag is how a person titles a note as easily as a job."""
     head = subject.strip()  # tabs and no-break spaces too
     if normalize_subject(head) != head.lower():
         return False  # 'Re:', 'FW:', 'Απ:' and the like: someone answered or passed it on

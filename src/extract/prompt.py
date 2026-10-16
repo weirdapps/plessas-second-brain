@@ -308,6 +308,8 @@ A task that someone has to do.
 
 COMMITMENTS
 A promise that a named person makes to another in the newest message: "by" is who made it, "to" is who received it. A commitment is usually an action item as well.
+- "direction": "owner_owes" when the owner made the promise; "owed_to_owner" when it was made to the owner; "third_party" when it involves neither.
+- "due": the date it is promised for, resolved against the email's date as a deadline is and written YYYY-MM-DD; null when it gives none.
 
 EVIDENCE
 Each decision, action item and commitment starts with its evidence: the shortest passage of the email, at most 200 characters, that states it, copied character for character from the newest message, in the same script, spelling and punctuation, with no ellipsis, translation or paraphrase. When no passage states an item, leave the item out.
@@ -433,6 +435,8 @@ EMAIL_EXAMPLES_V2 = (
                     "commitment": "Αποστολή της υπογεγραμμένης απόφασης στο Λογιστήριο έως τις 6/3",
                     "by": "Ελένη Παππά",
                     "to": "Νίκος Αντωνίου",
+                    "direction": "owner_owes",
+                    "due": "2026-03-06",
                 }
             ],
             "key_facts": ["Προϋπολογισμός του πιλοτικού προγράμματος: 40.000 ευρώ"],

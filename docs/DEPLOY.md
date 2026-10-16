@@ -889,8 +889,10 @@ job runs on, and `reextract --batch-collect` prints the replies later. What it s
 - replies counted `failed` with a message about the response's keys: the output lines are laid out
   otherwise than the code reads them, and nothing was stored. Report the message (it names the
   keys, not the text) before any backfill;
-- under `BRAIN_EXTRACT_CALL_SHAPE=v2`, run it a second time: cache reads in the usage log and
-  `parsed` replies say that batch jobs take the cached system prompt and the structured outputs.
+- under the default call shape, `v2-text`, run it a second time: cache reads in the usage log and
+  `parsed` replies say that batch jobs take the cached system prompt and the pinned effort; an
+  error naming either says to send that backfill with `BRAIN_EXTRACT_CALL_SHAPE=v1`. (`v2` adds
+  structured outputs, which the reference project refuses online.)
 
 **The backfill.** Price it first: `python -m src.cli maint reextract --long --estimate` prints the
 online and the batch cost. Then, on the producer:
@@ -1132,6 +1134,58 @@ is there; the counts are the reference replica's on 2026-10-16, as examples of s
    before. Marked scans read again by `reextract --garbled`, and scans read again by
    `reextract --ocr`, are turned upright too.
 
+### One-off commands after 2026-10-16 (call shape v2-text, schema v35)
+
+This release makes call shape `v2-text` the default for email and attachment
+extraction (README, "Extraction call shape"), stores what schema v2 says about each
+item (v35, below), takes no decisions, actions or commitments from news or automation
+mail, and widens the automation stamp to written dates. On the producer, in this order,
+with the environment the timers run with:
+
+1. **Before the pull, choose the shape.** The default changes with the code, at the
+   next hourly sync after the pull. To keep v1 until step 2 has run, put
+   `BRAIN_EXTRACT_CALL_SHAPE=v1` in the timers' environment before pulling, and take
+   it out after. A Vertex batch job sent before the pull was sent in v1 and is
+   collected only under v1: `BRAIN_EXTRACT_CALL_SHAPE=v1 python -m src.cli
+   process-attachments --phase 2 --batch-collect`. A batch backfill under v2-text
+   wants `maint reextract --batch --probe` first: the batch service is not yet known
+   to take the pinned effort and the cache marker.
+2. **The eval.** `python scripts/extraction_eval.py --dry-run --synthetic --call-shape
+   v2-text` costs nothing: it grades the gold and prints the request check, which
+   must read `0 with output_config.format`. Then
+   `python scripts/extraction_eval.py --run --synthetic --judge --yes --call-shape v2-text`
+   and the same with `--call-shape v1`, and compare the two records in
+   `results.jsonl` (`schema_valid`, `must_not`, `evidence_verbatim`, `owner_roles`, the
+   judge's F1). The estimate prints first: on the replica's prompts, 12 extraction
+   calls at most $0.47 under v2-text and $0.25 under v1, and 12 judge calls at most
+   $0.25 each run, upper bounds. With the owner's labelled set, run it the same way
+   without `--synthetic` (about $3 a shape).
+3. **Sources and the owner.** List every address the owner sends from in
+   `BRAIN_USER_EMAIL_PATTERN`, then `python -m src.cli maint classify-sources`. With
+   the work addresses listed it turns 736 stored reports from `mail` to `automation`
+   on the reference replica; reports sent from an address the pattern does not list
+   stay `mail`.
+4. **Items from news and automation.** `python -m src.cli maint forget-itemless`
+   counts, `--apply` deletes, in one transaction. On the reference replica, before
+   step 3: 44,627 decisions (19,606 news, 25,021 automation), 23,194 actions, 5,113
+   commitments; step 3 adds the reports it reclassified. No model call.
+5. **Boilerplate facts.** `python -m src.cli maint mark-boilerplate` counts the fact
+   texts found in five or more distinct threads and prints the commonest; `--apply`
+   marks them and records their keys, so later copies are marked as they load. On the
+   reference replica: 82,412 of 1,207,372 key facts, 5,399 texts, counted in 13 s;
+   nothing is deleted. It reads every key fact once into temporary tables; no model
+   call. Run it before step 6, so the facts step 6 writes are marked as they load,
+   and again now and then: the loader marks only texts already known.
+6. **Stacked attachment facts.** `python -m src.cli maint reextract-stacked` prices
+   it and changes nothing: 6,328 emails on the reference replica, one call each,
+   $157 at most with 1,500 output tokens a call, about $115 at 900, the system prompt
+   cached. Then once a day,
+   `python -m src.cli maint reextract-stacked --apply --token-budget 20000000 --limit 2500`
+   (about $45, which with the hourly jobs' $10-15 a day stays under the $60 alert),
+   until the dry run counts 0: three days. It resumes where it stopped; exit 75 means
+   the service stopped it, and the next run carries on. It runs beside the timers,
+   one commit per email.
+
 ### Schema notes
 
 A store that missed several releases takes every migration since its version in
@@ -1175,3 +1229,9 @@ one pass, at the first job that writes. The versions that ask for a step:
   the index over with `python -m src.cli embed --force` on the producer, apart from
   the embedding jobs (mind the API quota); `teams-sync` and `whatsapp-sync` add
   their vectors back, 500 a run.
+- **v35.** The item-state columns on `decisions`, `action_items`, `commitments` and
+  `key_facts`, and `boilerplate_fact_keys` (README, "Database schema"). ADD COLUMN
+  only: no row is rewritten and no full-text index rebuilt, so it takes well under a
+  second and nothing needs stopping. A job still running the old code writes NULL in
+  the new columns, as v1 rows hold. The one-off commands of 2026-10-16 above fill
+  what they can.

@@ -172,6 +172,7 @@ Extract the following as JSON:
 }}
 
 Take decisions and action items only from notes or minutes of the meeting itself: what was agreed, and who will do what. An agenda, an invitation or a list of topics to discuss records no decision; for those, return empty arrays and summarise the purpose and agenda.
+Not decisions either: a requirement of a law, regulation, contract or policy that the notes quote; a row or a figure of a table; an intention without a choice ("we will look into it"); a decision taken before the meeting that the notes only recall or forward.
 Set decision_date to the date the text states for the decision, as YYYY-MM-DD, or to JSON null when it states none.
 If the body is empty or contains only a Teams link with no agenda, return empty summary and empty arrays.
 """

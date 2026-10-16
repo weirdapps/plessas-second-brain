@@ -10,12 +10,15 @@ the calls would cost and stop.
     python scripts/extraction_eval.py --dry-run [--judge]    # validate, test the grader, regrade, estimate
     python scripts/extraction_eval.py --run --judge --yes    # extract, grade, record
     python scripts/extraction_eval.py --calibrate --yes      # how far the judge agrees with the owner
-    python scripts/extraction_eval.py --run --yes --call-shape v2   # the same cases in call shape v2
-    python scripts/extraction_eval.py --run --yes --synthetic       # six built-in cases, no set needed
+    python scripts/extraction_eval.py --run --yes --call-shape v1   # the same cases in call shape v1
+    python scripts/extraction_eval.py --run --yes --synthetic --call-shape v2-text   # no set needed
 
-`--call-shape v1|v2` builds every extraction call in that shape (src/extract/call_shape.py);
-without it the run takes BRAIN_EXTRACT_CALL_SHAPE's, as the sync would. Run the set under
-both and compare the two records before turning v2 on. `--synthetic` runs, or dry-runs, six
+`--call-shape v1|v2|v2-text` builds every extraction call in that shape
+(src/extract/call_shape.py); without it the run takes BRAIN_EXTRACT_CALL_SHAPE's, as the
+sync would (v2-text when unset). Run the set under two and compare the records. Before any
+call, every case's request is built and checked: a shape without structured outputs (v1,
+v2-text) must carry no `output_config.format`, or the dry run fails and the run refuses;
+the run also stops any such call before it is sent. `--synthetic` runs, or dry-runs, six
 labelled cases the eval builds itself in place of the set, for a host that has none.
 
 The set and its results live in ${BRAIN_DATA_DIR:-~/.second-brain}/evals/extraction/, never
@@ -176,7 +179,20 @@ def _dry_run(args, files: ev.Files, cases: list[dict]) -> int:
         _print_scores(regraded)
     estimate = ev.estimate(cases, reps=args.reps, judge=args.judge, call_shape=args.call_shape)
     _print_estimate(estimate, len(cases), args.reps)
-    return 1 if test["oracle_failures"] else 0
+    checked = _request_check(cases, args.call_shape)
+    return 1 if test["oracle_failures"] or not checked else 0
+
+
+def _request_check(cases: list[dict], shape: str) -> bool:
+    """Print what the request check found; whether it passed."""
+    check = ev.request_check(cases, shape)
+    print(
+        f"request check: {check['requests']} requests in call shape {shape},"
+        f" {check['format_requests']} with output_config.format"
+    )
+    if not check["ok"]:
+        print(f"  call shape {shape} must send no output_config.format: the project refuses it")
+    return bool(check["ok"])
 
 
 def _selected(cases: list[dict], wanted: list[str]) -> list[dict] | None:
@@ -213,6 +229,8 @@ def _run(args, files: ev.Files, cases: list[dict]) -> int:
         len(selected),
         args.reps,
     )
+    if not _request_check(selected, args.call_shape):
+        return 1
     if not args.yes:
         print("Nothing was called. Add --yes to run it.")
         return 2
@@ -233,7 +251,8 @@ def _run(args, files: ev.Files, cases: list[dict]) -> int:
     print(
         f"run {record['run_id']}: {record['model']}, call shape {record['call_shape']}, prompt"
         f" {record['prompt_sha']}, effort {record['effort']}; {rows['scored']} graded,"
-        f" {rows['truncated']} truncated, {rows['refused']} refused, {rows['errors']} errors"
+        f" {rows['truncated']} truncated, {rows['refused']} refused, {rows['errors']} errors;"
+        f" {record['format_calls']} calls with output_config.format"
     )
     _print_scores(record)
     if record["judge"]:

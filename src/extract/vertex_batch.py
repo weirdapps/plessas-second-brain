@@ -58,7 +58,7 @@ from urllib.parse import quote
 from src.config import DATA_ROOT, DEFAULT_DB, is_replica, replica_refusal
 from src.extract import attachment_pipeline as ap
 from src.extract import claude_extract
-from src.extract.call_shape import Request, call_shape, prompt_hash
+from src.extract.call_shape import Request, call_shape, prompt_hash, uses_schema_v2
 from src.extract.claude_extract import (
     ClaudeNotConfigured,
     claude_model,
@@ -820,7 +820,8 @@ def _outcome(reply: _Reply | None, call: ap.Phase2Call | None, shape: str) -> An
     stop = getattr(reply.response, "stop_reason", None)
     if stop == "refusal":
         return "refused"
-    if stop == "max_tokens" and shape == "v2":
+    # v2 and v2-text ask a reply cut short once more online, at twice the budget.
+    if stop == "max_tokens" and uses_schema_v2(shape):
         return "cut short"
     try:
         return call, ap.parse_reply(call.prompt, reply.response)

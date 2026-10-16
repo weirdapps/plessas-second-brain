@@ -13,6 +13,13 @@ from src.extract import claude_extract, vertex_auth
 from src.llm_policy import ReauthResult
 
 
+@pytest.fixture(autouse=True)
+def _v1_call_shape(monkeypatch):
+    """These tests are written against the v1 prompt and its replies. v2-text is the
+    default since 2026-10-16; the shapes are tested on their own in the call-shape tests."""
+    monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", "v1")
+
+
 def _create_test_db(db_path):
     """Create a minimal test database with attachments."""
     from src.store.schema import create_database

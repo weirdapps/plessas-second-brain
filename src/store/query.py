@@ -12,6 +12,7 @@ from typing import Any
 from src.config import USER_EMAIL_PATTERN
 from src.store import envelope
 from src.store.greek import register_sql_functions, search_fold
+from src.store.item_cleanup import not_boilerplate_sql
 from src.store.normalizer import normalize_topic
 from src.store.ordering import (
     EMAIL_DATE,
@@ -1380,7 +1381,7 @@ def meeting_prep(
             JOIN emails e ON kf.email_id = e.id
             WHERE e.id IN (SELECT et.email_id FROM email_topics et
                            JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
-              AND e.date_received >= ? AND {visible}
+              AND e.date_received >= ? AND {visible} AND {not_boilerplate_sql(conn)}
             ORDER BY {fact_order(EMAIL_DATE)} LIMIT 20
         """,
             (f"%{topic_normalized}%", cutoff),

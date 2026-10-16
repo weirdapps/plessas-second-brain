@@ -9,11 +9,20 @@ import inspect
 import json
 import sqlite3
 
+import pytest
+
 from src.extract import attachment_pipeline, claude_extract
 from src.extract.attachment_extractors import MAX_TEXT_CHARS, extract_text_from_file
 from src.extract.attachment_pipeline import DEFERRED, LONG_TEXT_CHARS, run_phase2
 from src.extract.attachment_prompt import PART_CHARS, build_attachment_prompt, split_text
 from src.store.schema import create_database
+
+
+@pytest.fixture(autouse=True)
+def _v1_call_shape(monkeypatch):
+    """These tests are written against the v1 prompt and its replies. v2-text is the
+    default since 2026-10-16; the shapes are tested on their own in the call-shape tests."""
+    monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", "v1")
 
 
 class _TextBlock:

@@ -18,6 +18,14 @@ from src.extract import attachment_extractors as ax
 from src.store.file_sweep import SweepPolicy, sweep_files
 from src.store.schema import create_database
 
+
+@pytest.fixture(autouse=True)
+def _v1_call_shape(monkeypatch):
+    """These tests are written against the v1 prompt and its replies. v2-text is the
+    default since 2026-10-16; the shapes are tested on their own in the call-shape tests."""
+    monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", "v1")
+
+
 WORDS = "The plan for the regional network, in enough words to pass the filter. "
 APPLY = SweepPolicy(apply=True)
 

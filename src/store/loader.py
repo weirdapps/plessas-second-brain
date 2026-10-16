@@ -15,6 +15,7 @@ from src.extract.parser import _as_string_list
 from src.redact import redact_secrets
 
 from .email_html import save_html, split_body
+from .greek import search_fold
 from .normalizer import find_or_create_person, find_or_create_topic, normalize_topic
 from .schema import normalize_subject
 from .source_class import stored_class
@@ -388,7 +389,7 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
     if html is not None and email_id is not None:
         save_html(conn, email_id, html)
 
-    _write_extraction(conn, email_id, metadata, extraction)
+    commitments = _write_extraction(conn, email_id, metadata, extraction)
 
     # Also add sender as a person. The header names below are the only ones that
     # may rename a person found by address (display_name=True): the model's
@@ -426,6 +427,7 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
                 "INSERT OR IGNORE INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, ?)",
                 (email_id, cc_id, "cc"),
             )
+    _link_commitment_people(conn, metadata, commitments)
 
     # Forward hook: Stage 1 image classification for inline images
     try:
@@ -462,18 +464,75 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
     return True
 
 
+def _iso_day(value) -> str | None:
+    """The YYYY-MM-DD a stored time starts with, or None."""
+    from src.extract.schema_v2 import is_date
+
+    day = str(value or "")[:10]
+    return day if is_date(day) else None
+
+
+def _evidence(item: dict, schema2: bool) -> str | None:
+    """A v2 item's quote, masked, when the parser found it in the text the model read; None
+    otherwise, a v1 item's always. A quote the text does not hold is a paraphrase, and the
+    column holds only passages the source states."""
+    quote = item.get("evidence")
+    if not (schema2 and item.get("evidence_found") and isinstance(quote, str) and quote.strip()):
+        return None
+    return redact_secrets(quote)
+
+
+def _v2_field(item: dict, key: str, schema2: bool):
+    """A schema v2 field of an item, None for a v1 item: v1's parser keeps keys it does not
+    know, and a v1 row keeps NULL in the v35 columns."""
+    value = item.get(key) if schema2 else None
+    return value if isinstance(value, str) and value else None
+
+
+# A v2 commitment written, for _link_commitment_people: its id, who gave it, who received
+# it, and the people the model named, by folded name.
+_Pending = tuple[int, str | None, str | None, dict[str, int]]
+
+
 def _write_extraction(
-    conn: sqlite3.Connection, email_id: int, metadata: dict, extraction: dict
-) -> None:
+    conn: sqlite3.Connection,
+    email_id: int,
+    metadata: dict,
+    extraction: dict,
+    *,
+    items_only: bool = False,
+) -> list[_Pending]:
     """Write the rows an extraction gives a stored email: its topics, decisions,
-    action items, commitments, the people the model named with their roles, and
+    action items, the people the model named with their roles, its commitments, and
     its key facts. The header people (sender, recipients) are the caller's.
 
     The texts of decisions, action items, commitments and key facts are masked
     (src/redact.py) as they are stored: the model may copy a card number, an IBAN
-    or a password out of text read before the masking, or despite its prompt."""
+    or a password out of text read before the masking, or despite its prompt.
+
+    A schema v2 extraction (src/extract/schema_v2.py) also fills the v35 columns: a
+    decision's status, owner_role and quote, dated by the email that states it (v2 takes
+    decisions from the newest message alone); an action's direction and quote; a
+    commitment's due date, direction, status 'open' and quote. A v1 extraction leaves them
+    NULL. News and the owner's automation mail give no decisions, action items or
+    commitments (src/store/source_class.py takes_items); their topics and key facts are
+    kept. A key fact whose text is known boilerplate (src/store/item_cleanup.py) is marked
+    as it is stored.
+
+    With `items_only` the topics and the people are left as they are (replace_items).
+
+    Returns the v2 commitments written, which _link_commitment_people gives their people
+    once the header people exist.
+    """
+    from .item_cleanup import is_boilerplate
+    from .source_class import classes_of, takes_items
+
+    schema2 = extraction.get("extraction_schema") == 2
+    takes = takes_items(classes_of(conn, [email_id]).get(email_id))
+    message_day = _iso_day(metadata.get("date_received")) if schema2 else None
+
     # Load topics
-    for topic_name in extraction.get("topics", []):
+    for topic_name in [] if items_only else extraction.get("topics", []):
         topic_id = find_or_create_topic(conn, topic_name)
         conn.execute(
             "INSERT OR IGNORE INTO email_topics (email_id, topic_id) VALUES (?, ?)",
@@ -481,7 +540,7 @@ def _write_extraction(
         )
 
     # Load decisions
-    for decision in extraction.get("decisions", []):
+    for decision in extraction.get("decisions", []) if takes else []:
         if isinstance(decision, dict):
             decision_text = decision.get("decision")
             if not decision_text:
@@ -494,10 +553,19 @@ def _write_extraction(
                 decision_date = decision_date[0] if decision_date else None
             conn.execute(
                 """
-                INSERT INTO decisions (email_id, decision, decided_by, decision_date)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO decisions (email_id, decision, decided_by, decision_date,
+                                       status, owner_role, evidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (email_id, redact_secrets(decision_text), decided_by, decision_date),
+                (
+                    email_id,
+                    redact_secrets(decision_text),
+                    decided_by,
+                    decision_date or message_day,
+                    _v2_field(decision, "status", schema2),
+                    _v2_field(decision, "owner_role", schema2),
+                    _evidence(decision, schema2),
+                ),
             )
         elif decision:
             conn.execute(
@@ -506,7 +574,7 @@ def _write_extraction(
             )
 
     # Load action items
-    for action in extraction.get("action_items", []):
+    for action in extraction.get("action_items", []) if takes else []:
         if isinstance(action, dict):
             task_text = action.get("task")
             if not task_text:
@@ -522,10 +590,19 @@ def _write_extraction(
                 status = status[0] if status else "open"
             conn.execute(
                 """
-                INSERT INTO action_items (email_id, task, owner, deadline, status)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO action_items (email_id, task, owner, deadline, status,
+                                          direction, evidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (email_id, redact_secrets(task_text), owner, deadline, status),
+                (
+                    email_id,
+                    redact_secrets(task_text),
+                    owner,
+                    deadline,
+                    status,
+                    _v2_field(action, "direction", schema2),
+                    _evidence(action, schema2),
+                ),
             )
         elif action:
             conn.execute(
@@ -533,34 +610,13 @@ def _write_extraction(
                 (email_id, redact_secrets(action)),
             )
 
-    # Load commitments (extracted by the LLM; previously parsed then dropped)
-    for commitment in extraction.get("commitments", []):
-        if isinstance(commitment, dict):
-            commitment_text = commitment.get("commitment")
-            if not commitment_text:
-                continue
-            by_person = commitment.get("by")
-            if isinstance(by_person, list):
-                by_person = ", ".join(str(b) for b in by_person)
-            to_person = commitment.get("to")
-            if isinstance(to_person, list):
-                to_person = ", ".join(str(t) for t in to_person)
-            conn.execute(
-                """
-                INSERT INTO commitments (email_id, commitment, by_person, to_person)
-                VALUES (?, ?, ?, ?)
-                """,
-                (email_id, redact_secrets(commitment_text), by_person, to_person),
-            )
-        elif commitment:
-            conn.execute(
-                "INSERT INTO commitments (email_id, commitment) VALUES (?, ?)",
-                (email_id, redact_secrets(commitment)),
-            )
-
     # Load people and their roles: people_roles in schema v1, people in schema v2
-    for person_name, person_email, roles in _named_people(extraction, metadata):
+    people_ids: dict[str, int] = {}
+    named = [] if items_only else _named_people(extraction, metadata)
+    for person_name, person_email, roles, names in named:
         person_id = find_or_create_person(conn, person_name, person_email)
+        for name in names:
+            people_ids.setdefault(search_fold(name), person_id)
 
         for role in roles:
             if isinstance(role, dict):
@@ -575,13 +631,83 @@ def _write_extraction(
                 (email_id, person_id, role),
             )
 
+    # Load commitments (extracted by the LLM; previously parsed then dropped)
+    pending: list[_Pending] = []
+    for commitment in extraction.get("commitments", []) if takes else []:
+        if isinstance(commitment, dict):
+            commitment_text = commitment.get("commitment")
+            if not commitment_text:
+                continue
+            by_person = commitment.get("by")
+            if isinstance(by_person, list):
+                by_person = ", ".join(str(b) for b in by_person)
+            to_person = commitment.get("to")
+            if isinstance(to_person, list):
+                to_person = ", ".join(str(t) for t in to_person)
+            cursor = conn.execute(
+                """
+                INSERT INTO commitments (email_id, commitment, by_person, to_person,
+                                         due, direction, status, evidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    email_id,
+                    redact_secrets(commitment_text),
+                    by_person,
+                    to_person,
+                    _v2_field(commitment, "due", schema2),
+                    _v2_field(commitment, "direction", schema2),
+                    "open" if schema2 else None,
+                    _evidence(commitment, schema2),
+                ),
+            )
+            if schema2 and cursor.lastrowid is not None:
+                pending.append((cursor.lastrowid, by_person, to_person, people_ids))
+        elif commitment:
+            conn.execute(
+                "INSERT INTO commitments (email_id, commitment) VALUES (?, ?)",
+                (email_id, redact_secrets(commitment)),
+            )
+
     # Load key facts
     for fact in extraction.get("key_facts", []):
         if fact:
+            masked = redact_secrets(fact)
             conn.execute(
-                "INSERT INTO key_facts (email_id, fact) VALUES (?, ?)",
-                (email_id, redact_secrets(fact)),
+                "INSERT INTO key_facts (email_id, fact, boilerplate) VALUES (?, ?, ?)",
+                (email_id, masked, int(is_boilerplate(conn, masked))),
             )
+    return pending
+
+
+def _link_commitment_people(
+    conn: sqlite3.Connection, metadata: dict, pending: list[_Pending]
+) -> None:
+    """Give each v2 commitment the people rows of who gave and who received it: a person
+    the model named, by any of the names it gave them, else a header person, by the name
+    the headers show; NULL for a name neither holds (a team, a committee). Run after the
+    header people are written, so a recipient the model did not list is found too."""
+
+    def person(name: str | None, ids: dict[str, int]) -> int | None:
+        name = (name or "").strip()
+        if not name:
+            return None
+        found = ids.get(search_fold(name))
+        if found is not None:
+            return found
+        address = _find_person_email(name, metadata)
+        if not address:
+            return None
+        row = conn.execute(
+            "SELECT id FROM people WHERE lower(email) = lower(?)", (address,)
+        ).fetchone()
+        return row[0] if row else None
+
+    for commitment_id, by_person, to_person, ids in pending:
+        conn.execute(
+            "UPDATE commitments SET by_person_id = ?, to_person_id = ? WHERE id = ?",
+            (person(by_person, ids), person(to_person, ids), commitment_id),
+        )
 
 
 def _stored_texts(items, key: str | None) -> list:
@@ -645,7 +771,39 @@ def replace_extraction(
         " OR person_id IN (SELECT id FROM people WHERE COALESCE(email, '') = ''))",
         (email_id,),
     )
-    _write_extraction(conn, email_id, metadata, right)
+    _link_commitment_people(conn, metadata, _write_extraction(conn, email_id, metadata, right))
+
+
+def replace_items(
+    conn: sqlite3.Connection, email_id: int, metadata: dict, extraction: dict
+) -> dict:
+    """Give a stored email the decisions, action items, commitments and key facts of
+    `extraction`, a new extraction of its body, in place of the ones its body gave it.
+
+    Every row of the email that no attachment wrote goes: its key facts, decisions and
+    action items with attachment_id NULL, and its commitments, which only a body gives.
+    Rows an attachment wrote, which carry its attachment_id, stay. Before schema v28 an
+    attachment's rows carried none, so the rows that go include those older generations,
+    which a later summary of the attachment had left beside its new rows. Nothing tells them
+    from the body's own rows, so this is the only way they go: with the body's rows written
+    again from `extraction` in the same transaction, which the caller holds. The summary,
+    topics, people and vector stay as they are. Returns the untagged key facts before and
+    after.
+    """
+    before = conn.execute(
+        "SELECT COUNT(*) FROM key_facts WHERE email_id = ? AND attachment_id IS NULL", (email_id,)
+    ).fetchone()[0]
+    for table in ("key_facts", "decisions", "action_items"):
+        conn.execute(
+            f"DELETE FROM {table} WHERE email_id = ? AND attachment_id IS NULL", (email_id,)
+        )
+    conn.execute("DELETE FROM commitments WHERE email_id = ?", (email_id,))
+    pending = _write_extraction(conn, email_id, metadata, extraction, items_only=True)
+    _link_commitment_people(conn, metadata, pending)
+    after = conn.execute(
+        "SELECT COUNT(*) FROM key_facts WHERE email_id = ? AND attachment_id IS NULL", (email_id,)
+    ).fetchone()[0]
+    return {"facts_before": before, "facts_after": after}
 
 
 def stored_email(conn: sqlite3.Connection, email_id: int) -> dict:
@@ -1030,8 +1188,12 @@ def _header_people(metadata: dict) -> dict[str, str]:
     return out
 
 
-def _named_people(extraction: dict, metadata: dict) -> list[tuple[str, str | None, list]]:
-    """(name, address or None, roles) of each person the model named.
+def _named_people(
+    extraction: dict, metadata: dict
+) -> list[tuple[str, str | None, list, tuple[str, ...]]]:
+    """(name, address or None, roles, names) of each person the model named; `names` are
+    every name the extraction gives them (the name stored, and in schema v2 its name as
+    written and in Latin letters), by which a commitment's giver or receiver is found.
 
     Schema v1 names them in `people_roles`, a role or a list of roles by name. Schema v2
     (src/extract/schema_v2.py) lists them in `people`, each with its name as written, its
@@ -1048,7 +1210,7 @@ def _named_people(extraction: dict, metadata: dict) -> list[tuple[str, str | Non
     people = extraction.get("people")
     if extraction.get("extraction_schema") == 2 and isinstance(people, list):
         headers = _header_people(metadata)
-        out: list[tuple[str, str | None, list]] = []
+        out: list[tuple[str, str | None, list, tuple[str, ...]]] = []
         for person in people:
             if not isinstance(person, dict):
                 continue
@@ -1064,21 +1226,23 @@ def _named_people(extraction: dict, metadata: dict) -> list[tuple[str, str | Non
                     latin and _find_person_email(latin, metadata)
                 )
                 address = str(found or "").strip().lower()
+            names = tuple(n for n in (written, latin) if n)
             if address in headers:
-                out.append((headers[address], address, roles))
+                out.append((headers[address], address, roles, (headers[address], *names)))
             else:
-                out.append((written or latin, None, roles))
+                out.append((written or latin, None, roles, names))
         return out
 
     people_roles = extraction.get("people_roles", {})
     if not isinstance(people_roles, dict):
         return []
-    named: list[tuple[str, str | None, list]] = []
+    named: list[tuple[str, str | None, list, tuple[str, ...]]] = []
     for person_name, roles in people_roles.items():
         # Try to get email from recipients
         person_email = _find_person_email(person_name, metadata)
         # Add roles (could be string or list)
-        named.append((person_name, person_email, [roles] if isinstance(roles, str) else roles))
+        roles = [roles] if isinstance(roles, str) else roles
+        named.append((person_name, person_email, roles, (person_name,)))
     return named
 
 

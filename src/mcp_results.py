@@ -116,7 +116,20 @@ class PersonContext(Fresh, total=False):
 
 
 @with_config(_OPEN)
+class TopicPage(Fresh, total=False):
+    """topic_page: the page (None when the topic has none), the findings filed about the
+    topic, and, with no page, the topics that have one."""
+
+    topic_page: dict[str, Any] | None
+    findings: Rows
+    pages: Rows
+    reason: str
+    truncated: Truncated
+
+
+@with_config(_OPEN)
 class TopicContext(Fresh, total=False):
+    topic_page: dict[str, Any]
     topic: dict[str, Any] | None
     email_count: int
     recent_emails: Rows

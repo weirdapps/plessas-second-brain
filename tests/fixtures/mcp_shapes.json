@@ -1941,6 +1941,7 @@
         "recent_emails",
         "stale",
         "topic",
+        "topic_page",
         "truncated"
       ],
       "required": [
@@ -1951,6 +1952,7 @@
     "result_keys": [
       "data_as_of",
       "stale",
+      "topic_page",
       "topic",
       "email_count",
       "recent_emails",
@@ -2016,6 +2018,73 @@
         "subject",
         "summary",
         "who"
+      ],
+      "topic_page.citations": [
+        "date",
+        "kind",
+        "ref",
+        "title"
+      ]
+    }
+  },
+  "topic_page": {
+    "input_schema": {
+      "properties": [
+        "topic"
+      ],
+      "required": [
+        "topic"
+      ]
+    },
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "data_as_of",
+        "findings",
+        "pages",
+        "reason",
+        "stale",
+        "topic_page",
+        "truncated"
+      ],
+      "required": [
+        "data_as_of",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "topic_page",
+      "findings"
+    ],
+    "rows": {
+      "findings": [
+        "as_of",
+        "author_kind",
+        "claim",
+        "date",
+        "id",
+        "kind",
+        "loaded_at",
+        "note_path",
+        "ordinal",
+        "quote",
+        "reason",
+        "ref",
+        "session_id",
+        "source_date",
+        "source_ref",
+        "status",
+        "superseded_by",
+        "supersedes",
+        "value"
+      ],
+      "topic_page.citations": [
+        "date",
+        "kind",
+        "ref",
+        "title"
       ]
     }
   }

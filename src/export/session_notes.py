@@ -12,6 +12,14 @@ keeps its last version known to be right and ignores that path's edits until the
 Only .md, .txt and .csv count. Files written by scripts or through Bash are not covered: the
 transcript does not carry their content.
 
+A ```findings block in a note also loads, line by line, as findings (src/store/findings.py):
+the claims a research session verified, each naming the store item it rests on. Each line
+fails closed: accepted only when its source is held and its quote or value is in that
+source's text, else stored rejected with the reason. They are kept in step with the note's
+last version, an unchanged one included, so a finding whose source arrived later is
+accepted on the next read. Each records whether the owner's own session wrote the note or
+an agent's (a teammate's or a subagent's), which ranks below.
+
 Which transcripts to read is decided per file, by its size and modification time against those
 recorded when it was last read (session_note_transcripts), never by a clock mark: transcripts
 reach this host by rsync with the writing Mac's times, so a laptop that syncs late delivers files
@@ -30,8 +38,14 @@ from datetime import datetime
 from pathlib import Path
 
 from src.config import CLAUDE_CODE_PROJECTS_DIR
+from src.export.conversation_export import (
+    _extract_text_content,
+    is_agent_record,
+    is_owner_record,
+)
 from src.extract.attachment_extractors import _apply_noise_filter
 from src.extract.attachment_pipeline import _guess_mime_type, ingest_text_document
+from src.store.findings import sync_note_findings
 from src.store.forget import forget_documents
 
 NOTE_SUFFIXES = (".md", ".txt", ".csv")
@@ -45,6 +59,55 @@ class Note:
     text: str
     written_at: str
     session_id: str
+    # Who ran the session whose tool call wrote it: 'owner' or 'agent' (author_kind).
+    author_kind: str = "agent"
+
+
+def _owner_turn(record: dict) -> bool:
+    """Whether conversation export labels this record's turn speaker 'user', the owner
+    typing (parse_conversation in src/export/conversation_export.py, the same functions),
+    leaving aside the session-wide agent test, which author_kind applies."""
+    if record.get("type") not in ("user", "assistant"):
+        return False
+    message = record.get("message")
+    if not isinstance(message, dict) or message.get("role", record.get("type")) != "user":
+        return False
+    try:
+        text = _extract_text_content(message)
+        return bool(text) and is_owner_record(record, text)
+    except Exception:  # an odd record is no evidence of the owner
+        return False
+
+
+def _top_level(jsonl_path: Path) -> bool:
+    """Whether the transcript is a session of its own at the top of a project
+    (projects/<project>/<session>.jsonl), not one under a session's own directory, where
+    its subagents' and workflows' transcripts are kept."""
+    if "subagents" in jsonl_path.parts:
+        return False
+    try:
+        inside = jsonl_path.resolve().relative_to(CLAUDE_CODE_PROJECTS_DIR.resolve())
+    except (OSError, ValueError):
+        return False
+    return len(inside.parts) == 2
+
+
+def author_kind(jsonl_path: Path, records) -> str:
+    """'owner' when the transcript is a session of its own, no record of it names an agent
+    (a teammate's name or team, a subagent's id), and it holds a turn the owner typed, as
+    conversation export labels turns; 'agent' otherwise, and whenever that cannot be read.
+
+    Only the transcript decides: never a note's text, its path or name, a field of its
+    findings block, or the session's workspace.
+    """
+    if not _top_level(jsonl_path):
+        return "agent"
+    owner = False
+    for record in records:
+        if is_agent_record(record):
+            return "agent"
+        owner = owner or _owner_turn(record)
+    return "owner" if owner else "agent"
 
 
 def _records(jsonl_path: Path):
@@ -79,7 +142,8 @@ def collect_session_notes(jsonl_path: Path) -> dict[str, Note]:
     lost: set[str] = set()
     pending: dict[str, tuple[str, dict, str]] = {}
     session_id = jsonl_path.stem
-    for record in _records(jsonl_path):
+    records = list(_records(jsonl_path))
+    for record in records:
         # Every field is checked for its type: a transcript is third-party input to this code,
         # and one odd record must not stop the read.
         sid = record.get("sessionId")
@@ -124,6 +188,10 @@ def collect_session_notes(jsonl_path: Path) -> dict[str, Note]:
                     lost.add(path)
                     continue
                 notes[path] = Note(path, text, timestamp, session_id)
+    if notes:
+        author = author_kind(jsonl_path, records)
+        for note in notes.values():
+            note.author_kind = author
     return notes
 
 
@@ -148,6 +216,15 @@ def _held_elsewhere(conn: sqlite3.Connection, message_id: int, path: str) -> boo
     return row is None or not str(row[0]).startswith("text:session-note:")
 
 
+def _sync_findings(conn: sqlite3.Connection, note: Note, stats: dict) -> None:
+    """The note's findings, in step with this version of it (not committed here)."""
+    found = sync_note_findings(
+        conn, note.path, note.session_id, note.written_at, note.text, author_kind=note.author_kind
+    )
+    stats["findings_accepted"] += found["accepted"]
+    stats["findings_rejected"] += found["rejected"]
+
+
 def _store_note(conn: sqlite3.Connection, note: Note, stats: dict) -> None:
     sha = hashlib.sha256(note.text.encode("utf-8")).hexdigest()
     held = conn.execute(
@@ -156,6 +233,8 @@ def _store_note(conn: sqlite3.Connection, note: Note, stats: dict) -> None:
     if held:
         if held[2] == sha:
             stats["unchanged"] += 1
+            _sync_findings(conn, note, stats)
+            conn.commit()
             return
         if (held[1] or "") > (note.written_at or ""):
             stats["older"] += 1
@@ -186,6 +265,7 @@ def _store_note(conn: sqlite3.Connection, note: Note, stats: dict) -> None:
              sha256 = excluded.sha256""",
         (note.path, outcome["message_id"], note.session_id, note.written_at, sha),
     )
+    _sync_findings(conn, note, stats)
     conn.commit()
     stats["stored"] += 1
 
@@ -207,7 +287,18 @@ def ingest_session_notes(conn: sqlite3.Connection, jsonl_files) -> dict:
     next run reads it again, and does not stop the others.
     """
     stats = dict.fromkeys(
-        ("transcripts", "notes", "stored", "replaced", "unchanged", "older", "errors"), 0
+        (
+            "transcripts",
+            "notes",
+            "stored",
+            "replaced",
+            "unchanged",
+            "older",
+            "errors",
+            "findings_accepted",
+            "findings_rejected",
+        ),
+        0,
     )
     for jsonl in jsonl_files:
         path = Path(jsonl)

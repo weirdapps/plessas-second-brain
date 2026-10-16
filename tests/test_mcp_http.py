@@ -308,7 +308,7 @@ def test_a_real_server_refuses_without_the_token_and_lists_tools_with_it(tmp_pat
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait()
-    assert len(hints) == 27, sorted(hints)
+    assert len(hints) == 28, sorted(hints)
     assert {"sql_query", "sql_schema"} <= set(hints)
     # The annotations reach a client over the wire: read-only everywhere but the
     # SharePoint refetch, which is what lets Claude Code run brain calls in parallel.

@@ -871,3 +871,17 @@ def get_conversation_context(conn: sqlite3.Connection, email_id: int) -> dict:
         "decisions": decisions,
         "action_items": action_items,
     }
+
+
+def topic_page_first(conn: sqlite3.Connection, out: dict) -> dict:
+    """`out`, a topic_context answer, with the topic's page first when one is held.
+
+    A page (src/store/topic_pages.py) is a cited account of a live topic, written by a
+    model from the store's items and rebuilt when new ones arrive. It is derived, so the
+    rows after it stay the evidence.
+    """
+    from src.store.topic_pages import find_page
+
+    topic = out.get("topic") or {}
+    page = find_page(conn, topic.get("name") or "", fuzzy=False) if topic else None
+    return {"topic_page": page, **out} if page else out

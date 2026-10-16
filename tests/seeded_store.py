@@ -129,6 +129,19 @@ def build(path: Path, *, synced: str | None = None) -> Path:
                                               position_in_body)
             VALUES ('ab12', '1', 'alice@example.com', 0.5);
 
+        INSERT INTO findings (note_path, ordinal, session_id, author_kind, written_at, claim,
+                              claim_key, value, as_of, source_ref, source_date, quote,
+                              status, reason, loaded_at)
+            VALUES ('/notes/okapi.md', 0, 's1', 'owner', '{reply}', 'Okapi plan body',
+                    'okapi plan body', NULL, '2026-09', 'email:1', '{mail}',
+                    'the okapi body', 'accepted', 'ok', '{reply}');
+        INSERT INTO topic_pages (topic, display_name, members, selected_by, body, citations,
+                                 evidence_keys, built_at, newest_evidence_at, prompt_hash,
+                                 lines_kept, lines_dropped)
+            VALUES ('okapi', 'okapi', '[{{"id": 1, "name": "okapi"}}]', 'named',
+                    '# okapi\n\n## Current status\n- The okapi plan was adopted [email:1]\n',
+                    '[{{"ref": "email:1", "kind": "email", "date": "{mail}", "title": "Okapi plan"}}]',
+                    '["email:1"]', '{reply}', '{mail}', 'abc123', 1, 0);
         INSERT INTO figure_series (id, stem, sender, name, editions, first_date, last_date,
                                    latest_period, latest_end)
             VALUES (1, 'okapi report', 'alice@example.com', 'Okapi report', 3, '{news}',
@@ -157,6 +170,7 @@ def build(path: Path, *, synced: str | None = None) -> Path:
 CALLS = {
     "person_context": {"name_or_email": "alice@example.com"},
     "topic_context": {"topic": "okapi"},
+    "topic_page": {"topic": "okapi"},
     "sender_brief": {"name_or_email": "alice@example.com"},
     "email_thread": {"email_id": 1},
     "search_emails": {"query": "okapi"},

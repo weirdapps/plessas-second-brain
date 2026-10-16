@@ -11,6 +11,8 @@ connect_read_only is also the store's one read-only open: every MCP tool that
 reads, and src.store.schema.get_connection on a replica, go through it.
 """
 
+import difflib
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -20,7 +22,11 @@ from src.store.greek import register_sql_functions
 
 MAX_ROWS = 200
 CELL_CHARS = 4000
-TOTAL_CHARS = 100_000
+# The cells' own characters. The MCP layer then holds the whole answer, JSON and
+# header included, to the 40,000-character response budget (src/mcp_budget.py); at
+# 100,000 here, 15 of 894 answers went past the 50,000 at which Claude Code saves a
+# result to a file.
+TOTAL_CHARS = 30_000
 BUDGET_SECONDS = 10.0
 # The caps above only shorten values already in memory, and a row arrives with
 # all its values at once: one row of 40 values of 8 MB peaked at 949 MB (about
@@ -169,6 +175,100 @@ def _cell(value: object, width: int = CELL_CHARS) -> object:
     return value
 
 
+# A table a query reads, and the alias it gives it: FROM emails e, JOIN attachments AS a.
+_NAMED_TABLE = re.compile(
+    r"\b(?:FROM|JOIN)\s+([A-Za-z_]\w*)(?:\s+(?:AS\s+)?([A-Za-z_]\w*))?", re.IGNORECASE
+)
+# Words that can follow a table name and are no alias.
+_NOT_AN_ALIAS = frozenset(
+    "where on join left right inner outer cross natural full group order limit using "
+    "union except intersect window having as select values".split()
+)
+# A guessed column that names a time, for which the table's own date columns are offered.
+_TIME_WORD = re.compile(r"date|time|_at$|^at$|sent|received|created|start|when", re.IGNORECASE)
+
+
+def tables_named(sql: str) -> list[str]:
+    """The names after FROM and JOIN in `sql`, as written: tables, views or CTEs."""
+    return [table for table, _ in _NAMED_TABLE.findall(sql)]
+
+
+def _named_tables(conn: sqlite3.Connection, sql: str) -> dict[str, str]:
+    """{alias or name: table} for each real table or view the query names."""
+    known = {
+        row[0].lower(): row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+        ).fetchall()
+    }
+    named: dict[str, str] = {}
+    for table, alias in _NAMED_TABLE.findall(sql):
+        real = known.get(table.lower())
+        if real is None:
+            continue  # a CTE, a subquery's alias, or a table that does not exist
+        named[real.lower()] = real
+        if alias and alias.lower() not in _NOT_AN_ALIAS:
+            named[alias.lower()] = real
+    return named
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    """The table's columns as a query names them; the generated *_f copies the
+    full-text indexes read are left out (pragma table_info does not list them)."""
+    return [row[0] for row in conn.execute("SELECT name FROM pragma_table_info(?)", (table,))]
+
+
+def _schema_hint(conn: sqlite3.Connection, sql: str, message: str) -> str:
+    """What to say after a 'no such column' or 'no such table': the real columns of the
+    tables the query names, the closest names, or the tables like the one it named.
+
+    50 of the 59 failed sql_query calls in six weeks were 'no such column', 30 of them
+    `date` guessed for emails.date_received; agents rarely called sql_schema first.
+    """
+    found = re.match(r"no such (column|table): (\S+)", message)
+    if not found:
+        return ""
+    # The statement failed before it read a row: the lookup reads only the schema.
+    conn.set_authorizer(None)
+    conn.set_progress_handler(None, 0)
+    what, name = found.groups()
+    try:
+        if what == "table":
+            tables = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') "
+                    "AND name NOT LIKE 'sqlite_%'"
+                )
+            ]
+            close = difflib.get_close_matches(name, tables, n=4, cutoff=0.5)
+            near = f" Tables with a close name: {', '.join(close)}." if close else ""
+            return f".{near} sql_schema() lists every table."
+        named = _named_tables(conn, sql)
+        qualifier, _, column = name.rpartition(".")
+        if qualifier and qualifier.lower() in named:
+            tables = [named[qualifier.lower()]]
+        else:
+            tables = list(dict.fromkeys(named.values()))
+        if not tables:
+            return ". sql_schema(table) gives a table's columns."
+        columns = {table: _columns(conn, table) for table in tables}
+        every = [(table, col) for table, cols in columns.items() for col in cols]
+        names = [col for _, col in every]
+        close = difflib.get_close_matches(column, names, n=3, cutoff=0.6)
+        if not close and _TIME_WORD.search(column):
+            close = [col for col in names if "date" in col or col.endswith("_at")][:4]
+        guess = [f"{table}.{col}" for table, col in every if col in close]
+        parts = []
+        if guess:
+            parts.append(f" Did you mean {' or '.join(guess)}?")
+        for table, cols in columns.items():
+            parts.append(f" {table} has: {', '.join(cols)}.")
+        return "." + "".join(parts)
+    except sqlite3.Error:
+        return ". sql_schema(table) gives a table's columns."
+
+
 def run_query(sql: str, limit: int = MAX_ROWS, db_path: Path | None = None) -> dict:
     """Run one read-only statement; rows and cells capped, writes refused."""
     limit = max(1, min(int(limit), MAX_ROWS))
@@ -218,15 +318,22 @@ def run_query(sql: str, limit: int = MAX_ROWS, db_path: Path | None = None) -> d
         # Errors the sqlite3 module raises itself (a column that is not UTF-8)
         # carry no sqlite_errorcode.
         if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
+            hint = ""
+            if re.search(r"\bLIKE\s+'%", sql, re.IGNORECASE) or "|| '%'" in sql:
+                hint = (
+                    "; a LIKE '%...%' scan reads every row, so find words through a "
+                    "full-text table instead (emails_fts MATCH sb_fold('...'))"
+                )
             return {
-                "error": f"query exceeded the {BUDGET_SECONDS:.0f} s budget; narrow it or add a LIMIT"
+                "error": f"query exceeded the {BUDGET_SECONDS:.0f} s budget; narrow it or "
+                f"add a LIMIT{hint}"
             }
         if "too many columns" in str(exc):
             return {
                 "error": f"the result has more than {MAX_COLUMNS} columns; "
                 "name only the columns you need instead of SELECT *"
             }
-        return {"error": f"SQLite: {exc}"}
+        return {"error": f"SQLite: {exc}{_schema_hint(conn, sql, str(exc))}"}
     except sqlite3.DataError:  # SQLITE_TOOBIG: a value over MAX_VALUE_BYTES
         return {
             "error": f"a value is too big (over {MAX_VALUE_BYTES:,} bytes); select a slice "

@@ -31,6 +31,23 @@ class Cut(TypedDict):
 # Each list the budget cut, by its key or dotted path: {"emails": {"kept", "total"}}.
 Truncated = dict[str, Cut]
 
+# What the sources an empty answer searched hold, by source, as stats.coverage gives
+# them: {"teams": {"first", "last", "items"}, "mailboxes": {name: {...}}, ...}.
+Coverage = dict[str, Any]
+
+
+class LeftOut(TypedDict):
+    """How many matches of one class the default filter left out, and the switch that
+    lets them in; `at_least` when the count stopped at its probe's limit."""
+
+    rows: int
+    switch: str
+    at_least: NotRequired[bool]
+
+
+# By class: {"news": {"rows": 12, "switch": "include_news=true"}}.
+Excluded = dict[str, LeftOut]
+
 _OPEN = ConfigDict(extra="allow")
 
 
@@ -53,9 +70,11 @@ class RowsResult(Fresh):
     """A list tool's rows, with `truncated` when the budget cut them and `reason`
     when nothing matched."""
 
+    excluded: NotRequired[Excluded]
     result: Rows
     truncated: NotRequired[Truncated]
     reason: NotRequired[str]
+    coverage: NotRequired[Coverage]
 
 
 @with_config(_OPEN)
@@ -65,6 +84,7 @@ class ResultsResult(Fresh):
     results: Rows
     truncated: NotRequired[Truncated]
     reason: NotRequired[str]
+    coverage: NotRequired[Coverage]
 
 
 @with_config(_OPEN)
@@ -89,6 +109,10 @@ class PersonContext(Fresh, total=False):
     teams: dict[str, Any]
     whatsapp: dict[str, Any]
     reason: str
+    coverage: Coverage
+    truncated: Truncated
+    # detail="card": the card sender_brief gave, keyed as SenderBrief is.
+    known: bool
 
 
 @with_config(_OPEN)
@@ -105,6 +129,8 @@ class TopicContext(Fresh, total=False):
     key_facts: list[Any]
     key_facts_total: int
     reason: str
+    coverage: Coverage
+    truncated: Truncated
 
 
 @with_config(_OPEN)
@@ -123,6 +149,8 @@ class SenderBrief(Fresh, total=False):
     resolved_by: str | None
     match_count: int
     other_candidates: list[Any]
+    reason: str
+    coverage: Coverage
 
 
 @with_config(_OPEN)
@@ -130,6 +158,7 @@ class EmailThread(Fresh):
     email_id: int
     emails: Rows
     thread_total: int
+    truncated: NotRequired[Truncated]
 
 
 @with_config(_OPEN)
@@ -142,7 +171,9 @@ class RecallResult(TypedDict):
     stale: bool
     _stale_warning: NotRequired[str]
     truncated: NotRequired[Truncated]
+    excluded: NotRequired[Excluded]
     reason: NotRequired[str]
+    coverage: NotRequired[Coverage]
     query: str
     emails: Rows
     attachments: Rows
@@ -165,6 +196,9 @@ class StaleThreads(Fresh):
     overdue_actions: Rows
     overdue_actions_total: int
     stale_threads_unavailable: NotRequired[str]
+    reason: NotRequired[str]
+    coverage: NotRequired[Coverage]
+    truncated: NotRequired[Truncated]
 
 
 @with_config(_OPEN)
@@ -172,6 +206,9 @@ class MeetingPrep(Fresh, total=False):
     attendees: Rows
     meetings: dict[str, Rows]
     topic_context: dict[str, Any] | None
+    reason: str
+    coverage: Coverage
+    truncated: Truncated
 
 
 @with_config(_OPEN)
@@ -180,6 +217,7 @@ class CalendarEvents(Fresh):
     count: int
     truncated: NotRequired[Truncated]
     reason: NotRequired[str]
+    coverage: NotRequired[Coverage]
 
 
 @with_config(_OPEN)
@@ -221,6 +259,7 @@ class ConversationContext(Fresh, total=False):
     action_items: Rows
     key_facts: list[Any]
     topics: list[Any]
+    truncated: Truncated
 
 
 @with_config(_OPEN)
@@ -228,6 +267,9 @@ class SharepointIndex(Fresh, total=False):
     links: Rows
     status: str
     document_message_id: Any
+    reason: str
+    coverage: Coverage
+    truncated: Truncated
 
 
 @with_config(_OPEN)
@@ -235,6 +277,8 @@ class ImageSearch(Fresh):
     results: Rows
     count: int
     reason: NotRequired[str]
+    coverage: NotRequired[Coverage]
+    truncated: NotRequired[Truncated]
 
 
 @with_config(_OPEN)
@@ -243,6 +287,9 @@ class LiveMail(Fresh):
     count: int
     since_minutes: int
     clamped: bool
+    reason: NotRequired[str]
+    coverage: NotRequired[Coverage]
+    truncated: NotRequired[Truncated]
 
 
 @with_config(_OPEN)
@@ -252,6 +299,7 @@ class TeamsThread(Fresh, total=False):
     decisions: Rows
     action_items: Rows
     key_facts: Rows
+    truncated: Truncated
 
 
 @with_config(_OPEN)
@@ -261,6 +309,9 @@ class TeamsChat(Fresh, total=False):
     last_messages: Rows
     top_senders: Rows
     open_actions: Rows
+    reason: str
+    coverage: Coverage
+    truncated: Truncated
 
 
 @with_config(_OPEN)
@@ -269,6 +320,23 @@ class SqlResult(Fresh):
     rows: list[list[Any]]
     row_count: int
     truncated: Any
+    reason: NotRequired[str]
+    coverage: NotRequired[Coverage]
+
+
+@with_config(_OPEN)
+class ItemResult(Fresh):
+    """get_item: the item behind a row's ref, its text a page at a time."""
+
+    kind: str
+    ref: Any
+    item: dict[str, Any]
+    text: str
+    offset: int
+    returned_chars: int
+    total_chars: int
+    next_offset: int | None
+    truncated: NotRequired[Truncated]
 
 
 @with_config(_OPEN)

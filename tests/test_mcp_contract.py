@@ -26,8 +26,9 @@ from tests.mcp_listing import listed_tools, registered_tool
 
 
 def test_the_tool_count_is_unchanged():
-    # 27 until recall_preference and recent_conversations were retired.
-    assert len(listed_tools()) == 25
+    # 27 until recall_preference and recent_conversations were retired, 25 until
+    # get_item; five of those 26 are deprecated and go in the next release.
+    assert len(listed_tools()) == 26
 
 
 def test_every_tool_says_whether_it_reads_or_writes():
@@ -96,10 +97,15 @@ def test_the_schema_refuses_what_the_tool_cannot_honour(tool, arguments):
         registered_tool(tool).fn_metadata.validate_arguments(arguments)
 
 
+# sql_query carries a third of all calls and loads upfront: the columns agents guessed
+# wrong (50 failed calls in six weeks) and the full-text form are worth the length.
+_LONGER = {"sql_query": 2000}
+
+
 def test_descriptions_are_short_and_carry_no_history():
     for name, tool in listed_tools().items():
         text = tool.description or ""
-        assert len(text) < 1000, name
+        assert len(text) < _LONGER.get(name, 1000), name
         # Python 3.12 keeps a docstring's indentation; the client gets it dedented.
         assert "\n    " not in text, name
         assert "TODO" not in text, name
@@ -115,7 +121,7 @@ def test_the_instructions_fit_and_lead_with_routing(tmp_path, monkeypatch, repli
 
     text = mcp_server._instructions()
 
-    assert len(text) <= 2000
+    assert len(text) <= 4000  # Claude Code keeps 4,096 since v2.1.296
     assert text.startswith("Routing.")
     assert "Not covered:" in text
 
@@ -208,6 +214,7 @@ CALLS = {
     "teams_chat_summary": {"chat_id": 1},
     "sql_query": {"sql": "SELECT id, subject FROM emails"},
     "sql_schema": {"table": "emails"},
+    "get_item": {"kind": "email", "ref": 1},
 }
 
 

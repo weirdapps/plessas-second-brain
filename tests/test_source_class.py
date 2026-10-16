@@ -282,6 +282,25 @@ def _build(path, monkeypatch) -> dict:
             "SELECT id FROM emails WHERE message_id = ?", (message_id,)
         ).fetchone()[0]
         expected[email_id] = cls
+        if cls in ("news", "automation"):
+            # The loader takes no items from news or automation since schema v35; the store
+            # still holds what earlier code took, until `brain maint forget-itemless`, and
+            # the read paths must leave those out too.
+            conn.execute(
+                "INSERT INTO decisions (email_id, decision, decided_by) VALUES (?, ?, 'Someone')",
+                (email_id, f"{label} {WORD} decision"),
+            )
+            conn.execute(
+                "INSERT INTO action_items (email_id, task, owner, deadline, status)"
+                " VALUES (?, ?, 'Someone', ?, 'open')",
+                (email_id, f"{label} {WORD} action", _day(-5)),
+            )
+            conn.execute(
+                "INSERT INTO commitments (email_id, commitment, by_person, to_person)"
+                " VALUES (?, ?, 'A', 'B')",
+                (email_id, f"{label} {WORD} commitment"),
+            )
+            conn.commit()
     by_label = {LOADED[m][3]: e for m, e in zip(LOADED, expected, strict=True)}
     _attachment(conn, by_label["mail"], f"mail attachment on {WORD}")
     _attachment(conn, by_label["tagged"], f"report attachment on {WORD}")

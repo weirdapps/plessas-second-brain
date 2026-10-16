@@ -162,6 +162,13 @@ def merge_person(conn: sqlite3.Connection, keep_id: int, remove_id: int):
     conn.execute(
         "UPDATE event_attendees SET person_id = ? WHERE person_id = ?", (keep_id, remove_id)
     )
+    # Who gave and who received a commitment (schema v35), on a store that has them.
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(commitments)")}
+    for column in ("by_person_id", "to_person_id"):
+        if column in columns:
+            conn.execute(
+                f"UPDATE commitments SET {column} = ? WHERE {column} = ?", (keep_id, remove_id)
+            )
     conn.execute("DELETE FROM people WHERE id = ?", (remove_id,))
 
 

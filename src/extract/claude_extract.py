@@ -539,20 +539,47 @@ def refusal_error(response: Any) -> ExtractionRefused:
     return ExtractionRefused(f"the model refused the item (category {category or 'unknown'})")
 
 
-def extract_one(email: dict) -> dict | None:
+def _hold(budget: Any, chars: int) -> int:
+    """Room held in a run's token budget (src/llm_cost.py TokenBudget) for a call of this
+    many characters; raises OverBudget when it does not fit. 0 without a budget."""
+    return budget.reserve(chars) if budget is not None else 0
+
+
+def _settle(budget: Any, held: int, response: Any) -> None:
+    if budget is not None:
+        budget.settle(held, getattr(response, "usage", None))
+
+
+def _release(budget: Any, held: int) -> None:
+    if budget is not None:
+        budget.release(held)
+
+
+def extract_one(email: dict, budget: Any = None) -> dict | None:
     """Extract structured data from a single email using Claude, in the call shape
     BRAIN_EXTRACT_CALL_SHAPE picks (src/extract/call_shape.py): schema v2 under v2 and
-    v2-text, the v1 prompt under v1."""
+    v2-text, the v1 prompt under v1.
+
+    With `budget`, a TokenBudget, each call is held against it before it is sent, raising
+    OverBudget instead of being sent when it does not fit, and charged what its response
+    reports (src/store/item_cleanup.py reextract-stacked). complete() is called from here,
+    so the usage log names this function, as without a budget."""
     if uses_schema_v2():
-        return _extract_one_v2(email)
+        return _extract_one_v2(email, budget)
 
     from src.extract.parser import parse_extraction
     from src.extract.prompt import build_extraction_prompt
 
     prompt = build_extraction_prompt(email)
-    response = complete(
-        max_tokens=MAX_OUTPUT_TOKENS, messages=[{"role": "user", "content": prompt}]
-    )
+    held = _hold(budget, len(prompt))
+    try:
+        response = complete(
+            max_tokens=MAX_OUTPUT_TOKENS, messages=[{"role": "user", "content": prompt}]
+        )
+    except BaseException:
+        _release(budget, held)
+        raise
+    _settle(budget, held, response)
 
     text = _response_text(response)
     if text.startswith("```"):
@@ -568,7 +595,7 @@ def extract_one(email: dict) -> dict | None:
     return extraction
 
 
-def _extract_one_v2(email: dict) -> dict:
+def _extract_one_v2(email: dict, budget: Any = None) -> dict:
     """extract_one in call shape v2 or v2-text: the cached system prompt, the fenced email,
     schema v2 (as structured output under v2, stated in the system prompt under v2-text)
     and a pinned effort; a reply stopped at max_tokens is asked once more at twice the
@@ -579,7 +606,13 @@ def _extract_one_v2(email: dict) -> dict:
 
     request = build_email_request_v2(email)
     for max_tokens in max_tokens_attempts(request.route):
-        response = complete(**request.kwargs(max_tokens))
+        held = _hold(budget, request.chars)
+        try:
+            response = complete(**request.kwargs(max_tokens))
+        except BaseException:
+            _release(budget, held)
+            raise
+        _settle(budget, held, response)
         if getattr(response, "stop_reason", None) != "max_tokens":
             break
     stop = getattr(response, "stop_reason", None)

@@ -502,6 +502,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 34:
         migrate_fts_update_triggers_on_source_columns(conn)
         migrate_index_people_lookups(conn)
+    if current < 35:
+        migrate_add_item_state(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -831,6 +833,75 @@ def migrate_fts_update_triggers_on_source_columns(conn: sqlite3.Connection) -> N
         # Not an explicit ROLLBACK: see _index_email_subjects.
         conn.rollback()
         raise
+
+
+# v35: what an extracted item is, and room for a consolidation pass that marks items rather
+# than deleting them. Table -> (column, declaration), in the order they are added.
+_CONSOLIDATION = (
+    ("canonical_id", "INTEGER"),
+    ("superseded_by", "INTEGER"),
+    ("invalid_at", "TEXT"),
+)
+ITEM_STATE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "decisions": (("status", "TEXT"), ("owner_role", "TEXT"), ("evidence", "TEXT"))
+    + _CONSOLIDATION,
+    "action_items": (
+        ("direction", "TEXT"),
+        ("evidence", "TEXT"),
+        ("closed_by", "TEXT"),
+        ("closed_at", "TEXT"),
+    )
+    + _CONSOLIDATION,
+    "commitments": (
+        ("due", "TEXT"),
+        ("direction", "TEXT"),
+        ("status", "TEXT"),
+        # people.id, kept in step by dedup_people.merge_person. No REFERENCES clause: a
+        # column with one cannot be dropped, and the dedup deletes people with the
+        # foreign keys off.
+        ("by_person_id", "INTEGER"),
+        ("to_person_id", "INTEGER"),
+        ("evidence", "TEXT"),
+    )
+    + _CONSOLIDATION,
+    "key_facts": _CONSOLIDATION + (("boilerplate", "INTEGER NOT NULL DEFAULT 0"),),
+}
+
+
+def migrate_add_item_state(conn: sqlite3.Connection) -> None:
+    """v35: the state of decisions, action items, commitments and key facts.
+
+    Schema v2 (src/extract/schema_v2.py) says what each item is, and nothing stored it:
+    a decision's status (made, proposed, requested), its owner_role and the quote that
+    states it; an action's direction (owner_owes, owed_to_owner, third_party) and quote,
+    and closed_by and closed_at for an action marked done (src/store/action_lifecycle.py
+    complete_action); a commitment's due date, direction, status, the people rows of who
+    gave and who received it, and its quote. canonical_id, superseded_by and invalid_at on
+    all four are for a later consolidation pass, which marks a duplicate, a superseded or
+    an invalid item instead of deleting it. key_facts.boilerplate marks text that recurs
+    across threads, whose keys boilerplate_fact_keys holds (src/store/item_cleanup.py).
+
+    Rows written before keep NULL (boilerplate 0): ADD COLUMN with a constant default
+    rewrites no row, and key_facts_au fires on an UPDATE of id or fact only (v34), so no
+    full-text index is touched now or when a column is set later. Each column is added
+    only where it is missing, so running it again changes nothing.
+    """
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    for table, columns in ITEM_STATE_COLUMNS.items():
+        if table not in tables:
+            continue
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, declaration in columns:
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS boilerplate_fact_keys (
+            key TEXT PRIMARY KEY,
+            threads INTEGER NOT NULL,
+            marked_at TEXT NOT NULL
+        )"""
+    )
+    conn.commit()
 
 
 def migrate_index_people_lookups(conn: sqlite3.Connection) -> None:

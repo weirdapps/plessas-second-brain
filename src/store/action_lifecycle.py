@@ -7,9 +7,12 @@ gives the 'open actions' view (query_action_items, stale_threads) a lifecycle:
   * dedup: remove exact-duplicate open actions from the same parent (same
     task + owner + deadline), a re-extraction artifact.
   * age-out: mark open actions whose deadline is far in the past as 'expired'
-    (a soft close: NOT 'completed', since we can't prove completion, but no longer
+    (a soft close: NOT 'done', since we can't prove completion, but no longer
     surfaced by the default status='open' queries). An action with no date ages
     with the email, thread, meeting or conversation it came from instead.
+  * completion (schema v35): complete_action marks an action 'done', with what closed
+    it (closed_by) and when (closed_at), for the consolidation pass or a person to call.
+    Both passes above touch open actions only, so a done one stays done.
 
 sb-daily-sync.sh runs it after each successful sync on the producer, whose
 database the replicas copy. By hand, `--dry-run` rolls back.
@@ -18,7 +21,7 @@ database the replicas copy. By hand, `--dry-run` rolls back.
 import re
 import sqlite3
 import sys
-from datetime import date
+from datetime import UTC, date, datetime
 
 from src.config import DEFAULT_DB
 from src.store.schema import get_connection
@@ -160,6 +163,24 @@ def expire_undated_actions(
         (date.today().year, days),
     )
     return cur.rowcount
+
+
+def complete_action(
+    conn: sqlite3.Connection, action_id: int, closed_by: str | None, closed_at: str | None = None
+) -> bool:
+    """Mark an open or expired action 'done': `closed_by` says what closed it (an item, as
+    'email:<id>' or 'teams_thread:<id>', or 'owner' for the owner's own word), `closed_at`
+    when (an ISO time, now in UTC by default). Whether a row changed: a done action keeps
+    what first closed it. The caller commits."""
+    if not (closed_by or "").strip():
+        raise ValueError("closed_by must say what closed the action")
+    when = closed_at or datetime.now(UTC).isoformat(timespec="seconds")
+    cur = conn.execute(
+        "UPDATE action_items SET status = 'done', closed_by = ?, closed_at = ?"
+        " WHERE id = ? AND COALESCE(status, 'open') IN ('open', 'expired')",
+        (str(closed_by).strip(), when, action_id),
+    )
+    return cur.rowcount > 0
 
 
 def run_action_lifecycle(

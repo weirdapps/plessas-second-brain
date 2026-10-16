@@ -275,10 +275,12 @@ def people_index(conn: sqlite3.Connection) -> _Index:
 
 
 def alias_targets(conn: sqlite3.Connection, ids) -> dict[int, int]:
-    """The row each of `ids` stands for by the alias map, where it has one."""
+    """The row each of `ids` stands for: by the reviewed alias map, else by its entity
+    (src/store/entities.py: the row the entity stands for), where it has one."""
     ids = sorted(set(ids))
     if not ids:
         return {}
+    targets = {}
     try:
         rows = conn.execute(
             "SELECT key, value FROM sync_metadata "
@@ -286,13 +288,16 @@ def alias_targets(conn: sqlite3.Connection, ids) -> dict[int, int]:
             (ALIAS_PREFIX, json.dumps(ids)),
         ).fetchall()
     except sqlite3.OperationalError:  # a store without sync_metadata
-        return {}
-    targets = {}
+        rows = []
     for key, value in rows:
         try:
             targets[int(key[len(ALIAS_PREFIX) :])] = int(str(value).strip())
         except ValueError:
             continue
+    from src.store.entities import entity_targets
+
+    for pid, target in entity_targets(conn, [i for i in ids if i not in targets]).items():
+        targets[pid] = target
     return targets
 
 

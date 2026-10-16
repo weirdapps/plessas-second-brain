@@ -169,6 +169,19 @@ def merge_person(conn: sqlite3.Connection, keep_id: int, remove_id: int):
             conn.execute(
                 f"UPDATE commitments SET {column} = ? WHERE {column} = ?", (keep_id, remove_id)
             )
+    # The entity of the row merged away (schema v38): its alias goes to the kept row unless
+    # that row has one already, and an entity standing for it stands for the kept row.
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'entity_aliases'"
+    ).fetchone():
+        conn.execute(
+            "UPDATE OR IGNORE entity_aliases SET value = ? WHERE kind = 'person' AND value = ?",
+            (str(keep_id), str(remove_id)),
+        )
+        conn.execute(
+            "DELETE FROM entity_aliases WHERE kind = 'person' AND value = ?", (str(remove_id),)
+        )
+        conn.execute("UPDATE entities SET person_id = ? WHERE person_id = ?", (keep_id, remove_id))
     conn.execute("DELETE FROM people WHERE id = ?", (remove_id,))
 
 

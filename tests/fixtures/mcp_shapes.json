@@ -327,6 +327,7 @@
         "days",
         "detail",
         "include_automation",
+        "include_history",
         "include_news",
         "people",
         "topic"
@@ -554,6 +555,7 @@
         "days",
         "detail",
         "include_automation",
+        "include_history",
         "include_news",
         "limit",
         "name_or_email"
@@ -690,6 +692,7 @@
     "input_schema": {
       "properties": [
         "include_automation",
+        "include_history",
         "include_news",
         "limit",
         "owner",
@@ -811,6 +814,7 @@
       "properties": [
         "days",
         "include_automation",
+        "include_history",
         "include_news",
         "limit",
         "person",
@@ -1653,6 +1657,7 @@
       "properties": [
         "days",
         "include_automation",
+        "include_history",
         "include_news",
         "limit",
         "max_days"
@@ -1915,6 +1920,7 @@
         "days",
         "detail",
         "include_automation",
+        "include_history",
         "include_news",
         "limit",
         "topic"

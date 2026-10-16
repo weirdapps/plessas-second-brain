@@ -24,6 +24,7 @@ import pytest
 
 from src.llm_deadline import _UNIT_TIMEOUT_SECONDS
 from src.pipeline.sync import (
+    CONSOLIDATE_SYNC_DEADLINE_S,
     CONVERSATION_SYNC_DEADLINE_S,
     EXTRACT_DEADLINE_BY_UNIT_S,
     EXTRACT_SYNC_DEADLINE_S,
@@ -45,6 +46,7 @@ def _sync_command_s(extract_s: float) -> float:
         + PHASE2_SYNC_DEADLINE_S
         + CONVERSATION_SYNC_DEADLINE_S
         + IMAGE_CLASSIFY_SYNC_BUDGET_S
+        + CONSOLIDATE_SYNC_DEADLINE_S
     )
 
 

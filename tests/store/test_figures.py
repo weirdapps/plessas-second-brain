@@ -203,6 +203,77 @@ def test_the_index_follows_its_metrics_and_survives_a_rebuild(conn, tmp_path):
     assert _matches(conn, "personal") == []
 
 
+# ------------------------------------------------------------------ ranking
+
+
+def _ranking_store(conn, tmp_path):
+    """A monthly migration index with English product headers, and a newer daily call-centre
+    report whose lines include one on loans."""
+    for month in (6, 7, 8):
+        months = [datetime(2026, m, 1) for m in range(1, month + 1)]
+        rows = [["Digital migration index"], ["Month", "Consumer Loans (5)", "Debit Cards (1)"]]
+        rows += [[d, 0.70 + d.month / 100, 0.30] for d in months]
+        _edition(
+            conn,
+            tmp_path,
+            f"Δείκτης Μετάπτωσης 2026-{month:02d}.xlsx",
+            rows,
+            f"2026-{month + 1:02d}-20T08:00:00Z",
+        )
+    for day in (13, 14, 15):
+        rows = [["Line", "Calls"], ["Line B Δάνεια", 100 + day], ["Line B Κάρτες", 50 + day]]
+        _edition(
+            conn, tmp_path, f"Call centre {day}.10.2026.xlsx", rows, f"2026-10-{day}T09:00:00Z"
+        )
+    _built(conn)
+
+
+def test_a_full_match_outranks_a_newer_partial_one(conn, tmp_path):
+    _ranking_store(conn, tmp_path)
+
+    rows = figures.search_figures(conn, "μετάπτωση καταναλωτικά δάνεια")["result"]
+
+    assert rows[0]["header"] == "Consumer Loans (5)"
+    assert rows[0]["latest"]["period"] == "2026-08" and "partial_match" not in rows[0]
+    loans = [r for r in rows if r["label"] == "Line B Δάνεια"]
+    assert loans and loans[0]["partial_match"] is True
+    assert rows.index(loans[0]) > 0
+
+
+def test_more_matched_words_rank_first_among_partial_matches(conn, tmp_path):
+    _ranking_store(conn, tmp_path)
+
+    rows = figures.search_figures(conn, "μετάπτωση κάρτες δάνεια")["result"]
+
+    assert {r["header"] for r in rows[:2]} == {"Consumer Loans (5)", "Debit Cards (1)"}
+    assert all(r.get("partial_match") for r in rows)
+    assert rows[-1]["label"].startswith("Line B")
+
+
+def test_a_running_years_target_does_not_outrank_this_months_figure(conn, tmp_path):
+    """A year's figure ends on 31 December; mailed in January it is as recent as January."""
+    _ranking_store(conn, tmp_path)
+    for day in (12, 13, 14):
+        rows = [["Product", "Target"], ["Consumer loans", 900]]
+        _edition(conn, tmp_path, f"Targets 2026 v{day}.xlsx", rows, f"2026-01-{day}T09:00:00Z")
+    _built(conn)
+
+    rows = figures.search_figures(conn, "consumer loans")["result"]
+
+    assert rows[0]["header"] == "Consumer Loans (5)"
+    assert any(r["series"] == "Targets" for r in rows)
+
+
+def test_greek_forms_and_report_terms_in_english_both_match(conn, tmp_path):
+    _ranking_store(conn, tmp_path)
+
+    rows = figures.search_figures(conn, "δανείων")["result"]
+
+    assert {r["header"] for r in rows} >= {"Consumer Loans (5)"}
+    assert {r["label"] for r in rows} >= {"Line B Δάνεια"}
+    assert not any(r.get("partial_match") for r in rows)
+
+
 # ------------------------------------------------------------------ supersession
 
 
@@ -292,9 +363,10 @@ def test_search_folds_greek_accents_and_finds_other_forms(conn, tmp_path):
     _built(conn)
 
     for query in ("κάρτες", "καρτες", "ΚΑΡΤΩΝ", "digital sales κάρτες"):
-        assert [r["label"] for r in figures.search_figures(conn, query)["result"]] == ["Κάρτες"], (
-            query
-        )
+        rows = figures.search_figures(conn, query)["result"]
+        full = [r["label"] for r in rows if not r.get("partial_match")]
+        # The rows holding only some words ("digital sales") come after, flagged.
+        assert full == ["Κάρτες"] and rows[0]["label"] == "Κάρτες", query
 
 
 def test_a_period_not_held_says_so_and_names_the_latest_held(conn, tmp_path):

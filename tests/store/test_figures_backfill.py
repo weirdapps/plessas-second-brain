@@ -104,6 +104,71 @@ def test_reset_needs_apply_and_reads_everything_again(db, monkeypatch, capsys):
     assert _count(db, "figure_values") == 10
 
 
+def _read_by_an_older_parser(db) -> None:
+    conn = get_connection(str(db))
+    conn.execute("UPDATE figure_editions SET parser = 1")
+    conn.commit()
+    conn.close()
+
+
+def _parsers(db) -> list[tuple]:
+    conn = get_connection(str(db))
+    try:
+        return [
+            tuple(r)
+            for r in conn.execute(
+                "SELECT status, parser, COUNT(*) FROM figure_editions GROUP BY 1, 2 ORDER BY 1, 2"
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def test_reparse_counts_the_editions_an_older_parser_read_and_writes_nothing(
+    db, monkeypatch, capsys
+):
+    brain(monkeypatch, capsys, "--db", str(db), "maint", "figures-backfill", "--apply")
+    _read_by_an_older_parser(db)
+
+    code, out, _ = brain(
+        monkeypatch, capsys, "--db", str(db), "maint", "figures-backfill", "--reparse"
+    )
+
+    assert code == 0 and "DRY RUN" in out
+    assert re.search(r"read by an older parser +: 4 editions in 1 series", out)
+    assert _parsers(db) == [("parsed", 1, 4)]
+
+
+def test_reparse_reads_them_again_and_resumes_where_it_stopped(db, monkeypatch, capsys):
+    from src.extract.figures_parse import PARSER_VERSION
+
+    brain(monkeypatch, capsys, "--db", str(db), "maint", "figures-backfill", "--apply")
+    _read_by_an_older_parser(db)
+    args = ("--db", str(db), "maint", "figures-backfill", "--reparse", "--apply")
+
+    brain(monkeypatch, capsys, *args, "--limit", "2")
+    assert _parsers(db) == [("parsed", PARSER_VERSION, 2), ("pending", 1, 2)]
+
+    code, out, _ = brain(monkeypatch, capsys, *args)
+    assert code == 0 and _parsers(db) == [("parsed", PARSER_VERSION, 4)]
+    assert _count(db, "figure_values") == 10
+
+
+def test_reparse_and_reset_do_not_go_together(db, monkeypatch, capsys):
+    code, _, _ = brain(
+        monkeypatch,
+        capsys,
+        "--db",
+        str(db),
+        "maint",
+        "figures-backfill",
+        "--apply",
+        "--reset",
+        "--reparse",
+    )
+    assert code == 2
+
+
 def test_apply_refuses_on_a_replica_and_the_dry_run_does_not(db, monkeypatch, capsys):
     monkeypatch.setenv("BRAIN_ROLE", "replica")
 

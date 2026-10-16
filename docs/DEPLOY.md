@@ -1398,6 +1398,25 @@ environment the timers run with, in this order:
    every label is in `item_labels` with its evidence, the values it replaced, the
    prompt hash and the reply id.
 
+### One-off commands after the figures follow-up (parser version 2)
+
+No schema change. The parser now labels rows named by their period alone and rows whose
+label is merged down from the row above (README, "Figures"), so the editions read before
+wait to be read again, on the producer, beside the timers:
+
+1. `python -m src.cli maint figures-backfill --reparse` counts the editions an older
+   parser read, by series; it only reads. Reference replica: every edition held, 4,548
+   in 185 series.
+2. `python -m src.cli maint figures-backfill --reparse --apply` reads them again, a series
+   at a time, its figures forgotten first; a run stopped part way (`--limit N`, a SIGTERM)
+   resumes with the editions it left. About as long as the first backfill (1.5 to 4
+   minutes on a Mac). Until it has run, `figures` answers from the figures read before,
+   searched with the new ordering.
+3. Forgotten documents need nothing more: `forget_documents` takes their figures from
+   now on and reads their series again at once, and every `figures-backfill --apply`
+   (with `--reparse` or not) first takes out an edition whose attachment is already
+   gone, as one forgotten before this release would be.
+
 ### After 2026-10-16 (vectors v2, schema v39)
 
 This release moves the index to gemini-embedding-2 at 768 dimensions in half precision,

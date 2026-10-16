@@ -10,6 +10,21 @@ import json
 from src.extract.untrusted import fence
 from src.redact import PROMPT_RULE
 
+# What makes a decision, and where items come from: the rules of the email prompt's v2
+# (src/extract/prompt.py), for a thread. About half of a sample of mail "decisions" were
+# quoted policy, intentions, table rows or news, and a reply that quotes an earlier
+# message re-extracted it. Shared with the WhatsApp prompt.
+ITEM_RULES = (
+    "A decision is a choice made by an identifiable person or body, which a message"
+    " states as made, proposed or requested. Not decisions: a requirement of a law,"
+    " regulation, contract or policy that a message quotes; an agenda item or a topic to"
+    " discuss; a row or a figure of a table; an intention without a choice ('we will look"
+    " into it'). A message may quote or paste an earlier message, a forwarded email or a"
+    " document: read that quoted text as context, and take decisions and action items"
+    " from what the participants themselves wrote in the thread, never from the quoted"
+    " text alone."
+)
+
 SYSTEM_PROMPT = (
     "You are extracting structured knowledge from a Microsoft Teams thread "
     "(channel post + replies, or a chat session). Produce the JSON object "
@@ -17,8 +32,8 @@ SYSTEM_PROMPT = (
     "searchable institutional memory. Write summary, decisions, action_items, "
     "and key_facts in the same language as the thread (e.g. Greek for Greek "
     "threads, English for English threads); the 'language' field is the "
-    "ISO 639-1 code for that language."
-    f" {PROMPT_RULE}"
+    "ISO 639-1 code for that language. "
+    f"{ITEM_RULES} {PROMPT_RULE}"
 )
 
 # The chat name and participants' names are third-party text, as the messages

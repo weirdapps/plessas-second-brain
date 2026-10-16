@@ -8,8 +8,8 @@ that shaped this one:
 - no string or array length limits are accepted, so the caps on list sizes and quote
   lengths are in the prompt;
 - a request may carry at most 24 optional and 16 union-typed parameters, so every property
-  is required, an empty string or list standing for "none", and the one union is an
-  action's deadline, a date or null;
+  is required, an empty string or list standing for "none", and the only unions are an
+  action's deadline and a commitment's due date, each a date or null;
 - an enum value can come back in any capitalisation, so the parser compares them folded.
 
 Properties are written in the order the schema lists them, so an item's `evidence`, the
@@ -113,7 +113,16 @@ ACTION = _object(
         "deadline": _DATE_OR_NULL,
     }
 )
-COMMITMENT = _object({"evidence": _TEXT, "commitment": _TEXT, "by": _TEXT, "to": _TEXT})
+COMMITMENT = _object(
+    {
+        "evidence": _TEXT,
+        "commitment": _TEXT,
+        "by": _TEXT,
+        "to": _TEXT,
+        "direction": _enum(DIRECTIONS),
+        "due": _DATE_OR_NULL,
+    }
+)
 PERSON = _object({"name_as_written": _TEXT, "name_latin": _TEXT, "email": _TEXT, "role": _TEXT})
 
 EMAIL_SCHEMA_V2 = _object(

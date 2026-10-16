@@ -51,7 +51,8 @@ def test_no_keyword_structured_outputs_refuse(schema):
 
 @pytest.mark.parametrize("schema", SCHEMAS)
 def test_the_unions_stay_far_under_the_limit_of_sixteen(schema):
-    assert sum("anyOf" in node for node in _nodes(schema)) <= 1
+    """An action's deadline and a commitment's due date, each a date or null."""
+    assert sum("anyOf" in node for node in _nodes(schema)) <= 2
 
 
 def test_people_is_an_array_with_the_names_in_both_scripts():

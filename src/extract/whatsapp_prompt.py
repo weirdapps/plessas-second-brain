@@ -7,7 +7,7 @@ told it is reading: chats with family, friends and colleagues, not a work
 channel, and short messages with media shown only by their kind.
 """
 
-from src.extract.teams_prompt import THREAD_TEMPLATE, USER_TEMPLATE, parse_response
+from src.extract.teams_prompt import ITEM_RULES, THREAD_TEMPLATE, USER_TEMPLATE, parse_response
 from src.extract.untrusted import fence
 from src.redact import PROMPT_RULE
 
@@ -21,8 +21,8 @@ SYSTEM_PROMPT = (
     "commentary, no preamble. Be terse but accurate; this becomes searchable "
     "personal memory. Write summary, decisions, action_items and key_facts in the "
     "same language as the chat (e.g. Greek for Greek chats, English for English "
-    "chats); the 'language' field is the ISO 639-1 code for that language."
-    f" {PROMPT_RULE}"
+    "chats); the 'language' field is the ISO 639-1 code for that language. "
+    f"{ITEM_RULES} {PROMPT_RULE}"
 )
 
 

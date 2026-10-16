@@ -109,7 +109,7 @@ def _drop_v38(conn):
     for index in [
         r[0]
         for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%_state_%'"
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND (name GLOB 'idx_*_state_canonical' OR name GLOB 'idx_*_state_superseded')"
         )
     ]:
         conn.execute(f"DROP INDEX {index}")
@@ -158,7 +158,7 @@ def test_the_migration_rebuilds_no_full_text_index_and_rewrites_no_row(store):
 def test_the_state_indexes_are_partial(store):
     indexes = dict(
         store.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%_state_%'"
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND (name GLOB 'idx_*_state_canonical' OR name GLOB 'idx_*_state_superseded')"
         ).fetchall()
     )
 

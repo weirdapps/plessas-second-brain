@@ -98,7 +98,7 @@ def _drop_v35(conn):
     conn.execute("DROP TABLE IF EXISTS boilerplate_fact_keys")
     # v38 indexes canonical_id and superseded_by, so they go before their columns can.
     for (index,) in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%_state_%'"
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND (name GLOB 'idx_*_state_canonical' OR name GLOB 'idx_*_state_superseded')"
     ).fetchall():
         conn.execute(f"DROP INDEX {index}")
     for table, columns in ITEM_STATE_COLUMNS.items():

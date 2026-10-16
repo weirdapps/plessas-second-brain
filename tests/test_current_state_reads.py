@@ -146,7 +146,7 @@ def test_a_store_before_v35_reads_every_item(tmp_path):
     email_id = f.email(conn, subject="Okapi plan", sender=ALICE, to=(BOB,))
     f.decision(conn, "Adopt the okapi plan", email_id=email_id)
     for (index,) in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%_state_%'"
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND (name GLOB 'idx_*_state_canonical' OR name GLOB 'idx_*_state_superseded')"
     ).fetchall():
         conn.execute(f"DROP INDEX {index}")
     for table, columns in ITEM_STATE_COLUMNS.items():

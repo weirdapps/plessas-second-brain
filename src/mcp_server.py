@@ -41,6 +41,7 @@ from src.mcp_results import (
     CalendarEvents,
     ConversationContext,
     EmailThread,
+    FiguresResult,
     ImageSearch,
     ItemResult,
     LiveMail,
@@ -83,6 +84,7 @@ for _module in (
     "src.store.context",
     "src.store.conversation_query",
     "src.store.embeddings",
+    "src.store.figures",
     "src.store.greek",
     "src.store.items",
     "src.store.query",
@@ -118,7 +120,9 @@ one short line per row for a quick scan. Use the specific tools when you know th
 kind (`search_emails`, `search_attachments`, `search_teams`, `search_whatsapp`, \
 `search_conversations`, `query_calendar_events`) or the entity (`person_context`, \
 `topic_context`, `meeting_prep`; `query_decisions` and `query_actions` for what was \
-decided and what is owed). Every row says its `kind` and `ref`, and \
+decided and what is owed). For a number from a recurring report (a KPI, a volume, \
+a month's or a day's figure), `figures` first: the latest period held, the one \
+before, and the sheet and cell. Every row says its `kind` and `ref`, and \
 `get_item(kind, ref)` reads that item whole: an email's body with its thread and \
 attachments, an attachment's text a page at a time (`offset`), a Teams thread, a \
 WhatsApp session, a meeting with every attendee, a past conversation. For counts, \
@@ -1483,6 +1487,80 @@ def search_attachments(
     finally:
         conn.close()
     return cast(RowsResult, _rows(head, rows, _NO_WORD, coverage=cover, excluded=excluded))
+
+
+@_tool()
+def figures(
+    query: Annotated[
+        str | None,
+        Field(
+            description="Plain words naming the figure, Greek or English: a row label, a column "
+            "header, a sheet or a report's name. Needed unless mode='series'."
+        ),
+    ] = None,
+    period: Annotated[
+        str | None,
+        Field(
+            description="The period asked for: 2026-08-31, 2026-08, August 2026, Αύγουστος 2026, "
+            "2026-Q3, 2026-H1 or 2026. Omit for the latest held."
+        ),
+    ] = None,
+    series: Annotated[
+        str | None,
+        Field(description="Only one report series: its series_id, or words of its name."),
+    ] = None,
+    mode: Annotated[
+        Literal["figures", "series"],
+        Field(
+            description="'figures' (default): the matching metrics. 'series': the report series "
+            "held, newest edition first, filtered by `query` when given."
+        ),
+    ] = "figures",
+    limit: Annotated[
+        int, Field(ge=1, le=MAX_LIMIT, description="Maximum rows, 1 to 200 (default 10).")
+    ] = 10,
+) -> FiguresResult:
+    """Look up a number from the recurring report workbooks (KPIs, volumes, ratios, a month's or a day's figure): per matching metric its latest held value and period, the previous period's value, the edition, and the attachment, sheet and cell it came from.
+
+    A metric is one row label and column header of one sheet of one report series (a recurring
+    workbook, by filename and sender), newest period first. latest.source is attachment:<id>;
+    get_item(kind='attachment', ref, offset=latest.offset) shows the cell's row. period_source
+    says where the period was read: header, row, sheet, filename or email. A % value is as the
+    workbook stores it, usually a fraction. With `period` each row says `held`, and one not held
+    gives the latest held, with "not held; latest held: <period>" in `reason`. Name the report
+    and period with every figure, and never estimate one it does not hold.
+    """
+    from src.store.figures import coverage as registry_coverage
+    from src.store.figures import list_series, search_figures
+
+    if mode == "figures" and not (query or "").strip():
+        raise ToolError("query is required unless mode='series': plain words naming the figure")
+    conn = _get_conn()
+    try:
+        if mode == "series":
+            out: dict[str, Any] = {"result": list_series(conn, query, limit=_cap(limit))}
+            if not out["result"]:
+                out["reason"] = "No report series held" + (
+                    f" is named like {query!r}" if query else ""
+                )
+        else:
+            try:
+                out = search_figures(
+                    conn, query or "", period=period, series=series, limit=_cap(limit)
+                )
+            except ValueError as exc:
+                raise ToolError(str(exc)) from None
+        head = _header(conn)
+        cover = None
+        if not out["result"]:
+            cover = {"figures": registry_coverage(conn)}
+            cover.update(_cover(conn, None, (ATTACHMENTS,)) or {})
+    finally:
+        conn.close()
+    answer: dict[str, Any] = {**head, "mode": mode, **out}
+    if cover is not None:
+        answer["coverage"] = cover
+    return cast(FiguresResult, budget_response(answer))
 
 
 @_tool()

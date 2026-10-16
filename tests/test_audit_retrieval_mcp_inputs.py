@@ -80,6 +80,7 @@ CASES = [
     ("search_teams", {"query": "okapi"}, "src.store.teams_query:search_teams", "limit"),
     ("search_whatsapp", {"query": "okapi"}, "src.store.whatsapp_query:search_whatsapp", "limit"),
     ("sql_query", {"sql": "SELECT 1"}, "src.store.sql_readonly:run_query", "limit"),
+    ("figures", {"query": "okapi"}, "src.store.figures:search_figures", "limit"),
 ]
 
 
@@ -107,6 +108,8 @@ def test_every_limit_is_clamped_to_1_to_200(
         seen.append(kw[arg] if isinstance(arg, str) else a[arg])
         if function == "recall":
             return {"query": "", "summary": {}, **dict.fromkeys(mcp_server._RECALL_KINDS, [])}
+        if function == "search_figures":
+            return {"result": []}
         if function == "run_query":
             return {"columns": [], "rows": [], "row_count": 0, "truncated": False}
         return {} if function in ("get_person_context", "get_topic_context") else []

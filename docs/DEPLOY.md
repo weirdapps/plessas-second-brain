@@ -1205,6 +1205,27 @@ No schema change and no one-off command: the ranking is in the query code alone 
    before ranked and the `_recency` modes with it; on the reference replica's 45
    questions, recall@10 0.62 to 0.78 in `recall`, 0.80 to 0.85 in `hybrid`.
 
+### One-off commands after the numbers registry (schema v36)
+
+The figures registry is new tables only (README, "Figures"). The hourly sync reads the
+figures of each new edition of a report series from then on; the editions already held
+wait for the backfill, which runs on the producer beside the timers, once:
+
+1. `python -m src.cli maint figures-backfill --estimate` counts the spreadsheet editions,
+   the report series they make and the editions waiting, and parses a sample of 100 to
+   project the figures and the time, storing nothing. It only reads, so it runs on a
+   replica too. Reference replica: 4,548 editions in 185 series, about 565,000 figures,
+   projected at 1.7 minutes on a Mac.
+2. `python -m src.cli maint figures-backfill --apply` reads them all, oldest first within
+   each series, and commits each edition, so a run stopped part way (`--limit N`, a
+   SIGTERM, a reboot) resumes where it stopped when run again. No model call. A copy of
+   the reference replica's corpus took 1.5 to 4 minutes on a Mac and 40.4 MB;
+   allow a few times that on a small VPS. Run it once more after every job that started
+   before the pull has exited, for the editions those registered without reading.
+3. After a change of the parser (`PARSER_VERSION` in `src/extract/figures_parse.py`),
+   `python -m src.cli maint figures-backfill --apply --reset` forgets every figure and
+   reads them all again.
+
 ### Schema notes
 
 A store that missed several releases takes every migration since its version in
@@ -1254,3 +1275,9 @@ one pass, at the first job that writes. The versions that ask for a step:
   second and nothing needs stopping. A job still running the old code writes NULL in
   the new columns, as v1 rows hold. The one-off commands of 2026-10-16 above fill
   what they can.
+- **v36.** The numbers registry: `figure_series`, `figure_editions`, `figure_metrics`,
+  `figure_values`, `figure_restated`, the view `figure_metrics_search` and the index
+  `figure_metrics_fts` (README, "Figures"). New tables only, created in well under a
+  second; nothing needs stopping. The registry fills from the backfill above. A replica
+  that runs this code on a store pulled before the migration answers `figures` with a
+  `reason` saying the registry is not built there yet.

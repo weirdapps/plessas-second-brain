@@ -725,8 +725,8 @@ def test_the_judge_scores_decision_and_action_sets(files, model):
     judge_calls = fake.judge_calls()
     assert len(judge_calls) == 1  # case b: both sides empty, nothing to ask
     call = judge_calls[0]
-    assert call["output_config"]["format"]["type"] == "json_schema"
-    assert call["output_config"]["effort"] == "high"
+    # The project refuses structured outputs: the judge states its verdict's shape instead.
+    assert call["output_config"] == {"effort": "high"}
     assert "untrusted_" in call["messages"][0]["content"]
     rows = {r["case_id"]: r for r in read_jsonl(files.runs / f"{record['run_id']}.jsonl")}
     decisions = rows["a"]["judge"]["decisions"]

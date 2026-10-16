@@ -86,6 +86,17 @@ def is_boilerplate(conn: sqlite3.Connection, fact: str | None) -> bool:
     return row is not None
 
 
+def not_boilerplate_sql(conn: sqlite3.Connection, alias: str = "kf", include: bool = False) -> str:
+    """A WHERE condition on key_facts `alias` that leaves out the rows marked boilerplate;
+    '1' with `include`, and on a store older than v35, which a replica's file is until its
+    next pull: there no row is marked and every fact is listed, as before."""
+    if include or not any(
+        r[1] == "boilerplate" for r in conn.execute("PRAGMA table_info(key_facts)")
+    ):
+        return "1"
+    return f"{alias}.boilerplate = 0"
+
+
 # A fact's thread: its email's conversation, else the email; its Teams or WhatsApp thread;
 # its conversation; for anything else the row alone, which shares no thread.
 _THREAD_SQL = """CASE

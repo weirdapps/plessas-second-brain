@@ -25,6 +25,12 @@
             read again Greek first. A reading no longer marked replaces the stored text whatever
             its length and is summarised; one still marked stays unsummarised. The marks come
             from Phase 1 and from `ocr-regarble --apply` (src/extract/ocr_regarble.py)
+    wide    a long workbook summarised from its digest (since DIGEST_SINCE) when the digest leaves
+            out columns of a sheet (attachment_digest.cuts_columns): until 2026-10-16 those were
+            its newest, so a report with a column a day was summarised for its oldest days.
+            Summarised again, from the stored text; the file is not read. The first run records
+            when it began (sync_metadata reextract_wide_since), and a row summarised since is
+            not taken again
 
 A row is updated in place, so its id, and the vector keyed on it, stay its own. A re-read that
 comes back with no text leaves a row that already had text untouched (counted as kept): a
@@ -73,14 +79,16 @@ the summaries as a Vertex AI batch job at half price, --batch-collect stores its
 
 import hashlib
 import math
-from datetime import datetime
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from src.config import ATTACHMENTS_DIR, DEFAULT_DB
-from src.extract.attachment_digest import is_spreadsheet
+from src.extract.attachment_digest import SPREADSHEET_METHODS, cuts_columns, is_spreadsheet
 from src.extract.attachment_extractors import extract_text_from_file
 from src.extract.attachment_pipeline import (
+    FULL_PARTS_KEY,
     LONG_TEXT_CHARS,
     _connect,
     estimate_summaries,
@@ -93,8 +101,24 @@ from src.llm_cost import TokenBudget
 from src.redact import redact_secrets
 from src.store.file_hashes import locate_file
 from src.store.file_sweep import OCR_GARBLED_SQL, PARTIAL_SINCE_KEY, PARTIAL_SQL, UNREAD_SQL
+from src.store.stamps import instant, utc_now
 
 OLD_TEXT_CAP = 100_000
+
+# When the spreadsheet digest reached the producer: a long workbook summarised since was
+# summarised from its digest (attachment_pipeline._route), one summarised before from its parts,
+# which read every column. The wide selector takes the first kind only.
+DIGEST_SINCE = datetime(2026, 10, 10, 21, tzinfo=UTC)  # midnight of 11 October in Athens
+# Set when the first wide run begins, as reextract_partial_since is for the partial selector.
+WIDE_SINCE_KEY = "reextract_wide_since"
+# A workbook reader's method, as is_spreadsheet tells it.
+_SPREADSHEET_SQL = (
+    "(ac.extraction_method IN ("
+    + ", ".join(f"'{m}'" for m in sorted(SPREADSHEET_METHODS))
+    + ")"
+    + "".join(f" OR ac.extraction_method LIKE '{m} %'" for m in sorted(SPREADSHEET_METHODS))
+    + ")"
+)
 
 # How far an OCR re-read of an unchanged scan drifts from the stored text: the larger of a few
 # characters and a small share of its length. Measured 2026-10-04 on the producer (tesseract 5.5.0)
@@ -155,6 +179,16 @@ SELECTORS: dict[str, tuple[str, bool]] = {
     ),
     # A text-only document kept no file to read again.
     "garbled": (f"{OCR_GARBLED_SQL} AND a.file_path NOT LIKE 'text:%'", True),
+    # Narrowed here, as text, to rows summarised from the day before the digest landed (both
+    # stamp forms start with their date); _wide_rows keeps the ones its digest cut.
+    "wide": (
+        f"ac.llm_status = 'extracted' AND {_SPREADSHEET_SQL}"
+        f" AND ac.llm_extracted_at >= '{DIGEST_SINCE.date().isoformat()}'"
+        f" AND length(ac.extracted_text) > {LONG_TEXT_CHARS}"
+        " AND NOT EXISTS (SELECT 1 FROM sync_metadata f"
+        f" WHERE f.key = '{FULL_PARTS_KEY}' || ac.attachment_id)",
+        False,
+    ),
 }
 
 # The images pass owns these rows (src/extract/image_*.py): never selected, never written.
@@ -175,13 +209,18 @@ def select_rows(
     `full_parts` adds those attachments' rows that hold text, to be summarised again.
     `no_spreadsheets` leaves out the rows a workbook reader read (is_spreadsheet)."""
     rows: dict[int, tuple] = {}
-    chosen = [SELECTORS[name] for name in sorted(which)]
+    chosen = [(name, *SELECTORS[name]) for name in sorted(which)]
     if full_parts:
         ids = ",".join(str(int(att)) for att in full_parts)
         chosen.append(
-            (f"ac.attachment_id IN ({ids}) AND ac.extraction_status = 'extracted'", False)
+            (
+                "full parts",
+                f"ac.attachment_id IN ({ids}) AND ac.extraction_status = 'extracted'",
+                False,
+            )
         )
-    for where, reread in chosen:
+    for name, where, reread in chosen:
+        keep = _wide_rows(conn) if name == "wide" else None
         for ac_id, att_id, file_path, mime, has_text, method in conn.execute(
             "SELECT ac.id, a.id, a.file_path, a.mime_type, ac.extracted_text IS NOT NULL,"
             " ac.extraction_method FROM attachment_content ac"
@@ -190,6 +229,8 @@ def select_rows(
             (after_id or 0,),
         ):
             if no_spreadsheets and is_spreadsheet(method):
+                continue
+            if keep is not None and not keep(ac_id):
                 continue
             prior = rows.get(ac_id)
             rows[ac_id] = (
@@ -202,6 +243,28 @@ def select_rows(
             )
     ordered = [rows[k] for k in sorted(rows)]
     return ordered[:limit] if limit else ordered
+
+
+def _wide_rows(conn) -> Callable[[int], bool]:
+    """Whether a row the wide selector's SQL found was summarised from a digest that left out
+    columns: summarised since DIGEST_SINCE and, once a wide run has begun, before it began, by
+    the instant whatever the stamp's form (src/store/stamps.py), and wide by cuts_columns."""
+    mark = conn.execute(
+        "SELECT value FROM sync_metadata WHERE key = ?", (WIDE_SINCE_KEY,)
+    ).fetchone()
+    since = instant(mark[0]) if mark else None
+
+    def keep(ac_id: int) -> bool:
+        text, stamp = conn.execute(
+            "SELECT extracted_text, llm_extracted_at FROM attachment_content WHERE id = ?",
+            (ac_id,),
+        ).fetchone()
+        when = instant(stamp)
+        if when is None or when < DIGEST_SINCE or (since is not None and when >= since):
+            return False
+        return cuts_columns(text)
+
+    return keep
 
 
 def duplicate_groups(conn, ac_ids) -> dict[int, list[int]]:
@@ -316,13 +379,13 @@ def reextract(
     copies: dict[int, list[int]] = {}
     conn = _connect(db_path)
     try:
-        now = datetime.now().isoformat()
-        if "partial" in (which or set()) and not dry_run:
-            conn.execute(
-                "INSERT OR IGNORE INTO sync_metadata (key, value) VALUES (?, ?)",
-                (PARTIAL_SINCE_KEY, now),
-            )
-            conn.commit()
+        now = utc_now()  # extracted_at and the partial mark, in UTC (src/store/stamps.py)
+        for selector, key in (("partial", PARTIAL_SINCE_KEY), ("wide", WIDE_SINCE_KEY)):
+            if selector in (which or set()) and not dry_run:
+                conn.execute(
+                    "INSERT OR IGNORE INTO sync_metadata (key, value) VALUES (?, ?)", (key, now)
+                )
+                conn.commit()
         if full_parts and not dry_run:
             marks = ",".join("?" * len(full_parts))
             known = [

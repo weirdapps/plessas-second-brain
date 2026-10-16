@@ -161,6 +161,31 @@ def test_remove_vectors_is_a_no_op_without_an_index(index):
     assert not index.exists()
 
 
+def test_remove_vectors_reads_no_vector_when_none_of_the_ids_is_indexed(index, monkeypatch):
+    """Forgetting a document that never had a summary (a hollow SharePoint shell) drops no
+    vector, and must not load the whole index, 1.78 GB on the producer, to find that out."""
+    from src.store import embeddings
+
+    embeddings._atomic_savez(index, [1, 2], np.eye(2, 4, dtype=np.float32))
+    real_load = np.load
+
+    class IdsOnly:
+        def __init__(self, data):
+            self.data = data
+
+        def __getitem__(self, key):
+            if key == "vectors":
+                raise AssertionError("the vectors were read")
+            return self.data[key]
+
+        def __contains__(self, key):
+            return key in self.data
+
+    monkeypatch.setattr(embeddings.np, "load", lambda *a, **k: IdsOnly(real_load(*a, **k)))
+
+    assert embeddings.remove_vectors({7, 8}) == 0
+
+
 def test_forgets_in_chunks_past_the_variable_limit(db, index, monkeypatch):
     import src.store.forget as forget
 

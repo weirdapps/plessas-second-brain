@@ -130,7 +130,9 @@ def search_conversations_keyword(
     # any natural-language query raised OperationalError straight out of the MCP
     # tool: a question mark is "fts5: syntax error near "?"", an ampersand the
     # same, and a bare word after a hyphen becomes "no such column".
-    for safe_query, partial in fts5_query_variants(query):
+    from src.store.cross_script import name_forms
+
+    for safe_query, partial in fts5_query_variants(query, name_forms(conn)):
         results = _conversation_hits(conn, safe_query, workspace, limit, include_agents)
         if results:
             if partial:

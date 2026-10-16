@@ -27,6 +27,7 @@ def search_whatsapp(
     Tried as the exact phrase, then every word in any order, then any meaningful
     word, with rows from that last pass flagged partial_match, as search_teams does.
     """
+    from src.store.cross_script import name_forms
     from src.store.query import _sanitize_fts5_query, fts5_query_variants
     from src.store.teams_query import _sanitize_fts
 
@@ -35,7 +36,7 @@ def search_whatsapp(
     except sqlite3.OperationalError:
         return []  # a store from before v26
     variants = [(_sanitize_fts(query), False)]
-    for expression, partial in fts5_query_variants(query):
+    for expression, partial in fts5_query_variants(query, name_forms(conn)):
         if expression != variants[0][0] and expression != _sanitize_fts5_query(""):
             variants.append((expression, partial))
     for safe, partial in variants:

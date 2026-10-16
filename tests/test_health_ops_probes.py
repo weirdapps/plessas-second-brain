@@ -237,6 +237,29 @@ def _semantic(tmp_path, embed):
     return functools.partial(query_semantic, embed_fn=embed, index_path=str(_index(tmp_path)))
 
 
+def _candidates(tmp_path, embed):
+    """recall's semantic provider, as the MCP tool injects it, on the test index."""
+    from src.store.embeddings import semantic_email_candidates
+
+    return functools.partial(
+        semantic_email_candidates, embed_fn=embed, index_path=str(_index(tmp_path))
+    )
+
+
+@pytest.fixture
+def golden(hc, monkeypatch, tmp_path):
+    """check_golden_query with no wait before its second look, and both semantic halves
+    on the test index with the embedder given."""
+    monkeypatch.setattr(hc, "GOLDEN_RECHECK_SECONDS", 0)
+
+    def run(conn, phrase, embed, **kw):
+        kw.setdefault("semantic", _semantic(tmp_path, embed))
+        kw.setdefault("candidates", _candidates(tmp_path, embed))
+        return hc.check_golden_query(conn, phrase, **kw)
+
+    return run
+
+
 def _embedded(_texts):
     return np.array([[1.0, 0.0]], dtype=np.float32)
 
@@ -245,57 +268,120 @@ def _refused(_texts):
     raise RuntimeError("the embedding service refused the model")
 
 
-def test_golden_query_ok_when_both_halves_answer(hc, tmp_path):
-    r = hc.check_golden_query(
-        _store(), "steering committee", semantic=_semantic(tmp_path, _embedded)
-    )
+def test_golden_query_ok_when_both_halves_answer(golden):
+    r = golden(_store(), "steering committee", _embedded)
 
     assert r["status"] == "OK"
     assert r["keyword_rows"] >= 1 and r["semantic_rows"] >= 1
     assert r["embed_backend"]
+    assert r["semantic"] == r["recall_semantic"] == "ok"
 
 
-def test_golden_query_is_stale_when_semantic_falls_back_to_keyword_matches(hc, tmp_path):
+def test_golden_query_is_stale_when_semantic_falls_back_to_keyword_matches(golden):
     """The September outage ran two days at "semantic: keyword_seeded" and nothing said so."""
-    r = hc.check_golden_query(
-        _store(), "steering committee", semantic=_semantic(tmp_path, _refused)
-    )
+    r = golden(_store(), "steering committee", _refused)
 
     assert r["status"] == "STALE"
     assert "keyword_seeded" in r["note"]
+    assert r["recall_semantic"].startswith("keyword_seeded")
 
 
-def test_golden_query_is_stale_when_semantic_search_cannot_run_at_all(hc, tmp_path):
-    r = hc.check_golden_query(_store(), "zeppelin", semantic=_semantic(tmp_path, _refused))
+def test_golden_query_is_stale_when_semantic_search_cannot_run_at_all(golden):
+    r = golden(_store(), "zeppelin", _refused)
 
     assert r["status"] == "STALE"
+    assert r["semantic"] == r["recall_semantic"] == "unavailable: RuntimeError"
 
 
-def test_golden_query_warns_when_the_phrase_matches_nothing(hc, tmp_path):
-    r = hc.check_golden_query(_store(), "zeppelin", semantic=_semantic(tmp_path, _embedded))
+def test_golden_query_warns_when_the_phrase_matches_nothing(golden):
+    r = golden(_store(), "zeppelin", _embedded)
 
     assert r["status"] == "WARN"
     assert "BRAIN_HEALTH_QUERY" in r["note"]
 
 
-def test_golden_query_warns_without_an_index(hc, tmp_path):
-    from src.store.embeddings import query_semantic
+def test_golden_query_warns_without_an_index(golden, tmp_path):
+    from src.store.embeddings import query_semantic, semantic_email_candidates
 
-    semantic = functools.partial(query_semantic, index_path=str(tmp_path / "absent.npz"))
-    r = hc.check_golden_query(_store(), "steering committee", semantic=semantic)
+    absent = str(tmp_path / "absent.npz")
+    r = golden(
+        _store(),
+        "steering committee",
+        _embedded,
+        semantic=functools.partial(query_semantic, index_path=absent),
+        candidates=functools.partial(semantic_email_candidates, index_path=absent),
+    )
 
     assert r["status"] == "WARN"
+    assert r["semantic"] == r["recall_semantic"] == "no index"
 
 
-def test_golden_query_fails_when_keyword_search_breaks(hc, tmp_path):
+def test_golden_query_fails_when_keyword_search_breaks(golden):
     def broken(conn, phrase, limit):
         raise sqlite3.OperationalError("no such table: emails_fts")
 
-    r = hc.check_golden_query(
-        _store(), "steering committee", keyword=broken, semantic=_semantic(tmp_path, _embedded)
-    )
+    r = golden(_store(), "steering committee", _embedded, keyword=broken)
 
     assert r["status"] == "FAIL"
+
+
+def _once_refused():
+    """An embedder that refuses its first call and answers every one after."""
+    calls = []
+
+    def embed(texts):
+        calls.append(texts)
+        if len(calls) == 1:
+            raise RuntimeError("the embedding service timed out")
+        return _embedded(texts)
+
+    return embed
+
+
+def test_golden_query_warns_on_a_failure_that_clears_on_a_second_look(golden):
+    """Any semantic status but ok is reported; one that does not last the run is a WARN."""
+    r = golden(_store(), "steering committee", _once_refused())
+
+    assert r["status"] == "WARN"
+    assert "keyword_seeded" in r["note"] and "then ok" in r["note"]
+    assert r["semantic"] == "ok"  # the second look
+
+
+def test_golden_query_is_stale_when_recall_alone_cannot_embed(golden, tmp_path):
+    """recall's provider is its own path: the 6-7 Oct outage showed only in recall's
+    summary.semantic, as unavailable: ClientError."""
+    r = golden(
+        _store(), "steering committee", _embedded, candidates=_candidates(tmp_path, _refused)
+    )
+
+    assert r["semantic"] == "ok"
+    assert r["recall_semantic"] == "keyword_seeded: RuntimeError"
+    assert r["status"] == "STALE"
+    assert "recall" in r["note"]
+
+
+def test_golden_query_waits_before_its_second_look(hc, tmp_path, monkeypatch):
+    waits = []
+    monkeypatch.setattr(hc, "GOLDEN_RECHECK_SECONDS", 20)
+    r = hc.check_golden_query(
+        _store(),
+        "steering committee",
+        semantic=_semantic(tmp_path, _refused),
+        candidates=_candidates(tmp_path, _refused),
+        sleep=waits.append,
+    )
+
+    assert waits == [20]
+    assert r["status"] == "STALE"
+    assert "20 s" in r["note"]
+
+
+def test_golden_query_does_not_wait_when_semantic_search_is_ok(hc, golden):
+    waits = []
+
+    golden(_store(), "steering committee", _embedded, sleep=waits.append)
+
+    assert waits == []
 
 
 def test_golden_query_is_not_applicable_to_an_empty_store(hc):

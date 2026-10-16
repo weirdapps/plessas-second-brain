@@ -179,7 +179,7 @@ def test_the_queries_never_read_the_stored_text(tmp_path, hc):
             text="x" * 50_000,
             summary="a summary",
             llm_status="extracted",
-            llm_extracted_at="2026-10-01T00:00:00",
+            llm_extracted_at="2026-10-01T00:00:00+00:00",
         )
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     conn.close()
@@ -192,7 +192,7 @@ def test_the_queries_never_read_the_stored_text(tmp_path, hc):
         conn.execute("SELECT summary FROM attachment_content NOT INDEXED").fetchall()
 
     assert len(conn.execute(file_sweep.registered_sql(conn)).fetchall()) == 20
-    assert conn.execute(hc.LATEST_LLM_EXTRACTION_SQL).fetchone()[0] == "2026-10-01T00:00:00"
+    assert conn.execute(hc.LATEST_LLM_EXTRACTION_SQL).fetchone()[0] == "2026-10-01T00:00:00.000Z"
     assert len(conn.execute(hc.SUMMARISED_ATTACHMENT_IDS_SQL).fetchall()) == 20
     conn.close()
 
@@ -234,10 +234,10 @@ def test_the_latest_extraction_query_uses_its_index(db, hc):
 
 
 def test_the_latest_extraction_is_the_newest_extracted_one(db, hc):
-    _attachment(db, "d1", "a.pdf", llm_status="extracted", llm_extracted_at="2026-10-01T10:00:00")
-    _attachment(db, "d2", "b.pdf", llm_status="extracted", llm_extracted_at="2026-10-03T10:00:00")
-    _attachment(db, "d3", "c.pdf", llm_status="pending", llm_extracted_at="2026-10-09T10:00:00")
-    assert db.execute(hc.LATEST_LLM_EXTRACTION_SQL).fetchone()[0] == "2026-10-03T10:00:00"
+    _attachment(db, "d1", "a.pdf", llm_status="extracted", llm_extracted_at="2026-10-01T10:00Z")
+    _attachment(db, "d2", "b.pdf", llm_status="extracted", llm_extracted_at="2026-10-03T10:00Z")
+    _attachment(db, "d3", "c.pdf", llm_status="pending", llm_extracted_at="2026-10-09T10:00Z")
+    assert db.execute(hc.LATEST_LLM_EXTRACTION_SQL).fetchone()[0] == "2026-10-03T10:00:00.000Z"
 
 
 def test_the_summarised_attachment_query_uses_its_index(db, hc):

@@ -45,6 +45,7 @@ from src.store.file_sweep import (
     OCR_GARBLED_SQL,
 )
 from src.store.source_class import stored_class
+from src.store.stamps import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -311,7 +312,8 @@ def run_phase1(
     """
     db_path = db_path or str(DEFAULT_DB)
     conn = _connect(db_path)
-    now = datetime.now().isoformat()
+    # extracted_at, in UTC with its offset since 2026-10-16 (src/store/stamps.py).
+    now = utc_now()
 
     # Build query with parameterized conditions
     type_condition, type_params = _build_mime_type_conditions(file_type)
@@ -842,7 +844,7 @@ def apply_call(
 
 def mark_full_parts(conn: sqlite3.Connection, attachment_ids: Iterable[int]) -> None:
     """Flag attachments to be summarised from every part (up to MAX_SUMMARY_PARTS)."""
-    now = datetime.now().isoformat()
+    now = utc_now()
     conn.executemany(
         "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES (?, ?)",
         [(f"{FULL_PARTS_KEY}{int(att)}", now) for att in attachment_ids],
@@ -929,6 +931,19 @@ def _extract_one_attachment(row, out_of_time=None, budget=None):
         if not verdict and is_transient(e) and not is_item_timeout(e):
             verdict = TRANSIENT
         return (r.ac_id, r.email_id, None, f"{type(e).__name__}: {str(e)[:500]}", verdict)
+
+
+def _takes_items(conn: sqlite3.Connection, email_id: int) -> bool:
+    """Whether an attachment summary may put decisions and action items on this email: not on
+    news or automation mail, which decide nothing and assign nothing to anyone, as the email
+    loader takes none from their bodies. Its key facts and topics are kept. The rule is
+    src.store.source_class.takes_items, which lands with this check in a parallel change; once
+    both are in, this calls it. A store older than v33 has no class: every email takes them."""
+    try:
+        row = conn.execute("SELECT source_class FROM emails WHERE id = ?", (email_id,)).fetchone()
+    except sqlite3.OperationalError:
+        return True
+    return row is None or row[0] not in ("news", "automation")
 
 
 def _held(conn: sqlite3.Connection, table: str, column: str, email_id: int, value: str) -> bool:
@@ -1088,7 +1103,7 @@ def store_phase2_result(
         # The parts a long document finished are saved, so the next run resumes it.
         stats["over_budget"] += 1
         return
-    now = datetime.now().isoformat()
+    now = utc_now()  # llm_extracted_at, in UTC (src/store/stamps.py)
     if error:
         if auth_error == TRANSIENT:
             # Offered again next run, and still counted, so a run during an
@@ -1161,7 +1176,8 @@ def store_phase2_result(
 
             # The texts are masked as the loader masks an email's
             # (src/store/loader.py), and compared masked with what the email holds.
-            for decision in extraction.get("decisions", []):
+            takes_items = _takes_items(conn, email_id)
+            for decision in extraction.get("decisions", []) if takes_items else []:
                 if isinstance(decision, dict) and decision.get("decision"):
                     text = redact_secrets(decision["decision"])
                     if _held(conn, "decisions", "decision", email_id, text):
@@ -1177,7 +1193,7 @@ def store_phase2_result(
                         ),
                     )
 
-            for action in extraction.get("action_items", []):
+            for action in extraction.get("action_items", []) if takes_items else []:
                 if isinstance(action, dict) and action.get("task"):
                     task = redact_secrets(action["task"])
                     if _held(conn, "action_items", "task", email_id, task):
@@ -1689,7 +1705,8 @@ def ingest_text_document(
     existing = conn.execute("SELECT id FROM emails WHERE message_id = ?", (message_id,)).fetchone()
     if existing:
         return {"skipped": True, "message_id": message_id, "email_id": existing[0]}
-    now = datetime.now().isoformat()
+    now = datetime.now().isoformat()  # attachments.exported_at, local time as its other writers
+    extracted = utc_now()  # attachment_content.extracted_at, in UTC (src/store/stamps.py)
     # Its class (src/store/source_class.py): a session note or a document
     source_class = stored_class(conn, "External", f"{source}@documents.local", subject)
     with conn:
@@ -1735,7 +1752,7 @@ def ingest_text_document(
                 method,
                 status,
                 error,
-                now,
+                extracted,
                 llm_status_for(error),
             ),
         )

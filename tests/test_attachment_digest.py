@@ -17,6 +17,7 @@ from src.extract.attachment_digest import (
     DIGEST_MAX_CHARS,
     FREE_TEXT_CHARS,
     SAMPLE_ROWS,
+    cuts_columns,
     is_spreadsheet,
     spreadsheet_digest,
 )
@@ -181,3 +182,142 @@ def test_text_without_sheet_markers_is_read_as_one_sheet():
 @pytest.mark.parametrize("bad", ["", "   \n\n  "])
 def test_an_empty_text_still_gives_a_digest(bad):
     assert "0 sheets" in spreadsheet_digest(bad)
+
+
+# --- a sheet with one column per period --------------------------------------------------
+#
+# A daily report mailed on 12 October held every day of January to September, one column a
+# day. The digest kept its first 40 columns and the first 600 characters of each row, so the
+# model saw January only, and the summary and the key facts said nothing of September (audit
+# 2026-10-16). A wide sheet now keeps its label columns and its newest columns.
+
+
+def _daily(first: date, days: int, channels=("Cards", "Internet", "Mobile")) -> list[list]:
+    """A label column, then one column a day: the shape of a daily volumes report."""
+    header: list = ["Channel", *(first + timedelta(days=i) for i in range(days))]
+    return [
+        header,
+        *[[name, *(1_000 * (k + 1) + i for i in range(days))] for k, name in enumerate(channels)],
+    ]
+
+
+def test_a_wide_sheet_keeps_its_label_column_and_its_newest_columns(tmp_path):
+    text = _dump(tmp_path, {"Volumes": _daily(date(2026, 1, 1), 273)})  # 1 Jan to 30 Sep
+
+    section = _section(spreadsheet_digest(text), "Volumes")
+
+    assert "2026-09-30" in section  # the newest day
+    assert "2026-01-15" not in section  # January is left out
+    header = next(line for line in section.splitlines() if line.startswith("Header:"))
+    assert header.startswith("Header: Channel | ")
+    assert header.rstrip().endswith("2026-09-30")
+    # Every row keeps its label and its newest value: 1,000 a channel plus the day's index.
+    for k, name in enumerate(("Cards", "Internet", "Mobile")):
+        row = next(line for line in section.splitlines() if line.startswith(f"{name} |"))
+        assert row.rstrip().endswith(str(1_000 * (k + 1) + 272))
+
+
+def test_a_wide_sheet_says_which_columns_it_shows(tmp_path):
+    text = _dump(tmp_path, {"Volumes": _daily(date(2026, 1, 1), 273)})
+
+    section = _section(spreadsheet_digest(text), "Volumes")
+
+    shown = next(line for line in section.splitlines() if line.startswith("Columns shown:"))
+    assert "of 274" in shown and "left out" in shown
+    assert "2026-01-01" in shown  # the first column left out, by its date
+
+
+def test_the_header_dates_are_named_by_month_in_greek_and_english(tmp_path):
+    text = _dump(tmp_path, {"Volumes": _daily(date(2026, 1, 1), 273)})
+
+    section = _section(spreadsheet_digest(text), "Volumes")
+
+    dates = next(line for line in section.splitlines() if line.startswith("Dates in the header:"))
+    assert "2026-01-01 to 2026-09-30" in dates
+    assert "Ιανουάριος 2026" in dates and "Σεπτέμβριος 2026" in dates
+    assert "January" in dates and "September 2026" in dates
+
+
+def test_a_sheet_whose_newest_period_comes_first_keeps_its_first_columns(tmp_path):
+    rows = _daily(date(2026, 1, 1), 273)
+    rows = [[row[0], *reversed(row[1:])] for row in rows]  # 30 Sep first, 1 Jan last
+
+    section = _section(spreadsheet_digest(_dump(tmp_path, {"Volumes": rows})), "Volumes")
+
+    header = next(line for line in section.splitlines() if line.startswith("Header:"))
+    assert header.startswith("Header: Channel | 2026-09-30 | 2026-09-29")
+    assert "2026-01-01 |" not in header
+
+
+def test_the_columns_shown_get_their_statistics(tmp_path):
+    text = _dump(tmp_path, {"Volumes": _daily(date(2026, 1, 1), 273)})
+
+    section = _section(spreadsheet_digest(text), "Volumes")
+
+    newest = next(line for line in section.splitlines() if line.startswith("- 2026-09-30"))
+    assert "number" in newest and re.search(r"max 3,272\b", newest)
+    assert not any(line.startswith("- 2026-01-02") for line in section.splitlines())
+
+
+def test_a_sheet_without_a_label_column_keeps_its_last_columns(tmp_path):
+    # Dates from the first column on, one block of header and values a year, as the report
+    # mailed on 12 October has them.
+    header = [date(2026, 1, 1) + timedelta(days=i) for i in range(273)] + ["Year total"]
+    values = [*(5_000 + i for i in range(273)), 999_999]
+    text = _dump(tmp_path, {"Count": [["Daily transactions, all channels"], header, values]})
+
+    section = _section(spreadsheet_digest(text), "Count")
+
+    assert "2026-09-30" in section and "Year total" in section and "999,999" in section
+    assert "2026-01-03" not in section
+
+
+def test_a_wide_digest_stays_under_its_cap(tmp_path):
+    sheets = {
+        f"Year {y}": _daily(date(y, 1, 1), 365, [f"Channel {i}" for i in range(30)])
+        for y in (2024, 2025, 2026)
+    }
+    digest = spreadsheet_digest(_dump(tmp_path, sheets))
+
+    assert len(digest) <= DIGEST_MAX_CHARS
+    assert all(f'"Year {y}"' in digest for y in (2024, 2025, 2026))
+
+
+def test_a_date_column_is_named_by_month_too(tmp_path):
+    text = _dump(tmp_path, {"Ledger": _ledger(300)})
+
+    ledger = _section(spreadsheet_digest(text), "Ledger")
+
+    when = next(line for line in ledger.splitlines() if line.lstrip("- ").startswith("Date"))
+    assert "Ιανουάριος 2025" in when and "Οκτώβριος 2025" in when and "October 2025" in when
+
+
+def test_a_narrow_sheet_shows_every_column_as_before(tmp_path):
+    text = _dump(tmp_path, {"Ledger": _ledger(300)})
+
+    ledger = _section(spreadsheet_digest(text), "Ledger")
+
+    assert "Columns shown:" not in ledger
+    assert "Date | Branch | Amount | Code" in ledger
+
+
+def test_the_digest_prompt_asks_the_summary_to_name_the_newest_month():
+    from src.extract.attachment_prompt import (
+        build_attachment_prompt,
+        build_attachment_request_v2,
+    )
+
+    v1 = build_attachment_prompt("digest", "book.xlsx", XLSX, digest=True)
+    v2 = build_attachment_request_v2("digest", "book.xlsx", XLSX, digest=True)
+    for prompt in (v1, v2.user):
+        assert "name its newest month" in prompt and "Σεπτέμβριος 2026" in prompt
+    assert "newest month" not in build_attachment_prompt("text", "a.pdf", "application/pdf")
+
+
+def test_cut_columns_tells_a_wide_sheet_from_a_narrow_one(tmp_path):
+    wide = _dump(tmp_path, {"Volumes": _daily(date(2026, 1, 1), 273)})
+    narrow = _dump(tmp_path, {"Ledger": _ledger(300)})
+
+    assert cuts_columns(wide)
+    assert not cuts_columns(narrow)
+    assert not cuts_columns("")

@@ -92,6 +92,7 @@ from src.export.outlook_cli import OutlookCliAuthRequired, OutlookCliError, run_
 from src.store.file_hashes import locate_file, sha256_of_file
 from src.store.file_sweep import OCR_GARBLED_SQL, REFETCH_KEY, SWEEP_INDEX
 from src.store.schema import get_connection
+from src.store.stamps import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -519,7 +520,7 @@ def _same_file(a: Path, b: Path) -> bool:
 def _record(conn: sqlite3.Connection, message: Message, outcome: Outcome, counts: dict) -> None:
     """Write what came of one message, for each of its rows, in one transaction, and count it in
     `counts`: the id half's, or the lookup's."""
-    now = datetime.now().isoformat()  # attachment_content.extracted_at's format
+    now = utc_now()  # in UTC, as attachment_content.extracted_at is (src/store/stamps.py)
     for row in message.rows:
         record: dict = {"attempts": row.attempts + 1, "last_attempt_at": now, **outcome.note}
         if outcome.state == FETCHED and row.attachment_id in outcome.placed:

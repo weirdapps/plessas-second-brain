@@ -84,3 +84,24 @@ def test_a_row_already_on_the_email_is_not_added_twice(tmp_path, monkeypatch):
 
     count = conn.execute("SELECT COUNT(*) FROM key_facts WHERE fact = 'revenue rose'").fetchone()[0]
     assert count == 1
+
+
+def test_news_and_automation_mail_take_no_decision_or_action_from_an_attachment(
+    tmp_path, monkeypatch
+):
+    """As the email loader takes none from their bodies: a monitor digest or a machine report
+    decides nothing and assigns nothing to anyone. Its facts and topics are still kept."""
+    for source_class in ("news", "automation"):
+        (tmp_path / source_class).mkdir()
+        path, conn = _db(tmp_path / source_class)
+        conn.execute("UPDATE emails SET source_class = ?", (source_class,))
+        conn.commit()
+
+        _summarise(path, monkeypatch)
+
+        counts = [
+            conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("decisions", "action_items", "key_facts")
+        ]
+        assert counts == [0, 0, 2], source_class
+        conn.close()

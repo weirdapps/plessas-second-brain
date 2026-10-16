@@ -152,7 +152,7 @@ def run(args):
         parse_event,
     )
     from src.export.outlook_cli import OutlookCliAuthRequired
-    from src.extract.calendar_extractor import event_prompt_hash, extract_event
+    from src.extract.calendar_extractor import event_body_text, event_prompt_hash, extract_event
     from src.extract.policy_bridge import classify_exception, is_transient
     from src.extract.vertex_auth import touch_sentinel
     from src.llm_policy import Outcome
@@ -366,6 +366,8 @@ def run(args):
                 ).fetchone()
             body_obj = body_raw.get("Body", {})
             body_html = body_obj.get("Content", "") if isinstance(body_obj, dict) else ""
+            # Stored as a reader sees it (calendar_events.body), whatever the extraction does.
+            event["body"] = event_body_text(body_html or "")
 
             # Extract. 'skipped' until something is actually attempted: no body, and under
             # the 50-char floor once the HTML and the online-meeting joining details are

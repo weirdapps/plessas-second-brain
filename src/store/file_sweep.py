@@ -40,6 +40,7 @@ from pathlib import Path
 
 from src.config import DATA_ROOT
 from src.extract.ocr_garble import OCR_GARBLED
+from src.store.stamps import instant_sql
 
 SWEEP_POLICY_FILE = DATA_ROOT / "state" / "sweep-policy.json"
 VISION_ATTEMPTS_LIMIT = 3
@@ -77,7 +78,9 @@ UNREAD_SQL = (
 # saying so.
 # They count as read in part until reextract --partial reads them again: it sets this
 # sync_metadata row when it begins, and every row it reads gets a later extracted_at. Until the
-# row exists every such row counts, since the new readers leave no mark of their own.
+# row exists every such row counts, since the new readers leave no mark of their own. The two
+# are compared as instants: until `brain maint utc-stamps` has run, either can be local time
+# with no offset, and the other UTC (src/store/stamps.py).
 PARTIAL_SINCE_KEY = "reextract_partial_since"
 PARTIAL_READERS = (
     "openpyxl",
@@ -93,8 +96,8 @@ PARTIAL_SQL = (
     " OR (ac.extraction_method = 'ocr'"
     " AND (lower(a.filename) LIKE '%.tif' OR lower(a.filename) LIKE '%.tiff'))"
     " OR length(ac.extracted_text) IN (" + ", ".join(str(n) for n in CUT_LENGTHS) + "))"
-    " AND COALESCE(ac.extracted_at, '') < COALESCE("
-    f"(SELECT value FROM sync_metadata WHERE key = '{PARTIAL_SINCE_KEY}'), '9999'))"
+    f" AND COALESCE({instant_sql('ac.extracted_at')}, 0) < COALESCE((SELECT"
+    f" {instant_sql('value')} FROM sync_metadata WHERE key = '{PARTIAL_SINCE_KEY}'), 1e9))"
 )
 
 # Not stored in full: the sweep keeps the file, the reaper does not count the hash as stored,
@@ -108,19 +111,23 @@ NOT_FULLY_READ_SQL = f"({UNREAD_SQL} OR {PARTIAL_SQL})"
 OCR_GARBLED_SQL = f"COALESCE(ac.extraction_error LIKE '%{OCR_GARBLED}%', 0)"
 
 # The sync_metadata key prefix of the record `refetch-garbled` keeps per attachment id
-# (src/export/refetch_garbled.py): a JSON object whose `fetched_at`, in the format
-# attachment_content.extracted_at keeps, says when the original was fetched back.
+# (src/export/refetch_garbled.py): a JSON object whose `fetched_at` says when the original was
+# fetched back.
 REFETCH_KEY = "refetch_garbled:"
 
 # An original fetched back from the mailbox for a garbled text, and not read since: no reading of
 # the row (reextract, or the image pass writing the transcription) is recorded after the fetch.
 # Its content is not held, so the file stays until one is, even if the mark is lifted first. A
-# record that is not JSON counts as none, so it cannot stop the sweep. 1 or 0, never NULL.
-REFETCHED_UNREAD_SQL = (
-    "COALESCE((SELECT CASE WHEN json_valid(m.value)"
-    " THEN json_extract(m.value, '$.fetched_at') END"
+# record that is not JSON counts as none, so it cannot stop the sweep. 1 or 0, never NULL. The
+# two stamps are compared as instants, local time or UTC (src/store/stamps.py): compared as text,
+# a fetch stamped in UTC read as older than a reading stamped in local time three hours earlier,
+# and the sweep would have deleted the file before anything read it.
+_FETCHED_AT = (
+    "(SELECT CASE WHEN json_valid(m.value) THEN json_extract(m.value, '$.fetched_at') END"
     f" FROM sync_metadata m WHERE m.key = '{REFETCH_KEY}' || a.id)"
-    " > COALESCE(ac.extracted_at, ''), 0)"
+)
+REFETCHED_UNREAD_SQL = (
+    f"COALESCE({instant_sql(_FETCHED_AT)} > COALESCE({instant_sql('ac.extracted_at')}, 0), 0)"
 )
 
 # The content is held: Phase 1 extracted the file's text, all of it, and the text is the file's

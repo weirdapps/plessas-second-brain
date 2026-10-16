@@ -200,6 +200,9 @@ def load_event(
     # meeting, and 'skipped' only knows the body is now too short to summarise,
     # while the decisions it keeps came from the body the summary did. Writing ''
     # over it lost the summary for good on a 'failed', which is not re-offered.
+    # The event's text is a fact from the API like its time and its attendees, so it is written
+    # whatever the extraction did. Nothing wrote it before 2026-10-16 (calendar-sync read it and
+    # threw it away); an event given without its text keeps the one stored.
     conn.execute(
         """
         INSERT INTO calendar_events (
@@ -207,9 +210,10 @@ def load_event(
             start_at, end_at, location, is_recurring, recurrence_master_id,
             response_status, is_cancelled, is_self_organized,
             created_at, modified_at, ingested_at, body_extracted_at, body_summary,
-            llm_status, change_key, extraction_hash
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            llm_status, change_key, extraction_hash, body
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(outlook_event_id) DO UPDATE SET
+            body = COALESCE(excluded.body, calendar_events.body),
             subject = excluded.subject,
             organizer_email = excluded.organizer_email,
             organizer_name = excluded.organizer_name,
@@ -254,6 +258,7 @@ def load_event(
             llm_status,
             event.get("change_key"),
             extraction_hash,
+            event.get("body"),
         ),
     )
 

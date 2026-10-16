@@ -47,6 +47,7 @@ from src.export.outlook_attachments import (  # noqa: E402
 from src.store.attachment_backlog import attachment_backlog  # noqa: E402
 from src.store.file_hashes import sha256_of_file  # noqa: E402
 from src.store.schema import SUMMARISED_ATTACHMENT_IDS_SQL  # noqa: E402
+from src.store.stamps import instant_sql, iso_sql  # noqa: E402
 
 DB_PATH = DEFAULT_DB
 LOG_DIR = Path.home() / ".second-brain/logs"
@@ -794,8 +795,11 @@ def _holds_only_copies(directory: Path, held: set[str], sizes: set[int] | None) 
 # ATTACHMENT_CONTENT_INDEXES). Neither may touch a column its index lacks: extracted_text sits
 # ahead of every column behind it, so one more column and every stored text is read again.
 # SUMMARISED_ATTACHMENT_IDS_SQL lives in the schema module, beside its index.
+# The newest as an instant, in UTC: llm_extracted_at is local time with no offset until `brain
+# maint utc-stamps` has run, and UTC after 2026-10-16 (src/store/stamps.py).
 LATEST_LLM_EXTRACTION_SQL = (
-    "SELECT MAX(llm_extracted_at) FROM attachment_content WHERE llm_status = 'extracted'"
+    f"SELECT {iso_sql('MAX(' + instant_sql('llm_extracted_at') + ')')}"
+    " FROM attachment_content WHERE llm_status = 'extracted'"
 )
 
 
@@ -927,8 +931,14 @@ def _spend_warn_usd() -> float:
 
 def _model_work_on(db, day) -> tuple[int, int]:
     """Mail received that day that carries a summary, and attachment summaries written that day:
-    the store's own evidence that the model was called. Both read through an index."""
+    the store's own evidence that the model was called. Both read through an index.
+
+    The day is UTC. llm_extracted_at was local time until 2026-10-16 and is UTC since (src/store/
+    stamps.py), so it is compared as an instant, inside a text range a day wider either side that
+    keeps the index's range scan."""
     start, end = day.isoformat(), (day + timedelta(days=1)).isoformat()
+    wide = (day - timedelta(days=1)).isoformat(), (day + timedelta(days=2)).isoformat()
+    when = instant_sql("llm_extracted_at")
     try:
         emails = db.execute(
             "SELECT COUNT(*) FROM emails WHERE date_received >= ? AND date_received < ?"
@@ -938,8 +948,9 @@ def _model_work_on(db, day) -> tuple[int, int]:
         ).fetchone()[0]
         attachments = db.execute(
             "SELECT COUNT(*) FROM attachment_content WHERE llm_status = 'extracted'"
-            " AND llm_extracted_at >= ? AND llm_extracted_at < ?",
-            (start, end),
+            " AND llm_extracted_at >= ? AND llm_extracted_at < ?"
+            f" AND {when} >= julianday(?) AND {when} < julianday(?)",
+            (*wide, start, end),
         ).fetchone()[0]
     except sqlite3.Error:
         return 0, 0

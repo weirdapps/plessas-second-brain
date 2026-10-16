@@ -1314,6 +1314,10 @@ def remove_vectors(ids) -> int:
             return 0
         data = np.load(EMBEDDINGS_FILE, allow_pickle=False)
         order = [int(x) for x in data["ids"]]
+        if drop.isdisjoint(order):
+            # Nothing of these is indexed (a forgotten row that never had a summary): the
+            # vectors, 1.78 GB on the producer, are never read.
+            return 0
         vectors = data["vectors"]
         if len(order) != len(vectors):
             raise RuntimeError(

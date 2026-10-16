@@ -225,6 +225,22 @@ def _without_joining_details(text: str) -> str:
     return "\n".join(line for line in lines if not _JOIN_LINE.match(line))
 
 
+# How much of an event's text calendar_events.body keeps. An invitation is a few hundred
+# characters; a meeting's notes written into it rarely pass a few thousand.
+BODY_MAX_CHARS = 20_000
+
+
+def event_body_text(body: str | None) -> str | None:
+    """An event's text as calendar_events.body stores it: as a reader sees it, the HTML
+    converted and the joining details left out, credentials masked, with no floor on its length
+    (a short note is still the meeting's), cut at BODY_MAX_CHARS. "" for an event with no text,
+    None when none was given."""
+    if body is None:
+        return None
+    text = html_to_text(body) if looks_like_html(body) else body
+    return redact_secrets(_without_joining_details(text).strip())[:BODY_MAX_CHARS]
+
+
 def _readable(body: str | None) -> str | None:
     """The body as a reader sees it, joining details out, or None when under MIN_TEXT
     characters are left. Credentials are redacted before the cut."""

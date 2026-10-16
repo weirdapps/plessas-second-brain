@@ -155,6 +155,21 @@ def entity_person_ids(conn: sqlite3.Connection, person_id: int) -> list[int]:
     return [person_id] + sorted(existing - {person_id})
 
 
+def proposed_rows(conn: sqlite3.Connection, ids) -> set[int]:
+    """The people rows of `ids` that are in their entity by the model's proposed join alone
+    (method 'model', adjudicate): what ranking counts below a join the rules made."""
+    if not ids or not _has_tables(conn):
+        return set()
+    return {
+        int(r[0])
+        for r in conn.execute(
+            "SELECT value FROM entity_aliases WHERE kind = 'person' AND method = ?"
+            " AND value IN (SELECT CAST(value AS TEXT) FROM json_each(?))",
+            (MODEL_METHOD, json.dumps(sorted({int(i) for i in ids}))),
+        )
+    }
+
+
 # entity_targets lives in src/store/person_resolve.py, which resolves through it.
 entity_targets = _entity_targets
 
@@ -807,13 +822,18 @@ def coverage(conn: sqlite3.Connection) -> dict:
 ENTITY_KINDS = ("person", "topic", "organisation", "initiative")
 # Per named entity, at most this many of its newest emails take part in the ranking.
 PER_ENTITY_EMAILS = 2000
+# What an item counts for a named person when only the model's proposed joins (method
+# 'model', adjudicate) link it to them, against 1 for a link by identifiers or the
+# deterministic seed: a proposal may rank an item, below any the rules found.
+PROPOSED_WEIGHT = 0.5
 _QUERY_WORD = re.compile(r"[\w@.\-:]+")
 
 
 @dataclass
 class Named:
-    """What a query names: people (each as the people rows of their entity), topic
-    families, and organisations by mail domain, each with the words that named it."""
+    """What a query names: people (each as the people rows of their entity), topics (each
+    with its synonyms, src/store/topic_canon.py), and organisations by mail domain, each
+    with the words that named it."""
 
     people: list[tuple[str, list[int]]] = field(default_factory=list)
     topics: list[tuple[str, list[int]]] = field(default_factory=list)
@@ -828,13 +848,22 @@ def _span_is_name(span: str, name: str | None) -> bool:
     return bool(target) and all(any(words_agree(w, t) for t in target) for w in name_words(span))
 
 
+def _identified(conn: sqlite3.Connection, index, ids: list[int]) -> bool:
+    """Whether a person's rows (entity_person_ids: the row named first) hold an identity, an
+    address, MRI or JID row (person_resolve's index kinds), among those the rules joined."""
+    proposed = proposed_rows(conn, ids[1:])
+    return any(pid in index.kinds for pid in ids if pid not in proposed)
+
+
 def entity_matches(conn: sqlite3.Connection, query: str, kinds=ENTITY_KINDS) -> Named:
     """The people, topics and organisations `query` names, longest spans first, each word
     used once. A person is a span of two or three words, or an address or MRI, that
     resolves to one person (person_resolve: an identifier, or a name fitting one person),
-    the owner aside, whose every row would match; a topic a span of one to four words that
-    is a topic's name; an organisation a word that is the first label of a seeded mail
-    domain."""
+    the owner aside, whose every row would match, and who is known by an identifier: a row
+    of theirs the rules joined (not the model's proposals) has an address, a Teams MRI or a
+    WhatsApp JID. A name extraction alone wrote ('Retail customers') is no one. A
+    topic is a span of one to four words that is a topic's name; an organisation a word
+    that is the first label of a seeded mail domain."""
     from src.store.normalizer import normalize_topic
     from src.store.person_resolve import IDENTIFIER_KINDS, people_index, resolve_identity
 
@@ -857,8 +886,10 @@ def entity_matches(conn: sqlite3.Connection, query: str, kinds=ENTITY_KINDS) -> 
             if ("@" in word or word.count(":") >= 2) and free(i, 1):
                 res = resolve_identity(conn, word, local_part=False)
                 if res.row is not None and res.row["id"] != index.owner_id:
-                    named.people.append((word, entity_person_ids(conn, res.row["id"])))
-                    take(i, 1)
+                    ids = entity_person_ids(conn, res.row["id"])
+                    if _identified(conn, index, ids):
+                        named.people.append((word, ids))
+                        take(i, 1)
         for n in (3, 2):
             for i in range(len(words) - n + 1):
                 if not free(i, n):
@@ -870,8 +901,10 @@ def entity_matches(conn: sqlite3.Connection, query: str, kinds=ENTITY_KINDS) -> 
                 if not _span_is_name(span, res.row["name"]):
                     continue  # 'Maria Papadopoulou okapi' is Maria and a word more
                 if res.resolved_by in IDENTIFIER_KINDS or res.match_count == 1:
-                    named.people.append((span, entity_person_ids(conn, res.row["id"])))
-                    take(i, n)
+                    ids = entity_person_ids(conn, res.row["id"])
+                    if _identified(conn, index, ids):
+                        named.people.append((span, ids))
+                        take(i, n)
     if "topic" in wanted or "initiative" in wanted:
         from src.store.topic_canon import topic_family_ids
 
@@ -884,7 +917,7 @@ def entity_matches(conn: sqlite3.Connection, query: str, kinds=ENTITY_KINDS) -> 
                     continue
                 row = conn.execute("SELECT id FROM topics WHERE name = ?", (name,)).fetchone()
                 if row is not None:
-                    named.topics.append((name, topic_family_ids(conn, row[0])))
+                    named.topics.append((name, topic_family_ids(conn, row[0], narrower=False)))
                     take(i, n)
     if "organisation" in wanted and _has_tables(conn):
         domains = [
@@ -914,10 +947,17 @@ def entity_ranked_ids(
     (entity_matches), best first, for recall to fuse as a third ranked list:
     {"emails": [email ids], "teams": [teams_threads ids], "whatsapp": [whatsapp_threads
     ids]}. An item linked to more of the named entities ranks above one linked to fewer,
-    then the newest first. Emails: a named person's rows on it (any role), a topic of the
-    family on it, or a participant at the organisation's domain; news and automation left
+    then the newest first. Emails: a named person's rows on it (any role), a named topic or
+    a synonym of it on it, or a participant at the organisation's domain; news and automation left
     out unless included. Teams threads: a named person wrote in it. WhatsApp sessions: a
-    named person's JID wrote in it. Empty lists when the query names nothing."""
+    named person's JID wrote in it. Empty lists when the query names nothing.
+
+    A link through a row only the model's proposed joins put in the person's entity counts
+    PROPOSED_WEIGHT, and an item linked to one person both ways counts once, at 1. A
+    topic counts with its fold and embedding synonyms, not the narrower topics
+    containment puts under it: on the owner's qa set the synonyms alone ranked better
+    than the whole family, up to 461 topics for one word (README, "Unified recall").
+    The lists rank and authorize nothing (the consolidation pass reads no entity)."""
     from src.store.source_class import visible_sql
 
     named = entity_matches(conn, query, kinds)
@@ -929,62 +969,91 @@ def entity_ranked_ids(
     wa_hits: Counter = Counter()
     wa_date: dict[int, str] = {}
 
-    def emails(sql: str, args) -> None:
+    def emails(sql: str, args) -> dict[int, str]:
         rows = conn.execute(
             f"SELECT e.id, e.date_received FROM emails e WHERE {sql} AND {visible}"
             " ORDER BY e.date_received DESC LIMIT ?",
             (*args, PER_ENTITY_EMAILS),
         ).fetchall()
-        for email_id, when in rows:
-            email_hits[email_id] += 1
-            email_date[email_id] = when or ""
+        return {email_id: when or "" for email_id, when in rows}
 
-    for _span, ids in named.people:
-        people = json.dumps(ids)
-        emails(
+    def threads(sql: str, args) -> dict[int, str]:
+        try:
+            return {thread_id: when or "" for thread_id, when in conn.execute(sql, args)}
+        except sqlite3.OperationalError:  # a store without Teams or WhatsApp
+            return {}
+
+    def count(hits: Counter, dates: dict[int, str], found: dict[int, str], weight=1.0) -> None:
+        for item, when in found.items():
+            hits[item] += weight
+            dates[item] = when
+
+    def person_emails(rows: list[int]) -> dict[int, str]:
+        return emails(
             "e.id IN (SELECT email_id FROM email_people WHERE person_id IN"
             " (SELECT value FROM json_each(?)))",
-            (people,),
+            (json.dumps(rows),),
         )
-        try:
-            for thread_id, when in conn.execute(
-                "SELECT t.id, t.ended_at FROM teams_threads t WHERE t.id IN"
-                " (SELECT thread_id FROM teams_messages WHERE sender_person_id IN"
-                " (SELECT value FROM json_each(?)) AND thread_id IS NOT NULL)",
-                (people,),
-            ):
-                teams_hits[thread_id] += 1
-                teams_date[thread_id] = when or ""
-            jids = [
-                r[0].lower()
-                for r in conn.execute(
-                    "SELECT email FROM people WHERE id IN (SELECT value FROM json_each(?))",
-                    (people,),
-                )
-                if r[0] and r[0].lower().endswith(_JID_DOMAINS)
-            ]
-            if jids:
-                for thread_id, when in conn.execute(
-                    "SELECT t.id, t.ended_at FROM whatsapp_threads t WHERE t.id IN"
-                    " (SELECT thread_id FROM whatsapp_messages WHERE lower(sender_jid) IN"
-                    " (SELECT value FROM json_each(?)) AND thread_id IS NOT NULL)",
-                    (json.dumps(jids),),
-                ):
-                    wa_hits[thread_id] += 1
-                    wa_date[thread_id] = when or ""
-        except sqlite3.OperationalError:  # a store without Teams or WhatsApp
-            pass
+
+    def person_teams(rows: list[int]) -> dict[int, str]:
+        return threads(
+            "SELECT t.id, t.ended_at FROM teams_threads t WHERE t.id IN"
+            " (SELECT thread_id FROM teams_messages WHERE sender_person_id IN"
+            " (SELECT value FROM json_each(?)) AND thread_id IS NOT NULL)",
+            (json.dumps(rows),),
+        )
+
+    def person_whatsapp(rows: list[int]) -> dict[int, str]:
+        jids = [
+            r[0].lower()
+            for r in conn.execute(
+                "SELECT email FROM people WHERE id IN (SELECT value FROM json_each(?))",
+                (json.dumps(rows),),
+            )
+            if r[0] and r[0].lower().endswith(_JID_DOMAINS)
+        ]
+        if not jids:
+            return {}
+        return threads(
+            "SELECT t.id, t.ended_at FROM whatsapp_threads t WHERE t.id IN"
+            " (SELECT thread_id FROM whatsapp_messages WHERE lower(sender_jid) IN"
+            " (SELECT value FROM json_each(?)) AND thread_id IS NOT NULL)",
+            (json.dumps(jids),),
+        )
+
+    by_kind = (
+        (person_emails, email_hits, email_date),
+        (person_teams, teams_hits, teams_date),
+        (person_whatsapp, wa_hits, wa_date),
+    )
+    for _span, ids in named.people:
+        proposed = proposed_rows(conn, ids[1:])  # the row the query named is its own
+        rules = [i for i in ids if i not in proposed]
+        for find, hits, dates in by_kind:
+            sure = find(rules)
+            count(hits, dates, sure)
+            if proposed:
+                more = {k: v for k, v in find(sorted(proposed)).items() if k not in sure}
+                count(hits, dates, more, PROPOSED_WEIGHT)
     for _name, ids in named.topics:
-        emails(
-            "e.id IN (SELECT email_id FROM email_topics WHERE topic_id IN"
-            " (SELECT value FROM json_each(?)))",
-            (json.dumps(ids),),
+        count(
+            email_hits,
+            email_date,
+            emails(
+                "e.id IN (SELECT email_id FROM email_topics WHERE topic_id IN"
+                " (SELECT value FROM json_each(?)))",
+                (json.dumps(ids),),
+            ),
         )
     for _word, domain in named.organisations:
-        emails(
-            "e.id IN (SELECT ep.email_id FROM email_people ep JOIN people p ON p.id = ep.person_id"
-            " WHERE lower(p.email) LIKE ?)",
-            (f"%@{domain}",),
+        count(
+            email_hits,
+            email_date,
+            emails(
+                "e.id IN (SELECT ep.email_id FROM email_people ep JOIN people p"
+                " ON p.id = ep.person_id WHERE lower(p.email) LIKE ?)",
+                (f"%@{domain}",),
+            ),
         )
 
     def ranked(hits: Counter, dates: dict[int, str]) -> list[int]:

@@ -28,8 +28,12 @@ sessions of the brain's own repository are left out unless --all-workspaces. `--
 asks each labelled question in four modes, the way the tools do (keyword and semantic
 as search_emails, hybrid as recall's fused email bucket, recall as its whole bundle),
 and grades recall@5, recall@10, MRR and nDCG@10 per mode on the gold kinds each mode
-can return. It records the semantic status of every semantic and recall call, so an
-embedding outage shows. Its only model calls are query embeddings.
+can return, overall and by the question's shape. The same again with the recency
+ranking (_recency), and with recall's entity list too (_entity: hybrid_entity,
+recall_entity), side by side. It records the semantic status of every semantic and
+recall call, so an embedding outage shows, the time of each recall call, and the space
+of the index searched (`--index`, default the store's): model and dimension. Its only
+model calls are query embeddings.
 
 Every run appends a dated record to evals/retrieval/results.jsonl, which
 src/evals/summary.py reads for the health check. Everything opens the database
@@ -49,7 +53,9 @@ import os
 import random
 import re
 import sqlite3
+import statistics
 import sys
+import time
 from collections import Counter
 from collections.abc import Iterable
 from contextlib import contextmanager
@@ -84,7 +90,15 @@ RANKED_MODES = {
     "hybrid_recency": "hybrid",
     "recall_recency": "recall",
 }
-QA_MODES = ("keyword", "semantic", "hybrid", "recall", *RANKED_MODES)
+# The _recency modes run without recall's entity list (BRAIN_RECALL_ENTITY_LIST 0), so
+# they compare with the runs before it, whatever its default; each _entity mode is the
+# same recall with it (src/store/recall.py ENTITY_WEIGHT).
+ENTITY_MODES = {"hybrid_entity": "hybrid", "recall_entity": "recall"}
+QA_MODES = ("keyword", "semantic", "hybrid", "recall", *RANKED_MODES, *ENTITY_MODES)
+# The modes a row stands for its series in (`editions`).
+SERIES_MODES = (*RANKED_MODES, *ENTITY_MODES)
+# The recall bundles of a question, each a call to time.
+BUNDLE_MODES = ("recall", "recall_recency", "recall_entity")
 # The kinds of item a question's gold may name. An email counts at thread level: any
 # email of its thread finds it. A thread is an Outlook conversation id.
 GOLD_KINDS = ("email", "thread", "attachment", "teams", "whatsapp", "conversation", "event")
@@ -96,7 +110,7 @@ REACH = {
     "semantic": {"email", "thread", "attachment", "teams", "whatsapp", "conversation"},
     "recall": set(GOLD_KINDS),
 }
-REACH.update({mode: REACH[plain] for mode, plain in RANKED_MODES.items()})
+REACH.update({mode: REACH[plain] for mode, plain in {**RANKED_MODES, **ENTITY_MODES}.items()})
 # The modes an unanswerable question (expect_empty) is checked in: a row there that holds
 # every query word claims an answer. Semantic search always returns its nearest rows.
 ABSTAINING_MODES = tuple(m for m in QA_MODES if m != "semantic")
@@ -475,9 +489,15 @@ def _semantic_rows(conn, query: str, embed_fn, index_path) -> tuple[list[dict], 
 
 
 # The settings the plain modes run with, as the code before the recency ranking ranked;
-# the _recency modes run with the opposite. Set for the run, then put back.
+# the _recency modes run with the opposite, without the entity list, and the _entity modes
+# with it. Set for the run, then put back.
 _PLAIN = {"BRAIN_QUERY_RANKING": "relevance", "BRAIN_QUERY_NAMES": "0"}
-_RANKED = {"BRAIN_QUERY_RANKING": "fused", "BRAIN_QUERY_NAMES": "1"}
+_RANKED = {
+    "BRAIN_QUERY_RANKING": "fused",
+    "BRAIN_QUERY_NAMES": "1",
+    "BRAIN_RECALL_ENTITY_LIST": "0",
+}
+_ENTITY = {**_RANKED, "BRAIN_RECALL_ENTITY_LIST": "1"}
 
 
 @contextmanager
@@ -532,11 +552,16 @@ def _with_alt(units: list, ranks: list, alt_units: list, alt_ranks: list) -> lis
     return out
 
 
+# The tags of a row no query word matched: semantic search or the entity list alone
+# brought it (src/store/envelope.py).
+_UNMATCHED = frozenset({"semantic", "entity"})
+
+
 def _answered(rows: Iterable[dict]) -> bool:
     """Whether a list holds a row that claims an answer: one holding every query word,
-    not a partial or a semantic-only row."""
+    not a partial, a semantic-only or an entity-only row."""
     return any(
-        not r.get("partial_match") and "semantic" not in (r.get("source"), r.get("matched_in"))
+        not r.get("partial_match") and not {r.get("source"), r.get("matched_in")} & _UNMATCHED
         for r in rows
     )
 
@@ -572,19 +597,39 @@ def _summary(graded: dict[str, list[dict]]) -> dict:
     }
 
 
+def _timed(call):
+    """call() and the milliseconds it took."""
+    started = time.perf_counter()
+    out = call()
+    return out, (time.perf_counter() - started) * 1000
+
+
+def _latency(values: list[float]) -> dict:
+    ordered = sorted(values)
+    return {
+        "calls": len(ordered),
+        "median": round(statistics.median(ordered), 1),
+        "p90": round(ordered[min(len(ordered) - 1, int(0.9 * len(ordered)))], 1),
+    }
+
+
 def run_qa(conn: sqlite3.Connection, items: list[dict], *, embed_fn=None, index_path=None) -> dict:
     """Every labelled question in every mode it allows, graded per mode.
 
     `embed_fn` and `index_path` reach the embedding store as the tools' own injection
     points; left None, the configured backend and index are used, as the tools use them.
-    The plain modes run as the code before the recency ranking (_PLAIN), the _recency
-    modes with it (_RANKED), each question embedded once for all of them. Graded twice:
+    `index` is the space of the index searched (embeddings.file_space): the model and
+    dimension the run measured. The plain modes run as the code before the recency
+    ranking (_PLAIN), the _recency modes with it but without recall's entity list
+    (_RANKED), the _entity modes with that too (_ENTITY), each question embedded once for
+    all of them; `latency_ms` times each recall call, the plain one paying the embedding.
+    Graded twice:
     strictly on the gold, comparable with earlier runs, and in `modes_with_alt` with a
     question's `alt` ids (copies, versions) standing for its gold. A gold item a row
     lists among its `editions` is found at that row, and `found_in_editions` counts
     them. Questions marked expect_empty are checked for `abstention`.
     """
-    from src.store.embeddings import semantic_email_candidates
+    from src.store.embeddings import file_space, semantic_email_candidates
     from src.store.greek import register_sql_functions
     from src.store.query import query_by_keyword
     from src.store.recall import recall
@@ -592,14 +637,11 @@ def run_qa(conn: sqlite3.Connection, items: list[dict], *, embed_fn=None, index_
     register_sql_functions(conn)
     embed = _memo(embed_fn)
     candidates = partial(semantic_email_candidates, embed_fn=embed, index_path=index_path)
-    status: dict[str, Counter] = {
-        "semantic": Counter(),
-        "recall": Counter(),
-        "recall_recency": Counter(),
-    }
+    status: dict[str, Counter] = {"semantic": Counter(), **{m: Counter() for m in BUNDLE_MODES}}
+    took: dict[str, list[float]] = {mode: [] for mode in BUNDLE_MODES}
     graded: dict[str, list[dict]] = {mode: [] for mode in QA_MODES}
     graded_alt: dict[str, list[dict]] = {mode: [] for mode in QA_MODES}
-    by_shape: dict[str, dict[str, list[float]]] = {}
+    by_shape: dict[str, dict[str, list[dict]]] = {}
     in_editions: Counter = Counter()
     abstention = {mode: {"cases": 0, "abstained": 0} for mode in ABSTAINING_MODES}
     per_question = []
@@ -608,24 +650,28 @@ def run_qa(conn: sqlite3.Connection, items: list[dict], *, embed_fn=None, index_
     unanswerable = [item for item in items if item.get("expect_empty") and not is_labelled_qa(item)]
     for item in [*labelled, *unanswerable]:
         query = (item.get("query") or "").strip() or item["question"]
+        ask = partial(
+            recall, conn, query, limit_per_kind=RECALL_PER_KIND, semantic_candidates=candidates
+        )
+        bundles: dict[str, dict] = {}
         with _ranking(_PLAIN):
             semantic, semantic_status = _semantic_rows(conn, query, embed, index_path)
-            bundles = {
-                "recall": recall(
-                    conn, query, limit_per_kind=RECALL_PER_KIND, semantic_candidates=candidates
-                )
-            }
+            bundles["recall"], ms = _timed(ask)
+            took["recall"].append(ms)
             keyword = {"keyword": query_by_keyword(conn, query, limit=TOP)}
         with _ranking(_RANKED):
-            bundles["recall_recency"] = recall(
-                conn, query, limit_per_kind=RECALL_PER_KIND, semantic_candidates=candidates
-            )
+            bundles["recall_recency"], ms = _timed(ask)
+            took["recall_recency"].append(ms)
             keyword["keyword_recency"] = query_by_keyword(conn, query, limit=TOP)
+        with _ranking(_ENTITY):
+            bundles["recall_entity"], ms = _timed(ask)
+            took["recall_entity"].append(ms)
         rows = {
             **keyword,
             "semantic": semantic,
             "hybrid": bundles["recall"]["emails"][:TOP],
             "hybrid_recency": bundles["recall_recency"]["emails"][:TOP],
+            "hybrid_entity": bundles["recall_entity"]["emails"][:TOP],
         }
         if item in unanswerable:
             for mode in ABSTAINING_MODES:
@@ -637,12 +683,12 @@ def run_qa(conn: sqlite3.Connection, items: list[dict], *, embed_fn=None, index_
                 abstention[mode]["abstained"] += not _answered(shown)
             continue
         status["semantic"][semantic_status] += 1
-        for name in ("recall", "recall_recency"):
+        for name in BUNDLE_MODES:
             status[name][bundles[name]["summary"].get("semantic", "unavailable")] += 1
 
         lists = {mode: _ranked(mode, bundles, rows) for mode in QA_MODES}
         # The same without the editions rows stand for, to count what only they found.
-        own = {mode: _ranked(mode, bundles, rows, editions=False) for mode in RANKED_MODES}
+        own = {mode: _ranked(mode, bundles, rows, editions=False) for mode in SERIES_MODES}
         gold_emails = list(item["gold"].get("email") or [])
         alt = item.get("alt") or {}
         every_key = [
@@ -677,7 +723,7 @@ def run_qa(conn: sqlite3.Connection, items: list[dict], *, embed_fn=None, index_
             if not reachable:
                 continue
             ranks = ranks_of(mode, reachable, lists[mode])
-            if mode in RANKED_MODES:
+            if mode in SERIES_MODES:
                 plain = ranks_of(mode, reachable, own[mode])
                 in_editions[mode] += sum(
                     1 for r, p in zip(ranks, plain, strict=True) if r is not None and p is None
@@ -689,7 +735,7 @@ def run_qa(conn: sqlite3.Connection, items: list[dict], *, embed_fn=None, index_
             alt_ranks = ranks_of(mode, alt_reach, lists[mode])
             graded_alt[mode].append(qa_metrics(_with_alt(reachable, ranks, alt_reach, alt_ranks)))
             shape = item.get("shape") or "unlabelled"
-            by_shape.setdefault(shape, {}).setdefault(mode, []).append(metrics["recall@10"])
+            by_shape.setdefault(shape, {}).setdefault(mode, []).append(metrics)
         per_question.append(result)
 
     return {
@@ -702,12 +748,18 @@ def run_qa(conn: sqlite3.Connection, items: list[dict], *, embed_fn=None, index_
         "abstention": {mode: counts for mode, counts in abstention.items() if counts["cases"]},
         "by_shape": {
             shape: {
-                mode: {"questions": len(values), "recall@10": _mean(values)}
+                mode: {
+                    "questions": len(values),
+                    "recall@10": _mean([v["recall@10"] for v in values]),
+                    "mrr": _mean([v["rr"] for v in values]),
+                }
                 for mode, values in modes.items()
             }
             for shape, modes in by_shape.items()
         },
         "semantic_status": {name: dict(counts) for name, counts in status.items()},
+        "latency_ms": {mode: _latency(values) for mode, values in took.items() if values},
+        "index": file_space(index_path),
         "per_question": per_question,
     }
 
@@ -786,13 +838,15 @@ def _run_qa(args) -> int:
         return 2
     conn = _open(args.db)
     try:
-        result = run_qa(conn, items)
+        result = run_qa(conn, items, index_path=args.index)
     finally:
         conn.close()
     append_jsonl(
         args.results, {"eval": "qa", **stamp(), "set_sha": file_sha(args.qa_file), **result}
     )
     print(f"{result['labelled']} of {result['questions']} questions labelled and asked")
+    space = result["index"] or {}
+    print(f" index: {space.get('model')} at {space.get('dim')} dimensions")
     for title, table in (("gold", result["modes"]), ("gold or alt", result["modes_with_alt"])):
         print(f" {title}:")
         for mode, row in table.items():
@@ -805,10 +859,12 @@ def _run_qa(args) -> int:
         print(f"  {mode}: {n} gold items found only in a row's editions")
     for mode, counts in result["abstention"].items():
         print(f"  {mode}: abstained on {counts['abstained']} of {counts['cases']} unanswerable")
-    print(" recall@10 by shape:")
+    print(" recall@10 / MRR by shape:")
     for shape, modes in sorted(result["by_shape"].items()):
-        cells = "  ".join(f"{m} {v['recall@10']:.2f}" for m, v in modes.items())
+        cells = "  ".join(f"{m} {v['recall@10']:.2f}/{v['mrr']:.2f}" for m, v in modes.items())
         print(f"  {shape:<14} {cells}")
+    for mode, row in result["latency_ms"].items():
+        print(f"  {mode} call: median {row['median']:.0f} ms, p90 {row['p90']:.0f} ms")
     for name, counts in result["semantic_status"].items():
         print(f"  {name} calls: " + ", ".join(f"{s} {n}" for s, n in sorted(counts.items())))
     if result["unknown_gold"]:
@@ -827,6 +883,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB)
     parser.add_argument("--file", type=Path, default=DEFAULT_SET, help="the known-item set")
     parser.add_argument("--qa-file", type=Path, default=None, help="the qa set")
+    parser.add_argument(
+        "--index", type=Path, default=None, help="the vector index (default: the store's)"
+    )
     parser.add_argument("--results", type=Path, default=None, help="where runs are recorded")
     parser.add_argument("--size", type=int, default=None, help="20 known items, 60 questions")
     parser.add_argument("--seed", type=int, default=7)

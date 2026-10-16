@@ -372,6 +372,104 @@ def test_entity_ranked_ids_put_items_linked_to_more_of_the_named_first(conn):
     assert [name for name, _ in named.topics] == ["okapi pilot"]
 
 
+def test_a_name_only_extraction_wrote_names_no_one_to_rank_by(conn):
+    """A mention row in no identity's entity has no address, MRI or JID behind it: on the
+    replica 6 of the 7 people the qa queries named were such rows, on one email each."""
+    email_id = f.email(conn, subject="Plan", sender=BOB, to=(OWNER,))
+    mention = _mention(conn, "Retail customers", email_id)
+    en.seed_entities(conn)
+
+    assert resolve_identity(conn, "retail customers", local_part=False).row["id"] == mention
+    assert en.entity_matches(conn, "retail customers loans").people == []
+    assert en.entity_ranked_ids(conn, "retail customers loans")["emails"] == []
+
+
+def test_a_mention_the_rules_joined_to_an_identity_names_it(conn):
+    _correspond(conn, MARIA)
+    email_id = f.email(conn, subject="Plan", sender=BOB, to=(OWNER,))
+    mention = _mention(conn, "Μαρία Παπαδοπούλου", email_id)
+    en.seed_entities(conn)
+
+    (named,) = en.entity_matches(conn, "Μαρία Παπαδοπούλου").people
+
+    assert mention in named[1] and _pid(conn, MARIA) in named[1]
+
+
+def _propose(conn, mention, contact):
+    """The model's proposed join of `mention` to `contact`'s entity, as adjudicate writes it."""
+    conn.execute(
+        "INSERT OR REPLACE INTO entity_aliases (kind, value, entity_id, method, created_at)"
+        " VALUES ('person', ?, ?, ?, 'now')",
+        (str(mention), en.entity_of_person(conn, _pid(conn, contact)), en.MODEL_METHOD),
+    )
+    conn.commit()
+
+
+def test_a_proposed_join_ranks_below_an_identifier_join_however_new(conn):
+    older = f.email(conn, subject="Plan", sender=MARIA, to=(OWNER,), date_received=f.ago(days=9))
+    newer = f.email(conn, subject="Notes", sender=BOB, to=(OWNER,), date_received=f.ago(days=1))
+    mention = _mention(conn, "Zq Unfit", newer)
+    en.seed_entities(conn)
+    _propose(conn, mention, MARIA)
+
+    ranked = en.entity_ranked_ids(conn, "Maria Papadopoulou")["emails"]
+
+    assert ranked == [older, newer]
+
+
+def test_an_item_both_joins_reach_counts_once_at_the_identifier_weight(conn):
+    shared = f.email(conn, subject="Plan", sender=MARIA, to=(OWNER,), date_received=f.ago(days=9))
+    pilot = f.email(
+        conn,
+        subject="Pilot",
+        sender=BOB,
+        to=(OWNER,),
+        topics=("okapi pilot",),
+        date_received=f.ago(days=5),
+    )
+    mention = _mention(conn, "Zq Unfit", shared)
+    en.seed_entities(conn)
+    _propose(conn, mention, MARIA)
+    both = f.email(
+        conn,
+        subject="Okapi",
+        sender=MARIA,
+        to=(OWNER,),
+        topics=("okapi pilot",),
+        date_received=f.ago(days=7),
+    )
+
+    ranked = en.entity_ranked_ids(conn, "Maria Papadopoulou okapi pilot")["emails"]
+
+    # Maria and the topic (2), then one named thing each, newest first: `shared` is Maria's
+    # by her address, and her proposed mention on it adds nothing.
+    assert ranked == [both, pilot, shared]
+
+
+def test_a_named_topic_ranks_its_synonyms_but_not_the_narrower_topics(conn):
+    """A containment family is every topic holding the head's words; the list takes the
+    topic and its fold or embedding synonyms only."""
+    own = f.email(conn, subject="A", sender=BOB, to=(OWNER,), topics=("payments",))
+    folded = f.email(conn, subject="B", sender=BOB, to=(OWNER,), topics=("payment",))
+    narrower = f.email(conn, subject="C", sender=BOB, to=(OWNER,), topics=("cardless payments",))
+    ids = {
+        name: conn.execute("SELECT id FROM topics WHERE name = ?", (name,)).fetchone()[0]
+        for name in ("payments", "payment", "cardless payments")
+    }
+    conn.executemany(
+        "INSERT INTO topic_family (topic_id, head_id, method, mapped_at) VALUES (?, ?, ?, 'now')",
+        [
+            (ids["payment"], ids["payments"], "fold"),
+            (ids["cardless payments"], ids["payments"], "containment"),
+        ],
+    )
+    conn.commit()
+
+    ranked = en.entity_ranked_ids(conn, "payments", kinds=("topic",))["emails"]
+
+    assert set(ranked) == {own, folded} and narrower not in ranked
+
+
 def test_entity_ranked_ids_of_a_query_naming_nothing_are_empty(conn):
     f.email(conn, subject="Plan", sender=MARIA, to=(OWNER,))
 

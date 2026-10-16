@@ -35,9 +35,12 @@ def _has_table(conn: sqlite3.Connection) -> bool:
     )
 
 
-def topic_family_ids(conn: sqlite3.Connection, topic_id: int) -> list[int]:
+def topic_family_ids(
+    conn: sqlite3.Connection, topic_id: int, *, narrower: bool = True
+) -> list[int]:
     """The topic, the topics mapped under it, and the family of a head it is a synonym
-    of; the topic itself first, then the rest by id."""
+    of; the topic itself first, then the rest by id. Without `narrower`, synonyms alone:
+    no topic containment put under any of them."""
     if not _has_table(conn):
         return [topic_id]
     heads = {topic_id}
@@ -49,11 +52,13 @@ def topic_family_ids(conn: sqlite3.Connection, topic_id: int) -> list[int]:
         )
     )
     members = set(heads)
+    synonyms = "" if narrower else " AND method IN (?, ?)"
     members.update(
         r[0]
         for r in conn.execute(
-            "SELECT topic_id FROM topic_family WHERE head_id IN (SELECT value FROM json_each(?))",
-            (json.dumps(sorted(heads)),),
+            "SELECT topic_id FROM topic_family WHERE head_id IN (SELECT value FROM json_each(?))"
+            + synonyms,
+            (json.dumps(sorted(heads)), *(() if narrower else SYNONYM_METHODS)),
         )
     )
     return [topic_id] + sorted(members - {topic_id})

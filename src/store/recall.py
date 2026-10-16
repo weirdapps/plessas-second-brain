@@ -21,6 +21,7 @@ from src.store.consolidate import recall_filters
 from src.store.context import get_person_context, get_topic_context
 from src.store.conversation_query import search_conversations_keyword
 from src.store.cross_script import name_forms
+from src.store.entities import entity_ranked_ids
 from src.store.envelope import EMAIL_KINDS, classes_for
 from src.store.fusion import reciprocal_rank_fusion
 from src.store.greek import (
@@ -336,6 +337,24 @@ def _maybe_topic_context(
 # first and cut after, it holds its 20.
 SIBLING_HEADROOM = 3
 
+# The entity list (src/store/entities.py entity_ranked_ids): the emails, Teams threads and
+# WhatsApp sessions linked to the people, topics and organisations a query names, fused as
+# a third ranked list into those three buckets wherever they fuse, at ENTITY_WEIGHT against
+# 1 for keyword and semantic. BRAIN_RECALL_ENTITY_LIST=1 puts it in and 0 leaves it out,
+# read at each call; ENTITY_LIST_DEFAULT when unset. Tuned on the owner's qa set (README,
+# "Unified recall"): at 0.25 no overall figure fell, at 0.5 recall@5 did. Off by
+# default: it helped no "who", status or meeting-prep question there.
+ENTITY_LIST_ENV = "BRAIN_RECALL_ENTITY_LIST"
+ENTITY_LIST_DEFAULT = False
+ENTITY_WEIGHT = 0.25
+
+
+def entity_list() -> bool:
+    """Whether recall fuses the entity list: BRAIN_RECALL_ENTITY_LIST 1 or 0, else
+    ENTITY_LIST_DEFAULT."""
+    raw = os.environ.get(ENTITY_LIST_ENV, "").strip()
+    return raw == "1" if raw in ("0", "1") else ENTITY_LIST_DEFAULT
+
 
 def _key_kind(key: Hashable) -> str | None:
     """What a fusion key of the form (kind, value) is keyed by: thread, series, copy..."""
@@ -346,14 +365,21 @@ def _dedup(keys: Iterable[Hashable]) -> list[Hashable]:
     return list(dict.fromkeys(keys))
 
 
-def _fused_keys(*lists: list[Hashable], recency: list[Hashable] | None = None) -> list[Hashable]:
+def _fused_keys(
+    *lists: list[Hashable],
+    recency: list[Hashable] | None = None,
+    entity: list[Hashable] | None = None,
+) -> list[Hashable]:
     """The keys of the lists given, by reciprocal rank fusion, best first; a recency list
-    counts at ranking.RECENCY_WEIGHT."""
+    counts at ranking.RECENCY_WEIGHT, an entity list at ENTITY_WEIGHT."""
     rankings = [_dedup(keys) for keys in lists]
     weights = [1.0] * len(rankings)
     if recency is not None:
         rankings.append(_dedup(recency))
         weights.append(ranking.RECENCY_WEIGHT)
+    if entity:
+        rankings.append(_dedup(entity))
+        weights.append(ENTITY_WEIGHT)
     return [key for key, _score in reciprocal_rank_fusion(rankings, weights=weights)]
 
 
@@ -406,29 +432,33 @@ def _hybrid_emails(
     *,
     collapse: bool,
     classes: tuple[str, ...] | None = None,
+    entity_ids: list | None = None,
     **switches: bool,
 ) -> list[dict]:
-    """RRF-fuse keyword email hits with semantic email candidates.
+    """RRF-fuse keyword email hits with semantic email candidates, and the entity list.
 
-    The keyword hits are an over-fetched pool, so fusion has candidates; the two
+    The keyword hits are an over-fetched pool, so fusion has candidates; the
     rankings merge by Reciprocal Rank Fusion, then the page is cut to `limit`.
-    Semantic-only emails are hydrated as email rows tagged source='semantic'.
-    `switches` are include_news and include_automation, and `classes` the source
-    classes `kinds` asked for: a candidate of a class they leave out is dropped,
-    whatever the provider returned.
+    Semantic-only emails are hydrated as email rows tagged source='semantic', and
+    those the entity list alone brought (`entity_ids`, at ENTITY_WEIGHT)
+    source='entity'. `switches` are include_news and include_automation, and
+    `classes` the source classes `kinds` asked for: a candidate of a class they
+    leave out is dropped, whatever the provider returned.
 
     Fused by thread, not by email: keyword search returns one email per thread, and
     the email that embeds best is rarely that one, so a thread both rankings put
     first never got the credit for it. A thread with a keyword hit is shown by that
     hit, which carries the evidence of the match. With `collapse` the candidates
     collapse onto their thread, or their dated subject's series, before the first
-    `pool` are kept, and a series' semantic members join its row's `editions`.
+    `pool` are kept, and a series' semantic and entity members join its row's
+    `editions`.
     """
     sem_ids = visible_ids(conn, sem_ids, classes=classes, **switches)
-    if not sem_ids:
+    entity_ids = visible_ids(conn, entity_ids or [], classes=classes, **switches)
+    if not sem_ids and not entity_ids:
         return keyword_hits[:limit]
     kw_ids = [h["email_id"] for h in keyword_hits]
-    keys = _email_keys(conn, kw_ids + list(sem_ids), collapse)
+    keys = _email_keys(conn, kw_ids + list(sem_ids) + list(entity_ids), collapse)
 
     def key(email_id):
         return keys.get(email_id) or ("email", email_id)
@@ -437,13 +467,15 @@ def _hybrid_emails(
     for kw_hit in keyword_hits:
         kw_by_key.setdefault(key(kw_hit["email_id"]), kw_hit)
     sem_by_key = _semantic_pool(sem_ids, key, pool)
+    entity_by_key = _semantic_pool(entity_ids, key, pool)
 
     out: list[dict] = []
-    for k in _fused_keys(list(kw_by_key), list(sem_by_key)):
+    for k in _fused_keys(list(kw_by_key), list(sem_by_key), entity=list(entity_by_key)):
         if len(out) >= limit:
             break
         hit = kw_by_key.get(k)
-        members = sem_by_key.get(k, [])
+        members = _dedup([*sem_by_key.get(k, []), *entity_by_key.get(k, [])])
+        source = envelope.SEMANTIC if k in sem_by_key else envelope.ENTITY
         if hit is not None:
             if collapse and _key_kind(k) == "series":
                 hit = _more_editions(hit, [m for m in members if m != hit["email_id"]])
@@ -471,7 +503,7 @@ def _hybrid_emails(
                 hit["older_editions"] = len(found) - 1
         else:
             hit = found[0]
-        hit["source"] = "semantic"
+        hit["source"] = source
         out.append(hit)
     with_source_class(conn, out)
     # The keyword hits came with their envelope; the semantic ones get theirs here.
@@ -626,18 +658,32 @@ def _fuse_threads(
     sem_ids: list,
     limit: int,
     pool: int,
+    entity_ids: list | None = None,
 ) -> list[dict]:
     """The Teams or WhatsApp bucket: its keyword rows, newest first as their searches
-    order them, fused with the threads semantic search ranks."""
+    order them, fused with the threads semantic search ranks and those the entity list
+    does (`entity_ids`, at ENTITY_WEIGHT; a row it alone brought says matched_in
+    'entity')."""
     kw_by_key = {row.get("thread_id"): row for row in reversed(keyword_rows)}
     kw_keys = _dedup(row.get("thread_id") for row in keyword_rows)
-    hydrated = _thread_rows(conn, kind, sem_ids)
-    sem_by_key = _semantic_pool(
-        (hydrated[i] for i in sem_ids if i in hydrated), lambda r: r["thread_id"], pool
+    entity_ids = entity_ids or []
+    hydrated = _thread_rows(conn, kind, _dedup([*sem_ids, *entity_ids]))
+
+    def thread(row: dict) -> Hashable:
+        return row["thread_id"]
+
+    sem_by_key = _semantic_pool((hydrated[i] for i in sem_ids if i in hydrated), thread, pool)
+    entity_by_key = _semantic_pool(
+        ({**hydrated[i], "matched_in": envelope.ENTITY} for i in entity_ids if i in hydrated),
+        thread,
+        pool,
     )
     out = []
-    for k in _fused_keys(kw_keys, list(sem_by_key))[:limit]:
-        out.append(kw_by_key[k] if k in kw_by_key else sem_by_key[k][0])
+    for k in _fused_keys(kw_keys, list(sem_by_key), entity=list(entity_by_key))[:limit]:
+        if k in kw_by_key:
+            out.append(kw_by_key[k])
+        else:
+            out.append((sem_by_key.get(k) or entity_by_key[k])[0])
     fresh = [r for r in out if "ref" not in r]
     (envelope.teams if kind == "teams" else envelope.whatsapp)(conn, fresh)
     return out
@@ -785,6 +831,20 @@ def _semantic_task(provider, query: str, limit: int) -> Task:
     return task
 
 
+def _entity_task(query: str, limit: int, switches: dict[str, bool]) -> Task:
+    """The entity list as a task: entity_ranked_ids' ids by bucket, {} when the store
+    cannot answer it (logged)."""
+
+    def task(conn: sqlite3.Connection) -> dict[str, list]:
+        try:
+            return entity_ranked_ids(conn, query, limit=limit, **switches)
+        except sqlite3.Error as e:
+            logger.warning("recall entity list skipped: %s: %s", type(e).__name__, e)
+            return {}
+
+    return task
+
+
 def recall(
     conn: sqlite3.Connection,
     query: str,
@@ -890,6 +950,9 @@ def recall(
     if hybrid and (asked(*EMAIL_KINDS) or (every_bucket and asked(*vector_kinds))):
         semantic_pool = pool * SIBLING_HEADROOM if fused else pool
         tasks.append(("semantic", _semantic_task(semantic_candidates, query, semantic_pool)))
+    # Looked up once a call, for the three buckets it ranks in.
+    if every_bucket and entity_list() and asked(*EMAIL_KINDS, "teams", "whatsapp"):
+        tasks.append(("entities", _entity_task(query, pool, switches)))
     # The two buckets that score every row in Python go first: they take longest.
     if parents != "0":
         tasks.append(("actions", lambda c: _search_actions(c, query, limit, on_actions)))
@@ -943,13 +1006,24 @@ def recall(
     done = _run(conn, tasks, recall_workers())
 
     sem_ids, by_kind, semantic, chunks = done.get("semantic", (None, {}, None, {}))
+    # The entity list does not need the semantic half: it fuses when that is unavailable.
+    linked: dict[str, list] = done.get("entities") or {}
+    sem_ok = sem_ids is not None
     emails: list[dict] = done.get("emails", [])
     if hybrid and "emails" in done:
         emails = (
             _hybrid_emails(
-                conn, emails, sem_ids, limit, pool, collapse=fused, classes=classes, **switches
+                conn,
+                emails,
+                sem_ids or [],
+                limit,
+                pool,
+                collapse=fused,
+                classes=classes,
+                entity_ids=linked.get("emails"),
+                **switches,
             )
-            if sem_ids is not None
+            if sem_ok or linked.get("emails")
             else emails[:limit]
         )
     attachments: list[dict] = done.get("attachments", [])
@@ -957,24 +1031,31 @@ def recall(
     whatsapp: list[dict] = done.get("whatsapp", [])
     conversations: list[dict] = done.get("conversations", [])
     # A bucket not asked for has no task, so nothing in `done`, and stays empty.
-    if every_bucket and sem_ids is not None:
-        if "attachments" in done:
+    if every_bucket:
+        if "attachments" in done and sem_ok:
             attachments = _fuse_attachments(
                 conn, attachments, by_kind.get("attachment", []), limit, pool, chunks
             )
-        if "teams" in done:
-            teams = _fuse_threads(conn, "teams", teams, by_kind.get("teams", []), limit, pool)
-        if "whatsapp" in done:
-            whatsapp = _fuse_threads(
-                conn, "whatsapp", whatsapp, by_kind.get("whatsapp", []), limit, pool
+        if "teams" in done and (sem_ok or linked.get("teams")):
+            teams = _fuse_threads(
+                conn, "teams", teams, by_kind.get("teams", []), limit, pool, linked.get("teams")
             )
-        if "conversations" in done:
+        if "whatsapp" in done and (sem_ok or linked.get("whatsapp")):
+            whatsapp = _fuse_threads(
+                conn,
+                "whatsapp",
+                whatsapp,
+                by_kind.get("whatsapp", []),
+                limit,
+                pool,
+                linked.get("whatsapp"),
+            )
+        if "conversations" in done and sem_ok:
             conversations = _fuse_conversations(
                 conn, conversations, by_kind.get("conversation", []), limit, pool
             )
-    else:
-        attachments, teams, whatsapp = attachments[:limit], teams[:limit], whatsapp[:limit]
-        conversations = conversations[:limit]
+    attachments, teams, whatsapp = attachments[:limit], teams[:limit], whatsapp[:limit]
+    conversations = conversations[:limit]
 
     text_kinds = {
         "emails": emails,
@@ -1025,12 +1106,11 @@ def recall(
 
 
 def _semantic_row(row: dict) -> bool:
-    """Whether semantic search alone put this row in its bucket: by an item's vector, or by
-    a passage of a document (matched_in 'chunk')."""
-    return row.get("source") == envelope.SEMANTIC or row.get("matched_in") in (
-        envelope.SEMANTIC,
-        "chunk",
-    )
+    """Whether semantic search or the entity list alone put this row in its bucket: by an
+    item's vector, by a passage of a document (matched_in 'chunk'), or by what the query
+    names (matched_in 'entity'). No word of the query matched it."""
+    tags = {row.get("source"), row.get("matched_in")}
+    return bool(tags & {envelope.SEMANTIC, "chunk", envelope.ENTITY})
 
 
 # How the MCP tool sends recall's rows. A summary is cut to about this many

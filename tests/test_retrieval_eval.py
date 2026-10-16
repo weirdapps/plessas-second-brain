@@ -322,6 +322,8 @@ def test_run_qa_grades_each_mode_on_the_kinds_it_can_return(ev, qa_store, index)
         "keyword_recency": 2,
         "hybrid_recency": 2,
         "recall_recency": 3,
+        "hybrid_entity": 2,
+        "recall_entity": 3,
     }
     for mode in modes:
         assert modes[mode]["recall@10"] == 1.0, mode
@@ -330,6 +332,14 @@ def test_run_qa_grades_each_mode_on_the_kinds_it_can_return(ev, qa_store, index)
         "semantic": {"ok": 3},
         "recall": {"ok": 3},
         "recall_recency": {"ok": 3},
+        "recall_entity": {"ok": 3},
+    }
+    assert set(result["latency_ms"]) == {"recall", "recall_recency", "recall_entity"}
+    assert result["index"] == {
+        "model": "gemini-embedding-001",
+        "dim": 4,
+        "task": None,
+        "template": 1,
     }
     first = result["per_question"][0]
     assert first["id"] == "q1" and first["units"] == ["thread:T1"]
@@ -570,8 +580,13 @@ def test_results_are_given_by_shape_too(ev, qa_store, index):
 
     result = ev.run_qa(ev._open(qa_store), items, embed_fn=embed, index_path=index)
 
-    assert result["by_shape"]["status"]["keyword"] == {"questions": 1, "recall@10": 1.0}
+    assert result["by_shape"]["status"]["keyword"] == {
+        "questions": 1,
+        "recall@10": 1.0,
+        "mrr": 1.0,
+    }
     assert set(result["by_shape"]) == {"status", "numbers"}
+    assert {"recall_recency", "recall_entity"} <= set(result["by_shape"]["status"])
 
 
 def test_each_question_is_embedded_once_for_every_mode(ev, qa_store, index):
@@ -600,3 +615,51 @@ def test_validate_qa_takes_alt_shape_and_expect_empty(ev):
     assert not [p for p in problems if p.startswith("q1:")]
     assert any(p.startswith("q2: alt") for p in problems)
     assert any(p.startswith("q2: expect_empty") for p in problems)
+
+
+# --- the entity list: recall_recency without it, recall_entity with it ------------------------
+
+
+@pytest.fixture
+def entity_store(tmp_path, monkeypatch):
+    """Mail that names its subject's person by her address alone, never by a word, and has
+    no vector in the test index (ids 1 to 4)."""
+    from src import config
+    from src.store import entities
+    from tests import factories
+
+    monkeypatch.setattr(config, "USER_NAME", "Olga Owner")
+    monkeypatch.setattr(config, "USER_EMAIL_PATTERN", "olga@corp.example")
+    path = tmp_path / "entity.db"
+    conn = create_database(str(path))
+    maria = ("Maria Papadopoulou", "maria@corp.example")
+    owner = ("Olga Owner", "olga@corp.example")
+    bob = ("Bob Jones", "bob@corp.example")
+    cc = factories.email(conn, id=10, subject="Lunch", sender=bob, to=(owner,), cc=(maria,))
+    entities.seed_entities(conn)
+    conn.close()
+    return path, cc
+
+
+def test_the_entity_modes_run_with_the_list_and_the_recency_modes_without(
+    ev, entity_store, index, monkeypatch
+):
+    monkeypatch.setenv("BRAIN_RECALL_ENTITY_LIST", "1")  # the run sets it per mode
+    path, cc = entity_store
+
+    result = ev.run_qa(
+        ev._open(path),
+        [question("q1", "Maria Papadopoulou", email=[cc])],
+        embed_fn=embed,
+        index_path=index,
+    )
+
+    modes = result["modes"]
+    assert modes["recall_recency"]["recall@10"] == 0.0
+    assert modes["recall_entity"]["recall@10"] == 1.0
+    assert modes["hybrid_entity"]["recall@10"] == 1.0
+
+
+def test_an_entity_row_claims_no_answer(ev):
+    assert not ev._answered([{"source": "entity", "matched_in": "entity"}])
+    assert not ev._answered([{"matched_in": "entity"}])

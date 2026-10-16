@@ -47,7 +47,7 @@ from typing import NamedTuple
 from src.store.greek import search_fold
 
 # Bumped when the parse changes what it reads, so a backfill can tell old rows from new.
-PARSER_VERSION = 1
+PARSER_VERSION = 2
 
 # A sheet of more non-empty rows is a data extract, not a report: left unread, cheaply.
 SHEET_MAX_ROWS = 3_000
@@ -832,6 +832,8 @@ class _SheetReader:
         sheet = self._period(name)
         self.standing: Found | None = sheet
         self.title: str | None = None
+        # The sheet's own title: its first row of one cell in words, above every table.
+        self.sheet_title: str | None = None
         self.header: _Header | None = None
         self.figures: list[Figure] = []
         self.seen: set[tuple[str, str, str]] = set()
@@ -859,6 +861,7 @@ class _SheetReader:
                 self.standing = found
             elif _LETTER.search(cell) and len(cell) <= TITLE_CHARS:
                 self.title = cell
+                self.sheet_title = self.sheet_title or cell
 
     def read(self, above: list[_Row], data: list[_Row]) -> None:
         rows = [r for r in data if r.data and not r.mixed]
@@ -935,6 +938,7 @@ class _SheetReader:
                 shift = -n
             elif (
                 n == 0
+                and single
                 and given == len(cells) - 1
                 and _is_label(cells[0])
                 and self._period(cells[0]) is None
@@ -942,6 +946,10 @@ class _SheetReader:
                 labels, shift = [cells[0]], 1  # the header's first cell names its one row
             elif n == 0 and given == value_columns and single and self.title:
                 labels, shift = [], wide
+            elif n == 0 and wide and given == value_columns and len(previous) >= wide:
+                # No label of its own: a label merged down over the rows under it is stored
+                # once, so the row takes the one above it in each label column.
+                labels, shift = previous[:wide], wide
             else:
                 self.skipped["unaligned_rows"] += 1
                 continue
@@ -1018,6 +1026,10 @@ class _SheetReader:
         if not p.labels and self.title:
             label = self.title[:LABEL_CHARS]
         label_key = _clean(search_fold(label))
+        if not label:
+            # A row named by its period alone (dates down the rows): shown and found by the
+            # sheet's title, else its name; keyed without, so a reworded title is one metric.
+            label = (self.sheet_title or sheet_title(self.name))[:LABEL_CHARS]
         for j in range(p.row.labels, len(p.row.cells)):
             h = j + p.shift
             if h < first or h >= len(cells):

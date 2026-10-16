@@ -1694,7 +1694,8 @@ def figures(
     """Look up a number from the recurring report workbooks (KPIs, volumes, ratios, a month's or a day's figure): per matching metric its latest held value and period, the previous period's value, the edition, and the attachment, sheet and cell it came from.
 
     A metric is one row label and column header of one sheet of one report series (a recurring
-    workbook, by filename and sender), newest period first. latest.source is attachment:<id>;
+    workbook, by filename and sender). Rows holding every word come first, newest period
+    first; rows holding some follow, flagged partial_match. latest.source is attachment:<id>;
     get_item(kind='attachment', ref, offset=latest.offset) shows the cell's row. period_source
     says where the period was read: header, row, sheet, filename or email. A % value is as the
     workbook stores it, usually a fraction. With `period` each row says `held`, and one not held

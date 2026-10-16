@@ -529,6 +529,89 @@ def test_a_to_date_header_is_as_of_the_report_not_the_year(tmp_path):
     ]
 
 
+def test_rows_named_by_their_period_are_labelled_by_the_sheets_title(tmp_path):
+    """Dates down the rows and products across: each row's label is its period, so the label
+    the figure is shown and found by is the sheet's title, its first row of one cell. Its key
+    stays empty, so a title reworded between editions keeps one metric."""
+    text = _dump(
+        tmp_path,
+        {
+            "KYC": [
+                ["Digital migration index KYC"],
+                ["Retail reporting"],
+                ["Month", "Upload", "Total"],
+                [datetime(2026, 6, 1), 10, 40],
+                [datetime(2026, 7, 1), 12, 41],
+                [datetime(2026, 8, 1), 14, 42],
+            ]
+        },
+    )
+
+    parsed = parse_workbook(text, filename="Index 31.08.2026.xlsx", email_date=MAILED)
+
+    upload = _by(parsed.figures, header="Upload")
+    assert {f.label for f in upload} == {"Digital migration index KYC"}
+    assert {f.label_key for f in upload} == {""}
+    assert [f.period for f in upload] == ["2026-06", "2026-07", "2026-08"]
+
+
+def test_without_a_title_the_sheet_name_labels_them(tmp_path):
+    text = _dump(
+        tmp_path,
+        {"Consumer loans": [["Month", "Digital", "Total"], [datetime(2026, 8, 1), 5, 7]]},
+    )
+
+    parsed = parse_workbook(text, filename="Index 31.08.2026.xlsx", email_date=MAILED)
+
+    assert {f.label for f in parsed.figures} == {"Consumer loans"}
+
+
+def test_a_section_names_the_period_rows_under_it(tmp_path):
+    text = _dump(
+        tmp_path,
+        {
+            "Sales": [
+                ["Sales index"],
+                ["Month", "Cards"],
+                ["Individuals"],
+                [datetime(2026, 8, 1), 5],
+                ["Business"],
+                [datetime(2026, 8, 1), 2],
+            ]
+        },
+    )
+
+    parsed = parse_workbook(text, filename="Index 31.08.2026.xlsx", email_date=MAILED)
+
+    assert [(f.label, f.value) for f in parsed.figures] == [("Individuals", 5), ("Business", 2)]
+
+
+def test_a_row_with_no_label_takes_the_label_above_it_in_its_column(tmp_path):
+    """A product label merged down over two segment blocks is stored once: the row under the
+    next segment has its figures and no label of its own."""
+    text = _dump(
+        tmp_path,
+        {
+            "Sales": [
+                ["Product", "Units", "Value"],
+                ["Individuals"],
+                ["Cards", 10, 100],
+                ["Business"],
+                [None, 7, 70],
+            ]
+        },
+    )
+
+    parsed = parse_workbook(text, filename="Sales 30.09.2026.xlsx", email_date=MAILED)
+
+    assert [(f.label, f.header, f.value) for f in parsed.figures] == [
+        ("Individuals / Cards", "Units", 10),
+        ("Individuals / Cards", "Value", 100),
+        ("Business / Cards", "Units", 7),
+        ("Business / Cards", "Value", 70),
+    ]
+
+
 def test_text_that_is_no_workbook_dump_gives_nothing():
     parsed = parse_workbook("Just a paragraph.", filename="x.xlsx", email_date=MAILED)
     assert parsed.figures == []

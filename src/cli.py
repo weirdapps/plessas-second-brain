@@ -2972,6 +2972,12 @@ def main():
         action="store_true",
         help="With --apply, forget every figure first and read them all again (a parser change)",
     )
+    parser_figures.add_argument(
+        "--reparse",
+        action="store_true",
+        help="Read again, series by series, the editions an older parser read (a dry run unless"
+        " --apply; resumable)",
+    )
     parser_figures.set_defaults(func=cmd_figures_backfill)
     # vectors-rebuild, vectors-slice (src/store/vector_rebuild.py): maint-only too.
     from src.store.vector_rebuild import add_maint_parsers as add_vector_parsers

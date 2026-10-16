@@ -306,7 +306,7 @@ The pass runs per thread (an email conversation, a Teams thread, a WhatsApp sess
 - a reply that would mark more than half of the items it was shown (above three labels), or more than 60, is applied not at all: the thread waits in `consolidation_threads.model_state = 'review'` with the labels in `review`;
 - every label is logged in `item_labels` with its evidence, the values it replaced, and for a model label the call's prompt hash and reply id; `brain maint consolidate --revert RUN_ID|THREAD` puts them back.
 
-On 66 real threads of the replica, 22 of 25 sampled model labels were right (the misses: a recurring "available for questions" line in two monthly reports, and a richer fact folded into a poorer one); the checks keep about four in ten of what the model proposes, refusing cross-language paraphrases below the overlap floor and any close by someone but the owner or a named party.
+On real threads of the replica, 23 of 25 sampled labels the checks kept were right (the misses: a restated task labelled superseded, and an item with a detail its target lacked); the checks keep about one in three of the model's proposals (47 of 132 on 24 threads), refusing cross-language paraphrases below the overlap floor and nearly every close by someone other than the owner (1 of 17 kept on that sample).
 
 ### Attachments and images
 

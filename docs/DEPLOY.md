@@ -1381,7 +1381,7 @@ environment the timers run with, in this order:
    threads, 179,700 duplicates by rule (143,279 key facts, 24,233 actions, 10,398
    decisions, 1,790 commitments) and 4,898 calls, $91 online with
    `BRAIN_CHARS_PER_TOKEN=1.95` (measured on this corpus) and 400 output tokens a call;
-   66 measured calls averaged $0.016-0.019, so $80-90. Then
+   90 measured calls came to about $0.016 each under the final prompt, so about $76. Then
    `python -m src.cli maint consolidate --apply --rules-only` (no model call, about ten
    minutes), and once a day
    `python -m src.cli maint consolidate --apply --token-budget 12000000 --limit 1600`

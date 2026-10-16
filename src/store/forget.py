@@ -5,12 +5,14 @@ a mail attachment (scripts/forget_duplicate_documents.py), and, in a later chang
 note replaced by its newer version. Every foreign key into emails and attachments is NO
 ACTION, so the children are deleted first. The full-text rows follow through their delete
 triggers. The vectors are an email's positive id and an attachment's -attachment_content.id
-(src/store/embeddings.py).
+(src/store/embeddings.py). The figures read from an attachment go with it, and its report series
+is read again without it (src/store/figures.py forget_attachments).
 """
 
 import sqlite3
 
 from src.store.embeddings import remove_vectors
+from src.store.figures import forget_attachments
 
 # Children of emails, deleted before their parents.
 _BY_EMAIL = (
@@ -65,6 +67,8 @@ def forget_documents(conn: sqlite3.Connection, message_ids) -> dict:
             conn.execute(f"DELETE FROM attachments WHERE id IN ({am})", att_ids)
         conn.execute(f"DELETE FROM emails WHERE id IN ({em})", email_ids)
         conn.commit()
+        # The figures read from those attachments (schema v37), and their series read again.
+        forget_attachments(conn, att_ids)
         stats["emails"] += len(email_ids)
         stats["attachments"] += len(att_ids)
     stats["vectors"] = remove_vectors(vectors)

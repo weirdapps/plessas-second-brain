@@ -24,11 +24,12 @@ order they are parsed in. Nothing here calls a model.
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import time
 from collections.abc import Iterable
 from datetime import UTC, date, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 from src.extract.attachment_digest import SPREADSHEET_METHODS
 from src.extract.figures_parse import (
@@ -43,7 +44,7 @@ from src.extract.figures_parse import (
     sheet_title,
 )
 from src.store import envelope
-from src.store.greek import register_sql_functions, search_fold, search_words
+from src.store.greek import query_stem, register_sql_functions, search_fold, search_words
 from src.store.stamps import instant, utc_now
 
 # A series is kept from its third edition: two files of one name are a coincidence as often
@@ -451,6 +452,104 @@ def ingest_editions(
     return {"registered": registered["registered"], **stats}
 
 
+def _wipe_series(conn: sqlite3.Connection, series_id: int) -> None:
+    """Forget a series' figures, keeping its editions, each waiting to be read again: a series
+    is rebuilt whole, as supersession runs over all its editions. Metrics go while their
+    series stands, as the index's delete reads its stem."""
+    metrics = "(SELECT id FROM figure_metrics WHERE series_id = ?)"
+    conn.execute(f"DELETE FROM figure_restated WHERE metric_id IN {metrics}", (series_id,))
+    conn.execute(f"DELETE FROM figure_values WHERE metric_id IN {metrics}", (series_id,))
+    conn.execute("DELETE FROM figure_metrics WHERE series_id = ?", (series_id,))
+    conn.execute(
+        "UPDATE figure_editions SET status = 'pending', figures = 0"
+        " WHERE series_id = ? AND copy_of IS NULL",
+        (series_id,),
+    )
+    conn.execute(
+        "UPDATE figure_series SET latest_period = NULL, latest_end = NULL, latest_from = NULL,"
+        " editions = (SELECT COUNT(*) FROM figure_editions WHERE series_id = ? AND copy_of IS NULL),"
+        " first_date = (SELECT MIN(edition_date) FROM figure_editions"
+        "  WHERE series_id = ? AND copy_of IS NULL),"
+        " last_date = (SELECT MAX(edition_date) FROM figure_editions"
+        "  WHERE series_id = ? AND copy_of IS NULL)"
+        " WHERE id = ?",
+        (series_id, series_id, series_id, series_id),
+    )
+
+
+def forget_attachments(conn: sqlite3.Connection, attachment_ids: Iterable[int]) -> dict[str, int]:
+    """Take forgotten attachments out of the registry (src/store/forget.py): their figures,
+    restated values and edition records, so no figure cites a missing attachment. A copy of a
+    forgotten edition's bytes becomes the edition in its place, and each series they were in is
+    read again from the editions left; one left with fewer than MIN_EDITIONS holds none."""
+    ids = sorted({int(i) for i in attachment_ids})
+    if not ids or not has_registry(conn):
+        return {}
+    gone = json.dumps(ids)
+    series = {
+        r[0]
+        for r in conn.execute(
+            "SELECT series_id FROM figure_editions"
+            " WHERE attachment_id IN (SELECT value FROM json_each(?))",
+            (gone,),
+        )
+    }
+    if not series:
+        return {}
+    for (held,) in conn.execute(
+        "SELECT attachment_id FROM figure_editions"
+        " WHERE attachment_id IN (SELECT value FROM json_each(?)) AND copy_of IS NULL",
+        (gone,),
+    ).fetchall():
+        copies = [
+            r[0]
+            for r in conn.execute(
+                "SELECT attachment_id FROM figure_editions WHERE copy_of = ?"
+                " AND attachment_id NOT IN (SELECT value FROM json_each(?))"
+                " ORDER BY edition_date, attachment_id",
+                (held, gone),
+            )
+        ]
+        if copies:
+            heir = copies[0]
+            conn.execute(
+                "UPDATE figure_editions SET copy_of = NULL, status = 'pending'"
+                " WHERE attachment_id = ?",
+                (heir,),
+            )
+            conn.execute("UPDATE figure_editions SET copy_of = ? WHERE copy_of = ?", (heir, held))
+            series.update(
+                r[0]
+                for r in conn.execute(
+                    "SELECT series_id FROM figure_editions WHERE attachment_id = ?", (heir,)
+                )
+            )
+    conn.execute(
+        "DELETE FROM figure_editions WHERE attachment_id IN (SELECT value FROM json_each(?))",
+        (gone,),
+    )
+    for series_id in sorted(series):
+        _wipe_series(conn, series_id)
+    conn.commit()
+    stats = parse_pending(conn, series_ids=series)
+    return {"editions": len(ids), "series": len(series), "parsed": stats["parsed"]}
+
+
+def forget_orphans(conn: sqlite3.Connection) -> dict[str, int]:
+    """forget_attachments for the editions whose attachment is gone already: one forgotten
+    before forget_documents took its figures with it."""
+    if not has_registry(conn):
+        return {}
+    gone = [
+        r[0]
+        for r in conn.execute(
+            "SELECT attachment_id FROM figure_editions"
+            " WHERE attachment_id NOT IN (SELECT id FROM attachments)"
+        )
+    ]
+    return forget_attachments(conn, gone) if gone else {}
+
+
 def reset(conn: sqlite3.Connection) -> None:
     """Forget every figure, metric, edition and series, for a backfill to start again (a
     parser change). Metrics go before their series: the index's delete reads the series' stem."""
@@ -527,29 +626,149 @@ def _series_ids(conn: sqlite3.Connection, series: str | None) -> list[int] | Non
     return ids
 
 
-def _candidates(
-    conn: sqlite3.Connection, query: str, series_ids: list[int] | None
-) -> tuple[list[tuple[int, float]], bool]:
-    """Metrics matching the query, best first, and whether they hold only some of its words."""
-    from src.store.query import fts5_query_variants
+# Report terms in Greek and in English: the workbooks head their columns in English ("Consumer
+# Loans") and the owner asks in Greek ("καταναλωτικά δάνεια"). Each pair is a folded Greek stem
+# and an English stem; a query word that starts with either is also searched by the other.
+GLOSSARY: tuple[tuple[str, str], ...] = (
+    ("καταναλωτικ", "consumer"),
+    ("δανει", "loan"),
+    ("στεγαστικ", "mortgage"),
+    ("καρτ", "card"),
+    ("πιστωτικ", "credit"),
+    ("χρεωστικ", "debit"),
+    ("προπληρωμεν", "prepaid"),
+    ("καταθεσ", "deposit"),
+    ("λογαριασμ", "account"),
+    ("συναλλαγ", "transaction"),
+    ("πωλησ", "sales"),
+    ("πελατ", "customer"),
+    ("ψηφιακ", "digital"),
+    ("κλησ", "call"),
+    ("αιτησ", "application"),
+    ("εγκρισ", "approv"),
+    ("εκταμιευ", "disburs"),
+    ("επενδυτικ", "investment"),
+    ("ασφαλ", "insurance"),
+    ("μεταπτωσ", "migration"),
+    ("δεικτ", "index"),
+    ("συνολ", "total"),
+    ("υπολοιπ", "balance"),
+    ("εισροε", "inflow"),
+    ("εκροε", "outflow"),
+    ("εξαγορ", "redemption"),
+    ("συμμετοχ", "subscription"),
+    ("εγγραφ", "registration"),
+    ("προυπολογισμ", "budget"),
+    ("στοχ", "target"),
+    ("δαπαν", "expense"),
+    ("εσοδ", "revenue"),
+    ("εξυπηρετησ", "service"),
+    ("καταστημ", "branch"),
+    ("ιδιωτ", "individual"),
+    ("επιχειρησ", "business"),
+)
+# How many metrics each pass reads before they are ordered: every one holding all the words,
+# then, when those are too few, the ones holding some.
+FULL_CANDIDATES = 500
+PARTIAL_CANDIDATES = 2000
 
-    where = ""
-    args: list = []
+
+class _Word(NamedTuple):
+    """One query word: the word itself, and the prefixes it is also found by (its Greek stem,
+    its glossary pair)."""
+
+    word: str
+    prefixes: tuple[str, ...]
+
+
+def _words(query: str) -> list[_Word]:
+    out = []
+    for word in search_words(query):
+        prefixes: set[str] = set()
+        stem = query_stem(word)
+        if stem:
+            prefixes.add(stem)
+        for greek, english in GLOSSARY:
+            if word.startswith(greek) or word.startswith(english):
+                prefixes.update((greek, english))
+        if len(word) >= 3:
+            prefixes.discard(word)
+        out.append(_Word(word, tuple(sorted(p for p in prefixes if len(p) >= 3))))
+    return out
+
+
+def _term(text: str) -> str:
+    return '"' + text.replace('"', '""') + '"'
+
+
+def _terms(word: _Word) -> str:
+    return "(" + " OR ".join([_term(word.word), *(f"{_term(p)}*" for p in word.prefixes)]) + ")"
+
+
+def _holds(word: _Word, text: str) -> bool:
+    """Whether a folded text holds a query word: the word whole, or one of its prefixes at the
+    start of a word."""
+    if re.search(r"(?<!\w)" + re.escape(word.word) + r"(?!\w)", text):
+        return True
+    return any(re.search(r"(?<!\w)" + re.escape(p), text) for p in word.prefixes)
+
+
+def _matching(
+    conn: sqlite3.Connection, expr: str, series_ids: list[int] | None, cap: int
+) -> dict[int, float]:
+    where, args = "", []
     if series_ids is not None:
         where = " AND m.series_id IN (SELECT value FROM json_each(?))"
         args.append(json.dumps(series_ids))
-    for expr, partial in fts5_query_variants(query):
-        rows = conn.execute(
-            "SELECT f.rowid, bm25(figure_metrics_fts, 1.0, 1.0, 2.0, 2.0) AS score"
-            " FROM figure_metrics_fts f JOIN figure_metrics m ON m.id = f.rowid"
-            " JOIN figure_series s ON s.id = m.series_id"
-            f" WHERE figure_metrics_fts MATCH ? AND s.editions >= ?{where}"
-            " ORDER BY score LIMIT ?",
-            [expr, MIN_EDITIONS, *args, CANDIDATES],
+    rows = conn.execute(
+        "SELECT f.rowid, bm25(figure_metrics_fts, 1.0, 1.0, 2.0, 2.0) AS score"
+        " FROM figure_metrics_fts f JOIN figure_metrics m ON m.id = f.rowid"
+        " JOIN figure_series s ON s.id = m.series_id"
+        f" WHERE figure_metrics_fts MATCH ? AND s.editions >= ?{where}"
+        " ORDER BY score LIMIT ?",
+        [expr, MIN_EDITIONS, *args, cap],
+    )
+    return {r[0]: r[1] for r in rows}
+
+
+def _candidates(
+    conn: sqlite3.Connection, words: list[_Word], series_ids: list[int] | None, limit: int
+) -> list[tuple[int, int]]:
+    """(metric id, how many query words it holds) for the metrics holding any of the words, in
+    order: more words held first, so a metric holding every word is never below one holding
+    some; then the newest latest period; then full-text relevance. A word is held across the
+    series name, the sheet, the row label and the column header."""
+    found = _matching(conn, " AND ".join(map(_terms, words)), series_ids, FULL_CANDIDATES)
+    if len(words) > 1 and len(found) < limit:
+        loose = _matching(conn, " OR ".join(map(_terms, words)), series_ids, PARTIAL_CANDIDATES)
+        found = {**loose, **found}
+    if not found:
+        return []
+    ids = json.dumps(sorted(found))
+    held: dict[int, int] = {}
+    for mid, *texts in conn.execute(
+        "SELECT id, series_f, sheet_f, label_f, header_f FROM figure_metrics_search"
+        " WHERE id IN (SELECT value FROM json_each(?))",
+        (ids,),
+    ):
+        text = search_fold(" | ".join(t or "" for t in texts))
+        held[mid] = sum(_holds(w, text) for w in words)
+    # How recent a metric's newest figure is: its period's end, but no later than the day its
+    # edition was mailed, so a running year's total (ending 31 December) is as recent as the
+    # day it was reported, not months newer than this month's figure.
+    newest = dict(
+        conn.execute(
+            "SELECT v.metric_id,"
+            " MAX(MIN(v.period_end, COALESCE(substr(fe.edition_date, 1, 10), v.period_end)))"
+            " FROM figure_values v LEFT JOIN figure_editions fe ON fe.attachment_id = v.attachment_id"
+            " WHERE v.metric_id IN (SELECT value FROM json_each(?)) GROUP BY v.metric_id",
+            (ids,),
         ).fetchall()
-        if rows:
-            return [(r[0], r[1]) for r in rows], partial
-    return [], False
+    )
+    order = sorted((m for m in found if m in newest), key=lambda m: found[m])
+    order.sort(key=lambda m: newest[m], reverse=True)
+    order.sort(key=lambda m: held.get(m, 0), reverse=True)
+    return [(m, held.get(m, 0)) for m in order]
 
 
 def _metric_name(label: str, header: str) -> str:
@@ -579,7 +798,8 @@ def search_figures(
             "result": [],
             "reason": f"No kept series is named like {series!r}: figures(mode='series') lists them.",
         }
-    found, partial = _candidates(conn, query, series_ids)
+    words = _words(query)
+    found = _candidates(conn, words, series_ids, limit) if words else []
     if not found:
         return {
             "result": [],
@@ -596,8 +816,10 @@ def search_figures(
             (json.dumps([mid for mid, _ in found]),),
         )
     }
-    rows = []
-    for metric_id, _score in found:
+    ranked: list[tuple[int, dict[str, Any]]] = []
+    # Rows are built for the best few times `limit`: within each count of words held, a row
+    # holding the period asked goes before one that does not.
+    for metric_id, held_words in found[: max(3 * limit, 30)]:
         if metric_id not in meta:
             continue
         series_id, name, sheet, label, header, unit = meta[metric_id]
@@ -650,14 +872,11 @@ def search_figures(
             {"value": restated[0], "source": f"attachment:{restated[1]}"} if restated else None
         )
         row["attachment_id"] = latest["attachment_id"]
-        rows.append(row)
-    # Best match first, then (stable) newest period first, then rows holding the asked period.
-    rows.sort(key=lambda r: r["latest"]["period_end"], reverse=True)
-    rows.sort(key=lambda r: not r.get("held", True))
-    rows = rows[:limit]
-    for row in rows:
-        if partial:
+        if held_words < len(words):
             row["partial_match"] = True
+        ranked.append((held_words, row))
+    ranked.sort(key=lambda hr: (-hr[0], not hr[1].get("held", True)))
+    rows = [row for _held, row in ranked[:limit]]
     envelope.attachments(conn, rows)
     out: dict[str, Any] = {"result": rows}
     if asked is not None and rows and not any(r.get("held") for r in rows):
@@ -802,8 +1021,57 @@ def _estimate(conn: sqlite3.Connection, waiting: list[int]) -> dict[str, float]:
     return {"sampled": len(sample), "figures": found * scale, "seconds": spent * scale}
 
 
+_STALE = (
+    "SELECT fe.series_id, COUNT(*) FROM figure_editions fe"
+    " JOIN figure_series s ON s.id = fe.series_id"
+    " WHERE s.editions >= ? AND fe.status IN ('parsed', 'failed')"
+    " AND (fe.parser IS NULL OR fe.parser < ?) GROUP BY fe.series_id ORDER BY fe.series_id"
+)
+
+
+def stale(conn: sqlite3.Connection) -> dict[int, int]:
+    """{series id: editions} for the kept series holding editions an older parser read."""
+    if not has_registry(conn):
+        return {}
+    return dict(conn.execute(_STALE, (MIN_EDITIONS, PARSER_VERSION)).fetchall())
+
+
+def reparse(conn: sqlite3.Connection, *, limit: int | None = None, progress=None) -> dict[str, int]:
+    """Read again, with today's parser, the series an older one read: each series whole, its
+    figures forgotten first, as supersession runs over all its editions. The editions a run
+    stopped at (`limit`, a signal) wait as pending and are read first by the next run, so a
+    series is never wiped twice."""
+    left = limit
+    stats = parse_pending(conn, limit=left, progress=progress)
+    totals = {"series": 0, "parsed": stats["parsed"], "failed": stats["failed"]}
+    totals["figures"] = stats["figures"]
+    if left is not None:
+        left -= stats["parsed"] + stats["failed"]
+    for series_id in stale(conn):
+        if left is not None and left <= 0:
+            break
+        _wipe_series(conn, series_id)
+        conn.commit()
+        done = parse_pending(conn, series_ids=[series_id], limit=left, progress=progress)
+        totals["series"] += 1
+        for key in ("parsed", "failed", "figures"):
+            totals[key] += done[key]
+        if left is not None:
+            left -= done["parsed"] + done["failed"]
+    totals["waiting"] = (
+        sum(stale(conn).values())
+        + conn.execute(
+            "SELECT COUNT(*) FROM figure_editions fe JOIN figure_series s ON s.id = fe.series_id"
+            " WHERE fe.status = 'pending' AND s.editions >= ?",
+            (MIN_EDITIONS,),
+        ).fetchone()[0]
+    )
+    return totals
+
+
 def cmd(args) -> int:
-    """`brain maint figures-backfill`: a dry run unless --apply; --estimate parses a sample."""
+    """`brain maint figures-backfill`: a dry run unless --apply; --estimate parses a sample;
+    --reparse reads again what an older parser read."""
     from src.config import is_replica, replica_refusal
     from src.store.schema import get_connection, run_migrations
     from src.store.sql_readonly import connect_read_only
@@ -814,6 +1082,11 @@ def cmd(args) -> int:
     if args.reset and not args.apply:
         print("--reset forgets every figure, so it runs only with --apply")
         return 2
+    if args.reset and args.reparse:
+        print("--reset reads everything again already; --reparse reads what an older parser read")
+        return 2
+    if args.reparse:
+        return _reparse_cmd(args)
     if not args.apply:
         conn = connect_read_only(args.db, immutable=True)
         try:
@@ -844,6 +1117,7 @@ def cmd(args) -> int:
         run_migrations(conn)
         if args.reset:
             reset(conn)
+        forget_orphans(conn)
         registered = register_editions(conn)
         started = time.perf_counter()
         stats = parse_pending(conn, limit=args.limit, progress=print)
@@ -863,3 +1137,42 @@ def cmd(args) -> int:
     if stats["deferred"]:
         print(f"  {'still waiting':<26}: {stats['deferred']:,} (--limit); run it again")
     return 1 if stats["failed"] and not stats["parsed"] else 0
+
+
+def _reparse_cmd(args) -> int:
+    """`figures-backfill --reparse [--apply] [--limit N]`."""
+    from src.store.schema import get_connection, run_migrations
+    from src.store.sql_readonly import connect_read_only
+
+    if not args.apply:
+        conn = connect_read_only(args.db, immutable=True)
+        try:
+            series = stale(conn)
+        finally:
+            conn.close()
+        print("figures-backfill --reparse DRY RUN (nothing written):")
+        print(
+            f"  {'read by an older parser':<26}: {sum(series.values()):,} editions in"
+            f" {len(series):,} series (today's parser is version {PARSER_VERSION})"
+        )
+        print("Run it again with --apply to read them again; it resumes where a run stopped.")
+        return 0
+    conn = get_connection(str(args.db))
+    try:
+        run_migrations(conn)
+        forget_orphans(conn)
+        register_editions(conn)
+        started = time.perf_counter()
+        totals = reparse(conn, limit=args.limit, progress=print)
+        spent = time.perf_counter() - started
+        values = conn.execute("SELECT COUNT(*) FROM figure_values").fetchone()[0]
+        metrics = conn.execute("SELECT COUNT(*) FROM figure_metrics").fetchone()[0]
+    finally:
+        conn.close()
+    print(f"figures-backfill --reparse APPLIED in {spent / 60:.1f} min:")
+    print(f"  {'series read again':<26}: {totals['series']:,}")
+    print(f"  {'editions read':<26}: {totals['parsed']:,}, {totals['failed']:,} failed")
+    print(f"  {'held':<26}: {metrics:,} metrics, {values:,} values")
+    if totals["waiting"]:
+        print(f"  {'still waiting':<26}: {totals['waiting']:,} editions; run it again")
+    return 1 if totals["failed"] and not totals["parsed"] else 0

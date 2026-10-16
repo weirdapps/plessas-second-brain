@@ -255,7 +255,7 @@ python -m src.cli maint topic-pages               # every page again, new eviden
 python -m src.cli topic-pages                     # what the nightly timer runs: only pages with new evidence
 ```
 
-On a replica's store of 2026-10-16 the rule picked 20 topics (5 by sessions, 15 by mail); a page's evidence ran 46-101 items and 9,000-19,000 input tokens. Two real calls took 22 s and cost $0.04 each, every line kept. The first build is priced at about $1.15 (20 pages; the estimate counts 2,500 output tokens a page, the calls used 1,800), and in the week before 6 to 16 of the 20 had an item dated each day, so a night costs about $0.25-0.90.
+On a replica's store of 2026-10-16 the rule picked 20 topics (6 by sessions, 14 by mail); a page's evidence ran 46-101 items and 9,000-19,000 input tokens. Two real calls took 22 s and cost $0.04 each, every line kept. The first build is priced at about $1.15 (20 pages; the estimate counts 2,500 output tokens a page, the calls used 1,800), and in the week before 6 to 16 of the 20 had an item dated each day, so a night costs about $0.25-0.90.
 
 **Findings.** A research session that settles a claim or a figure files it back in a ```` ```findings ```` block, in any `.md`, `.txt` or `.csv` note it writes. Notes are already ingested (`ingest-session-notes`, [Claude Code conversation memory](#claude-code-conversation-memory)); the block also loads, one JSON object a line, into the `findings` table (schema v37, `src/store/findings.py`), with the session id, the note's path and its date:
 

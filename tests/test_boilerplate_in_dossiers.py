@@ -39,6 +39,14 @@ def test_the_topic_dossier_lists_boilerplate_when_asked(store):
     assert context["key_facts_total"] == 2
 
 
+def test_the_meeting_prep_topic_facts_leave_boilerplate_out(store):
+    from src.store.query import meeting_prep
+
+    prep = meeting_prep(store, [f.ALICE[1]], topic="okapi")
+
+    assert [row["fact"] for row in prep["topic_context"]["key_facts"]] == ["Okapi budget: 40,000"]
+
+
 def test_a_store_without_the_mark_filters_nothing(tmp_path):
     conn = create_database(str(tmp_path / "old.db"))
     conn.execute("ALTER TABLE key_facts DROP COLUMN boilerplate")

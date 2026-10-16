@@ -44,7 +44,7 @@ from src.store.file_sweep import (
     NOT_FULLY_READ_SQL,
     OCR_GARBLED_SQL,
 )
-from src.store.source_class import stored_class
+from src.store.source_class import classes_of, stored_class, takes_items
 from src.store.stamps import utc_now
 
 logger = logging.getLogger(__name__)
@@ -936,14 +936,10 @@ def _extract_one_attachment(row, out_of_time=None, budget=None):
 def _takes_items(conn: sqlite3.Connection, email_id: int) -> bool:
     """Whether an attachment summary may put decisions and action items on this email: not on
     news or automation mail, which decide nothing and assign nothing to anyone, as the email
-    loader takes none from their bodies. Its key facts and topics are kept. The rule is
-    src.store.source_class.takes_items, which lands with this check in a parallel change; once
-    both are in, this calls it. A store older than v33 has no class: every email takes them."""
-    try:
-        row = conn.execute("SELECT source_class FROM emails WHERE id = ?", (email_id,)).fetchone()
-    except sqlite3.OperationalError:
-        return True
-    return row is None or row[0] not in ("news", "automation")
+    loader takes none from their bodies (src.store.source_class.takes_items, the one rule). Its
+    key facts and topics are kept. The class is the stored one; a store older than v33 has
+    none, and its News mailbox is news (classes_of)."""
+    return takes_items(classes_of(conn, [email_id]).get(email_id))
 
 
 def _held(conn: sqlite3.Connection, table: str, column: str, email_id: int, value: str) -> bool:
@@ -1176,8 +1172,8 @@ def store_phase2_result(
 
             # The texts are masked as the loader masks an email's
             # (src/store/loader.py), and compared masked with what the email holds.
-            takes_items = _takes_items(conn, email_id)
-            for decision in extraction.get("decisions", []) if takes_items else []:
+            with_items = _takes_items(conn, email_id)
+            for decision in extraction.get("decisions", []) if with_items else []:
                 if isinstance(decision, dict) and decision.get("decision"):
                     text = redact_secrets(decision["decision"])
                     if _held(conn, "decisions", "decision", email_id, text):
@@ -1193,7 +1189,7 @@ def store_phase2_result(
                         ),
                     )
 
-            for action in extraction.get("action_items", []) if takes_items else []:
+            for action in extraction.get("action_items", []) if with_items else []:
                 if isinstance(action, dict) and action.get("task"):
                     task = redact_secrets(action["task"])
                     if _held(conn, "action_items", "task", email_id, task):

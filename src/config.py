@@ -166,7 +166,7 @@ GEMINI_MODEL = os.environ.get("BRAIN_GEMINI_MODEL", "gemini-2.5-flash")
 # The Claude model and its Vertex region have no default: src/extract/claude_extract.py.
 
 # Schema version — bump when adding migrations (must match number of migrations in schema.py)
-CURRENT_SCHEMA_VERSION = 35
+CURRENT_SCHEMA_VERSION = 37
 
 ATTACHMENTS_DIR = DATA_ROOT / "attachments"
 RAW_BATCH_DIR = DATA_ROOT / "raw"

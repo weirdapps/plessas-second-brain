@@ -12,6 +12,11 @@ keeps its last version known to be right and ignores that path's edits until the
 Only .md, .txt and .csv count. Files written by scripts or through Bash are not covered: the
 transcript does not carry their content.
 
+A ```findings block in a note also loads, line by line, as findings (src/store/findings.py):
+the claims a research session verified, each naming the store item it rests on. They are
+kept in step with the note's last version, an unchanged one included, so a finding whose
+source arrived later becomes sourced on the next read.
+
 Which transcripts to read is decided per file, by its size and modification time against those
 recorded when it was last read (session_note_transcripts), never by a clock mark: transcripts
 reach this host by rsync with the writing Mac's times, so a laptop that syncs late delivers files
@@ -32,6 +37,7 @@ from pathlib import Path
 from src.config import CLAUDE_CODE_PROJECTS_DIR
 from src.extract.attachment_extractors import _apply_noise_filter
 from src.extract.attachment_pipeline import _guess_mime_type, ingest_text_document
+from src.store.findings import sync_note_findings
 from src.store.forget import forget_documents
 
 NOTE_SUFFIXES = (".md", ".txt", ".csv")
@@ -148,6 +154,14 @@ def _held_elsewhere(conn: sqlite3.Connection, message_id: int, path: str) -> boo
     return row is None or not str(row[0]).startswith("text:session-note:")
 
 
+def _sync_findings(conn: sqlite3.Connection, note: Note, stats: dict) -> None:
+    """The note's findings, in step with this version of it (not committed here)."""
+    found = sync_note_findings(conn, note.path, note.session_id, note.written_at, note.text)
+    stats["findings"] += found["stored"] + found["changed"] + found["unchanged"]
+    stats["findings_unsourced"] += found["unsourced"]
+    stats["findings_invalid"] += found["invalid"]
+
+
 def _store_note(conn: sqlite3.Connection, note: Note, stats: dict) -> None:
     sha = hashlib.sha256(note.text.encode("utf-8")).hexdigest()
     held = conn.execute(
@@ -156,6 +170,8 @@ def _store_note(conn: sqlite3.Connection, note: Note, stats: dict) -> None:
     if held:
         if held[2] == sha:
             stats["unchanged"] += 1
+            _sync_findings(conn, note, stats)
+            conn.commit()
             return
         if (held[1] or "") > (note.written_at or ""):
             stats["older"] += 1
@@ -186,6 +202,7 @@ def _store_note(conn: sqlite3.Connection, note: Note, stats: dict) -> None:
              sha256 = excluded.sha256""",
         (note.path, outcome["message_id"], note.session_id, note.written_at, sha),
     )
+    _sync_findings(conn, note, stats)
     conn.commit()
     stats["stored"] += 1
 
@@ -207,7 +224,19 @@ def ingest_session_notes(conn: sqlite3.Connection, jsonl_files) -> dict:
     next run reads it again, and does not stop the others.
     """
     stats = dict.fromkeys(
-        ("transcripts", "notes", "stored", "replaced", "unchanged", "older", "errors"), 0
+        (
+            "transcripts",
+            "notes",
+            "stored",
+            "replaced",
+            "unchanged",
+            "older",
+            "errors",
+            "findings",
+            "findings_unsourced",
+            "findings_invalid",
+        ),
+        0,
     )
     for jsonl in jsonl_files:
         path = Path(jsonl)

@@ -504,6 +504,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_index_people_lookups(conn)
     if current < 35:
         migrate_add_item_state(conn)
+    # v36 is the figures registry's (pr-numbers); renumber if this merges first.
+    if current < 37:
+        migrate_add_topic_pages(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -866,6 +869,68 @@ ITEM_STATE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     + _CONSOLIDATION,
     "key_facts": _CONSOLIDATION + (("boilerplate", "INTEGER NOT NULL DEFAULT 0"),),
 }
+
+
+def migrate_add_topic_pages(conn: sqlite3.Connection) -> None:
+    """v37: topic pages, and the findings research sessions file back.
+
+    A topic page (src/store/topic_pages.py) is one model call's account of a live topic,
+    every line citing a store item by its kind and ref. It is derived, so it gets a table
+    of its own and nothing else: no full-text index, no trigger, no vector, and no other
+    page or finding reads it as evidence. `members` lists the topic rows the page covers,
+    `evidence_keys` the refs its evidence held, which decides whether new evidence came
+    in since `built_at`, and `prompt_hash` the prompt it was written with.
+
+    A finding (src/store/findings.py) is a line of a ```findings block in a note a session
+    wrote (src/export/session_notes.py): a claim, its value, the date it holds for, the
+    store item it rests on and what it supersedes. `sourced` is 1 only when `source_ref`
+    names a primary item the store holds; `source_check` says why not otherwise. One row
+    per note path and position, so a note written again keeps its findings' ids.
+
+    Both tables are new, so no row is rewritten; CREATE ... IF NOT EXISTS makes a second
+    run a no-op.
+    """
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS topic_pages (
+            id INTEGER PRIMARY KEY,
+            topic TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
+            members TEXT NOT NULL,
+            selected_by TEXT NOT NULL,
+            body TEXT NOT NULL,
+            citations TEXT NOT NULL,
+            evidence_keys TEXT NOT NULL,
+            built_at TEXT NOT NULL,
+            newest_evidence_at TEXT,
+            prompt_hash TEXT NOT NULL,
+            model TEXT,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cost_usd REAL,
+            lines_kept INTEGER,
+            lines_dropped INTEGER
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS findings (
+            id INTEGER PRIMARY KEY,
+            note_path TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            session_id TEXT,
+            written_at TEXT,
+            claim TEXT NOT NULL,
+            value TEXT,
+            as_of TEXT,
+            source_ref TEXT,
+            supersedes TEXT,
+            sourced INTEGER NOT NULL DEFAULT 0,
+            source_check TEXT NOT NULL,
+            loaded_at TEXT NOT NULL,
+            UNIQUE(note_path, ordinal)
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_findings_source_ref ON findings(source_ref)")
+    conn.commit()
 
 
 def migrate_add_item_state(conn: sqlite3.Connection) -> None:

@@ -513,6 +513,13 @@ def cmd_topic_pages(args):
     return cmd(args)
 
 
+def cmd_findings(args):
+    """The findings sessions filed, and the rejected ones with why (src/store/findings.py)."""
+    from src.store.findings import cmd
+
+    return cmd(args)
+
+
 def cmd_briefs(args):
     """One pass of the pre-meeting brief pilot (src/pipeline/briefs.py)."""
     from src.pipeline.briefs import run
@@ -1727,6 +1734,7 @@ READ_ONLY_COMMANDS = frozenset(
         "topic-pages",
         # --dry-run reads; a pass that may mail refuses on a replica itself.
         "briefs",
+        "findings",
     }
 )
 
@@ -2252,6 +2260,17 @@ def main():
         help="Start no page after this many seconds (default 1500)",
     )
     parser_topic_pages.set_defaults(func=cmd_topic_pages)
+
+    parser_findings = subparsers.add_parser(
+        "findings",
+        help="The findings sessions filed back, by status, and the rejected ones with why "
+        "(for review; read-only)",
+    )
+    parser_findings.add_argument(
+        "--accepted", action="store_true", help="List the accepted ones instead"
+    )
+    parser_findings.add_argument("--limit", type=int, default=100, help="At most this many")
+    parser_findings.set_defaults(func=cmd_findings)
 
     parser_briefs = subparsers.add_parser(
         "briefs",

@@ -13,9 +13,12 @@ Only .md, .txt and .csv count. Files written by scripts or through Bash are not 
 transcript does not carry their content.
 
 A ```findings block in a note also loads, line by line, as findings (src/store/findings.py):
-the claims a research session verified, each naming the store item it rests on. They are
-kept in step with the note's last version, an unchanged one included, so a finding whose
-source arrived later becomes sourced on the next read.
+the claims a research session verified, each naming the store item it rests on. Each line
+fails closed: accepted only when its source is held and its quote or value is in that
+source's text, else stored rejected with the reason. They are kept in step with the note's
+last version, an unchanged one included, so a finding whose source arrived later is
+accepted on the next read. Each records whether the owner's own session wrote the note or
+an agent's (a teammate's or a subagent's), which ranks below.
 
 Which transcripts to read is decided per file, by its size and modification time against those
 recorded when it was last read (session_note_transcripts), never by a clock mark: transcripts
@@ -35,6 +38,7 @@ from datetime import datetime
 from pathlib import Path
 
 from src.config import CLAUDE_CODE_PROJECTS_DIR
+from src.export.conversation_export import is_agent_record, is_owner_record
 from src.extract.attachment_extractors import _apply_noise_filter
 from src.extract.attachment_pipeline import _guess_mime_type, ingest_text_document
 from src.store.findings import sync_note_findings
@@ -51,6 +55,26 @@ class Note:
     text: str
     written_at: str
     session_id: str
+    # Who ran the session that wrote it: 'owner' when the owner typed in it and no record
+    # names an agent (src/export/conversation_export.py), else 'agent'.
+    author_kind: str = "agent"
+
+
+def _typed_text(record: dict) -> str | None:
+    """The text of a user record that may be a prompt: a string, or text blocks alone."""
+    if record.get("type") != "user":
+        return None
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        return content
+    if (
+        isinstance(content, list)
+        and content
+        and all(isinstance(b, dict) and b.get("type") == "text" for b in content)
+    ):
+        return "\n".join(str(b.get("text") or "") for b in content)
+    return None
 
 
 def _records(jsonl_path: Path):
@@ -85,12 +109,17 @@ def collect_session_notes(jsonl_path: Path) -> dict[str, Note]:
     lost: set[str] = set()
     pending: dict[str, tuple[str, dict, str]] = {}
     session_id = jsonl_path.stem
+    agent_session = owner_typed = False
     for record in _records(jsonl_path):
         # Every field is checked for its type: a transcript is third-party input to this code,
         # and one odd record must not stop the read.
         sid = record.get("sessionId")
         if isinstance(sid, str) and sid:
             session_id = sid
+        agent_session = agent_session or is_agent_record(record)
+        typed = _typed_text(record)
+        if typed is not None and not owner_typed:
+            owner_typed = is_owner_record(record, typed)
         message = record.get("message")
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
@@ -130,6 +159,9 @@ def collect_session_notes(jsonl_path: Path) -> dict[str, Note]:
                     lost.add(path)
                     continue
                 notes[path] = Note(path, text, timestamp, session_id)
+    author = "owner" if owner_typed and not agent_session else "agent"
+    for note in notes.values():
+        note.author_kind = author
     return notes
 
 
@@ -156,10 +188,11 @@ def _held_elsewhere(conn: sqlite3.Connection, message_id: int, path: str) -> boo
 
 def _sync_findings(conn: sqlite3.Connection, note: Note, stats: dict) -> None:
     """The note's findings, in step with this version of it (not committed here)."""
-    found = sync_note_findings(conn, note.path, note.session_id, note.written_at, note.text)
-    stats["findings"] += found["stored"] + found["changed"] + found["unchanged"]
-    stats["findings_unsourced"] += found["unsourced"]
-    stats["findings_invalid"] += found["invalid"]
+    found = sync_note_findings(
+        conn, note.path, note.session_id, note.written_at, note.text, author_kind=note.author_kind
+    )
+    stats["findings_accepted"] += found["accepted"]
+    stats["findings_rejected"] += found["rejected"]
 
 
 def _store_note(conn: sqlite3.Connection, note: Note, stats: dict) -> None:
@@ -232,9 +265,8 @@ def ingest_session_notes(conn: sqlite3.Connection, jsonl_files) -> dict:
             "unchanged",
             "older",
             "errors",
-            "findings",
-            "findings_unsourced",
-            "findings_invalid",
+            "findings_accepted",
+            "findings_rejected",
         ),
         0,
     )

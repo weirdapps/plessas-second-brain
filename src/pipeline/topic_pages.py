@@ -61,9 +61,10 @@ Rules:
 - Every line rests on the evidence: give the cite keys of the rows it comes from in \
 "refs". A line you cannot cite, leave out. Never invent a key, a number, a date or a name.
 - Primary rows (emails, decisions, facts, actions, attachments, figures) outrank derived \
-rows. A finding (finding:N) may support a line only where no primary row says otherwise; \
-a finding marked SUPERSEDED or unsourced is not a settled number. Work sessions and notes \
-are for open questions and deliverables only.
+rows. A finding (finding:N) may support a line only where no primary row says otherwise, \
+and never removes or contradicts a primary row; one marked SUPERSEDED is not a settled \
+number, and one filed by an agent session ranks below one filed by the owner's. Work \
+sessions and notes are for open questions and deliverables only.
 - Numbers: only values the evidence states, each with its period and its source (the \
 report or sender), as "metric: value".
 - When newer evidence changes an older value or decision, give the newer one under its \

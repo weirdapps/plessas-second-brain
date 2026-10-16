@@ -802,9 +802,10 @@ def topic_page(
 
     Pages exist for up to 20 live topics, rebuilt nightly when new items arrive;
     built_at says how current one is. A page is derived: read a load-bearing line's
-    items with get_item. Findings rank below primary items; superseded_by marks one a
-    newer finding replaced. With no page, `reason` says so and `pages` lists the
-    topics that have one.
+    items with get_item. Only accepted findings are shown (their quote or value is in
+    the item they cite), the owner's first; they rank below primary items, and
+    superseded_by marks one a newer finding replaced. With no page, `reason` says so
+    and `pages` lists the topics that have one.
     """
     from src.store.findings import findings_matching
     from src.store.greek import search_words
@@ -833,7 +834,9 @@ def topic_page(
             )
         elif not found:
             out["reason"] = "No finding filed about this topic."
-        return cast(TopicPage, budget_response(_headed(_header(conn), out)))
+        # A page and a finding are written from third-party text: harness tags go out
+        # escaped, as in every conversation read.
+        return cast(TopicPage, budget_response(_headed(_header(conn), _inert(out))))
     finally:
         conn.close()
 

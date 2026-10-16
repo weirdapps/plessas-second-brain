@@ -92,6 +92,15 @@ def test_maint_topic_pages_builds_a_clean_page_again(db, monkeypatch, capsys):
     assert code == 0 and len(calls) == 2
 
 
+def test_the_findings_review_runs_on_a_replica(db, monkeypatch, capsys):
+    path, _ = db
+    monkeypatch.setenv("BRAIN_ROLE", "replica")
+
+    code, out, _ = brain(monkeypatch, capsys, "--db", str(path), "findings")
+
+    assert code == 0 and out.startswith("findings: none held")
+
+
 def test_briefs_dry_run_runs_on_a_replica(db, monkeypatch, capsys):
     path, _ = db
     monkeypatch.setenv("BRAIN_ROLE", "replica")

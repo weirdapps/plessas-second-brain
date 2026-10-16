@@ -593,19 +593,21 @@ def gather_evidence(
             f" (sheet {fig.get('sheet')}, cell {latest.get('cell')}){before}",
             title=fig.get("metric"),
         )
+    # Accepted findings only (src/store/findings.py: the source is held and the quote or
+    # value is in its text), the owner's own sessions' first, then agents'.
     for finding in findings_matching(conn, topic_ids=ids, words=live.words, limit=_CAPS["finding"]):
-        status = "sourced" if finding["sourced"] else f"unsourced: {finding['source_check']}"
+        by = "the owner's session" if finding["author_kind"] == "owner" else "an agent session"
         superseded = (
             f"; SUPERSEDED by {finding['superseded_by']}" if finding["superseded_by"] else ""
         )
         value = f" = {finding['value']}" if finding["value"] else ""
         as_of = f" as of {finding['as_of']}" if finding["as_of"] else ""
-        rests = f"; rests on {finding['source_ref']}" if finding["source_ref"] else ""
         evidence.add(
             "finding",
             finding["ref"],
             finding["date"],
-            f"{_cut(finding['claim'])}{value}{as_of} ({status}{rests}{superseded})",
+            f"{_cut(finding['claim'])}{value}{as_of} (filed by {by}; rests on "
+            f"{finding['source_ref']}{superseded})",
             title=finding["claim"],
         )
     if ids:

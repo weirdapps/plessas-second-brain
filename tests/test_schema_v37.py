@@ -43,14 +43,18 @@ FINDING_COLUMNS = [
     "note_path",
     "ordinal",
     "session_id",
+    "author_kind",
     "written_at",
     "claim",
+    "claim_key",
     "value",
     "as_of",
     "source_ref",
+    "source_date",
+    "quote",
     "supersedes",
-    "sourced",
-    "source_check",
+    "status",
+    "reason",
     "loaded_at",
 ]
 
@@ -89,11 +93,25 @@ def test_neither_table_has_a_full_text_index_or_a_trigger(store):
     assert not [name for kind, name in kinds if name.endswith("_fts")]
 
 
+def test_a_finding_is_rejected_unless_a_check_accepted_it(store):
+    """Fail closed: the column's default, and nothing but the two statuses."""
+    store.execute(
+        "INSERT INTO findings (note_path, ordinal, claim, claim_key, reason, loaded_at)"
+        " VALUES ('/n/a.md', 0, 'c', 'c', 'not checked', '2026-10-16')"
+    )
+    assert tuple(store.execute("SELECT status, author_kind FROM findings").fetchone()) == (
+        "rejected",
+        "agent",
+    )
+    with pytest.raises(Exception, match="CHECK"):
+        store.execute("UPDATE findings SET status = 'sourced'")
+
+
 def test_one_finding_per_note_position(store):
-    row = ("/n/a.md", 1, "s1", "2026-10-01", "claim", "ok", "2026-10-16")
+    row = ("/n/a.md", 1, "s1", "2026-10-01", "claim", "claim", "ok", "2026-10-16")
     insert = (
-        "INSERT INTO findings (note_path, ordinal, session_id, written_at, claim,"
-        " source_check, loaded_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO findings (note_path, ordinal, session_id, written_at, claim, claim_key,"
+        " reason, loaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     )
     store.execute(insert, row)
     with pytest.raises(Exception, match="UNIQUE"):
@@ -118,8 +136,8 @@ def test_migrating_a_v35_store_adds_both_tables_and_keeps_every_row(store):
 
 def test_the_migration_runs_again_over_its_own_result(store):
     store.execute(
-        "INSERT INTO findings (note_path, ordinal, claim, source_check, loaded_at)"
-        " VALUES ('/n/a.md', 0, 'kept', 'ok', '2026-10-16')"
+        "INSERT INTO findings (note_path, ordinal, claim, claim_key, reason, loaded_at)"
+        " VALUES ('/n/a.md', 0, 'kept', 'kept', 'ok', '2026-10-16')"
     )
     store.commit()
 

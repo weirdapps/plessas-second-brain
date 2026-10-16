@@ -2004,17 +2004,21 @@
     "rows": {
       "findings": [
         "as_of",
+        "author_kind",
         "claim",
         "date",
         "id",
         "kind",
         "loaded_at",
         "note_path",
+        "ordinal",
+        "quote",
+        "reason",
         "ref",
         "session_id",
-        "source_check",
+        "source_date",
         "source_ref",
-        "sourced",
+        "status",
         "superseded_by",
         "supersedes",
         "value"

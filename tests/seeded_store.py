@@ -129,10 +129,12 @@ def build(path: Path, *, synced: str | None = None) -> Path:
                                               position_in_body)
             VALUES ('ab12', '1', 'alice@example.com', 0.5);
 
-        INSERT INTO findings (note_path, ordinal, session_id, written_at, claim, value, as_of,
-                              source_ref, sourced, source_check, loaded_at)
-            VALUES ('/notes/okapi.md', 0, 's1', '{reply}', 'Okapi plan cost', '5', '2026-09',
-                    'email:1', 1, 'ok', '{reply}');
+        INSERT INTO findings (note_path, ordinal, session_id, author_kind, written_at, claim,
+                              claim_key, value, as_of, source_ref, source_date, quote,
+                              status, reason, loaded_at)
+            VALUES ('/notes/okapi.md', 0, 's1', 'owner', '{reply}', 'Okapi plan body',
+                    'okapi plan body', NULL, '2026-09', 'email:1', '{mail}',
+                    'the okapi body', 'accepted', 'ok', '{reply}');
         INSERT INTO topic_pages (topic, display_name, members, selected_by, body, citations,
                                  evidence_keys, built_at, newest_evidence_at, prompt_hash,
                                  lines_kept, lines_dropped)

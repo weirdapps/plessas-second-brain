@@ -136,25 +136,36 @@ Otherwise rebuild it, from the repo directory:
 ```bash
 # 5. Rebuild the embedding index against the restored rows.
 mv "$DATA/embeddings.npz" "$DATA/embeddings.npz.pre-restore"
-python -m src.cli embed --force   # emails, attachments, conversations
-python -c 'from src.config import DEFAULT_DB; from src.store.schema import get_connection; from src.store.embeddings import build_teams_index; print(build_teams_index(get_connection(str(DEFAULT_DB))))'   # Teams threads
-python -c 'from src.config import DEFAULT_DB; from src.store.schema import get_connection; from src.store.embeddings import build_whatsapp_index; print(build_whatsapp_index(get_connection(str(DEFAULT_DB))))'   # WhatsApp sessions
+python -m src.cli maint vectors-rebuild --abandon      # a side build from before the loss, if any
+python -m src.cli maint vectors-rebuild --estimate     # texts, tokens and dollars; sends nothing
+python -m src.cli maint vectors-rebuild                # every kind, then the swap; resumes
 ```
 
-`embed --force` covers emails, attachments and conversations only. Teams threads
-and WhatsApp sessions are embedded by their own builders, which pick up every
-thread whose vector is missing from the index, so after the `mv` they rebuild in
-full. Skip either and its vectors come back only as its sync re-adds them, at
-most 500 a run (`TEAMS_EMBED_LIMIT` in `src/pipeline/teams_sync.py`,
-`WHATSAPP_EMBED_LIMIT` in `src/pipeline/whatsapp_sync.py`).
+The rebuild embeds every summary (emails, attachments, conversations, Teams threads,
+WhatsApp sessions) and every chunk of the long PDF, Word and PowerPoint attachments,
+cutting the chunks first (`attachment_chunks`, schema v39), in this code's space
+(gemini-embedding-2 at 768 dimensions; README, "Database schema", Vector index). It
+builds into `$DATA/embeddings.rebuild/`, a part or a batch job at a time, and only
+the finished index is put in place, so a run stopped by a signal, an error or
+`--token-budget N` carries on where it was when run again. It sends Gemini batch jobs
+(half the online price), rolling: the Gemini API caps the tokens a key may have
+queued in embedding batch jobs (500,000 at tier 1, 5 million at tier 2), and a job
+that would pass the cap waits until earlier ones finish. `--online` sends 100 texts a
+call instead, as it does on Vertex AI, which has no embedding batch jobs.
 
-The rebuild sends every summary to the embedding model again (about 140,000 texts
-on the reference producer), so run it on the producer with the environment its
-scheduled jobs use. The service is chosen as it is everywhere else
-(`src.config.embed_backend`): `BRAIN_EMBED_BACKEND` when set, else the Gemini API
-when `GEMINI_API_KEY` is set, else Vertex AI. Where the Vertex project refuses the
-embedding model, export `BRAIN_EMBED_BACKEND=gemini` and `GEMINI_API_KEY` before
-step 5. Both serve `gemini-embedding-001`, so the vectors join one index.
+Measured on the reference replica, 2026-10-16: 143,801 summary texts (58 M characters,
+about 16 M tokens at 3.56 characters a token) and 86,133 chunks from 5,733 documents
+(391 M characters, about 147 M tokens at 2.66), so about $16 as batch jobs and $33
+online. A tier-2 key cleared about 5 million tokens every 2 to 3 minutes in batch
+mode, so the whole rebuild takes about an hour and a half; the estimate prints the
+counts for the store at hand.
+
+Run it on the producer with the environment its scheduled jobs use. The service is
+chosen as it is everywhere else (`src.config.embed_backend`): `BRAIN_EMBED_BACKEND`
+when set, else the Gemini API when `GEMINI_API_KEY` is set, else Vertex AI. Where the
+Vertex project refuses the embedding model, export `BRAIN_EMBED_BACKEND=gemini` and
+`GEMINI_API_KEY` before step 5. The writers are stopped (step 0), so nothing waits on
+the rebuild; had they been running, they would add no vector while it holds its lock.
 
 The export cursors are not in the snapshot either, and they are now ahead of
 it. Each `outlook_sync*.json` under `$DATA/state` still holds the newest mail

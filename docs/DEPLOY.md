@@ -450,7 +450,9 @@ checked before an item starts, and what does not fit waits for the next run:
    any source, get the rules, then model calls within `BRAIN_CONSOLIDATE_SYNC_TOKENS`,
    for 60 s (README, "Decisions and actions"); a failure here fails no sync.
 8. One embedding pass over what the run stored, when it loaded mail or
-   conversations.
+   conversations, in the index's space; once that is this code's, it also cuts the new
+   long PDF, Word and PowerPoint attachments into chunks and embeds them, for 60 s.
+   It adds nothing while `maint vectors-rebuild` runs.
 9. Record `last_sync_date` and `mail_export_ok_at`, which `stats` reports.
 
 It exits 0; 75 when extraction ended on a quota pause, or when the model extracted
@@ -650,8 +652,9 @@ pipeline itself. STALE in any of them fails the freshness ping, like any other S
 | Backups | The newest `brain-*.db` snapshot and the newest `brain-*.db.zst.enc` archive, STALE past 26 h; the last restore drill, WARN past 35 days ([`RESTORE.md`](RESTORE.md)). Not judged on a replica. | `BRAIN_BACKUP_DIR` (default `$BRAIN_DATA_DIR/backups`), `BRAIN_BACKUP_OFFSITE_DIR` (default its `offsite`), `BRAIN_RESTORE_DRILL_STAMP` |
 | Mail loss | Messages the export gave up fetching, and staging batches quarantined as unreadable. WARN on any quarantined batch, and on a message given up in the last week; the cursor files keep their give-ups for good, so older ones are reported, not warned on. | Read from `state/mail_loss.json` while it is under two days old, else counted from the cursor files |
 
-The golden query loads the whole embedding index (about 1.7 GB on the reference
-producer) into the check's own process, so schedule the check where that memory is
+The golden query loads the whole embedding index (1.78 GB on the reference producer
+in the legacy space, about 0.35 GB once rebuilt in this code's, section 12) into the
+check's own process, so schedule the check where that memory is
 free. On a systemd host the job list is every `sb-*` service the user manager has,
 plus the bot's unit when present (section 9); the list kept in the script is the
 floor, so a unit that disappears reads NOT_LOADED instead of dropping out.
@@ -722,7 +725,8 @@ the latest ingest. On a replica it is whatever the last pull left behind: check
 ### Over HTTP: one process for every client
 
 Each stdio client spawns its own server, and each server loads the embedding
-index (about 1.6 GB) on its first semantic query. A client that cannot spawn the
+index (1.78 GB in the legacy space, about 0.35 GB in this code's) on its first
+semantic query. A client that cannot spawn the
 server, or would spawn it per request, should use the HTTP mode instead.
 
 ```bash
@@ -760,8 +764,8 @@ RestartSec=10
 # would mail every 10 s. In direct mode the restarts are silent, and OnFailure= fires
 # once, when the start limit in [Unit] gives up.
 RestartMode=direct
-# A reload after embeddings.npz changes holds one index (about 1.6 GB), plus the
-# old one only while a reader is still mid-call.
+# A reload after embeddings.npz changes holds one index (1.78 GB in the legacy
+# space, about 0.35 GB rebuilt), plus the old one only while a reader is still mid-call.
 MemoryMax=4G
 NoNewPrivileges=yes
 
@@ -1413,6 +1417,73 @@ wait to be read again, on the producer, beside the timers:
    (with `--reparse` or not) first takes out an edition whose attachment is already
    gone, as one forgotten before this release would be.
 
+### After 2026-10-16 (vectors v2, schema v39)
+
+This release moves the index to gemini-embedding-2 at 768 dimensions in half precision,
+with a vector per chunk of every long PDF, Word and PowerPoint attachment (README,
+"Database schema", Vector index and Attachment chunks). The space drives both sides: until
+the rebuild below swaps the new index in, every writer goes on adding gemini-embedding-001
+vectors to the old one and every search embeds its query as before, so nothing breaks
+between the pull and the swap, on the producer or on a replica.
+
+On the producer, with the environment the timers run with (the Gemini API key: batch jobs
+need the Gemini API):
+
+1. **Replicas first.** Pull this release on every Mac that reads a replica, and start new
+   Claude Code sessions there (each starts its MCP server on the new code). Code from before
+   it cannot embed a query into the new space: after the swap reached it, it would rank
+   every query around its keyword matches (`keyword_seeded: IndexSpaceMismatch`) until
+   updated.
+2. **Pull, then restart the server** (steps 1 to 3 above):
+   `systemctl --user try-restart sb-mcp.service`. Schema v39 creates `attachment_chunks` at
+   the first job that writes, in milliseconds, with nothing stopped (or by hand:
+   `python -m src.cli maint migrate`).
+3. **Price it.** `python -m src.cli maint vectors-rebuild --estimate` sends nothing and
+   writes nothing. The reference replica on 2026-10-16: 143,801 summary texts (93,600
+   emails, 40,151 attachments, 6,886 Teams threads, 2,954 conversations, 210 WhatsApp
+   sessions), about 16 M tokens, and 86,133 chunks of 5,733 documents, about 147 M tokens:
+   about $16 as batch jobs, $33 online, at $0.10 and $0.20 a million tokens. The chunks are
+   most of it, and send the documents' text, not only their summaries, to the Gemini API;
+   on the owner's qa set they measured neutral and the model switch carried the gain
+   (README, "Retrieval qa"). To build without them, put `BRAIN_CHUNK_VECTORS=0` in the
+   timers' environment and the rebuild's: summaries alone, about $1.60 as batch jobs and a
+   quarter of an hour.
+4. **Build and swap.** No timer needs stopping. Start it where it can run for an hour or two
+   and outlive the login, for instance
+   `tmux new -d -s vectors 'python -m src.cli maint vectors-rebuild 2>&1 | tee -a ~/.second-brain/logs/vectors-rebuild.log'`.
+   While it holds its lock (`embeddings.npz.rebuild.lock`), the sync's embedding pass,
+   teams-sync and whatsapp-sync add no vector (they log `A vector rebuild is running`) and
+   load no index, so the producer holds the old index once, in sb-mcp, beside the
+   rebuild's own few hundred megabytes. It cuts the chunks first, then sends batch jobs of
+   at most a million tokens as the key's queue takes them (5 million tokens at tier 2, which
+   cleared every 2 to 3 minutes when measured: about an hour and a half for the whole
+   store; tier 1 queues 500,000, about ten times slower), collects them, embeds online what
+   the store gained meanwhile and what a job missed, and swaps the new index in. The old one
+   stays beside it as `embeddings.npz.pre-rebuild`. It exits 0 once swapped, 75 when
+   `--token-budget` or `--no-wait` left work for the next run, 1 on an error; run the same
+   command again to carry on. `--status` shows the side build, `--abandon` drops it.
+5. **The server** reloads the new index on its next query (its cache follows the file's
+   mtime); `systemctl --user try-restart sb-mcp.service` makes sure it holds only the new
+   one, about 0.35 GB against 1.78 GB.
+6. **Timers.** Nothing to restart: none was stopped. The next sync's embedding pass, teams-sync
+   and whatsapp-sync add their vectors in the new space, and the sync's pass cuts and embeds
+   the new long documents for at most 60 s a run.
+7. **Replicas** take the new index with their next :45 pull, 0.35 GB instead of 1.78 GB;
+   their MCP servers reload it on their next query.
+8. **Check.** The nightly report's Embeddings line reads
+   `gemini-embedding-2 768-d: <n> email, <n> attachment, <n> chunk, ...` with no gap, and
+   `brain maint vectors-rebuild --status` says `No side build.` On a Mac, the retrieval qa
+   eval (README, "Retrieval qa") compares with the runs before.
+9. **Back out**, if wanted: `mv data/embeddings.npz.pre-rebuild data/embeddings.npz` and
+   `try-restart sb-mcp.service`. The writers follow the old space again at once;
+   `attachment_chunks` stays, unread by it. Delete `embeddings.npz.pre-rebuild` once the
+   new index has served a day.
+
+`brain maint vectors-slice` is the no-cost alternative: it cuts the old index to its first
+768 dimensions in half precision (0.4 s on the replica, 1.78 GB to 0.22 GB), which
+gemini-embedding-001 queries at 768 dimensions match as if it had been built so; it adds
+no chunks and keeps the old model.
+
 ### Schema notes
 
 A store that missed several releases takes every migration since its version in
@@ -1452,10 +1523,9 @@ one pass, at the first job that writes. The versions that ask for a step:
   rebuilt). Nothing needs stopping: a job still running the old code works with the
   new triggers. The same release records the embedding space in `embeddings.npz` on
   its next save (README, "Database schema", Vector index), with nothing to run.
-  After a deliberate change of model, task type, dimension or text template, start
-  the index over with `python -m src.cli embed --force` on the producer, apart from
-  the embedding jobs (mind the API quota); `teams-sync` and `whatsapp-sync` add
-  their vectors back, 500 a run.
+  After a deliberate change of model, task type, dimension or text template, rebuild
+  the index with `python -m src.cli maint vectors-rebuild` on the producer (the
+  vectors v2 section above), which covers every kind and resumes.
 - **v35.** The item-state columns on `decisions`, `action_items`, `commitments` and
   `key_facts`, and `boilerplate_fact_keys` (README, "Database schema"). ADD COLUMN
   only: no row is rewritten and no full-text index rebuilt, so it takes well under a
@@ -1477,3 +1547,8 @@ one pass, at the first job that writes. The versions that ask for a step:
   NULL everywhere: no row is rewritten, no full-text index rebuilt, well under a second,
   and nothing needs stopping. Readers on a store before v35 or v38 see every item as
   current and every topic as a family of one.
+- **v39.** `attachment_chunks`, where each chunk of a long document lies (README,
+  "Database schema", Attachment chunks). CREATE TABLE only, so it takes milliseconds and
+  nothing needs stopping; the hourly embedding pass and `maint vectors-rebuild` fill it,
+  the pass only once the index is in this code's space. A job still running the old code
+  neither reads nor writes it.

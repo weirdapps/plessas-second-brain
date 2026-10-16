@@ -209,9 +209,9 @@ def test_a_person_at_a_terminal_keeps_the_unbounded_run(monkeypatch):
     assert sync._extract_deadline_s() is None
 
 
-# The stages after extraction hold back SYNC_AFTER_EXTRACTION_S, 440 s since the
-# consolidation slice (60 s) joined them.
-@pytest.mark.parametrize(("left_s", "expected"), [(10_000.0, 300.0), (460.0, 20.0), (100.0, 0.0)])
+# The stages after extraction hold back SYNC_AFTER_EXTRACTION_S, 500 s since the
+# consolidation slice and the chunk embedding slice (60 s each) joined them.
+@pytest.mark.parametrize(("left_s", "expected"), [(10_000.0, 300.0), (520.0, 20.0), (100.0, 0.0)])
 def test_the_slice_is_capped_by_what_is_left_of_the_unit(monkeypatch, left_s, expected):
     """A second sync in the same unit (the wrappers retry once on a database
     lock) got a fresh full slice and ran past the unit timeout. The unit-anchored

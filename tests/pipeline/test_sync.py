@@ -51,8 +51,8 @@ class Stages:
                 touched_people.update({7, 9})
             return record("load", {"db_path": db_path}, self.mail)
 
-        def embed(conn):
-            record("embed", {}, None)
+        def embed(conn, **kw):
+            record("embed", kw, None)
             if self.embed_error is not None:
                 raise self.embed_error
             return 1

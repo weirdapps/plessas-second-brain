@@ -118,6 +118,12 @@ EXTRACT_DEADLINE_BY_UNIT_S = {
 # no longer ordinary.
 MODEL_UNUSABLE_ALARM = 3
 
+# Step 9 cuts the long documents the run stored into chunks and embeds them (src/store/
+# chunks.py), wall-clock like the other slow stages: a 100-page PDF is about 50 chunks, one
+# embedding call. What does not fit waits for the next run. Only an index in a space with
+# chunks (template 2, after `brain maint vectors-rebuild`) has any to embed.
+CHUNK_EMBED_SYNC_DEADLINE_S = 60.0
+
 # Observed span for the stages that have no budget of their own: load,
 # registration (count-bounded), people dedup, and the incremental embeddings
 # update (about 10 s), made once at the end of the run (Step 9), which rewrites
@@ -131,6 +137,7 @@ SYNC_AFTER_EXTRACTION_S = (
     + PHASE2_SYNC_DEADLINE_S
     + CONVERSATION_SYNC_DEADLINE_S
     + IMAGE_CLASSIFY_SYNC_BUDGET_S
+    + CHUNK_EMBED_SYNC_DEADLINE_S
     + CONSOLIDATE_SYNC_DEADLINE_S
 )
 
@@ -531,14 +538,15 @@ def run(args):
     # and each pass loads and rewrites the whole index (embeddings.npz, 1.7 GB on the
     # producer): an hourly run saved it twice to load one email, at its 6 GB MemoryMax. Taken
     # when mail or conversations loaded, as those two were; a run stopped before it leaves
-    # its vectors to the next run's pass.
+    # its vectors to the next run's pass. The new long documents' chunks go in the same save,
+    # within CHUNK_EMBED_SYNC_DEADLINE_S; while a vector rebuild runs the pass adds nothing.
     if count > 0 or conv_loaded:
         print("\nStep 9: Updating embeddings...")
         from src.store.embeddings import build_index
 
         conn_embed = get_conn(db_path)
         try:
-            build_index(conn_embed)
+            build_index(conn_embed, chunk_deadline_s=CHUNK_EMBED_SYNC_DEADLINE_S)
             print("Embeddings updated")
         except Exception as e:
             # A run that loaded mail fails here, as Step 5 did. One that loaded only

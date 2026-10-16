@@ -1620,7 +1620,7 @@ def cmd_embed(args):
     conn.close()
 
     if count > 0:
-        print(f"Generated embeddings for {count} emails.")
+        print(f"Generated {count} embeddings.")
     else:
         print("Embedding index is up to date.")
 
@@ -1744,6 +1744,9 @@ READ_ONLY_COMMANDS = frozenset(
         "findings",
         # `brain maint figures-backfill`: the same; its dry run opens the store read-only.
         "figures-backfill",
+        # `brain maint vectors-rebuild`: --estimate and --status read; the rest refuses on a
+        # replica itself (exit 2).
+        "vectors-rebuild",
     }
 )
 
@@ -2852,9 +2855,16 @@ def main():
     parser_stale.set_defaults(func=cmd_stale)
 
     # Embed command (build embedding index)
-    parser_embed = subparsers.add_parser("embed", help="Build embedding index for semantic search")
+    parser_embed = subparsers.add_parser(
+        "embed",
+        help="Add the vectors the index lacks, in its space (brain maint vectors-rebuild moves "
+        "it to this code's)",
+    )
     parser_embed.add_argument(
-        "--force", action="store_true", help="Rebuild all embeddings from scratch"
+        "--force",
+        action="store_true",
+        help="Start the index over in this code's space, online, emails, attachments, "
+        "conversations and chunks only",
     )
     parser_embed.set_defaults(func=cmd_embed)
 
@@ -2969,6 +2979,10 @@ def main():
         " --apply; resumable)",
     )
     parser_figures.set_defaults(func=cmd_figures_backfill)
+    # vectors-rebuild, vectors-slice (src/store/vector_rebuild.py): maint-only too.
+    from src.store.vector_rebuild import add_maint_parsers as add_vector_parsers
+
+    add_vector_parsers(maint_subparsers)
     # consolidate (src/store/consolidate.py), entities (src/store/entities.py) and
     # topic-canon (src/store/topic_canon.py): maint-only, with no old spelling.
     from src.store import consolidate, entities, topic_canon

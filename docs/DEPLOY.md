@@ -9,8 +9,9 @@ on a single host or split across two (see "Topology" below).
 - Python 3.12+, and [`uv`](https://docs.astral.sh/uv/), which installs from the
   committed `uv.lock`.
 - `sqlite3` on `PATH`, on both hosts of a two-host setup: the replica pull runs
-  `.backup` on the producer and `PRAGMA quick_check` on the replica, and the
-  manual restore in [`RESTORE.md`](RESTORE.md) uses it. Everything else opens the
+  `PRAGMA quick_check` on the replica, and the manual restore in
+  [`RESTORE.md`](RESTORE.md) uses it. The pull's snapshot on the producer runs
+  `python3` there (its `sqlite3` module's online backup, every page in one step). Everything else opens the
   database through Python's own `sqlite3` module.
 - `curl`, for the health check's Healthchecks pings (section 7).
 - `unzip` on a replica. The pull checks a new `embeddings.npz` with `unzip -t`
@@ -191,7 +192,7 @@ Everything above describes one host that ingests and serves from the same
   `brain.db` and `embeddings.npz` down from the producer, and the local MCP
   server reads that copy. `scripts/wrappers/launchd/sb-db-pull.sh` is the
   reference implementation: it checkpoints the producer's WAL, takes a
-  `.backup` snapshot there, rsyncs the snapshot rather than the live file
+  backup snapshot there, rsyncs the snapshot rather than the live file
   (copying a WAL-mode database in place can capture a torn read) into
   `brain.db.new`, runs `PRAGMA quick_check` on that, and only then renames it
   over `brain.db`. `embeddings.npz` follows the same way, checked with
@@ -204,8 +205,11 @@ Everything above describes one host that ingests and serves from the same
   the same retention, which is what the weekly restore drill decrypts
   ([`RESTORE.md`](RESTORE.md), "Exercise it").
 
-**An unchanged producer costs no snapshot.** The `.backup` rewrites the whole
-database on the producer. When the producer's `brain.db` has the mtime and size
+**An unchanged producer costs no snapshot.** The backup rewrites the whole
+database on the producer. It copies every page in one step, under one read
+transaction, because the `sqlite3` CLI's `.backup` copies 100 pages a step and
+starts again whenever a writer commits in between: a producer committing every few
+seconds kept it copying for an hour on 2026-10-16. When the producer's `brain.db` has the mtime and size
 the last good pull recorded (`~/.second-brain/db-pull.source`, written beside
 the stamp), an empty `-wal`, and the consumer's snapshot is still there, the run
 reuses that snapshot instead. Any failed run deletes the record, so the next one

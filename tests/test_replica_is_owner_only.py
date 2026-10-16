@@ -61,13 +61,13 @@ def test_the_rsync_options_are_ones_the_macs_own_rsync_accepts(tmp_path):
 
 
 def test_the_producer_side_pull_snapshot_ends_owner_only(tmp_path):
-    """Run the real remote command: .backup into an old 0644 copy, then the chmod.
+    """Run the real remote command: a backup into an old 0644 copy, then the chmod.
 
     `chmod 600 '$REMOTE_SNAP'` single-quoted a path holding an escaped $HOME, so the
     producer's shell never expanded it, chmod failed, and the whole snapshot step
     reported rc=1 with the copy still 0644.
     """
-    line = next(ln for ln in TEXT.splitlines() if ".backup '$REMOTE_SNAP'" in ln)
+    line = next(ln for ln in TEXT.splitlines() if "python3 -c '$SNAPSHOT_PY'" in ln)
     home = tmp_path / "home"
     (home / ".second-brain").mkdir(parents=True)
     snap = home / ".second-brain" / "brain.snapshot.test.db"
@@ -75,14 +75,12 @@ def test_the_producer_side_pull_snapshot_ends_owner_only(tmp_path):
     snap.chmod(0o644)
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    fake = bindir / "sqlite3"
-    # .backup into an existing file keeps its mode, as sqlite3 does.
-    fake.write_text(
-        '#!/bin/sh\ndest=$(printf "%s" "$2" | sed -e "s/^.backup .//" -e "s/.$//")\n'
-        'printf new > "$dest"\n'
-    )
+    fake = bindir / "python3"
+    # A backup into an existing file keeps its mode, as sqlite3 does: python3 -c CODE SRC DEST.
+    fake.write_text('#!/bin/sh\nprintf new > "$4"\n')
     fake.chmod(0o755)
     script = (
+        "SNAPSHOT_PY=pass\n"
         "REMOTE_DATA=data; SNAP_NAME=brain.snapshot.test.db\n"
         'REMOTE_SNAP="\\$HOME/.second-brain/$SNAP_NAME"; SSH_OPTS=""; VPS=producer\n'
         "LOG_FILE=/dev/null\n"

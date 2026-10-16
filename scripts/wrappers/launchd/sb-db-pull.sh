@@ -121,7 +121,7 @@ if [ $CP_RC -ne 0 ]; then
 fi
 
 # --- Has the producer's brain.db changed since the last good pull? ---
-# The .backup below rewrites the whole database on the producer, every hour, for a
+# The backup below rewrites the whole database on the producer, every hour, for a
 # file that a quiet hour leaves exactly as it was. When nothing has written to it
 # since the last pull that passed, this host's snapshot on the producer already IS
 # that database, so it is reused. Unchanged means all of: the same mtime and size
@@ -187,19 +187,27 @@ seed_from() {
 # The DEFER guard and the WAL checkpoint above both narrow the window; neither
 # closes it, because nothing stops a write starting mid-rsync.
 #
-# `.backup` takes SQLite's own consistent snapshot and retries around writers,
-# which is exactly what a plain file copy cannot do. It lives outside the repo
+# SQLite's online backup takes a consistent snapshot, which is exactly what a plain
+# file copy cannot do, but only when it copies every page in ONE step. The sqlite3
+# CLI's `.backup` copies 100 pages a step and starts again from the first page
+# whenever another connection writes between two steps, so a producer committing
+# every few seconds keeps it copying forever: on 2026-10-16 (reextract-stacked, a
+# commit about every 6 s) the 21:45 pull ran an hour without finishing while the
+# snapshot's -wal grew to 5 GB. Python's Connection.backup() with its default
+# pages=-1 is that one step, under one read transaction that WAL lets writers run
+# beside: SNAPSHOT_PY below. The snapshot lives outside the repo
 # data dir and PERSISTS between runs on purpose: a stable page layout is what
 # lets rsync keep sending deltas instead of 3 GB every hour.
 # Per consumer, not one shared file. Two Macs pull from this VPS (one at :15,
 # one at :45) and both ran `sqlite3 .backup` into the SAME path, guarded only by
 # a /tmp lock that is local to each machine and therefore guards nothing across
-# them. A pull that overruns its 30-minute gap means two .backup runs writing one
+# them. A pull that overruns its 30-minute gap means two backup runs writing one
 # file, and both hosts then rsync whatever that produced. The DEFER check above
 # looks for VPS sync jobs and would not see the other Mac.
 # The extra disk is one snapshot per consumer, and rsync deltas are unaffected
 # because each host keeps its own stable page layout, which is the whole reason
 # this file persists between runs.
+SNAPSHOT_PY='import sqlite3, sys; s = sqlite3.connect(sys.argv[1]); d = sqlite3.connect(sys.argv[2]); s.backup(d); d.close(); s.close()'
 DB_RC=0
 INTEGRITY_RC=0
 EMB_RC=0
@@ -207,11 +215,11 @@ if [ $REUSE -eq 1 ]; then
   log "producer brain.db unchanged since the last good pull, reusing its snapshot"
   SNAP_RC=0
 else
-  # umask and chmod: the pull snapshot is a whole copy of brain.db, and .backup into
+  # umask and chmod: the pull snapshot is a whole copy of brain.db, and a backup into
   # an existing file keeps that file's mode, so an old 0644 copy stays 0644 unless
   # it is set here. Double quotes around the path, so the producer's shell expands the
   # escaped $HOME in it; single quotes left chmod a literal path and failed the step.
-  ssh $SSH_OPTS "$VPS" "umask 077; mkdir -p \$HOME/.second-brain && sqlite3 \$HOME/$REMOTE_DATA/brain.db \".backup '$REMOTE_SNAP'\" && chmod 600 \"$REMOTE_SNAP\"" 2>> "$LOG_FILE"
+  ssh $SSH_OPTS "$VPS" "umask 077; mkdir -p \$HOME/.second-brain && python3 -c '$SNAPSHOT_PY' \"\$HOME/$REMOTE_DATA/brain.db\" \"$REMOTE_SNAP\" && chmod 600 \"$REMOTE_SNAP\"" 2>> "$LOG_FILE"
   SNAP_RC=$?
 fi
 if [ $SNAP_RC -ne 0 ]; then

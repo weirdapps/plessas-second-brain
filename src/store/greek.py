@@ -105,6 +105,8 @@ STOPWORDS = frozenset(
         "μια", "είναι", "θα", "δεν", "τους", "τις", "στις", "στους", "ότι",
         "πώς", "τι", "ποιος", "ποια", "ποιο", "ποιες", "ποιοι", "όταν",
         "σχετικά", "έχει", "είχε", "ήταν", "αυτό", "αυτή", "αυτά", "μας", "σας",
+        # Prepositions: 'πωλήσεις ανά κανάλι' asks of a report that never says ανά.
+        "ανά", "κατά", "προς", "μέσω", "έως",
         "the", "and", "for", "with", "from", "that", "this", "are", "was", "not",
         "but", "you", "all", "any", "our", "what", "how", "when", "who", "which",
         "about", "did", "does", "have", "has", "there", "will", "can", "should",

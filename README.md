@@ -165,6 +165,30 @@ The price is precision, since a stem can start a different word: `πλήρης` 
 
 `BRAIN_QUERY_STEMMING=0` turns it off for one deployment, and every word is searched as typed, as before. Set it where the searching process reads its environment; for the MCP server that is `$BRAIN_DATA_DIR/env` or `~/.second-brain/env` (see [Run the MCP server](#run-the-mcp-server)). A checkout updated without `uv sync`, and so without `snowballstemmer`, searches as typed too and logs a warning saying why.
 
+The prepositions `ανά`, `κατά`, `προς`, `μέσω` and `έως` are stopwords, which a row need not hold: `πωλήσεις ανά κανάλι` missed the weekly report that never says `ανά`.
+
+### Newest first, one row a report
+
+Keyword search ranked by text relevance alone, the date only breaking ties, so a report mailed every month matched its own name as well in every edition and the older ones led: on one store the newest edition of a monthly KPI workbook came 18th and 19th for its own name, behind five older editions, where recall's five attachment rows never reached it. Now `search_attachments`, `search_emails` in keyword mode and the `recall` buckets rank their best matches by relevance (the best 4 per row asked, at least 40 and at most 100, never fewer than asked) a second time newest first, and fuse the two lists by reciprocal rank fusion, recency at equal weight (`src/store/ranking.py`, `src/store/fusion.py`). Recency reorders the matches the words found and adds none. `search_emails` keeps its stages (subject, summary, body, key facts, attachments): recency reorders the rows inside each, so an old email whose subject holds the words still comes before newer mail that mentions them in the body.
+
+Items whose name differs only by a date, a period or a version are one series, and so are copies of one file:
+
+| | One series |
+| --- | --- |
+| Filenames | `Report 31.08.2026.xlsx` and `Report 31.07.2026.xlsx`; `KPIs August 2026.pptx` and `KPIs September 2026.pptx` (English and Greek month names); `Q3 2026 results.pdf` and `Q2 2026 results.pdf`; `deck v3.pptx`, `deck final.pptx` and `deck.pptx`; `Budget (1).xlsx` and `Budget (2).xlsx`; any two attachments with the same `sha256` |
+| Subjects | the same, after their `Re:` and `Fwd:` prefixes: `Daily dashboard 15/10/2026` and `RE: Daily dashboard 14/10/2026` |
+| Never | `image003.png` twice with different contents (no date, no version), `Report.xlsx` and `Report.pdf` (another extension), a name holding nothing but a date |
+
+Once a name holds a date, its other numbers of up to four digits count as part of it (the `9` of `Tue 9 JUN`); a longer number is a reference and keeps two invoices apart. A series is ranked once, by its best match and its newest date, and shown by its newest member, preferring an edition's own mail to a later reply to an older one and, on the same day, a version named final. The row says `older_editions: n` and lists the others' refs in `editions`, newest first. A query that names a date (`31.05.2026`) is shown the member whose name holds it. The page is cut after the collapse, so five rows are five series. On the store above the newest edition now comes 3rd, standing for ten older rows.
+
+`BRAIN_QUERY_RANKING=relevance` turns recency and the series off for one deployment, and in `recall` only the email bucket fuses semantic search, as before.
+
+### Names in either script
+
+Most mail is Greek and most queries are not: in six weeks of use 53% of query text was English or Latin only and 27% mixed, and agents retried about 60 searches by translating a surname from Latin into Greek letters by hand. Now a query word of four letters or more, in one script, that is a word of a name the people table holds in the other script, by the spelling keys person resolution uses (`src/store/transliterate.py`), is searched in those forms too: `Okapidis` is `("Okapidis" OR "οκαπιδ"*)`, a Greek form by its stem where it has one, at most three forms a word, the most frequent first (`src/store/cross_script.py`). The reverse holds: `Οκαπίδης` also finds `Okapidis`. Every full-text search takes it: `search_emails`, `query_emails`, `search_attachments`, `search_teams`, `search_whatsapp`, `search_conversations`, `query_calendar_events` and the `recall` buckets that search the full-text index. The decision, action, commitment and image buckets, which match in Python, do not.
+
+A word no name holds in the other script is searched as before: of 180 common query words on one store, 3 had a form, each its own transliteration (a system's name, an English loan word and a first name). Measured on 60 Latin-script surnames of addressed people there, `search_emails` came back empty for 2 before and none after and returned 14.3 rows of 20 on average before and 19.3 after; paired with a Greek word, 12 queries found only partial matches before and 1 after; `search_attachments` came back empty for 11 before and 1 after. Greek surnames gained less (empty 1 to 0 in mail, 3 to 1 in attachments): Latin-script mail names people less often. The forms are built once per store and process from the people index (under half a second for 34K people), and again when the people table changes. `BRAIN_QUERY_NAMES=0` turns it off.
+
 ### Unified recall
 
 - `recall(query, limit_per_kind, days, include_context, include_news, include_automation, kinds, detail)`. Fan-out across every text-bearing index. This is the default "tell me everything you know about X" entry point. `detail="concise"` gives a short line per row ([`detail`](#mcp-tools)), and `excluded` counts the emails and attachments the class filter left out.
@@ -175,7 +199,13 @@ The price is precision, since a stem can start a different word: `πλήρης` 
 
   `include_context` (default `false`) attaches the person and topic dossiers the query matches, as `person_context` and `topic_context`, with `summary.has_person_context` and `has_topic_context`. They used to be attached to every call: 27% of an average payload, often for the wrong entity, since a topic word can start a person's name. The person dossier comes only when the query is an address, a Teams MRI or a WhatsApp JID, or a name that fits one person (`match_count` 1, rows the alias map joins counting once); a surname that fits several people used to attach whichever was most emailed. Call `person_context` or `topic_context` directly for a full dossier.
 
-  Only the `emails` bucket is a keyword plus semantic fusion (reciprocal rank fusion over FTS5 and embedding hits, degrading to keyword-only if the index or credentials are absent). Every other bucket is keyword-only. News and automation are left out of every bucket, the semantic candidates and both dossiers unless included (see above).
+  The buckets that have vectors, `emails`, `attachments`, `teams`, `whatsapp` and `conversations`, are each a reciprocal rank fusion of their keyword hits, ranked with recency (see [Newest first, one row a report](#newest-first-one-row-a-report); Teams and WhatsApp hits come newest first already, conversations get a recency list in the fusion), and the semantic hits of their kind. One query vector serves them all: `semantic_email_candidates` ranks the attachments, Teams threads, WhatsApp sessions and the owner's conversations by it beside the emails. A row semantic search alone found says `matched_in: semantic`, and counts as neither a whole nor a partial match in `summary.partial_kinds`. `summary.semantic` is the one status for every bucket; when the semantic half is unavailable, every bucket is keyword-only. Decisions, actions, commitments, images and calendar events are keyword-only. Before this only the `emails` bucket fused, and the other buckets' vectors, in the index all along, went unused: on the 45-question qa set below, recall's recall@10 rose from 0.62 to 0.78 and its MRR from 0.59 to 0.70, documents from 0.33 to 0.67.
+
+  Replies of one thread embed close together (cosine 0.89 against 0.66 for two random emails), so of the 20 semantic candidates a bucket fused about a third were siblings, which the fusion then collapsed into one row. Each bucket now takes three candidates per slot, collapses them onto their thread (for mail with a dated subject, its series) and only then keeps its 20: on 200 probe vectors from the store the pool held 13.5 distinct threads on average before and 18.6 after.
+
+  The buckets run at once (`BRAIN_RECALL_WORKERS`, default 6), each on its own read-only connection (`src/store/sql_readonly.py`), the semantic half first, so its embedding call overlaps the keyword buckets. With a 0.6-second embedding on the replica, a call took 1.24 s (median of 20) before this change and 1.03 s after, with every bucket now fused; with the new ranking, running the buckets at once instead of one after another cut the slowest of eight calls from 4.6 s to 2.5 s. A process's first call also builds the name forms and opens its first connections, about 2.5 s once. The result is the serial run's. A store in memory, which no other connection can open, and a connection with a transaction open, whose rows no other connection sees, run serially.
+
+  News and automation are left out of every bucket, the semantic candidates and both dossiers unless included (see above).
 
   A search embeds its query with a 4-second timeout and at most one retry (a 4xx other than 429 is not retried), never the ingest job's two-minute backoff. When the query cannot be embedded, semantic search ranks around the vectors of the query's best keyword matches instead, and says so: `summary.semantic` in `recall`, and each row's `semantic` in `search_emails` and `search_conversations`, read `keyword_seeded: <error type>`. With no keyword match to stand in, `recall` reports `unavailable: <error type>` and stays keyword-only.
 
@@ -183,7 +213,7 @@ The price is precision, since a stem can start a different word: `πλήρης` 
 
 ### Emails
 
-- `search_emails(query, search_type, limit, include_news, include_automation, kinds)`. Keyword (FTS5) or semantic (embedding). Keyword search tries the subject first, then the summary, the body, key facts and attachments, and returns one email per thread (for a subject match, the thread's newest); a row whose thread has more than one email matching in its subject, summary or body says how many in `thread_matches`. Semantic search leaves the vectors of news and automation mail, and of their attachments, out of the ranking unless included.
+- `search_emails(query, search_type, limit, include_news, include_automation, kinds)`. Keyword (FTS5) or semantic (embedding). Keyword search tries the subject first, then the summary, the body, key facts and attachments, and returns one email per thread (for a subject match, the thread's newest); a row whose thread has more than one email matching in its subject, summary or body says how many in `thread_matches`. Inside each stage its rows are ranked with recency, and mail whose subject differs only by a date is one row, the newest edition, with `older_editions` ([Newest first, one row a report](#newest-first-one-row-a-report)); a name matches in Latin or Greek letters ([Names in either script](#names-in-either-script)). Key facts marked boilerplate (schema v35) are not searched. Semantic search leaves the vectors of news and automation mail, and of their attachments, out of the ranking unless included.
 - `email_thread(email_id, limit)`. Deprecated, going in the next release: `get_item(kind="email", ref=email_id)` gives the same thread, 20 emails centred on the hit, with the email's body. The emails of a hit's thread, oldest first, with `thread_total`; a thread longer than `limit` comes back as the `limit` emails centred on the hit, and a News item or an email with no conversation id as a thread of one. The thread asked for comes back whatever its class, each row saying its `source_class`.
 - `query_emails(person, topic, keyword, start_date, end_date, limit, include_news, include_automation, kinds)`. Combined filters.
 - `outlook_live_search(folder, since_minutes, subject_contains)`. Bypasses the DB and queries the live Outlook mailbox directly, for mail newer than the store. `since_minutes` defaults to 60 and is capped at 1440 (24 hours); the answer's `since_minutes` and `clamped` say what was searched. This is the escape hatch when `stats` says the local copy is stale. When Outlook needs a new sign-in (outlook-cli exit 4), or outlook-cli fails, the error says so and points at the brain's own copy.
@@ -209,7 +239,7 @@ Every dossier dates and orders its rows the same way (`src/store/ordering.py`): 
 
 ### Attachments and images
 
-- `search_attachments(query, limit, include_news, include_automation)`. FTS over extracted text and LLM summaries; each row carries its email's `source_class`. Since 2026-10-11 a long attachment's summary is built from all or part of it: a spreadsheet's from its structure, any other long text's from every part up to `BRAIN_ATTACHMENT_FULL_PARTS_UPTO` parts (default 8, about 100 pages) and from three of its parts above that (see [Attachment summaries and spend](#attachment-summaries-and-spend)). The full extracted text is still searched.
+- `search_attachments(query, limit, include_news, include_automation)`. FTS over extracted text and LLM summaries; each row carries its email's `source_class`. Ranked by relevance and recency, the editions, versions and copies of one file one row, the newest, with `older_editions` and `editions` ([Newest first, one row a report](#newest-first-one-row-a-report)). The snippet is taken for the rows shown only: on a 2M-character spreadsheet it costs about 6 ms. Since 2026-10-11 a long attachment's summary is built from all or part of it: a spreadsheet's from its structure, any other long text's from every part up to `BRAIN_ATTACHMENT_FULL_PARTS_UPTO` parts (default 8, about 100 pages) and from three of its parts above that (see [Attachment summaries and spend](#attachment-summaries-and-spend)). The full extracted text is still searched.
   Also since 2026-10-11, an OCR text that is Greek read as Latin look-alike letters ("kal" for «και», "tnv" for «την») carries the mark `ocr_garbled` in `extraction_error` and gets no summary: its text is still searched, but no summary, decision, action or fact is made from the wrong words. An image's text is replaced by its vision transcription, a scan's by `reextract --garbled`, and an original the sweep already deleted is fetched back from the mailbox first by `refetch-garbled`. See [Greek read as Latin letters](#greek-read-as-latin-letters).
 - `attachment_image_search(query, limit)`. Case- and accent-blind match on vision descriptions of classified content images: the whole query first, then any meaningful word (`partial_match`).
 
@@ -430,6 +460,11 @@ No credentials are printed by the code. All secrets are read from environment or
 ### Search
 
 - `BRAIN_QUERY_STEMMING`: `0` searches each Greek word only in the form typed, turning off the stemming described in [Greek words are matched in any form](#greek-words-are-matched-in-any-form). On when unset.
+- `BRAIN_QUERY_RANKING`: `relevance` ranks keyword search by text relevance alone, collapses no editions, and fuses only `recall`'s email bucket with semantic search, as before ([Newest first, one row a report](#newest-first-one-row-a-report)). Recency and editions when unset.
+- `BRAIN_QUERY_NAMES`: `0` searches a name only in the script typed ([Names in either script](#names-in-either-script)). On when unset.
+- `BRAIN_RECALL_WORKERS`: how many of `recall`'s buckets run at once, each on its own read-only connection; `1` runs them one after another. Default 6.
+
+All four are read at each call, where the searching process reads its environment.
 
 ### Attachments in the hourly sync
 
@@ -751,8 +786,10 @@ src/
     person_resolve.py          Who a name or an address means: identities first, both scripts, the alias map
     person_aliases.py          Proposes and records which identity a mention row stands for; never merges
     embeddings.py              Embedding index build and query
-    recall.py                  Unified `recall` fan-out
-    fusion.py                  Reciprocal rank fusion over keyword and semantic result lists
+    recall.py                  Unified `recall` fan-out: buckets in parallel, each with vectors fused
+    fusion.py                  Reciprocal rank fusion over ranked lists, weighted
+    ranking.py                 Recency fused into keyword ranking; editions, versions and copies as one row
+    cross_script.py            A name word searched in the other script's forms the people table holds
     normalizer.py              Greek-aware topic and people normalization
     dedup_people.py            Seven-phase people deduplication
     dedup_topics.py            One-time merge of topics differing only by case, accents, separators
@@ -916,7 +953,18 @@ Cost: on the replica's real prompts the script estimates $2.32 for 80 extraction
 
 1. `python scripts/retrieval_eval.py --build-qa` drafts up to 60 questions from the owner's logged sessions: a user turn answered by a call to a `second-brain` tool. Each draft holds the question and the tools called, with every gold list empty. Sessions in the brain's own repository are left out unless `--all-workspaces`.
 2. Keep 30-50 real questions, and for each fill `gold` with the ids of the items that answer it: `email` (a row's `email_id`; any email of its thread counts), `attachment` (`attachment_id`), `teams` or `whatsapp` (thread ids), `conversation` (id or session id), `event` (calendar event id) or `thread` (an Outlook conversation id). Optionally set `query` to the keywords a session would send (real calls send 4-6-word keyword bags, and the question itself is the default), `modes` to limit the modes, and `answer` for a later answer judge.
-3. `--run-qa` asks each labelled question in four modes: `keyword` and `semantic` as `search_emails` runs them, `hybrid` as recall's fused email bucket, and `recall` as its whole bundle at 10 rows per kind. A question is graded in a mode only on the gold kinds that mode can return. The record carries recall@5, recall@10, MRR and nDCG@10 per mode, and every semantic and recall call's `summary.semantic` status, so an embedding outage shows. It loads the vector index as the MCP server does (about 1.5 GB on the current corpus), so on the producer, run it apart from the embedding jobs.
+3. `--run-qa` asks each labelled question in seven modes: `keyword` and `semantic` as `search_emails` runs them, `hybrid` as recall's fused email bucket, and `recall` as its whole bundle at 10 rows per kind, ranked as the code before the recency ranking ranked (`BRAIN_QUERY_RANKING=relevance`, `BRAIN_QUERY_NAMES=0`), so a run compares with the runs before it; and `keyword_recency`, `hybrid_recency` and `recall_recency`, the same with recency, editions, names in both scripts and every recall bucket fused. Each question is embedded once for all seven. A question is graded in a mode only on the gold kinds that mode can return. The record carries recall@5, recall@10, MRR and nDCG@10 per mode, and every semantic and recall call's `summary.semantic` status, so an embedding outage shows. It loads the vector index as the MCP server does (about 1.5 GB on the current corpus), so on the producer, run it apart from the embedding jobs.
+4. The record also holds, under `modes_with_alt`, the same metrics with a question's `alt` ids (copies and versions of a gold item, `{"attachment": [ids], "email": [ids]}`) standing for its gold, the strict figures staying comparable; `found_in_editions`, how many gold items a mode found only among a row's `editions`, where a row stands for its series; `abstention`, for the questions marked `"expect_empty": true` (with no gold), how often each mode but `semantic` returned no row holding every query word; and `by_shape`, recall@10 per question `shape`.
+
+On the reference replica's set (45 questions with gold, 5 unanswerable), 2026-10-16:
+
+| Mode | recall@10 | MRR | with the ranking | recall@10 | MRR |
+| --- | --- | --- | --- | --- | --- |
+| `keyword` | 0.56 | 0.50 | `keyword_recency` | 0.60 | 0.57 |
+| `hybrid` | 0.80 | 0.57 | `hybrid_recency` | 0.85 | 0.66 |
+| `recall` | 0.62 | 0.59 | `recall_recency` | 0.78 | 0.70 |
+
+`semantic`, which the ranking does not change, read 0.57 and 0.42. By shape, recall@10 in `recall` went from 0.44 to 0.67 for numbers and from 0.33 to 0.67 for documents. Each mode abstained on 2 of the 5 unanswerable questions, before and after.
 
 #### Known-item
 

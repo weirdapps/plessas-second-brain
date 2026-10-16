@@ -7,14 +7,19 @@ a known person name/email or topic. Used by both the /recall skill and
 by other agents through the MCP `recall` tool.
 """
 
+import json
 import logging
+import os
 import re
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Callable, Hashable, Iterable
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
-from src.store import envelope
+from src.store import envelope, ranking
 from src.store.context import get_person_context, get_topic_context
 from src.store.conversation_query import search_conversations_keyword
+from src.store.cross_script import name_forms
 from src.store.envelope import EMAIL_KINDS, classes_for
 from src.store.fusion import reciprocal_rank_fusion
 from src.store.greek import (
@@ -39,6 +44,7 @@ from src.store.source_class import (
     visible_sql,
     with_source_class,
 )
+from src.store.sql_readonly import connect_read_only
 from src.store.teams_query import search_teams as _search_teams_q
 from src.store.whatsapp_query import search_whatsapp as _search_whatsapp_q
 
@@ -250,7 +256,7 @@ def _search_calendar_events(conn: sqlite3.Connection, query: str, limit: int) ->
     if not _table_exists(conn, "calendar_events_fts"):
         return []
     try:
-        for expression, partial in fts5_query_variants(query):
+        for expression, partial in fts5_query_variants(query, name_forms(conn)):
             rows = conn.execute(
                 """SELECT ce.id, ce.subject, ce.start_at, ce.body_summary, ce.organizer_name
                    FROM calendar_events_fts f
@@ -322,86 +328,344 @@ def _maybe_topic_context(
     return ctx if ctx.get("topic") else None
 
 
+# How many semantic candidates a bucket asks for per slot of its pool. Replies of one
+# thread embed close together (cosine 0.89 against 0.66 for two random emails), so
+# about 9 of 20 candidates were one thread's siblings, which the fusion then collapsed
+# into one: the pool held about 11 threads. With room for three per slot, collapsed
+# first and cut after, it holds its 20.
+SIBLING_HEADROOM = 3
+
+
+def _key_kind(key: Hashable) -> str | None:
+    """What a fusion key of the form (kind, value) is keyed by: thread, series, copy..."""
+    return key[0] if isinstance(key, tuple) and key else None
+
+
+def _dedup(keys: Iterable[Hashable]) -> list[Hashable]:
+    return list(dict.fromkeys(keys))
+
+
+def _fused_keys(*lists: list[Hashable], recency: list[Hashable] | None = None) -> list[Hashable]:
+    """The keys of the lists given, by reciprocal rank fusion, best first; a recency list
+    counts at ranking.RECENCY_WEIGHT."""
+    rankings = [_dedup(keys) for keys in lists]
+    weights = [1.0] * len(rankings)
+    if recency is not None:
+        rankings.append(_dedup(recency))
+        weights.append(ranking.RECENCY_WEIGHT)
+    return [key for key, _score in reciprocal_rank_fusion(rankings, weights=weights)]
+
+
+def _semantic_pool(items: Iterable, key: Callable, pool: int) -> dict[Hashable, list]:
+    """Semantic items by their bucket's key, best first, for the first `pool` keys: the
+    siblings of a key collapse onto it before the pool is cut, not after."""
+    by_key: dict[Hashable, list] = {}
+    for item in items:
+        k = key(item)
+        if k is None or (k not in by_key and len(by_key) >= pool):
+            continue
+        by_key.setdefault(k, []).append(item)
+    return by_key
+
+
+def _more_editions(row: dict, refs: Iterable) -> dict:
+    """`row` with the refs semantic search found of its series that it does not list."""
+    listed = set(row.get("editions") or ()) | {row.get("ref")}
+    extra = [r for r in refs if r not in listed]
+    if extra:
+        row = dict(row)
+        row["editions"] = [*(row.get("editions") or ()), *extra]
+        row["older_editions"] = len(row["editions"])
+    return row
+
+
+def _email_keys(conn: sqlite3.Connection, email_ids: list, series: bool) -> dict:
+    """email id -> the key the fused email bucket counts it under: its thread, as keyword
+    search counts threads, or with `series` its dated subject's series of editions."""
+    threads = thread_keys(conn, email_ids)
+    keys = {eid: ("thread", t) for eid, t in threads.items() if t}
+    if series:
+        rows = conn.execute(
+            "SELECT id, subject FROM emails WHERE id IN (SELECT value FROM json_each(?))",
+            (json.dumps(list(email_ids)),),
+        )
+        for eid, subject in rows:
+            name = ranking.series_key(subject, subject=True)
+            if name:
+                keys[eid] = ("series", name)
+    return keys
+
+
 def _hybrid_emails(
     conn: sqlite3.Connection,
-    query: str,
+    keyword_hits: list[dict],
+    sem_ids: list,
     limit: int,
-    semantic_candidates,
+    pool: int,
+    *,
+    collapse: bool,
     classes: tuple[str, ...] | None = None,
     **switches: bool,
-) -> tuple[list[dict], str]:
+) -> list[dict]:
     """RRF-fuse keyword email hits with semantic email candidates.
 
-    Over-fetches keyword hits so fusion has a candidate pool, merges the keyword
-    and semantic rankings with Reciprocal Rank Fusion, then caps to `limit`.
-    Semantic-only emails are hydrated as email rows tagged source='semantic'. Any
-    semantic failure (missing index, embed error, no ADC) degrades gracefully to
-    keyword-only, so recall never breaks. `switches` are include_news and
-    include_automation, and `classes` the source classes `kinds` asked for: a
-    candidate of a class they leave out is dropped, whatever the provider returned.
+    The keyword hits are an over-fetched pool, so fusion has candidates; the two
+    rankings merge by Reciprocal Rank Fusion, then the page is cut to `limit`.
+    Semantic-only emails are hydrated as email rows tagged source='semantic'.
+    `switches` are include_news and include_automation, and `classes` the source
+    classes `kinds` asked for: a candidate of a class they leave out is dropped,
+    whatever the provider returned.
 
-    Returns the rows and the semantic half's status: 'ok', 'keyword_seeded:
-    <exception type>' when the provider ranked around the keyword matches because
-    the query could not be embedded (its `semantic` attribute says so), or
-    'unavailable: <exception type>'. The fallback used to leave no trace, so a
-    keyword-only answer, when the Mac's ADC had expired, read exactly like a fused one.
+    Fused by thread, not by email: keyword search returns one email per thread, and
+    the email that embeds best is rarely that one, so a thread both rankings put
+    first never got the credit for it. A thread with a keyword hit is shown by that
+    hit, which carries the evidence of the match. With `collapse` the candidates
+    collapse onto their thread, or their dated subject's series, before the first
+    `pool` are kept, and a series' semantic members join its row's `editions`.
     """
-    pool = max(limit * 4, limit)
-    keyword_hits = query_by_keyword(conn, query, limit=pool, classes=classes, **switches)
-    try:
-        candidates = semantic_candidates(conn, query, pool)
-        status = getattr(candidates, "semantic", "ok")
-        # Read twice below: a provider that yields would be empty the second time.
-        sem_ids = list(candidates)
-    except Exception as e:
-        logger.warning("recall semantic fusion skipped: %s: %s", type(e).__name__, e)
-        return keyword_hits[:limit], f"unavailable: {type(e).__name__}"
     sem_ids = visible_ids(conn, sem_ids, classes=classes, **switches)
     if not sem_ids:
-        return keyword_hits[:limit], status
-
-    # Fused by thread, not by email: keyword search returns one email per thread,
-    # and the email that embeds best is rarely that one, so a thread both
-    # rankings put first never got the credit for it. A thread with a keyword
-    # hit is shown by that hit, which carries the evidence of the match.
+        return keyword_hits[:limit]
     kw_ids = [h["email_id"] for h in keyword_hits]
-    threads = thread_keys(conn, kw_ids + list(sem_ids))
+    keys = _email_keys(conn, kw_ids + list(sem_ids), collapse)
 
     def key(email_id):
-        return threads.get(email_id) or ("email", email_id)
+        return keys.get(email_id) or ("email", email_id)
 
     kw_by_key: dict = {}
     for kw_hit in keyword_hits:
         kw_by_key.setdefault(key(kw_hit["email_id"]), kw_hit)
-    sem_by_key: dict = {}
-    for email_id in sem_ids:
-        sem_by_key.setdefault(key(email_id), email_id)
-    fused = reciprocal_rank_fusion([list(kw_by_key), list(sem_by_key)])
+    sem_by_key = _semantic_pool(sem_ids, key, pool)
 
     out: list[dict] = []
-    for thread, _score in fused:
+    for k in _fused_keys(list(kw_by_key), list(sem_by_key)):
         if len(out) >= limit:
             break
-        hit = kw_by_key.get(thread)
+        hit = kw_by_key.get(k)
+        members = sem_by_key.get(k, [])
         if hit is not None:
+            if collapse and _key_kind(k) == "series":
+                hit = _more_editions(hit, [m for m in members if m != hit["email_id"]])
             out.append(hit)
             continue
-        row = conn.execute(
-            """
-            SELECT id as email_id, date_received as date, subject,
-                   summary, summary as snippet
-            FROM emails WHERE id = ?
-            """,
-            (sem_by_key[thread],),
-        ).fetchone()
-        if row:
-            hit = dict(row)
-            hit["source"] = "semantic"
-            out.append(hit)
+        rows = {
+            r["email_id"]: dict(r)
+            for r in conn.execute(
+                """
+                SELECT id as email_id, date_received as date, subject,
+                       summary, summary as snippet
+                FROM emails WHERE id IN (SELECT value FROM json_each(?))
+                """,
+                (json.dumps(members),),
+            )
+        }
+        found = [rows[m] for m in (members if collapse else members[:1]) if m in rows]
+        if not found:
+            continue
+        if collapse and _key_kind(k) == "series":
+            found.sort(key=lambda r: r["date"] or "", reverse=True)
+            hit = found[0]
+            if len(found) > 1:
+                hit["editions"] = [r["email_id"] for r in found[1:]]
+                hit["older_editions"] = len(found) - 1
+        else:
+            hit = found[0]
+        hit["source"] = "semantic"
+        out.append(hit)
     with_source_class(conn, out)
     # The keyword hits came with their envelope; the semantic ones get theirs here.
     envelope.emails(conn, [hit for hit in out if "ref" not in hit])
-    return out, status
+    return out
+
+
+def _attachment_rows(conn: sqlite3.Connection, attachment_ids: list) -> dict[int, dict]:
+    """attachments.id -> a row as search_attachments writes one, with no snippet: what a
+    semantic hit is shown as. A row whose text was never summarised has no vector."""
+    rows = conn.execute(
+        """
+        SELECT a.id, a.filename, a.mime_type, a.email_id, e.subject, e.date_received,
+               ac.summary, a.sha256
+        FROM attachments a
+        LEFT JOIN emails e ON e.id = a.email_id
+        LEFT JOIN attachment_content ac ON ac.attachment_id = a.id
+        WHERE a.id IN (SELECT value FROM json_each(?))
+        """,
+        (json.dumps(attachment_ids),),
+    )
+    out: dict[int, dict] = {}
+    for r in rows:
+        out.setdefault(
+            r[0],
+            {
+                "attachment_id": r[0],
+                "filename": r[1],
+                "mime_type": r[2],
+                "email_id": r[3],
+                "email_subject": r[4],
+                "email_date": r[5],
+                "summary": r[6],
+                "sha256": r[7],
+                "matched_in": envelope.SEMANTIC,
+            },
+        )
+    return out
+
+
+def _attachment_key(row: dict) -> Hashable:
+    """The attachment bucket's key: a dated or versioned filename's series, else the
+    file's hash (copies), else the attachment."""
+    name = ranking.series_key(row.get("filename"))
+    if name:
+        return ("series", name)
+    if row.get("sha256"):
+        return ("copy", row["sha256"])
+    return ("attachment", row["attachment_id"])
+
+
+def _fuse_attachments(
+    conn: sqlite3.Connection, keyword_rows: list[dict], sem_ids: list, limit: int, pool: int
+) -> list[dict]:
+    """The attachment bucket: its keyword rows (already ranked with recency, editions
+    collapsed) fused with the attachments semantic search ranks."""
+    hashes = dict(
+        conn.execute(
+            "SELECT id, sha256 FROM attachments WHERE id IN (SELECT value FROM json_each(?))",
+            (json.dumps([r["attachment_id"] for r in keyword_rows]),),
+        ).fetchall()
+    )
+    kw_by_key: dict[Hashable, dict] = {}
+    for row in keyword_rows:
+        kw_by_key.setdefault(
+            _attachment_key({**row, "sha256": hashes.get(row["attachment_id"])}), row
+        )
+    hydrated = _attachment_rows(conn, sem_ids)
+    sem_by_key = _semantic_pool(
+        (hydrated[i] for i in sem_ids if i in hydrated), _attachment_key, pool
+    )
+    out: list[dict] = []
+    for k in _fused_keys(list(kw_by_key), list(sem_by_key))[:limit]:
+        members = sem_by_key.get(k, [])
+        if k in kw_by_key:
+            row = kw_by_key[k]
+            if members and _key_kind(k) != "attachment":
+                row = _more_editions(
+                    row,
+                    [m["attachment_id"] for m in members if m["attachment_id"] != row.get("ref")],
+                )
+            out.append(row)
+            continue
+        members = sorted(members, key=lambda m: m["email_date"] or "", reverse=True)
+        row = {key: value for key, value in members[0].items() if key != "sha256"}
+        if len(members) > 1:
+            row["editions"] = [m["attachment_id"] for m in members[1:]]
+            row["older_editions"] = len(members) - 1
+        out.append(row)
+    fresh = [r for r in out if "ref" not in r]
+    envelope.attachments(conn, with_source_class(conn, fresh))
+    return out
+
+
+def _thread_rows(conn: sqlite3.Connection, kind: str, thread_ids: list) -> dict[int, dict]:
+    """thread id -> a Teams or WhatsApp row as their searches write one, with no snippet
+    and no matching message: what a semantic hit is shown as."""
+    if kind == "teams":
+        sql = """
+            SELECT t.id, t.chat_id, t.title, t.summary, t.started_at, t.ended_at,
+                   t.message_count, t.participant_display_names, c.team_name, c.topic
+            FROM teams_threads t JOIN teams_chats c ON c.id = t.chat_id
+            WHERE t.id IN (SELECT value FROM json_each(?))
+        """
+    else:
+        sql = """
+            SELECT t.id, t.chat_id, t.title, t.summary, t.started_at, t.ended_at,
+                   t.message_count, t.participant_names, c.name, c.chat_kind
+            FROM whatsapp_threads t JOIN whatsapp_chats c ON c.id = t.chat_id
+            WHERE t.id IN (SELECT value FROM json_each(?))
+        """
+    try:
+        rows = conn.execute(sql, (json.dumps(thread_ids),)).fetchall()
+    except sqlite3.OperationalError:  # a store without the tables
+        return {}
+    out = {}
+    for r in rows:
+        row = {
+            "thread_id": r[0],
+            "chat_id": r[1],
+            "title": r[2],
+            "summary": r[3],
+            "started_at": r[4],
+            "ended_at": r[5],
+            "message_count": r[6],
+            "participants": json.loads(r[7] or "[]"),
+            "matched_in": envelope.SEMANTIC,
+        }
+        if kind == "teams":
+            row.update(team_name=r[8], channel_topic=r[9])
+        else:
+            row.update(chat_name=r[8], chat_kind=r[9])
+        out[r[0]] = row
+    return out
+
+
+def _fuse_threads(
+    conn: sqlite3.Connection,
+    kind: str,
+    keyword_rows: list[dict],
+    sem_ids: list,
+    limit: int,
+    pool: int,
+) -> list[dict]:
+    """The Teams or WhatsApp bucket: its keyword rows, newest first as their searches
+    order them, fused with the threads semantic search ranks."""
+    kw_by_key = {row.get("thread_id"): row for row in reversed(keyword_rows)}
+    kw_keys = _dedup(row.get("thread_id") for row in keyword_rows)
+    hydrated = _thread_rows(conn, kind, sem_ids)
+    sem_by_key = _semantic_pool(
+        (hydrated[i] for i in sem_ids if i in hydrated), lambda r: r["thread_id"], pool
+    )
+    out = []
+    for k in _fused_keys(kw_keys, list(sem_by_key))[:limit]:
+        out.append(kw_by_key[k] if k in kw_by_key else sem_by_key[k][0])
+    fresh = [r for r in out if "ref" not in r]
+    (envelope.teams if kind == "teams" else envelope.whatsapp)(conn, fresh)
+    return out
+
+
+def _fuse_conversations(
+    conn: sqlite3.Connection, keyword_rows: list[dict], sem_ids: list, limit: int, pool: int
+) -> list[dict]:
+    """The conversation bucket: its keyword rows and their recency, fused with the
+    owner's sessions semantic search ranks."""
+    rows = conn.execute(
+        """
+        SELECT id, session_id, started_at, project_name, summary, turn_count
+        FROM conversations WHERE id IN (SELECT value FROM json_each(?))
+        """,
+        (json.dumps(sem_ids),),
+    ).fetchall()
+    hydrated = {
+        r[0]: {
+            "conversation_id": r[0],
+            "session_id": r[1],
+            "date": r[2],
+            "project_name": r[3],
+            "summary": r[4],
+            "turn_count": r[5],
+            "matched_in": envelope.SEMANTIC,
+        }
+        for r in rows
+    }
+    kw_by_key = {row["conversation_id"]: row for row in reversed(keyword_rows)}
+    kw_keys = _dedup(row["conversation_id"] for row in keyword_rows)
+    by_date = sorted(kw_keys, key=lambda k: kw_by_key[k].get("date") or "", reverse=True)
+    sem_by_key = _semantic_pool(
+        (hydrated[i] for i in sem_ids if i in hydrated), lambda r: r["conversation_id"], pool
+    )
+    out = []
+    for k in _fused_keys(kw_keys, list(sem_by_key), recency=by_date)[:limit]:
+        out.append(kw_by_key[k] if k in kw_by_key else sem_by_key[k][0])
+    envelope.conversations(conn, [r for r in out if "ref" not in r])
+    return out
 
 
 # The kinds an extracted item's parent can be besides an email, with the alias the
@@ -439,6 +703,74 @@ def _and(condition: str, narrower: str | None) -> str:
     return condition if narrower is None else f"{condition} AND {narrower}"
 
 
+# How many buckets recall runs at once, each on its own read-only connection, the
+# semantic half first so its embedding call overlaps the keyword buckets.
+# BRAIN_RECALL_WORKERS=1 runs them one after another, as before.
+RECALL_WORKERS = 6
+
+
+def recall_workers() -> int:
+    """BRAIN_RECALL_WORKERS, else RECALL_WORKERS; at least 1."""
+    raw = os.environ.get("BRAIN_RECALL_WORKERS", "").strip()
+    try:
+        return max(1, int(raw)) if raw else RECALL_WORKERS
+    except ValueError:
+        return RECALL_WORKERS
+
+
+def _store_file(conn: sqlite3.Connection) -> str | None:
+    """The main database's file, or None for one in memory."""
+    for row in conn.execute("PRAGMA database_list"):
+        if row[1] == "main":
+            return row[2] or None
+    return None
+
+
+Task = Callable[[sqlite3.Connection], Any]
+
+
+def _run(conn: sqlite3.Connection, tasks: list[tuple[str, Task]], workers: int) -> dict:
+    """Each task's result by name.
+
+    In parallel, each task on its own read-only connection to conn's store
+    (connect_read_only): a sqlite3 connection is not shared across threads. Serially
+    on conn itself for one worker, a store in memory, which no other connection can
+    open, and a conn with a transaction open, whose rows no other connection sees.
+    Either way a task that raises raises here, the first in the order given.
+    """
+    path = _store_file(conn) if workers > 1 and len(tasks) > 1 else None
+    if path is None or conn.in_transaction:
+        return {name: task(conn) for name, task in tasks}
+
+    def on_own_connection(task: Task):
+        own = connect_read_only(path, immutable=True)
+        try:
+            return task(own)
+        finally:
+            own.close()
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(tasks))) as pool:
+        futures = [(name, pool.submit(on_own_connection, task)) for name, task in tasks]
+        return {name: future.result() for name, future in futures}
+
+
+def _semantic_task(provider, query: str, limit: int) -> Task:
+    """The semantic provider as a task: (email ids or None, ids by kind, status)."""
+
+    def task(conn: sqlite3.Connection):
+        try:
+            candidates = provider(conn, query, limit)
+            status = getattr(candidates, "semantic", "ok")
+            by_kind = dict(getattr(candidates, "by_kind", None) or {})
+            # Read once: a provider that yields would be empty the second time.
+            return list(candidates), by_kind, status
+        except Exception as e:
+            logger.warning("recall semantic fusion skipped: %s: %s", type(e).__name__, e)
+            return None, {}, f"unavailable: {type(e).__name__}"
+
+    return task
+
+
 def recall(
     conn: sqlite3.Connection,
     query: str,
@@ -464,13 +796,16 @@ def recall(
             person.
         semantic_candidates: Optional callable (conn, query, limit) -> ranked
             email ids. When provided, the emails bucket becomes a keyword+semantic
-            RRF fusion; when None (default) it stays keyword-only. Injected by the
-            MCP layer so recall itself carries no embedding dependency. With a
-            provider, summary.semantic says whether its half ran: 'ok',
-            'keyword_seeded: <exception type>' when the query could not be
+            RRF fusion; when None (default) every bucket stays keyword-only. When
+            the ids carry `by_kind` (embeddings.SemanticCandidates, which
+            semantic_email_candidates returns), the attachment, Teams, WhatsApp and
+            conversation buckets fuse those too, from the same query vector.
+            Injected by the MCP layer so recall itself carries no embedding
+            dependency. With a provider, summary.semantic says whether its half ran:
+            'ok', 'keyword_seeded: <exception type>' when the query could not be
             embedded and the provider ranked around its keyword matches, or
-            'unavailable: <exception type>' when it failed and the emails bucket
-            is keyword-only.
+            'unavailable: <exception type>' when it failed and every bucket is
+            keyword-only.
         include_news, include_automation: Include news items and the owner's
             automation mail, which every bucket and dossier leaves out by
             default (src/store/source_class.py). On a store older than the
@@ -481,6 +816,10 @@ def recall(
             commitments those taken from an item of a kind named. Naming news
             includes it whatever include_news says. None (default) is every kind.
 
+    The buckets run in parallel, each on its own read-only connection, with the
+    semantic half first (recall_workers, _run); the result is the serial run's.
+    With BRAIN_QUERY_RANKING=relevance only the emails bucket fuses, as before.
+
     Returns:
         Dict with categorized hits across emails (incl. standalone docs),
         attachments, conversations, decisions, actions, inline_images, teams
@@ -488,7 +827,8 @@ def recall(
         and topic_context (None when the query matches no known person or topic).
         Always includes every kind key (empty list if no matches) so callers
         don't have to handle missing keys. Rows drawn from emails carry their
-        source_class, and every row the row envelope (src/store/envelope.py).
+        source_class, and every row the row envelope (src/store/envelope.py); a
+        row semantic search alone found says matched_in 'semantic'.
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
     wanted = None if kinds is None else set(kinds)
@@ -501,104 +841,145 @@ def recall(
         return wanted is None or not wanted.isdisjoint(names)
 
     classes = classes_for(None if wanted is None else wanted & set(EMAIL_KINDS))
-    # Emails (incl. attachments + standalone docs — query_by_keyword spans
-    # emails_fts, key_facts_fts, and attachment_content_fts in one call). When a
-    # semantic candidate provider is injected (the MCP runtime does this), fuse the
-    # keyword and semantic rankings with RRF; otherwise stay keyword-only.
-    semantic = None
-    emails: list[dict] = []
-    if not asked(*EMAIL_KINDS):
-        pass
-    elif semantic_candidates is None:
-        emails = query_by_keyword(conn, query, limit=limit_per_kind, classes=classes, **switches)
-    else:
-        emails, semantic = _hybrid_emails(
-            conn, query, limit_per_kind, semantic_candidates, classes=classes, **switches
-        )
+    limit = limit_per_kind
+    pool = max(limit * 4, limit)
+    fused = ranking.fused_ranking()
+    hybrid = semantic_candidates is not None
+    # Every bucket with vectors fuses, unless the ranking is relevance alone.
+    every_bucket = hybrid and fused
+    vector_kinds = ("attachment", "teams", "whatsapp", "conversation")
+    others = pool if every_bucket else limit
 
-    # Conversations. search_conversations_keyword sanitizes the raw query itself
-    # and falls back to any-token like every other bucket. It used to be handed
-    # an already-sanitized string, which it quoted a second time.
-    if asked("conversation") and _table_exists(conn, "conversation_turns_fts"):
-        conversations = envelope.conversations(
-            conn, search_conversations_keyword(conn, query, limit=limit_per_kind)
-        )
-    else:
-        conversations = []
-
-    # Attachments as their own kind. They DO feed the emails bucket via
-    # query_by_keyword, but last in its source waterfall and deduped by
-    # email_id — so an attachment whose parent email also matches is invisible,
-    # which is the common case (a one-line "see attached" carrying the real
-    # substance). This bucket surfaces the extracted text and LLM summary
-    # directly, with the filename the caller needs to cite.
-    attachments = (
-        search_attachments(conn, query, limit=limit_per_kind, **switches)
-        if asked("attachment")
-        else []
-    )
-
-    # What was decided, given or promised, kept to the kinds of item it was taken from.
+    # What was decided, given or promised, kept to the kinds of item it was taken
+    # from: the conditions are read off conn here, and the tasks only run them.
     news, automation = switches["include_news"], switches["include_automation"]
     parents = None if wanted is None else _parents_sql(conn, wanted, news, automation)
     by_email = None if wanted is None else _email_parent_sql(conn, classes, news, automation)
-    decisions: list[dict] = []
-    actions: list[dict] = []
-    commitments: list[dict] = []
+    on_decisions = _and(visible_sql(conn, "d.email_id", news, automation), parents)
+    on_actions = _and(visible_sql(conn, "a.email_id", news, automation), parents)
+    on_commitments = _and(visible_sql(conn, "c.email_id", news, automation), by_email)
+
+    def conversation_rows(c: sqlite3.Connection) -> list[dict]:
+        # search_conversations_keyword sanitizes the raw query itself and falls back
+        # to any-token like every other bucket.
+        if not _table_exists(c, "conversation_turns_fts"):
+            return []
+        return envelope.conversations(c, search_conversations_keyword(c, query, limit=others))
+
+    tasks: list[tuple[str, Task]] = []
+    if hybrid and (asked(*EMAIL_KINDS) or (every_bucket and asked(*vector_kinds))):
+        semantic_pool = pool * SIBLING_HEADROOM if fused else pool
+        tasks.append(("semantic", _semantic_task(semantic_candidates, query, semantic_pool)))
+    # The two buckets that score every row in Python go first: they take longest.
     if parents != "0":
-        decisions = _search_decisions(
-            conn,
-            query,
-            limit_per_kind,
-            _and(visible_sql(conn, "d.email_id", news, automation), parents),
+        tasks.append(("actions", lambda c: _search_actions(c, query, limit, on_actions)))
+        tasks.append(("decisions", lambda c: _search_decisions(c, query, limit, on_decisions)))
+    if asked(*EMAIL_KINDS):
+        # Emails, attachments and standalone docs: query_by_keyword spans emails_fts,
+        # key_facts_fts and attachment_content_fts in one call. Over-fetched as the
+        # fusion's pool when there is a semantic half.
+        email_rows = pool if hybrid else limit
+        tasks.append(
+            (
+                "emails",
+                lambda c: query_by_keyword(c, query, limit=email_rows, classes=classes, **switches),
+            )
         )
-        actions = _search_actions(
-            conn,
-            query,
-            limit_per_kind,
-            _and(visible_sql(conn, "a.email_id", news, automation), parents),
+    if asked("attachment"):
+        # Attachments as their own kind. They DO feed the emails bucket via
+        # query_by_keyword, but last in its source waterfall and deduped by
+        # email_id: so an attachment whose parent email also matches is invisible,
+        # which is the common case (a one-line "see attached" carrying the real
+        # substance). This bucket surfaces the extracted text and LLM summary
+        # directly, with the filename the caller needs to cite.
+        tasks.append(
+            ("attachments", lambda c: search_attachments(c, query, limit=others, **switches))
         )
+    if asked("conversation"):
+        tasks.append(("conversations", conversation_rows))
     if by_email != "0":
-        commitments = _search_commitments(
-            conn,
-            query,
-            limit_per_kind,
-            _and(visible_sql(conn, "c.email_id", news, automation), by_email),
+        tasks.append(
+            ("commitments", lambda c: _search_commitments(c, query, limit, on_commitments))
         )
     # Inline images are not filtered: an image belongs to every email it appears in,
     # and on the replica none of 7,205 described images appeared in news or
     # automation mail alone.
-    inline_images = _search_inline_images(conn, query, limit_per_kind) if asked("image") else []
-    teams = _search_teams(conn, query, limit_per_kind) if asked("teams") else []
-    whatsapp = _search_whatsapp(conn, query, limit_per_kind) if asked("whatsapp") else []
-    calendar_events = (
-        _search_calendar_events(conn, query, limit_per_kind) if asked("calendar") else []
-    )
+    if asked("image"):
+        tasks.append(("inline_images", lambda c: _search_inline_images(c, query, limit)))
+    if asked("teams"):
+        tasks.append(("teams", lambda c: _search_teams(c, query, others)))
+    if asked("whatsapp"):
+        tasks.append(("whatsapp", lambda c: _search_whatsapp(c, query, others)))
+    if asked("calendar"):
+        tasks.append(("calendar_events", lambda c: _search_calendar_events(c, query, limit)))
+    if include_context:
+        tasks.append(
+            ("person_context", lambda c: _maybe_person_context(c, query, days=days, **switches))
+        )
+        tasks.append(
+            ("topic_context", lambda c: _maybe_topic_context(c, query, days=days, **switches))
+        )
+
+    done = _run(conn, tasks, recall_workers())
+
+    sem_ids, by_kind, semantic = done.get("semantic", (None, {}, None))
+    emails: list[dict] = done.get("emails", [])
+    if hybrid and "emails" in done:
+        emails = (
+            _hybrid_emails(
+                conn, emails, sem_ids, limit, pool, collapse=fused, classes=classes, **switches
+            )
+            if sem_ids is not None
+            else emails[:limit]
+        )
+    attachments: list[dict] = done.get("attachments", [])
+    teams: list[dict] = done.get("teams", [])
+    whatsapp: list[dict] = done.get("whatsapp", [])
+    conversations: list[dict] = done.get("conversations", [])
+    # A bucket not asked for has no task, so nothing in `done`, and stays empty.
+    if every_bucket and sem_ids is not None:
+        if "attachments" in done:
+            attachments = _fuse_attachments(
+                conn, attachments, by_kind.get("attachment", []), limit, pool
+            )
+        if "teams" in done:
+            teams = _fuse_threads(conn, "teams", teams, by_kind.get("teams", []), limit, pool)
+        if "whatsapp" in done:
+            whatsapp = _fuse_threads(
+                conn, "whatsapp", whatsapp, by_kind.get("whatsapp", []), limit, pool
+            )
+        if "conversations" in done:
+            conversations = _fuse_conversations(
+                conn, conversations, by_kind.get("conversation", []), limit, pool
+            )
+    else:
+        attachments, teams, whatsapp = attachments[:limit], teams[:limit], whatsapp[:limit]
+        conversations = conversations[:limit]
 
     text_kinds = {
         "emails": emails,
         "attachments": attachments,
         "conversations": conversations,
-        "decisions": decisions,
-        "actions": actions,
-        "commitments": commitments,
-        "inline_images": inline_images,
+        "decisions": done.get("decisions", []),
+        "actions": done.get("actions", []),
+        "commitments": done.get("commitments", []),
+        "inline_images": done.get("inline_images", []),
         "teams": teams,
         "whatsapp": whatsapp,
-        "calendar_events": calendar_events,
+        "calendar_events": done.get("calendar_events", []),
     }
     total_hits = sum(len(v) for v in text_kinds.values())
     kinds_with_results = [k for k, v in text_kinds.items() if v]
     # Kinds whose every row came from the any-token fallback: nothing there held
     # the whole query, which a caller reading only the summary could not tell.
-    # Semantic rows in the fused email bucket carry no flag either way, so they
-    # count as neither whole nor partial.
+    # Semantic rows in a fused bucket carry no flag either way, so they count as
+    # neither whole nor partial.
     partial_kinds = [
         k
         for k, v in text_kinds.items()
         if v
         and any(r.get("partial_match") for r in v)
-        and all(r.get("partial_match") or r.get("source") == "semantic" for r in v)
+        and all(r.get("partial_match") or _semantic_row(r) for r in v)
     ]
 
     # The semantic status leads: it says how far to trust everything after it.
@@ -613,14 +994,19 @@ def recall(
     )
     out: dict = {"query": query, **text_kinds}
     if include_context:
-        person_context = _maybe_person_context(conn, query, days=days, **switches)
-        topic_context = _maybe_topic_context(conn, query, days=days, **switches)
+        person_context = done.get("person_context")
+        topic_context = done.get("topic_context")
         summary["has_person_context"] = person_context is not None
         summary["has_topic_context"] = topic_context is not None
         out["person_context"] = person_context
         out["topic_context"] = topic_context
     out["summary"] = summary
     return out
+
+
+def _semantic_row(row: dict) -> bool:
+    """Whether semantic search alone put this row in its bucket."""
+    return row.get("source") == envelope.SEMANTIC or row.get("matched_in") == envelope.SEMANTIC
 
 
 # How the MCP tool sends recall's rows. A summary is cut to about this many

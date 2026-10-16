@@ -1607,26 +1607,74 @@ def golden_phrase() -> str:
     )
 
 
-def check_golden_query(conn=None, phrase=None, keyword=None, semantic=None):
+# How long the golden query waits before it looks at a semantic failure a second time.
+GOLDEN_RECHECK_SECONDS = 20
+# Semantic statuses that are no outage: a store with no index yet, and a phrase whose
+# search returned nothing, are WARNs of their own and are not looked at twice.
+_NOT_AN_OUTAGE = ("ok", "no index", "empty", None)
+
+
+def _semantic_probe(conn, phrase: str, semantic, candidates) -> dict:
+    """Both semantic paths once: search_emails' (`semantic`, query_semantic) and recall's
+    provider (`candidates`, semantic_email_candidates). Each one's status is 'ok',
+    'keyword_seeded: <type>', 'unavailable: <type>', 'no index' or 'empty'; error types
+    only, since an embedding error's message can quote the query or a credential."""
+    out: dict = {"rows": 0, "search": None, "recall": None}
+    try:
+        sem = semantic(conn, phrase, limit=GOLDEN_QUERY_LIMIT)
+    except FileNotFoundError:
+        out["search"] = "no index"
+    except Exception as e:
+        cause = e.__cause__ or e
+        out["search"] = f"unavailable: {type(cause).__name__}"
+    else:
+        seeded = next((r["semantic"] for r in sem if r.get("semantic")), None)
+        out["search"] = seeded or ("ok" if sem else "empty")
+        out["rows"] = len(sem)
+    if candidates is not None:
+        try:
+            found = candidates(conn, phrase, GOLDEN_QUERY_LIMIT)
+        except FileNotFoundError:
+            out["recall"] = "no index"
+        except Exception as e:
+            out["recall"] = f"unavailable: {type(e).__name__}"
+        else:
+            out["recall"] = getattr(found, "semantic", "ok")
+    return out
+
+
+def _outages(probe: dict) -> list[str]:
+    """The probe's failing paths, as 'search keyword_seeded: X' / 'recall unavailable: X'."""
+    return [
+        f"{path} {probe[path]}"
+        for path in ("search", "recall")
+        if probe[path] not in _NOT_AN_OUTAGE
+    ]
+
+
+def check_golden_query(
+    conn=None, phrase=None, keyword=None, semantic=None, candidates=None, *, sleep=time.sleep
+):
     """One keyword and one semantic search for a fixed phrase, through the functions the
     MCP tools call. Every other row reads the store; this is the one that asks it a question.
 
     Semantic search that cannot embed the query ranks around its keyword matches instead,
     and says so only in a field of each row. It ran that way for two days in October with
     nothing noticing, and it still does in every session started without the embedding
-    key. So an answer stood in for by keyword matches is STALE, as is a semantic search
-    that cannot run, and both fail the freshness ping. A phrase that finds nothing is a
-    WARN (BRAIN_HEALTH_QUERY names a better one), and a keyword search that breaks FAILs.
-    Only error types are reported for the semantic half: an embedding error's message
-    can quote the query or a credential, as src/store/embeddings.py notes.
+    key. So any semantic status but ok, on search_emails' path or on recall's provider
+    (`candidates`, the path the 6-7 Oct outage showed on), is reported. Looked at again
+    GOLDEN_RECHECK_SECONDS later: a failure that clears is a WARN, one that persists for
+    the run is STALE and fails the freshness ping. A phrase that finds nothing is a WARN
+    (BRAIN_HEALTH_QUERY names a better one), and a keyword search that breaks FAILs.
     """
     from src.config import embed_backend
-    from src.store.embeddings import query_semantic
+    from src.store.embeddings import query_semantic, semantic_email_candidates
     from src.store.query import query_by_keyword
 
     phrase = phrase or golden_phrase()
     keyword = keyword or query_by_keyword
     semantic = semantic or query_semantic
+    candidates = candidates or semantic_email_candidates
     own = conn is None
     if own:
         from src.store.schema import get_connection
@@ -1640,8 +1688,7 @@ def check_golden_query(conn=None, phrase=None, keyword=None, semantic=None):
     }
     verdicts: list[tuple[str, str]] = []
     kw: list = []
-    sem: list = []
-    seeded = None
+    probe: dict = {"rows": 0, "search": None, "recall": None}
     try:
         if conn.execute("SELECT 1 FROM emails LIMIT 1").fetchone() is None:
             return {**row, "status": "N/A", "note": "the store holds no mail yet"}
@@ -1658,21 +1705,32 @@ def check_golden_query(conn=None, phrase=None, keyword=None, semantic=None):
                         " set BRAIN_HEALTH_QUERY to a phrase the store holds",
                     )
                 )
-        try:
-            sem = semantic(conn, phrase, limit=GOLDEN_QUERY_LIMIT)
-        except FileNotFoundError:
-            verdicts.append(("WARN", "no embedding index, so no semantic search"))
-        except Exception as e:
-            cause = e.__cause__ or e
-            verdicts.append(("STALE", f"semantic search failed: {type(cause).__name__}"))
-        else:
-            seeded = next((r["semantic"] for r in sem if r.get("semantic")), None)
-            if seeded:
+        probe = _semantic_probe(conn, phrase, semantic, candidates)
+        first = _outages(probe)
+        if first:
+            sleep(GOLDEN_RECHECK_SECONDS)
+            probe = _semantic_probe(conn, phrase, semantic, candidates)
+            still = _outages(probe)
+            if still:
                 verdicts.append(
-                    ("STALE", f"semantic search fell back to keyword matches ({seeded})")
+                    (
+                        "STALE",
+                        f"semantic search not ok ({', '.join(first)}), and still not after"
+                        f" {GOLDEN_RECHECK_SECONDS} s ({', '.join(still)})",
+                    )
                 )
-            elif not sem:
-                verdicts.append(("WARN", "semantic search returned nothing"))
+            else:
+                verdicts.append(
+                    (
+                        "WARN",
+                        f"semantic search not ok ({', '.join(first)}), then ok"
+                        f" {GOLDEN_RECHECK_SECONDS} s later",
+                    )
+                )
+        if "no index" in (probe["search"], probe["recall"]):
+            verdicts.append(("WARN", "no embedding index, so no semantic search"))
+        if probe["search"] == "empty":
+            verdicts.append(("WARN", "semantic search returned nothing"))
     finally:
         if own:
             conn.close()
@@ -1681,8 +1739,9 @@ def check_golden_query(conn=None, phrase=None, keyword=None, semantic=None):
     return {
         **row,
         "keyword_rows": len(kw),
-        "semantic_rows": len(sem),
-        "semantic": seeded or "ok",
+        "semantic_rows": probe["rows"],
+        "semantic": probe["search"],
+        "recall_semantic": probe["recall"],
         "note": "; ".join(note for _v, note in verdicts) or None,
         "status": status,
     }

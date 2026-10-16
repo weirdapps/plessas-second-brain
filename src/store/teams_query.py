@@ -27,10 +27,11 @@ def search_teams(
         last pass carry partial_match. Only the phrase used to be tried, so a
         query whose words were all present but not adjacent found nothing.
     """
+    from src.store.cross_script import name_forms
     from src.store.query import _sanitize_fts5_query, fts5_query_variants
 
     variants = [(_sanitize_fts(query), False)]
-    for expression, partial in fts5_query_variants(query):
+    for expression, partial in fts5_query_variants(query, name_forms(conn)):
         if expression != variants[0][0] and expression != _sanitize_fts5_query(""):
             variants.append((expression, partial))
     for safe, partial in variants:

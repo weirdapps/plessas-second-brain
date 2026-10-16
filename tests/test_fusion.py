@@ -49,3 +49,19 @@ class TestReciprocalRankFusion:
         fused = reciprocal_rank_fusion([["a", "b", "c"], ["c", "b"]])
         scores = [s for _, s in fused]
         assert scores == sorted(scores, reverse=True)
+
+    def test_weights_scale_each_lists_contribution(self):
+        fused = dict(reciprocal_rank_fusion([["a", "b"], ["b", "a"]], weights=[1.0, 0.5]))
+        assert abs(fused["a"] - (_score(0) + 0.5 * _score(1))) < 1e-12
+        assert abs(fused["b"] - (_score(1) + 0.5 * _score(0))) < 1e-12
+        assert fused["a"] > fused["b"]  # the heavier list decides a tie of positions
+
+    def test_equal_weights_are_the_unweighted_fusion(self):
+        lists = [["a", "b", "c"], ["c", "a"], ["b"]]
+        assert reciprocal_rank_fusion(lists, weights=[1, 1, 1]) == reciprocal_rank_fusion(lists)
+
+    def test_weights_must_match_the_lists(self):
+        import pytest
+
+        with pytest.raises(ValueError):
+            reciprocal_rank_fusion([["a"], ["b"]], weights=[1.0])

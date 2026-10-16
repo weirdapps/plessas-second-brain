@@ -352,7 +352,10 @@ def test_unthreaded_emails_never_share_a_thread_key(tmp_path):
     assert sorted(r["email_id"] for r in results) == [7, 8, 11, 12]
 
 
-def test_a_full_page_of_subjects_skips_the_summary_search(tmp_path):
+def test_a_full_page_of_subjects_skips_the_summary_search(tmp_path, monkeypatch):
+    # The page the waterfall fills is the limit by relevance alone; with recency fused
+    # it is the pool ranked again (src/store/ranking.py pool_size), and the same holds.
+    monkeypatch.setenv("BRAIN_QUERY_RANKING", "relevance")
     conn = create_database(str(tmp_path / "b.db"))
     conn.row_factory = sqlite3.Row
     for n in range(1, 4):
@@ -474,13 +477,15 @@ def test_one_thread_takes_one_slot_whichever_source_found_it(tmp_path, source):
     conn = create_database(str(tmp_path / "b.db"))
     conn.row_factory = sqlite3.Row
 
+    # A subject without a date or period: "Q3 numbers" would make the six threads one
+    # series of editions (src/store/ranking.py), which is not what this tests.
     def mail(n, text, thread):
         if source == "summary":
-            _mail(conn, n, "Q3 numbers", summary=text, thread=thread)
+            _mail(conn, n, "Numbers update", summary=text, thread=thread)
         elif source == "content":
-            _mail(conn, n, "Q3 numbers", content=text, thread=thread)
+            _mail(conn, n, "Numbers update", content=text, thread=thread)
         else:
-            _mail(conn, n, "Q3 numbers", thread=thread)
+            _mail(conn, n, "Numbers update", thread=thread)
             _found_by(conn, n, source, text)
 
     for n in range(1, 21):

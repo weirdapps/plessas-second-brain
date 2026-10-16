@@ -884,11 +884,16 @@ def _query_vector(
 
 class SemanticCandidates(list):
     """Ranked email ids, with `semantic` saying how the query vector was made:
-    'ok', or 'keyword_seeded: <error type>' when the model could not embed it."""
+    'ok', or 'keyword_seeded: <error type>' when the model could not embed it.
 
-    def __init__(self, ids=(), semantic: str = "ok"):
+    `by_kind` ranks the other kinds by the same vector, best first, under recall's
+    names for them: 'attachment' (attachments.id), 'teams' and 'whatsapp' (thread ids)
+    and 'conversation' (conversations.id, the owner's sessions only)."""
+
+    def __init__(self, ids=(), semantic: str = "ok", by_kind: dict[str, list[int]] | None = None):
         super().__init__(ids)
         self.semantic = semantic
+        self.by_kind = by_kind or {}
 
 
 def query_semantic(
@@ -1108,15 +1113,12 @@ def semantic_email_candidates(
     ids, normalized, space = _load_index_and_space(index_path)
     query_norm, seeded = _query_vector(conn, query, ids, normalized, embed_fn or embed_query, space)
     similarities = normalized @ query_norm
+    hidden = _hidden_vector_ids(conn, include_news, include_automation, classes)
     # Over-fetch: several attachment vectors can collapse onto one email, so we
     # need headroom to fill `limit` emails. Other kinds, and the classes a read
     # leaves out, are left out first.
     order = _top_indices(
-        similarities,
-        ids,
-        max(limit * 4, limit),
-        {"email", "attachment"},
-        excluded_ids=_hidden_vector_ids(conn, include_news, include_automation, classes),
+        similarities, ids, max(limit * 4, limit), {"email", "attachment"}, excluded_ids=hidden
     )
     out: list[int] = []
     seen: set[int] = set()
@@ -1128,7 +1130,56 @@ def semantic_email_candidates(
         out.append(email_id)
         if len(out) >= limit:
             break
-    return SemanticCandidates(out, semantic=seeded or "ok")
+    by_kind = _other_kinds(conn, similarities, ids, limit, hidden)
+    return SemanticCandidates(out, semantic=seeded or "ok", by_kind=by_kind)
+
+
+def _other_kinds(
+    conn: sqlite3.Connection, similarities, ids, limit: int, hidden
+) -> dict[str, list[int]]:
+    """The `limit` best attachments, Teams threads, WhatsApp sessions and owner
+    conversations by the similarities already computed, as their tables' ids.
+
+    recall's other buckets fuse these with their keyword hits: the vectors were in the
+    index all along, and only the email bucket used them. The attachments of hidden
+    email (news, automation) leave as `hidden` says; a conversation must be one of the
+    owner's sessions, as recall's keyword bucket reads them (conversation_query)."""
+    found: dict[str, list[int]] = {}
+    texts = [
+        -int(ids[i])
+        for i in _top_indices(similarities, ids, limit, {"attachment"}, excluded_ids=hidden)
+    ]
+    if texts:
+        attachment_of = dict(
+            conn.execute(
+                "SELECT id, attachment_id FROM attachment_content"
+                " WHERE id IN (SELECT value FROM json_each(?))",
+                (json.dumps(texts),),
+            ).fetchall()
+        )
+        found["attachment"] = list(
+            dict.fromkeys(attachment_of[t] for t in texts if t in attachment_of)
+        )
+    for kind, vector_kind, offset in (
+        ("teams", "teams_thread", TEAMS_THREAD_ID_OFFSET),
+        ("whatsapp", "whatsapp_thread", WHATSAPP_THREAD_ID_OFFSET),
+    ):
+        found[kind] = [
+            offset - int(ids[i]) for i in _top_indices(similarities, ids, limit, {vector_kind})
+        ]
+    try:
+        from src.store.conversation_query import conversation_ids_in_workspace
+
+        owner = conversation_ids_in_workspace(conn, "")
+    except sqlite3.OperationalError:  # a store without conversations
+        owner = set()
+    if owner:
+        allowed = {CONVERSATION_ID_OFFSET - cid for cid in owner}
+        found["conversation"] = [
+            CONVERSATION_ID_OFFSET - int(ids[i])
+            for i in _top_indices(similarities, ids, limit, {"conversation"}, allowed)
+        ]
+    return found
 
 
 def _append_to_index(ids: list[int], vectors) -> dict:

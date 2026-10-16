@@ -30,7 +30,8 @@ Every such row now also carries, under the same names wherever it comes from:
     matched_in   on a row a search matched, the field the words matched in: the
                  email's `source` (subject, summary, content, mixed, key_fact,
                  attachment), Teams' and WhatsApp's `match` (thread, message), a
-                 conversation's `match_type` (summary, turn_content), or semantic
+                 conversation's `match_type` (summary, turn_content), semantic, or
+                 entity (recall's entity list alone found it)
 
 A key a row already has stays as it is: `email_id` beside `ref`, `source` beside
 `matched_in` (for one release, see the README), a decision's own `date`, and the
@@ -78,10 +79,13 @@ _CLASSES_OF_KIND = {
     "document": (DOCUMENT, SESSION_NOTE),
 }
 SEMANTIC = "semantic"
+# A row recall's entity list alone brought: linked to a person, topic or organisation the
+# query names (src/store/entities.py), no word of the query matched in it.
+ENTITY = "entity"
 # Keyword search's stages, and recall's fused rows: the values of `source` that name the
 # field a search matched in. On a decision or action row `source` is its parent's kind.
 MATCH_STAGES = frozenset(
-    {"subject", "summary", "content", "mixed", "key_fact", "attachment", SEMANTIC}
+    {"subject", "summary", "content", "mixed", "key_fact", "attachment", SEMANTIC, ENTITY}
 )
 
 # What a row whose item cannot be found says.

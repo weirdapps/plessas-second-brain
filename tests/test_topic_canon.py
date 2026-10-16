@@ -87,6 +87,9 @@ def test_a_family_is_one_way_for_containment_and_both_ways_for_synonyms(conn):
     assert tc.topic_family_ids(conn, payments) == [payments, cardless, synonym]
     assert tc.topic_family_ids(conn, cardless) == [cardless]
     assert tc.topic_family_ids(conn, synonym) == [synonym, payments, cardless]
+    # Synonyms alone, as recall's entity list ranks by them: no narrower topic.
+    assert tc.topic_family_ids(conn, payments, narrower=False) == [payments, synonym]
+    assert tc.topic_family_ids(conn, synonym, narrower=False) == [synonym, payments]
 
 
 def _vectors(table):

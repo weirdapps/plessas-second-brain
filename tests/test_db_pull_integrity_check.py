@@ -24,6 +24,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -359,3 +360,56 @@ class TestRsyncChoice:
             assert not re.match(r"\s*rsync\s", code), (
                 f"a bare rsync call bypasses the chosen binary: {line.strip()}"
             )
+
+
+class TestSnapshotUnderWriters:
+    """The producer-side snapshot must finish while another connection keeps committing.
+
+    The sqlite3 CLI's `.backup` copies 100 pages a step and starts again whenever another
+    connection writes between two steps: on 2026-10-16 a commit about every 6 s kept the
+    21:45 pull copying for an hour. SNAPSHOT_PY copies every page in one step, under one
+    read transaction, so a writer cannot restart it. At this size (about 200 MB) the CLI's
+    `.backup` was still copying after 20 s beside the same writer, and SNAPSHOT_PY took
+    0.4 s (measured on the Mac, 2026-10-16); at 10 MB both finish, which proves nothing.
+    """
+
+    def test_the_snapshot_finishes_and_reads_clean_while_a_writer_commits(self, tmp_path):
+        code = re.search(r"^SNAPSHOT_PY='([^']*)'$", _WRAPPER.read_text(), re.MULTILINE)
+        assert code, "the snapshot code should be one single-quoted SNAPSHOT_PY line"
+        src = tmp_path / "brain.db"
+        conn = sqlite3.connect(src)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
+        conn.executemany("INSERT INTO t (body) VALUES (?)", [("x" * 2000,)] * 100_000)
+        conn.commit()
+        conn.close()
+        stop = threading.Event()
+        commits = []
+
+        def write():
+            writer = sqlite3.connect(src, timeout=30)
+            while not stop.is_set():
+                writer.execute("INSERT INTO t (body) VALUES ('y')")
+                writer.commit()
+                commits.append(1)
+            writer.close()
+
+        thread = threading.Thread(target=write)
+        thread.start()
+        try:
+            out = subprocess.run(
+                [sys.executable, "-c", code.group(1), str(src), str(tmp_path / "snap.db")],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        finally:
+            stop.set()
+            thread.join()
+
+        assert out.returncode == 0, out.stderr
+        assert commits, "the writer should have committed while the snapshot ran"
+        snap = sqlite3.connect(tmp_path / "snap.db")
+        assert snap.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert snap.execute("SELECT COUNT(*) FROM t").fetchone()[0] >= 100_000
+        snap.close()

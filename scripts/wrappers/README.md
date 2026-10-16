@@ -31,7 +31,7 @@ upgrade.
 
 | Directory | Host | Scheduler | Count |
 | --- | --- | --- | --- |
-| `systemd/` | the producer (a Linux VPS) | `systemctl --user` timers, plus one long-running service | 13 |
+| `systemd/` | the producer (a Linux VPS) | `systemctl --user` timers, plus one long-running service | 15 |
 | `launchd/` | a Mac that holds a replica | LaunchAgents, and one Claude Code hook | 4, plus one plist template |
 
 What each one runs, and when on the reference deployment (Europe/Athens; the unit
@@ -51,6 +51,8 @@ section 6 shows the same schedule from the pipeline's side):
 | `systemd/sb-attachment-pass.sh` | `sb-attachments` | 02:00 | the nightly attachment pass: registration, Phase 1, Phase 2, images, SharePoint, the orphan reaper, the file sweep, `mail-reconcile --since 7d` |
 | `systemd/sb-auth-watch.sh` | `sb-auth-watch`, and `sb-outlook-sync.sh` before each run | every 4 hours | checks the Outlook and Teams sessions, renews them, and sets or clears the re-auth sentinels |
 | `systemd/sb-health-check.sh` | `sb-health-check` | 23:50 | `scripts/health_check.py --fix --email-if-issues`, then the `sb-brain-freshness` ping (`docs/DEPLOY.md`, section 7) |
+| `systemd/sb-topic-pages.sh` | `sb-topic-pages` | 03:30 | `topic-pages`: the pages of the live topics with new evidence (`docs/DEPLOY.md`, section 6) |
+| `systemd/sb-briefs.sh` | `sb-briefs` | every 15 minutes, 07:00 to 21:45, until the pilot's date | `briefs`, the pre-meeting brief pilot; disables its own timer once the pilot has ended (`docs/DEPLOY.md`, section 6) |
 | `systemd/sb-mcp.sh` | `sb-mcp` | always on | `python -m src.mcp_server --http` with `BRAIN_ROLE=replica` (`docs/DEPLOY.md`, section 9) |
 | `systemd/sb-db-pull.sh` | nothing | | an old copy of the pull, kept as history: the producer runs no pull |
 | `launchd/sb-db-pull.sh` | a LaunchAgent | :45 every hour | the replica pull, and the copy of the encrypted backup archives (`docs/DEPLOY.md`, section 5) |

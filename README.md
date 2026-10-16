@@ -107,7 +107,7 @@ See [`examples/example_exporter.py`](examples/example_exporter.py) for a ~40-lin
 
 ## MCP tools
 
-The MCP server exposes 26 tools (all defined in `src/mcp_server.py`), five of them deprecated ([below](#deprecated-tools)). Register the server once with `claude mcp add` (see [Register with Claude Code](#register-with-claude-code)), then every session picks them up.
+The MCP server exposes 27 tools (all defined in `src/mcp_server.py`), five of them deprecated ([below](#deprecated-tools)). Register the server once with `claude mcp add` (see [Register with Claude Code](#register-with-claude-code)), then every session picks them up.
 
 **Loaded with the session.** Under tool search only the tool names and the server instructions load at session start, and a `ToolSearch` turn came first in 187 of 192 sessions that used the brain. `sql_query`, `search_emails`, `search_attachments`, `recall` and `stats`, which carry most calls (the first four 76% of them) or come first (`stats`), carry `_meta["anthropic/alwaysLoad"]: true`, so Claude Code loads them with the session. The server instructions stay under 4,000 characters, the 4,096 Claude Code keeps of them since v2.1.296 (it kept 2,048 before), and lead with routing: which tool first, `get_item` for reading, the sizes, what an empty answer means, how matching falls back and how a name resolves, and the deprecated tools.
 
@@ -223,13 +223,68 @@ Mail deleted or junked in Outlook keeps the folder it had, where it used to be r
 ### People and topics
 
 - `person_context(name_or_email, days, limit, include_news, include_automation, detail)`. `detail` is `full`, `concise` or `card` (the card `sender_brief` gave). History, sentiment, decisions, open actions, communication pattern, `teams`: the messages they wrote in the window and the threads they wrote in (`recent_threads`, with `recent_threads_total`), and `whatsapp`, the same for WhatsApp, matched on a name of two words or more against sender names, since WhatsApp has no address to join on. Each list is capped at `limit` (default 20) and carries a `<name>_total` sibling with the real count, so a truncated answer is distinguishable from a complete one. An address, a Teams MRI or a WhatsApp JID resolves exactly; pass one when you have it. A name is matched ignoring case, accents and script, in the common romanisations of Greek ('Mprostopoulou', 'Brostopulu' and 'Μπροστοπούλου' are one name), each word at the start of a word in any order. A person known by an address, MRI or JID (an identity) is preferred over a name the model only extracted from text (a mention, 78% of the people rows on a large store), and an identity whose name shares the surname and contradicts no word of the query counts as a match ('Evi Surname' is 'E. Surname (Evanthia)' at `surname.evi@`); among those, the most-emailed is used. Every spelling of the owner (`BRAIN_USER_NAME`) and every address he lists (`BRAIN_USER_EMAIL_PATTERN`) resolves to one row, the busiest at a listed address; a name alone never makes a row the owner, and a row at an address he does not list is someone else. `resolved_by` says how the person was found (`email`, `mri`, `jid`, `name`, or `alias` for the alias map and the owner rule), `match_count` how many people the query fits, and `other_candidates` the next three with each one's `identifier` kind (`null` for a mention) (`sender_brief` and `meeting_prep` resolve names the same way).
-- `topic_context(topic, days, limit, include_news, include_automation, detail)`. Key people, decisions, actions, facts. Same `limit` and `<name>_total` contract.
+- `topic_context(topic, days, limit, include_news, include_automation, detail)`. Key people, decisions, actions, facts. Same `limit` and `<name>_total` contract. When the topic has a page ([Topic pages and findings](#topic-pages-and-findings)), `topic_page` comes first, before the rows it was written from.
 - `sender_brief(name_or_email, days)`. Deprecated, going in the next release: `person_context(name_or_email, detail="card")` returns the same card. Compact briefing suitable for inline display.
 - `meeting_prep(people, topic, days, include_news, include_automation, detail)`. Per-attendee dossiers, optionally scoped to a topic, and `meetings`: the `next` and `last` meetings (three each, the last within `days`) that the people it resolved share with you, the ones most of them attend first, each with its `body_summary` (an invitation's purpose and agenda, see [Calendar](#calendar)), `is_recurring`, and at most 12 attendees as `query_calendar_events` lists them, those people kept among them. Pass each attendee's address when you have it: by display name, 42% of a month's attendees resolved to no one and a third of the rest to someone other than their address, before name resolution preferred identities (18% and 10% after).
 
 The alias map joins mention rows to the identity they stand for, so that a name fitting a person's identity and their extracted spellings counts as one person. `python -m src.store.person_aliases` proposes, for each mention row, the one identity whose name agrees with it and with which it shares threads (at least half of them for a one-word name), and prints the proposals; `--apply` records them as `sync_metadata` rows (`person_alias:<mention id>` to the identity's id) on the host that builds the store. No people row is merged or changed, and a replica gets the rows with its next pull. Delete a row to undo an alias.
 
 Every dossier dates and orders its rows the same way (`src/store/ordering.py`): decisions newest first by their own date when it is an ISO date, else by their parent's (the email, Teams or WhatsApp session, meeting or conversation they came from); key facts newest parent first; open actions upcoming first, soonest first, then undated, then overdue, most recently missed first. Every decision, fact and action row carries `date` and `parent_date`.
+
+### Topic pages and findings
+
+The owner comes back to a handful of live topics (in six weeks one budget topic came up in nine sessions over eight days), and a status question was the costliest he asked: a median of 18 brain calls, up to 49. Agents dug up earlier sessions 56 times. A page per live topic holds where it stands, so the next session starts there. Pages are few, cited, written again from the sources, and never a source themselves: a 43-page wiki tried in April 2026 lasted two days, and the practitioners' verdict on such wikis (July to October 2026) is that pages rot, a bad page becomes a prior, and a flat index breaks past 100-200 pages.
+
+- `topic_page(topic)`. The page: `body` in markdown under Current status, Decisions (dated), Settled numbers (each with its period and source), Open questions, Deliverables produced and Superseded, every line ending with the items it rests on as `[kind:ref; ...]`, which `get_item` reads; `citations` lists each item cited with its kind, date and title; `built_at` and `newest_evidence_at` say how current it is. Then `findings`, the accepted findings filed about the topic, the owner's sessions' first (below). With no page, `topic_page` is `null`, `reason` says why and `pages` lists the topics that have one. Held to the 40,000-character budget.
+
+**Which topics** (`src/store/topic_pages.py` `select_live_topics`), at most 20, in this order:
+
+1. every page `BRAIN_TOPIC_PAGES` names: pages separated by `;`, the phrases of one page by `|`, the first naming it (`"budget 2027|business plan 2027; data platform"`). Topic tags fragment ("2027 budget", "exco budget 2027"), so a named page covers every tag holding all the words of one of its phrases, the 12 most used in the last 120 days;
+2. topics the owner's own sessions came back to: three or more sessions in the last 30 days in which he typed a turn and called a brain tool (a teammate's or subagent's session never counts, and most of his sessions are coding ones whose tags are tools and hosts), with two or more of his discussion threads;
+3. topics with the most of his discussion threads, three or more. A discussion thread holds two or more mail messages in the window, at least one sent by him or addressed to him; news, automation, documents, session notes and meeting responses do not count, and neither does a broadcast, one message a thread.
+
+Both 2 and 3 must be live: the topic's share of its year's mail that fell in the last 30 days is at least twice the store's own share, so the employer's name, a unit's name or meeting logistics, present all year, get no page (the test is skipped while the store holds less mail before the window than in it). A tag that holds another picked tag's words joins its page (`okapi pilot results` joins `okapi pilot`). `BRAIN_TOPIC_PAGES_SKIP` (`;`-separated tags) keeps a tag from ever getting a page or joining one. A page whose topic is no longer picked is removed once it is 14 days old.
+
+**What a page is written from** (`gather_evidence`): `topic_context`'s decisions, key facts, open actions and recent emails over 120 days for every tag the page covers, the newest attachment summaries, and the figures registry's latest values when it is installed (`src/store/figures.py`, cited by the attachment that holds the cell). Then, marked derived: the accepted findings (the owner's first), the owner's sessions on the topic (for open questions only) and the notes his sessions wrote about it (listed as deliverables, never read for facts). A session note's own rows are left out, and so is every page: no page is evidence for another.
+
+**How** (`src/pipeline/topic_pages.py`): one call per page through `claude_extract.complete()`, plain text with the evidence fenced as third-party content and the reply plain JSON (the deployment's Vertex project refuses structured outputs), effort `medium`. A post-check keeps only the lines whose every ref was in the evidence given and drops the rest, counted in `lines_dropped`; a reply with no line left keeps the page held. A page is written again only when its evidence holds an item it was not written from, or the prompt changed (`prompt_hash`). Pages live in the `topic_pages` table (schema v36), which no full-text index and no vector reads.
+
+```bash
+python -m src.cli topic-pages --estimate          # the topics picked today, and what writing their pages costs; no model call (runs on a replica)
+python -m src.cli maint topic-pages               # every page again, new evidence or not; --topic NAME for one
+python -m src.cli topic-pages                     # what the nightly timer runs: only pages with new evidence
+```
+
+On a replica's store of 2026-10-16 the rule picked 20 topics (6 by sessions, 14 by mail); a page's evidence ran 46-101 items and 9,000-19,000 input tokens. Two real calls took 22 s and cost $0.04 each, every line kept. The first build is priced at about $1.15 (20 pages; the estimate counts 2,500 output tokens a page, the calls used 1,800), and in the week before 6 to 16 of the 20 had an item dated each day, so a night costs about $0.25-0.90.
+
+**Findings.** A research session that settles a claim or a figure files it back in a ```` ```findings ```` block, in any `.md`, `.txt` or `.csv` note it writes. Notes are already ingested (`ingest-session-notes`, [Claude Code conversation memory](#claude-code-conversation-memory)); the block also loads, one JSON object a line, into the `findings` table (schema v36, `src/store/findings.py`), with the session id, the note's path and its date:
+
+````text
+```findings
+{"claim": "Share of loan applications made online, year to date", "value": "64.0%", "as_of": "2026-08", "source_ref": "attachment:1234", "quote": "online applications 64.0% of the total"}
+{"claim": "Monthly active app users", "value": "1.2M", "as_of": "2026-06-30", "source_ref": "email:5678", "supersedes": "finding:17"}
+```
+````
+
+| Key | Holds |
+| --- | --- |
+| `claim` | What the finding states, 3 to 300 characters. Required |
+| `source_ref` | The primary item it rests on, as a row's `kind:ref` (what `get_item` reads): `email:`, `news:`, `document:`, `attachment:`, `teams:`, `whatsapp:` or `calendar:`, with the row's id. Required |
+| `value` | The settled value as the source writes it, at most 100 characters: a number, a percentage, a date |
+| `quote` | Words copied from the source, 12 to 300 characters, holding the value |
+| `as_of` | The date or period the value holds for, not in the future: `2026-08-31`, `2026-08`, `2026-Q3`, `2026` |
+| `supersedes` | An earlier accepted finding with the same claim, whose source is older, as `finding:<id>` |
+
+The agents that write notes read third-party mail, so a mail can make one write a block, and a finding fails closed. It is `accepted`, and only then shown, cited or given to a page, when every check passes; otherwise it is stored `rejected` with its `reason`, never shown, and listed for review by `python -m src.cli findings` (`--accepted` for the others; read-only, so it runs on a replica). The checks, line by line, in `src/store/findings.py`:
+
+1. **Strict shape.** One JSON object a line with the keys above and no other, each of its type and length; a line that breaks one is rejected, never repaired, and the other lines of the block stand. A rejection's reason never quotes the line.
+2. **A held primary source.** `source_ref` names an item the store holds. A finding, a topic page, a session (`conversation:`) or a session note is never a source, so no finding rests on another.
+3. **Checked against it.** The `quote`, or else the `value`, occurs in the item's stored text (an email's subject and body with its attachments' text, an attachment's text, a Teams or WhatsApp thread's messages, a meeting's subject and invitation), case, accents and spacing aside, and as a whole: `12%` is not found in `112%`. A value of fewer than three letters or digits (`58%`) is too short to check alone and needs a quote; a value given with a quote must be in one of the two.
+4. **`supersedes` within findings.** It names an accepted finding with the same claim (its letters and digits, folded), whose source is older, written by a session of the same rank or below, else the line is rejected: an agent's finding never supersedes the owner's, a finding never itself, and a name that is not `finding:<id>` of one held finding is refused. It marks that finding `superseded_by` and nothing else, and the mark is checked again whenever it is read: a finding never hides a primary item, a fact or a decision.
+5. **Who wrote it.** `author_kind` comes from the transcript whose tool call wrote the note, and from nothing else: never the note's text, path or name, a field of the block, or the session's workspace. It is `owner` only for a session of its own (`projects/<project>/<session>.jsonl`, not under a session's directory, where subagents' transcripts are kept) in which no record names an agent and some turn is the owner's own typing, as conversation export labels it; anything else, an unreadable transcript included, is `agent`. An agent's findings rank below the owner's.
+6. **Any error is a rejection.** An error while checking a line rejects it, with a log line; a row is never accepted by default. No setting relaxes these checks, and nothing promotes a rejected finding: the note is corrected, and the next read checks it again.
+
+Accepted findings rank below every primary item: a page's evidence lists them after the items, fenced as third-party text like the rest, and the page cites one only where no primary row says otherwise. Nothing indexes or embeds them. A note written again keeps its findings' ids, and every read checks them again, so a finding whose source arrives later is accepted then, and one whose source is gone is rejected.
 
 ### Decisions and actions
 
@@ -285,6 +340,8 @@ Conversation memory is the owner's own sessions. Each turn's `speaker` says who 
 
 - `search_conversations(query, search_type, workspace, limit, include_agents)`. With `include_agents`, each row says its `kind`, `owner` or `agent`.
 - `conversation_context(session_id, include_agents)`. Deprecated, going in the next release: `get_item(kind="conversation", ref=session_id)` reads the same session with every turn in full. An agent session is an error unless `include_agents`; the result says its `kind`.
+
+A note a session writes (`.md`, `.txt`, `.csv`) is stored as a text-only document of class `session_note`, and a ```` ```findings ```` block in it loads as findings ([Topic pages and findings](#topic-pages-and-findings)).
 
 `recall_preference` and `recent_conversations` are retired. Standing preferences belong in `CLAUDE.md` and Claude Code's own memory, where they can be read and edited, and `/resume` lists recent sessions; the brain's copies repeated one rule up to 162 times and mixed in agent instructions. Their store functions in `src/store/conversation_query.py` stay one release, deprecated. A `[PREFERENCE]` fact that still comes back (in `conversation_context`) comes back once, and none is taken from a turn the owner did not type.
 
@@ -591,7 +648,10 @@ python -m src.cli process-sharepoint --since 2026-06-01   # a rescan by date; th
 python -m src.cli reverse-ingest --root ~/path/to/documents --workers 4   # only the directories you name
 python -m src.cli ingest ~/Downloads/report.pdf --source "Q2 report"
 python -m src.cli ingest --url https://example.com/article
-python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents
+python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents, and their findings blocks
+python -m src.cli findings [--accepted]                # the findings sessions filed: the rejected ones with why, for review (read-only)
+python -m src.cli topic-pages [--estimate]             # nightly: the pages of the live topics with new evidence (Topic pages and findings)
+python -m src.cli briefs [--dry-run]                   # every 15 minutes: the pre-meeting brief pilot (Pre-meeting briefs)
 
 # Housekeeping
 python -m src.cli load                      # creates brain.db on a fresh host and loads what was extracted
@@ -674,6 +734,7 @@ python -m src.cli maint reextract --wide --estimate          # wide workbooks su
 python -m src.cli maint utc-stamps [--apply]                 # attachment and sync stamps stored in local time, converted to UTC (dry run by default)
 python -m src.cli maint sharepoint-shells [--apply]          # forget the hollow SharePoint documents an old fetch left; queue the links not held
 python -m src.cli maint calendar-bodies --limit 500          # fetch the text of calendar events stored without it; no model call
+python -m src.cli maint topic-pages [--topic NAME] [--estimate]  # every live topic's page again (or one), new evidence or not; --estimate prices it
 # reextract summarises copies of one document (same sha256, else same text) once and copies the summary to the rest (duplicates)
 python -m src.cli maint reextract --batch --probe            # ten requests as a batch job: prints the replies and the cost, stores nothing
 python -m src.cli maint reextract --long --batch --limit 500 # read again, then send the summaries as a batch job; --batch-collect stores them
@@ -700,7 +761,7 @@ src/
   cli.py                       Command-line entry (`brain` wrapper points here): parsing, thin commands
   mcp_call.py                  `brain tool`: an MCP tool called through the server's own call, JSON out
   config.py                    Paths, env-driven settings, schema version
-  mcp_server.py                MCP server (MCPServer, mcp SDK v2), 26 tools; a crash reaches the client in words
+  mcp_server.py                MCP server (MCPServer, mcp SDK v2), 27 tools; a crash reaches the client in words
   mcp_http.py                  Streamable-HTTP serving: bearer auth, loopback only
   mcp_results.py               The tools' return types, which their output schemas are built from
   mcp_budget.py                The 40,000-character budget for tool results, and detail="concise" rows
@@ -716,6 +777,8 @@ src/
     whatsapp_sync.py           `whatsapp-sync`: ingest the snapshot, bound, extract, embed
     calendar_sync.py           `calendar-sync`: list, fetch, extract and load what changed
     calendar_bodies.py         `calendar-bodies`: the text of the events stored before it was kept
+    topic_pages.py             `topic-pages`: one call a live topic's page, the citation check, the row
+    briefs.py                  `briefs`: the pre-meeting brief pilot, its stop rule, owner-only mail
     sharepoint.py              `process-sharepoint`: retry pass, link scan, fetch, store
   export/
     outlook_export.py          Hourly Outlook ingestion via outlook-cli
@@ -730,7 +793,7 @@ src/
     inbox_reconcile.py         Inbox to Archive move detection; Deleted Items and Junk as state
     mail_reconcile.py          `mail-reconcile`: the Outlook messages the store lacks, staged again
     refetch_garbled.py         `refetch-garbled`: swept originals of garbled OCR texts, from the mailbox
-    session_notes.py           Notes Claude sessions wrote, ingested as text-only documents
+    session_notes.py           Notes Claude sessions wrote, ingested as text-only documents, and their findings
     whatsapp_export.py         `whatsapp-sync` step 1: the pushed snapshot into the WhatsApp tables
     sharepoint_fetcher.py      SharePoint link fetch and host classification
     sharepoint_cli.py          sharepoint-cli subprocess wrapper (cookie session, not bearer)
@@ -783,6 +846,8 @@ src/
     owner.py                   Whether an address or a name is the owner's, and the one people row every spelling of him resolves to
     ordering.py                How decisions, key facts and actions are dated and ordered in every list
     context.py                 Rich person and topic context aggregations
+    topic_pages.py             Which topics get a page, what a page may cite, and the pages held
+    findings.py                ```findings blocks of session notes, failing closed: checked against their source
     person_resolve.py          Who a name or an address means: identities first, both scripts, the alias map
     person_aliases.py          Proposes and records which identity a mention row stands for; never merges
     embeddings.py              Embedding index build and query
@@ -879,6 +944,7 @@ skill/
 - **WhatsApp** (v26): `whatsapp_chats`, `whatsapp_threads`, `whatsapp_messages`; decisions, action items and key facts point back through `whatsapp_thread_id`
 - **Conversations**: `conversations`, `conversation_turns`, `conversation_topics`
 - **External refs**: `sharepoint_links`
+- **Derived** (v36): `topic_pages`, one row per live topic's page (its body, citations, the evidence keys it was written from, `built_at`, `newest_evidence_at`, `prompt_hash`, model, tokens and cost), and `findings`, one row per line of a session note's findings block (claim, value, as of, source ref and its date, quote, supersedes, `status` (`accepted` or `rejected`, the default) and `reason`, `author_kind`, the note's path, session and date). Neither has a full-text index, a trigger or a vector, and nothing reads them as a source ([Topic pages and findings](#topic-pages-and-findings))
 - **FTS5**: `emails_fts` (summary, body and, from v22, subject, all accent-folded), `key_facts_fts`, `attachment_content_fts`, `conversation_turns_fts`, `conversations_fts`, `teams_messages_fts`, `teams_threads_fts`, `whatsapp_messages_fts`, `whatsapp_threads_fts`, `calendar_events_fts`. Each is kept in step with its table by three triggers. From v34 the update trigger (`<table>_au`) fires only when an UPDATE sets the row's `id` or a column the index reads, so a status, a timestamp, a mailbox move or a Teams payload no longer re-indexes the row's whole text; the v34 migration recreates the ten triggers and rebuilds no index
 - **People lookups** (v34): `idx_people_email_lower` on `lower(email)` serves every `LOWER(email) = ?` lookup as written (the loader's, for each sender, recipient and cc, and those of the people dedup, the calendar loader and the Teams MRI resolution), so each keeps its exact meaning and none reads the whole table any more; `idx_people_name_email` on `(name, email)` serves the loader's lookups of a person named without an address
 - **Vector index**: `embeddings.npz` beside the database, one vector per email, attachment, conversation, Teams thread and WhatsApp session summary (`ids` and `vectors`). From the schema v34 release it also records the space its vectors are in, as a JSON member `space`: `{model, dim, task, template}`, the embedding model, the vectors' dimension, the task type (`null`: none is sent) and the version of the texts the vectors are made from (`EMBEDDING_TEMPLATE_VERSION` in `src/store/embeddings.py`, to bump with any change to those texts). It is read on its own, without loading a vector. Every writer refuses to merge vectors of another space into the index, before paying for any embedding when it can, with `IndexSpaceMismatch` and the command that starts it over: `python -m src.cli embed --force` (the next teams-sync and whatsapp-sync add their vectors back, 500 a run; step 5 of `docs/RESTORE.md` rebuilds them at once). An index saved before that release records no space: it is taken as this code's, at its own vectors' dimension, and the space is written on its next save, with no step to run. The same object is kept in `sync_metadata` under `embedding_space` for SQL to read, written when it changes
@@ -996,9 +1062,19 @@ Without the secret the name checks print `SKIP` and the job still passes on the 
 
 Dependabot is configured for the `uv` ecosystem (see `.github/dependabot.yml`), so PRs update `uv.lock`.
 
+### Pre-meeting briefs (pilot)
+
+Push nobody asked for goes unread: in six weeks the owner asked for no briefing and ran no morning digest, and OpenAI and Microsoft withdrew their generic daily feeds in the summer of 2026, while briefs bound to an event survived. So this is a two-week pilot with a stop rule, not a feature (`src/pipeline/briefs.py`). Every 15 minutes the producer looks at the meetings starting 30 to 45 minutes after the quarter hour, not cancelled and not declined. One qualifies when someone from outside the owner's domain attends, or someone he has not met in the last 90 days, unless it is an occurrence of a recurring internal series or more than 20 others attend. For each, one call (through `claude_extract.complete()`, plain text) turns `meeting_prep`'s dossiers of the first six attendees, the outside or unmet ones first, into a brief of at most 250 words (WHO, OPEN ITEMS, WATCH), mailed through the path the health check mails by: `outlook-cli send-mail` to `HEALTH_EMAIL_TO`.
+
+- **Owner only.** Nothing is sent unless `HEALTH_EMAIL_TO` is a single address that `BRAIN_USER_EMAIL_PATTERN` lists as the owner's.
+- **It ends by itself.** Nothing is sent after `BRAIN_BRIEF_PILOT_UNTIL` (`YYYY-MM-DD`), which the install sets to the install date plus 14 days, nor while it is unset; the wrapper then disables its own timer. Moving the date and enabling the timer again is the only way on. `BRAIN_BRIEFS_OFF=1` is the kill switch.
+- **Logged.** Each brief is a line of `state/briefs.jsonl` under the data home (0600): the meeting's id and start, why it qualified, the model, tokens and cost, and whether the mail went, no subject or name. A meeting already briefed is not briefed again, and at most 8 go a day.
+
+On a replica's calendar the rule would have picked 53 of the 245 meetings of the 30 days to 2026-10-16, on 19 days, one to six a day; a brief's call is about 8,000 tokens in and 400 out, about $0.03. `python -m src.cli briefs --dry-run` lists what the next pass would brief, with no call and no mail, on a replica too. [`docs/DEPLOY.md`](docs/DEPLOY.md), section 6, has the install.
+
 ### Scheduling
 
-The pipeline is CLI commands, so any scheduler runs it: cron, launchd or systemd timers. `sync` stages no mail itself, it extracts and loads what `outlook_export` (or your own exporter) staged, and it covers mail only: `calendar-sync`, `teams-sync`, `whatsapp-sync`, `news-sync` and `process-sharepoint` each want their own schedule, and a nightly `process-attachments` pass reads what the hourly slice leaves. The hourly `calendar-sync` lists the week behind and the 30 days ahead; a month it never reached is filled by the one-off `brain maint calendar-backfill`, not by a schedule.
+The pipeline is CLI commands, so any scheduler runs it: cron, launchd or systemd timers. `sync` stages no mail itself, it extracts and loads what `outlook_export` (or your own exporter) staged, and it covers mail only: `calendar-sync`, `teams-sync`, `whatsapp-sync`, `news-sync` and `process-sharepoint` each want their own schedule, and a nightly `process-attachments` pass reads what the hourly slice leaves, `topic-pages` writes the live topics' pages each night, and `briefs` runs every 15 minutes during the pilot. The hourly `calendar-sync` lists the week behind and the 30 days ahead; a month it never reached is filled by the one-off `brain maint calendar-backfill`, not by a schedule.
 
 [`docs/DEPLOY.md`](docs/DEPLOY.md), section 6, has the recipes, the stages of one `sync` in order, and the reference deployment's hourly and nightly units; section 5 has the two-host shape (one producer that ingests, workstations that read a pulled replica) and the `loginctl enable-linger` without which `systemd --user` timers die at logout.
 

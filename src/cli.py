@@ -506,6 +506,27 @@ def cmd_calendar_bodies(args):
     return run(args)
 
 
+def cmd_topic_pages(args):
+    """Write the pages of the live topics whose evidence is new (src/store/topic_pages.py)."""
+    from src.pipeline.topic_pages import cmd
+
+    return cmd(args)
+
+
+def cmd_findings(args):
+    """The findings sessions filed, and the rejected ones with why (src/store/findings.py)."""
+    from src.store.findings import cmd
+
+    return cmd(args)
+
+
+def cmd_briefs(args):
+    """One pass of the pre-meeting brief pilot (src/pipeline/briefs.py)."""
+    from src.pipeline.briefs import run
+
+    return run(args)
+
+
 def cmd_utc_stamps(args):
     """Convert the attachment and sync stamps stored in local time to UTC (src/store/stamps.py)."""
     from src.store.stamps import cmd
@@ -1709,6 +1730,11 @@ READ_ONLY_COMMANDS = frozenset(
         "sharepoint-refused",
         # `brain maint scrub`: the dry run reads; --apply refuses on a replica itself (exit 3).
         "scrub",
+        # --estimate reads; building pages refuses on a replica itself.
+        "topic-pages",
+        # --dry-run reads; a pass that may mail refuses on a replica itself.
+        "briefs",
+        "findings",
     }
 )
 
@@ -1765,6 +1791,12 @@ MAINT_COMMANDS: dict[str, tuple[str, dict[str, bool], str]] = {
         "calendar-bodies",
         {},
         "Fetch and store the text of the calendar events stored without it (no model call)",
+    ),
+    "topic-pages": (
+        "topic-pages",
+        {"build": True},
+        "Write the live topics' pages again whether or not new evidence came in; --topic "
+        "for one, --estimate to price it (topic-pages --build)",
     ),
     "sharepoint-shells": (
         "sharepoint-shells",
@@ -2198,6 +2230,59 @@ def main():
         "--dry-run", action="store_true", help="Count the events only"
     )
     parser_calendar_bodies.set_defaults(func=cmd_calendar_bodies)
+
+    parser_topic_pages = subparsers.add_parser(
+        "topic-pages",
+        help="Write the pages of the live topics whose evidence is new (nightly; one model "
+        "call a page)",
+    )
+    parser_topic_pages.add_argument(
+        "--build",
+        action="store_true",
+        help="Every page, new evidence or not (brain maint topic-pages)",
+    )
+    parser_topic_pages.add_argument(
+        "--estimate",
+        action="store_true",
+        help="Count and price the calls; no model call, nothing written (runs on a replica)",
+    )
+    parser_topic_pages.add_argument(
+        "--topic",
+        action="append",
+        metavar="NAME",
+        help="Only this page; a topic not picked is built as BRAIN_TOPIC_PAGES would "
+        "('a|b' covers both phrases). Repeatable",
+    )
+    parser_topic_pages.add_argument(
+        "--deadline-s",
+        type=float,
+        default=1500.0,
+        help="Start no page after this many seconds (default 1500)",
+    )
+    parser_topic_pages.set_defaults(func=cmd_topic_pages)
+
+    parser_findings = subparsers.add_parser(
+        "findings",
+        help="The findings sessions filed back, by status, and the rejected ones with why "
+        "(for review; read-only)",
+    )
+    parser_findings.add_argument(
+        "--accepted", action="store_true", help="List the accepted ones instead"
+    )
+    parser_findings.add_argument("--limit", type=int, default=100, help="At most this many")
+    parser_findings.set_defaults(func=cmd_findings)
+
+    parser_briefs = subparsers.add_parser(
+        "briefs",
+        help="Mail the owner a brief before each qualifying meeting 30-45 minutes ahead "
+        "(the pilot; every 15 minutes)",
+    )
+    parser_briefs.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List what it would brief; no model call, no mail (runs on a replica)",
+    )
+    parser_briefs.set_defaults(func=cmd_briefs)
 
     parser_shells = subparsers.add_parser(
         "sharepoint-shells",

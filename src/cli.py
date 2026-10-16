@@ -2963,6 +2963,13 @@ def main():
         help="With --apply, forget every figure first and read them all again (a parser change)",
     )
     parser_figures.set_defaults(func=cmd_figures_backfill)
+    # consolidate (src/store/consolidate.py), entities (src/store/entities.py) and
+    # topic-canon (src/store/topic_canon.py): maint-only, with no old spelling.
+    from src.store import consolidate, entities, topic_canon
+
+    consolidate.add_maint_parser(maint_subparsers)
+    entities.add_maint_parser(maint_subparsers)
+    topic_canon.add_maint_parser(maint_subparsers)
 
     # Parse and execute
     args = parser.parse_args()

@@ -105,6 +105,11 @@ def test_every_limit_is_clamped_to_1_to_200(
             # own fixed limit, never the caller's.
             assert kw[arg] == mcp_server._EXCLUDED_PROBE <= 200
             return []
+        if kw.get("include_history") is True:
+            # The probe that counts what the current-state filter left out
+            # (`history_left_out`): its own fixed limit too.
+            assert kw[arg] == mcp_server._EXCLUDED_PROBE <= 200
+            return []
         seen.append(kw[arg] if isinstance(arg, str) else a[arg])
         if function == "recall":
             return {"query": "", "summary": {}, **dict.fromkeys(mcp_server._RECALL_KINDS, [])}

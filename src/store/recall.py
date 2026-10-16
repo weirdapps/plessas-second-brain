@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from src.store import envelope, ranking
+from src.store.consolidate import recall_filters
 from src.store.context import get_person_context, get_topic_context
 from src.store.conversation_query import search_conversations_keyword
 from src.store.cross_script import name_forms
@@ -782,6 +783,7 @@ def recall(
     include_news: bool = False,
     include_automation: bool = False,
     kinds: Iterable[str] | None = None,
+    include_history: bool = False,
 ) -> dict:
     """Unified search across every text-bearing index in the brain.
 
@@ -858,6 +860,11 @@ def recall(
     on_decisions = _and(visible_sql(conn, "d.email_id", news, automation), parents)
     on_actions = _and(visible_sql(conn, "a.email_id", news, automation), parents)
     on_commitments = _and(visible_sql(conn, "c.email_id", news, automation), by_email)
+    # Current items only unless include_history (src/store/consolidate.py).
+    current = recall_filters(conn, include_history)
+    on_decisions = _and(on_decisions, current["decisions"])
+    on_actions = _and(on_actions, current["actions"])
+    on_commitments = _and(on_commitments, current["commitments"])
 
     def conversation_rows(c: sqlite3.Connection) -> list[dict]:
         # search_conversations_keyword sanitizes the raw query itself and falls back

@@ -552,7 +552,7 @@ pipeline itself. STALE in any of them fails the freshness ping, like any other S
 | Row | Verdict | Setting |
 | --- | --- | --- |
 | Emails | Each folder's newest mail against its own limit: Inbox and Archive 6 h, Sent Items 24 h, News 12 h. Triage relabels Inbox mail Archive, so the Inbox also counts its export's last success. STALE past a limit, or when an export would list from the future (its cursor ahead of the clock by more than the six-hour listing overlap). | `BRAIN_HEALTH_FOLDER_LAG_HOURS="Sent Items=48,News=12"`; 0 stops judging a folder |
-| Golden query | One keyword and one semantic search for a fixed phrase, through the store's own search functions. STALE when the semantic half falls back to keyword matches or cannot run, WARN when the phrase finds nothing. | `BRAIN_HEALTH_QUERY`, else `BRAIN_USER_ROLE`, else `BRAIN_USER_NAME` |
+| Golden query | One keyword search and two semantic ones for a fixed phrase, through the store's own search functions: `search_emails`' semantic mode and `recall`'s semantic provider, reported as `semantic` and `recall_semantic`. Any semantic status but `ok` (`keyword_seeded`, `unavailable`) is looked at again 20 s later: one that clears is a WARN, one that persists is STALE. WARN when the phrase finds nothing or no index exists. | `BRAIN_HEALTH_QUERY`, else `BRAIN_USER_ROLE`, else `BRAIN_USER_NAME` |
 | Attachment lag | The oldest attachment waiting for its text, and the oldest text waiting for a summary. WARN past a day. The MCP `stats` tool returns the same counts and ages. | |
 | Backups | The newest `brain-*.db` snapshot and the newest `brain-*.db.zst.enc` archive, STALE past 26 h; the last restore drill, WARN past 35 days ([`RESTORE.md`](RESTORE.md)). Not judged on a replica. | `BRAIN_BACKUP_DIR` (default `$BRAIN_DATA_DIR/backups`), `BRAIN_BACKUP_OFFSITE_DIR` (default its `offsite`), `BRAIN_RESTORE_DRILL_STAMP` |
 | Mail loss | Messages the export gave up fetching, and staging batches quarantined as unreadable. WARN on any quarantined batch, and on a message given up in the last week; the cursor files keep their give-ups for good, so older ones are reported, not warned on. | Read from `state/mail_loss.json` while it is under two days old, else counted from the cursor files |
@@ -1185,6 +1185,25 @@ with the environment the timers run with:
    until the dry run counts 0: three days. It resumes where it stopped; exit 75 means
    the service stopped it, and the next run carries on. It runs beside the timers,
    one commit per email.
+
+### After 2026-10-16 (retrieval ranking)
+
+No schema change and no one-off command: the ranking is in the query code alone (README,
+"Newest first, one row a report", "Names in either script", "Unified recall").
+
+1. `systemctl --user try-restart sb-mcp.service` (step 2 above): the HTTP server ranks
+   as it did until it restarts. A Mac's MCP servers take the new code with each new
+   Claude Code session.
+2. Nothing to set. To go back for one deployment, put these in the searching process's
+   environment (`$BRAIN_DATA_DIR/env` or `~/.second-brain/env` for the MCP server):
+   `BRAIN_QUERY_RANKING=relevance` (relevance alone, no editions, recall's email bucket
+   alone fused with semantic search), `BRAIN_QUERY_NAMES=0` (no Latin and Greek name
+   forms), `BRAIN_RECALL_WORKERS=1` (recall's buckets one after another).
+3. `recall` opens up to six more read-only connections per call, one per bucket at a
+   time, closed when it returns; they share the process's one copy of the vector index.
+4. To compare, `scripts/retrieval_eval.py --run-qa` grades the plain modes as the code
+   before ranked and the `_recency` modes with it; on the reference replica's 45
+   questions, recall@10 0.62 to 0.78 in `recall`, 0.80 to 0.85 in `hybrid`.
 
 ### Schema notes
 

@@ -874,7 +874,9 @@ def search_emails(
     holds them all it falls back to any meaningful word and flags those rows
     partial_match. One email per thread: a subject match shows the thread's
     newest, and thread_matches counts its other matching emails, which
-    get_item reads. Semantic mode can also return attachment, Teams, WhatsApp
+    get_item reads. Keyword rows rank by relevance and recency, a report's dated
+    editions as one row (`older_editions`); names match in Latin or Greek letters.
+    Semantic mode can also return attachment, Teams, WhatsApp
     and conversation rows; when the query cannot be embedded it ranks around the
     best keyword matches and marks each row `semantic: keyword_seeded: <error>`.
     Each row says its `kind` (email, news, document...), and `kinds` keeps only
@@ -986,7 +988,7 @@ def recall(
     standalone documents), attachments, conversations, decisions, actions,
     commitments, inline_images, teams, whatsapp, calendar_events;
     `summary.kinds_with_results` names those with rows, and `kinds` keeps only rows
-    of the kinds named. Only emails fuses keyword and semantic ranking. A bucket
+    of the kinds named. Buckets with vectors fuse keyword, semantic and recency. A bucket
     where nothing held the whole query falls back to rows holding some of its
     words, flagged partial_match (`summary.partial_kinds`). News and the owner's
     automation mail are left out unless included, and `excluded` counts the emails
@@ -1015,7 +1017,7 @@ def recall(
     left_out = tuple(c for c in every_left_out if c in email_left or c in attachment_left)
     conn = _get_conn()
     try:
-        # Inject the semantic provider so the emails bucket is a keyword+semantic
+        # Inject the semantic provider so every bucket with vectors is a keyword+semantic
         # RRF fusion. recall() degrades to keyword-only if the index/ADC is absent.
         found = _recall(
             conn,
@@ -1452,7 +1454,9 @@ def search_attachments(
     source_class, a matching snippet and the summary; attachments of news and of
     the owner's automation mail are left out unless included, and `excluded`
     counts those among the best matches. get_item(kind='attachment', ref) reads
-    the full text a page at a time.
+    the full text a page at a time. Ranked by relevance and recency; the editions,
+    versions and copies of one file are one row, the newest, with `older_editions`
+    and their refs in `editions`.
     """
     from src.store.query import search_attachments as _search
 
@@ -1591,10 +1595,11 @@ def query_calendar_events(
         # MATCH: every word, then any meaningful word, whose rows are flagged
         # partial_match. Raw text here raised OperationalError on ? & : or a
         # leading hyphen.
+        from src.store.cross_script import name_forms
         from src.store.query import fts5_query_variants
 
         variants: list[tuple[str | None, bool]] = (
-            list(fts5_query_variants(keyword)) if keyword else [(None, False)]
+            list(fts5_query_variants(keyword, name_forms(conn))) if keyword else [(None, False)]
         )
         rows: list = []
         partial = False

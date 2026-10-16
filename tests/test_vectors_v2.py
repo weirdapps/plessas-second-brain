@@ -509,6 +509,26 @@ def test_a_spent_deadline_leaves_the_chunks_for_the_next_pass(store):
     assert _chunk_ids(path)
 
 
+def test_the_switch_turns_chunk_vectors_off_and_keeps_those_made(store, monkeypatch):
+    """BRAIN_CHUNK_VECTORS=0: no document is cut and no passage sent, by the pass or the
+    rebuild; chunk vectors already made stay, and still fold onto their documents."""
+    conn, path, client = store
+    deck = factories.attachment(conn, filename="deck.pptx", text=_paragraphs(30), summary="d")
+    embeddings.build_index(conn)
+    made = _chunk_ids(path)
+    assert made
+    factories.attachment(conn, filename="other.pdf", text=_paragraphs(30), summary="o")
+    monkeypatch.setenv("BRAIN_CHUNK_VECTORS", "0")
+    client.calls.clear()
+
+    embeddings.build_index(conn)
+
+    assert _chunk_ids(path) == made
+    assert all("\n\nParagraph" not in t for c in client.calls for t in c["texts"])
+    cut = conn.execute("SELECT DISTINCT attachment_id FROM attachment_chunks").fetchall()
+    assert [r[0] for r in cut] == [deck]
+
+
 def test_a_legacy_index_gets_no_chunks(store):
     conn, path, _client = store
     _save(path, [999], [_vector("old", 3072)], legacy_space())

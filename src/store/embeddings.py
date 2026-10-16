@@ -165,6 +165,20 @@ def has_chunks(space: dict) -> bool:
     return int(space.get("template") or 0) >= 2
 
 
+# Set to 0, no document is cut and no passage embedded, by the embedding pass or the rebuild:
+# an index in this code's space then holds summaries alone, and no attachment's text leaves
+# for the embedding service. Chunk vectors already made stay, and still fold onto their
+# documents; a rebuild with it set leaves them out. On by default. On the owner's 45-question
+# qa set chunks measured neutral (README, "Retrieval qa").
+CHUNK_SWITCH_ENV = "BRAIN_CHUNK_VECTORS"
+
+
+def chunks_wanted(space: dict) -> bool:
+    """Whether chunk vectors are made for an index in `space`: it holds them, and the switch
+    is not 0. Read at each call."""
+    return has_chunks(space) and os.environ.get(CHUNK_SWITCH_ENV, "1").strip() != "0"
+
+
 @contextmanager
 def in_space(space: dict | None) -> Iterator[None]:
     """Embed into `space` inside this block, wherever the embedder is called from."""
@@ -1057,7 +1071,7 @@ def build_index(
     chunk_pairs: list[tuple[int, str]] = []
     gone_chunks: set[int] = set()
     deadline = None
-    if has_chunks(space):
+    if chunks_wanted(space):
         if chunk_deadline_s is not None:
             deadline = time.monotonic() + chunk_deadline_s
         plan = _plan_chunks(conn, deadline)
@@ -1206,16 +1220,15 @@ def _kind_mask(ids, kinds) -> np.ndarray:
     return mask
 
 
-def _first_of_each(order: np.ndarray, parents: np.ndarray, limit: int) -> np.ndarray:
-    """The first `limit` entries of `order` (best first) whose item has not come before: a
-    document's best chunk or its summary, whichever ranks higher, and only that one."""
-    window = max(limit * 4, 64)
-    while True:
-        head = order[:window]
-        _items, first = np.unique(parents[head], return_index=True)
-        if len(first) >= limit or window >= len(order):
-            return head[np.sort(first)][:limit]
-        window *= 4
+def _best_first(similarities, candidates: np.ndarray, k: int) -> np.ndarray:
+    """The `k` most similar of `candidates` (row indices), best first; all of them, sorted,
+    when there are no more. A partition, then a sort of the `k` alone: on 229,796 vectors the
+    three rankings a recall makes took 8.8 ms against 45.6 ms for a sort of every candidate,
+    the same rows in the same order but for ties."""
+    if k >= len(candidates):
+        return candidates[np.argsort(similarities[candidates])[::-1]]
+    top = candidates[np.argpartition(-similarities[candidates], k)[:k]]
+    return top[np.argsort(similarities[top])[::-1]]
 
 
 def _top_indices(
@@ -1233,19 +1246,27 @@ def _top_indices(
     applied after the top came back empty whenever the best matches sat in other
     projects. A chunk is left out with its attachment.
     """
+    limit = max(int(limit), 0)
     parents = _parents(ids)
-    if kinds is None and allowed_ids is None and excluded_ids is None and parents is ids:
-        return np.argsort(similarities)[::-1][:limit]
-    mask = np.ones(len(ids), dtype=bool) if kinds is None else _kind_mask(ids, kinds)
-    if allowed_ids is not None:
-        mask &= np.isin(ids, np.fromiter(allowed_ids, dtype=np.int64))
-    if excluded_ids is not None:
-        mask &= ~np.isin(parents, excluded_ids)
-    candidates = np.flatnonzero(mask)
-    order = candidates[np.argsort(similarities[candidates])[::-1]]
+    if kinds is None and allowed_ids is None and excluded_ids is None:
+        candidates = np.arange(len(ids))
+    else:
+        mask = np.ones(len(ids), dtype=bool) if kinds is None else _kind_mask(ids, kinds)
+        if allowed_ids is not None:
+            mask &= np.isin(ids, np.fromiter(allowed_ids, dtype=np.int64))
+        if excluded_ids is not None:
+            mask &= ~np.isin(parents, excluded_ids)
+        candidates = np.flatnonzero(mask)
     if parents is ids:
-        return order[:limit]
-    return _first_of_each(order, parents, limit)
+        return _best_first(similarities, candidates, limit)
+    # One row per item: a window of the best, widened until it holds `limit` items.
+    window = max(limit * 4, 64)
+    while True:
+        head = _best_first(similarities, candidates, window)
+        _items, first = np.unique(parents[head], return_index=True)
+        if len(first) >= limit or window >= len(candidates):
+            return head[np.sort(first)][:limit]
+        window *= 4
 
 
 def _hidden_vector_ids(

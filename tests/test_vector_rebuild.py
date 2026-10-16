@@ -180,6 +180,18 @@ def test_a_rebuild_swaps_in_every_kind_in_this_codes_space(store, online):
         assert sent <= set(client.deleted), "the texts sent, and the jobs, are deleted"
 
 
+def test_with_the_switch_off_the_rebuild_sends_summaries_alone(store, monkeypatch):
+    conn, path, _thread = store
+    monkeypatch.setenv("BRAIN_CHUNK_VECTORS", "0")
+
+    assert "chunk" not in vector_rebuild.estimate(conn)["by_kind"]
+    report = vector_rebuild.rebuild(conn, online=True, client=BatchClient())
+
+    assert report["state"] == "swapped"
+    assert _kinds(path) == {"email": 3, "chunk": 0, "summary": 2, "teams": 1}
+    assert conn.execute("SELECT COUNT(*) FROM attachment_chunks").fetchone()[0] == 0
+
+
 def test_the_writers_continue_in_the_new_space_after_the_swap(store, monkeypatch):
     conn, path, _thread = store
     client = BatchClient()

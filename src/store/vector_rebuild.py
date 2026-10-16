@@ -140,7 +140,7 @@ class Wanted:
 def _wanted(conn: sqlite3.Connection, space: dict) -> Wanted:
     """The items of `space`, chunks cut first where the store has none (writes
     attachment_chunks)."""
-    plan = emb._plan_chunks(conn, None) if emb.has_chunks(space) else None
+    plan = emb._plan_chunks(conn, None) if emb.chunks_wanted(space) else None
     return Wanted(emb.summary_items(conn, space), plan)
 
 
@@ -328,7 +328,7 @@ def estimate(conn: sqlite3.Connection, space: dict | None = None) -> dict:
         row["texts"] += 1
         row["chars"] += len(text)
         row["tokens"] += _tokens(vid, text)
-    if emb.has_chunks(space):
+    if emb.chunks_wanted(space):
         row = by_kind.setdefault("chunk", {"texts": 0, "chars": 0, "tokens": 0, "documents": 0})
         for aid, cid, _at, _n in eligible(conn):
             text = (

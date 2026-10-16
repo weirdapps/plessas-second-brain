@@ -1510,16 +1510,21 @@ def search_attachments(
     include_news: IncludeNews = False,
     include_automation: IncludeAutomation = False,
 ) -> RowsResult:
-    """Find what is inside email attachments (PDF, Word, Excel, PowerPoint, images): full-text search over their extracted text and summaries.
+    """Find what is inside email attachments (PDF, Word, Excel, PowerPoint, images): full-text search over their extracted text and summaries, fused with semantic search.
 
     Each row gives the filename, the parent email's subject, date and
     source_class, a matching snippet and the summary; attachments of news and of
     the owner's automation mail are left out unless included, and `excluded`
-    counts those among the best matches. get_item(kind='attachment', ref) reads
-    the full text a page at a time. Ranked by relevance and recency; the editions,
-    versions and copies of one file are one row, the newest, with `older_editions`
-    and their refs in `editions`.
+    counts those among the best matches. A row semantic search alone found says
+    matched_in 'semantic', or 'chunk' when a passage of a long document matched,
+    with chunk_offset: get_item(kind='attachment', ref, offset=chunk_offset) opens
+    it, and get_item reads the full text a page at a time. Ranked by relevance and
+    recency; the editions, versions and copies of one file are one row, the newest,
+    with `older_editions` and their refs in `editions`.
     """
+    from functools import partial
+
+    from src.store.embeddings import semantic_email_candidates
     from src.store.query import search_attachments as _search
 
     left_out = _left_out(include_news, include_automation)
@@ -1531,6 +1536,11 @@ def search_attachments(
             limit=_cap(limit),
             include_news=include_news,
             include_automation=include_automation,
+            semantic_candidates=partial(
+                semantic_email_candidates,
+                include_news=include_news,
+                include_automation=include_automation,
+            ),
         )
         excluded = None
         if left_out:

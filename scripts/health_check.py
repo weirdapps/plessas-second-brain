@@ -1642,10 +1642,10 @@ def check_embeddings(db, npz_path: Path | None = None, now: datetime | None = No
     # months ago. The file's mtime is the only thing here that keeps moving.
     age = (now or datetime.now()) - datetime.fromtimestamp(npz.stat().st_mtime)
     stale = age > STALE_THRESHOLDS["embeddings"]
-    from src.store.embeddings import has_chunks
+    from src.store.embeddings import chunks_wanted
 
     space = _index_space(npz)
-    coverage = _embedding_coverage(db, ids, chunks=bool(space and has_chunks(space)))
+    coverage = _embedding_coverage(db, ids, chunks=bool(space and chunks_wanted(space)))
     gaps = {
         name: (have, want)
         for name, (have, want) in coverage.items()

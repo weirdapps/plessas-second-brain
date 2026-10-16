@@ -547,7 +547,9 @@ No credentials are printed by the code. All secrets are read from environment or
 - `BRAIN_QUERY_NAMES`: `0` searches a name only in the script typed ([Names in either script](#names-in-either-script)). On when unset.
 - `BRAIN_RECALL_WORKERS`: how many of `recall`'s buckets run at once, each on its own read-only connection; `1` runs them one after another. Default 6.
 
-All four are read at each call, where the searching process reads its environment.
+These four are read at each call, where the searching process reads its environment.
+
+- `BRAIN_CHUNK_VECTORS`: `0` cuts no document into chunks and embeds no passage, in the embedding pass or the rebuild, so no attachment text beyond its summary goes to the embedding service; chunk vectors already made stay and still fold onto their documents, and a rebuild with it set leaves them out. On when unset. Read by the process that writes vectors (and by the health check, for chunk coverage).
 
 The embedding model, dimension and query prompt are not settings: a search takes them from the index it loads, and a writer adds vectors in the same space (Vector index under [Database schema](#database-schema)). The service is chosen as everywhere else (`BRAIN_EMBED_BACKEND`, `GEMINI_API_KEY`, `src.config.embed_backend`); `brain maint vectors-rebuild` sends batch jobs only through the Gemini API, which has them for embeddings, and goes online on Vertex AI, which has none.
 
@@ -1073,6 +1075,16 @@ On the reference replica's set (45 questions with gold, 5 unanswerable), 2026-10
 | `recall` | 0.62 | 0.59 | `recall_recency` | 0.78 | 0.70 |
 
 `semantic`, which the ranking does not change, read 0.57 and 0.42. By shape, recall@10 in `recall` went from 0.44 to 0.67 for numbers and from 0.33 to 0.67 for documents. Each mode abstained on 2 of the 5 unanswerable questions, before and after.
+
+**Vectors v2** (Vector index under [Database schema](#database-schema)), measured on one snapshot of the reference replica, 2026-10-16, with the same 45 questions. With the legacy index, the code before the change and this code score the same in every mode (`recall_recency` 0.781 and 0.688). The legacy index sliced to 768 dimensions, at no cost, scores 0.793 and 0.685 (`semantic` 0.56 and 0.40). A full rebuild was not run from the Mac; gemini-embedding-2 was measured on a pool of 36,952 summary vectors (each question's best 600 email or attachment vectors, 150 attachments, 150 Teams threads, 60 conversations and 40 WhatsApp sessions by the legacy index, the gold items, and 10,000 at random), on which the legacy vectors score 0.781 and 0.684, as on the whole index:
+
+| Index on the pool | `recall_recency` recall@10 | MRR | `hybrid_recency` recall@10 | MRR | `semantic` MRR | documents | numbers |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| gemini-embedding-001, 3072, summaries | 0.781 | 0.684 | 0.849 | 0.660 | 0.41 | 0.67 | 0.67 |
+| gemini-embedding-2, 768, summaries | 0.848 | 0.696 | 0.909 | 0.672 | 0.48 | 0.72 | 0.78 |
+| the same with 14,683 chunks of 581 documents | 0.841 | 0.694 | 0.909 | 0.659 | 0.49 | 0.72 | 0.78 |
+
+The model carries the gain. Chunks moved a few ranks either way and measured neutral on these questions, whose answers sit mostly in mail and short decks (4 of their 27 gold attachments are over 20,000 characters); `BRAIN_CHUNK_VECTORS=0` builds and keeps the index without them. `search_attachments` alone found a question's gold attachment in its first 10 rows for 2 of the 26 questions that have one; fused with semantic search, for 14 (legacy vectors), 17 (gemini-embedding-2) and 16 (with chunks). The pool and the rebuild's batch path cost about $3.30 in embeddings.
 
 #### Known-item
 

@@ -1319,6 +1319,7 @@ On the producer, with the environment the timers run with:
    findings"); `ingest-session-notes`, in `sb-conversation-sync`, loads them three
    times a day, each checked against its source. `python -m src.cli findings` lists
    the rejected ones with why, for review (read-only, so a replica runs it too).
+
 ### One-off commands after the numbers registry (schema v37)
 
 The figures registry is new tables only (README, "Figures"). The hourly sync reads the
@@ -1365,7 +1366,12 @@ need the Gemini API):
    writes nothing. The reference replica on 2026-10-16: 143,801 summary texts (93,600
    emails, 40,151 attachments, 6,886 Teams threads, 2,954 conversations, 210 WhatsApp
    sessions), about 16 M tokens, and 86,133 chunks of 5,733 documents, about 147 M tokens:
-   about $16 as batch jobs, $33 online, at $0.10 and $0.20 a million tokens.
+   about $16 as batch jobs, $33 online, at $0.10 and $0.20 a million tokens. The chunks are
+   most of it, and send the documents' text, not only their summaries, to the Gemini API;
+   on the owner's qa set they measured neutral and the model switch carried the gain
+   (README, "Retrieval qa"). To build without them, put `BRAIN_CHUNK_VECTORS=0` in the
+   timers' environment and the rebuild's: summaries alone, about $1.60 as batch jobs and a
+   quarter of an hour.
 4. **Build and swap.** No timer needs stopping. Start it where it can run for an hour or two
    and outlive the login, for instance
    `tmux new -d -s vectors 'python -m src.cli maint vectors-rebuild 2>&1 | tee -a ~/.second-brain/logs/vectors-rebuild.log'`.

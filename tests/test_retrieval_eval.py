@@ -319,13 +319,22 @@ def test_run_qa_grades_each_mode_on_the_kinds_it_can_return(ev, qa_store, index)
         "semantic": 2,
         "hybrid": 2,
         "recall": 3,
+        "keyword_recency": 2,
+        "hybrid_recency": 2,
+        "recall_recency": 3,
     }
     for mode in modes:
         assert modes[mode]["recall@10"] == 1.0, mode
         assert modes[mode]["mrr"] == 1.0, mode
-    assert result["semantic_status"] == {"semantic": {"ok": 3}, "recall": {"ok": 3}}
+    assert result["semantic_status"] == {
+        "semantic": {"ok": 3},
+        "recall": {"ok": 3},
+        "recall_recency": {"ok": 3},
+    }
     first = result["per_question"][0]
     assert first["id"] == "q1" and first["units"] == ["thread:T1"]
+    # Every gold item was found by its own row: none only through a row's editions.
+    assert not any(result["found_in_editions"].values())
 
 
 def test_a_question_can_be_held_to_some_modes(ev, qa_store, index):
@@ -455,3 +464,139 @@ def test_one_mode_at_a_time(ev):
         ev.main(["build", "--run-qa"])
     with pytest.raises(SystemExit):
         ev.main([])
+
+
+# --- before and after the ranking of #PR: recency, editions, names, every bucket -------------
+
+
+@pytest.fixture
+def ranked_store(tmp_path):
+    """A name written in Greek, monthly editions of one workbook, and a copy of a deck."""
+    from tests import factories
+
+    path = tmp_path / "ranked.db"
+    conn = create_database(str(path))
+    factories.person(conn, "Νικόλαος Οκαπίδης", "nokapidis@example.com")
+    greek = factories.email(
+        conn, subject="Θέμα", summary="Ο Οκαπίδης ενέκρινε.", content="Σώμα.", conversation_id="G"
+    )
+    editions = []
+    for month in range(3, 9):
+        sent = f"2026-{month + 1:02d}-20T09:00:00Z"
+        email_id = factories.email(
+            conn, subject=f"Zebra report {month}", date_received=sent, conversation_id=f"Z{month}"
+        )
+        editions.append(
+            factories.attachment(
+                conn,
+                email_id=email_id,
+                filename=f"Zebra Workbook 28.{month:02d}.2026.xlsx",
+                text="the zebra conversion ratio",
+            )
+        )
+    deck = factories.attachment(conn, filename="gnu deck.pptx", text="the gnu strategy")
+    copy = factories.attachment(conn, filename="gnu deck final.pptx", text="unrelated words")
+    conn.close()
+    return path, {"greek": greek, "editions": editions, "deck": deck, "copy": copy}
+
+
+def test_the_plain_modes_rank_as_before_and_the_recency_modes_as_now(ev, ranked_store, index):
+    """A Latin name finds the Greek mail in keyword_recency only: the plain modes run with
+    BRAIN_QUERY_RANKING=relevance and BRAIN_QUERY_NAMES=0, as the code before them."""
+    path, made = ranked_store
+
+    result = ev.run_qa(
+        ev._open(path),
+        [question("q1", "Okapidis", email=[made["greek"]])],
+        embed_fn=embed,
+        index_path=index,
+    )
+
+    modes = result["modes"]
+    assert modes["keyword"]["recall@10"] == 0.0
+    assert modes["keyword_recency"]["recall@10"] == 1.0
+    assert modes["recall_recency"]["recall@10"] == 1.0
+
+
+def test_an_edition_a_row_stands_for_counts_as_found_and_is_counted(ev, ranked_store, index):
+    path, made = ranked_store
+    oldest = made["editions"][0]
+
+    result = ev.run_qa(
+        ev._open(path),
+        [question("q1", "zebra conversion ratio", attachment=[oldest])],
+        embed_fn=embed,
+        index_path=index,
+    )
+
+    assert result["modes"]["recall_recency"]["recall@10"] == 1.0
+    assert result["found_in_editions"]["recall_recency"] == 1
+    assert result["found_in_editions"].get("recall", 0) == 0
+
+
+def test_alt_ids_are_graded_apart_as_equivalent_gold(ev, ranked_store, index):
+    """The copy is found, the canonical deck is not: 0 strictly, 1 with alt."""
+    path, made = ranked_store
+    item = {**question("q1", "unrelated words", attachment=[made["deck"]])}
+    item["alt"] = {"attachment": [made["copy"]]}
+
+    result = ev.run_qa(ev._open(path), [item], embed_fn=embed, index_path=index)
+
+    assert result["modes"]["recall"]["recall@10"] == 0.0
+    assert result["modes_with_alt"]["recall"]["recall@10"] == 1.0
+    assert result["modes_with_alt"]["recall_recency"]["recall@10"] == 1.0
+
+
+def test_unanswerable_questions_are_checked_for_abstention(ev, ranked_store, index):
+    path, _made = ranked_store
+    items = [
+        {**question("e1", "quokka invoices"), "expect_empty": True},  # nothing holds it
+        {**question("e2", "zebra conversion ratio"), "expect_empty": True},  # rows claim it
+    ]
+
+    result = ev.run_qa(ev._open(path), items, embed_fn=embed, index_path=index)
+
+    abstention = result["abstention"]
+    assert abstention["keyword"] == {"cases": 2, "abstained": 1}
+    assert abstention["recall_recency"] == {"cases": 2, "abstained": 1}
+    assert "semantic" not in abstention
+
+
+def test_results_are_given_by_shape_too(ev, qa_store, index):
+    items = [
+        {**question("q1", "budget plan", email=[1]), "shape": "status"},
+        {**question("q3", "kiwi orchard", email=[4]), "shape": "numbers"},
+    ]
+
+    result = ev.run_qa(ev._open(qa_store), items, embed_fn=embed, index_path=index)
+
+    assert result["by_shape"]["status"]["keyword"] == {"questions": 1, "recall@10": 1.0}
+    assert set(result["by_shape"]) == {"status", "numbers"}
+
+
+def test_each_question_is_embedded_once_for_every_mode(ev, qa_store, index):
+    calls = []
+
+    def counting(texts):
+        calls.append(tuple(texts))
+        return embed(texts)
+
+    ev.run_qa(
+        ev._open(qa_store),
+        [question("q1", "budget plan", email=[1])],
+        embed_fn=counting,
+        index_path=index,
+    )
+
+    assert calls == [("budget plan",)]
+
+
+def test_validate_qa_takes_alt_shape_and_expect_empty(ev):
+    good = {**question("q1", "a", email=[1]), "alt": {"attachment": [2]}, "shape": "numbers"}
+    bad = {**question("q2", "b", email=[1]), "alt": {"tickets": [2]}, "expect_empty": "yes"}
+
+    problems = ev.validate_qa([good, bad])
+
+    assert not [p for p in problems if p.startswith("q1:")]
+    assert any(p.startswith("q2: alt") for p in problems)
+    assert any(p.startswith("q2: expect_empty") for p in problems)

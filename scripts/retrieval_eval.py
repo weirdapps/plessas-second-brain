@@ -45,11 +45,14 @@ subject: case ids, counts and rates.
 import argparse
 import json
 import math
+import os
 import random
 import re
 import sqlite3
 import sys
 from collections import Counter
+from collections.abc import Iterable
+from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 
@@ -72,7 +75,16 @@ from src.store.greek import search_fold, search_words  # noqa: E402
 DEFAULT_SET = Path.home() / ".second-brain" / "retrieval-eval.json"
 QUERY_WORDS = 2
 
-QA_MODES = ("keyword", "semantic", "hybrid", "recall")
+# The plain modes rank as the code before the recency ranking did (BRAIN_QUERY_RANKING
+# relevance, BRAIN_QUERY_NAMES 0), so a run compares with the runs before it; each
+# _recency mode is the same search with it: recency fused, editions collapsed, names in
+# both scripts, every recall bucket fused, thread siblings collapsed before the cut.
+RANKED_MODES = {
+    "keyword_recency": "keyword",
+    "hybrid_recency": "hybrid",
+    "recall_recency": "recall",
+}
+QA_MODES = ("keyword", "semantic", "hybrid", "recall", *RANKED_MODES)
 # The kinds of item a question's gold may name. An email counts at thread level: any
 # email of its thread finds it. A thread is an Outlook conversation id.
 GOLD_KINDS = ("email", "thread", "attachment", "teams", "whatsapp", "conversation", "event")
@@ -84,6 +96,10 @@ REACH = {
     "semantic": {"email", "thread", "attachment", "teams", "whatsapp", "conversation"},
     "recall": set(GOLD_KINDS),
 }
+REACH.update({mode: REACH[plain] for mode, plain in RANKED_MODES.items()})
+# The modes an unanswerable question (expect_empty) is checked in: a row there that holds
+# every query word claims an answer. Semantic search always returns its nearest rows.
+ABSTAINING_MODES = tuple(m for m in QA_MODES if m != "semantic")
 QA_SIZE = 60
 TOP = 10
 # recall's per-kind maximum: recall@10 there is a gold item among the first ten of its kind.
@@ -328,13 +344,28 @@ def validate_qa(items: list[dict]) -> list[str]:
             continue
         if not set(gold) <= set(GOLD_KINDS):
             problems.append(f"{name}: gold may name only {', '.join(GOLD_KINDS)}")
-        for kind in GOLD_KINDS:
-            values = gold.get(kind, [])
-            numeric = kind in NUMERIC_KINDS
-            valid = _is_number if numeric else _is_id
-            if not isinstance(values, list) or not all(valid(v) for v in values):
-                what = "numeric ids" if numeric else "ids"
-                problems.append(f"{name}: gold.{kind} is not a list of {what}")
+        problems += _id_lists(name, "gold", gold)
+        alt = item.get("alt", {})
+        if not isinstance(alt, dict) or not set(alt) <= set(GOLD_KINDS):
+            problems.append(f"{name}: alt is not an object of {', '.join(GOLD_KINDS)}")
+        else:
+            problems += _id_lists(name, "alt", alt)
+        if not isinstance(item.get("expect_empty", False), bool):
+            problems.append(f"{name}: expect_empty is not true or false")
+        if not isinstance(item.get("shape", ""), str):
+            problems.append(f"{name}: shape is not text")
+    return problems
+
+
+def _id_lists(name: str, field: str, ids: dict) -> list[str]:
+    problems = []
+    for kind in GOLD_KINDS:
+        values = ids.get(kind, [])
+        numeric = kind in NUMERIC_KINDS
+        valid = _is_number if numeric else _is_id
+        if not isinstance(values, list) or not all(valid(v) for v in values):
+            what = "numeric ids" if numeric else "ids"
+            problems.append(f"{name}: {field}.{kind} is not a list of {what}")
     return problems
 
 
@@ -343,8 +374,13 @@ def is_labelled_qa(item: dict) -> bool:
     return isinstance(gold, dict) and any(gold.get(kind) for kind in GOLD_KINDS)
 
 
-def _keys(row: dict, fields: tuple[tuple[str, str], ...]) -> set:
-    return {(kind, row[field]) for kind, field in fields if row.get(field) is not None}
+def _keys(row: dict, fields: tuple[tuple[str, str], ...], editions: bool = True) -> set:
+    """The (kind, id) units a row finds: its own ids, and with `editions` the items of its
+    series it stands for (src/store/ranking.py), which a reader has the refs of."""
+    keys = {(kind, row[field]) for kind, field in fields if row.get(field) is not None}
+    if editions and fields:
+        keys |= {(fields[0][0], ref) for ref in row.get("editions") or ()}
+    return keys
 
 
 def _semantic_keys(row: dict) -> set:
@@ -438,11 +474,115 @@ def _semantic_rows(conn, query: str, embed_fn, index_path) -> tuple[list[dict], 
     return rows, seeded or "ok"
 
 
+# The settings the plain modes run with, as the code before the recency ranking ranked;
+# the _recency modes run with the opposite. Set for the run, then put back.
+_PLAIN = {"BRAIN_QUERY_RANKING": "relevance", "BRAIN_QUERY_NAMES": "0"}
+_RANKED = {"BRAIN_QUERY_RANKING": "fused", "BRAIN_QUERY_NAMES": "1"}
+
+
+@contextmanager
+def _ranking(settings: dict[str, str]):
+    saved = {key: os.environ.get(key) for key in settings}
+    os.environ.update(settings)
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _memo(embed_fn):
+    """`embed_fn` (the configured one when None) asked once per query text: every mode of
+    a question shares its vector, so a run costs one embedding a question. A failure is
+    not kept, so each mode records it."""
+    from src.store.embeddings import embed_query
+
+    embed = embed_fn or embed_query
+    seen: dict[tuple, object] = {}
+
+    def memo(texts):
+        key = tuple(texts)
+        if key not in seen:
+            seen[key] = embed(texts)
+        return seen[key]
+
+    return memo
+
+
+def _group(unit: tuple) -> str:
+    """The kind a unit is graded as: an email and its thread are one."""
+    return "email" if unit[0] in ("email", "thread") else unit[0]
+
+
+def _with_alt(units: list, ranks: list, alt_units: list, alt_ranks: list) -> list:
+    """The units' ranks when a found alt (a copy or version of a gold item) stands for a
+    gold unit of its kind not found sooner: each kind's best places, own or alt, go to
+    its units."""
+    out = list(ranks)
+    for group in {_group(u) for u in units}:
+        slots = [i for i, u in enumerate(units) if _group(u) == group]
+        found = [ranks[i] for i in slots if ranks[i] is not None]
+        found += [r for u, r in zip(alt_units, alt_ranks, strict=True) if _group(u) == group and r]
+        found.sort()
+        for n, i in enumerate(slots):
+            out[i] = found[n] if n < len(found) else None
+    return out
+
+
+def _answered(rows: Iterable[dict]) -> bool:
+    """Whether a list holds a row that claims an answer: one holding every query word,
+    not a partial or a semantic-only row."""
+    return any(
+        not r.get("partial_match") and "semantic" not in (r.get("source"), r.get("matched_in"))
+        for r in rows
+    )
+
+
+def _ranked(mode: str, bundles: dict, rows: dict, editions: bool = True):
+    """What `mode` returned, as the units each row finds: a list for the list modes, a
+    list per bucket for the recall modes."""
+    if mode in bundles:
+        return {
+            name: [_keys(r, fields, editions) for r in bundles[mode].get(name) or []]
+            for name, fields in BUCKET_IDS.items()
+        }
+    if mode == "semantic":
+        return [_semantic_keys(r) for r in rows[mode]]
+    return [_keys(r, BUCKET_IDS["emails"], editions) for r in rows[mode]]
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values)
+
+
+def _summary(graded: dict[str, list[dict]]) -> dict:
+    return {
+        mode: {
+            "questions": len(rows),
+            "recall@5": _mean([r["recall@5"] for r in rows]),
+            "recall@10": _mean([r["recall@10"] for r in rows]),
+            "mrr": _mean([r["rr"] for r in rows]),
+            "ndcg@10": _mean([r["ndcg@10"] for r in rows]),
+        }
+        for mode, rows in graded.items()
+        if rows
+    }
+
+
 def run_qa(conn: sqlite3.Connection, items: list[dict], *, embed_fn=None, index_path=None) -> dict:
     """Every labelled question in every mode it allows, graded per mode.
 
     `embed_fn` and `index_path` reach the embedding store as the tools' own injection
     points; left None, the configured backend and index are used, as the tools use them.
+    The plain modes run as the code before the recency ranking (_PLAIN), the _recency
+    modes with it (_RANKED), each question embedded once for all of them. Graded twice:
+    strictly on the gold, comparable with earlier runs, and in `modes_with_alt` with a
+    question's `alt` ids (copies, versions) standing for its gold. A gold item a row
+    lists among its `editions` is found at that row, and `found_in_editions` counts
+    them. Questions marked expect_empty are checked for `abstention`.
     """
     from src.store.embeddings import semantic_email_candidates
     from src.store.greek import register_sql_functions
@@ -450,76 +590,122 @@ def run_qa(conn: sqlite3.Connection, items: list[dict], *, embed_fn=None, index_
     from src.store.recall import recall
 
     register_sql_functions(conn)
-    candidates = partial(semantic_email_candidates, embed_fn=embed_fn, index_path=index_path)
-    status: dict[str, Counter] = {"semantic": Counter(), "recall": Counter()}
+    embed = _memo(embed_fn)
+    candidates = partial(semantic_email_candidates, embed_fn=embed, index_path=index_path)
+    status: dict[str, Counter] = {
+        "semantic": Counter(),
+        "recall": Counter(),
+        "recall_recency": Counter(),
+    }
     graded: dict[str, list[dict]] = {mode: [] for mode in QA_MODES}
+    graded_alt: dict[str, list[dict]] = {mode: [] for mode in QA_MODES}
+    by_shape: dict[str, dict[str, list[float]]] = {}
+    in_editions: Counter = Counter()
+    abstention = {mode: {"cases": 0, "abstained": 0} for mode in ABSTAINING_MODES}
     per_question = []
     unknown = 0
     labelled = [item for item in items if is_labelled_qa(item)]
-    for item in labelled:
+    unanswerable = [item for item in items if item.get("expect_empty") and not is_labelled_qa(item)]
+    for item in [*labelled, *unanswerable]:
         query = (item.get("query") or "").strip() or item["question"]
-        semantic, semantic_status = _semantic_rows(conn, query, embed_fn, index_path)
-        bundle = recall(conn, query, limit_per_kind=RECALL_PER_KIND, semantic_candidates=candidates)
-        recall_status = bundle["summary"].get("semantic", "unavailable")
+        with _ranking(_PLAIN):
+            semantic, semantic_status = _semantic_rows(conn, query, embed, index_path)
+            bundles = {
+                "recall": recall(
+                    conn, query, limit_per_kind=RECALL_PER_KIND, semantic_candidates=candidates
+                )
+            }
+            keyword = {"keyword": query_by_keyword(conn, query, limit=TOP)}
+        with _ranking(_RANKED):
+            bundles["recall_recency"] = recall(
+                conn, query, limit_per_kind=RECALL_PER_KIND, semantic_candidates=candidates
+            )
+            keyword["keyword_recency"] = query_by_keyword(conn, query, limit=TOP)
+        rows = {
+            **keyword,
+            "semantic": semantic,
+            "hybrid": bundles["recall"]["emails"][:TOP],
+            "hybrid_recency": bundles["recall_recency"]["emails"][:TOP],
+        }
+        if item in unanswerable:
+            for mode in ABSTAINING_MODES:
+                bundle = bundles.get(mode)
+                shown = (
+                    [r for b in BUCKET_IDS for r in bundle.get(b) or []] if bundle else rows[mode]
+                )
+                abstention[mode]["cases"] += 1
+                abstention[mode]["abstained"] += not _answered(shown)
+            continue
         status["semantic"][semantic_status] += 1
-        status["recall"][recall_status] += 1
-        email_ids = BUCKET_IDS["emails"]
-        lists = {
-            "keyword": [_keys(r, email_ids) for r in query_by_keyword(conn, query, limit=TOP)],
-            "semantic": [_semantic_keys(r) for r in semantic],
-            "hybrid": [_keys(r, email_ids) for r in bundle["emails"][:TOP]],
-        }
-        buckets = {
-            name: [_keys(r, fields) for r in bundle.get(name) or []]
-            for name, fields in BUCKET_IDS.items()
-        }
+        for name in ("recall", "recall_recency"):
+            status[name][bundles[name]["summary"].get("semantic", "unavailable")] += 1
+
+        lists = {mode: _ranked(mode, bundles, rows) for mode in QA_MODES}
+        # The same without the editions rows stand for, to count what only they found.
+        own = {mode: _ranked(mode, bundles, rows, editions=False) for mode in RANKED_MODES}
         gold_emails = list(item["gold"].get("email") or [])
-        threads = _expand(
-            conn,
-            [keys for rows in [*lists.values(), *buckets.values()] for keys in rows],
-            gold_emails,
-        )
+        alt = item.get("alt") or {}
+        every_key = [
+            keys
+            for found in [*lists.values(), *own.values()]
+            for keys in (
+                found if isinstance(found, list) else [k for ks in found.values() for k in ks]
+            )
+        ]
+        threads = _expand(conn, every_key, gold_emails + list(alt.get("email") or []))
         unknown += sum(1 for e in gold_emails if e not in threads)
         units = _gold_units(item["gold"], threads)
+        alt_units = [u for u in _gold_units(alt, threads) if u not in units]
         modes = [m for m in (item.get("modes") or QA_MODES) if m in QA_MODES]
         result: dict = {
             "id": item["id"],
             "units": [f"{kind}:{value}" for kind, value in units],
             "semantic": semantic_status,
-            "recall_semantic": recall_status,
+            "recall_semantic": bundles["recall"]["summary"].get("semantic", "unavailable"),
             "modes": {},
         }
+
+        def ranks_of(mode: str, wanted: list, found) -> list:
+            return (
+                _bundle_ranks(wanted, found)
+                if isinstance(found, dict)
+                else _list_ranks(wanted, found)
+            )
+
         for mode in modes:
             reachable = [u for u in units if u[0] in REACH[mode]]
             if not reachable:
                 continue
-            ranks = (
-                _bundle_ranks(reachable, buckets)
-                if mode == "recall"
-                else _list_ranks(reachable, lists[mode])
-            )
+            ranks = ranks_of(mode, reachable, lists[mode])
+            if mode in RANKED_MODES:
+                plain = ranks_of(mode, reachable, own[mode])
+                in_editions[mode] += sum(
+                    1 for r, p in zip(ranks, plain, strict=True) if r is not None and p is None
+                )
             metrics = qa_metrics(ranks)
             result["modes"][mode] = {"ranks": ranks, **metrics}
             graded[mode].append(metrics)
+            alt_reach = [u for u in alt_units if u[0] in REACH[mode]]
+            alt_ranks = ranks_of(mode, alt_reach, lists[mode])
+            graded_alt[mode].append(qa_metrics(_with_alt(reachable, ranks, alt_reach, alt_ranks)))
+            shape = item.get("shape") or "unlabelled"
+            by_shape.setdefault(shape, {}).setdefault(mode, []).append(metrics["recall@10"])
         per_question.append(result)
-
-    def mean(values: list[float]) -> float:
-        return sum(values) / len(values)
 
     return {
         "questions": len(items),
         "labelled": len(labelled),
         "unknown_gold": unknown,
-        "modes": {
-            mode: {
-                "questions": len(rows),
-                "recall@5": mean([r["recall@5"] for r in rows]),
-                "recall@10": mean([r["recall@10"] for r in rows]),
-                "mrr": mean([r["rr"] for r in rows]),
-                "ndcg@10": mean([r["ndcg@10"] for r in rows]),
+        "modes": _summary(graded),
+        "modes_with_alt": _summary(graded_alt),
+        "found_in_editions": dict(in_editions),
+        "abstention": {mode: counts for mode, counts in abstention.items() if counts["cases"]},
+        "by_shape": {
+            shape: {
+                mode: {"questions": len(values), "recall@10": _mean(values)}
+                for mode, values in modes.items()
             }
-            for mode, rows in graded.items()
-            if rows
+            for shape, modes in by_shape.items()
         },
         "semantic_status": {name: dict(counts) for name, counts in status.items()},
         "per_question": per_question,
@@ -607,11 +793,22 @@ def _run_qa(args) -> int:
         args.results, {"eval": "qa", **stamp(), "set_sha": file_sha(args.qa_file), **result}
     )
     print(f"{result['labelled']} of {result['questions']} questions labelled and asked")
-    for mode, row in result["modes"].items():
-        print(
-            f"  {mode:<9} {row['questions']:>3} questions  recall@5 {row['recall@5']:.2f}"
-            f"  recall@10 {row['recall@10']:.2f}  MRR {row['mrr']:.2f}  nDCG@10 {row['ndcg@10']:.2f}"
-        )
+    for title, table in (("gold", result["modes"]), ("gold or alt", result["modes_with_alt"])):
+        print(f" {title}:")
+        for mode, row in table.items():
+            print(
+                f"  {mode:<15} {row['questions']:>3} questions  recall@5 {row['recall@5']:.2f}"
+                f"  recall@10 {row['recall@10']:.2f}  MRR {row['mrr']:.2f}"
+                f"  nDCG@10 {row['ndcg@10']:.2f}"
+            )
+    for mode, n in result["found_in_editions"].items():
+        print(f"  {mode}: {n} gold items found only in a row's editions")
+    for mode, counts in result["abstention"].items():
+        print(f"  {mode}: abstained on {counts['abstained']} of {counts['cases']} unanswerable")
+    print(" recall@10 by shape:")
+    for shape, modes in sorted(result["by_shape"].items()):
+        cells = "  ".join(f"{m} {v['recall@10']:.2f}" for m, v in modes.items())
+        print(f"  {shape:<14} {cells}")
     for name, counts in result["semantic_status"].items():
         print(f"  {name} calls: " + ", ".join(f"{s} {n}" for s, n in sorted(counts.items())))
     if result["unknown_gold"]:

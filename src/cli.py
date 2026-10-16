@@ -490,6 +490,29 @@ def cmd_refetch_garbled(args):
     return cmd(args)
 
 
+def cmd_sharepoint_shells(args):
+    """Forget the hollow SharePoint documents an old fetch left, and queue again the links whose
+    content is not held (src/export/sharepoint_shells.py)."""
+    from src.export.sharepoint_shells import cmd
+
+    return cmd(args)
+
+
+def cmd_calendar_bodies(args):
+    """Store the text of the calendar events stored before it was kept
+    (src/pipeline/calendar_bodies.py)."""
+    from src.pipeline.calendar_bodies import run
+
+    return run(args)
+
+
+def cmd_utc_stamps(args):
+    """Convert the attachment and sync stamps stored in local time to UTC (src/store/stamps.py)."""
+    from src.store.stamps import cmd
+
+    return cmd(args)
+
+
 def cmd_sweep_files(args):
     """Delete attachment files whose content is already stored (src/store/file_sweep.py).
 
@@ -1733,6 +1756,21 @@ MAINT_COMMANDS: dict[str, tuple[str, dict[str, bool], str]] = {
         {},
         "Fetch again from the mailbox the swept originals of garbled OCR texts",
     ),
+    "utc-stamps": (
+        "utc-stamps",
+        {},
+        "Convert the attachment and sync stamps stored in local time to UTC",
+    ),
+    "calendar-bodies": (
+        "calendar-bodies",
+        {},
+        "Fetch and store the text of the calendar events stored without it (no model call)",
+    ),
+    "sharepoint-shells": (
+        "sharepoint-shells",
+        {},
+        "Forget the hollow SharePoint documents an old fetch left; queue the links not held",
+    ),
     "reextract": (
         "reextract",
         {},
@@ -2065,6 +2103,11 @@ def main():
         "--garbled", action="store_true", help="OCR text marked as Greek read as Latin letters"
     )
     parser_reextract.add_argument(
+        "--wide",
+        action="store_true",
+        help="wide workbooks summarised from a digest that left out their newest columns",
+    )
+    parser_reextract.add_argument(
         "--no-spreadsheets",
         action="store_true",
         dest="no_spreadsheets",
@@ -2135,6 +2178,35 @@ def main():
         "--root", default=str(ATTACHMENTS_DIR), help="Attachments root, for rows recorded elsewhere"
     )
     parser_regarble.set_defaults(func=cmd_ocr_regarble)
+
+    parser_utc_stamps = subparsers.add_parser(
+        "utc-stamps", help="Convert the attachment and sync stamps stored in local time to UTC"
+    )
+    utc_stamps_mode = parser_utc_stamps.add_mutually_exclusive_group()
+    utc_stamps_mode.add_argument("--dry-run", action="store_true", help="Count only (default)")
+    utc_stamps_mode.add_argument("--apply", action="store_true", help="Convert them")
+    parser_utc_stamps.set_defaults(func=cmd_utc_stamps)
+
+    parser_calendar_bodies = subparsers.add_parser(
+        "calendar-bodies",
+        help="Fetch and store the text of the calendar events stored without it (no model call)",
+    )
+    parser_calendar_bodies.add_argument(
+        "--limit", type=int, default=0, help="At most this many events, newest first (0 = all)"
+    )
+    parser_calendar_bodies.add_argument(
+        "--dry-run", action="store_true", help="Count the events only"
+    )
+    parser_calendar_bodies.set_defaults(func=cmd_calendar_bodies)
+
+    parser_shells = subparsers.add_parser(
+        "sharepoint-shells",
+        help="Forget the hollow SharePoint documents an old fetch left; queue the links not held",
+    )
+    shells_mode = parser_shells.add_mutually_exclusive_group()
+    shells_mode.add_argument("--dry-run", action="store_true", help="Count only (default)")
+    shells_mode.add_argument("--apply", action="store_true", help="Forget them and queue the links")
+    parser_shells.set_defaults(func=cmd_sharepoint_shells)
 
     parser_refetch_garbled = subparsers.add_parser(
         "refetch-garbled",

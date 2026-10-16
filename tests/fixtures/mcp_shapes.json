@@ -13,10 +13,12 @@
       "properties": [
         "_stale_warning",
         "count",
+        "coverage",
         "data_as_of",
         "reason",
         "results",
-        "stale"
+        "stale",
+        "truncated"
       ],
       "required": [
         "count",
@@ -70,6 +72,7 @@
         "stale",
         "summary",
         "topics",
+        "truncated",
         "turns"
       ],
       "required": [
@@ -125,7 +128,8 @@
         "email_id",
         "emails",
         "stale",
-        "thread_total"
+        "thread_total",
+        "truncated"
       ],
       "required": [
         "data_as_of",
@@ -159,10 +163,112 @@
       ]
     }
   },
+  "get_item": {
+    "input_schema": {
+      "properties": [
+        "include_agents",
+        "kind",
+        "max_chars",
+        "offset",
+        "ref"
+      ],
+      "required": [
+        "kind",
+        "ref"
+      ]
+    },
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "data_as_of",
+        "item",
+        "kind",
+        "next_offset",
+        "offset",
+        "ref",
+        "returned_chars",
+        "stale",
+        "text",
+        "total_chars",
+        "truncated"
+      ],
+      "required": [
+        "data_as_of",
+        "item",
+        "kind",
+        "next_offset",
+        "offset",
+        "ref",
+        "returned_chars",
+        "stale",
+        "text",
+        "total_chars"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "kind",
+      "ref",
+      "item",
+      "text",
+      "offset",
+      "returned_chars",
+      "total_chars",
+      "next_offset"
+    ],
+    "rows": {
+      "item.attachments": [
+        "extraction_status",
+        "file_size",
+        "filename",
+        "is_inline",
+        "mime_type",
+        "ref",
+        "text_chars"
+      ],
+      "item.extracted.action_items": [
+        "attachment_id",
+        "deadline",
+        "owner",
+        "status",
+        "task"
+      ],
+      "item.extracted.commitments": [
+        "by_person",
+        "commitment",
+        "to_person"
+      ],
+      "item.extracted.decisions": [
+        "attachment_id",
+        "decided_by",
+        "decision",
+        "decision_date"
+      ],
+      "item.extracted.key_facts": [
+        "attachment_id",
+        "fact"
+      ],
+      "item.people": [
+        "email",
+        "name",
+        "role"
+      ],
+      "item.thread": [
+        "date",
+        "kind",
+        "ref",
+        "subject",
+        "summary",
+        "who"
+      ]
+    }
+  },
   "meeting_prep": {
     "input_schema": {
       "properties": [
         "days",
+        "detail",
         "include_automation",
         "include_news",
         "people",
@@ -176,10 +282,13 @@
       "properties": [
         "_stale_warning",
         "attendees",
+        "coverage",
         "data_as_of",
         "meetings",
+        "reason",
         "stale",
-        "topic_context"
+        "topic_context",
+        "truncated"
       ],
       "required": [
         "data_as_of",
@@ -353,10 +462,13 @@
         "_stale_warning",
         "clamped",
         "count",
+        "coverage",
         "data_as_of",
         "messages",
+        "reason",
         "since_minutes",
-        "stale"
+        "stale",
+        "truncated"
       ],
       "required": [
         "clamped",
@@ -373,7 +485,9 @@
       "messages",
       "count",
       "since_minutes",
-      "clamped"
+      "clamped",
+      "reason",
+      "coverage"
     ],
     "rows": {}
   },
@@ -381,6 +495,7 @@
     "input_schema": {
       "properties": [
         "days",
+        "detail",
         "include_automation",
         "include_news",
         "limit",
@@ -394,10 +509,12 @@
       "properties": [
         "_stale_warning",
         "communication_pattern",
+        "coverage",
         "data_as_of",
         "decisions",
         "decisions_total",
         "email_count",
+        "known",
         "last_met",
         "match_count",
         "meeting_count_30d",
@@ -414,6 +531,7 @@
         "teams",
         "topics",
         "topics_total",
+        "truncated",
         "whatsapp"
       ],
       "required": [
@@ -525,7 +643,9 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
+        "coverage",
         "data_as_of",
+        "excluded",
         "reason",
         "result",
         "stale",
@@ -540,6 +660,7 @@
     "result_keys": [
       "data_as_of",
       "stale",
+      "excluded",
       "result"
     ],
     "rows": {
@@ -579,6 +700,7 @@
       "properties": [
         "_stale_warning",
         "count",
+        "coverage",
         "data_as_of",
         "events",
         "reason",
@@ -642,7 +764,9 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
+        "coverage",
         "data_as_of",
+        "excluded",
         "reason",
         "result",
         "stale",
@@ -657,6 +781,7 @@
     "result_keys": [
       "data_as_of",
       "stale",
+      "excluded",
       "result"
     ],
     "rows": {
@@ -696,7 +821,9 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
+        "coverage",
         "data_as_of",
+        "excluded",
         "reason",
         "result",
         "stale",
@@ -711,6 +838,7 @@
     "result_keys": [
       "data_as_of",
       "stale",
+      "excluded",
       "result"
     ],
     "rows": {
@@ -734,6 +862,7 @@
     "input_schema": {
       "properties": [
         "days",
+        "detail",
         "include_automation",
         "include_context",
         "include_news",
@@ -753,9 +882,11 @@
         "calendar_events",
         "commitments",
         "conversations",
+        "coverage",
         "data_as_of",
         "decisions",
         "emails",
+        "excluded",
         "inline_images",
         "person_context",
         "query",
@@ -788,6 +919,7 @@
       "summary",
       "data_as_of",
       "stale",
+      "excluded",
       "query",
       "emails",
       "attachments",
@@ -1027,7 +1159,9 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
+        "coverage",
         "data_as_of",
+        "excluded",
         "reason",
         "result",
         "stale",
@@ -1042,6 +1176,7 @@
     "result_keys": [
       "data_as_of",
       "stale",
+      "excluded",
       "result"
     ],
     "rows": {
@@ -1080,7 +1215,9 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
+        "coverage",
         "data_as_of",
+        "excluded",
         "reason",
         "result",
         "stale",
@@ -1132,7 +1269,9 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
+        "coverage",
         "data_as_of",
+        "excluded",
         "reason",
         "result",
         "stale",
@@ -1147,6 +1286,7 @@
     "result_keys": [
       "data_as_of",
       "stale",
+      "excluded",
       "result"
     ],
     "rows": {
@@ -1181,6 +1321,7 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
+        "coverage",
         "data_as_of",
         "reason",
         "results",
@@ -1235,6 +1376,7 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
+        "coverage",
         "data_as_of",
         "reason",
         "results",
@@ -1287,6 +1429,7 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
+        "coverage",
         "data_as_of",
         "email",
         "email_count",
@@ -1297,6 +1440,7 @@
         "open_actions_count",
         "other_candidates",
         "query",
+        "reason",
         "recent_decisions",
         "resolved_by",
         "role",
@@ -1341,11 +1485,14 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
+        "coverage",
         "data_as_of",
         "document_message_id",
         "links",
+        "reason",
         "stale",
-        "status"
+        "status",
+        "truncated"
       ],
       "required": [
         "data_as_of",
@@ -1355,7 +1502,9 @@
     "result_keys": [
       "data_as_of",
       "stale",
-      "links"
+      "links",
+      "reason",
+      "coverage"
     ],
     "rows": {}
   },
@@ -1373,7 +1522,9 @@
       "properties": [
         "_stale_warning",
         "columns",
+        "coverage",
         "data_as_of",
+        "reason",
         "row_count",
         "rows",
         "stale",
@@ -1454,13 +1605,16 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
+        "coverage",
         "data_as_of",
         "overdue_actions",
         "overdue_actions_total",
+        "reason",
         "stale",
         "stale_threads",
         "stale_threads_total",
-        "stale_threads_unavailable"
+        "stale_threads_unavailable",
+        "truncated"
       ],
       "required": [
         "data_as_of",
@@ -1587,12 +1741,15 @@
       "properties": [
         "_stale_warning",
         "chat",
+        "coverage",
         "data_as_of",
         "last_messages",
         "open_actions",
+        "reason",
         "stale",
         "threads",
-        "top_senders"
+        "top_senders",
+        "truncated"
       ],
       "required": [
         "data_as_of",
@@ -1655,7 +1812,8 @@
         "key_facts",
         "messages",
         "stale",
-        "thread"
+        "thread",
+        "truncated"
       ],
       "required": [
         "data_as_of",
@@ -1698,6 +1856,7 @@
     "input_schema": {
       "properties": [
         "days",
+        "detail",
         "include_automation",
         "include_news",
         "limit",
@@ -1710,6 +1869,7 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
+        "coverage",
         "data_as_of",
         "decisions",
         "decisions_total",
@@ -1723,7 +1883,8 @@
         "reason",
         "recent_emails",
         "stale",
-        "topic"
+        "topic",
+        "truncated"
       ],
       "required": [
         "data_as_of",

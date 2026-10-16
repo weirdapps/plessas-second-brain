@@ -1092,6 +1092,48 @@ On the reference deployment, `relabel-conversations`, `person_aliases --apply`,
 their figures above are what they did there, not work still pending there;
 `teams-drop-raw-json` and the batch probe had not run.
 
+### One-off commands after 2026-10-16 (attachments and ingest)
+
+No schema change. Each runs on the producer, beside the timers, once the release's code
+is there; the counts are the reference replica's on 2026-10-16, as examples of scale.
+
+1. **Stamps in UTC.** `python -m src.cli maint utc-stamps` counts the attachment and
+   sync stamps stored in local time with no offset (README, "Attachment stamps");
+   `--apply` converts them, 500 rows to a transaction. Nothing waits on it, since every
+   reader compares instants meanwhile; it brings the store level so that plain SQL reads
+   them right too. Each stamp sits behind its row's text, so the run reads every stored
+   text once (minutes on a 3 GB store) and writes one page a row. Run it once more after
+   every job that started before the pull has exited, since those still write local
+   time. 51,907 content rows and `last_sync_date` on the reference replica.
+2. **SharePoint shells.** `python -m src.cli maint sharepoint-shells` counts the hollow
+   documents an old fetch left (README, "SharePoint"), by what their links say;
+   `--apply` forgets the ones whose content another document holds, the ones linked to
+   nothing readable and the ones no link names, and queues for the retry pass the links
+   whose content is not held. It fetches nothing and calls no model: `brain
+   process-sharepoint`, or the nightly pass, reads the queued links, and a second
+   `sharepoint-shells --apply` after that forgets the shells they now hold. Reference
+   replica: 883 held, 181 linked to nothing readable, 38 named by no link, 4 links to
+   queue, of 1,106.
+3. **Calendar text.** `python -m src.cli maint calendar-bodies --dry-run` counts the
+   stored events with no text (README, "Calendar"); `--limit 500`, repeated until the
+   dry run counts only the events Outlook no longer returns, fetches each one's text,
+   one `outlook-cli get-event` call each, newest first, and stores that column alone:
+   no model call. Exit 4 means `outlook-cli` needs a login: log in and run it again.
+   3,701 events on the reference producer.
+4. **Wide workbooks.** `python -m src.cli maint reextract --wide --estimate` prices the
+   re-summary of the long workbooks summarised from a digest that left out their newest
+   columns (README, "Attachment summaries and spend"); `python -m src.cli maint reextract
+   --wide` summarises them again from the new digest, from the stored text (`--batch`
+   at half the price). Reference replica: 8 rows, 7 of them distinct, 7 calls, about
+   77,000 input tokens, $0.28 online, $0.14 as a batch job. The first run records when
+   it began, so a second takes only what is left.
+5. **OCR orientation.** Nothing to run. Each image and scan page is turned upright
+   before it is read (README, "Scans on their side or upside down"), which needs
+   Tesseract's orientation data: `tesseract --list-langs | grep -x osd` (Debian's
+   `tesseract-ocr` package ships it). A host without it reads every page as it is, as
+   before. Marked scans read again by `reextract --garbled`, and scans read again by
+   `reextract --ocr`, are turned upright too.
+
 ### One-off commands after 2026-10-16 (call shape v2-text, schema v35)
 
 This release makes call shape `v2-text` the default for email and attachment

@@ -22,6 +22,7 @@ from src.store.file_sweep import (
     VISION_ATTEMPTS_LIMIT,
     VISION_FILLABLE_SQL,
 )
+from src.store.stamps import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +90,8 @@ def project_vision_text(conn: sqlite3.Connection) -> int:
               AND {VISION_FILLABLE_SQL}
               AND (ii.transcribed_at IS NOT NULL OR NOT {OCR_GARBLED_SQL})"""
     ).fetchall()
-    # attachment_content keeps Phase 1's timestamp format.
-    now = datetime.now().isoformat()
+    # In UTC, as Phase 1 stamps attachment_content (src/store/stamps.py).
+    now = utc_now()
     written = 0
     for ac_id, description, transcription, stored_text, stored_summary, method in rows:
         summary = redact_secrets(description)

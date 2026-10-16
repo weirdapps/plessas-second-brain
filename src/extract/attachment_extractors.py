@@ -109,6 +109,13 @@ OCR_MAX_SECONDS = 120
 # it is itself Greek in Latin look-alikes (_read_page).
 OCR_LANGS = "ell+eng"
 OCR_LANGS_LATIN = "eng+ell"
+# Each image and scan page goes through Tesseract's orientation detection before it is read, and
+# is turned when the detection says, with at least this confidence, that it lies on its side or
+# upside down. An upside-down scan was read as letters of no language that passed the noise
+# filter (audit 2026-10-16). A page of text scores 15 to 20 and the detection gives up on a logo;
+# 2 is the threshold Tesseract's own documentation suggests for a reliable answer. The detection
+# takes about a quarter of a second a page, under half of one reading.
+OSD_MIN_CONFIDENCE = 2.0
 # What a scan with too little text says.
 OCR_INSUFFICIENT = "OCR returned insufficient text"
 # The methods whose text holds an OCR reading: an image, a scan or a text PDF with scanned pages,
@@ -1097,8 +1104,30 @@ def _extract_xlsb(path: str) -> dict:
     return {"text": text, "method": "pyxlsb", "status": "extracted", "error": None}
 
 
+def _upright(img):
+    """The image turned upright when Tesseract's orientation detection (OSD) is confident that it
+    lies at 90, 180 or 270 degrees; else the image as it is. An image OSD cannot judge (too few
+    letters, as a logo has, or a host without osd.traineddata) raises, and is read as it is."""
+    import pytesseract
+    from PIL import Image
+
+    try:
+        osd = pytesseract.image_to_osd(img, config="--psm 0", output_type=pytesseract.Output.DICT)
+        rotate = int(osd.get("rotate") or 0) % 360
+        confident = float(osd.get("orientation_conf") or 0) >= OSD_MIN_CONFIDENCE
+    except Exception:  # TesseractError, TesseractNotFoundError, a reply it cannot parse
+        return img
+    turn = {
+        90: Image.Transpose.ROTATE_270,  # a quarter turn clockwise
+        180: Image.Transpose.ROTATE_180,
+        270: Image.Transpose.ROTATE_90,  # a quarter turn anticlockwise
+    }.get(rotate)
+    return img.transpose(turn) if turn is not None and confident else img
+
+
 def _read_page(img) -> str:
-    """One image or page OCR'd: Greek first, and English first when that reads as Latin script.
+    """One image or page OCR'd: turned upright first (_upright), then read Greek first, and
+    English first when that reads as Latin script.
 
     Latin script is a reading with letters or digits whose letters are at most GREEK_SHARE_MAX
     Greek (src/extract/ocr_garble.py), figures alone included. Its English-first reading takes
@@ -1107,6 +1136,7 @@ def _read_page(img) -> str:
     """
     import pytesseract
 
+    img = _upright(img)
     text = pytesseract.image_to_string(img, lang=OCR_LANGS)
     if not any(c.isalnum() for c in text) or script_profile(text).greek_share > GREEK_SHARE_MAX:
         return text

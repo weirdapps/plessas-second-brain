@@ -10,7 +10,6 @@ page); its text is its identity. A link that is not content is not fetched at al
 import hashlib
 import sqlite3
 import tempfile
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -24,6 +23,7 @@ from src.extract.attachment_pipeline import (
 )
 from src.extract.html_text import html_to_text
 from src.store.file_hashes import sha256_of_file
+from src.store.stamps import utc_now
 
 
 def _label(url: str | None, filename: str) -> str:
@@ -82,7 +82,7 @@ def ingest_fetched_file(
         error=result["error"],
         subject=f"[SharePoint] {_label(url, path.name)}",
         sender_name="SharePoint",
-        date=date or datetime.now().isoformat(),
+        date=date or utc_now(),
     )
     return message_id, True
 
@@ -122,7 +122,7 @@ def ingest_page(
         error=None,
         subject=f"[SharePoint page] {page.title or _label(page.url, name)}",
         sender_name="SharePoint",
-        date=date or datetime.now().isoformat(),
+        date=date or utc_now(),
     )
     return outcome["message_id"]
 

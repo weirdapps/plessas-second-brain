@@ -99,6 +99,11 @@ def test_every_limit_is_clamped_to_1_to_200(
     seen: list = []
 
     def spy(*a, **kw):
+        if kw.get("include_news") is True and kw.get("include_automation") is True:
+            # The probe that counts what the class filter left out (`excluded`): its
+            # own fixed limit, never the caller's.
+            assert kw[arg] == mcp_server._EXCLUDED_PROBE <= 200
+            return []
         seen.append(kw[arg] if isinstance(arg, str) else a[arg])
         if function == "recall":
             return {"query": "", "summary": {}, **dict.fromkeys(mcp_server._RECALL_KINDS, [])}

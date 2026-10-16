@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from src.config import ATTACHMENTS_DIR, DATA_ROOT, EXTRACT_ENGINE, IMAGE_CLASSIFY_BUDGET_S
+from src.store.stamps import utc_now
 
 # Attachments registered per sync run. Step 6 runs Phase 1 (local parse) and
 # Phase 2 (one LLM call each) over exactly this set, inside a unit with a
@@ -524,7 +525,7 @@ def run(args):
     # Update sync metadata
     conn = get_conn(db_path)
     migrate_add_sync_metadata(conn)
-    now = datetime.now().isoformat()
+    now = utc_now()  # UTC with its offset since 2026-10-16 (src/store/stamps.py)
     if not model_down:
         conn.execute(
             "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES ('last_sync_date', ?)",

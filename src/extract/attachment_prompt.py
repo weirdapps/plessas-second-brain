@@ -91,7 +91,10 @@ def build_attachment_prompt(
             "\nThe document content is a digest of a spreadsheet, not its cells: per sheet its"
             " size, header row, sample rows, column types with their statistics, and any free"
             " text. Describe what the workbook holds and shows. Take decisions and action items"
-            " only from text that states them, never from table rows.\n"
+            " only from text that states them, never from table rows. When the digest names"
+            " the months its dates fall in, say in the summary which period the workbook"
+            " covers and name its newest month as the digest does (for example Σεπτέμβριος"
+            " 2026, September 2026); a wide sheet shows its newest columns.\n"
         )
         if digest
         else ""
@@ -427,7 +430,10 @@ def build_attachment_request_v2(
         notes.append(
             "the document content is a digest of a spreadsheet, not its cells: per sheet its"
             " size, header row, sample rows, column types with their statistics, and any"
-            " free text."
+            " free text. When the digest names the months its dates fall in, say in the"
+            " summary which period the workbook covers and name its newest month as the"
+            " digest does (for example Σεπτέμβριος 2026, September 2026); a wide sheet"
+            " shows its newest columns."
         )
     document = document_text(extracted_text, filename, mime_type, email_subject, email_date)
     return _request_v2(notes, document, document)

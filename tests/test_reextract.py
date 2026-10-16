@@ -836,3 +836,110 @@ def test_the_no_spreadsheets_flag_reaches_the_command(monkeypatch):
     cli.main()
 
     assert (got["long"], got["no_spreadsheets"]) == (True, True)
+
+
+# --- --wide: workbooks summarised from a digest that left out their newest columns -----------
+#
+# Until 2026-10-16 the digest of a wide sheet kept its first 40 columns and the first 600
+# characters of a row, so a report with a column per day was summarised for its oldest days
+# (audit 2026-10-16). --wide takes the long workbooks summarised from a digest, since it landed
+# on 2026-10-11, whose digest leaves out columns, and summarises them again from the new one.
+
+
+def _wide_dump(days: int = 120) -> str:
+    """A cell dump as Phase 1 stores it: a label column, then a column a day."""
+    header = " | ".join(
+        ["Channel", *(f"2026-{1 + i // 28:02d}-{1 + i % 28:02d} 00:00:00" for i in range(days))]
+    )
+    rows = [
+        " | ".join([name, *(str(10_000_000 + k * 1000 + i) for i in range(days))])
+        for k, name in enumerate(("Cards", "Internet", "Mobile", "Branches"))
+    ]
+    text = "--- Sheet: Volumes ---\n" + "\n".join([header, *rows])
+    return (text + "\n") * (1 + 50_001 // len(text))
+
+
+def _summarised(conn, att_id, when, method="openpyxl"):
+    conn.execute(
+        "UPDATE attachment_content SET extraction_method = ?, llm_extracted_at = ?"
+        " WHERE attachment_id = ?",
+        (method, when, att_id),
+    )
+    conn.commit()
+
+
+def test_wide_takes_a_wide_workbook_summarised_from_the_digest(store):
+    path, conn, root, _removed, summarised = store
+    wide = _row(conn, root, "volumes.xlsx", _wide_dump())
+    _summarised(conn, wide, "2026-10-13T02:10:00.000000")
+    narrow = _row(conn, root, "ledger.xlsx", "--- Sheet: L ---\n" + "a | b | 1\n" * 6_000)
+    _summarised(conn, narrow, "2026-10-13T02:10:00.000000")
+    before = _row(conn, root, "old.xlsx", _wide_dump())
+    _summarised(conn, before, "2026-10-09T02:10:00.000000")  # from its parts, every column
+    document = _row(conn, root, "plan.docx", _wide_dump())
+    _summarised(conn, document, "2026-10-13T02:10:00+00:00", method="python-docx")
+
+    stats = _run(path, root, "wide")
+
+    assert (stats["selected"], stats["reread"], summarised) == (1, 0, [wide])
+    assert _content(conn, wide, "summary")[0] == "new summary"
+
+
+def test_wide_does_not_take_a_row_twice(store):
+    path, conn, root, _removed, summarised = store
+    wide = _row(conn, root, "volumes.xlsx", _wide_dump())
+    _summarised(conn, wide, "2026-10-13T02:10:00+00:00")
+
+    _run(path, root, "wide")
+    stats = _run(path, root, "wide")
+
+    assert (stats["selected"], summarised) == (0, [wide])
+    since = conn.execute(
+        "SELECT value FROM sync_metadata WHERE key = 'reextract_wide_since'"
+    ).fetchone()[0]
+    assert since.endswith("+00:00")
+
+
+def test_wide_leaves_a_row_flagged_for_full_parts(store):
+    path, conn, root, _removed, summarised = store
+    wide = _row(conn, root, "volumes.xlsx", _wide_dump())
+    _summarised(conn, wide, "2026-10-13T02:10:00+00:00")
+    conn.execute(
+        "INSERT INTO sync_metadata (key, value) VALUES (?, '2026-10-12')",
+        (f"{attachment_pipeline.FULL_PARTS_KEY}{wide}",),
+    )
+    conn.commit()
+
+    assert _run(path, root, "wide")["selected"] == 0
+
+
+def test_wide_is_priced_before_it_runs_and_a_dry_run_sets_no_mark(store):
+    path, conn, root, _removed, summarised = store
+    wide = _row(conn, root, "volumes.xlsx", _wide_dump())
+    _summarised(conn, wide, "2026-10-13T02:10:00+00:00")
+
+    est = rx.estimate_reextract(str(path), {"wide"})
+    dry = _run(path, root, "wide", dry_run=True)
+
+    assert (est["selected"], est["rows"], est["calls"]) == (1, 1, 1)  # one call over its digest
+    assert dry["selected"] == 1 and summarised == []
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM sync_metadata WHERE key = 'reextract_wide_since'"
+        ).fetchone()[0]
+        == 0
+    )
+
+
+def test_the_wide_flag_reaches_the_command(monkeypatch):
+    import sys
+
+    from src import cli
+
+    got: dict = {}
+    monkeypatch.setattr(cli, "cmd_reextract", lambda args: got.update(vars(args)))
+    monkeypatch.setattr(sys, "argv", ["brain", "maint", "reextract", "--wide", "--estimate"])
+
+    cli.main()
+
+    assert (got["wide"], got["estimate"]) == (True, True)

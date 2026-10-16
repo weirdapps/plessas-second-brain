@@ -294,11 +294,28 @@ def alias_targets(conn: sqlite3.Connection, ids) -> dict[int, int]:
             targets[int(key[len(ALIAS_PREFIX) :])] = int(str(value).strip())
         except ValueError:
             continue
-    from src.store.entities import entity_targets
-
     for pid, target in entity_targets(conn, [i for i in ids if i not in targets]).items():
         targets[pid] = target
     return targets
+
+
+def entity_targets(conn: sqlite3.Connection, ids) -> dict[int, int]:
+    """For people rows of `ids` that belong to an entity standing for another row (its
+    person_id, src/store/entities.py), that row. Empty on a store before v38."""
+    ids = sorted({int(i) for i in ids})
+    if not ids:
+        return {}
+    try:
+        rows = conn.execute(
+            "SELECT CAST(ea.value AS INTEGER), e.person_id FROM entity_aliases ea"
+            " JOIN entities e ON e.id = ea.entity_id"
+            " WHERE ea.kind = 'person' AND e.person_id IS NOT NULL"
+            " AND ea.value IN (SELECT CAST(value AS TEXT) FROM json_each(?))",
+            (json.dumps(ids),),
+        ).fetchall()
+    except sqlite3.OperationalError:  # a store without the entity tables
+        return {}
+    return {pid: target for pid, target in rows if pid != target}
 
 
 def _email_counts(conn: sqlite3.Connection, ids) -> dict[int, int]:

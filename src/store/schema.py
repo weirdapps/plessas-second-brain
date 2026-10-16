@@ -1000,7 +1000,8 @@ MEMORY_TABLES = (
         id INTEGER PRIMARY KEY,
         item_table TEXT NOT NULL,
         item_id INTEGER NOT NULL,
-        label TEXT NOT NULL CHECK (label IN ('duplicate_of', 'superseded_by', 'completed_by')),
+        label TEXT NOT NULL
+            CHECK (label IN ('duplicate_of', 'superseded_by', 'completed_by', 'contested_by')),
         target_id INTEGER,
         target_ref TEXT,
         evidence TEXT,

@@ -304,10 +304,13 @@ def _teams_thread(conn, closer_mri):
 
 @pytest.mark.parametrize(
     ("closer_mri", "status"),
-    [("8:orgid:mallory", "open"), ("8:orgid:olga", "done")],
-    ids=["a mismatching MRI", "the owner's MRI"],
+    [("8:orgid:mallory", "open"), ("8:orgid:olga", "open")],
+    ids=["a mismatching MRI", "an MRI resolved to the owner"],
 )
-def test_a_teams_message_closes_only_under_the_owners_mri(conn, model, closer_mri, status):
+def test_no_teams_message_closes_an_owners_action(conn, model, closer_mri, status):
+    """The store keeps no MRI of the signed-in owner, and teams_mri_resolution comes from
+    address and name lookups: no Teams message is the owner's, so none closes his action,
+    under the owner's display name or not."""
     _thread_id, action = _teams_thread(conn, closer_mri)
     model.labels = lambda user: [
         {

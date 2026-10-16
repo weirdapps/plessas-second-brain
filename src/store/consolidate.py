@@ -30,21 +30,30 @@ hostile email must not be able to erase what the owner owes or decided. So:
   prompt says that text is data.
 - Each label is checked in code after the reply and before anything is written
   (check_labels). The target is in the thread and current. `completed_by` names a message
-  after the item's own, whose stored text holds the quote word for word (case and spacing
-  aside, quote_in), and whose sender may close the item (may_close). `superseded_by`
-  names a later item whose own text or message holds the quote, from a message whose
-  sender was already on the thread (may_supersede); only a decision made supersedes a
-  decision made. `duplicate_of` keeps the more settled item, and the duplicate must
-  overlap its target by MODEL_DUP_JACCARD and hold no number its target lacks.
+  strictly after the item's own, by order and by date, both known (an item with no
+  message of its own, as in Teams and WhatsApp, is never closed), whose stored text holds
+  the quote word for word (case and spacing aside, quote_in), and whose sender may close
+  the item (may_close). `superseded_by` names a strictly later item whose own text or
+  message holds the quote, from a message of the owner's or of someone already on the
+  thread (may_supersede); only a decision made supersedes a decision made; and an item
+  from the owner's own message is superseded only by an item from another of his, or
+  when he wrote in the thread after it; otherwise it is `contested_by` the other, logged
+  and left as it is. `duplicate_of` keeps the more settled item and never hides the
+  owner's behind someone else's; the duplicate must overlap its target by
+  MODEL_DUP_JACCARD, hold no number its target lacks, and agree with it on negation.
 - Who sent a message is its machine identifier, read from its stored row, never a name:
-  the sender address of an email, the MRI of a Teams message, the JID of a WhatsApp one
-  (or the phone's own is_from_me). The owner is an address BRAIN_USER_EMAIL_PATTERN lists,
-  an MRI resolved to one, or is_from_me. A closing sender must have been on the thread
-  before, by identifier, and be the owner or a party the item names by identifier (a
-  commitment's by_person_id or to_person_id row with an address); an action names no one
-  so, and only the owner closes it. A display name, a name in a body or extracted by the
-  model, a people row with no address, a missing or unparseable identifier: none
-  authorizes anything, and no setting turns the check off.
+  the From address of an email, the MRI of a Teams message, the JID of a WhatsApp one.
+  The owner is an email from an address BRAIN_USER_EMAIL_PATTERN lists (in any folder:
+  he copies himself and clears Sent Items), or a WhatsApp message is_from_me; never a
+  Teams message, as the store keeps no MRI of the signed-in owner. Anyone else closing an
+  item must have been on the thread before, by identifier (the sender of an earlier
+  message, or someone the owner wrote to), and be a party the item names by identifier:
+  a commitment's by_person_id or to_person_id row whose address is the From of the
+  commitment's own email, the extracted name agreeing with that header's. An action names
+  no party so, and only the owner closes it. A display name, a name in a body or
+  extracted by the model, a recipient list, a people row with no address, a missing or
+  unparseable identifier, order or date: none authorizes anything, and no setting turns
+  the check off.
 - A reply that would mark more than MAX_LABEL_SHARE of the items it was shown, or more
   than MAX_LABELS_PER_CALL, is applied not at all: the thread waits in model_state
   'review' with the labels in consolidation_threads.review.
@@ -124,6 +133,8 @@ DEFAULT_EFFORT = "low"
 QUOTE_MATCH = 0.6
 
 LABELS = ("duplicate_of", "superseded_by", "completed_by")
+# What a reply may label; contested_by is ours, recorded and hiding nothing.
+WRITTEN_LABELS = (*LABELS, "contested_by")
 
 
 def _now() -> str:
@@ -226,6 +237,7 @@ class Message:
     sender_id: str | None = None
     sender_is_owner: bool = False
     people_ids: frozenset[str] = frozenset()
+    header_name: str = ""  # an email's From display name, for matching a named party
 
 
 @dataclass
@@ -245,6 +257,7 @@ class Item:
     # people rows by_person_id and to_person_id name, when those rows have one.
     by_id: str | None = None
     to_id: str | None = None
+    owner_sourced: bool = False  # taken from a message the owner sent
     canonical_id: int | None = None
     superseded_by: int | None = None
     invalid_at: str | None = None
@@ -321,11 +334,8 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
 
-def _item(
-    table: str, row: dict, date: str, message: str | None, party: dict[int, str] | None = None
-) -> Item:
+def _item(table: str, row: dict, date: str, message: str | None) -> Item:
     text = row.get(TEXT_COLUMN[table]) or ""
-    party = party or {}
     tokens, numbers = _words(text)
     if table == "decisions":
         who, due = row.get("decided_by"), None
@@ -347,8 +357,6 @@ def _item(
         due=due,
         evidence=row.get("evidence"),
         direction=row.get("direction"),
-        by_id=party.get(row.get("by_person_id")),  # type: ignore[arg-type]
-        to_id=party.get(row.get("to_person_id")),  # type: ignore[arg-type]
         canonical_id=row.get("canonical_id"),
         superseded_by=row.get("superseded_by"),
         invalid_at=row.get("invalid_at"),
@@ -405,36 +413,6 @@ def _owner_address(identifier: str | None) -> bool:
     return is_owner_address(identifier.removeprefix("address:"), config.USER_EMAIL_PATTERN)
 
 
-def _email_people(conn: sqlite3.Connection, ids: list[int]) -> dict[int, set[str]]:
-    """Who was on each email, by the address of their people row (sender, recipients and
-    cc); a row with no address (a mention) is no one here."""
-    out: dict[int, set[str]] = defaultdict(set)
-    for row in _dicts(
-        conn,
-        "SELECT ep.email_id, p.email FROM email_people ep JOIN people p ON p.id = ep.person_id"
-        " WHERE ep.email_id IN (SELECT value FROM json_each(?))"
-        " AND ep.role_in_email IN ('sender', 'recipient', 'cc')",
-        (json.dumps(ids),),
-    ):
-        identifier = address_id(row["email"])
-        if identifier:
-            out[row["email_id"]].add(identifier)
-    return out
-
-
-def _people_ids(conn: sqlite3.Connection, ids) -> dict[int, str]:
-    """The identifier of each people row of `ids` that has an address or a JID."""
-    found = {}
-    for pid, email in conn.execute(
-        "SELECT id, email FROM people WHERE id IN (SELECT value FROM json_each(?))",
-        (json.dumps(sorted({int(i) for i in ids if i is not None})),),
-    ):
-        identifier = address_id(email)
-        if identifier:
-            found[pid] = identifier
-    return found
-
-
 def _whatsapp_id(row: dict) -> str | None:
     if row.get("is_from_me"):
         return "owner:whatsapp"
@@ -442,18 +420,91 @@ def _whatsapp_id(row: dict) -> str | None:
     return f"jid:{jid}" if jid else None
 
 
-def _owner_mris(conn: sqlite3.Connection, mris) -> set[str]:
-    """Which of these Teams MRIs resolve to an address of the owner's, by the resolution
-    table's address or its people row's."""
-    out = set()
-    for mri, email, person_email in conn.execute(
-        "SELECT r.mri, r.email, p.email FROM teams_mri_resolution r"
-        " LEFT JOIN people p ON p.id = r.person_id WHERE r.mri IN (SELECT value FROM json_each(?))",
-        (json.dumps(sorted(set(mris))),),
+def _owner_recipients(conn: sqlite3.Connection, emails: list[dict]) -> dict[int, set[str]]:
+    """The recipients and cc, by address, of each email the owner sent."""
+    ids = [e["id"] for e in emails if _owner_address(address_id(e["sender_address"]))]
+    out: dict[int, set[str]] = defaultdict(set)
+    if not ids:
+        return out
+    for email_id, address in conn.execute(
+        "SELECT ep.email_id, p.email FROM email_people ep JOIN people p ON p.id = ep.person_id"
+        " WHERE ep.email_id IN (SELECT value FROM json_each(?))"
+        " AND ep.role_in_email IN ('recipient', 'cc')",
+        (json.dumps(ids),),
     ):
-        if any(_owner_address(address_id(a)) for a in (email, person_email)):
-            out.add(mri)
+        identifier = address_id(address)
+        if identifier:
+            out[email_id].add(identifier)
     return out
+
+
+def _email_message(e: dict, recipients: set[str]) -> Message:
+    """An email as a message. Its sender is the address in its From header, and it is the
+    owner's when that address is one BRAIN_USER_EMAIL_PATTERN lists, in any folder: he
+    clears Sent Items and copies himself, so his own mail is stored from the Inbox and
+    the Archive too. The export keeps no authentication signal to test the address
+    against (no Authentication-Results, no Sender beside From; the Message-ID is the
+    sender's to choose and absent on about 10k of his stored copies), so a forged From is
+    the tenant's mail edge (DMARC) to stop, not this module."""
+    sender_id = address_id(e["sender_address"])
+    owner_copy = _owner_address(sender_id)
+    return Message(
+        ref=f"email:{e['id']}",
+        date=e["date_received"] or "",
+        sender=e["sender_name"] or e["sender_address"] or "",
+        text=" || ".join(
+            part
+            for part in (_cut(e["summary"], MESSAGE_CHARS), _cut(e["content"], MESSAGE_CHARS))
+            if part
+        ),
+        stored="\n".join(part for part in (e["summary"], e["content"]) if part),
+        sender_id=sender_id,
+        sender_is_owner=owner_copy,
+        # The From header, and for the owner's mail the people he wrote to: the store keeps
+        # no recipient list apart from the people rows extraction also writes, so only the
+        # owner's own mail vouches for its recipients.
+        people_ids=frozenset(
+            ({sender_id} if sender_id else set()) | (recipients if owner_copy else set())
+        ),
+        header_name=e["sender_name"] or "",
+    )
+
+
+def _verified_parties(conn: sqlite3.Connection, thread: Thread, rows: list[dict]) -> None:
+    """Set each commitment's by_id and to_id: the address of the people row it names, only
+    when that address is the From address of the commitment's own email and the name the
+    extraction gave agrees with that header's display name. Any other party, a recipient,
+    a name extraction found in the text, a row with no address, is none."""
+    from src.store.transliterate import name_words, names_agree
+
+    people = {
+        pid: (name or "", email)
+        for pid, name, email in conn.execute(
+            "SELECT id, name, email FROM people WHERE id IN (SELECT value FROM json_each(?))",
+            (
+                json.dumps(
+                    sorted(
+                        {r[c] for r in rows for c in ("by_person_id", "to_person_id") if r.get(c)}
+                    )
+                ),
+            ),
+        )
+    }
+    by_id = {r["id"]: r for r in rows}
+    for item in thread.items:
+        if item.table != "commitments" or item.id not in by_id:
+            continue
+        row, source = by_id[item.id], thread.post(item.message)
+        if source is None or not source.sender_id:
+            continue
+        for side in ("by", "to"):
+            pid, said = row.get(f"{side}_person_id"), row.get(f"{side}_person")
+            if pid not in people:
+                continue
+            name, email = people[pid]
+            agree = names_agree(name_words(said or name), name_words(source.header_name))
+            if address_id(email) == source.sender_id and agree:
+                setattr(item, f"{side}_id", source.sender_id)
 
 
 def load_thread(conn: sqlite3.Connection, key: str) -> Thread | None:
@@ -466,47 +517,27 @@ def load_thread(conn: sqlite3.Connection, key: str) -> Thread | None:
         emails = _dicts(
             conn,
             f"SELECT e.id, e.date_received, e.sender_name, e.sender_address, e.subject,"
-            f" e.summary, e.content FROM emails e WHERE e.{where}"
+            f" e.summary, e.content, e.mailbox_name FROM emails e WHERE e.{where}"
             f" AND NOT {_itemless_sql(conn)} ORDER BY e.date_received, e.id",
             (arg,),
         )
         if not emails:
             return None
-        people = _email_people(conn, [e["id"] for e in emails])
-        messages = [
-            Message(
-                ref=f"email:{e['id']}",
-                date=e["date_received"] or "",
-                sender=e["sender_name"] or e["sender_address"] or "",
-                text=" || ".join(
-                    part
-                    for part in (
-                        _cut(e["summary"], MESSAGE_CHARS),
-                        _cut(e["content"], MESSAGE_CHARS),
-                    )
-                    if part
-                ),
-                stored="\n".join(part for part in (e["summary"], e["content"]) if part),
-                sender_id=address_id(e["sender_address"]),
-                sender_is_owner=_owner_address(address_id(e["sender_address"])),
-                people_ids=frozenset(
-                    {i for i in [address_id(e["sender_address"])] if i} | people.get(e["id"], set())
-                ),
-            )
-            for e in emails
-        ]
+        written_to = _owner_recipients(conn, emails)
+        messages = [_email_message(e, written_to.get(e["id"], set())) for e in emails]
         dates = {e["id"]: e["date_received"] or "" for e in emails}
         rows = _items_where(conn, "email_id", list(dates))
-        party = _people_ids(
-            conn,
-            [r.get(c) for r in rows["commitments"] for c in ("by_person_id", "to_person_id")],
-        )
         items = [
-            _item(table, row, dates[row["email_id"]], f"email:{row['email_id']}", party)
+            _item(table, row, dates[row["email_id"]], f"email:{row['email_id']}")
             for table in STATE_TABLES
             for row in rows[table]
         ]
-        return Thread(key, "email", emails[-1]["subject"] or "", messages, _ordered(items))
+        loaded = Thread(key, "email", emails[-1]["subject"] or "", messages, _ordered(items))
+        _verified_parties(conn, loaded, rows["commitments"])
+        owners = {m.ref for m in messages if m.sender_is_owner}
+        for item in loaded.items:
+            item.owner_sourced = item.message in owners
+        return loaded
     if kind == "teams":
         found = _dicts(
             conn, "SELECT id, started_at, title FROM teams_threads WHERE id = ?", (int(ident),)
@@ -522,7 +553,9 @@ def load_thread(conn: sqlite3.Connection, key: str) -> Thread | None:
             " ORDER BY composed_at, id",
             (thread["id"],),
         )
-        owner_mris = _owner_mris(conn, [r["sender_mri"] for r in rows_m if r["sender_mri"]])
+        # The store records no MRI of the signed-in owner (teams-cli reports none it keeps),
+        # and teams_mri_resolution comes from address and name lookups: no Teams message
+        # is the owner's, until the session's own MRI is stored.
         messages = [
             Message(
                 f"teams_message:{r['id']}",
@@ -531,7 +564,7 @@ def load_thread(conn: sqlite3.Connection, key: str) -> Thread | None:
                 text,
                 stored=r["content_text"] or "",
                 sender_id=f"mri:{r['sender_mri']}" if r["sender_mri"] else None,
-                sender_is_owner=bool(r["sender_mri"]) and r["sender_mri"] in owner_mris,
+                sender_is_owner=False,
                 people_ids=frozenset({f"mri:{r['sender_mri']}"} if r["sender_mri"] else set()),
             )
             for r in rows_m
@@ -631,8 +664,17 @@ _SETTLED = {"made"}
 _OPEN_DECISION = {"proposed", "requested"}
 
 
+# Words that turn a statement round: two items that differ in them say opposite things
+# ('approve the plan', 'do not approve the plan'), folded as fact_text folds.
+NEGATIONS = frozenset(
+    {"not", "no", "never", "cannot", "without", "nor", "δεν", "μην", "μη", "οχι", "ουτε", "χωρισ"}
+)
+
+
 def _compatible(a: Item, b: Item) -> bool:
     """Whether two alike items can be one item: nothing about them disagrees."""
+    if (a.tokens & NEGATIONS) != (b.tokens & NEGATIONS):
+        return False
     if a.table == "decisions":
         if a.status and b.status and a.status != b.status:
             return False
@@ -657,7 +699,9 @@ def _rank(item: Item) -> int:
 
 
 def _canonical_key(item: Item) -> tuple:
-    return (_rank(item), item.date, item.id)
+    """The canonical of a cluster: the most settled, then the owner's, then the earliest;
+    a copy by someone else never hides the owner's."""
+    return (_rank(item), not item.owner_sourced, item.date, item.id)
 
 
 def _clusters(items: list[Item]) -> list[list[Item]]:
@@ -804,6 +848,8 @@ def write_label(conn: sqlite3.Connection, label: Label, thread_key: str, run_id:
             )
             if not cur.rowcount:
                 return False
+    elif label.label == "contested_by":
+        pass  # recorded, and the item stays as it is
     else:
         raise ValueError(f"not a label: {label.label}")
     _log(conn, label, prior, thread_key, run_id)
@@ -1035,14 +1081,31 @@ def quote_in(quote: str | None, text: str | None) -> bool:
 # --- who may close or supersede what ---------------------------------------------------
 #
 # Identity comes from machine identifiers alone, read from the stored rows: an email's
-# sender address, a Teams sender's MRI, a WhatsApp sender's JID (or the device's own
-# is_from_me). A display name, a name in a body, a name the model extracted and a people
-# row with no address never authorize anything. Whatever cannot be told is refused.
+# From address, a Teams sender's MRI, a WhatsApp sender's JID (or the phone's own
+# is_from_me). The owner is an email from an address he lists (any folder), a WhatsApp
+# message is_from_me; a Teams message never, since the store keeps no MRI of the
+# signed-in owner. A display name, a name in a body, a name
+# extraction found, a recipient list and a people row with no address authorize nothing.
+# Whatever cannot be told, an identifier, an order or a date, is refused.
+
+
+def _index(thread: Thread, ref: str | None) -> int | None:
+    refs = [m.ref for m in thread.posts]
+    return refs.index(ref) if ref in refs else None
+
+
+def _after(thread: Thread, later: Message | None, earlier: Message | None) -> bool:
+    """Whether `later` comes strictly after `earlier` in the thread, both by their order and
+    by their dates; False when either message, its place or its date is unknown."""
+    if later is None or earlier is None or not later.date or not earlier.date:
+        return False
+    i, j = _index(thread, later.ref), _index(thread, earlier.ref)
+    return i is not None and j is not None and i > j and later.date > earlier.date
 
 
 def _participant(thread: Thread, message: Message) -> bool:
     """Whether the sender of `message` was on the thread before it, by identifier: the
-    sender, recipients or cc (people rows with an address) of an earlier message."""
+    sender of an earlier message, or someone the owner wrote to in an earlier copy of his."""
     if not message.sender_id:
         return False
     for post in thread.posts:
@@ -1054,25 +1117,33 @@ def _participant(thread: Thread, message: Message) -> bool:
 
 
 def may_close(item: Item, message: Message, thread: Thread) -> bool:
-    """Whether `message` can show `item` (an action or a commitment) done: its sender, by
-    the identifier on its stored row, was on the thread before it, and is the owner or a
-    party the item names by identifier (a commitment's giver or receiver whose people row
-    has an address). An action names no one by identifier, so only the owner closes one.
-    No identifier, no party, no close."""
-    if not message.sender_id or not _participant(thread, message):
+    """Whether `message` can show `item` (an action or a commitment) done: a message the
+    owner sent (from an address he lists, is_from_me), or a sender who sent an earlier
+    message of the thread
+    and is the party the commitment names by identifier (by_id, to_id: the From address of
+    its own email, the name agreeing). An action names no party so: only the owner closes
+    it. No identifier, no party, no close."""
+    if not message.sender_id:
         return False
     if message.sender_is_owner:
         return True
-    parties = {i for i in (item.by_id, item.to_id) if i}
-    return message.sender_id in parties
+    if not _participant(thread, message):
+        return False
+    return message.sender_id in {i for i in (item.by_id, item.to_id) if i}
 
 
 def may_supersede(other: Item, thread: Thread) -> bool:
-    """Whether `other` can supersede an item of its thread: it was taken from a message of
-    the thread whose sender, by identifier, was on the thread before it. A Teams or
-    WhatsApp item comes from no one message, so it supersedes nothing."""
+    """Whether `other` can supersede an item of its thread: taken from a message the owner
+    sent, or from one whose sender was on the thread before it. A Teams or WhatsApp item comes from
+    no one message, so it supersedes nothing."""
     source = thread.post(other.message)
-    return source is not None and _participant(thread, source)
+    return source is not None and (source.sender_is_owner or _participant(thread, source))
+
+
+def owner_replied_after(thread: Thread, ref: str | None) -> bool:
+    """Whether a message the owner sent comes after message `ref` in the thread."""
+    at = _index(thread, ref)
+    return at is not None and any(m.sender_is_owner for m in thread.posts[at + 1 :])
 
 
 # --- checking a reply --------------------------------------------------------------------
@@ -1105,31 +1176,22 @@ def over_cap(labels: list[Label], prompt: Prompt) -> bool:
     """Whether a reply marks too much of what it was shown to be applied unseen: more than
     MAX_LABELS_PER_CALL labels, or more than MAX_LABEL_SHARE of the items shown once it
     marks more than UNCAPPED_LABELS (a request and its 'done' is a whole small thread)."""
-    n = len(labels)
+    n = sum(label.label != "contested_by" for label in labels)  # those hide nothing
     return n > MAX_LABELS_PER_CALL or (
         n > UNCAPPED_LABELS and n > MAX_LABEL_SHARE * max(1, len(prompt.items))
     )
 
 
-def _after(thread: Thread, later: str | None, earlier: str | None) -> bool:
-    """Whether message `later` comes after message `earlier` in the thread; true when the
-    earlier one is not known (a Teams or WhatsApp item comes from the whole session)."""
-    refs = [m.ref for m in thread.posts]
-    if earlier is None or earlier not in refs:
-        return True
-    return later in refs and refs.index(later) > refs.index(earlier)
-
-
 def _check_one(item, label, target, evidence, prompt, thread) -> Label | None:
     quote = _cut(str(evidence or ""), QUOTE_CHARS) or None
+    source = thread.post(item.message)  # where the item was taken from; None for Teams/WhatsApp
     if label == "completed_by":
         message = prompt.posts.get(target)
         if (
             item.table not in ("action_items", "commitments")
             or item.status == "done"
             or message is None
-            or not _after(thread, message.ref, item.message)
-            or (item.date and message.date and message.date < item.date)
+            or not _after(thread, message, source)  # strictly later, both known
             or not quote_in(quote, message.stored)
             or not may_close(item, message, thread)
         ):
@@ -1149,26 +1211,36 @@ def _check_one(item, label, target, evidence, prompt, thread) -> Label | None:
     if label == "duplicate_of":
         if (
             _rank(other) > _rank(item)  # a proposal does not absorb a decision made
+            or (item.owner_sourced and not other.owner_sourced)  # nor anyone the owner's
             or _jaccard(item.tokens, other.tokens) < MODEL_DUP_JACCARD
             or not item.numbers <= other.numbers  # nor a richer item a poorer one
             or not _compatible(item, other)
         ):
             return None
         return Label(item.table, item.id, label, "model", target_id=other.id)
-    # superseded_by: by a later item of the thread, on its own words or its message's
-    if other.date < item.date or (other.date == item.date and other.message == item.message):
-        return None
-    if other.message is not None and not _after(thread, other.message, item.message):
+    # superseded_by: by a later item of the thread, both from known messages in order
+    later = thread.post(other.message)
+    if not _after(thread, later, source):
         return None
     if item.table == "decisions" and item.status in _SETTLED and other.status not in _SETTLED:
         return None  # only a decision made supersedes a decision made
     if item.table == "decisions" and other.status in _OPEN_DECISION and item.status is None:
         return None
-    source = thread.post(other.message)
     if not may_supersede(other, thread):
         return None
-    if not (quote_in(quote, other.text) or (source is not None and quote_in(quote, source.stored))):
+    assert later is not None  # _after checked it
+    if not (quote_in(quote, other.text) or quote_in(quote, later.stored)):
         return None
+    if (
+        item.owner_sourced
+        and not other.owner_sourced
+        and not owner_replied_after(thread, later.ref)
+    ):
+        # The owner's own item, changed by someone else and not taken up by him since:
+        # recorded, not hidden.
+        return Label(
+            item.table, item.id, "contested_by", "model", target_id=other.id, evidence=quote
+        )
     return Label(
         item.table,
         item.id,

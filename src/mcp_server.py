@@ -64,6 +64,7 @@ from src.mcp_results import (
 )
 from src.store import envelope
 from src.store.calendar_query import ATTENDEES_MAX, ATTENDEES_SHOWN
+from src.store.consolidate import hidden_ids, history_left_out
 from src.store.schema import get_connection
 from src.store.sql_readonly import connect_read_only
 
@@ -682,8 +683,6 @@ def _history_probe(
     gives with include_history, how many the current-state filter left out (and, for a
     list of open actions, `done_too`, how many are marked done); `at_least` when that probe
     read its whole limit. None when it left out none."""
-    from src.store.consolidate import hidden_ids, history_left_out
-
     hidden = hidden_ids(conn, table, [row.get(key) for row in probe])
     if done_too:
         hidden |= {int(row[key]) for row in probe if row.get("status") == "done"}
@@ -1081,6 +1080,7 @@ def recall(
     include_automation: IncludeAutomation = False,
     kinds: RecallKinds = None,
     detail: Detail = "full",
+    include_history: IncludeHistory = False,
 ) -> RecallResult:
     """Tell me everything we know about X: one search across every index, the default first call.
 
@@ -1136,6 +1136,7 @@ def recall(
             include_news=include_news,
             include_automation=include_automation,
             kinds=kinds,
+            include_history=include_history,
         )
         fresh = _header(conn)
         excluded = None
@@ -1519,8 +1520,6 @@ def stale_threads(
                 - (out["overdue_actions_total"])
             )
             if left > 0:
-                from src.store.consolidate import history_left_out
-
                 out["history_left_out"] = {"overdue_actions": history_left_out(left)}
         if not USER_EMAIL_PATTERN:
             out["stale_threads_unavailable"] = (

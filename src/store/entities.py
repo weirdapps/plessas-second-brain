@@ -56,6 +56,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from src.store.person_resolve import ALIAS_PREFIX
+from src.store.person_resolve import entity_targets as _entity_targets
 
 # Mail services anyone has an address at: no organisation.
 PUBLIC_DOMAINS = frozenset(
@@ -154,20 +155,8 @@ def entity_person_ids(conn: sqlite3.Connection, person_id: int) -> list[int]:
     return [person_id] + sorted(existing - {person_id})
 
 
-def entity_targets(conn: sqlite3.Connection, ids) -> dict[int, int]:
-    """For people rows of `ids` that belong to an entity standing for another row (its
-    person_id), that row."""
-    ids = sorted({int(i) for i in ids})
-    if not ids or not _has_tables(conn):
-        return {}
-    rows = conn.execute(
-        "SELECT CAST(ea.value AS INTEGER), e.person_id FROM entity_aliases ea"
-        " JOIN entities e ON e.id = ea.entity_id"
-        " WHERE ea.kind = 'person' AND e.person_id IS NOT NULL"
-        " AND ea.value IN (SELECT CAST(value AS TEXT) FROM json_each(?))",
-        (json.dumps(ids),),
-    )
-    return {pid: target for pid, target in rows if pid != target}
+# entity_targets lives in src/store/person_resolve.py, which resolves through it.
+entity_targets = _entity_targets
 
 
 # --- the seed -------------------------------------------------------------------------------
@@ -280,6 +269,29 @@ def _whole_identity_named(identity_name: str, mention) -> bool:
     return True
 
 
+# The owner must have written to an address this many times before a name joins it.
+MIN_OWNER_MAILS = 2
+
+
+def established_correspondents(conn: sqlite3.Connection) -> set[int]:
+    """The people rows the owner has written to (recipient or cc) in MIN_OWNER_MAILS emails
+    or more, his own mail being that from an address BRAIN_USER_EMAIL_PATTERN lists, in
+    any folder. Empty without the pattern: then no name joins anyone by rule."""
+    from src import config
+    from src.store.owner import owner_address_sql
+
+    sent_by_owner, params = owner_address_sql("e.sender_address", config.USER_EMAIL_PATTERN)
+    rows = conn.execute(
+        f"""SELECT ep.person_id FROM email_people ep
+            JOIN people p ON p.id = ep.person_id AND COALESCE(p.email, '') <> ''
+            WHERE ep.role_in_email IN ('recipient', 'cc')
+              AND ep.email_id IN (SELECT e.id FROM emails e WHERE {sent_by_owner})
+            GROUP BY ep.person_id HAVING COUNT(DISTINCT ep.email_id) >= ?""",
+        (*params, MIN_OWNER_MAILS),
+    )
+    return {r[0] for r in rows}
+
+
 def plan_seed(conn: sqlite3.Connection) -> Plan:
     """What seed_entities would write, read from the store as it is. Writes nothing."""
     from src.store.person_aliases import _aliased, _shared_threads
@@ -347,7 +359,8 @@ def plan_seed(conn: sqlite3.Connection) -> Plan:
         for mri in mris.get(pid, ()):
             join(entity, "mri", mri, "identity")
 
-    # 2. mentions joined to an identity
+    # 2. mentions joined to an identity: one alone fits, and the owner has written to it
+    established = established_correspondents(conn)
     reviewed = alias_targets(conn, [p for p in index.names if p not in index.kinds])
     aliased = _aliased(conn)
     unfit: list[int] = []
@@ -367,24 +380,25 @@ def plan_seed(conn: sqlite3.Connection) -> Plan:
         if not fits:
             unfit.append(pid)
             continue
-        whole = sum(not w.initial for w in words)
-        if len(fits) == 1 and whole >= 2:
-            (identity,) = fits
-            if _whole_identity_named(index.names[identity], words):
-                join(entity_of[identity], "person", str(pid), "translit")
-                continue
-        shared, total = _shared_threads(conn, pid, fits)
-        enough = {
-            identity
-            for identity, n in shared.items()
-            if n and (whole >= 2 or n >= ONE_WORD_SHARE * total)
-        }
-        if len(enough) == 1:
-            (identity,) = enough
-            join(entity_of[identity], "person", str(pid), "thread")
-        elif len(fits) > 1 or enough:
-            plan.ambiguous[pid] = sorted(enough or fits)
+        if len(fits) > 1:
+            # Two identities fit: the name is ambiguous and joins nothing by rule. A display
+            # name is anyone's to set, so a second identity named as a colleague must not
+            # steer the colleague's mentions.
+            plan.ambiguous[pid] = sorted(fits)
             plan.counts["ambiguous"] += 1
+            continue
+        (identity,) = fits
+        if identity not in established:
+            plan.counts["not_established"] += 1
+            continue
+        whole = sum(not w.initial for w in words)
+        if whole >= 2 and _whole_identity_named(index.names[identity], words):
+            join(entity_of[identity], "person", str(pid), "translit")
+            continue
+        shared, total = _shared_threads(conn, pid, fits)
+        n = shared.get(identity, 0)
+        if n and (whole >= 2 or n >= ONE_WORD_SHARE * total):
+            join(entity_of[identity], "person", str(pid), "thread")
         else:
             plan.counts["unshared"] += 1
 
@@ -489,12 +503,14 @@ def _fence():
 
 def eligible_candidates(conn: sqlite3.Connection, index, candidates) -> list[int]:
     """The candidates a mention may be joined to by the model: identities (an address or
-    MRI), each in an entity already, none of them the owner's."""
+    MRI) the owner has written to (established_correspondents), each in an entity already,
+    none of them the owner's."""
     owner_rows = set(owner_address_rows(index)) | set(index.owner_rows)
+    established = established_correspondents(conn)
     owner_entity = entity_of_person(conn, index.owner_id) if index.owner_id is not None else None
     out = []
     for pid in candidates:
-        if pid not in index.kinds or pid in owner_rows:
+        if pid not in index.kinds or pid in owner_rows or pid not in established:
             continue
         entity = entity_of_person(conn, pid)
         if entity is None or (owner_entity is not None and entity == owner_entity):

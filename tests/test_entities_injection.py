@@ -77,7 +77,15 @@ def _mention(conn, name, email_id):
     return pid
 
 
+def _correspond(conn, *contacts):
+    """The owner writes to each contact twice: they become established correspondents."""
+    for contact in contacts:
+        for n in range(2):
+            f.email(conn, subject=f"To {contact[0]} {n}", sender=OWNER, to=(contact,))
+
+
 def _setup(conn, name="Nikos Georgiou"):
+    _correspond(conn, NIKOS_A, NIKOS_B)
     f.email(conn, subject="A", sender=NIKOS_A, to=(OWNER,))
     f.email(conn, subject="B", sender=NIKOS_B, to=(OWNER,))
     other = f.email(conn, subject="C", sender=BOB, to=(OWNER,))
@@ -168,6 +176,7 @@ def test_the_owner_is_never_offered_even_in_a_crafted_plan(conn, model):
 
 def test_a_run_joins_at_most_the_cap_to_one_identity(conn, model, monkeypatch):
     monkeypatch.setattr(en, "MAX_MODEL_JOINS_PER_IDENTITY", 1)
+    _correspond(conn, NIKOS_A, NIKOS_B)
     f.email(conn, subject="A", sender=NIKOS_A, to=(OWNER,))
     f.email(conn, subject="B", sender=NIKOS_B, to=(OWNER,))
     other = f.email(conn, subject="C", sender=BOB, to=(OWNER,))

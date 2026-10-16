@@ -443,17 +443,22 @@ def test_a_message_from_before_the_item_completes_nothing(conn, model):
 
 
 def test_a_commitment_can_close(conn, model):
-    first, second = _thread(conn)
-    conn.execute("UPDATE emails SET summary = 'Bob booked the okapi venue' WHERE id = ?", (second,))
+    """Bob promised in his own email; his later email shows it done."""
+    _ask, promised, booked = _thread(conn, n=3)
+    conn.execute(
+        "UPDATE emails SET sender_name = ?, sender_address = ?, summary = ? WHERE id = ?",
+        (*BOB, "Bob booked the okapi venue", booked),
+    )
+    conn.commit()
     bob = conn.execute("SELECT id FROM people WHERE email = ?", (BOB[1],)).fetchone()[0]
     promise = _commitment(
-        conn, first, "Bob will book the okapi venue", by_person="Bob Jones", by_person_id=bob
+        conn, promised, "Bob will book the okapi venue", by_person="Bob Jones", by_person_id=bob
     )
     model.labels = lambda user: [
         {
             "item": _handle(user, "book the okapi venue"),
             "label": "completed_by",
-            "target": "M2",
+            "target": "M3",
             "evidence": "Bob booked the okapi venue",
         }
     ]
@@ -461,11 +466,12 @@ def test_a_commitment_can_close(conn, model):
     _backfill(conn, budget=TokenBudget(100_000))
 
     row = _row(conn, "commitments", promise)
-    assert (row["status"], row["closed_by"]) == ("done", f"email:{second}")
+    assert (row["status"], row["closed_by"]) == ("done", f"email:{booked}")
 
 
 def test_a_newer_value_supersedes_the_older_one(conn, model):
-    first, second = _thread(conn)
+    """Alice, who opened the thread, restates Bob's figure with a new value."""
+    _opening, first, second = _thread(conn, n=3)
     f.action_item(conn, "Approve the okapi budget", email_id=first)  # opens the gate
     old = _fact(conn, first, "Okapi pilot budget is 5000 euros")
     new = _fact(conn, second, "Okapi pilot budget is 7000 euros")

@@ -100,3 +100,10 @@ def test_an_empty_list_says_its_matches_were_history(store, tmp_path):
 
     assert out["result"] == []
     assert "include_history=true" in out["reason"]
+
+
+def test_recall_leaves_a_duplicate_decision_out_unless_asked(store):
+    rows = mcp_server.recall("okapi")["decisions"]
+    full = mcp_server.recall("okapi", include_history=True)["decisions"]
+
+    assert len(full) == len(rows) + 1

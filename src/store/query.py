@@ -12,8 +12,8 @@ from typing import Any
 
 from src.config import USER_EMAIL_PATTERN
 from src.store import envelope, ranking
-from src.store.cross_script import NameForms, name_forms
 from src.store.consolidate import current_sql, history_left_out, open_status_sql
+from src.store.cross_script import NameForms, name_forms
 from src.store.entities import entity_person_ids
 from src.store.greek import register_sql_functions, search_fold
 from src.store.item_cleanup import not_boilerplate_sql

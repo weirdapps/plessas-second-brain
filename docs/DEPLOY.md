@@ -1356,9 +1356,11 @@ environment the timers run with, in this order:
    step 5, put `BRAIN_CONSOLIDATE_SYNC_TOKENS=0` (the rules alone) in the timers'
    environment, and take it out after.
 2. **Entities.** `python -m src.cli maint entities` counts (no model call): on the
-   reference replica 8,143 new entities, 3,257 joins by the alias map, 219 by
-   transliteration, 21 by shared threads, 301 groups of mentions, 211 organisations and
-   1,669 ambiguous names, whose adjudication it prices (about $6). Then
+   reference replica 8,143 new entities, 3,257 joins by the alias map, 119 by
+   transliteration, 10 by shared threads, 301 groups of mentions, 211 organisations, 960
+   names fitting one identity the owner never wrote to (left alone) and 1,678 ambiguous
+   names, whose adjudication it prices (about $6). It needs `BRAIN_USER_EMAIL_PATTERN`:
+   without it no name joins anyone. Then
    `python -m src.cli maint entities --apply` (seconds), and
    `python -m src.cli maint entities --apply --adjudicate --token-budget 2500000`: one
    call per ambiguous name, 18 measured calls averaged 1,100 tokens. Its joins are

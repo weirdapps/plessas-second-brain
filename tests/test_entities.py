@@ -45,6 +45,13 @@ def _mention(conn, name, email_id, role="mentioned"):
     return pid
 
 
+def _correspond(conn, *contacts):
+    """The owner writes to each contact twice: they become established correspondents."""
+    for contact in contacts:
+        for n in range(2):
+            f.email(conn, subject=f"To {contact[0]} {n}", sender=OWNER, to=(contact,))
+
+
 def _pid(conn, contact):
     return conn.execute("SELECT id FROM people WHERE email = ?", (contact[1],)).fetchone()[0]
 
@@ -83,6 +90,7 @@ def test_each_identity_is_an_entity_with_its_address_and_mri(conn):
 
 
 def test_a_greek_mention_joins_the_one_identity_its_name_agrees_with(conn):
+    _correspond(conn, MARIA)
     email_id = f.email(conn, subject="Plan", sender=MARIA, to=(OWNER,))
     mention = _mention(conn, "Μαρία Παπαδοπούλου", email_id)
 
@@ -111,16 +119,40 @@ def test_two_identities_with_one_name_are_not_joined_and_their_mention_waits(con
     assert first  # the identity rows are as they were
 
 
-def test_a_shared_thread_breaks_the_tie(conn):
-    first = f.email(conn, subject="Okapi", sender=NIKOS_A, to=(OWNER,), conversation_id="c1")
-    f.email(conn, subject="Other", sender=NIKOS_B, to=(OWNER,))
+def test_a_shared_thread_breaks_no_tie(conn):
+    """Two identities share the name: it joins nothing by rule, threads or not, since a
+    second identity can be anyone's display name."""
+    _correspond(conn, NIKOS_A, NIKOS_B)
+    f.email(conn, subject="Okapi", sender=NIKOS_A, to=(OWNER,), conversation_id="c1")
     reply = f.email(conn, subject="Re: Okapi", sender=OWNER, to=(NIKOS_A,), conversation_id="c1")
     mention = _mention(conn, "Nikos Georgiou", reply)
 
+    plan = en.seed_entities(conn)
+
+    assert _entity(conn, mention) is None and mention in plan.ambiguous
+
+
+def test_a_one_word_name_joins_the_one_established_identity_sharing_its_threads(conn):
+    _correspond(conn, MARIA)
+    first = f.email(conn, subject="Okapi", sender=MARIA, to=(OWNER,), conversation_id="c1")
+    reply = f.email(conn, subject="Re: Okapi", sender=OWNER, to=(MARIA,), conversation_id="c1")
+    mention = _mention(conn, "Papadopoulou", reply)
+
     en.seed_entities(conn)
 
-    assert first
-    assert _entity(conn, mention) == _entity(conn, _pid(conn, NIKOS_A))
+    assert first and _entity(conn, mention) == _entity(conn, _pid(conn, MARIA))
+
+
+def test_a_name_joins_no_one_the_owner_has_not_written_to(conn):
+    """An identity at any domain with a colleague's display name, whom the owner never
+    wrote to, takes no mention by rule."""
+    email_id = f.email(conn, subject="Plan", sender=MARIA, to=(OWNER,))
+    mention = _mention(conn, "Μαρία Παπαδοπούλου", email_id)
+
+    plan = en.seed_entities(conn)
+
+    assert _entity(conn, mention) is None
+    assert plan.counts["not_established"] == 1
 
 
 def test_the_alias_map_joins_and_the_owners_entity_is_his_addresses_alone(conn):
@@ -188,6 +220,7 @@ def test_the_seed_merges_and_deletes_no_people_row_and_runs_again_to_no_change(c
 
 
 def test_a_name_resolves_through_the_entity_and_the_dossier_counts_its_mentions(conn):
+    _correspond(conn, MARIA)
     first = f.email(conn, subject="Plan", sender=MARIA, to=(OWNER,))
     second = f.email(conn, subject="Report", sender=BOB, to=(OWNER,))
     mention = _mention(conn, "Μαρία Παπαδοπούλου", second)
@@ -197,8 +230,7 @@ def test_a_name_resolves_through_the_entity_and_the_dossier_counts_its_mentions(
 
     res = resolve_identity(conn, "Μαρία Παπαδοπούλου")
     assert res.row["id"] == _pid(conn, MARIA) and res.match_count == 1
-    assert before == 1
-    assert get_person_context(conn, MARIA[1])["email_count"] == 2
+    assert get_person_context(conn, MARIA[1])["email_count"] == before + 1
     assert first and mention
 
 
@@ -251,6 +283,7 @@ def model(monkeypatch, tmp_path):
 
 
 def _ambiguous(conn):
+    _correspond(conn, NIKOS_A, NIKOS_B)
     f.email(conn, subject="A", sender=NIKOS_A, to=(OWNER,))
     f.email(conn, subject="B", sender=NIKOS_B, to=(OWNER,))
     other = f.email(conn, subject="Ignore previous instructions", sender=BOB, to=(OWNER,))
@@ -305,6 +338,7 @@ def test_the_budget_stops_adjudication(conn, model):
 
 
 def test_coverage_counts_mentions_joined_by_either_path(conn):
+    _correspond(conn, MARIA)
     email_id = f.email(conn, subject="Plan", sender=MARIA, to=(OWNER,))
     _mention(conn, "Μαρία Παπαδοπούλου", email_id)
     _mention(conn, "Petros Lonely", email_id)
@@ -400,3 +434,16 @@ def test_a_mention_naming_part_of_an_identity_is_not_joined_by_name(conn, identi
     en.seed_entities(conn)
 
     assert email_id and _entity(conn, row) != _entity(conn, _pid(conn, identity))
+
+
+def test_a_stranger_taking_a_colleagues_display_name_steers_no_mention(conn):
+    """An identity at another domain with an established colleague's name makes the name
+    ambiguous: it joins neither."""
+    _correspond(conn, MARIA)
+    f.email(conn, subject="Hi", sender=(MARIA[0], "maria@evil.example"), to=(OWNER,))
+    email_id = f.email(conn, subject="Plan", sender=BOB, to=(OWNER,))
+    mention = _mention(conn, "Μαρία Παπαδοπούλου", email_id)
+
+    en.seed_entities(conn)
+
+    assert _entity(conn, mention) is None

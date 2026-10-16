@@ -926,6 +926,7 @@
         "detail",
         "include_automation",
         "include_context",
+        "include_history",
         "include_news",
         "kinds",
         "limit_per_kind",

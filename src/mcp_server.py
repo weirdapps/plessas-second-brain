@@ -7,6 +7,7 @@ Run: python -m src.mcp_server
 import argparse
 import importlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -58,6 +59,7 @@ from src.mcp_results import (
     TeamsChat,
     TeamsThread,
     TopicContext,
+    TopicPage,
 )
 from src.store import envelope
 from src.store.calendar_query import ATTENDEES_MAX, ATTENDEES_SHOWN
@@ -83,11 +85,13 @@ for _module in (
     "src.store.context",
     "src.store.conversation_query",
     "src.store.embeddings",
+    "src.store.findings",
     "src.store.greek",
     "src.store.items",
     "src.store.query",
     "src.store.recall",
     "src.store.teams_query",
+    "src.store.topic_pages",
     "src.store.whatsapp_query",
 ):
     importlib.import_module(_module)
@@ -118,7 +122,9 @@ one short line per row for a quick scan. Use the specific tools when you know th
 kind (`search_emails`, `search_attachments`, `search_teams`, `search_whatsapp`, \
 `search_conversations`, `query_calendar_events`) or the entity (`person_context`, \
 `topic_context`, `meeting_prep`; `query_decisions` and `query_actions` for what was \
-decided and what is owed). Every row says its `kind` and `ref`, and \
+decided and what is owed). For where a live topic stands, `topic_page` first: a \
+page rebuilt nightly, each line citing its items, with the findings sessions filed \
+back (derived: check with get_item). Every row says its `kind` and `ref`, and \
 `get_item(kind, ref)` reads that item whole: an email's body with its thread and \
 attachments, an attachment's text a page at a time (`offset`), a Teams thread, a \
 WhatsApp session, a meeting with every attendee, a past conversation. For counts, \
@@ -757,7 +763,7 @@ def topic_context(
     owner's automation mail are left out unless included. When no tag matches,
     recall searches the text itself.
     """
-    from src.store.context import get_topic_context
+    from src.store.context import get_topic_context, topic_page_first
 
     _check_choice("detail", detail, ("full", "concise"))
     conn = _get_conn()
@@ -770,6 +776,8 @@ def topic_context(
             include_news=include_news,
             include_automation=include_automation,
         )
+        # The topic's page first, when one is held (topic_page reads it alone).
+        out = topic_page_first(conn, out)
         head = _header(conn)
         if out.get("topic") is None:
             reason = "No topic tag matched; recall searches the text itself."
@@ -781,6 +789,53 @@ def topic_context(
     if cover is not None:
         _say_empty(out, reason, cover)
     return cast(TopicContext, _sized(_headed(head, out), detail))
+
+
+@_tool()
+def topic_page(
+    topic: Annotated[
+        str,
+        Field(description="A live topic's name, or a topic tag it covers; part of one matches."),
+    ],
+) -> TopicPage:
+    """Where a live topic stands: a page a model wrote from the store's items (status, dated decisions, numbers with source and period, open questions, deliverables, superseded claims), each line citing its items as kind:ref, and the findings research sessions filed about it.
+
+    Pages exist for up to 20 live topics, rebuilt nightly when new items arrive;
+    built_at says how current one is. A page is derived: read a load-bearing line's
+    items with get_item. Findings rank below primary items; superseded_by marks one a
+    newer finding replaced. With no page, `reason` says so and `pages` lists the
+    topics that have one.
+    """
+    from src.store.findings import findings_matching
+    from src.store.greek import search_words
+    from src.store.normalizer import normalize_topic
+    from src.store.topic_pages import find_page, list_pages
+
+    conn = _get_conn()
+    try:
+        page = find_page(conn, topic)
+        names = [*page["members"], page["key"]] if page else [normalize_topic(topic)]
+        topic_ids = [
+            r[0]
+            for r in conn.execute(
+                "SELECT id FROM topics WHERE name IN (SELECT value FROM json_each(?))",
+                (json.dumps(names),),
+            )
+        ]
+        words = search_words(page["topic"] if page else topic)
+        found = findings_matching(conn, topic_ids=topic_ids, words=words)
+        out: dict = {"topic_page": page, "findings": found}
+        if page is None:
+            out["pages"] = list_pages(conn)
+            out["reason"] = (
+                "No page for this topic: pages are kept for the live topics only, listed "
+                "in `pages`. topic_context and recall read the items themselves."
+            )
+        elif not found:
+            out["reason"] = "No finding filed about this topic."
+        return cast(TopicPage, budget_response(_headed(_header(conn), out)))
+    finally:
+        conn.close()
 
 
 @_tool()

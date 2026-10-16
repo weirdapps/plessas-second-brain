@@ -27,8 +27,9 @@ from tests.mcp_listing import listed_tools, registered_tool
 
 def test_the_tool_count_is_unchanged():
     # 27 until recall_preference and recent_conversations were retired, 25 until
-    # get_item; five of those 26 are deprecated and go in the next release.
-    assert len(listed_tools()) == 26
+    # get_item, 26 until topic_page; five of those 27 are deprecated and go in the
+    # next release.
+    assert len(listed_tools()) == 27
 
 
 def test_every_tool_says_whether_it_reads_or_writes():
@@ -191,6 +192,7 @@ def store(tmp_path, monkeypatch):
 CALLS = {
     "person_context": {"name_or_email": "Alice"},
     "topic_context": {"topic": "okapi"},
+    "topic_page": {"topic": "okapi"},
     "sender_brief": {"name_or_email": "alice@example.com"},
     "email_thread": {"email_id": 1},
     "search_emails": {"query": "okapi"},

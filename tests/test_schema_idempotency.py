@@ -127,6 +127,17 @@ def _seed(conn: sqlite3.Connection) -> None:
                                        sender_name, is_from_me, sent_at, content)
             VALUES ('120000000000000001@g.us', 'w1', 1, 1, '30000000001@s.whatsapp.net',
                     'Carol Example', 0, '{started}', 'okapi tickets bought');
+        INSERT INTO figure_series (id, stem, sender, name, editions)
+            VALUES (1, 'okapi report', 'alice@example.com', 'Okapi report', 3);
+        INSERT INTO figure_editions (attachment_id, series_id, edition_date, status)
+            VALUES ({attachment_id}, 1, '{started}', 'parsed');
+        INSERT INTO figure_metrics (id, series_id, key, sheet, label, header)
+            VALUES (1, 1, 7, 'KPIs', 'Okapi sightings', '');
+        INSERT INTO figure_values (metric_id, period, period_end, period_source, value,
+                                   attachment_id, cell, text_offset)
+            VALUES (1, '2026-09', '2026-09-30', 'header', 42, {attachment_id}, 'R2C2', 4);
+        INSERT INTO figure_restated (metric_id, period, value, attachment_id, cell, text_offset)
+            VALUES (1, '2026-09', 41, {attachment_id}, 'R2C2', 4);
         """
     )
     conn.commit()

@@ -527,6 +527,13 @@ def cmd_briefs(args):
     return run(args)
 
 
+def cmd_figures_backfill(args):
+    """Read every report edition's figures into the numbers registry (src/store/figures.py)."""
+    from src.store.figures import cmd
+
+    return cmd(args)
+
+
 def cmd_utc_stamps(args):
     """Convert the attachment and sync stamps stored in local time to UTC (src/store/stamps.py)."""
     from src.store.stamps import cmd
@@ -1735,6 +1742,8 @@ READ_ONLY_COMMANDS = frozenset(
         # --dry-run reads; a pass that may mail refuses on a replica itself.
         "briefs",
         "findings",
+        # `brain maint figures-backfill`: the same; its dry run opens the store read-only.
+        "figures-backfill",
     }
 )
 
@@ -2929,6 +2938,31 @@ def main():
     from src.store.item_cleanup import add_maint_parsers
 
     add_maint_parsers(maint_subparsers)
+    # New with the numbers registry (schema v37): no old spelling to keep.
+    parser_figures = maint_subparsers.add_parser(
+        "figures-backfill",
+        help="Read the figures of every report edition held into the numbers registry "
+        "(no model call; a dry run unless --apply)",
+    )
+    figures_mode = parser_figures.add_mutually_exclusive_group()
+    figures_mode.add_argument("--dry-run", action="store_true", help="Count only (default)")
+    figures_mode.add_argument(
+        "--apply", action="store_true", help="Read them, committing each edition; resumable"
+    )
+    parser_figures.add_argument(
+        "--estimate",
+        action="store_true",
+        help="With the dry run, parse a sample of editions to project figures and time",
+    )
+    parser_figures.add_argument(
+        "--limit", type=int, default=None, help="Read at most this many editions in this run"
+    )
+    parser_figures.add_argument(
+        "--reset",
+        action="store_true",
+        help="With --apply, forget every figure first and read them all again (a parser change)",
+    )
+    parser_figures.set_defaults(func=cmd_figures_backfill)
 
     # Parse and execute
     args = parser.parse_args()

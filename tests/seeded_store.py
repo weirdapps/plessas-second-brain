@@ -142,6 +142,19 @@ def build(path: Path, *, synced: str | None = None) -> Path:
                     '# okapi\n\n## Current status\n- The okapi plan was adopted [email:1]\n',
                     '[{{"ref": "email:1", "kind": "email", "date": "{mail}", "title": "Okapi plan"}}]',
                     '["email:1"]', '{reply}', '{mail}', 'abc123', 1, 0);
+        INSERT INTO figure_series (id, stem, sender, name, editions, first_date, last_date,
+                                   latest_period, latest_end)
+            VALUES (1, 'okapi report', 'alice@example.com', 'Okapi report', 3, '{news}',
+                    '{mail}', '2026-09', '2026-09-30');
+        INSERT INTO figure_editions (attachment_id, series_id, edition_date, status, figures,
+                                     parser)
+            VALUES (1, 1, '{mail}', 'parsed', 2, 1);
+        INSERT INTO figure_metrics (id, series_id, key, sheet, label, header)
+            VALUES (1, 1, 7, 'KPIs', 'Okapi sightings', '');
+        INSERT INTO figure_values (metric_id, period, period_end, period_source, value,
+                                   attachment_id, cell, text_offset)
+            VALUES (1, '2026-08', '2026-08-31', 'header', 40, 1, 'R2C2', 4),
+                   (1, '2026-09', '2026-09-30', 'header', 42, 1, 'R2C3', 8);
         """
     )
     conn.execute(
@@ -168,6 +181,7 @@ CALLS = {
     "stale_threads": {},
     "meeting_prep": {"people": "alice@example.com", "topic": "okapi"},
     "search_attachments": {"query": "okapi"},
+    "figures": {"query": "okapi"},
     "query_calendar_events": {"keyword": "okapi"},
     "stats": {},
     "search_conversations": {"query": "okapi"},

@@ -430,8 +430,27 @@ def run_phase1(
         stats["ids"].append(att_id)
 
     conn.commit()
+    figures = _ingest_figures(conn, stats["ids"])
+    if figures:
+        stats["figures"] = figures
     conn.close()
     return stats
+
+
+def _ingest_figures(conn: sqlite3.Connection, attachment_ids: list[int]) -> dict:
+    """The figures of the new workbooks that are editions of a report series, read from the text
+    just stored (src/store/figures.py), in a time box of their own. A failure is logged and
+    leaves them for `brain maint figures-backfill`: it never fails the text phase."""
+    if not attachment_ids:
+        return {}
+    try:
+        from src.store.figures import ingest_editions
+
+        return ingest_editions(conn, attachment_ids)
+    except Exception:
+        logger.exception("figures: new editions not read; figures-backfill will read them")
+        conn.rollback()
+        return {"error": 1}
 
 
 # What a Phase 2 call in shape v1 may answer with. Dense documents (large spreadsheets/decks)

@@ -27,9 +27,9 @@ from tests.mcp_listing import listed_tools, registered_tool
 
 def test_the_tool_count_is_unchanged():
     # 27 until recall_preference and recent_conversations were retired, 25 until
-    # get_item, 26 until topic_page; five of those 27 are deprecated and go in the
-    # next release.
-    assert len(listed_tools()) == 27
+    # get_item, 26 until topic_page, 27 until figures; five of those 28 are deprecated
+    # and go in the next release.
+    assert len(listed_tools()) == 28
 
 
 def test_every_tool_says_whether_it_reads_or_writes():
@@ -203,6 +203,7 @@ CALLS = {
     "stale_threads": {},
     "meeting_prep": {"people": "Alice Smith", "topic": "okapi"},
     "search_attachments": {"query": "okapi"},
+    "figures": {"query": "okapi"},
     "query_calendar_events": {"keyword": "okapi"},
     "stats": {},
     "search_conversations": {"query": "okapi"},

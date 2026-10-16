@@ -506,6 +506,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_item_state(conn)
     if current < 36:
         migrate_add_topic_pages(conn)
+    if current < 37:
+        migrate_add_figures(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -2452,3 +2454,153 @@ def _fts_update_trigger(fts: str, table: str, indexed: list[str], sources: list[
         f"VALUES('delete', old.id, {old_vals}); "
         f"INSERT INTO {fts}(rowid, {names}) VALUES (new.id, {new_vals}); END"
     )
+
+
+# The figures registry's search index reads its text from this view: a metric's sheet, row label
+# and column header, and its series' stem, all folded as every index in the store folds.
+FIGURE_SEARCH_COLUMNS = ("series_f", "sheet_f", "label_f", "header_f")
+
+
+def migrate_add_figures(conn: sqlite3.Connection) -> None:
+    """v37: the numbers registry, figures read from recurring report workbooks (src/store/figures.py).
+
+    figure_series groups spreadsheet attachments by filename stem and sender; figure_editions
+    holds one row per spreadsheet attachment, with its series, its date, the earlier edition
+    whose bytes it copies, and whether its figures are stored. figure_metrics is one row per
+    (series, sheet, row label, column header), found by a 64-bit hash of their folded forms.
+    figure_values is one row per metric and period: the value held, the newest edition stating
+    it, its cell and its offset in that edition's text. One unique index on (metric_id,
+    period_end, period) makes the latest held and a period's range one key range each, and
+    is the only index the values need. A rowid table, not WITHOUT ROWID: the scrub scripts
+    read every table by rowid. figure_restated keeps the values a newer edition replaced, so a
+    restatement is never lost.
+
+    figure_metrics_fts indexes the metrics through the view figure_metrics_search, which folds
+    their text as v20 folds the others, so a 'rebuild' reads the text the triggers wrote. A
+    series' stem never changes, so the delete trigger's values are the ones inserted. New tables
+    only: no other table or index is touched, so this is quick on the producer, and running it
+    again changes nothing.
+    """
+    from src.store.greek import fold_sql_expr
+
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS figure_series (
+            id INTEGER PRIMARY KEY,
+            stem TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            name TEXT NOT NULL,
+            editions INTEGER NOT NULL DEFAULT 0,
+            first_date TEXT,
+            last_date TEXT,
+            latest_period TEXT,
+            latest_end TEXT,
+            latest_from TEXT,
+            UNIQUE (stem, sender)
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS figure_editions (
+            attachment_id INTEGER PRIMARY KEY,
+            series_id INTEGER NOT NULL REFERENCES figure_series(id),
+            edition_date TEXT,
+            copy_of INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending',
+            figures INTEGER NOT NULL DEFAULT 0,
+            parser INTEGER,
+            parsed_at TEXT
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_figure_editions_series"
+        " ON figure_editions(series_id, edition_date)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_figure_editions_status ON figure_editions(status)")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS figure_metrics (
+            id INTEGER PRIMARY KEY,
+            series_id INTEGER NOT NULL REFERENCES figure_series(id),
+            key INTEGER NOT NULL,
+            sheet TEXT NOT NULL,
+            label TEXT NOT NULL,
+            header TEXT NOT NULL,
+            unit TEXT,
+            UNIQUE (series_id, key)
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS figure_values (
+            id INTEGER PRIMARY KEY,
+            metric_id INTEGER NOT NULL REFERENCES figure_metrics(id),
+            period_end TEXT NOT NULL,
+            period TEXT NOT NULL,
+            period_source TEXT NOT NULL,
+            value REAL NOT NULL,
+            attachment_id INTEGER NOT NULL,
+            cell TEXT NOT NULL,
+            text_offset INTEGER NOT NULL
+        )"""
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_figure_values_period"
+        " ON figure_values(metric_id, period_end, period)"
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS figure_restated (
+            id INTEGER PRIMARY KEY,
+            metric_id INTEGER NOT NULL REFERENCES figure_metrics(id),
+            period TEXT NOT NULL,
+            value REAL NOT NULL,
+            attachment_id INTEGER NOT NULL,
+            cell TEXT NOT NULL,
+            text_offset INTEGER NOT NULL
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_figure_restated_metric ON figure_restated(metric_id, period)"
+    )
+    folded = {
+        "series_f": fold_sql_expr("s.stem"),
+        "sheet_f": fold_sql_expr("m.sheet"),
+        "label_f": fold_sql_expr("m.label"),
+        "header_f": fold_sql_expr("m.header"),
+    }
+    select = ", ".join(f"{folded[name]} AS {name}" for name in FIGURE_SEARCH_COLUMNS)
+    conn.execute(
+        f"CREATE VIEW IF NOT EXISTS figure_metrics_search AS SELECT m.id AS id, {select}"
+        " FROM figure_metrics m JOIN figure_series s ON s.id = m.series_id"
+    )
+    columns = ", ".join(FIGURE_SEARCH_COLUMNS)
+    if not _table_exists(conn, "figure_metrics_fts"):
+        conn.execute(
+            f"CREATE VIRTUAL TABLE figure_metrics_fts USING fts5({columns},"
+            " content='figure_metrics_search', content_rowid='id')"
+        )
+    old = {
+        "series_f": fold_sql_expr("(SELECT stem FROM figure_series WHERE id = old.series_id)"),
+        "sheet_f": fold_sql_expr("old.sheet"),
+        "label_f": fold_sql_expr("old.label"),
+        "header_f": fold_sql_expr("old.header"),
+    }
+    old_values = ", ".join(old[name] for name in FIGURE_SEARCH_COLUMNS)
+    insert = (
+        f"INSERT INTO figure_metrics_fts(rowid, {columns}) "
+        f"SELECT id, {columns} FROM figure_metrics_search WHERE id = new.id;"
+    )
+    delete = (
+        f"INSERT INTO figure_metrics_fts(figure_metrics_fts, rowid, {columns}) "
+        f"VALUES ('delete', old.id, {old_values});"
+    )
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS figure_metrics_ai AFTER INSERT ON figure_metrics"
+        f" BEGIN {insert} END"
+    )
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS figure_metrics_ad AFTER DELETE ON figure_metrics"
+        f" BEGIN {delete} END"
+    )
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS figure_metrics_au"
+        " AFTER UPDATE OF id, series_id, sheet, label, header ON figure_metrics"
+        f" BEGIN {delete} {insert} END"
+    )
+    conn.commit()

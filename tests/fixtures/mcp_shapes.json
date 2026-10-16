@@ -163,6 +163,63 @@
       ]
     }
   },
+  "figures": {
+    "input_schema": {
+      "properties": [
+        "limit",
+        "mode",
+        "period",
+        "query",
+        "series"
+      ],
+      "required": []
+    },
+    "output_schema": {
+      "properties": [
+        "_stale_warning",
+        "coverage",
+        "data_as_of",
+        "mode",
+        "reason",
+        "result",
+        "stale",
+        "truncated"
+      ],
+      "required": [
+        "data_as_of",
+        "mode",
+        "result",
+        "stale"
+      ]
+    },
+    "result_keys": [
+      "data_as_of",
+      "stale",
+      "mode",
+      "result"
+    ],
+    "rows": {
+      "result": [
+        "attachment_id",
+        "date",
+        "header",
+        "ingested_at",
+        "kind",
+        "label",
+        "latest",
+        "mailbox",
+        "metric",
+        "previous",
+        "ref",
+        "restated_from",
+        "series",
+        "series_id",
+        "sheet",
+        "unit",
+        "who"
+      ]
+    }
+  },
   "get_item": {
     "input_schema": {
       "properties": [

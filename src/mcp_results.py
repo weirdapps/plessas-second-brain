@@ -353,6 +353,19 @@ class ItemResult(Fresh):
 
 
 @with_config(_OPEN)
+class FiguresResult(Fresh):
+    """figures: one row per matching metric, its latest held value and the one before it, or
+    in mode 'series' one row per report series; `reason` when a list is short or the period
+    asked is not held, `coverage` what the registry holds when nothing matched."""
+
+    mode: str
+    result: Rows
+    truncated: NotRequired[Truncated]
+    reason: NotRequired[str]
+    coverage: NotRequired[Coverage]
+
+
+@with_config(_OPEN)
 class SqlSchema(Fresh, total=False):
     tables: Rows
     table: str

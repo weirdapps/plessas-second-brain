@@ -96,7 +96,7 @@ def test_the_embedded_text_names_the_chat(db, index):
     _, texts = index
     _extracted_session(db)
     build_whatsapp_index(db)
-    assert texts == ["[WhatsApp: Chat A] Planned the sailing trip"]
+    assert texts == ["title: Chat A | text: Planned the sailing trip"]
 
 
 def test_the_kind_mask_tells_teams_from_whatsapp():

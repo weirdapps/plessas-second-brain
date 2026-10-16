@@ -163,7 +163,7 @@ def _assert_saved_under_lock(index, monkeypatch):
     real_save = embeddings._atomic_savez
     probes = []
 
-    def probing_save(path, ids, vectors):
+    def probing_save(path, ids, vectors, *space):
         with open(embeddings._index_lock_path(), "a") as fh:
             try:
                 fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -172,7 +172,7 @@ def _assert_saved_under_lock(index, monkeypatch):
             else:
                 fcntl.flock(fh, fcntl.LOCK_UN)
                 probes.append("free")
-        real_save(path, ids, vectors)
+        real_save(path, ids, vectors, *space)
 
     monkeypatch.setattr(embeddings, "_atomic_savez", probing_save)
     return probes

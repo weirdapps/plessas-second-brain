@@ -366,7 +366,14 @@ def test_the_embed_pass_selects_the_attachments_it_always_did(db, embedded, forc
 
     embeddings.build_index(db, force=force)
 
-    expected = [f"[Attachment: {n}] {s}" for cid, n, s in eligible if force or -cid not in already]
+    # A forced rebuild starts over in this code's space and its template-2 texts; an
+    # incremental pass adds to the index's own space, the legacy one here.
+    space = embeddings.embedding_space() if force else embeddings.legacy_space()
+    expected = [
+        embeddings.attachment_text(space, n, s)
+        for cid, n, s in eligible
+        if force or -cid not in already
+    ]
     assert sorted(seen) == sorted(expected)  # the old query promised no order
     assert expected  # the fixture must leave something to embed
 
@@ -378,4 +385,4 @@ def test_a_large_batch_of_new_attachments_is_fetched_in_chunks(db, embedded):
         _attachment(db, f"d{i}", f"f{i}.pdf", summary=f"s{i}", llm_status="extracted")
 
     assert embeddings.build_index(db) == 1_200
-    assert seen == [f"[Attachment: f{i}.pdf] s{i}" for i in range(1_200)]
+    assert seen == [f"title: f{i}.pdf | text: s{i}" for i in range(1_200)]

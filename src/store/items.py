@@ -8,7 +8,8 @@ extracted from it, and its text as one string, which the caller pages:
 
     email, news, document  the body, with the thread, the people on it and the
                            attachments (their refs and sizes)
-    attachment             the extracted text, with the email it came with
+    attachment             the extracted text, with the email it came with and, for a
+                           long document, where each of its chunks lies
     teams, whatsapp        the messages in order, one line each
     calendar               the invitation's text, then every attendee
     conversation           the turns in full, one after another
@@ -211,7 +212,29 @@ def _attachment(conn: sqlite3.Connection, kind: str, ref: Any, **_: Any) -> dict
             "source_class": email["source_class"],
         }
     item["extracted"] = _extracted(conn, "attachment_id", attachment_id)
+    item.update(_chunks(conn, attachment_id))
     return {"item": item, "text": row["extracted_text"] or ""}
+
+
+def _chunks(conn: sqlite3.Connection, attachment_id: int) -> dict:
+    """The passages a long document was cut into for its chunk vectors (schema v39), where
+    each lies in the text: a search row whose passage matched gives its chunk_offset, the
+    `offset` that opens it here. {} for a document with none, and on a store before v39."""
+    try:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM attachment_chunks WHERE attachment_id = ?", (attachment_id,)
+        ).fetchone()[0]
+    except sqlite3.OperationalError:  # a store before v39
+        return {}
+    if not total:
+        return {}
+    rows = _rows(
+        conn,
+        "SELECT chunk_no, start_char AS chunk_offset, end_char AS chunk_end FROM "
+        f"attachment_chunks WHERE attachment_id = ? ORDER BY chunk_no LIMIT {EXTRACTED_ROWS}",
+        attachment_id,
+    )
+    return {"chunks_total": total, "chunks": rows}
 
 
 # ------------------------------------------------------------------ Teams, WhatsApp

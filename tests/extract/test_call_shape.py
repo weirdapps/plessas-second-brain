@@ -1,8 +1,9 @@
 """The call-shape switch: BRAIN_EXTRACT_CALL_SHAPE picks how extraction calls are built.
 
-v1, the default, is the calls as they were; v2 is the shape of issue 163 (a cached system
-prompt, a schema, a pinned effort). The switch is read at each call, so the eval can run
-the same cases under either shape in one process.
+v1 is the calls as they were; v2 is the shape of issue 163 (a cached system prompt, a
+schema, a pinned effort); v2-text, the default, is v2 without structured outputs
+(tests/extract/test_call_shape_v2_text.py). The switch is read at each call, so the eval
+can run the same cases under each shape in one process.
 """
 
 import pytest
@@ -12,12 +13,19 @@ from src.extract.claude_extract import ClaudeNotConfigured
 from tests.patching import unset_env
 
 
-@pytest.mark.parametrize("value", [None, "", "  ", "v1", "V1"])
-def test_v1_is_the_default(monkeypatch, value):
+@pytest.mark.parametrize("value", [None, "", "  "])
+def test_unset_or_blank_is_the_default_v2_text(monkeypatch, value):
     if value is None:
         unset_env(monkeypatch, "BRAIN_EXTRACT_CALL_SHAPE")
     else:
         monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", value)
+
+    assert call_shape.call_shape() == call_shape.DEFAULT_SHAPE == "v2-text"
+
+
+@pytest.mark.parametrize("value", ["v1", "V1", " v1 "])
+def test_v1_is_chosen_by_the_variable(monkeypatch, value):
+    monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", value)
 
     assert call_shape.call_shape() == "v1"
 

@@ -20,6 +20,14 @@ from src.extract import claude_extract
 from src.store.schema import create_database
 from tests.payment_data import card, iban
 
+
+@pytest.fixture(autouse=True)
+def _v1_call_shape(monkeypatch):
+    """These tests are written against the v1 prompt and its replies. v2-text is the
+    default since 2026-10-16; the shapes are tested on their own in the call-shape tests."""
+    monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", "v1")
+
+
 NOW = datetime(2026, 10, 11, 9, 0, tzinfo=UTC)
 MODEL = "claude-sonnet-5-5"
 SCRIPT = Path(__file__).parents[2] / "scripts" / "extraction_eval.py"

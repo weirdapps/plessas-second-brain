@@ -15,7 +15,6 @@ from types import SimpleNamespace
 import pytest
 
 from src.extract import call_shape, claude_extract, prompt, schema_v2
-from tests.patching import unset_env
 
 EMAIL = {
     "message_id": "m-1",
@@ -111,8 +110,8 @@ def v2(monkeypatch):
 # --- v1 stays as it was --------------------------------------------------------------
 
 
-def test_v1_is_the_default_and_sends_the_v1_prompt_alone(monkeypatch, model):
-    unset_env(monkeypatch, "BRAIN_EXTRACT_CALL_SHAPE")
+def test_v1_sends_the_v1_prompt_alone(monkeypatch, model):
+    monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", "v1")
     model.replies = [response('{"summary": "s"}')]
 
     claude_extract.extract_one(EMAIL)

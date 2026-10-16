@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 from src.config import USER_NAME, USER_ROLE
-from src.extract.call_shape import ROUTES, Request, call_shape, system_blocks
+from src.extract.call_shape import ROUTES, Request, system_blocks, uses_schema_v2
 from src.extract.prompt import WorkedExample, examples_text, identity_v2
 from src.extract.untrusted import fence
 from src.redact import PROMPT_RULE
@@ -482,8 +482,9 @@ File type: {mime_type or "unknown"}
 
 def attachment_input(**kwargs: Any) -> str | Request:
     """What an attachment call sends, in the shape BRAIN_EXTRACT_CALL_SHAPE picks: the v1
-    prompt, or the v2 request. Takes build_attachment_prompt's arguments."""
-    if call_shape() == "v2":
+    prompt, or the schema v2 request (v2 and v2-text). Takes build_attachment_prompt's
+    arguments."""
+    if uses_schema_v2():
         return build_attachment_request_v2(**kwargs)
     return build_attachment_prompt(**kwargs)
 
@@ -491,6 +492,6 @@ def attachment_input(**kwargs: Any) -> str | Request:
 def merge_input(*, source: str = "", **kwargs: Any) -> str | Request:
     """The merge call of a long document, in the shape BRAIN_EXTRACT_CALL_SHAPE picks.
     Takes build_merge_prompt's arguments, and `source` for v2."""
-    if call_shape() == "v2":
+    if uses_schema_v2():
         return build_merge_request_v2(source=source, **kwargs)
     return build_merge_prompt(**kwargs)

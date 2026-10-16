@@ -140,10 +140,11 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setenv("VERTEX_SDK_PROJECT", "test-project")
     monkeypatch.setenv("VERTEX_SDK_REGION", "eu")
     monkeypatch.setenv("CLAUDE_EXTRACT_MODEL", "claude-sonnet-5-5")
+    # The tests below are written against v1 unless they set a shape of their own.
+    monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", "v1")
     unset_env(
         monkeypatch,
         "BRAIN_BATCH_LOCATION",
-        "BRAIN_EXTRACT_CALL_SHAPE",
         "ANTHROPIC_VERTEX_PROJECT_ID",
         "CLOUD_ML_REGION",
         "VERTEX_MODEL_EXTRACT",

@@ -215,7 +215,7 @@ def test_the_switch_holds_for_the_run_only(files, model, synthetic):
     ev.run(files, synthetic[:1], reps=1, workers=1, call_shape="v2", set_sha="s", now=NOW)
 
     assert "BRAIN_EXTRACT_CALL_SHAPE" not in os.environ
-    assert call_shape.call_shape() == "v1"
+    assert call_shape.call_shape() == call_shape.DEFAULT_SHAPE
 
 
 def test_a_retried_attempt_is_counted_and_priced_whole(files, model, synthetic):

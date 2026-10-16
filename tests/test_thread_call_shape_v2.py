@@ -43,7 +43,7 @@ def model(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize(("pipeline", "_route"), ROUTES)
 def test_v1_sends_what_it_always_sent(monkeypatch, model, pipeline, _route):
-    unset_env(monkeypatch, "BRAIN_EXTRACT_CALL_SHAPE")
+    monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", "v1")
     model.replies = [response('{"summary": "s"}')]
 
     assert pipeline._call_llm("the system prompt", "the thread") == '{"summary": "s"}'
@@ -62,7 +62,7 @@ def test_v1_sends_what_it_always_sent(monkeypatch, model, pipeline, _route):
 def test_v1_asks_once_more_at_the_route_budget_after_a_max_tokens_stop(
     monkeypatch, model, pipeline, route
 ):
-    unset_env(monkeypatch, "BRAIN_EXTRACT_CALL_SHAPE")
+    monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", "v1")
     model.replies = [response('{"summary": "cu', stop="max_tokens"), response('{"summary": "s"}')]
 
     assert pipeline._call_llm("sys", "thread") == '{"summary": "s"}'

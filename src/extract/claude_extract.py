@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from src.config import DATA_ROOT
-from src.extract.call_shape import call_shape, max_tokens_attempts, prompt_hash
+from src.extract.call_shape import max_tokens_attempts, prompt_hash, uses_schema_v2
 from src.llm_policy import (
     Action,
     Attempt,
@@ -541,8 +541,9 @@ def refusal_error(response: Any) -> ExtractionRefused:
 
 def extract_one(email: dict) -> dict | None:
     """Extract structured data from a single email using Claude, in the call shape
-    BRAIN_EXTRACT_CALL_SHAPE picks (src/extract/call_shape.py)."""
-    if call_shape() == "v2":
+    BRAIN_EXTRACT_CALL_SHAPE picks (src/extract/call_shape.py): schema v2 under v2 and
+    v2-text, the v1 prompt under v1."""
+    if uses_schema_v2():
         return _extract_one_v2(email)
 
     from src.extract.parser import parse_extraction
@@ -568,7 +569,8 @@ def extract_one(email: dict) -> dict | None:
 
 
 def _extract_one_v2(email: dict) -> dict:
-    """extract_one in call shape v2: the cached system prompt, the fenced email, schema v2
+    """extract_one in call shape v2 or v2-text: the cached system prompt, the fenced email,
+    schema v2 (as structured output under v2, stated in the system prompt under v2-text)
     and a pinned effort; a reply stopped at max_tokens is asked once more at twice the
     budget. Each billed call is logged on its own. Raises ExtractionRefused for a refusal
     and ValueError for a reply still cut short or holding no JSON object."""

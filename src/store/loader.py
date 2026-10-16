@@ -810,7 +810,9 @@ def stored_email(conn: sqlite3.Connection, email_id: int) -> dict:
     """The email as the loader was given it, rebuilt from the store: what the
     extraction prompt reads, and the header people replace_extraction names from.
 
-    A header person always has an address, so one without is the model's.
+    A header person always has an address, so one without is the model's. The message id
+    is text, as staging gives it: emails.message_id is declared INTEGER, so the store holds
+    an id of digits as a number.
     """
     row = conn.execute(
         "SELECT message_id, subject, date_received, sender_name, sender_address, content,"
@@ -825,7 +827,7 @@ def stored_email(conn: sqlite3.Connection, email_id: int) -> dict:
         (email_id,),
     ).fetchall()
     return {
-        "message_id": row[0],
+        "message_id": str(row[0]),
         "subject": row[1],
         "date_received": row[2],
         "sender": {"name": row[3] or "", "address": row[4] or ""},

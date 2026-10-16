@@ -331,6 +331,25 @@ def test_the_body_is_extracted_again_and_its_untagged_items_replaced(
     assert len(list(tmp_path.glob("**/*.json"))) == 2
 
 
+def test_an_email_whose_message_id_the_store_holds_as_a_number_is_extracted(conn, model, tmp_path):
+    """emails.message_id is declared INTEGER, so an id of digits is stored as a number: 55,029
+    on the producer on 2026-10-16. Its extraction file is named by the id's text, as staging
+    gave it; the number stopped the whole run with "'int' object has no attribute 'encode'"."""
+    email_id = _email(conn, "-586877450580397460", content="We approved the pilot budget.")
+    assert conn.execute("SELECT typeof(message_id) FROM emails").fetchone()[0] == "integer"
+    for fact, attachment_id in (("body fact", None), ("attachment fact", 7)):
+        conn.execute(
+            "INSERT INTO key_facts (email_id, fact, attachment_id) VALUES (?, ?, ?)",
+            (email_id, fact, attachment_id),
+        )
+    conn.commit()
+
+    stats = ic.reextract_stacked(conn, budget=TokenBudget(10**9), extracted_dir=tmp_path)
+
+    assert (stats["done"], stats["failed"], stats["left"]) == (1, 0, 0)
+    assert [p.name.split(".")[0] for p in tmp_path.glob("*.json")] == ["-586877450580397460"]
+
+
 def test_a_second_run_takes_nothing_it_has_done(conn, stacked, model):
     ic.reextract_stacked(conn, budget=TokenBudget(10**9))
     calls = len(model.calls)

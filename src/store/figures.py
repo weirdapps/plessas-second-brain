@@ -65,13 +65,13 @@ _SPREADSHEET = (
 )
 _TABLES = ("figure_series", "figure_editions", "figure_metrics", "figure_values", "figure_restated")
 NOT_BUILT = (
-    "The figures registry is not built on this store yet: it comes with schema v36 and "
+    "The figures registry is not built on this store yet: it comes with schema v37 and "
     "`brain maint figures-backfill --apply` on the producer, and reaches a replica with the next pull."
 )
 
 
 def has_registry(conn: sqlite3.Connection) -> bool:
-    """Whether the store has the v36 tables (a replica may run newer code than its copy)."""
+    """Whether the store has the v37 tables (a replica may run newer code than its copy)."""
     found = {
         r[0]
         for r in conn.execute(
@@ -433,7 +433,7 @@ def ingest_editions(
     conn: sqlite3.Connection,
     attachment_ids: Iterable[int],
     *,
-    deadline_s: float = INGEST_DEADLINE_S,
+    deadline_s: float | None = None,
 ) -> dict[str, int]:
     """The hourly hook: record the new spreadsheet editions among `attachment_ids` and parse the
     waiting editions of the series they belong to, in `deadline_s` at most. The backlog of
@@ -446,7 +446,8 @@ def ingest_editions(
         return {}
     if not registered["series"]:  # copies only
         return {"registered": registered["registered"]}
-    stats = parse_pending(conn, series_ids=registered["series"], deadline_s=deadline_s)
+    box = INGEST_DEADLINE_S if deadline_s is None else deadline_s
+    stats = parse_pending(conn, series_ids=registered["series"], deadline_s=box)
     return {"registered": registered["registered"], **stats}
 
 

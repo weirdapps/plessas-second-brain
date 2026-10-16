@@ -504,7 +504,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_index_people_lookups(conn)
     if current < 35:
         migrate_add_item_state(conn)
-    if current < 36:
+    if current < 37:
         migrate_add_figures(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
@@ -2389,7 +2389,7 @@ FIGURE_SEARCH_COLUMNS = ("series_f", "sheet_f", "label_f", "header_f")
 
 
 def migrate_add_figures(conn: sqlite3.Connection) -> None:
-    """v36: the numbers registry, figures read from recurring report workbooks (src/store/figures.py).
+    """v37: the numbers registry, figures read from recurring report workbooks (src/store/figures.py).
 
     figure_series groups spreadsheet attachments by filename stem and sender; figure_editions
     holds one row per spreadsheet attachment, with its series, its date, the earlier edition

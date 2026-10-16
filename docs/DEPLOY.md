@@ -1205,7 +1205,7 @@ No schema change and no one-off command: the ranking is in the query code alone 
    before ranked and the `_recency` modes with it; on the reference replica's 45
    questions, recall@10 0.62 to 0.78 in `recall`, 0.80 to 0.85 in `hybrid`.
 
-### One-off commands after the numbers registry (schema v36)
+### One-off commands after the numbers registry (schema v37)
 
 The figures registry is new tables only (README, "Figures"). The hourly sync reads the
 figures of each new edition of a report series from then on; the editions already held
@@ -1275,7 +1275,7 @@ one pass, at the first job that writes. The versions that ask for a step:
   second and nothing needs stopping. A job still running the old code writes NULL in
   the new columns, as v1 rows hold. The one-off commands of 2026-10-16 above fill
   what they can.
-- **v36.** The numbers registry: `figure_series`, `figure_editions`, `figure_metrics`,
+- **v37.** The numbers registry: `figure_series`, `figure_editions`, `figure_metrics`,
   `figure_values`, `figure_restated`, the view `figure_metrics_search` and the index
   `figure_metrics_fts` (README, "Figures"). New tables only, created in well under a
   second; nothing needs stopping. The registry fills from the backfill above. A replica

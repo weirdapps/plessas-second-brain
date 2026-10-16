@@ -132,7 +132,7 @@ def test_every_full_text_index_of_the_store_is_covered():
         )
     }
     conn.close()
-    # figure_metrics_fts (v36) reads its folded text through a view, not generated columns, so
+    # figure_metrics_fts (v37) reads its folded text through a view, not generated columns, so
     # it is not one of _FOLDED_FTS; tests/store/test_figures.py covers its triggers.
     assert found - {"figure_metrics_fts"} == {fts for fts, _table in TABLES}
     assert set(UNINDEXED) == {table for _fts, table in TABLES}

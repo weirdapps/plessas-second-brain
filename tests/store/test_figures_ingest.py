@@ -5,7 +5,6 @@ edition or later), its figures are read from that text in the same run, in a tim
 (figures.INGEST_DEADLINE_S), and only for the series it touched: the backlog is the backfill's.
 """
 
-import time
 from datetime import datetime
 
 import openpyxl
@@ -111,9 +110,9 @@ def test_text_that_is_not_a_workbook_adds_nothing(db, tmp_path):
     assert "figures" not in stats
 
 
-def test_reading_an_hours_editions_takes_a_fraction_of_a_second_each(db, tmp_path):
-    """Synthetic load: twelve editions of a 200-row, 9-month workbook in one hour, more than a
-    day of real report mail, are registered and read in under two seconds in all."""
+def _heavy_hour(db, tmp_path) -> None:
+    """Twelve editions of a 200-row, 9-month workbook in one hour: more than a day of real
+    report mail (no hour of the reference replica's last 30 days brought more than 8)."""
     conn = _conn(db)
     for i, month in enumerate([1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 9]):
         path = tmp_path / f"volumes-{i}.xlsx"
@@ -131,19 +130,30 @@ def test_reading_an_hours_editions_takes_a_fraction_of_a_second_each(db, tmp_pat
             sha256=f"sha-{i}",
         )
     conn.close()
+
+
+def test_a_heavy_hour_of_editions_is_read_whole(db, tmp_path):
+    """Its cost is measured, not asserted here: CI's coverage runs it three times slower. On a
+    Mac the hook read twelve editions of five such sheets in 0.76 s (README, "Figures")."""
+    _heavy_hour(db, tmp_path)
+
+    stats = run_phase1(str(db))
+
+    assert (stats["figures"]["parsed"], stats["figures"]["deferred"]) == (12, 0)
+    assert stats["figures"]["figures"] > 12 * 200
+
+
+def test_past_its_time_box_the_hook_leaves_the_rest_to_the_backfill(db, tmp_path, monkeypatch):
+    _heavy_hour(db, tmp_path)
+    monkeypatch.setattr(figures, "INGEST_DEADLINE_S", 0.0)
+
     stats = run_phase1(str(db))
     conn = _conn(db)
-    figures.reset(conn)
-
-    started = time.perf_counter()
-    figures.register_editions(conn)
-    parsed = figures.parse_pending(conn)
-    reading = time.perf_counter() - started
+    later = figures.parse_pending(conn)
     conn.close()
 
-    assert stats["figures"]["parsed"] == 12 and parsed["parsed"] == 12
-    assert parsed["figures"] > 12 * 200
-    assert reading < 2.0
+    assert (stats["figures"]["parsed"], stats["figures"]["deferred"]) == (0, 12)
+    assert later["parsed"] == 12
 
 
 def test_the_hook_is_bounded_by_its_own_time_box(monkeypatch):

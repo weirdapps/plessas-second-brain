@@ -2853,7 +2853,7 @@ def main():
     from src.store.item_cleanup import add_maint_parsers
 
     add_maint_parsers(maint_subparsers)
-    # New with the numbers registry (schema v36): no old spelling to keep.
+    # New with the numbers registry (schema v37): no old spelling to keep.
     parser_figures = maint_subparsers.add_parser(
         "figures-backfill",
         help="Read the figures of every report edition held into the numbers registry "

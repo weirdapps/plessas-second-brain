@@ -4,10 +4,13 @@ Provides rich context functions for the email-handler plugin and /recall skill
 to retrieve person, topic, conversation, and decision context from the knowledge store.
 """
 
+import json
 import sqlite3
 from datetime import datetime, timedelta
 
 from src.store import envelope
+from src.store.consolidate import current_sql, history_left_out, open_status_sql
+from src.store.entities import entity_person_ids
 from src.store.greek import (
     PHRASE_MATCH,
     register_sql_functions,
@@ -16,7 +19,6 @@ from src.store.greek import (
     search_words,
 )
 from src.store.item_cleanup import not_boilerplate_sql
-from src.store.normalizer import normalize_topic
 from src.store.ordering import (
     EMAIL_DATE,
     action_order,
@@ -28,6 +30,7 @@ from src.store.ordering import (
 )
 from src.store.person_resolve import resolve_identity
 from src.store.source_class import visible_sql, with_source_class
+from src.store.topic_canon import family_names, resolve_topic, topic_family_ids
 
 # Every list in a context dossier is capped at this many rows unless the caller
 # asks for more. These functions are reached from MCP tools, so their return
@@ -41,6 +44,12 @@ from src.store.source_class import visible_sql, with_source_class
 # one-word queries for the same reason. Each capped list ships a `<name>_total`
 # sibling so a caller can still tell a complete answer from the head of one.
 DEFAULT_CONTEXT_LIMIT = 20
+
+
+def _history(**left: int) -> dict:
+    """`history_left_out` of a dossier: each list's rows the current-state filter left out
+    (src/store/consolidate.py), as {"rows", "switch"}, for the lists that left any out."""
+    return {name: history_left_out(n) for name, n in left.items() if n > 0}
 
 
 def resolve_person(
@@ -66,6 +75,7 @@ def get_person_context(
     local_part: bool = True,
     include_news: bool = False,
     include_automation: bool = False,
+    include_history: bool = False,
 ) -> dict:
     """Return rich context for a person.
 
@@ -83,6 +93,13 @@ def get_person_context(
         include_news, include_automation: Count and list news items and the
             owner's automation mail too, left out by default
             (src/store/source_class.py)
+        include_history: List and count decisions and actions a consolidation
+            pass marked duplicate, superseded or invalid too (src/store/consolidate.py),
+            left out by default; `history_left_out` says how many were
+
+    The person's mail is that of every people row of their entity: the row found, the
+    rows the entity seed joined to it and the mentions the alias map points at it
+    (src/store/entities.py entity_person_ids), so a name extraction wrote in text counts.
 
     Returns:
         Dict with person info, resolved_by ('email', 'mri', 'jid', 'name' or
@@ -126,6 +143,10 @@ def get_person_context(
 
     person = dict(person_row)
     person_id = person["id"]
+    rows_of = json.dumps(entity_person_ids(conn, person_id))
+    current_d = current_sql(conn, "d", "decisions", include_history)
+    current_a = current_sql(conn, "a", "action_items", include_history)
+    open_a = open_status_sql("a", include_history)
 
     # Email count in period
     email_count = conn.execute(
@@ -133,9 +154,10 @@ def get_person_context(
         SELECT COUNT(DISTINCT e.id) as cnt
         FROM emails e
         JOIN email_people ep ON e.id = ep.email_id
-        WHERE ep.person_id = ? AND e.date_received >= ? AND {visible}
+        WHERE ep.person_id IN (SELECT value FROM json_each(?))
+          AND e.date_received >= ? AND {visible}
     """,
-        (person_id, cutoff),
+        (rows_of, cutoff),
     ).fetchone()["cnt"]
 
     # One row per email below, however many roles the person holds on it:
@@ -153,15 +175,15 @@ def get_person_context(
             f"""
         SELECT e.id as email_id, e.date_received as date, e.subject, e.summary,
             (SELECT ep.role_in_email FROM email_people ep
-              WHERE ep.email_id = e.id AND ep.person_id = ?
+              WHERE ep.email_id = e.id AND ep.person_id IN (SELECT value FROM json_each(?))
               ORDER BY ep.role_in_email <> 'sender', ep.role_in_email LIMIT 1) as role_in_email
         FROM emails e
-        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id IN (SELECT value FROM json_each(?)))
           AND e.date_received >= ? AND {visible}
         ORDER BY e.date_received DESC
         LIMIT ?
     """,
-            (person_id, person_id, cutoff, min(limit, 10)),
+            (rows_of, rows_of, cutoff, min(limit, 10)),
         ).fetchall()
     ]
 
@@ -174,13 +196,13 @@ def get_person_context(
         FROM topics t
         JOIN email_topics et ON t.id = et.topic_id
         JOIN emails e ON et.email_id = e.id
-        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id IN (SELECT value FROM json_each(?)))
           AND e.date_received >= ? AND {visible}
         GROUP BY t.id
         ORDER BY count DESC
         LIMIT ?
     """,
-            (person_id, cutoff, limit),
+            (rows_of, cutoff, limit),
         ).fetchall()
     ]
     topics_total = conn.execute(
@@ -189,10 +211,10 @@ def get_person_context(
         FROM topics t
         JOIN email_topics et ON t.id = et.topic_id
         JOIN emails e ON et.email_id = e.id
-        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id IN (SELECT value FROM json_each(?)))
           AND e.date_received >= ? AND {visible}
     """,
-        (person_id, cutoff),
+        (rows_of, cutoff),
     ).fetchone()["cnt"]
 
     # Sentiment distribution
@@ -200,11 +222,11 @@ def get_person_context(
         f"""
         SELECT e.sentiment, COUNT(*) as count
         FROM emails e
-        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id IN (SELECT value FROM json_each(?)))
           AND e.date_received >= ? AND e.sentiment IS NOT NULL AND {visible}
         GROUP BY e.sentiment
     """,
-        (person_id, cutoff),
+        (rows_of, cutoff),
     ).fetchall()
     sentiment_distribution = {r["sentiment"]: r["count"] for r in sentiment_rows}
 
@@ -216,24 +238,25 @@ def get_person_context(
         SELECT d.decision, d.decided_by, {decision_dates(EMAIL_DATE)}, e.id as email_id
         FROM decisions d
         JOIN emails e ON d.email_id = e.id
-        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
-          AND e.date_received >= ? AND {visible}
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id IN (SELECT value FROM json_each(?)))
+          AND e.date_received >= ? AND {visible} AND {current_d}
         ORDER BY {decision_order(EMAIL_DATE)}
         LIMIT ?
     """,
-            (person_id, cutoff, limit),
+            (rows_of, cutoff, limit),
         ).fetchall()
     ]
-    decisions_total = conn.execute(
+    decisions_total, decisions_all = conn.execute(
         f"""
-        SELECT COUNT(*) as cnt
+        SELECT TOTAL({current_d}), COUNT(*)
         FROM decisions d
         JOIN emails e ON d.email_id = e.id
-        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id IN (SELECT value FROM json_each(?)))
           AND e.date_received >= ? AND {visible}
     """,
-        (person_id, cutoff),
-    ).fetchone()["cnt"]
+        (rows_of, cutoff),
+    ).fetchone()
+    decisions_total = int(decisions_total)
 
     # Open action items, the actionable first
     open_actions = [
@@ -244,24 +267,25 @@ def get_person_context(
             e.id as email_id
         FROM action_items a
         JOIN emails e ON a.email_id = e.id
-        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
-          AND a.status = 'open' AND e.date_received >= ? AND {visible}
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id IN (SELECT value FROM json_each(?)))
+          AND {open_a} AND e.date_received >= ? AND {visible} AND {current_a}
         ORDER BY {action_order(EMAIL_DATE)}
         LIMIT ?
     """,
-            (person_id, cutoff, limit),
+            (rows_of, cutoff, limit),
         ).fetchall()
     ]
-    open_actions_total = conn.execute(
+    open_actions_total, open_actions_all = conn.execute(
         f"""
-        SELECT COUNT(*) as cnt
+        SELECT TOTAL({current_a} AND {open_a}), COUNT(*)
         FROM action_items a
         JOIN emails e ON a.email_id = e.id
-        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
-          AND a.status = 'open' AND e.date_received >= ? AND {visible}
+        WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id IN (SELECT value FROM json_each(?)))
+          AND a.status IN ('open', 'done') AND e.date_received >= ? AND {visible}
     """,
-        (person_id, cutoff),
-    ).fetchone()["cnt"]
+        (rows_of, cutoff),
+    ).fetchone()
+    open_actions_total = int(open_actions_total)
     for rows in (recent_emails, decisions, open_actions):
         # Each says what it stands for: its email, or the one it was taken from.
         envelope.emails(conn, with_source_class(conn, rows))
@@ -275,9 +299,9 @@ def get_person_context(
             COUNT(DISTINCT e.id) as total
         FROM emails e
         JOIN email_people ep ON e.id = ep.email_id
-        WHERE ep.person_id = ? AND {visible}
+        WHERE ep.person_id IN (SELECT value FROM json_each(?)) AND {visible}
     """,
-        (person_id,),
+        (rows_of,),
     ).fetchone()
 
     communication_pattern = {}
@@ -369,7 +393,7 @@ def get_person_context(
 
     del person["id"]
 
-    return {
+    out = {
         "person": person,
         "resolved_by": resolution.resolved_by,
         "match_count": resolution.match_count,
@@ -390,6 +414,13 @@ def get_person_context(
         "teams": teams,
         "whatsapp": whatsapp,
     }
+    left = _history(
+        decisions=decisions_all - decisions_total,
+        open_actions=open_actions_all - open_actions_total,
+    )
+    if left:
+        out["history_left_out"] = left
+    return out
 
 
 def _no_whatsapp() -> dict:
@@ -546,6 +577,8 @@ def get_topic_context(
     include_news: bool = False,
     include_automation: bool = False,
     include_boilerplate: bool = False,
+    include_history: bool = False,
+    family: bool = True,
 ) -> dict:
     """Return context for a topic.
 
@@ -560,39 +593,31 @@ def get_topic_context(
             (src/store/source_class.py)
         include_boilerplate: List key facts marked boilerplate too (text that recurs
             across threads, schema v35, src/store/item_cleanup.py), left out by default
+        include_history: List and count decisions, actions and facts a consolidation
+            pass marked duplicate, superseded or invalid too (src/store/consolidate.py),
+            left out by default; `history_left_out` says how many were
+        family: Read the topic's whole family (src/store/topic_canon.py): the topics
+            mapped under it and its synonyms. False reads the one topic row, as before
+            v38.
 
     Returns:
-        Dict with topic info, email_count, recent_emails, key_people,
-        decisions, open_actions, key_facts; every email, decision, action and
-        fact row carries its email_id, source_class and the row envelope
-        (src/store/envelope.py)
+        Dict with topic info (with `family`, the family's names, and `family_total`),
+        email_count, recent_emails, key_people, decisions, open_actions, key_facts;
+        every email, decision, action and fact row carries its email_id, source_class
+        and the row envelope (src/store/envelope.py)
     """
 
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
     visible = visible_sql(conn, "e.id", include_news, include_automation)
     facts = not_boilerplate_sql(conn, "kf", include_boilerplate)
-    # Topics are stored normalized (lower case, accents stripped), so the query
-    # must be too: an accented query matched nothing. Among partial matches an
-    # exact name wins, then the most-used topic, rather than whichever came first.
-    topic_normalized = normalize_topic(topic)
-
-    # Find topic. With no letter or digit there is none: '   ', '-' and '.'
-    # normalize to '', and LIKE '%%' matched every topic, so the most-used one
-    # came back as if it were the answer.
-    topic_row = (
-        conn.execute(
-            """
-            SELECT t.id, t.name, t.display_name FROM topics t
-            WHERE t.name LIKE ?
-            ORDER BY (t.name = ?) DESC,
-                     (SELECT COUNT(*) FROM email_topics et WHERE et.topic_id = t.id) DESC, t.id
-            LIMIT 1
-            """,
-            (f"%{topic_normalized}%", topic_normalized),
-        ).fetchone()
-        if any(ch.isalnum() for ch in topic_normalized)
-        else None
-    )
+    current_d = current_sql(conn, "d", "decisions", include_history)
+    current_a = current_sql(conn, "a", "action_items", include_history)
+    open_a = open_status_sql("a", include_history)
+    current_f = current_sql(conn, "kf", "key_facts", include_history)
+    # Topics are stored normalized (lower case, accents stripped), so the query must be too;
+    # among partial matches an exact name wins, then the most-used topic. With no letter or
+    # digit there is none: LIKE '%%' matched every topic (topic_canon.resolve_topic).
+    topic_row = resolve_topic(conn, topic)
 
     if not topic_row:
         return {
@@ -609,18 +634,29 @@ def get_topic_context(
             "key_facts_total": 0,
         }
 
-    topic_info = {"name": topic_row["name"], "display_name": topic_row["display_name"]}
     topic_id = topic_row["id"]
+    ids = topic_family_ids(conn, topic_id) if family else [topic_id]
+    topic_info = {
+        "name": topic_row["name"],
+        "display_name": topic_row["display_name"],
+        "family": family_names(conn, ids),
+        "family_total": len(ids),
+    }
+    family_ids = json.dumps(ids)
+    # The emails tagged with any topic of the family, each once however many it carries.
+    tagged = (
+        "e.id IN (SELECT et.email_id FROM email_topics et"
+        " WHERE et.topic_id IN (SELECT value FROM json_each(?)))"
+    )
 
     # Email count
     email_count = conn.execute(
         f"""
-        SELECT COUNT(DISTINCT e.id) as cnt
+        SELECT COUNT(*) as cnt
         FROM emails e
-        JOIN email_topics et ON e.id = et.email_id
-        WHERE et.topic_id = ? AND e.date_received >= ? AND {visible}
+        WHERE {tagged} AND e.date_received >= ? AND {visible}
     """,
-        (topic_id, cutoff),
+        (family_ids, cutoff),
     ).fetchone()["cnt"]
 
     # Recent emails
@@ -631,12 +667,11 @@ def get_topic_context(
         SELECT e.id as email_id, e.date_received as date, e.subject, e.summary,
             e.sender_name as sender
         FROM emails e
-        JOIN email_topics et ON e.id = et.email_id
-        WHERE et.topic_id = ? AND e.date_received >= ? AND {visible}
+        WHERE {tagged} AND e.date_received >= ? AND {visible}
         ORDER BY e.date_received DESC
         LIMIT 10
     """,
-            (topic_id, cutoff),
+            (family_ids, cutoff),
         ).fetchall()
     ]
 
@@ -648,14 +683,13 @@ def get_topic_context(
         SELECT p.name, COUNT(DISTINCT e.id) as email_count
         FROM people p
         JOIN email_people ep ON p.id = ep.person_id
-        JOIN email_topics et ON ep.email_id = et.email_id
         JOIN emails e ON ep.email_id = e.id
-        WHERE et.topic_id = ? AND e.date_received >= ? AND {visible}
+        WHERE {tagged} AND e.date_received >= ? AND {visible}
         GROUP BY p.id
         ORDER BY email_count DESC
         LIMIT ?
     """,
-            (topic_id, cutoff, limit),
+            (family_ids, cutoff, limit),
         ).fetchall()
     ]
     key_people_total = conn.execute(
@@ -663,11 +697,10 @@ def get_topic_context(
         SELECT COUNT(DISTINCT p.id) as cnt
         FROM people p
         JOIN email_people ep ON p.id = ep.person_id
-        JOIN email_topics et ON ep.email_id = et.email_id
         JOIN emails e ON ep.email_id = e.id
-        WHERE et.topic_id = ? AND e.date_received >= ? AND {visible}
+        WHERE {tagged} AND e.date_received >= ? AND {visible}
     """,
-        (topic_id, cutoff),
+        (family_ids, cutoff),
     ).fetchone()["cnt"]
 
     # Decisions, newest first by their own date or their email's (src/store/ordering.py)
@@ -678,24 +711,23 @@ def get_topic_context(
         SELECT d.decision, d.decided_by, {decision_dates(EMAIL_DATE)}, e.id as email_id
         FROM decisions d
         JOIN emails e ON d.email_id = e.id
-        JOIN email_topics et ON e.id = et.email_id
-        WHERE et.topic_id = ? AND e.date_received >= ? AND {visible}
+        WHERE {tagged} AND e.date_received >= ? AND {visible} AND {current_d}
         ORDER BY {decision_order(EMAIL_DATE)}
         LIMIT ?
     """,
-            (topic_id, cutoff, limit),
+            (family_ids, cutoff, limit),
         ).fetchall()
     ]
-    decisions_total = conn.execute(
+    decisions_total, decisions_all = conn.execute(
         f"""
-        SELECT COUNT(*) as cnt
+        SELECT TOTAL({current_d}), COUNT(*)
         FROM decisions d
         JOIN emails e ON d.email_id = e.id
-        JOIN email_topics et ON e.id = et.email_id
-        WHERE et.topic_id = ? AND e.date_received >= ? AND {visible}
+        WHERE {tagged} AND e.date_received >= ? AND {visible}
     """,
-        (topic_id, cutoff),
-    ).fetchone()["cnt"]
+        (family_ids, cutoff),
+    ).fetchone()
+    decisions_total = int(decisions_total)
 
     # Open action items, the actionable first
     open_actions = [
@@ -706,24 +738,24 @@ def get_topic_context(
             e.id as email_id
         FROM action_items a
         JOIN emails e ON a.email_id = e.id
-        JOIN email_topics et ON e.id = et.email_id
-        WHERE et.topic_id = ? AND a.status = 'open' AND e.date_received >= ? AND {visible}
+        WHERE {tagged} AND {open_a} AND e.date_received >= ? AND {visible}
+          AND {current_a}
         ORDER BY {action_order(EMAIL_DATE)}
         LIMIT ?
     """,
-            (topic_id, cutoff, limit),
+            (family_ids, cutoff, limit),
         ).fetchall()
     ]
-    open_actions_total = conn.execute(
+    open_actions_total, open_actions_all = conn.execute(
         f"""
-        SELECT COUNT(*) as cnt
+        SELECT TOTAL({current_a} AND {open_a}), COUNT(*)
         FROM action_items a
         JOIN emails e ON a.email_id = e.id
-        JOIN email_topics et ON e.id = et.email_id
-        WHERE et.topic_id = ? AND a.status = 'open' AND e.date_received >= ? AND {visible}
+        WHERE {tagged} AND a.status IN ('open', 'done') AND e.date_received >= ? AND {visible}
     """,
-        (topic_id, cutoff),
-    ).fetchone()["cnt"]
+        (family_ids, cutoff),
+    ).fetchone()
+    open_actions_total = int(open_actions_total)
 
     # Key facts, newest email first: with no ORDER BY the cap kept whichever came first
     key_facts = [
@@ -733,28 +765,27 @@ def get_topic_context(
         SELECT kf.fact, {parent_dates(EMAIL_DATE)}, e.id as email_id
         FROM key_facts kf
         JOIN emails e ON kf.email_id = e.id
-        JOIN email_topics et ON e.id = et.email_id
-        WHERE et.topic_id = ? AND e.date_received >= ? AND {visible} AND {facts}
+        WHERE {tagged} AND e.date_received >= ? AND {visible} AND {facts} AND {current_f}
         ORDER BY {fact_order(EMAIL_DATE)}
         LIMIT ?
     """,
-            (topic_id, cutoff, limit),
+            (family_ids, cutoff, limit),
         ).fetchall()
     ]
-    key_facts_total = conn.execute(
+    key_facts_total, key_facts_all = conn.execute(
         f"""
-        SELECT COUNT(*) as cnt
+        SELECT TOTAL({current_f}), COUNT(*)
         FROM key_facts kf
         JOIN emails e ON kf.email_id = e.id
-        JOIN email_topics et ON e.id = et.email_id
-        WHERE et.topic_id = ? AND e.date_received >= ? AND {visible} AND {facts}
+        WHERE {tagged} AND e.date_received >= ? AND {visible} AND {facts}
     """,
-        (topic_id, cutoff),
-    ).fetchone()["cnt"]
+        (family_ids, cutoff),
+    ).fetchone()
+    key_facts_total = int(key_facts_total)
     for rows in (recent_emails, decisions, open_actions, key_facts):
         envelope.emails(conn, with_source_class(conn, rows))
 
-    return {
+    out = {
         "topic": topic_info,
         "email_count": email_count,
         "recent_emails": recent_emails,
@@ -767,6 +798,14 @@ def get_topic_context(
         "key_facts": key_facts,
         "key_facts_total": key_facts_total,
     }
+    left = _history(
+        decisions=decisions_all - decisions_total,
+        open_actions=open_actions_all - open_actions_total,
+        key_facts=key_facts_all - key_facts_total,
+    )
+    if left:
+        out["history_left_out"] = left
+    return out
 
 
 def get_conversation_context(conn: sqlite3.Connection, email_id: int) -> dict:

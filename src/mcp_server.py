@@ -64,6 +64,7 @@ from src.mcp_results import (
 )
 from src.store import envelope
 from src.store.calendar_query import ATTENDEES_MAX, ATTENDEES_SHOWN
+from src.store.consolidate import hidden_ids, history_left_out
 from src.store.schema import get_connection
 from src.store.sql_readonly import connect_read_only
 
@@ -349,6 +350,15 @@ IncludeAutomation = Annotated[
         "automation), left out by default."
     ),
 ]
+# Items a consolidation pass marked (src/store/consolidate.py), left out by default.
+IncludeHistory = Annotated[
+    bool,
+    Field(
+        description="Include decisions, actions and facts a consolidation pass marked as a "
+        "duplicate, superseded or no longer true, left out by default and counted in "
+        "history_left_out."
+    ),
+]
 # The kinds a row says it is (src/store/envelope.py), as each search takes them. Leaving
 # news out needs no switch of its own: include_news is false unless set.
 _NEWS_IN_KINDS = "Naming news includes it whatever include_news says; omit for every kind."
@@ -612,6 +622,12 @@ def _say_empty(out: dict, reason: str, coverage: dict | None) -> dict:
     if left:
         held = ", ".join(f"{cut['rows']} {name} ({cut['switch']})" for name, cut in left.items())
         reason = f"Only matches left out by default were found: {held}. {reason}"
+    history = out.get("history_left_out") or {}
+    if history and "rows" in history:
+        reason = (
+            f"{history['rows']} older or duplicate rows were left out "
+            f"({history['switch']}). {reason}"
+        )
     out.setdefault("reason", reason)
     if coverage is not None:
         out["coverage"] = coverage
@@ -660,6 +676,21 @@ def _excluded(left_out: tuple[str, ...], *probes: list[dict]) -> dict:
     return out
 
 
+def _history_probe(
+    conn, table: str, key: str, probe: list[dict], *, done_too: bool = False
+) -> dict | None:
+    """history_left_out of a list tool: of the first _EXCLUDED_PROBE rows the same search
+    gives with include_history, how many the current-state filter left out (and, for a
+    list of open actions, `done_too`, how many are marked done); `at_least` when that probe
+    read its whole limit. None when it left out none."""
+    hidden = hidden_ids(conn, table, [row.get(key) for row in probe])
+    if done_too:
+        hidden |= {int(row[key]) for row in probe if row.get("status") == "done"}
+    if not hidden:
+        return None
+    return history_left_out(len(hidden), at_least=len(probe) >= _EXCLUDED_PROBE)
+
+
 _NO_WORD = (
     "Nothing held any meaningful word of the query. Try other words or the other "
     "language (most text is Greek), and check stats coverage for the dates held."
@@ -685,16 +716,19 @@ def person_context(
     include_news: IncludeNews = False,
     include_automation: IncludeAutomation = False,
     detail: PersonDetail = "full",
+    include_history: IncludeHistory = False,
 ) -> PersonContext:
     """Brief me on a person: their email history, topics, sentiment, decisions, open actions, communication pattern, meetings (last_met, next_meeting, meeting_count_30d), and their Teams and WhatsApp activity.
 
     Each list is capped at `limit` and has a `<name>_total` sibling with the real
     count. A name resolves to someone with an address before a mere mention, then
     the most-emailed: resolved_by says how ('email', 'mri', 'jid', 'name',
-    'alias'), match_count how many people it fits, other_candidates who else. News
-    and the owner's automation mail are left out unless included. detail='card'
-    gives a short card, 'concise' a short line per row; meeting_prep takes several
-    people.
+    'alias'), match_count how many people it fits, other_candidates who else; their
+    mail is that of every row joined to them (their entity). News and the owner's
+    automation mail are left out unless included, and so are decisions and actions
+    marked duplicate or superseded (history_left_out counts them, include_history
+    keeps them). detail='card' gives a short card, 'concise' a short line per row;
+    meeting_prep takes several people.
     """
     from src.store.context import get_person_context
 
@@ -710,6 +744,7 @@ def person_context(
             limit=_cap(limit),
             include_news=include_news,
             include_automation=include_automation,
+            include_history=include_history,
         )
         head = _header(conn)
         if out.get("person") is None:
@@ -759,13 +794,16 @@ def topic_context(
     include_news: IncludeNews = False,
     include_automation: IncludeAutomation = False,
     detail: Detail = "full",
+    include_history: IncludeHistory = False,
 ) -> TopicContext:
     """Brief me on a topic: its related emails, key people, decisions, open actions and key facts.
 
-    The topic is matched against the extracted topic tags. Each list is capped at
-    `limit` and has a `<name>_total` sibling with the real count. News and the
-    owner's automation mail are left out unless included. When no tag matches,
-    recall searches the text itself.
+    The topic is matched against the extracted topic tags and read with its family
+    (topic.family: the variants mapped under it and its synonyms). Each list is
+    capped at `limit` and has a `<name>_total` sibling with the real count. News and
+    the owner's automation mail are left out unless included, and so are items
+    marked duplicate or superseded (history_left_out counts them). When no tag
+    matches, recall searches the text itself.
     """
     from src.store.context import get_topic_context, topic_page_first
 
@@ -779,6 +817,7 @@ def topic_context(
             limit=_cap(limit),
             include_news=include_news,
             include_automation=include_automation,
+            include_history=include_history,
         )
         # The topic's page first, when one is held (topic_page reads it alone).
         out = topic_page_first(conn, out)
@@ -1041,6 +1080,7 @@ def recall(
     include_automation: IncludeAutomation = False,
     kinds: RecallKinds = None,
     detail: Detail = "full",
+    include_history: IncludeHistory = False,
 ) -> RecallResult:
     """Tell me everything we know about X: one search across every index, the default first call.
 
@@ -1096,6 +1136,7 @@ def recall(
             include_news=include_news,
             include_automation=include_automation,
             kinds=kinds,
+            include_history=include_history,
         )
         fresh = _header(conn)
         excluded = None
@@ -1249,6 +1290,7 @@ def query_decisions(
         bool, Field(description="Include decisions extracted from news articles.")
     ] = False,
     include_automation: IncludeAutomation = False,
+    include_history: IncludeHistory = False,
 ) -> RowsResult:
     """What was decided, recently or about a topic or by a person.
 
@@ -1257,7 +1299,9 @@ def query_decisions(
     the class of its email. Decisions extracted from news articles and from the
     owner's automation mail are left out unless asked for: those are what
     companies announced or bots reported, not what this user decided. `excluded`
-    counts the ones left out.
+    counts the ones left out. So are decisions a consolidation pass marked as a
+    duplicate or superseded: `history_left_out` counts them. A topic takes its
+    family of variants and synonyms.
     """
     from src.store.query import query_decisions as _qd
 
@@ -1274,6 +1318,7 @@ def query_decisions(
             limit=_cap(limit),
             include_news=include_news,
             include_automation=include_automation,
+            include_history=include_history,
         )
         left_out = _left_out(include_news, include_automation)
         excluded = None
@@ -1288,10 +1333,29 @@ def query_decisions(
                 include_automation=True,
             )
             excluded = _excluded(left_out, probe)
+        history = None
+        if not include_history:
+            history = _history_probe(
+                conn,
+                "decisions",
+                "decision_id",
+                _qd(
+                    conn,
+                    topic=topic,
+                    person=person,
+                    days=days,
+                    limit=_EXCLUDED_PROBE,
+                    include_news=include_news,
+                    include_automation=include_automation,
+                    include_history=True,
+                ),
+            )
         head = _header(conn)
         cover = _cover(conn, rows, EXTRACTED_FROM)
     finally:
         conn.close()
+    if history:
+        head = {**head, "history_left_out": history}
     return cast(
         RowsResult,
         _rows(
@@ -1311,11 +1375,12 @@ def query_actions(
         Field(description="The action's owner, by name; matches everyone the name fits."),
     ] = None,
     status: Annotated[
-        Literal["open", "expired"],
+        Literal["open", "expired", "done"],
         Field(
-            description="'open' (default) or 'expired': the lifecycle job marks an action "
+            description="'open' (default), 'expired' (the lifecycle job marks an action "
             "expired 180 days after its deadline or, with no date, 90 days after its source "
-            "last saw activity."
+            "last saw activity) or 'done' (a later message showed it done: closed_by, "
+            "closed_at)."
         ),
     ] = "open",
     limit: Annotated[
@@ -1325,16 +1390,18 @@ def query_actions(
         bool, Field(description="Include action items extracted from news articles.")
     ] = False,
     include_automation: IncludeAutomation = False,
+    include_history: IncludeHistory = False,
 ) -> RowsResult:
     """What is still to be done, by whom: action items, optionally by owner and status.
 
     Ordered so the actionable ones come first: upcoming deadlines soonest first,
     then undated items, then overdue ones most recently missed first. Each row
     carries `overdue` and a `source` of email, teams, calendar or conversation.
-    Status is 'open' or 'expired' (180 days after the deadline, or 90 days after
-    the source last saw activity): nothing records that an action was done, so
-    there is no other status. Items from news articles and from the owner's
-    automation mail are left out unless asked for (`excluded` counts them);
+    Status is 'open', 'expired' (180 days after the deadline, or 90 days after the
+    source last saw activity) or 'done', which the consolidation pass sets when a
+    later message shows the action done. Items from news articles and from the
+    owner's automation mail are left out unless asked for (`excluded` counts them),
+    and so are duplicates of another action (`history_left_out` counts them);
     `source_class` gives an email item's class. The rows come under `result`.
     """
     from src.store.query import query_action_items
@@ -1348,6 +1415,7 @@ def query_actions(
             limit=_cap(limit),
             include_news=include_news,
             include_automation=include_automation,
+            include_history=include_history,
         )
         left_out = _left_out(include_news, include_automation)
         excluded = None
@@ -1361,10 +1429,29 @@ def query_actions(
                 include_automation=True,
             )
             excluded = _excluded(left_out, probe)
+        history = None
+        if not include_history:
+            history = _history_probe(
+                conn,
+                "action_items",
+                "action_id",
+                query_action_items(
+                    conn,
+                    owner=owner,
+                    status=status,
+                    limit=_EXCLUDED_PROBE,
+                    include_news=include_news,
+                    include_automation=include_automation,
+                    include_history=True,
+                ),
+                done_too=status == "open",
+            )
         head = _header(conn)
         cover = _cover(conn, rows, EXTRACTED_FROM)
     finally:
         conn.close()
+    if history:
+        head = {**head, "history_left_out": history}
     return cast(
         RowsResult,
         _rows(
@@ -1388,14 +1475,16 @@ def stale_threads(
     ] = 30,
     include_news: IncludeNews = False,
     include_automation: IncludeAutomation = False,
+    include_history: IncludeHistory = False,
 ) -> StaleThreads:
     """Who owes me a reply, and what is overdue: threads you sent last with no answer, and overdue action items.
 
     Both lists are capped at `limit`, newest first, each with a `_total`.
     `stale_threads` holds threads whose last message you sent between `days` and
     `max_days` ago; `overdue_actions` the most recently missed deadlines from
-    every source but news and the owner's automation mail, unless included. The
-    thread half needs BRAIN_USER_EMAIL_PATTERN; without it the list is empty and
+    every source but news and the owner's automation mail, unless included, and
+    without the duplicates a consolidation pass marked (history_left_out counts them).
+    The thread half needs BRAIN_USER_EMAIL_PATTERN; without it the list is empty and
     `stale_threads_unavailable` says why.
     """
     from src.config import USER_EMAIL_PATTERN
@@ -1418,9 +1507,20 @@ def stale_threads(
             "stale_threads_total": count_stale_threads(
                 conn, days=days, max_days=max_days, **switches
             ),
-            "overdue_actions": find_overdue_actions(conn, limit=limit, **switches),
-            "overdue_actions_total": count_overdue_actions(conn, **switches),
+            "overdue_actions": find_overdue_actions(
+                conn, limit=limit, include_history=include_history, **switches
+            ),
+            "overdue_actions_total": count_overdue_actions(
+                conn, include_history=include_history, **switches
+            ),
         }
+        if not include_history:
+            left = (
+                count_overdue_actions(conn, include_history=True, **switches)
+                - (out["overdue_actions_total"])
+            )
+            if left > 0:
+                out["history_left_out"] = {"overdue_actions": history_left_out(left)}
         if not USER_EMAIL_PATTERN:
             out["stale_threads_unavailable"] = (
                 "BRAIN_USER_EMAIL_PATTERN is unset, so 'you sent last' cannot be "
@@ -1455,13 +1555,15 @@ def meeting_prep(
     include_news: IncludeNews = False,
     include_automation: IncludeAutomation = False,
     detail: Detail = "full",
+    include_history: IncludeHistory = False,
 ) -> MeetingPrep:
     """Prepare me for a meeting: a dossier per attendee (emails, decisions, open actions, topics, sentiment), `meetings` (the next and last ones they share with me, each with its purpose and a dozen attendees), and the topic's context when one is given.
 
     Each attendee resolves as person_context resolves it, with resolved_by,
     match_count and other_candidates. News and the owner's automation mail are
-    left out unless included. The budget cuts rows inside each dossier, which then
-    says so in its own `truncated`, never a whole attendee.
+    left out unless included, and so are items marked duplicate or superseded (each
+    dossier's history_left_out counts them). The budget cuts rows inside each
+    dossier, which then says so in its own `truncated`, never a whole attendee.
     """
     from src.store.query import meeting_prep as _mp
 
@@ -1476,6 +1578,7 @@ def meeting_prep(
             days=days,
             include_news=include_news,
             include_automation=include_automation,
+            include_history=include_history,
         )
         out = _headed(_header(conn), prep)
         resolved = any(a.get("resolved_email") or a.get("resolved_name") for a in prep["attendees"])

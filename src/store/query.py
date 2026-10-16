@@ -13,7 +13,9 @@ from typing import Any
 
 from src.config import USER_EMAIL_PATTERN
 from src.store import envelope, ranking
+from src.store.consolidate import current_sql, history_left_out, open_status_sql
 from src.store.cross_script import NameForms, name_forms
+from src.store.entities import entity_person_ids
 from src.store.greek import register_sql_functions, search_fold
 from src.store.item_cleanup import not_boilerplate_sql
 from src.store.normalizer import normalize_topic
@@ -31,6 +33,13 @@ from src.store.ordering import (
 from src.store.owner import owner_address_sql
 from src.store.schema import subject_to_conversation_id
 from src.store.source_class import class_counts, visible_sql, with_source_class
+from src.store.topic_canon import family_of_matching_sql
+
+# The emails of every people row of a person's entity (src/store/entities.py), given their
+# ids as a JSON list.
+_ENTITY_EMAILS = (
+    "(SELECT email_id FROM email_people WHERE person_id IN (SELECT value FROM json_each(?)))"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -957,6 +966,7 @@ def query_decisions(
     include_news: bool = False,
     *,
     include_automation: bool = False,
+    include_history: bool = False,
 ) -> list[dict]:
     """Find decisions, optionally filtered by topic or person.
 
@@ -975,6 +985,11 @@ def query_decisions(
         include_automation: Include decisions extracted from the owner's
             automation mail: bot settings and report lines, not decisions anyone
             took (src/store/source_class.py). Default False.
+        include_history: Include decisions a consolidation pass marked duplicate,
+            superseded or invalid (src/store/consolidate.py). Default False.
+
+    The topic filter takes the family (src/store/topic_canon.py) of every topic whose name
+    holds it.
 
     Returns:
         List of dicts with keys: decision_id, decision, decided_by, date (its own
@@ -1022,7 +1037,8 @@ def query_decisions(
 
     if topic:
         where_clauses.append(
-            "e.id IN (SELECT email_id FROM email_topics et2 JOIN topics t2 ON et2.topic_id = t2.id WHERE t2.name LIKE ?)"
+            "e.id IN (SELECT email_id FROM email_topics et2 WHERE et2.topic_id IN"
+            f" ({family_of_matching_sql(conn)}))"
         )
         params.append(f"%{normalize_topic(topic)}%")
 
@@ -1031,6 +1047,7 @@ def query_decisions(
         params.append(f"%{search_fold(person)}%")
 
     where_clauses.append(visible_sql(conn, "d.email_id", include_news, include_automation))
+    where_clauses.append(current_sql(conn, "d", "decisions", include_history))
 
     # Nothing has been decided at a date still to come. A meeting next week
     # returned its agenda as decisions, and dated by the meeting they sorted
@@ -1077,6 +1094,7 @@ def query_action_items(
     sources: tuple[str, ...] = ("email", "teams", "whatsapp", "calendar", "conversation"),
     *,
     include_automation: bool = False,
+    include_history: bool = False,
 ) -> list[dict]:
     """Find action items, filtered by owner and/or status.
 
@@ -1096,6 +1114,9 @@ def query_action_items(
         include_automation: Include items extracted from the owner's automation
             mail, which re-creates the same "execute" or "monitor" item in every
             report (src/store/source_class.py). Default False.
+        include_history: Include actions a consolidation pass marked duplicate,
+            superseded or invalid (src/store/consolidate.py). Default False. An action
+            the pass found done has status 'done', closed_by and closed_at.
 
     Returns:
         List of dicts with keys: action_id, task, owner, deadline, status,
@@ -1141,7 +1162,9 @@ def query_action_items(
     where_clauses = []
     params: list[Any] = []
 
-    if status:
+    if status == "open":
+        where_clauses.append(open_status_sql("a", include_history))
+    elif status:
         where_clauses.append("a.status = ?")
         params.append(status)
 
@@ -1150,6 +1173,7 @@ def query_action_items(
         params.append(f"%{search_fold(owner)}%")
 
     where_clauses.append(visible_sql(conn, "a.email_id", include_news, include_automation))
+    where_clauses.append(current_sql(conn, "a", "action_items", include_history))
 
     wanted = set(sources)
     if wanted != {"email", "teams", "whatsapp", "calendar", "conversation"}:
@@ -1318,6 +1342,7 @@ def meeting_prep(
     *,
     include_news: bool = False,
     include_automation: bool = False,
+    include_history: bool = False,
 ) -> dict:
     """Generate a meeting prep dossier for attendees.
 
@@ -1330,6 +1355,13 @@ def meeting_prep(
         limit_per_person: Max emails per person (default: 10)
         include_news, include_automation: Include news items and the owner's
             automation mail, left out by default (src/store/source_class.py)
+        include_history: Include decisions, actions and facts a consolidation pass
+            marked duplicate, superseded or invalid (src/store/consolidate.py), left
+            out by default; each dossier's `history_left_out` counts them
+
+    An attendee's mail is that of every people row of their entity
+    (src/store/entities.py), and the topic is read with its family
+    (src/store/topic_canon.py).
 
     Returns:
         Dict with keys:
@@ -1343,6 +1375,10 @@ def meeting_prep(
 
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     visible = visible_sql(conn, "e.id", include_news, include_automation)
+    current_d = current_sql(conn, "d", "decisions", include_history)
+    current_a = current_sql(conn, "a", "action_items", include_history)
+    current_f = current_sql(conn, "kf", "key_facts", include_history)
+    open_a = open_status_sql("a", include_history)
 
     result: dict[str, Any] = {"attendees": [], "topic_context": None}
 
@@ -1370,7 +1406,7 @@ def meeting_prep(
             continue
         dossier["resolved_name"] = person_row["name"]
         dossier["resolved_email"] = person_row["email"]
-        person_id = person_row["id"]
+        rows_of = json.dumps(entity_person_ids(conn, person_row["id"]))
 
         # One row per email, as in person_context: email_people is keyed by
         # role too, so joined through it an email where the person held two
@@ -1380,15 +1416,15 @@ def meeting_prep(
             f"""
             SELECT e.id as email_id, e.date_received as date, e.subject, e.summary,
                 (SELECT ep.role_in_email FROM email_people ep
-                  WHERE ep.email_id = e.id AND ep.person_id = ?
+                  WHERE ep.email_id = e.id AND ep.person_id IN (SELECT value FROM json_each(?))
                   ORDER BY ep.role_in_email <> 'sender', ep.role_in_email LIMIT 1) as role,
                 e.sentiment
             FROM emails e
-            WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+            WHERE e.id IN {_ENTITY_EMAILS}
               AND e.date_received >= ? AND {visible}
             ORDER BY e.date_received DESC LIMIT ?
         """,
-            (person_id, person_id, cutoff, limit_per_person),
+            (rows_of, rows_of, cutoff, limit_per_person),
         )
         dossier["emails"] = with_source_class(conn, [dict(r) for r in cursor.fetchall()])
 
@@ -1405,13 +1441,19 @@ def meeting_prep(
                 e.id as email_id, e.subject as email_subject
             FROM decisions d
             JOIN emails e ON d.email_id = e.id
-            WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
-              AND e.date_received >= ? AND {visible}
+            WHERE e.id IN {_ENTITY_EMAILS}
+              AND e.date_received >= ? AND {visible} AND {current_d}
             ORDER BY {decision_order(EMAIL_DATE)} LIMIT 10
         """,
-            (person_id, cutoff),
+            (rows_of, cutoff),
         )
         dossier["decisions"] = with_source_class(conn, [dict(r) for r in cursor.fetchall()])
+        left_d = conn.execute(
+            f"""SELECT COUNT(*) - TOTAL({current_d}) FROM decisions d
+            JOIN emails e ON d.email_id = e.id
+            WHERE e.id IN {_ENTITY_EMAILS} AND e.date_received >= ? AND {visible}""",
+            (rows_of, cutoff),
+        ).fetchone()[0]
 
         # Open action items, the actionable first
         cursor = conn.execute(
@@ -1420,13 +1462,26 @@ def meeting_prep(
                 e.id as email_id, e.subject as email_subject
             FROM action_items a
             JOIN emails e ON a.email_id = e.id
-            WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
-              AND a.status = 'open' AND {visible}
+            WHERE e.id IN {_ENTITY_EMAILS}
+              AND {open_a} AND {visible} AND {current_a}
             ORDER BY {action_order(EMAIL_DATE)} LIMIT 10
         """,
-            (person_id,),
+            (rows_of,),
         )
         dossier["open_actions"] = with_source_class(conn, [dict(r) for r in cursor.fetchall()])
+        left_a = conn.execute(
+            f"""SELECT COUNT(*) - TOTAL({current_a} AND {open_a}) FROM action_items a
+            JOIN emails e ON a.email_id = e.id
+            WHERE e.id IN {_ENTITY_EMAILS} AND a.status IN ('open', 'done') AND {visible}""",
+            (rows_of,),
+        ).fetchone()[0]
+        left = {
+            name: history_left_out(int(n))
+            for name, n in (("decisions", left_d), ("open_actions", left_a))
+            if n > 0
+        }
+        if left:
+            dossier["history_left_out"] = left
 
         # Top topics
         cursor = conn.execute(
@@ -1435,11 +1490,11 @@ def meeting_prep(
             FROM email_topics et
             JOIN topics t ON et.topic_id = t.id
             JOIN emails e ON et.email_id = e.id
-            WHERE e.id IN (SELECT email_id FROM email_people WHERE person_id = ?)
+            WHERE e.id IN {_ENTITY_EMAILS}
               AND e.date_received >= ? AND {visible}
             GROUP BY t.id ORDER BY count DESC LIMIT 5
         """,
-            (person_id, cutoff),
+            (rows_of, cutoff),
         )
         dossier["topics"] = [dict(r) for r in cursor.fetchall()]
 
@@ -1479,8 +1534,8 @@ def meeting_prep(
             FROM decisions d
             JOIN emails e ON d.email_id = e.id
             WHERE e.id IN (SELECT et.email_id FROM email_topics et
-                           JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
-              AND e.date_received >= ? AND {visible}
+                           WHERE et.topic_id IN ({family_of_matching_sql(conn)}))
+              AND e.date_received >= ? AND {visible} AND {current_d}
             ORDER BY {decision_order(EMAIL_DATE)} LIMIT 20
         """,
             (f"%{topic_normalized}%", cutoff),
@@ -1493,8 +1548,9 @@ def meeting_prep(
             FROM key_facts kf
             JOIN emails e ON kf.email_id = e.id
             WHERE e.id IN (SELECT et.email_id FROM email_topics et
-                           JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
+                           WHERE et.topic_id IN ({family_of_matching_sql(conn)}))
               AND e.date_received >= ? AND {visible} AND {not_boilerplate_sql(conn)}
+              AND {current_f}
             ORDER BY {fact_order(EMAIL_DATE)} LIMIT 20
         """,
             (f"%{topic_normalized}%", cutoff),
@@ -1508,8 +1564,8 @@ def meeting_prep(
             FROM action_items a
             JOIN emails e ON a.email_id = e.id
             WHERE e.id IN (SELECT et.email_id FROM email_topics et
-                           JOIN topics t ON t.id = et.topic_id WHERE t.name LIKE ?)
-              AND a.status = 'open' AND {visible}
+                           WHERE et.topic_id IN ({family_of_matching_sql(conn)}))
+              AND {open_a} AND {visible} AND {current_a}
             ORDER BY {action_order(EMAIL_DATE)} LIMIT 20
         """,
             (f"%{topic_normalized}%",),
@@ -1668,7 +1724,10 @@ def count_stale_threads(
 
 
 def _overdue_where(
-    conn: sqlite3.Connection, include_news: bool = False, include_automation: bool = False
+    conn: sqlite3.Connection,
+    include_news: bool = False,
+    include_automation: bool = False,
+    include_history: bool = False,
 ) -> str:
     """Open, past an ISO date, and not from a news item or the owner's automation
     mail unless asked. Free text sorted to the top with days_overdue = NULL and
@@ -1677,21 +1736,27 @@ def _overdue_where(
     so those counted as overdue with days_overdue near 2.46 million. The same ISO
     test query_action_items uses."""
     return f"""
-    ai.status = 'open' AND ai.deadline {_ISO_DATE}
+    {open_status_sql("ai", include_history)} AND ai.deadline {_ISO_DATE}
       AND date(substr(ai.deadline, 1, 10)) IS NOT NULL
       AND substr(ai.deadline, 1, 10) < date('now')
       AND {visible_sql(conn, "ai.email_id", include_news, include_automation)}
+      AND {current_sql(conn, "ai", "action_items", include_history)}
 """
 
 
 def count_overdue_actions(
-    conn: sqlite3.Connection, *, include_news: bool = False, include_automation: bool = False
+    conn: sqlite3.Connection,
+    *,
+    include_news: bool = False,
+    include_automation: bool = False,
+    include_history: bool = False,
 ) -> int:
-    """How many open action items are past a parseable deadline, news and the
-    owner's automation mail excluded unless asked."""
+    """How many open action items are past a parseable deadline, news and the owner's
+    automation mail excluded unless asked, and those a consolidation pass marked
+    duplicate or superseded unless include_history."""
     return conn.execute(
         "SELECT COUNT(*) FROM action_items ai WHERE "
-        + _overdue_where(conn, include_news, include_automation)
+        + _overdue_where(conn, include_news, include_automation, include_history)
     ).fetchone()[0]
 
 
@@ -1701,6 +1766,7 @@ def find_overdue_actions(
     *,
     include_news: bool = False,
     include_automation: bool = False,
+    include_history: bool = False,
 ) -> list[dict]:
     """Find action items past their deadline, most recently missed first.
 
@@ -1742,7 +1808,7 @@ def find_overdue_actions(
         LEFT JOIN conversation_turns ct ON ai.conversation_turn_id = ct.id
         LEFT JOIN conversations c ON ct.conversation_id = c.id
         WHERE """
-        + _overdue_where(conn, include_news, include_automation)
+        + _overdue_where(conn, include_news, include_automation, include_history)
         + """
         ORDER BY ai.deadline DESC
         LIMIT ?

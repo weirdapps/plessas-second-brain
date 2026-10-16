@@ -508,6 +508,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_topic_pages(conn)
     if current < 37:
         migrate_add_figures(conn)
+    if current < 38:
+        migrate_add_memory(conn)
     if current < 39:
         migrate_add_attachment_chunks(conn)
 
@@ -1006,6 +1008,117 @@ def migrate_add_attachment_chunks(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (attachment_id, chunk_no)
         )"""
     )
+
+
+# v38: the tables of the consolidation pass (src/store/consolidate.py), the entity seed
+# (src/store/entities.py) and the topic families (src/store/topic_canon.py).
+MEMORY_TABLES = (
+    """CREATE TABLE IF NOT EXISTS consolidation_threads (
+        thread_key TEXT PRIMARY KEY,
+        signature TEXT NOT NULL,
+        last_at TEXT,
+        rule_at TEXT,
+        model_signature TEXT,
+        model_at TEXT,
+        model_state TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        labels INTEGER NOT NULL DEFAULT 0,
+        review TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS item_labels (
+        id INTEGER PRIMARY KEY,
+        item_table TEXT NOT NULL,
+        item_id INTEGER NOT NULL,
+        label TEXT NOT NULL
+            CHECK (label IN ('duplicate_of', 'superseded_by', 'completed_by', 'contested_by')),
+        target_id INTEGER,
+        target_ref TEXT,
+        evidence TEXT,
+        prior TEXT,
+        method TEXT NOT NULL,
+        prompt_hash TEXT,
+        reply_id TEXT,
+        thread_key TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        undone_at TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_item_labels_item ON item_labels(item_table, item_id)",
+    "CREATE INDEX IF NOT EXISTS idx_item_labels_run ON item_labels(run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_item_labels_thread ON item_labels(thread_key)",
+    """CREATE TABLE IF NOT EXISTS entities (
+        id INTEGER PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('person', 'organisation', 'initiative')),
+        name TEXT NOT NULL,
+        person_id INTEGER,
+        method TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS entity_aliases (
+        kind TEXT NOT NULL,
+        value TEXT NOT NULL,
+        entity_id INTEGER NOT NULL REFERENCES entities(id),
+        method TEXT NOT NULL,
+        score REAL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (kind, value)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_entity_aliases_entity ON entity_aliases(entity_id)",
+    """CREATE TABLE IF NOT EXISTS entity_adjudications (
+        key TEXT PRIMARY KEY,
+        verdict TEXT NOT NULL,
+        detail TEXT,
+        decided_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS topic_family (
+        topic_id INTEGER NOT NULL,
+        head_id INTEGER NOT NULL,
+        method TEXT NOT NULL CHECK (method IN ('fold', 'containment', 'embedding')),
+        score REAL,
+        mapped_at TEXT NOT NULL,
+        PRIMARY KEY (topic_id, head_id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_topic_family_head ON topic_family(head_id)",
+)
+# What closed a commitment, as action_items.closed_by and closed_at say it for an action.
+COMMITMENT_CLOSE_COLUMNS = (("closed_by", "TEXT"), ("closed_at", "TEXT"))
+
+
+def migrate_add_memory(conn: sqlite3.Connection) -> None:
+    """v38: consolidation state, entities and canonical topics.
+
+    consolidation_threads records each thread's last pass (the items it saw, by rule and by
+    model) and item_labels every label a pass wrote, with its evidence, so a label can be
+    read back and undone; the labels themselves go in the v35 columns canonical_id,
+    superseded_by and invalid_at, and a completion in status/closed_by/closed_at, which
+    commitments gain here. entities and entity_aliases join people rows (never merged or
+    deleted), Teams MRIs, WhatsApp JIDs, mail domains and topics to one person,
+    organisation or initiative; entity_adjudications remembers what the model said of an
+    ambiguous group. topic_family maps a topic to the head of its family.
+
+    The partial indexes on canonical_id and superseded_by start empty (every row is NULL)
+    and serve the repair of pointers to deleted rows. Nothing is rewritten: ADD COLUMN with
+    no default and CREATE ... IF NOT EXISTS, so no full-text index is touched and running it
+    again changes nothing.
+    """
+    for statement in MEMORY_TABLES:
+        conn.execute(statement)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    if "commitments" in tables:
+        have = {r[1] for r in conn.execute("PRAGMA table_info(commitments)")}
+        for name, declaration in COMMITMENT_CLOSE_COLUMNS:
+            if name not in have:
+                conn.execute(f"ALTER TABLE commitments ADD COLUMN {name} {declaration}")
+    for table in ("decisions", "action_items", "commitments", "key_facts"):
+        if table not in tables:
+            continue
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for column, short in (("canonical_id", "canonical"), ("superseded_by", "superseded")):
+            if column in have:
+                conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table}_state_{short} ON {table}({column})"
+                    f" WHERE {column} IS NOT NULL"
+                )
     conn.commit()
 
 

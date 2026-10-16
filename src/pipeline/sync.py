@@ -88,6 +88,12 @@ IMAGE_CLASSIFY_SYNC_BUDGET_S = 90.0
 # sb-conversation-sync, which has 900 s.
 CONVERSATION_SYNC_DEADLINE_S = 30.0
 
+# Step 8b (consolidation, src/store/consolidate.py): the rules on the threads that received
+# items since the last run, then model calls within BRAIN_CONSOLIDATE_SYNC_TOKENS. About 50
+# threads change a day; a call took 3-10 s on the replica's sample. What is not reached
+# waits in model_state 'pending' for the next run.
+CONSOLIDATE_SYNC_DEADLINE_S = 60.0
+
 # Step 2 (email extraction) had no bound either, and could sleep an hour
 # in-process on five quota errors. Measured on 2026-09-23: 7-19 new emails an
 # hour take 1.5-2.5 minutes through Steps 2-4, most of it extraction. The rest
@@ -132,6 +138,7 @@ SYNC_AFTER_EXTRACTION_S = (
     + CONVERSATION_SYNC_DEADLINE_S
     + IMAGE_CLASSIFY_SYNC_BUDGET_S
     + CHUNK_EMBED_SYNC_DEADLINE_S
+    + CONSOLIDATE_SYNC_DEADLINE_S
 )
 
 
@@ -503,6 +510,26 @@ def run(args):
             print("  No unclassified images")
     except Exception as e:
         print(f"  Image classification skipped: {e}")
+
+    # Step 8b: consolidation (src/store/consolidate.py): the threads with new items from any
+    # source, this run's mail and the Teams and WhatsApp syncs' since the last run. Marks
+    # items duplicate, superseded or done; deletes nothing. A failure here fails no sync.
+    print("\nStep 8b: Consolidating the threads with new items...")
+    try:
+        from src.store.consolidate import run_in_sync
+
+        consolidation = run_in_sync(db_path, CONSOLIDATE_SYNC_DEADLINE_S)
+        if consolidation.started_from_scratch:
+            print("  First run: recorded where consolidation starts (backfill: maint consolidate)")
+        else:
+            print(
+                f"  {consolidation.threads} threads by rule ({consolidation.rule_labels} duplicates),"
+                f" {consolidation.calls} calls, {consolidation.model_labels} labels"
+                f" {dict(consolidation.by_label)}, {consolidation.review} held for review"
+                + (f"; stopped: {consolidation.stopped}" if consolidation.stopped else "")
+            )
+    except Exception as e:
+        print(f"  Consolidation skipped: {e}", file=sys.stderr)
 
     # Step 9: one embedding pass for everything this run stored: the mail of Step 3, the
     # attachment summaries of Step 6, the conversations of Step 7 (one loaded again has a new

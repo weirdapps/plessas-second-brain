@@ -96,6 +96,11 @@ def test_a_fact_is_not_boilerplate_until_marked(store):
 def _drop_v35(conn):
     """The store as v34 left it: the v35 columns and table gone, the version stamped back."""
     conn.execute("DROP TABLE IF EXISTS boilerplate_fact_keys")
+    # v38 indexes canonical_id and superseded_by, so they go before their columns can.
+    for (index,) in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND (name GLOB 'idx_*_state_canonical' OR name GLOB 'idx_*_state_superseded')"
+    ).fetchall():
+        conn.execute(f"DROP INDEX {index}")
     for table, columns in ITEM_STATE_COLUMNS.items():
         for name, _decl in columns:
             conn.execute(f"ALTER TABLE {table} DROP COLUMN {name}")

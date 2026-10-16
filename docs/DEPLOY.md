@@ -446,11 +446,14 @@ checked before an item starts, and what does not fit waits for the next run:
 5. Claude Code conversations: export the sessions of the last 7 days that changed,
    extract for 30 s, load (`--skip-conversations` leaves this out).
 6. Inline images: classify and describe new ones, for 90 s.
-7. One embedding pass over what the run stored, when it loaded mail or
+7. Consolidation (Step 8b): the threads that received items since the last run, from
+   any source, get the rules, then model calls within `BRAIN_CONSOLIDATE_SYNC_TOKENS`,
+   for 60 s (README, "Decisions and actions"); a failure here fails no sync.
+8. One embedding pass over what the run stored, when it loaded mail or
    conversations, in the index's space; once that is this code's, it also cuts the new
    long PDF, Word and PowerPoint attachments into chunks and embeds them, for 60 s.
    It adds nothing while `maint vectors-rebuild` runs.
-8. Record `last_sync_date` and `mail_export_ok_at`, which `stats` reports.
+9. Record `last_sync_date` and `mail_export_ok_at`, which `stats` reports.
 
 It exits 0; 75 when extraction ended on a quota pause, or when the model extracted
 none of the new mail sent to it (`last_sync_date` is then held back, so the run
@@ -1341,6 +1344,60 @@ wait for the backfill, which runs on the producer beside the timers, once:
    `python -m src.cli maint figures-backfill --apply --reset` forgets every figure and
    reads them all again.
 
+### One-off commands after 2026-10-16 (memory: consolidation, entities, topic families, schema v38)
+
+This release adds the consolidation pass, entities and topic families (README,
+"Decisions and actions" and "People and topics"). v38 applies at the first job that
+writes (Schema notes, below); nothing needs stopping. On the producer, with the
+environment the timers run with, in this order:
+
+1. **The hourly pass.** The first `sync` after the pull records where consolidation
+   starts (`consolidate_high_water`) and takes nothing older; later runs take the
+   threads with new items, rules first, then calls within `BRAIN_CONSOLIDATE_SYNC_TOKENS`
+   (default 60,000 a run, about $0.20). While `maint reextract-stacked` is still
+   running, every email it extracts again gives its thread new items, and the hourly
+   pass would call the model on them at up to ten threads a run: to hold the calls until
+   step 5, put `BRAIN_CONSOLIDATE_SYNC_TOKENS=0` (the rules alone) in the timers'
+   environment, and take it out after.
+2. **Entities.** `python -m src.cli maint entities` counts (no model call): on the
+   reference replica 8,143 new entities, 3,257 joins by the alias map, 119 by
+   transliteration, 10 by shared threads, 301 groups of mentions, 211 organisations, 960
+   names fitting one identity the owner never wrote to (left alone) and 1,678 ambiguous
+   names, whose adjudication it prices (about $6). It needs `BRAIN_USER_EMAIL_PATTERN`:
+   without it no name joins anyone. Then
+   `python -m src.cli maint entities --apply` (seconds), and
+   `python -m src.cli maint entities --apply --adjudicate --token-budget 2500000`: one
+   call per ambiguous name, 18 measured calls averaged 1,100 tokens. Its joins are
+   proposals; `maint entities --revert-proposed RUN_ID` (printed by the run) or `all`
+   takes them back.
+3. **Topic families.** `python -m src.cli maint topic-canon` counts, then
+   `python -m src.cli maint topic-canon --apply` writes the folding and containment rows
+   (12,555 and 131,404 on the reference replica; no model call), then
+   `python -m src.cli maint topic-canon --apply --embed` embeds the 60,303 remaining
+   names at 256 dimensions through the embedding client (the Gemini API key: about
+   $0.05; the vectors are kept in `topic_vectors.npz` under the data root, so a second
+   run sends only new names) and writes the synonyms. Not beside another embedding job
+   (section 6): it holds about 70 MB of vectors and a 140 MB block of similarities.
+4. **Wait for `reextract-stacked`.** The backfill should read each thread's items once
+   they are final: run step 5 after `maint reextract-stacked` counts 0.
+5. **The consolidation backfill.** `python -m src.cli maint consolidate` (default
+   `--since` a year ago) prices it and writes nothing: on the reference replica 27,785
+   threads, 179,700 duplicates by rule (143,279 key facts, 24,233 actions, 10,398
+   decisions, 1,790 commitments) and 4,898 calls, $91 online with
+   `BRAIN_CHARS_PER_TOKEN=1.95` (measured on this corpus) and 400 output tokens a call;
+   90 measured calls came to about $0.016 each under the final prompt, so about $76. Then
+   `python -m src.cli maint consolidate --apply --rules-only` (no model call, about ten
+   minutes), and once a day
+   `python -m src.cli maint consolidate --apply --token-budget 12000000 --limit 1600`
+   (about $30, which with the hourly jobs stays under the $60 alert) until the dry run
+   counts no calls: three days. Exit 75 means the service stopped it; the next run
+   carries on.
+6. **Review.** Threads whose reply would have marked too much wait unapplied:
+   `SELECT thread_key, review FROM consolidation_threads WHERE model_state = 'review'`.
+   `maint consolidate --revert RUN_ID|THREAD` puts back a run's or a thread's labels;
+   every label is in `item_labels` with its evidence, the values it replaced, the
+   prompt hash and the reply id.
+
 ### After 2026-10-16 (vectors v2, schema v39)
 
 This release moves the index to gemini-embedding-2 at 768 dimensions in half precision,
@@ -1465,6 +1522,12 @@ one pass, at the first job that writes. The versions that ask for a step:
   second; nothing needs stopping. The registry fills from the backfill above. A replica
   that runs this code on a store pulled before the migration answers `figures` with a
   `reason` saying the registry is not built there yet.
+- **v38.** The consolidation, entity and topic-family tables, `commitments.closed_by`
+  and `closed_at`, and partial indexes on `canonical_id` and `superseded_by` (README,
+  "Database schema", Memory). New tables, ADD COLUMN and indexes over columns that are
+  NULL everywhere: no row is rewritten, no full-text index rebuilt, well under a second,
+  and nothing needs stopping. Readers on a store before v35 or v38 see every item as
+  current and every topic as a family of one.
 - **v39.** `attachment_chunks`, where each chunk of a long document lies (README,
   "Database schema", Attachment chunks). CREATE TABLE only, so it takes milliseconds and
   nothing needs stopping; the hourly embedding pass and `maint vectors-rebuild` fill it,

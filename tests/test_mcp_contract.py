@@ -74,7 +74,7 @@ def test_every_limit_is_bounded_in_the_schema():
         ("search_conversations", "search_type", ["keyword", "semantic"]),
         ("search_teams", "kind", ["thread", "message", "both"]),
         ("sharepoint_index", "operation", ["list_stale", "list_unfetched", "refetch"]),
-        ("query_actions", "status", ["open", "expired"]),
+        ("query_actions", "status", ["open", "expired", "done"]),
     ],
 )
 def test_the_choices_are_enums(tool, param, values):

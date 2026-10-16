@@ -2977,6 +2977,13 @@ def main():
     from src.store.vector_rebuild import add_maint_parsers as add_vector_parsers
 
     add_vector_parsers(maint_subparsers)
+    # consolidate (src/store/consolidate.py), entities (src/store/entities.py) and
+    # topic-canon (src/store/topic_canon.py): maint-only, with no old spelling.
+    from src.store import consolidate, entities, topic_canon
+
+    consolidate.add_maint_parser(maint_subparsers)
+    entities.add_maint_parser(maint_subparsers)
+    topic_canon.add_maint_parser(maint_subparsers)
 
     # Parse and execute
     args = parser.parse_args()

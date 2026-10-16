@@ -1488,8 +1488,9 @@ def check_conversations(db):
     }
 
 
-def _embedding_coverage(db, ids) -> dict[str, tuple[int, int]]:
-    """(indexed, eligible) per source, with "eligible" as each embedder selects it.
+def _embedding_coverage(db, ids, chunks: bool = False) -> dict[str, tuple[int, int]]:
+    """(indexed, eligible) per source, with "eligible" as each embedder selects it; with
+    `chunks` (an index in a space that holds them), the chunks attachment_chunks records too.
 
     A fresh file with a plausible total can still be missing a whole source: on
     2026-09-23 the index held 133 of 5,469 extracted Teams threads while this
@@ -1499,6 +1500,7 @@ def _embedding_coverage(db, ids) -> dict[str, tuple[int, int]]:
         CONVERSATION_ID_OFFSET,
         TEAMS_THREAD_ID_OFFSET,
         WHATSAPP_THREAD_ID_OFFSET,
+        chunk_vector_id,
     )
 
     indexed = {int(i) for i in ids}
@@ -1531,7 +1533,74 @@ def _embedding_coverage(db, ids) -> dict[str, tuple[int, int]]:
             continue  # a source this schema does not have
         eligible = [to_vector_id(int(r[0])) for r in rows]
         coverage[name] = (sum(1 for v in eligible if v in indexed), len(eligible))
+    if chunks:
+        # The passages attachment_chunks records, each owed a vector (schema v39).
+        try:
+            rows = db.execute("SELECT content_id, chunk_no FROM attachment_chunks").fetchall()
+        except sqlite3.Error:
+            rows = []
+        wanted = [chunk_vector_id(r[0], r[1]) for r in rows]
+        coverage["chunks"] = (sum(1 for v in wanted if v in indexed), len(wanted))
     return coverage
+
+
+VECTOR_KINDS = ("email", "attachment", "chunk", "conversation", "teams", "whatsapp")
+
+
+def _vectors_by_kind(ids) -> dict[str, int]:
+    """How many vectors of each kind the index holds, read off their id ranges."""
+    import numpy as np
+
+    from src.store.embeddings import (
+        CHUNK_ID_OFFSET,
+        CONVERSATION_ID_OFFSET,
+        TEAMS_THREAD_ID_OFFSET,
+        WHATSAPP_THREAD_ID_OFFSET,
+    )
+
+    ids = np.asarray(ids, dtype=np.int64)
+    masks = {
+        "email": ids > 0,
+        "attachment": (ids < 0) & (ids > CONVERSATION_ID_OFFSET),
+        "chunk": ids <= CHUNK_ID_OFFSET,
+        "conversation": (ids <= CONVERSATION_ID_OFFSET) & (ids > TEAMS_THREAD_ID_OFFSET),
+        "teams": (ids <= TEAMS_THREAD_ID_OFFSET) & (ids > WHATSAPP_THREAD_ID_OFFSET),
+        "whatsapp": (ids <= WHATSAPP_THREAD_ID_OFFSET) & (ids > CHUNK_ID_OFFSET),
+    }
+    return {kind: int(masks[kind].sum()) for kind in VECTOR_KINDS}
+
+
+def _index_space(npz: Path) -> dict | None:
+    """The space the index records, the legacy one at its width for one that records none, or
+    None when neither can be read."""
+    import zipfile
+
+    from src.store.embeddings import file_space
+
+    try:
+        return file_space(npz)
+    except (KeyError, OSError, ValueError, zipfile.BadZipFile):
+        return None
+
+
+# A side build of the vector rebuild older than this has stalled: its batch jobs have a
+# 24-hour target, and the writers add no vector while it runs.
+REBUILD_STALE_AFTER = timedelta(days=2)
+
+
+def _rebuild_state(npz: Path) -> dict | None:
+    """The vector rebuild's side build beside the index (src/store/vector_rebuild.py), or None."""
+    path = npz.with_name("embeddings.rebuild") / "state.json"
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return {
+        "started_at": state.get("started_at"),
+        "parts": len(state.get("parts") or []),
+        "jobs_pending": len(state.get("jobs") or []),
+        "space": state.get("space"),
+    }
 
 
 # A source is a gap below this share of its eligible rows, once it has enough
@@ -1573,22 +1642,42 @@ def check_embeddings(db, npz_path: Path | None = None, now: datetime | None = No
     # months ago. The file's mtime is the only thing here that keeps moving.
     age = (now or datetime.now()) - datetime.fromtimestamp(npz.stat().st_mtime)
     stale = age > STALE_THRESHOLDS["embeddings"]
-    coverage = _embedding_coverage(db, ids)
+    from src.store.embeddings import has_chunks
+
+    space = _index_space(npz)
+    coverage = _embedding_coverage(db, ids, chunks=bool(space and has_chunks(space)))
     gaps = {
         name: (have, want)
         for name, (have, want) in coverage.items()
         if want >= EMBEDDING_COVERAGE_MIN_ROWS and have < EMBEDDING_COVERAGE_MIN * want
     }
-    return {
+    rebuild = _rebuild_state(npz)
+    stalled = False
+    if rebuild and rebuild["started_at"]:
+        try:
+            began = datetime.fromisoformat(rebuild["started_at"])
+            stalled = datetime.now(began.tzinfo) - began > REBUILD_STALE_AFTER
+        except ValueError:
+            stalled = False
+    result = {
         "name": "Embeddings",
         "embedded": n,
         "total_emails": total_emails,
         "age": age,
         "stale": stale,
+        "space": space,
+        "by_kind": _vectors_by_kind(ids),
         "coverage": coverage,
         "gaps": gaps,
-        "status": "STALE" if stale else ("WARN" if gaps else "OK"),
+        "rebuild": rebuild,
+        "status": "STALE" if stale else ("WARN" if gaps or stalled else "OK"),
     }
+    if stalled and rebuild:
+        result["note"] = (
+            f"vector rebuild started {rebuild['started_at']} and not swapped in: "
+            "brain maint vectors-rebuild --status"
+        )
+    return result
 
 
 GOLDEN_QUERY_LIMIT = 5
@@ -2540,6 +2629,12 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
             )
         elif c["name"] == "Embeddings" and c.get("note"):
             extra = f" ({c['note']})"
+        elif c["name"] == "Embeddings" and c.get("by_kind"):
+            space = c.get("space") or {}
+            kinds = ", ".join(f"{n:,} {kind}" for kind, n in c["by_kind"].items() if n)
+            extra = f" ({space.get('model', '?')} {space.get('dim', '?')}-d: {kinds})"
+            if c.get("rebuild"):
+                extra += f"; rebuild since {c['rebuild']['started_at']}"
         elif c["name"] == "Teams":
             extra = f" ({c.get('recent_24h', 0)} today)"
             if c.get("coverage_lost"):

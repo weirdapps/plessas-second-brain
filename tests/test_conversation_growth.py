@@ -488,10 +488,10 @@ def test_sync_embeds_the_conversations_it_loads(tmp_path, monkeypatch):
         ):
             return cli.cmd_sync(args)
 
-    def down(conn):
+    def down(conn, **_):
         raise RuntimeError("embedding service down")
 
-    assert sync(1, lambda conn: embedded.append("loaded")) == 0
-    assert sync(0, lambda conn: embedded.append("none loaded")) == 0
+    assert sync(1, lambda conn, **_: embedded.append("loaded")) == 0
+    assert sync(0, lambda conn, **_: embedded.append("none loaded")) == 0
     assert embedded == ["loaded"]
     assert sync(1, down) == 0

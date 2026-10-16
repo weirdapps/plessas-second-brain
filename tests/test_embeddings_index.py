@@ -320,7 +320,7 @@ class TestGenerateEmbeddingsAlignment:
                 self.values = v
 
         class _Models:
-            def embed_content(self, model, contents):
+            def embed_content(self, model, contents, config=None):
                 class R:
                     embeddings = [_Emb([0.0, 0.0, 0.0]) for _ in range(n_returned)]
 
@@ -346,7 +346,7 @@ class TestGenerateEmbeddingsAlignment:
         monkeypatch.setattr(emb.time, "sleep", lambda _s: None)
 
         class _Models:
-            def embed_content(self, model, contents):
+            def embed_content(self, model, contents, config=None):
                 raise RuntimeError("429 RESOURCE_EXHAUSTED")
 
         class _C:
@@ -376,7 +376,7 @@ class TestGenerateEmbeddingsMemory:
                 self.values = [0.5] * dim
 
         class _Models:
-            def embed_content(self, model, contents):
+            def embed_content(self, model, contents, config=None):
                 class R:
                     embeddings = [_Emb() for _ in contents]
 
@@ -416,7 +416,7 @@ class TestGenerateEmbeddingsMemory:
         calls = {"n": 0}
 
         class _Models:
-            def embed_content(self, model, contents):
+            def embed_content(self, model, contents, config=None):
                 calls["n"] += 1
                 marker = float(calls["n"])
 

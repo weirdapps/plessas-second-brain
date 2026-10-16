@@ -22,6 +22,7 @@ from src.store.embeddings import (
     IndexSpaceMismatch,
     embedding_space,
     index_space,
+    legacy_space,
     query_semantic,
     semantic_email_candidates,
 )
@@ -175,14 +176,22 @@ def test_an_index_from_before_has_no_space_and_none_is_no_index(tmp_path):
 # --- an index from before the space was recorded --------------------------------------------
 
 
-def test_an_index_from_before_is_taken_as_this_codes_space_and_tagged_on_its_next_save(index):
-    path, _calls = index
+def test_an_index_from_before_is_taken_as_the_legacy_space_and_tagged_on_its_next_save(index):
+    """Every index saved before the space was recorded was built with gemini-embedding-001 from
+    the template-1 texts, so it is in the legacy space, at its own vectors' width, and a writer
+    goes on adding vectors in it: the producer's hourly passes keep working between the merge
+    of the new code and the rebuild that moves the index to this code's space."""
+    path, calls = index
     _legacy(path, [1])
 
     assert embeddings.build_index(_store()) == 1
 
     assert _ids(path) == [1, 5]
-    assert index_space(path) == embedding_space(DIM)
+    assert index_space(path) == legacy_space(DIM)
+    template_1 = embeddings._email_embed_text(
+        "Lighthouse", None, "2026-01-01", "harbour lighthouse repairs"
+    )
+    assert calls == [[template_1]]
 
 
 def test_an_append_tags_an_index_from_before_too(index):
@@ -191,14 +200,14 @@ def test_an_append_tags_an_index_from_before_too(index):
 
     embeddings._append_to_index([-10_000_001], np.ones((1, DIM), np.float32))
 
-    assert index_space(path) == embedding_space(DIM)
+    assert index_space(path) == legacy_space(DIM)
 
 
 def test_a_removal_tags_an_index_from_before_and_keeps_a_recorded_space(index):
     path, _calls = index
     _legacy(path, [1, 2])
     embeddings.remove_vectors([2])
-    assert (_ids(path), index_space(path)) == ([1], embedding_space(DIM))
+    assert (_ids(path), index_space(path)) == ([1], legacy_space(DIM))
 
     _in_space(path, [1, 2], OTHER_MODEL)
     embeddings.remove_vectors([2])

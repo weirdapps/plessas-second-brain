@@ -6,6 +6,7 @@ optimized for CLI display.
 """
 
 import json
+import logging
 import sqlite3
 from collections.abc import Callable, Hashable
 from typing import Any
@@ -30,6 +31,8 @@ from src.store.ordering import (
 from src.store.owner import owner_address_sql
 from src.store.schema import subject_to_conversation_id
 from src.store.source_class import class_counts, visible_sql, with_source_class
+
+logger = logging.getLogger(__name__)
 
 # The loader threads an email with no conversation id and no references by the
 # hash of its normalized subject, so every blank subject shares this id: 92
@@ -1951,8 +1954,9 @@ def search_attachments(
     *,
     include_news: bool = False,
     include_automation: bool = False,
+    semantic_candidates=None,
 ) -> list[dict]:
-    """Search attachment content using FTS5.
+    """Search attachment content using FTS5, and with a semantic provider their vectors too.
 
     Args:
         conn: Database connection
@@ -1961,6 +1965,13 @@ def search_attachments(
         include_news, include_automation: Include the attachments of news items
             and of the owner's automation mail, left out by default
             (src/store/source_class.py)
+        semantic_candidates: Optional provider (conn, query, n) -> ranked candidates, as
+            recall takes one (embeddings.semantic_email_candidates). When given, and the
+            ranking fuses, the keyword rows are fused with the attachments its query vector
+            ranks, as recall's attachments bucket fuses them: a row semantic search alone
+            found says matched_in 'semantic', or 'chunk' with chunk_no, chunk_offset and
+            chunk_end when a passage of the document matched. A provider that fails leaves
+            the search keyword-only. None (default) is keyword-only.
 
     Returns:
         List of dicts with: attachment_id, filename, mime_type, email_id,
@@ -1970,6 +1981,32 @@ def search_attachments(
         and recency, the editions of one report (filenames apart only by a date)
         one row, the newest, with older_editions and editions (src/store/ranking.py).
     """
+    switches = {"include_news": include_news, "include_automation": include_automation}
+    if semantic_candidates is None or not ranking.fused_ranking():
+        return _keyword_attachments(conn, keyword, limit, **switches)
+    from src.store.recall import SIBLING_HEADROOM, _fuse_attachments
+
+    pool = max(limit * 4, limit)
+    rows = _keyword_attachments(conn, keyword, pool, **switches)
+    try:
+        candidates = semantic_candidates(conn, keyword, pool * SIBLING_HEADROOM)
+    except Exception as e:  # the index or the model is down; the words still match
+        logger.warning("search_attachments semantic half skipped: %s", type(e).__name__)
+        return rows[:limit]
+    by_kind = getattr(candidates, "by_kind", None) or {}
+    chunks = getattr(candidates, "chunks", None) or {}
+    return _fuse_attachments(conn, rows, list(by_kind.get("attachment", [])), limit, pool, chunks)
+
+
+def _keyword_attachments(
+    conn: sqlite3.Connection,
+    keyword: str,
+    limit: int,
+    *,
+    include_news: bool = False,
+    include_automation: bool = False,
+) -> list[dict]:
+    """search_attachments by its words alone (FTS5), as it always ranked."""
     # Check if attachment_content_fts exists
     tables = [
         r[0]

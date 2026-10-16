@@ -508,6 +508,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_topic_pages(conn)
     if current < 37:
         migrate_add_figures(conn)
+    if current < 39:
+        migrate_add_attachment_chunks(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -974,6 +976,34 @@ def migrate_add_item_state(conn: sqlite3.Connection) -> None:
             key TEXT PRIMARY KEY,
             threads INTEGER NOT NULL,
             marked_at TEXT NOT NULL
+        )"""
+    )
+    conn.commit()
+
+
+def migrate_add_attachment_chunks(conn: sqlite3.Connection) -> None:
+    """v39: attachment_chunks, where each chunk of a long PDF, Word or PowerPoint text lies.
+
+    One row per chunk src/store/chunks.py cuts: the attachment and its content row (the chunk
+    vector's id is made from content_id and chunk_no, src/store/embeddings.py), the chunk's
+    [start_char, end_char) span in attachment_content.extracted_text and its length (chars),
+    and the text it was cut from: its length (text_chars) and extraction time
+    (text_extracted_at), which tell a text read again, and when it was cut (chunked_at). Rows
+    are written by the hourly embedding pass and the vector rebuild, never by this migration:
+    CREATE TABLE IF NOT EXISTS, so it takes milliseconds and running it again changes nothing.
+    """
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS attachment_chunks (
+            attachment_id INTEGER NOT NULL,
+            chunk_no INTEGER NOT NULL,
+            content_id INTEGER NOT NULL,
+            start_char INTEGER NOT NULL,
+            end_char INTEGER NOT NULL,
+            chars INTEGER NOT NULL,
+            text_chars INTEGER NOT NULL,
+            text_extracted_at TEXT,
+            chunked_at TEXT NOT NULL,
+            PRIMARY KEY (attachment_id, chunk_no)
         )"""
     )
     conn.commit()

@@ -429,7 +429,7 @@ def test_build_index_embeds_the_image_description(conn, tmp_path, monkeypatch):
 
     assert emb.build_index(conn) == 1
 
-    assert embedded == [f"[Attachment: image001.png] {DESCRIPTION}"]
+    assert embedded == [f"title: image001.png | text: {DESCRIPTION}"]
     assert np.load(tmp_path / "embeddings.npz")["ids"].tolist() == [-ac_id]
 
 

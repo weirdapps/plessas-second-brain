@@ -478,9 +478,13 @@ def _hybrid_emails(
     return out
 
 
-def _attachment_rows(conn: sqlite3.Connection, attachment_ids: list) -> dict[int, dict]:
+def _attachment_rows(
+    conn: sqlite3.Connection, attachment_ids: list, chunks: dict[int, dict] | None = None
+) -> dict[int, dict]:
     """attachments.id -> a row as search_attachments writes one, with no snippet: what a
-    semantic hit is shown as. A row whose text was never summarised has no vector."""
+    semantic hit is shown as. A row whose text was never summarised has no vector. One whose
+    best match was a passage says which (`chunks`, embeddings.SemanticCandidates.chunks):
+    matched_in 'chunk', chunk_no, chunk_offset and chunk_end."""
     rows = conn.execute(
         """
         SELECT a.id, a.filename, a.mime_type, a.email_id, e.subject, e.date_received,
@@ -506,6 +510,7 @@ def _attachment_rows(conn: sqlite3.Connection, attachment_ids: list) -> dict[int
                 "summary": r[6],
                 "sha256": r[7],
                 "matched_in": envelope.SEMANTIC,
+                **((chunks or {}).get(r[0]) or {}),
             },
         )
     return out
@@ -523,10 +528,16 @@ def _attachment_key(row: dict) -> Hashable:
 
 
 def _fuse_attachments(
-    conn: sqlite3.Connection, keyword_rows: list[dict], sem_ids: list, limit: int, pool: int
+    conn: sqlite3.Connection,
+    keyword_rows: list[dict],
+    sem_ids: list,
+    limit: int,
+    pool: int,
+    chunks: dict[int, dict] | None = None,
 ) -> list[dict]:
     """The attachment bucket: its keyword rows (already ranked with recency, editions
-    collapsed) fused with the attachments semantic search ranks."""
+    collapsed) fused with the attachments semantic search ranks, a document's passages
+    folded onto it (`chunks` says which passage matched)."""
     hashes = dict(
         conn.execute(
             "SELECT id, sha256 FROM attachments WHERE id IN (SELECT value FROM json_each(?))",
@@ -538,7 +549,7 @@ def _fuse_attachments(
         kw_by_key.setdefault(
             _attachment_key({**row, "sha256": hashes.get(row["attachment_id"])}), row
         )
-    hydrated = _attachment_rows(conn, sem_ids)
+    hydrated = _attachment_rows(conn, sem_ids, chunks)
     sem_by_key = _semantic_pool(
         (hydrated[i] for i in sem_ids if i in hydrated), _attachment_key, pool
     )
@@ -755,18 +766,20 @@ def _run(conn: sqlite3.Connection, tasks: list[tuple[str, Task]], workers: int) 
 
 
 def _semantic_task(provider, query: str, limit: int) -> Task:
-    """The semantic provider as a task: (email ids or None, ids by kind, status)."""
+    """The semantic provider as a task: (email ids or None, ids by kind, status, the passages
+    that matched by attachment)."""
 
     def task(conn: sqlite3.Connection):
         try:
             candidates = provider(conn, query, limit)
             status = getattr(candidates, "semantic", "ok")
             by_kind = dict(getattr(candidates, "by_kind", None) or {})
+            chunks = dict(getattr(candidates, "chunks", None) or {})
             # Read once: a provider that yields would be empty the second time.
-            return list(candidates), by_kind, status
+            return list(candidates), by_kind, status, chunks
         except Exception as e:
             logger.warning("recall semantic fusion skipped: %s: %s", type(e).__name__, e)
-            return None, {}, f"unavailable: {type(e).__name__}"
+            return None, {}, f"unavailable: {type(e).__name__}", {}
 
     return task
 
@@ -922,7 +935,7 @@ def recall(
 
     done = _run(conn, tasks, recall_workers())
 
-    sem_ids, by_kind, semantic = done.get("semantic", (None, {}, None))
+    sem_ids, by_kind, semantic, chunks = done.get("semantic", (None, {}, None, {}))
     emails: list[dict] = done.get("emails", [])
     if hybrid and "emails" in done:
         emails = (
@@ -940,7 +953,7 @@ def recall(
     if every_bucket and sem_ids is not None:
         if "attachments" in done:
             attachments = _fuse_attachments(
-                conn, attachments, by_kind.get("attachment", []), limit, pool
+                conn, attachments, by_kind.get("attachment", []), limit, pool, chunks
             )
         if "teams" in done:
             teams = _fuse_threads(conn, "teams", teams, by_kind.get("teams", []), limit, pool)
@@ -1005,8 +1018,12 @@ def recall(
 
 
 def _semantic_row(row: dict) -> bool:
-    """Whether semantic search alone put this row in its bucket."""
-    return row.get("source") == envelope.SEMANTIC or row.get("matched_in") == envelope.SEMANTIC
+    """Whether semantic search alone put this row in its bucket: by an item's vector, or by
+    a passage of a document (matched_in 'chunk')."""
+    return row.get("source") == envelope.SEMANTIC or row.get("matched_in") in (
+        envelope.SEMANTIC,
+        "chunk",
+    )
 
 
 # How the MCP tool sends recall's rows. A summary is cut to about this many

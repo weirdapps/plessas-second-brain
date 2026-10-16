@@ -24,6 +24,7 @@ import pytest
 
 from src.llm_deadline import _UNIT_TIMEOUT_SECONDS
 from src.pipeline.sync import (
+    CHUNK_EMBED_SYNC_DEADLINE_S,
     CONVERSATION_SYNC_DEADLINE_S,
     EXTRACT_DEADLINE_BY_UNIT_S,
     EXTRACT_SYNC_DEADLINE_S,
@@ -45,6 +46,7 @@ def _sync_command_s(extract_s: float) -> float:
         + PHASE2_SYNC_DEADLINE_S
         + CONVERSATION_SYNC_DEADLINE_S
         + IMAGE_CLASSIFY_SYNC_BUDGET_S
+        + CHUNK_EMBED_SYNC_DEADLINE_S
     )
 
 
@@ -191,3 +193,14 @@ def test_the_backlog_units_extraction_slice_fits_their_timeout(unit):
 
 def test_the_hourly_unit_uses_the_hourly_slice():
     assert EXTRACT_DEADLINE_BY_UNIT_S["sb-outlook-sync"] == EXTRACT_SYNC_DEADLINE_S
+
+
+def test_the_embedding_pass_is_handed_its_chunk_deadline():
+    """Step 9 cuts and embeds new long documents. The sum above counts the 60 s only because
+    the call site hands it to build_index, which stops sending chunks when it is spent."""
+    import inspect
+
+    from src.pipeline import sync
+
+    assert "chunk_deadline_s=CHUNK_EMBED_SYNC_DEADLINE_S" in inspect.getsource(sync.run)
+    assert isinstance(CHUNK_EMBED_SYNC_DEADLINE_S, float)

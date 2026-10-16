@@ -38,7 +38,11 @@ from datetime import datetime
 from pathlib import Path
 
 from src.config import CLAUDE_CODE_PROJECTS_DIR
-from src.export.conversation_export import is_agent_record, is_owner_record
+from src.export.conversation_export import (
+    _extract_text_content,
+    is_agent_record,
+    is_owner_record,
+)
 from src.extract.attachment_extractors import _apply_noise_filter
 from src.extract.attachment_pipeline import _guess_mime_type, ingest_text_document
 from src.store.findings import sync_note_findings
@@ -55,26 +59,55 @@ class Note:
     text: str
     written_at: str
     session_id: str
-    # Who ran the session that wrote it: 'owner' when the owner typed in it and no record
-    # names an agent (src/export/conversation_export.py), else 'agent'.
+    # Who ran the session whose tool call wrote it: 'owner' or 'agent' (author_kind).
     author_kind: str = "agent"
 
 
-def _typed_text(record: dict) -> str | None:
-    """The text of a user record that may be a prompt: a string, or text blocks alone."""
-    if record.get("type") != "user":
-        return None
+def _owner_turn(record: dict) -> bool:
+    """Whether conversation export labels this record's turn speaker 'user', the owner
+    typing (parse_conversation in src/export/conversation_export.py, the same functions),
+    leaving aside the session-wide agent test, which author_kind applies."""
+    if record.get("type") not in ("user", "assistant"):
+        return False
     message = record.get("message")
-    content = message.get("content") if isinstance(message, dict) else None
-    if isinstance(content, str):
-        return content
-    if (
-        isinstance(content, list)
-        and content
-        and all(isinstance(b, dict) and b.get("type") == "text" for b in content)
-    ):
-        return "\n".join(str(b.get("text") or "") for b in content)
-    return None
+    if not isinstance(message, dict) or message.get("role", record.get("type")) != "user":
+        return False
+    try:
+        text = _extract_text_content(message)
+        return bool(text) and is_owner_record(record, text)
+    except Exception:  # an odd record is no evidence of the owner
+        return False
+
+
+def _top_level(jsonl_path: Path) -> bool:
+    """Whether the transcript is a session of its own at the top of a project
+    (projects/<project>/<session>.jsonl), not one under a session's own directory, where
+    its subagents' and workflows' transcripts are kept."""
+    if "subagents" in jsonl_path.parts:
+        return False
+    try:
+        inside = jsonl_path.resolve().relative_to(CLAUDE_CODE_PROJECTS_DIR.resolve())
+    except (OSError, ValueError):
+        return False
+    return len(inside.parts) == 2
+
+
+def author_kind(jsonl_path: Path, records) -> str:
+    """'owner' when the transcript is a session of its own, no record of it names an agent
+    (a teammate's name or team, a subagent's id), and it holds a turn the owner typed, as
+    conversation export labels turns; 'agent' otherwise, and whenever that cannot be read.
+
+    Only the transcript decides: never a note's text, its path or name, a field of its
+    findings block, or the session's workspace.
+    """
+    if not _top_level(jsonl_path):
+        return "agent"
+    owner = False
+    for record in records:
+        if is_agent_record(record):
+            return "agent"
+        owner = owner or _owner_turn(record)
+    return "owner" if owner else "agent"
 
 
 def _records(jsonl_path: Path):
@@ -109,17 +142,13 @@ def collect_session_notes(jsonl_path: Path) -> dict[str, Note]:
     lost: set[str] = set()
     pending: dict[str, tuple[str, dict, str]] = {}
     session_id = jsonl_path.stem
-    agent_session = owner_typed = False
-    for record in _records(jsonl_path):
+    records = list(_records(jsonl_path))
+    for record in records:
         # Every field is checked for its type: a transcript is third-party input to this code,
         # and one odd record must not stop the read.
         sid = record.get("sessionId")
         if isinstance(sid, str) and sid:
             session_id = sid
-        agent_session = agent_session or is_agent_record(record)
-        typed = _typed_text(record)
-        if typed is not None and not owner_typed:
-            owner_typed = is_owner_record(record, typed)
         message = record.get("message")
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
@@ -159,9 +188,10 @@ def collect_session_notes(jsonl_path: Path) -> dict[str, Note]:
                     lost.add(path)
                     continue
                 notes[path] = Note(path, text, timestamp, session_id)
-    author = "owner" if owner_typed and not agent_session else "agent"
-    for note in notes.values():
-        note.author_kind = author
+    if notes:
+        author = author_kind(jsonl_path, records)
+        for note in notes.values():
+            note.author_kind = author
     return notes
 
 

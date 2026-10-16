@@ -272,6 +272,53 @@ def test_supersedes_that_breaks_a_rule_rejects_the_line(store, claim, target, wh
     assert _status(store, "/n/new.md") == [("rejected", why)]
 
 
+def _owner_then(store, author):
+    """An owner's finding on the old report, then one of `author` superseding it."""
+    old, new = _two_reports(store)
+    first = {"claim": "Okapi share", "value": "58.0%", "source_ref": f"email:{old}"}
+    _sync(store, first, path="/n/old.md", author="owner")
+    (old_id,) = _ids(store, "/n/old.md")
+    later = {"claim": "Okapi share", "value": "61.5%", "source_ref": f"email:{new}"}
+    _sync(store, {**later, "supersedes": f"finding:{old_id}"}, path="/n/new.md", author=author)
+    return old_id
+
+
+def test_an_agents_finding_cannot_supersede_the_owners(store):
+    old_id = _owner_then(store, "agent")
+
+    assert _status(store, "/n/new.md") == [
+        ("rejected", "an agent's finding cannot supersede the owner's")
+    ]
+    (row,) = [r for r in findings.findings_matching(store, words=["okapi"]) if r["id"] == old_id]
+    assert row["superseded_by"] is None
+
+
+def test_the_owner_may_supersede_his_own_or_an_agents(store):
+    _owner_then(store, "owner")
+
+    assert _status(store, "/n/new.md") == [("accepted", "ok")]
+
+
+def test_a_superseded_mark_is_checked_again_when_read(store):
+    """An author or a claim changed after the line was checked: the mark is not applied."""
+    old_id = _owner_then(store, "owner")
+    store.execute("UPDATE findings SET author_kind = 'agent' WHERE note_path = '/n/new.md'")
+    store.commit()
+
+    (row,) = [r for r in findings.findings_matching(store, words=["okapi"]) if r["id"] == old_id]
+
+    assert row["superseded_by"] is None
+
+
+def test_a_finding_cannot_supersede_itself(store, report):
+    _sync(store, _ok(report))
+    (own_id,) = _ids(store, "/n/a.md")
+
+    _sync(store, _ok(report, supersedes=f"finding:{own_id}"))
+
+    assert _status(store) == [("rejected", "a finding cannot supersede itself")]
+
+
 def test_supersedes_cannot_name_a_rejected_finding_or_a_primary_item(store, report):
     _sync(store, _ok(report, value="99%"), path="/n/old.md")
     (rejected_id,) = _ids(store, "/n/old.md")
@@ -452,10 +499,25 @@ def _transcript(path: Path, *records) -> Path:
     return path
 
 
-def test_a_session_note_with_a_block_loads_its_findings(store, report, tmp_path):
+@pytest.fixture
+def projects(tmp_path, monkeypatch):
+    """The projects directory Claude Code keeps transcripts in: a session of its own sits
+    at projects/<project>/<session>.jsonl, its subagents under projects/<project>/<session>/."""
+    from src.export import session_notes
+
+    path = tmp_path / "projects"
+    (path / "-work").mkdir(parents=True)
+    monkeypatch.setattr(session_notes, "CLAUDE_CODE_PROJECTS_DIR", path)
+    return path
+
+
+def test_a_session_note_with_a_block_loads_its_findings(store, report, projects):
     note = _block(_ok(report, as_of="2026-08"))
     transcript = _transcript(
-        tmp_path / "s1.jsonl", _prompt(), _use(1, "/work/okapi-findings.md", note), _result(1)
+        projects / "-work" / "s1.jsonl",
+        _prompt(),
+        _use(1, "/work/okapi-findings.md", note),
+        _result(1),
     )
 
     stats = ingest_session_notes(store, [transcript])
@@ -488,17 +550,91 @@ def test_a_session_note_with_a_block_loads_its_findings(store, report, tmp_path)
         [_prompt("<teammate-message>go</teammate-message>")],
     ],
 )
-def test_a_note_an_agent_wrote_is_marked_so(tmp_path, lead):
+def test_a_note_an_agent_wrote_is_marked_so(projects, lead):
     records = [*lead, _use(1, "/work/a.md", "text"), _result(1)]
 
-    notes = collect_session_notes(_transcript(tmp_path / "s.jsonl", *records))
+    notes = collect_session_notes(_transcript(projects / "-work" / "s.jsonl", *records))
 
     assert notes["/work/a.md"].author_kind == "agent"
 
 
-def test_a_note_read_again_unchanged_keeps_its_findings(store, report, tmp_path):
+def test_a_subagent_transcript_is_an_agent_whatever_it_holds(projects):
+    """Under a session's own directory: its subagents', with the parent's session id."""
+    subagents = projects / "-work" / "s1" / "subagents"
+    subagents.mkdir(parents=True)
+    records = [_prompt(), _use(1, "/work/a.md", "text"), _result(1)]
+
+    notes = collect_session_notes(_transcript(subagents / "agent-1.jsonl", *records))
+
+    assert notes["/work/a.md"].author_kind == "agent"
+
+
+def test_a_transcript_outside_the_projects_directory_is_an_agent(projects, tmp_path):
+    records = [_prompt(), _use(1, "/work/a.md", "text"), _result(1)]
+
+    notes = collect_session_notes(_transcript(tmp_path / "s1.jsonl", *records))
+
+    assert notes["/work/a.md"].author_kind == "agent"
+
+
+def test_a_block_claiming_the_owner_in_an_agent_session_stays_an_agents(store, report, projects):
+    note = _block(_ok(report, author="owner"), _ok(report))
+    records = [_prompt(agentName="researcher", teamName="t"), _use(1, "/work/a.md", note)]
+    transcript = _transcript(projects / "-work" / "s1.jsonl", *records, _result(1))
+
+    ingest_session_notes(store, [transcript])
+
+    rows = store.execute("SELECT author_kind, status, reason FROM findings ORDER BY ordinal")
+    assert [tuple(r) for r in rows] == [
+        ("agent", "rejected", "1 unknown field(s)"),
+        ("agent", "accepted", "ok"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "note_path",
+    [
+        "/home/x/.claude/projects/-work/other-session/subagents/agent-9/notes.md",
+        "/work/agent-notes/written-by-researcher.md",
+    ],
+)
+def test_a_notes_path_says_nothing_about_who_wrote_it(store, report, projects, note_path):
     note = _block(_ok(report))
-    transcript = _transcript(tmp_path / "s1.jsonl", _use(1, "/work/a.md", note), _result(1))
+    records = [_prompt(), _use(1, note_path, note), _result(1)]
+    owner_transcript = _transcript(projects / "-work" / "s1.jsonl", *records)
+    agent_records = [_prompt(agentName="r"), _use(2, "/work/owner-session.md", note), _result(2)]
+    agent_transcript = _transcript(projects / "-work" / "s2.jsonl", *agent_records)
+
+    ingest_session_notes(store, [owner_transcript, agent_transcript])
+
+    rows = dict(store.execute("SELECT note_path, author_kind FROM findings").fetchall())
+    assert rows == {note_path: "owner", "/work/owner-session.md": "agent"}
+
+
+def test_a_missing_transcript_loads_nothing(store, projects):
+    missing = projects / "-work" / "gone.jsonl"
+
+    stats = ingest_session_notes(store, [missing])
+
+    assert collect_session_notes(missing) == {}
+    assert stats["transcripts"] == 0
+    assert store.execute("SELECT COUNT(*) FROM findings").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("given", [None, "", "Owner", "teammate", "root"])
+def test_an_unknown_author_kind_is_an_agent(store, report, given):
+    findings.sync_note_findings(
+        store, "/n/a.md", "s1", "2026-10-10", _block(_ok(report)), author_kind=given, today=TODAY
+    )
+
+    assert store.execute("SELECT author_kind FROM findings").fetchone()[0] == "agent"
+
+
+def test_a_note_read_again_unchanged_keeps_its_findings(store, report, projects):
+    note = _block(_ok(report))
+    transcript = _transcript(
+        projects / "-work" / "s1.jsonl", _use(1, "/work/a.md", note), _result(1)
+    )
     ingest_session_notes(store, [transcript])
     first = [tuple(r) for r in store.execute("SELECT id, loaded_at, status FROM findings")]
 

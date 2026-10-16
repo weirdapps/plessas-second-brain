@@ -26,12 +26,16 @@ shown, and listed by `brain findings` for review.
   or more), or else the `value` (3 letters or digits or more, whole), occurs in it, case,
   accents and spacing aside; a value given with a quote must occur in one of the two.
 - `supersedes`, when given, names an accepted finding (`finding:<id>`) with the same claim
-  whose source is older. It marks that finding superseded and nothing else: no primary
-  item, fact or decision is ever hidden by a finding.
+  whose source is older, written by a session of the same rank or below: an agent's
+  finding never supersedes the owner's. It marks that finding superseded and nothing
+  else: no primary item, fact or decision is ever hidden by a finding.
 - Any error while checking a line rejects it, with a log line; none is accepted by default.
 
 Each finding records whether the owner's own session wrote its note or an agent's (a
-teammate's or a subagent's), and an agent's ranks below the owner's. Findings are derived
+teammate's or a subagent's), read off the transcript alone (session_notes.author_kind),
+and an agent's ranks below the owner's; an unknown author is an agent. Nothing relaxes
+these checks, and nothing promotes a rejected finding: the note is corrected and read
+again. Findings are derived
 and rank below every primary item: nothing indexes or embeds them, and a topic page cites
 one only where no primary row says otherwise.
 """
@@ -242,24 +246,52 @@ def check_against(fields: dict, text: str) -> None:
         raise Rejected("the value is not in the source")
 
 
-def _check_supersedes(conn: sqlite3.Connection, fields: dict, key: str, when: str | None) -> None:
+# An author's rank: a finding supersedes only one of the same rank or below.
+_RANK = {OWNER: 1, AGENT: 0}
+
+
+def may_supersede(newer: dict, older: dict) -> str | None:
+    """Why `newer` may not supersede `older` (both finding rows), or None when it may: the
+    same claim, an older source, and an author of the same rank or above, so an agent's
+    finding never supersedes the owner's. An unknown author ranks as an agent."""
+    if older.get("status") != ACCEPTED:
+        return "supersedes names no accepted finding"
+    if older.get("id") is not None and older.get("id") == newer.get("id"):
+        return "a finding cannot supersede itself"
+    if older.get("claim_key") != newer.get("claim_key"):
+        return "supersedes names a finding with another claim"
+    if not (older.get("source_date") and newer.get("source_date")):
+        return "supersedes names a finding whose source is not older"
+    if not older["source_date"] < newer["source_date"]:
+        return "supersedes names a finding whose source is not older"
+    if _RANK.get(str(newer.get("author_kind")), 0) < _RANK.get(str(older.get("author_kind")), 0):
+        return "an agent's finding cannot supersede the owner's"
+    return None
+
+
+def _check_supersedes(conn: sqlite3.Connection, fields: dict, newer: dict) -> None:
     if not fields["supersedes"]:
         return
     target_id = int(fields["supersedes"].partition(":")[2])
-    row = conn.execute(
-        "SELECT status, claim_key, source_date FROM findings WHERE id = ?", (target_id,)
-    ).fetchone()
-    if row is None or row[0] != ACCEPTED:
+    rows = _dicts(conn.execute("SELECT * FROM findings WHERE id = ?", (target_id,)))
+    if len(rows) != 1:
         raise Rejected("supersedes names no accepted finding")
-    if row[1] != key:
-        raise Rejected("supersedes names a finding with another claim")
-    if not (row[2] and when and row[2] < when):
-        raise Rejected("supersedes names a finding whose source is not older")
+    why = may_supersede(newer, rows[0])
+    if why:
+        raise Rejected(why)
 
 
-def validate(conn: sqlite3.Connection, line: str, today: date) -> tuple[dict, str, str]:
-    """(fields, status, reason) for one block line. Never raises: anything that goes wrong
-    while checking rejects the line."""
+def validate(
+    conn: sqlite3.Connection,
+    line: str,
+    today: date,
+    *,
+    author_kind: str = AGENT,
+    finding_id: int | None = None,
+) -> tuple[dict, str, str]:
+    """(fields, status, reason) for one block line, written by a session of `author_kind`
+    (and held as `finding_id`, when it is). Never raises: anything that goes wrong while
+    checking rejects the line."""
     fields: dict = dict.fromkeys(KEYS)
     fields["source_date"] = None
     try:
@@ -267,7 +299,13 @@ def validate(conn: sqlite3.Connection, line: str, today: date) -> tuple[dict, st
         text, when = read_source(conn, fields["source_ref"])
         fields["source_date"] = when
         check_against(fields, text)
-        _check_supersedes(conn, fields, claim_key(fields["claim"]), when)
+        newer = {
+            "id": finding_id,
+            "claim_key": claim_key(fields["claim"]),
+            "source_date": when,
+            "author_kind": author_kind,
+        }
+        _check_supersedes(conn, fields, newer)
     except Rejected as e:
         return fields, REJECTED, str(e)
     except Exception as e:  # fail closed: an error is a rejection, never an acceptance
@@ -317,7 +355,10 @@ def sync_note_findings(
     stats = dict.fromkeys(("lines", "accepted", "rejected", "new", "changed", "removed"), 0)
     stats["lines"] = len(lines)
     for ordinal, (block_no, line_no, line) in enumerate(lines):
-        fields, status, reason = validate(conn, line, today)
+        old = held.get(ordinal)
+        fields, status, reason = validate(
+            conn, line, today, author_kind=author, finding_id=old["id"] if old else None
+        )
         stats[status] += 1
         if status == REJECTED:
             _log.warning(
@@ -335,7 +376,6 @@ def sync_note_findings(
             "author_kind": author,
             "written_at": written_at,
         }
-        old = held.get(ordinal)
         if old is None:
             columns = ", ".join([*values, "note_path", "ordinal", "loaded_at"])
             marks = ", ".join("?" * (len(values) + 3))
@@ -389,18 +429,29 @@ def _row(r: dict) -> dict:
 
 def _mark_superseded(conn: sqlite3.Connection, rows: list[dict]) -> None:
     """Set each row's superseded_by: the newest accepted finding naming it in `supersedes`
-    (accepted only after the checks in _check_supersedes)."""
-    ids = {r["id"] for r in rows}
+    that may supersede it (may_supersede, checked again here: an author or a status may
+    have changed since the line was checked)."""
+    by_id = {r["id"]: r for r in rows}
+    held = {
+        r["id"]: r
+        for r in _dicts(
+            conn.execute(
+                "SELECT id, status, claim_key, source_date, author_kind FROM findings"
+                " WHERE id IN (SELECT value FROM json_each(?))",
+                (json.dumps(list(by_id)),),
+            )
+        )
+    }
     newer: dict[int, tuple[str, int]] = {}
     for g in _dicts(
         conn.execute(
-            "SELECT id, supersedes, source_date FROM findings"
+            "SELECT id, supersedes, status, claim_key, source_date, author_kind FROM findings"
             " WHERE status = ? AND supersedes IS NOT NULL",
             (ACCEPTED,),
         )
     ):
         target = int(str(g["supersedes"]).partition(":")[2] or 0)
-        if target in ids:
+        if target in held and may_supersede(g, held[target]) is None:
             key = (g["source_date"] or "", g["id"])
             if target not in newer or key > newer[target]:
                 newer[target] = key

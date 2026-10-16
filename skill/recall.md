@@ -1,183 +1,96 @@
 ---
-name: recall
-description: Search the knowledge repository by person, topic, keyword, date, decision or action item, and return synthesized context rather than raw rows.
+name: second-brain
+description: Answer questions from the owner's own work history (mail, attachments, figures from recurring reports, Teams, WhatsApp, calendar, decisions, actions, people, live topics, past Claude Code sessions) through the second-brain MCP tools. Use it whenever a task needs a fact, a document, a number, a status or a person from that history, including research teammates grounding a deliverable.
 ---
 
-# recall: knowledge repository query
+# second-brain: how to ask it, and how to answer from it
 
-Reference prompt for querying the second-brain store. **Nothing installs this
-file.** It is not a slash command and not a discovered skill: Claude Code finds
-commands under `.claude/commands/` and skills under `.claude/skills/<name>/SKILL.md`
-or a plugin, and a bare `skill/recall.md` at a repo root is none of those. Copy
-it to one of those locations, or into a plugin, if you want it to load. Until
-then it is documentation of the intended workflow.
+The `second-brain` MCP server (`mcp__second-brain__*`) holds the owner's work history,
+extracted and indexed. This file is the routing and answering contract. To load it in
+Claude Code, link or copy it to `~/.claude/skills/second-brain/SKILL.md` (or a plugin's
+`skills/`); the repository's copy is the source of truth.
 
-> **Primary path: `mcp__second-brain__recall(query)`.** One fan-out call across
-> every text-bearing index; `include_context=true` adds the person and topic
-> dossiers the query matches. Use it first; drop to the per-kind tools only when
-> you need a filter it does not expose.
->
-> Per-kind tools: `search_emails`, `search_attachments`, `search_teams`,
-> `search_whatsapp`, `search_conversations`, `query_calendar_events`,
-> `query_decisions`, `query_actions`. Dossier tools: `person_context` (email,
-> Teams and WhatsApp),
-> `topic_context`, `sender_brief`, `meeting_prep`. The rest of a hit's thread:
-> `email_thread` (a keyword row's `thread_matches` says how many of its emails
-> match in subject, summary or body). Corpus size, per-source coverage and freshness: `stats`.
+## 1. Route by what is asked
 
-## Usage
-
-Query forms that route sensibly:
-
-- **Person**: `Duarte`, `christina.ivanova@example.com`
-- **Topic**: `cards migration`, `digital banking`
-- **Keyword**: `budget approval Q4`
-- **Date range**: `March 2025`, `2025-01-01 to 2025-03-31`
-- **Decisions**: `decisions about cards`, `what did we decide about UX`
-- **Action items**: `open actions for Okafor`
-- **Person history**: `history with Duarte`, `context for Chen`
-- **Topic deep-dive**: `everything about cards migration`
-- **Combined**: `Chen digital banking 2025`
-
-## Step 1: parse the query
-
-| Pattern | Query type | Tool |
+| The question | First call | Then, if needed |
 | --- | --- | --- |
-| Person name or email | person | `person_context` |
-| Project or initiative name | topic | `topic_context` |
-| General keywords | keyword | `recall`, or `search_emails` |
-| Date references | date | `query_emails` with `start_date` / `end_date` |
-| "decisions about..." | decisions | `query_decisions` |
-| "actions for..." | actions | `query_actions` |
-| Conceptual or fuzzy questions | semantic | `search_emails(search_type="semantic")` |
-| Attachment content | attachments | `search_attachments` |
-| Multiple filters | combined | `query_emails` |
+| A number or KPI ("digital share of loans in August", "contact-centre calls last week") | `figures(query, period=...)` | `search_attachments` for the report, `get_item(kind="attachment", ref, offset)` for the cell's context |
+| Find a document or an email | `search_attachments(query)` / `search_emails(query)` | `get_item` on the hit; a `matched_in: "chunk"` row names the passage offsets |
+| Status or timeline of a live topic | `topic_page(topic)` | `topic_context(topic)`, `query_decisions(topic=...)`, then primary items for anything load-bearing |
+| Who is X, history with X | `person_context(name_or_email, detail="card")` | `detail="full"` for the dossier; pass an address when you have one |
+| Prepare a meeting | `meeting_prep(people=[...], topic=...)` | `topic_page` for its topic |
+| What did we decide about Y | `query_decisions(topic=Y)` | `get_item` on the source row for the exact wording |
+| What do I owe / what is owed to me | `query_actions(status="open")`, `stale_threads()` | the source email through `get_item` |
+| A task from an emailed brief | `search_emails` for the brief, `get_item(kind="email", ref)` for the whole mail | `recall` for related material |
+| Anything else, or unsure | `recall(query)` | the per-kind tool that matched |
+| Mail from the last hours | `outlook_live_search(since_minutes=...)` | the store lags the mailbox |
+| Counts, trends, aggregates, full text | `sql_schema()`, then `sql_query(sql)` | its description names the key columns (`emails.date_received`, not `date`) |
 
-If it is ambiguous, call `recall` and let the fan-out decide.
+`recall` fans out over every index (email, attachments, Teams, WhatsApp, conversations,
+decisions, actions, commitments, images, calendar), each bucket keyword plus semantic
+plus recency, and opens with `summary`. Use `detail="concise"` when you only need to
+see what exists, `kinds=[...]` to narrow, and `include_context=true` only for a person
+or topic dossier in the same answer.
 
-## Step 2: run the query
+## 2. Write the query like the corpus
 
-Default path, one call:
+- Keyword bags of 4 to 6 words, not sentences.
+- Most text is Greek with English business terms. Add the Greek word for a Greek subject
+  ("δείκτης μετάπτωσης καταναλωτικά", not only "digital migration consumer loans").
+  Names match in either script, and Greek words in any inflection.
+- For full-text search through `sql_query`, use the FTS tables with `MATCH`, not
+  `LIKE '%...%'`; fold both sides with `sb_fold()`.
+- Name the period for "latest" questions; ranking already prefers the newest edition and
+  lists older ones under `older_editions`.
 
-```text
-mcp__second-brain__recall(query="cards migration", limit_per_kind=5)
+## 3. Read what the result says about itself
+
+| Field | Meaning | Do |
+| --- | --- | --- |
+| `data_as_of`, `stale`, `_stale_warning` | The store is a replica and can lag | For anything recent, say how fresh it is; use `outlook_live_search` |
+| `reason`, `coverage` on an empty list | What was searched and the dates each source covers | An empty result inside coverage is evidence; outside it, it is a gap, not an absence |
+| `excluded` | Matches the default filter hid (news, the owner's own automation mail) | Ask again with `include_news` / `include_automation` when they could answer |
+| `history_left_out` | Duplicate or superseded items hidden | `include_history=true` when the history itself is the question |
+| `truncated` | Rows cut to fit the answer budget | Narrow the query or lower `limit` |
+| `partial_match` | Only some words matched | Treat as weaker |
+| `semantic` other than `ok` | Semantic search was unavailable; the answer is keyword-only | Say so if the question was conceptual |
+
+`email_thread`, `teams_thread_context`, `conversation_context`, `sender_brief` and
+`teams_chat_summary` are deprecated: use `get_item` and `person_context(detail="card")`.
+
+## 4. Answer rules
+
+1. **Every figure names its source and period**: the report, the period it holds for,
+   and the `kind:ref` of the item (e.g. `attachment:1234, sheet KYC, 2026-08`). If the
+   period asked is not held, say "not held; latest held: <period>". Never estimate a
+   figure the store does not hold, and never fill a gap from memory.
+2. **Cite dates and refs** for facts and decisions. A two-year-old fact and last week's
+   carry different weight; say which you have.
+3. **Topic pages and findings are derived.** Use them to orient; verify any number or
+   decision you will put in a deliverable against the primary item they cite.
+4. **Say what you could not see**: spoken meetings and calls, mailboxes the store does
+   not hold, and anything before a source's coverage start (`stats().coverage`).
+
+## 5. File back what you verified
+
+A research run that settles a claim writes it into its notes in a findings block, so
+the next run starts from it. Each line is one JSON object; only `claim` and
+`source_ref` are required:
+
+````text
+```findings
+{"claim": "Share of loan applications made online, year to date", "value": "64.0%", "as_of": "2026-08", "source_ref": "attachment:1234", "quote": "online applications 64.0% of the total"}
 ```
+````
 
-It returns ten buckets, keyed exactly as listed: `emails` (which also covers
-standalone documents, since they share the `emails` table; news and the reports
-the owner's own jobs mail him only with `include_news` / `include_automation`),
-`attachments`, `conversations`, `decisions`, `actions`, `commitments`,
-`inline_images`, `teams`, `whatsapp`, `calendar_events`. `summary.kinds_with_results` names
-the ones that matched. Only the `emails` bucket fuses keyword and semantic
-ranking; the rest are keyword-only.
+`source_ref` is a primary row's `kind:ref` (email, news, document, attachment, teams,
+whatsapp, calendar), `quote` is 12 to 300 characters copied from it holding the value,
+`as_of` a date or period not in the future, and `supersedes` an earlier finding with the
+same claim (`finding:<id>`). A finding is accepted only when its quote or value occurs in
+that source; anything else is stored as rejected and never shown. README "Topic pages
+and findings" has the full rules.
 
-**Check freshness before answering about anything recent.** The database is
-usually a replica of a machine that builds it elsewhere, so it lags. `recall`
-opens with `summary`, `data_as_of` and `stale`, plus `_stale_warning` when the
-copy is behind, and `stats` always returns `data_as_of`, `age_hours` and
-`stale`. For mail newer than the replica, use `outlook_live_search`. A list cut
-to fit the 40,000-character answer budget is named in `truncated`.
+## Without an MCP session
 
-When no MCP session is available, `brain tool` calls the same tools from a shell
-and prints their answers as JSON:
-
-```bash
-python -m src.cli tool recall '{"query": "budget approval"}'
-python -m src.cli tool query_emails '{"person": "Duarte", "topic": "cards",
-  "start_date": "2025-01-01", "end_date": "2025-12-31", "limit": 20}'
-python -m src.cli tool stats
-```
-
-## Step 3: synthesize
-
-Do not dump raw results. Turn them into a briefing.
-
-**Person queries:**
-
-- Communication pattern (frequency, sentiment distribution)
-- Key topics discussed
-- Recent decisions involving them
-- Open action items assigned to or from them
-- Their role, and how they relate to the user (`BRAIN_USER_NAME`)
-
-**Topic queries:**
-
-- Timeline of key events and decisions
-- Key people involved and their roles
-- Current status, from the most recent items
-- Open action items
-- Key facts and references
-
-**Keyword or general queries:**
-
-- Most relevant results, with context
-- Related topics and people
-- The decision trail, if there is one
-
-**Decision queries:**
-
-- Decision timeline, chronological
-- Who decided, who was involved
-- Context from the surrounding emails
-- Any follow-up actions
-
-**Semantic queries:**
-
-- Most similar results, with similarity scores
-- Grouped by theme when results span several topics
-- A suggestion to narrow by keyword, person or topic if the spread is too wide
-
-**Action item queries:**
-
-- Grouped by status (open, expired: nothing records that an action was done)
-- Deadline proximity
-- Owner and context
-
-Cite dates and provenance. A fact from a 2019 email and a fact from last week
-carry different weight, and the reader cannot tell them apart unless you say so.
-
-## Step 4: offer follow-ups
-
-- "Want me to dig deeper into [topic]?"
-- "Should I check for related decisions?"
-- "Want the full thread for [result]?"
-
-## Context API
-
-For deeper queries, `src.store.context` is what the dossier tools call:
-
-- **`get_person_context(conn, name_or_email, days=365, limit=20)`**: email
-  history, topics, sentiment, decisions, open actions, communication pattern. Pass
-  an address when you have one. A name resolves to someone with an address before
-  a mere mention, then the most-emailed; `resolved_by`, `match_count` and
-  `other_candidates` say how sure that is and who else it could be
-- **`get_topic_context(conn, topic, days=365, limit=20)`**: emails, key people,
-  decisions, open actions, key facts
-- **`get_conversation_context(conn, email_id)`**: all emails in a thread, with
-  participants, decisions and action items. The thread is email_thread's: a News
-  item, or an email with no conversation id, stands alone
-
-The first two cap every list at `limit` and return a `<name>_total` sibling
-(`topics_total`, `decisions_total`, `open_actions_total`, and so on) with the
-real count, so a truncated answer is distinguishable from a complete one. Say
-which one you have.
-
-Recent decisions come from `src.store.query.query_decisions(conn, days=365,
-limit=20)`, which covers email, Teams, WhatsApp, calendar and conversation decisions and
-skips news and the owner's automation mail unless asked. `days` defaults to None, all time.
-
-## Notes
-
-- The store holds email summaries, original content, and LLM summaries of
-  attachments (PDF, Word, Excel, PowerPoint), plus Teams and WhatsApp messages, calendar
-  events, news digests and past Claude Code conversations. Call `stats` for
-  current counts and `coverage`, where each source starts; do not quote a
-  number from memory.
-- FTS5 full-text indexes cover summaries, content, key facts and attachment text.
-- Semantic search uses embedding similarity and needs an index built by
-  `python -m src.cli embed`. Without it, search degrades to keyword-only.
-- Topics are normalized (lowercase, collapsed whitespace, accent-folded).
-- People are deduplicated by email address, then by a Greek-aware name
-  canonicalization pass.
-- All dates are ISO 8601.
-- Results are ordered most recent first unless stated otherwise.
+`python -m src.cli tool <name> '<json>'` calls any tool from a shell and prints its JSON
+answer, for example `python -m src.cli tool figures '{"query": "μετάπτωση καταναλωτικά"}'`.

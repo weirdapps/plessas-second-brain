@@ -971,9 +971,10 @@ docs/
   RESTORE.md                   Backup artefacts, the restore path, restic and the weekly drill
 
 skill/
-  recall.md                    Reference prompt for the recall workflow. Not installed
-                               by anything: copy it to `.claude/skills/recall/SKILL.md`
-                               or into a plugin to make it loadable
+  recall.md                    The `second-brain` skill: routing by question shape, reading
+                               the result fields, the answer rules and the findings block.
+                               Link or copy it to `~/.claude/skills/second-brain/SKILL.md`
+                               (or a plugin's `skills/`) to load it
 ```
 
 ## Database schema

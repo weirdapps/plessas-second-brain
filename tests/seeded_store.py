@@ -166,6 +166,7 @@ CALLS = {
     "teams_chat_summary": {"chat_id": 1},
     "sql_query": {"sql": "SELECT id, subject FROM emails"},
     "sql_schema": {"table": "emails"},
+    "get_item": {"kind": "email", "ref": 1},
 }
 
 

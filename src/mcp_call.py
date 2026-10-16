@@ -62,11 +62,11 @@ def call(name: str, arguments: Any) -> dict:
     UnknownTool, InvalidInput (with the tool's input schema) or ToolCallError.
     """
     import anyio
-    from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+    from mcp.server.mcpserver.exceptions import ToolError
     from mcp.types import CallToolResult
     from pydantic import ValidationError
 
-    from src.mcp_server import mcp
+    from src.mcp_server import ToolFailure, mcp
 
     tools = {tool["name"]: tool for tool in listing()}
     if name not in tools:
@@ -87,11 +87,9 @@ def call(name: str, arguments: Any) -> dict:
         )
     try:
         result = anyio.run(mcp.call_tool, name, arguments)
-    except UnexpectedToolError as exc:
-        # The server tells a client only "Error executing tool <name>"; whoever runs the
-        # command on this host gets the cause as well.
-        cause = exc.__cause__
-        raise ToolCallError(f"{name} failed: {type(cause).__name__}: {cause}") from exc
+    except ToolFailure as exc:
+        # A crash, in the words the server sends a client: what raised, and what next.
+        raise ToolCallError(f"{name} failed: {exc.detail}") from exc
     except ToolError as exc:
         if isinstance(exc.__cause__, ValidationError):
             raise InvalidInput(_rejected(name, exc.__cause__), schema) from None

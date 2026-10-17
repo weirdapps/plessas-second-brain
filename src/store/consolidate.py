@@ -1055,14 +1055,23 @@ def build_prompt(thread: Thread, hints: list[tuple[Item, Item]]) -> Prompt:
 
 
 def _reply_json(text: str) -> dict:
-    stripped = text.strip()
-    start, end = stripped.find("{"), stripped.rfind("}")
-    if start < 0 or end < start:
-        raise ValueError("the reply holds no JSON object")
-    data = json.loads(stripped[start : end + 1])
-    if not isinstance(data, dict):
-        raise ValueError("the reply is not a JSON object")
-    return data
+    """The reply's last JSON object holding "labels". A reply can answer, say in a line of
+    prose that it got something wrong, and answer again; the last answer is the one meant."""
+    decoder = json.JSONDecoder()
+    found = None
+    at = text.find("{")
+    while at >= 0:
+        try:
+            data, end = decoder.raw_decode(text, at)
+        except json.JSONDecodeError:
+            at = text.find("{", at + 1)
+            continue
+        if isinstance(data, dict) and "labels" in data:
+            found = data
+        at = text.find("{", end)
+    if found is None:
+        raise ValueError("the reply holds no JSON object with labels")
+    return found
 
 
 def _plain(text: str | None) -> str:

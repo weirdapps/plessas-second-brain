@@ -586,6 +586,38 @@ def test_a_reply_with_no_json_counts_an_attempt(conn, model, monkeypatch):
     assert conn.execute("SELECT attempts FROM consolidation_threads").fetchone()[0] == 1
 
 
+def test_a_reply_that_corrects_itself_is_read_at_its_last_object(conn, model, monkeypatch):
+    # The shape Sonnet 5.5 sent on about a third of the 2026-10-17 backfill's calls: an
+    # answer, a line of prose, and the corrected answer. Read whole, it was not JSON.
+    from src import config
+
+    monkeypatch.setattr(config, "USER_EMAIL_PATTERN", BOB[1])
+    first, second = _thread(conn)
+    conn.execute(
+        "UPDATE emails SET summary = 'Bob sent the okapi deck as asked' WHERE id = ?", (second,)
+    )
+    action = f.action_item(conn, "Send the okapi deck to Alice", email_id=first, owner="Bob Jones")
+
+    def create(client, **kw):
+        corrected = {
+            "item": _handle(kw["messages"][0]["content"], "Send the okapi deck"),
+            "label": "completed_by",
+            "target": "M2",
+            "evidence": "Bob sent the okapi deck",
+        }
+        return _response(
+            '{"labels": []}\n\nWait, M2 shows the deck was sent. Corrected:\n\n'
+            + json.dumps({"labels": [corrected]})
+        )
+
+    monkeypatch.setattr("src.extract.vertex_fallback.create_with_refusal_fallback", create)
+
+    stats = _backfill(conn, budget=TokenBudget(100_000))
+
+    assert (stats.calls, stats.failed) == (1, 0)
+    assert _row(conn, "action_items", action)["status"] == "done"
+
+
 def test_the_hourly_queue_takes_pending_threads_only(conn, model):
     _start(conn)
     first, second = _thread(conn)

@@ -1462,9 +1462,9 @@ def model_pass(conn: sqlite3.Connection, key: str, stats: RunStats, budget=None)
     except OverBudget:
         raise
     except Exception as e:
-        from src.extract.policy_bridge import is_transient
+        from src.extract.policy_bridge import is_service_failure
 
-        if is_transient(e):
+        if is_service_failure(e):
             raise
         conn.execute(
             "UPDATE consolidation_threads SET attempts = attempts + 1,"

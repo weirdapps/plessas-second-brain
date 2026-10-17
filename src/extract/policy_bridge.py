@@ -158,6 +158,14 @@ def is_transient(exc: BaseException) -> bool:
     return isinstance(exc, ConnectionError | TimeoutError)
 
 
+def is_service_failure(exc: BaseException) -> bool:
+    """For a job that stops when the service fails rather than writing the reauth sentinel
+    (the store maintenance passes): a transient failure, or a credential that needs signing
+    in again. An expired sign-in fails every call alike, so no item is at fault. On
+    2026-10-17 it cost 964 consolidation threads an attempt each, at half a second a call."""
+    return is_transient(exc) or classify_exception(exc, None) is Outcome.AUTH_REAUTH_REQUIRED
+
+
 def is_overload(exc: BaseException) -> bool:
     """The service is overloaded: the direct API's OverloadedError, or the 529 the
     Vertex client raises as a plain InternalServerError, having no class for it.

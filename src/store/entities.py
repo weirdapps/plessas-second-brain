@@ -664,9 +664,9 @@ def adjudicate(
         except Exception as e:
             if budget is not None:
                 budget.release(held)
-            from src.extract.policy_bridge import is_transient
+            from src.extract.policy_bridge import is_service_failure
 
-            if is_transient(e):
+            if is_service_failure(e):
                 stats.stopped = f"{type(e).__name__}: the service failed; run again later"
                 break
             stats.failed += 1

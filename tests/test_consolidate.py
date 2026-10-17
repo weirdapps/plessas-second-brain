@@ -586,6 +586,24 @@ def test_a_reply_with_no_json_counts_an_attempt(conn, model, monkeypatch):
     assert conn.execute("SELECT attempts FROM consolidation_threads").fetchone()[0] == 1
 
 
+def test_an_expired_sign_in_stops_the_run_without_counting_an_attempt(conn, model, monkeypatch):
+    import google.auth.exceptions as gauth
+
+    first, second = _thread(conn)
+    f.action_item(conn, "Send the okapi deck", email_id=first)
+
+    def expired(**kw):
+        raise gauth.RefreshError("Reauthentication is needed")
+
+    monkeypatch.setattr(claude_extract, "complete", expired)
+
+    stats = _backfill(conn, budget=TokenBudget(100_000))
+
+    assert (stats.stop_kind, stats.failed) == ("service", 0)
+    state = conn.execute("SELECT model_state, attempts FROM consolidation_threads").fetchone()
+    assert tuple(state) == ("backlog", 0)
+
+
 def test_a_reply_that_corrects_itself_is_read_at_its_last_object(conn, model, monkeypatch):
     # The shape Sonnet 5.5 sent on about a third of the 2026-10-17 backfill's calls: an
     # answer, a line of prose, and the corrected answer. Read whole, it was not JSON.

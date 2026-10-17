@@ -325,6 +325,26 @@ def test_a_mention_adjudicated_once_is_not_asked_again(conn, model):
     assert again.asked == 0 and len(model.calls) == 1
 
 
+def test_an_expired_sign_in_stops_adjudication_without_a_verdict(conn, model, monkeypatch):
+    import google.auth.exceptions as gauth
+
+    mention = _ambiguous(conn)
+    plan = en.seed_entities(conn)
+
+    def expired(**kw):
+        raise gauth.RefreshError("Reauthentication is needed")
+
+    monkeypatch.setattr(claude_extract, "complete", expired)
+
+    stats = en.adjudicate(conn, plan, budget=TokenBudget(10_000))
+
+    assert stats.stopped and stats.failed == 0
+    verdicts = conn.execute(
+        "SELECT COUNT(*) FROM entity_adjudications WHERE key = ?", (f"mention:{mention}",)
+    ).fetchone()[0]
+    assert verdicts == 0
+
+
 def test_the_budget_stops_adjudication(conn, model):
     _ambiguous(conn)
     plan = en.seed_entities(conn)

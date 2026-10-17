@@ -143,6 +143,15 @@ def test_is_transient_leaves_an_unusable_reply_permanent():
     assert not is_transient(gauth.RefreshError("invalid_grant"))
 
 
+def test_is_service_failure_adds_an_expired_sign_in_to_the_transient_failures():
+    from src.extract.policy_bridge import is_service_failure
+
+    assert is_service_failure(gauth.RefreshError("Reauthentication is needed"))
+    assert is_service_failure(_status_error(anthropic.APIStatusError, 408))
+    assert not is_service_failure(ValueError("calendar extraction response is not JSON"))
+    assert not is_service_failure(_status_error(anthropic.BadRequestError, 400))
+
+
 def test_reset_client_cache_is_registered_as_a_post_reauth_callback():
     from src import llm_policy
     from src.extract import (

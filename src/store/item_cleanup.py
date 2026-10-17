@@ -363,7 +363,7 @@ def reextract_stacked(
     from src.extract import claude_extract
     from src.extract.call_shape import call_shape
     from src.extract.extraction_files import extraction_path
-    from src.extract.policy_bridge import is_transient
+    from src.extract.policy_bridge import is_service_failure
     from src.llm_cost import OverBudget
     from src.redact import redact_payload
     from src.store.loader import replace_items, stored_email
@@ -381,7 +381,7 @@ def reextract_stacked(
             stats["stopped"], stats["stop_kind"] = f"token budget: {e}", "budget"
             break
         except Exception as e:
-            if is_transient(e):
+            if is_service_failure(e):
                 stats["stopped"] = f"{type(e).__name__}: the service failed; run again later"
                 stats["stop_kind"] = "service"
                 break

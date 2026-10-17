@@ -400,6 +400,20 @@ def test_a_service_failure_stops_the_run_without_counting_an_attempt(conn, stack
     assert _count(conn, "SELECT COUNT(*) FROM key_facts WHERE fact = 'old attachment fact'") == 1
 
 
+def test_an_expired_sign_in_stops_the_run_without_counting_an_attempt(conn, stacked, monkeypatch):
+    import google.auth.exceptions as gauth
+
+    def expired(email, **kw):
+        raise gauth.RefreshError("Reauthentication is needed")
+
+    monkeypatch.setattr(claude_extract, "extract_one", expired)
+
+    stats = ic.reextract_stacked(conn, budget=TokenBudget(10**9))
+
+    assert (stats["stop_kind"], stats["failed"]) == ("service", 0)
+    assert ic.stacked_emails(conn) == [stacked["stacked"], stacked["older"]]
+
+
 def test_over_budget_is_what_extract_one_raises_for_a_call_that_does_not_fit(model):
     email = {
         "message_id": "x",

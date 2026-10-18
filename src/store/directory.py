@@ -12,6 +12,7 @@ a move or a new manager shows within weeks, and three for an address the directo
 not know (a group mailbox, a former colleague), which rarely changes.
 """
 
+import re
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -23,6 +24,11 @@ REFRESH_NOT_FOUND_DAYS = 90
 
 # What directory_card lists of a manager's direct reports.
 REPORTS_LIMIT = 20
+
+# An address that may be handed to teams-cli: the people table is filled from mail
+# headers, which anyone can write, so nothing that could read as a flag or carry
+# another character goes out.
+_ADDRESS = re.compile(r"[a-z0-9][a-z0-9._%+'-]*@[a-z0-9][a-z0-9.-]*")
 
 
 def org_domains(pattern: str | None) -> list[str]:
@@ -55,7 +61,7 @@ def due_addresses(
     ).fetchall()
     mails: dict[str, int] = {}
     for address, count in rows:
-        if address.partition("@")[2] in domains:
+        if _ADDRESS.fullmatch(address) and address.partition("@")[2] in domains:
             mails[address] = mails.get(address, 0) + count
     checked = {
         r[0]: (r[1], r[2])

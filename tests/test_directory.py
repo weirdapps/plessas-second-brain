@@ -134,6 +134,13 @@ def test_due_addresses_are_colleagues_never_looked_up_most_mailed_first(conn):
     assert directory.due_addresses(conn, [], now=NOW) == []
 
 
+def test_an_address_that_could_read_as_a_flag_is_never_due(conn):
+    # People rows come from mail headers, which anyone can write.
+    for address in ("--help@example.com", "-x@example.com", "a b@example.com", "ok@example.com"):
+        conn.execute("INSERT INTO people (name, email) VALUES ('x', ?)", (address,))
+    assert directory.due_addresses(conn, ["example.com"], now=NOW) == ["ok@example.com"]
+
+
 def test_a_recent_lookup_is_not_due_and_an_old_one_is(conn):
     for address in ("fresh@example.com", "old@example.com", "gone@example.com"):
         find_or_create_person(conn, address.split("@")[0], address)
@@ -291,16 +298,21 @@ def store(tmp_path):
     return db
 
 
+def _addresses(args):
+    """The addresses of a lookup-users call, after the "--" that ends its options."""
+    assert args[:3] == ["lookup-users", "--no-auto-reauth", "--"]
+    return args[3:]
+
+
 def _answer(args, timeout_sec=60):
-    assert args[0] == "lookup-users"
-    return {"users": [_ok(a) for a in args[1:]]}
+    return {"users": [_ok(a) for a in _addresses(args)]}
 
 
 def test_the_job_looks_up_due_colleagues_in_chunks(store, monkeypatch):
     monkeypatch.setattr(directory_sync, "CHUNK", 2)
     with patch.object(directory_sync, "run_teams_cli", side_effect=_answer) as cli:
         assert directory_sync.run(_args(store, domain=["example.com"])) == 0
-    assert [len(call.args[0]) - 1 for call in cli.call_args_list] == [2, 2, 1]
+    assert [len(_addresses(call.args[0])) for call in cli.call_args_list] == [2, 2, 1]
     c = get_connection(store)
     assert (
         c.execute("SELECT COUNT(*) FROM directory_entries WHERE status = 'ok'").fetchone()[0] == 5
@@ -312,7 +324,7 @@ def test_the_job_takes_its_domains_from_the_owner_identity(store, monkeypatch):
     monkeypatch.setattr(directory_sync, "USER_EMAIL_PATTERN", "me@example.com")
     with patch.object(directory_sync, "run_teams_cli", side_effect=_answer) as cli:
         assert directory_sync.run(_args(store, limit=3)) == 0
-    assert len(cli.call_args_list[0].args[0]) - 1 == 3
+    assert len(_addresses(cli.call_args_list[0].args[0])) == 3
 
 
 def test_the_job_refuses_without_a_domain(store, monkeypatch, capsys):
@@ -331,7 +343,9 @@ def test_a_dry_run_looks_nothing_up(store):
 
 def test_an_expired_sign_in_keeps_what_was_stored_and_asks_for_reauth(store, monkeypatch):
     monkeypatch.setattr(directory_sync, "CHUNK", 2)
-    answers = iter([_answer(["lookup-users", "c0@example.com", "c1@example.com"])])
+    answers = iter(
+        [_answer(["lookup-users", "--no-auto-reauth", "--", "c0@example.com", "c1@example.com"])]
+    )
 
     def cli(args, timeout_sec=60):
         try:

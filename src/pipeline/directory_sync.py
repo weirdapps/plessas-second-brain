@@ -60,7 +60,12 @@ def run(args) -> int:
         for start in range(0, len(due), CHUNK):
             chunk = due[start : start + CHUNK]
             try:
-                answer = run_teams_cli(["lookup-users", *chunk], timeout_sec=CALL_TIMEOUT_S)
+                # due_addresses passes only plain addresses; "--" ends the options
+                # anyway, so no address can ever be read as one.
+                answer = run_teams_cli(
+                    ["lookup-users", "--no-auto-reauth", "--", *chunk],
+                    timeout_sec=CALL_TIMEOUT_S,
+                )
             except TeamsCliAuthRequired as e:
                 _report(totals)
                 print(

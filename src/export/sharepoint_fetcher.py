@@ -357,6 +357,48 @@ def fetch_sharepoint_link(
     )
 
 
+# What sharepoint_links.message_id names: the item a link was found in. A link in mail names
+# the email's message_id, as it always has; a link in Teams names the message's row,
+# "teams:<teams_messages.id>"; a file the shared-with-me backfill lists (process-sharepoint
+# --urls-file) names SHARED_WITH_ME. An email's message_id is an integer, so neither can
+# collide with one.
+TEAMS_REF_PREFIX = "teams:"
+SHARED_WITH_ME = "shared-with-me"
+
+LinkSource = Literal["email", "teams", "shared-with-me"]
+
+# The same, in SQL over a sharepoint_links row.
+LINK_SOURCE_SQL = (
+    f"(CASE WHEN message_id LIKE '{TEAMS_REF_PREFIX}%' THEN 'teams'"
+    f" WHEN message_id = '{SHARED_WITH_ME}' THEN '{SHARED_WITH_ME}' ELSE 'email' END)"
+)
+
+
+def teams_ref(row_id: int) -> str:
+    """The message_id a link found in the Teams message with this teams_messages.id records."""
+    return f"{TEAMS_REF_PREFIX}{int(row_id)}"
+
+
+def link_source(ref) -> LinkSource:
+    """Where the link a sharepoint_links.message_id belongs to was found."""
+    text = "" if ref is None else str(ref)
+    if text.startswith(TEAMS_REF_PREFIX):
+        return "teams"
+    if text == SHARED_WITH_ME:
+        return "shared-with-me"
+    return "email"
+
+
+def teams_row_id(ref) -> int | None:
+    """The teams_messages.id a Teams ref names; None for any other ref."""
+    if link_source(ref) != "teams":
+        return None
+    try:
+        return int(str(ref)[len(TEAMS_REF_PREFIX) :])
+    except ValueError:
+        return None
+
+
 def record_link_in_db(
     conn: sqlite3.Connection,
     url: str,
@@ -367,8 +409,10 @@ def record_link_in_db(
     file_size: int | None = None,
     document_message_id: int | None = None,
 ) -> None:
-    """Record one fetch attempt. `document_message_id` names the text-only document the fetched
-    file became (src/extract/sharepoint_ingest.py); a later attempt that stores none keeps it.
+    """Record one fetch attempt. `message_id` names what the link was found in (link_source);
+    the first attempt's stays. `document_message_id` names the text-only document the fetched
+    file became (src/extract/sharepoint_ingest.py), or the email whose attachment already held
+    its bytes as text; a later attempt that stores none keeps it.
     'not-content' settles a link as 'ok' does: fetched_at is set and the attempts reset."""
     now = datetime.now(UTC).isoformat()
     conn.execute(

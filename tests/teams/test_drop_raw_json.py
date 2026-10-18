@@ -165,6 +165,57 @@ def test_a_post_holding_replies_not_stored_keeps_its_payload_until_they_are(db):
     assert set(_payloads(db).values()) == {None}
 
 
+def _sending_a_file(n):
+    """The n-th chat message, sending a SharePoint file: its payload alone names it."""
+    message = _chat_message(n, "The plan, attached.")
+    entry = {"objectUrl": "https://contoso.sharepoint.com/sites/Team/Shared Documents/Plan.docx"}
+    message["properties"] = {"files": json.dumps([entry])}
+    return message
+
+
+def _teams_scan_reached(db, row_id):
+    db.execute(
+        "INSERT OR REPLACE INTO sync_metadata (key, value)"
+        " VALUES ('sharepoint_teams_scan_last_id', ?)",
+        (str(row_id),),
+    )
+    db.commit()
+
+
+def test_a_payload_naming_a_file_the_sharepoint_pass_has_not_read_is_kept_until_it_has(db):
+    """process-sharepoint reads a sent file from the payload only (properties.files): the HTML
+    kept in content_html does not name it. Dropped before the Teams scan passed the message,
+    the file would never be fetched."""
+    chat = _chat(db)
+    _persist_messages(db, chat, {"messages": [_sending_a_file(0), _chat_message(1, "Thanks.")]})
+    db.commit()
+    sent, plain = (r[0] for r in db.execute("SELECT id FROM teams_messages ORDER BY id"))
+
+    first = drop_raw_json(db)
+
+    assert (first["dropped"], first["kept_links"]) == (1, 1)
+    assert _payloads(db)[f"{chat}::{_sending_a_file(0)['id']}"] is not None
+
+    _teams_scan_reached(db, sent)
+    second = drop_raw_json(db)
+
+    assert (second["dropped"], second["kept_links"]) == (1, 0)
+    assert set(_payloads(db).values()) == {None}
+    assert plain > sent
+
+
+def test_the_command_says_it_kept_payloads_for_the_sharepoint_pass(db, monkeypatch, capsys):
+    chat = _chat(db)
+    _persist_messages(db, chat, {"messages": [_sending_a_file(0)]})
+    db.commit()
+
+    assert _run_cli(monkeypatch, _db_path(db), "teams-drop-raw-json") == 0
+
+    out = capsys.readouterr().out
+    assert "kept 1 payloads naming a SharePoint file" in out
+    assert "process-sharepoint" in out
+
+
 def test_a_post_whose_payload_does_not_parse_is_kept(db):
     channel = _chat(db, "channel", CHANNEL)
     db.execute(

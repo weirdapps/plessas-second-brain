@@ -95,6 +95,27 @@ def test_list_stale_returns_every_non_ok_status(mock_get_conn, mock_conn):
     assert "https://sp/ok" not in urls
 
 
+@pytest.mark.parametrize("operation", ["list_stale", "list_unfetched"])
+@patch("src.mcp_server._get_conn")
+def test_each_listed_link_says_where_it_was_found(mock_get_conn, mock_conn, operation):
+    """message_id is an email's for a link in mail, "teams:<row id>" for one in Teams, and
+    "shared-with-me" for one the backfill listed: source says which, so none reads as an
+    email id."""
+    mock_conn.executemany(
+        "INSERT INTO sharepoint_links (url, message_id, last_status, last_attempt_at)"
+        " VALUES (?, ?, 'http-error', '2026-04-06T00:00:00Z')",
+        [("https://sp/teams", "teams:42"), ("https://sp/shared", "shared-with-me")],
+    )
+    mock_get_conn.return_value = mock_conn
+    from src.mcp_server import sharepoint_index
+
+    rows = {row["url"]: row for row in sharepoint_index(operation=operation)["links"]}
+    assert rows["https://sp/teams"]["source"] == "teams"
+    assert rows["https://sp/teams"]["message_id"] == "teams:42"
+    assert rows["https://sp/shared"]["source"] == "shared-with-me"
+    assert rows["https://sp/stale"]["source"] == "email"
+
+
 @patch("src.mcp_server._get_conn")
 def test_list_unfetched_returns_no_local_path(mock_get_conn, mock_conn):
     mock_get_conn.return_value = mock_conn

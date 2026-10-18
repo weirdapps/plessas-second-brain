@@ -1335,6 +1335,11 @@ def cmd_teams_drop_raw_json(args):
         )
     if c["kept_unreadable"]:
         print(f"  kept {c['kept_unreadable']:,} channel posts whose payload does not parse")
+    if c["kept_links"]:
+        print(
+            f"  kept {c['kept_links']:,} payloads naming a SharePoint file not read yet: run"
+            " process-sharepoint (or wait for the nightly pass), then this again"
+        )
     if c["left"]:
         print(f"  {c['left']:,} left past --limit {args.limit}")
     if c["dropped"] and not args.dry_run:
@@ -2393,7 +2398,7 @@ def main():
 
     # Process SharePoint command
     parser_process_sp = subparsers.add_parser(
-        "process-sharepoint", help="Scan emails for SharePoint URLs and fetch them"
+        "process-sharepoint", help="Scan emails and Teams for SharePoint URLs and fetch them"
     )
     parser_process_sp.add_argument(
         "--since",
@@ -2441,6 +2446,13 @@ def main():
         action="store_true",
         help="Drop the links an email no longer yields and record what it does, offer again "
         "the pages recorded ok without their text, then exit; fetches nothing (--dry-run counts)",
+    )
+    parser_process_sp.add_argument(
+        "--urls-file",
+        dest="urls_file",
+        default=None,
+        help="Fetch the files a JSON-lines list names, one {url, date, label} a line, each dated "
+        "by its line, then exit; no scan runs and no mark moves (--dry-run counts)",
     )
     parser_process_sp.set_defaults(func=cmd_process_sharepoint)
 

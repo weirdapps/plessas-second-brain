@@ -74,7 +74,7 @@ graph TD
 | Calendar events | `src/export/calendar_export.py`, `src/extract/calendar_extractor.py` | Outlook events with attendees and series; an invitation's purpose and agenda, a past meeting's decisions. |
 | MS Teams | `src/export/teams_cli.py`, `teams_export.py`, `src/extract/teams_pipeline.py` | Chats, threads, messages, MRI resolution. |
 | WhatsApp | `scripts/whatsapp_snapshot.py`, `src/export/whatsapp_export.py`, `src/extract/whatsapp_pipeline.py` | A minimized snapshot pushed hourly from the Mac that runs a WhatsApp bridge; sessions extracted and embedded like Teams threads. See [WhatsApp](#whatsapp). |
-| SharePoint links | `src/extract/sharepoint_url_scanner.py`, `src/export/sharepoint_fetcher.py` | Managed host defaults to `contoso.sharepoint.com` (override via `SHAREPOINT_HOST`). |
+| SharePoint links | `src/extract/sharepoint_url_scanner.py`, `src/extract/teams_file_links.py`, `src/export/sharepoint_fetcher.py` | Links in mail and in Teams messages: the files sent with a message (its payload's `properties.files`) and the links in its text. `process-sharepoint` scans each past a mark of its own (`sharepoint_scan_last_id`, `sharepoint_teams_scan_last_id`), fetches what they point at, and stores it as a text-only document dated by the email or the message; `sharepoint_links.message_id` records the email's id, `teams:<teams_messages.id>`, or `shared-with-me` for a file a `--urls-file` backfill lists. A file whose bytes an attachment already holds as text makes no second document: its link names the email that holds them. Managed host defaults to `contoso.sharepoint.com` (override via `SHAREPOINT_HOST`). |
 | Standalone documents | `src/cli.py ingest`, `reverse-ingest`, `src/ingest/reverse_scan.py` | Latest-version-per-logical-name dedup. `reverse-ingest` scans only the directories you name with `--root`; nothing schedules a scan. A file whose bytes are already stored is skipped with its reason: ingested before, or held by an attachment whose text is stored (`attachments.sha256`), such as a mail attachment saved into a folder. A twin that failed, was skipped, is encrypted or was read in part does not stop it. |
 | Web and YouTube | `src/extract/web_ingest.py` | URL fetch plus transcript pull via `youtube-transcript-api`. |
 | News digests | `src/export/news_export.py` | Reads an external news-reader SQLite DB (`BRAIN_NEWS_DB`) read-only. Digest syntheses plus articles at or above `--relevance`. Landed under `mailbox_name = 'News'`, so mail counts exclude them. Not sent to the model: the summary is the synthesis's brief or the article's opening, the topics its section categories or the article's categories (`src/extract/news_extract.py`). |
@@ -368,7 +368,7 @@ A channel thread holds the post and its replies, each reply a message of its own
 
 A message's text is what a reader sees of it: no tags, entities decoded, a block or a line break on a line of its own, and the visible text of a mention, a link (its address after it, as in a mail body) and an emoji kept. The HTML is kept beside it. The content's shape decides, not the type the payload declares: the services declare an HTML body as text, and until this change the text of every HTML message was its markup, so `search_teams` matched words such as `itemtype` and `nbsp` and the model read the tags. System messages (calls, membership changes) keep the service's XML. `brain maint teams-strip-html` converts the text stored before, once (section 12 of `docs/DEPLOY.md`).
 
-Each message also keeps the payload teams-cli returned (`raw_json`), which the pull compares to tell an edit or a delete; nothing else reads it once the replies are stored. `brain maint teams-drop-raw-json` drops it from the messages stored before, once, after `teams-backfill-replies` (section 12 of `docs/DEPLOY.md`); a channel post whose payload still holds a reply that is not a message of its own keeps its payload. New messages keep their payload, and one whose payload was dropped gets it back, with the same text and no new extraction, the next time a pull reads it.
+Each message also keeps the payload teams-cli returned (`raw_json`), which the pull compares to tell an edit or a delete; nothing else reads it once the replies are stored. `brain maint teams-drop-raw-json` drops it from the messages stored before, once, after `teams-backfill-replies` (section 12 of `docs/DEPLOY.md`); a channel post whose payload still holds a reply that is not a message of its own keeps its payload, and so does a message whose payload names a SharePoint file `process-sharepoint` has not read yet. New messages keep their payload, and one whose payload was dropped gets it back, with the same text and no new extraction, the next time a pull reads it.
 
 ### WhatsApp
 
@@ -376,7 +376,7 @@ Each message also keeps the payload teams-cli returned (`raw_json`), which the p
 
 ### SharePoint
 
-- `sharepoint_index(operation, url)`. `list_stale` (any link whose `last_status` is not `ok` or `not-content`), `list_unfetched`, or `refetch` a specific URL.
+- `sharepoint_index(operation, url)`. `list_stale` (any link whose `last_status` is not `ok` or `not-content`), `list_unfetched`, or `refetch` a specific URL. Each listed link says its `source`: `email`, `teams` (its `message_id` reads `teams:<teams_messages.id>`) or `shared-with-me`.
 
   What a link points at decides what is fetched (`link_kind` in `src/export/sharepoint_fetcher.py`): a file (a sharing link to a document, an Office viewer URL, a document URL) is downloaded through `sharepoint-cli get` and stored as text; an intranet page (`/SitePages/*.aspx`) is read through `sharepoint-cli page` and stored as a text-only document titled `[SharePoint page] <title>`; anything else (the SharePoint home, OneDrive and library views, folders, videos) is recorded once as `not-content` and never fetched. Links to the same target share one fetch per run.
 
@@ -717,7 +717,8 @@ python -m src.cli process-attachments --phase 2 --token-budget 2000000 # stop be
 python -m src.cli process-attachments --phase 2 --batch                # the pending summaries as a Vertex AI batch job, at half price (see below)
 python -m src.cli process-attachments --batch-collect                  # store the replies of finished batch jobs; the rest stay pending
 python -m src.cli process-images --limit 500
-python -m src.cli process-sharepoint --since 2026-06-01   # a rescan by date; the nightly run continues past the last email id it scanned, fetching at most --max-fetches (100)
+python -m src.cli process-sharepoint --since 2026-06-01   # a rescan by date; the nightly run continues past the last email and Teams message ids it scanned, fetching at most --max-fetches (100)
+python -m src.cli process-sharepoint --urls-file shared.jsonl --max-fetches 0   # fetch the files a list names, one {"url", "date", "label"} a line, each dated by its line; no scan, no mark moved
 python -m src.cli reverse-ingest --root ~/path/to/documents --workers 4   # only the directories you name
 python -m src.cli ingest ~/Downloads/report.pdf --source "Q2 report"
 python -m src.cli ingest --url https://example.com/article
@@ -865,7 +866,7 @@ src/
     calendar_bodies.py         `calendar-bodies`: the text of the events stored before it was kept
     topic_pages.py             `topic-pages`: one call a live topic's page, the citation check, the row
     briefs.py                  `briefs`: the pre-meeting brief pilot, its stop rule, owner-only mail
-    sharepoint.py              `process-sharepoint`: retry pass, link scan, fetch, store
+    sharepoint.py              `process-sharepoint`: retry pass, mail and Teams link scans, fetch, store
   export/
     outlook_export.py          Hourly Outlook ingestion via outlook-cli
     outlook_cli.py             outlook-cli subprocess wrapper
@@ -924,6 +925,7 @@ src/
     whatsapp_pipeline.py       `whatsapp-sync` step 3: extract every changed session, the Teams way
     whatsapp_prompt.py         WhatsApp session extraction prompt
     sharepoint_url_scanner.py  Detect SharePoint URLs in email bodies
+    teams_file_links.py        The SharePoint files a Teams message sends and the links in its text
   store/
     schema.py                  Tables, FTS5 indexes, migrations
     loader.py                  Extracted JSON to SQLite

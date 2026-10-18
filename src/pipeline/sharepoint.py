@@ -1,27 +1,73 @@
-"""`brain process-sharepoint`: scan mail for SharePoint links, fetch them, store their text.
+"""`brain process-sharepoint`: scan mail and Teams for SharePoint links, fetch them, store their text.
 
 Moved from src/cli.py on 2026-10-11 as it was: the CLI parses the arguments and calls
 run(args) with the argparse namespace.
 """
 
+import json
 import sys
 from pathlib import Path
 
 from src.config import SHAREPOINT_DATA_DIR
 from src.pipeline import EXIT_REAUTH
 
+# How far each scan has read: the last emails.id, and the last teams_messages.id, every link of
+# which was dealt with.
+MAIL_MARK = "sharepoint_scan_last_id"
+TEAMS_MARK = "sharepoint_teams_scan_last_id"
+
+
+def _read_urls_file(path: Path) -> tuple[list[tuple[str, str, str | None]], list[str]]:
+    """The lines of a shared-with-me list: ([(url, date, label)], [why each line was skipped]).
+
+    One JSON object a line, {"url": ..., "date": ISO 8601, "label": optional}. A blank line is
+    ignored; a line that is not one, or whose URL is not a SharePoint URL or whose date does not
+    parse, is skipped and said. The same URL twice is read once, at its first line.
+    """
+    from src.extract.sharepoint_url_scanner import normalise_sharepoint_url
+    from src.store.stamps import instant
+
+    entries: list[tuple[str, str, str | None]] = []
+    skipped: list[str] = []
+    seen: set[str] = set()
+    for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            skipped.append(f"line {n}: not JSON")
+            continue
+        if not isinstance(item, dict):
+            skipped.append(f"line {n}: not a JSON object")
+            continue
+        url = normalise_sharepoint_url(item.get("url"))
+        date = item.get("date")
+        label = item.get("label")
+        if url is None:
+            skipped.append(f"line {n}: no SharePoint url")
+        elif not isinstance(date, str) or instant(date) is None:
+            skipped.append(f"line {n}: no ISO 8601 date")
+        elif url not in seen:
+            seen.add(url)
+            entries.append((url, date, label if isinstance(label, str) else None))
+    return entries, skipped
+
 
 def run(args):
-    """Scan emails for SharePoint URLs and fetch them."""
+    """Scan emails and Teams messages for SharePoint URLs and fetch them."""
     from src.config import SHAREPOINT_HOST
     from src.export.sharepoint_fetcher import (
+        SHARED_WITH_ME,
         is_managed_sharepoint_host,
         record_link_in_db,
         retry_candidates,
         target_of,
+        teams_ref,
     )
     from src.extract.sharepoint_ingest import fetch_and_ingest
     from src.extract.sharepoint_url_scanner import extract_sharepoint_urls
+    from src.extract.teams_file_links import message_urls
     from src.store.email_html import markup_or_text
     from src.store.schema import get_connection, run_migrations
 
@@ -89,6 +135,18 @@ def run(args):
         )
         sys.exit(2)
 
+    # The shared-with-me list is read before the store is opened: a file that is not there or
+    # not text stops the run with nothing done.
+    urls_file = getattr(args, "urls_file", None)
+    shared: list[tuple[str, str, str | None]] | None = None
+    skipped: list[str] = []
+    if urls_file:
+        try:
+            shared, skipped = _read_urls_file(Path(urls_file))
+        except (OSError, UnicodeDecodeError) as err:
+            print(f"Error: cannot read the URLs file {urls_file}: {err}", file=sys.stderr)
+            return 1
+
     # Ensure schema is up to date
     conn = get_connection(db_path)
     run_migrations(conn)
@@ -110,10 +168,11 @@ def run(args):
     )
     params: list = []
 
-    mark_row = conn.execute(
-        "SELECT value FROM sync_metadata WHERE key = 'sharepoint_scan_last_id'"
-    ).fetchone()
-    scan_mark = int(mark_row[0]) if mark_row else 0
+    def _mark(key: str) -> int:
+        row = conn.execute("SELECT value FROM sync_metadata WHERE key = ?", (key,)).fetchone()
+        return int(row[0]) if row else 0
+
+    scan_mark = _mark(MAIL_MARK)
 
     if args.since:
         query += " AND e.date_received >= ?"
@@ -147,13 +206,14 @@ def run(args):
     def _out_of_time() -> bool:
         return deadline is not None and time.monotonic() >= deadline
 
-    print("Scanning emails for SharePoint URLs...")
-    if args.since:
-        print(f"  Filtering to emails after {args.since}")
-    else:
-        print(f"  Starting past email id {scan_mark}")
-    if args.since and args.limit and args.limit > 0:
-        print(f"  Limiting to {args.limit} emails")
+    if shared is None:
+        print("Scanning emails and Teams messages for SharePoint URLs...")
+        if args.since:
+            print(f"  Filtering to emails and Teams messages after {args.since}")
+        else:
+            print(f"  Starting past email id {scan_mark}, Teams message id {_mark(TEAMS_MARK)}")
+        if args.since and args.limit and args.limit > 0:
+            print(f"  Limiting to {args.limit} emails")
     if max_fetches > 0 and not args.dry_run:
         print(f"  Fetching at most {max_fetches} new URLs")
     if args.dry_run:
@@ -162,6 +222,7 @@ def run(args):
 
     stats = {
         "emails_scanned": 0,
+        "teams_scanned": 0,
         "urls_found": 0,
         "urls_new": 0,
         "urls_retried": 0,
@@ -183,9 +244,11 @@ def run(args):
     # many query strings, and every link to it records the one result (target_of).
     by_target: dict[str, tuple] = {}
 
-    def _fetch_one(url: str, message_id: str) -> bool:
+    def _fetch_one(url: str, message_id: str, date: str | None = None) -> bool:
         """Fetch + record one URL, updating outcome stats. Returns True on a
-        re-loginable (managed-host) auth failure so the caller stops the pass."""
+        re-loginable (managed-host) auth failure so the caller stops the pass.
+        `message_id` names what the link was found in; `date`, when given, dates its document
+        instead of that (src/extract/sharepoint_ingest.py link_date)."""
         print(f"  Fetching: {url}")
         target = target_of(url)
         if target in by_target:
@@ -193,7 +256,7 @@ def run(args):
             print("    (the same target as a link above: not fetched again)")
         else:
             # Fetched into a temporary directory and stored as text; no file is kept.
-            result, document = fetch_and_ingest(conn, url, message_id)
+            result, document = fetch_and_ingest(conn, url, message_id, date=date)
             by_target[target] = (result, document)
         # An auth failure on an external tenant (a host we hold no session for)
         # can never be fixed by our re-login, so record it distinctly and keep
@@ -297,6 +360,47 @@ def run(args):
             return EXIT_REAUTH
         return 0
 
+    # The shared-with-me backfill (--urls-file): each listed file is fetched like any link,
+    # recorded as SHARED_WITH_ME and its document dated by its line, since sharepoint_links holds
+    # no date. Neither scan nor the retry pass runs, so no mark moves; the cap and the deadline
+    # hold. A URL already fetched is skipped, so running the same file again fetches the rest
+    # and retries the failures, each still dated by its line. The nightly retry pass retries
+    # them too, but knows no line: what it stores is dated by the fetch.
+    if shared is not None:
+        todo = [entry for entry in shared if entry[0] not in existing_urls]
+        print(
+            f"Shared-with-me list {urls_file}: {len(shared)} file(s), {len(todo)} to fetch,"
+            f" {len(shared) - len(todo)} already fetched, {len(skipped)} line(s) skipped"
+        )
+        for why in skipped:
+            print(f"  {why}")
+        read = 0
+        if not args.dry_run:
+            for url, date, label in todo:
+                if max_fetches > 0 and read >= max_fetches:
+                    print(f"  Fetch cap of {max_fetches} reached: run it again for the rest")
+                    break
+                if _out_of_time():
+                    print("  Time budget spent: run it again for the rest")
+                    break
+                read += 1
+                if label:
+                    print(f"  {label}")
+                if _fetch_one(url, SHARED_WITH_ME, date):
+                    break
+        conn.close()
+        print(
+            f"\nShared-with-me: {read} read, {stats['urls_fetched']} fetched,"
+            f" {stats['urls_failed']} failed, {stats['urls_not_content']} not content,"
+            f" {stats['urls_skipped_external']} on another tenant"
+        )
+        if stats["auth_required"]:
+            print(
+                f"\n⚠ Auth required: run 'sharepoint-cli login --host {SHAREPOINT_HOST}' and retry"
+            )
+            return EXIT_REAUTH
+        return 0
+
     # Retry pass: links seen before but never fetched OK (fetched_at NULL) or
     # gone stale get re-attempted regardless of whether their source email is
     # still inside the scan window — otherwise old failures never clear.
@@ -318,11 +422,37 @@ def run(args):
             if _fetch_one(url, message_id):
                 break
 
-    # Scan emails for new URLs (skip anything already fetched or attempted).
-    # scanned_to is the last email every link of which was dealt with.
-    scanned_to = scan_mark
+    # Scan emails, then Teams messages, for new URLs (skip anything already fetched or
+    # attempted). Each scan's mark is the last item every link of which was dealt with. The two
+    # share the fetch cap and the deadline: a run the mail used up leaves Teams to the next.
     fetches = 0
     capped = False
+
+    def _take_links(ref: str, urls: list[str]) -> bool:
+        """Deal with one item's links; False when the pass stops before they are all done."""
+        nonlocal fetches, capped
+        stats["urls_found"] += len(urls)
+        for url in urls:
+            if url in existing_urls or url in attempted:
+                continue
+            if not args.dry_run and max_fetches > 0 and fetches >= max_fetches:
+                capped = True
+                return False
+            if not args.dry_run and _out_of_time():
+                capped = True
+                return False
+            attempted.add(url)
+            stats["urls_new"] += 1
+
+            if args.dry_run:
+                continue
+
+            fetches += 1
+            if _fetch_one(url, ref):
+                return False
+        return True
+
+    scanned_to = scan_mark
     if not stats["auth_required"]:
         # The scan reads on a connection of its own. Its open cursor holds a read
         # snapshot, and on the connection every fetch commits on, a commit from
@@ -334,48 +464,84 @@ def run(args):
             for row in scan_conn.execute(query, params):
                 email_id, message_id, content, date_received, html = row
                 stats["emails_scanned"] += 1
-
-                urls = extract_sharepoint_urls(markup_or_text(content, html))
-                stats["urls_found"] += len(urls)
-
-                for url in urls:
-                    if url in existing_urls or url in attempted:
-                        continue
-                    if not args.dry_run and max_fetches > 0 and fetches >= max_fetches:
-                        capped = True
-                        break
-                    if not args.dry_run and _out_of_time():
-                        capped = True
-                        break
-                    attempted.add(url)
-                    stats["urls_new"] += 1
-
-                    if args.dry_run:
-                        continue
-
-                    fetches += 1
-                    if _fetch_one(url, message_id):
-                        break
-
-                if stats["auth_required"] or capped:
+                if not _take_links(
+                    message_id, extract_sharepoint_urls(markup_or_text(content, html))
+                ):
                     break
                 scanned_to = email_id
         finally:
             scan_conn.close()
 
+    # Teams: the files sent with a message (its payload's properties.files) and the links in
+    # its HTML (src/extract/teams_file_links.py), recorded as "teams:<teams_messages.id>" and
+    # dated by the message. Only messages that mention SharePoint are read; the rest have no
+    # link to deal with, so a scan that finishes moves the mark to the newest message it saw,
+    # and the next run reads nothing twice. A system message (a call, a member joining) is a
+    # record the service writes, and is not read.
+    teams_mark = _mark(TEAMS_MARK)
+    teams_scanned_to = teams_mark
+    if not stats["auth_required"] and not capped:
+        scan_conn = get_connection(db_path)
+        try:
+            top = scan_conn.execute("SELECT COALESCE(MAX(id), 0) FROM teams_messages").fetchone()[0]
+            teams_query = (
+                "SELECT id, chat_id, raw_json, content_html FROM teams_messages"
+                " WHERE is_system = 0 AND id <= ?"
+                " AND (raw_json LIKE '%sharepoint.com%' OR content_html LIKE '%sharepoint.com%')"
+            )
+            teams_params: list = [top]
+            if args.since:
+                teams_query += " AND composed_at >= ?"
+                teams_params.append(args.since)
+            else:
+                teams_query += " AND id > ?"
+                teams_params.append(teams_mark)
+
+            def _reply_stored(chat_id: int, reply_id: str) -> bool:
+                # A reply stored as a message of its own is read there, under its own date.
+                return (
+                    scan_conn.execute(
+                        "SELECT 1 FROM teams_messages WHERE teams_message_id = ?",
+                        (f"{chat_id}::{reply_id}",),
+                    ).fetchone()
+                    is not None
+                )
+
+            finished = True
+            for row_id, chat_id, raw_json, html in scan_conn.execute(
+                teams_query + " ORDER BY id", teams_params
+            ):
+                stats["teams_scanned"] += 1
+                urls = message_urls(
+                    raw_json, html, reply_stored=lambda rid, chat=chat_id: _reply_stored(chat, rid)
+                )
+                if not _take_links(teams_ref(row_id), urls):
+                    finished = False
+                    break
+                teams_scanned_to = row_id
+            if finished:
+                teams_scanned_to = max(teams_scanned_to, top)
+        finally:
+            scan_conn.close()
+
     # Only a real pass over the mark's own range moves it: a dry run fetched
     # nothing, and a --since backfill did not read every id above the mark.
-    if not args.dry_run and not args.since and scanned_to > scan_mark:
-        conn.execute(
-            "INSERT OR REPLACE INTO sync_metadata (key, value) "
-            "VALUES ('sharepoint_scan_last_id', ?)",
-            (str(scanned_to),),
-        )
+    if not args.dry_run and not args.since:
+        for key, reached, mark in (
+            (MAIL_MARK, scanned_to, scan_mark),
+            (TEAMS_MARK, teams_scanned_to, teams_mark),
+        ):
+            if reached > mark:
+                conn.execute(
+                    "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES (?, ?)",
+                    (key, str(reached)),
+                )
         conn.commit()
     conn.close()
 
     print("\nSharePoint processing complete:")
     print(f"  Emails scanned: {stats['emails_scanned']}")
+    print(f"  Teams messages with a SharePoint link: {stats['teams_scanned']}")
     print(f"  URLs found: {stats['urls_found']}")
     print(f"  New URLs: {stats['urls_new']}")
     if not args.dry_run:

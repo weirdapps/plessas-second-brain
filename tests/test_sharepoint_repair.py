@@ -255,6 +255,63 @@ def test_viewer_links_to_two_files_are_two_documents(conn):
     assert len(refused_links(conn)) == 2
 
 
+# --- Links not found in mail: Teams and the shared-with-me backfill -------------------------
+
+
+def _teams_message(conn) -> int:
+    chat = conn.execute(
+        "INSERT INTO teams_chats (teams_chat_id, chat_kind, topic, first_seen_at)"
+        " VALUES ('19:example@thread.v2', 'group', 'Budget review', '2026-09-01')"
+    ).lastrowid
+    row = conn.execute(
+        "INSERT INTO teams_messages (teams_message_id, chat_id, sender_display_name,"
+        " composed_at, is_system) VALUES (?, ?, 'Ann Example', '2026-10-02T08:30:00Z', 0)",
+        (f"{chat}::1760000000000", chat),
+    ).lastrowid
+    conn.commit()
+    return row
+
+
+def test_the_rescan_leaves_links_not_found_in_mail_alone(conn):
+    """The rescan reads an email again to judge its links; a Teams message or the backfill
+    list is not an email, and its never-fetched links are not the old scanner's."""
+    row = _teams_message(conn)
+    _given_up(conn, f"{SITE}/Plan.aspx", message_id=f"teams:{row}")
+    _given_up(conn, f"{SITE}/Budget.aspx", message_id="shared-with-me")
+    before = _links(conn)
+
+    stats = rescan_links(conn, apply=True)
+
+    assert stats == {"emails": 0, "dropped": 0, "added": 0}
+    assert _links(conn) == before
+
+
+def test_a_refused_link_found_in_teams_names_its_message(conn):
+    row = _teams_message(conn)
+    sheet = "https://contoso.sharepoint.com/:x:/g/personal/ann/EQsheet"
+    record_link_in_db(conn, url=sheet, message_id=f"teams:{row}", status="http-error")
+    record_link_in_db(conn, url=f"{sheet}?e=1", message_id="shared-with-me", status="http-error")
+
+    (doc,) = refused_links(conn)
+
+    assert doc["emails"] == [
+        {
+            "message_id": "shared-with-me",
+            "source": "shared-with-me",
+            "date": None,
+            "sender": None,
+            "subject": None,
+        },
+        {
+            "message_id": f"teams:{row}",
+            "source": "teams",
+            "date": "2026-10-02T08:30:00Z",
+            "sender": "Ann Example",
+            "subject": "Budget review",
+        },
+    ]
+
+
 def test_the_refused_list_runs_on_a_replica(tmp_path, monkeypatch, capsys):
     """Deprecated for one release, it answers through the sharepoint_index tool, which
     lists every link whose last fetch did not succeed."""

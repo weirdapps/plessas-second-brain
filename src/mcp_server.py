@@ -2139,11 +2139,13 @@ def sharepoint_index(
         str | None, Field(description="For refetch only: a link already recorded.")
     ] = None,
 ) -> SharepointIndex:
-    """Check or retry the SharePoint links found in mail: the ones that failed, the ones never fetched, or fetch one again.
+    """Check or retry the SharePoint links found in mail and Teams: the ones that failed, the ones never fetched, or fetch one again.
 
     list_stale returns links whose last_status is anything but 'ok' or
-    'not-content'. refetch accepts only a link already recorded, on the
-    configured SharePoint host, and is refused on a replica.
+    'not-content'. Each row's source says where its link was found: 'email'
+    (message_id is the email's), 'teams' (message_id is "teams:<message row>")
+    or 'shared-with-me' (the backfill list). refetch accepts only a link already
+    recorded, on the configured SharePoint host, and is refused on a replica.
     """
     from src.config import SHAREPOINT_HOST
     from src.export import sharepoint_fetcher
@@ -2162,8 +2164,9 @@ def sharepoint_index(
             # scripts/health_check.py counts them. 'not-content' is settled, not failing: a
             # link with nothing to read, recorded once and never fetched.
             rows = conn.execute(
-                """
-                SELECT url, message_id, last_status, last_attempt_at
+                f"""
+                SELECT url, message_id, {sharepoint_fetcher.LINK_SOURCE_SQL} AS source,
+                       last_status, last_attempt_at
                 FROM sharepoint_links
                 WHERE last_status NOT IN ('ok', 'not-content')
                 ORDER BY last_attempt_at DESC
@@ -2173,8 +2176,9 @@ def sharepoint_index(
 
         if operation == "list_unfetched":
             rows = conn.execute(
-                """
-                SELECT url, message_id, last_status
+                f"""
+                SELECT url, message_id, {sharepoint_fetcher.LINK_SOURCE_SQL} AS source,
+                       last_status
                 FROM sharepoint_links
                 WHERE fetched_at IS NULL
                 ORDER BY last_attempt_at DESC

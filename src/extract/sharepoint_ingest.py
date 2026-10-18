@@ -1,10 +1,12 @@
 """SharePoint files and pages become text-only documents; the fetched file is never kept.
 
-A link found in mail is fetched into a temporary directory, extracted, and stored through
-ingest_text_document (src/extract/attachment_pipeline.py). The fetched bytes' hash is the
-document's identity, so a file linked from many emails is one document, and each link records
-it in sharepoint_links.document_message_id. An intranet page is read as text (sharepoint-cli
-page); its text is its identity. A link that is not content is not fetched at all.
+A link found in mail or in Teams is fetched into a temporary directory, extracted, and stored
+through ingest_text_document (src/extract/attachment_pipeline.py). The fetched bytes' hash is
+the document's identity, so a file linked from many emails is one document, and each link
+records it in sharepoint_links.document_message_id. Bytes an attachment already holds as text
+make no document: the link records the email that holds them. An intranet page is read as text
+(sharepoint-cli page); its text is its identity. A link that is not content is not fetched at
+all. The document is dated by what the link was found in (link_date).
 """
 
 import hashlib
@@ -23,6 +25,7 @@ from src.extract.attachment_pipeline import (
 )
 from src.extract.html_text import html_to_text
 from src.store.file_hashes import sha256_of_file
+from src.store.file_sweep import FULLY_HELD_SQL
 from src.store.stamps import utc_now
 
 
@@ -35,12 +38,47 @@ def _label(url: str | None, filename: str) -> str:
     return f"{parsed.netloc}/{path}" if path else (parsed.netloc or filename)
 
 
-def _email_date(conn: sqlite3.Connection, message_id) -> str | None:
-    """When the email carrying the link arrived: the date its document is filed under."""
-    if message_id is None:
+def link_date(conn: sqlite3.Connection, ref) -> str | None:
+    """When the item a link was found in was sent: the date its document is filed under.
+
+    `ref` is a sharepoint_links.message_id (sharepoint_fetcher.link_source): an email arrived at
+    its date_received, a Teams message was written at its composed_at. A shared-with-me link has
+    no item; the backfill that lists it passes its date in. None when the item is not held, and
+    the document is then dated by its fetch.
+    """
+    if ref is None:
         return None
+    source = sharepoint_fetcher.link_source(ref)
+    if source == "teams":
+        row_id = sharepoint_fetcher.teams_row_id(ref)
+        if row_id is None:
+            return None
+        row = conn.execute(
+            "SELECT composed_at FROM teams_messages WHERE id = ?", (row_id,)
+        ).fetchone()
+    elif source == "email":
+        row = conn.execute(
+            "SELECT date_received FROM emails WHERE message_id = ?", (ref,)
+        ).fetchone()
+    else:
+        return None
+    return row[0] if row and row[0] else None
+
+
+def _held_twin(conn: sqlite3.Connection, sha: str):
+    """The message id of an attachment whose bytes are these and whose text is stored, if any.
+
+    The rule ingest_document and the sweep use (FULLY_HELD_SQL), with text in the row: a twin
+    that failed, was skipped, is encrypted or was read in part holds nothing a document of these
+    bytes would repeat.
+    """
     row = conn.execute(
-        "SELECT date_received FROM emails WHERE message_id = ?", (message_id,)
+        "SELECT a.message_id FROM attachments a"
+        " JOIN attachment_content ac ON ac.attachment_id = a.id"
+        f" WHERE a.sha256 = ? AND COALESCE({FULLY_HELD_SQL}, 0)"
+        " AND LENGTH(TRIM(COALESCE(ac.extracted_text, ''))) > 0"
+        " ORDER BY a.id LIMIT 1",
+        (sha,),
     ).fetchone()
     return row[0] if row else None
 
@@ -55,16 +93,21 @@ def ingest_fetched_file(
 ) -> tuple[int | None, bool]:
     """Store a fetched file as a text-only document: (its message id, whether it is new).
 
-    The same bytes stored before are not extracted again. With `require_text`, a file that
-    yields no text makes no document and (None, False) comes back: a view link often returns
-    the browser page (an .aspx viewer, a sign-in or error page) instead of the file. The backlog
-    pass keeps its default, because a file left on disk needs its row for the sweep to know it
-    was read.
+    The same bytes stored before are not extracted again. Bytes another attachment holds as
+    text (a mail attachment, most often, that the link shares too) make no document either: the
+    message id of what holds them comes back, so search finds one copy, not twins. With
+    `require_text`, a file that yields no text makes no document and (None, False) comes back: a
+    view link often returns the browser page (an .aspx viewer, a sign-in or error page) instead
+    of the file. The backlog pass keeps its default, because a file left on disk needs its row
+    for the sweep to know it was read (the sweep counts a held twin's bytes as read).
     """
     sha = sha256_of_file(path)
     message_id = _sha256_to_message_id(sha)
     if conn.execute("SELECT 1 FROM emails WHERE message_id = ?", (message_id,)).fetchone():
         return message_id, False
+    twin = _held_twin(conn, sha)
+    if twin is not None:
+        return twin, False
     mime = _guess_mime_type(str(path))
     result = extract_text_from_file(str(path), mime)
     if require_text and not result["text"]:
@@ -128,21 +171,26 @@ def ingest_page(
 
 
 def fetch_and_ingest(
-    conn: sqlite3.Connection, url: str, message_id
+    conn: sqlite3.Connection, url: str, message_id, date: str | None = None
 ) -> tuple[SharepointFetchResult, int | None]:
     """Fetch what a link points at and store its text. No file outlives the call.
 
     A file is fetched into a temporary directory, a page is read as text, and a link that is
-    not content is recorded as such without a fetch. The fetchers are looked up on their module
-    at call time, where the tests replace them.
+    not content is recorded as such without a fetch. The document is dated `date` when one is
+    given, else by what `message_id` names (link_date). The fetchers are looked up on their
+    module at call time, where the tests replace them.
     """
     kind = sharepoint_fetcher.link_kind(url)
     if kind == "not-content":
         return SharepointFetchResult(url=url, status="not-content"), None
+
+    def _dated() -> str | None:
+        # Read only once there is something to store.
+        return date if date is not None else link_date(conn, message_id)
+
     if kind == "page":
         page = sharepoint_fetcher.fetch_sharepoint_page(url)
-        date = _email_date(conn, message_id)
-        document = ingest_page(conn, page, date) if page.status == "ok" else None
+        document = ingest_page(conn, page, _dated()) if page.status == "ok" else None
         status, error = page.status, page.error_message
         if status == "ok" and document is None:
             # Read, but nothing to store: recorded 'ok' this would settle the link with no
@@ -161,7 +209,7 @@ def fetch_and_ingest(
         document = None
         if result.status == "ok" and result.local_path and result.local_path.is_file():
             document, _ = ingest_fetched_file(
-                conn, result.local_path, url, _email_date(conn, message_id), require_text=True
+                conn, result.local_path, url, _dated(), require_text=True
             )
     return result, document
 
@@ -192,7 +240,7 @@ def ingest_fetched_backlog(conn: sqlite3.Connection, roots) -> dict:
             size = path.stat().st_size
             mine = [(u, m) for u, m, s in links.get((root.name, path.name), []) if s == size]
             url, message_id = mine[0] if mine else (None, None)
-            document, new = ingest_fetched_file(conn, path, url, _email_date(conn, message_id))
+            document, new = ingest_fetched_file(conn, path, url, link_date(conn, message_id))
             stats["ingested" if new else "already"] += 1
             for u, _m in mine:
                 conn.execute(

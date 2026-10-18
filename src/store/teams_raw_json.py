@@ -2,13 +2,15 @@
 
 raw_json keeps each message as teams-cli returned it, 133 MB of the 244 MB table on the
 producer, where the text, the HTML and the thread of each message are kept in columns of their
-own. Two things read it. The pull compares a message it reads again with the stored payload
+own. Three things read it. The pull compares a message it reads again with the stored payload
 to find an edit or a delete (src/export/teams_export.py, _apply_later_version), so new rows
 keep writing it; with the payload gone, the next pull that reads the message stores it once
-more in full, the same text, and sends no thread back to extraction. And teams-backfill-replies
+more in full, the same text, and sends no thread back to extraction. teams-backfill-replies
 stores the replies a channel post's payload holds, which until #146 lived nowhere else: a post
 holding a reply that is not a row of its own keeps its payload, whichever command runs first,
-until the backfill has stored it.
+until the backfill has stored it. And process-sharepoint reads the SharePoint files sent with a
+message from its payload alone (src/extract/teams_file_links.py): a payload naming one keeps
+it until the SharePoint pass's Teams scan has read past the message.
 
 A dry run opens the store read-only. Each batch is one short transaction, so the timers'
 writers wait on it seconds at most, and a stopped run keeps what it did. The file shrinks only
@@ -19,22 +21,35 @@ import json
 import sqlite3
 
 from src.export.teams_export import _replies_of
+from src.extract.teams_file_links import holds_file_link
 
 # Payloads dropped per transaction.
 DROP_BATCH = 500
+
+# How far process-sharepoint's Teams scan has read (src/pipeline/sharepoint.py TEAMS_MARK).
+TEAMS_SCAN_MARK = "sharepoint_teams_scan_last_id"
 
 
 def drop_raw_json(conn: sqlite3.Connection, *, limit: int = 0, dry_run: bool = False) -> dict:
     """Set raw_json to NULL wherever nothing needs it, oldest message first, at most `limit`
     (0 = every one).
 
-    Returns {"dropped", "bytes", "kept_replies", "kept_unreadable", "left"}: payloads dropped
-    (or, in a dry run, that would be) and their size in bytes; channel posts kept because a
-    reply in the payload is not stored as a row, or because the payload does not parse; and
-    payloads past the limit.
+    Returns {"dropped", "bytes", "kept_replies", "kept_unreadable", "kept_links", "left"}:
+    payloads dropped (or, in a dry run, that would be) and their size in bytes; channel posts
+    kept because a reply in the payload is not stored as a row, or because the payload does not
+    parse; payloads kept because they name a SharePoint file the SharePoint pass has not read
+    yet; and payloads past the limit.
     """
-    counts = {"dropped": 0, "bytes": 0, "kept_replies": 0, "kept_unreadable": 0, "left": 0}
+    counts = {
+        "dropped": 0,
+        "bytes": 0,
+        "kept_replies": 0,
+        "kept_unreadable": 0,
+        "kept_links": 0,
+        "left": 0,
+    }
     kept = _posts_to_keep(conn, counts)
+    kept |= _links_to_keep(conn, kept, counts)
     held = [
         row[0]
         for row in conn.execute(
@@ -66,6 +81,33 @@ def drop_raw_json(conn: sqlite3.Connection, *, limit: int = 0, dry_run: bool = F
         counts["dropped"] += dropped
         counts["bytes"] += size
     return counts
+
+
+def _links_to_keep(conn: sqlite3.Connection, kept: set[int], counts: dict) -> set[int]:
+    """The messages past the SharePoint pass's Teams mark whose payload names a SharePoint file.
+
+    A file sent with a message is named in its payload alone, not in the HTML the store keeps,
+    so the payload stays until the scan has read the message. Only payloads that mention
+    SharePoint are parsed; those kept for a reply already are not counted twice.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM sync_metadata WHERE key = ?", (TEAMS_SCAN_MARK,)
+        ).fetchone()
+    except sqlite3.OperationalError:  # a store with no sync_metadata has never been scanned
+        row = None
+    mark = int(row[0]) if row else 0
+    found: set[int] = set()
+    # One payload at a time, as in _posts_to_keep.
+    for message_id, raw in conn.execute(
+        "SELECT id, raw_json FROM teams_messages WHERE id > ? AND raw_json IS NOT NULL"
+        " AND raw_json LIKE '%sharepoint.com%' ORDER BY id",
+        (mark,),
+    ):
+        if message_id not in kept and holds_file_link(raw):
+            found.add(message_id)
+            counts["kept_links"] += 1
+    return found
 
 
 def _posts_to_keep(conn: sqlite3.Connection, counts: dict) -> set[int]:

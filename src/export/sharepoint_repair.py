@@ -17,7 +17,13 @@ process-sharepoint`, or the nightly run). With apply False both only count.
 import sqlite3
 from urllib.parse import parse_qs, unquote, urlparse
 
-from src.export.sharepoint_fetcher import link_kind, record_link_in_db, target_of
+from src.export.sharepoint_fetcher import (
+    link_kind,
+    link_source,
+    record_link_in_db,
+    target_of,
+    teams_row_id,
+)
 from src.extract.sharepoint_url_scanner import extract_sharepoint_urls
 from src.store.email_html import markup_or_text
 
@@ -56,7 +62,9 @@ def rescan_links(conn: sqlite3.Connection, *, apply: bool) -> dict:
     fetched or settled as no content: a link that once fetched was not mangled, whatever
     its spelling. A link whose email is gone is kept, since nothing can tell a mangled one
     from a real one without it. A recorded file or page link is queued for the retry pass;
-    one with nothing to read is settled as the pass would settle it, without a fetch.
+    one with nothing to read is settled as the pass would settle it, without a fetch. Only
+    links found in mail are judged: the old scanner never read Teams or the backfill list
+    (link_source).
     """
     candidates = conn.execute(
         "SELECT url, message_id FROM sharepoint_links WHERE document_message_id IS NULL"
@@ -65,7 +73,8 @@ def rescan_links(conn: sqlite3.Connection, *, apply: bool) -> dict:
     present = {url for (url,) in conn.execute("SELECT url FROM sharepoint_links")}
     by_email: dict[str, list[str]] = {}
     for url, message_id in candidates:
-        by_email.setdefault(message_id, []).append(url)
+        if link_source(message_id) == "email":
+            by_email.setdefault(message_id, []).append(url)
     dropped: list[str] = []
     added: dict[str, str] = {}
     for message_id, urls in by_email.items():
@@ -126,12 +135,34 @@ def _document_key(url: str) -> tuple[str, str, str]:
     return (parsed.netloc.lower(), unquote(parsed.path).lower(), named.lower())
 
 
+def _origin(conn: sqlite3.Connection, message_id) -> tuple:
+    """(date, sender, subject) of what a link was found in: an email, or a Teams message (its
+    chat's topic as the subject). A shared-with-me link, or an item not held, has none."""
+    source = link_source(message_id)
+    if source == "teams":
+        row = conn.execute(
+            "SELECT m.composed_at, m.sender_display_name, c.topic FROM teams_messages m"
+            " LEFT JOIN teams_chats c ON c.id = m.chat_id WHERE m.id = ?",
+            (teams_row_id(message_id),),
+        ).fetchone()
+    elif source == "email":
+        row = conn.execute(
+            "SELECT date_received, sender_address, subject FROM emails WHERE message_id = ?",
+            (message_id,),
+        ).fetchone()
+    else:
+        row = None
+    return tuple(row) if row else (None, None, None)
+
+
 def refused_links(conn: sqlite3.Connection, status: str = "http-error") -> list[dict]:
     """Links recorded with `status`, one entry per document they name, oldest email first.
 
     'http-error' is our own tenant answering no: mostly access denied, which the owner of the
     file can grant (a refusal from another tenant is 'unsupported-host'). The variants Safe
-    Links makes of one URL, one per email, collapse into their document. Read only.
+    Links makes of one URL, one per email, collapse into their document. Each item a link was
+    found in says its source (link_source): an email, a Teams message, or the shared-with-me
+    list. Read only.
     """
     groups: dict[tuple[str, str, str], dict] = {}
     for url, message_id, attempts, last_attempt in conn.execute(
@@ -153,13 +184,15 @@ def refused_links(conn: sqlite3.Connection, status: str = "http-error") -> list[
     for doc in groups.values():
         emails = []
         for message_id in doc.pop("message_ids"):
-            row = conn.execute(
-                "SELECT date_received, sender_address, subject FROM emails WHERE message_id = ?",
-                (message_id,),
-            ).fetchone()
-            date, sender, subject = row if row else (None, None, None)
+            date, sender, subject = _origin(conn, message_id)
             emails.append(
-                {"message_id": message_id, "date": date, "sender": sender, "subject": subject}
+                {
+                    "message_id": message_id,
+                    "source": link_source(message_id),
+                    "date": date,
+                    "sender": sender,
+                    "subject": subject,
+                }
             )
         emails.sort(key=lambda e: (e["date"] or "", str(e["message_id"])))
         out.append({**doc, "emails": emails})

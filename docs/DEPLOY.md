@@ -871,7 +871,7 @@ The wrappers under `scripts/wrappers/systemd/` call the sweep and the reaper; in
 `~/.local/bin` after changing them (they are an archive, see section 12). The health check's
 "Files on disk" row shows what is still held and warns when the sweep stops.
 
-**Documents without files.** A SharePoint file linked from mail and a note a Claude session
+**Documents without files.** A SharePoint file linked from mail or Teams and a note a Claude session
 wrote (`.md`, `.txt`, `.csv`) are stored as text only: `attachments.file_path` reads
 `text:<source>:<key>`, and no file is kept. `process-sharepoint` fetches into a temporary
 directory, within the nightly pass's `--deadline-s`; the conversation sync runs
@@ -1487,6 +1487,31 @@ need the Gemini API):
 768 dimensions in half precision (0.4 s on the replica, 1.78 GB to 0.22 GB), which
 gemini-embedding-001 queries at 768 dimensions match as if it had been built so; it adds
 no chunks and keeps the old model.
+
+### After the Teams SharePoint links (no schema change)
+
+`process-sharepoint` now reads Teams after mail: the files sent with a message and the links
+in its text, past a mark of its own (`sharepoint_teams_scan_last_id`), within the same
+`--max-fetches` and `--deadline-s`. Nothing to run for that: the nightly attachment pass
+starts the Teams scan from the first message and works through the backlog 100 fetches a
+night, mail first. On the reference replica, 732 messages mention SharePoint and name 348
+files and pages to fetch; the rest are pictures and videos, recorded as `not-content`.
+`maint teams-drop-raw-json` keeps the payloads that name a file the scan has not reached.
+
+One step is the owner's, once, before November 2026, when Graph's `sharedWithMe` listing
+stops returning data: fetch the documents shared with you that no mail or message links.
+
+1. Write the list as JSON lines, one file a line:
+   `{"url": "<the file's webUrl>", "date": "<ISO 8601, e.g. when it was shared>", "label": "<its name>"}`.
+   `label` is optional and only printed.
+2. `python -m src.cli process-sharepoint --urls-file shared.jsonl --dry-run` counts the lines,
+   what is already fetched, what it would fetch, and names each line it cannot read; it needs
+   no tenant and writes nothing.
+3. `python -m src.cli process-sharepoint --urls-file shared.jsonl --max-fetches 0 --deadline-s 1800`
+   fetches them, each recorded as `shared-with-me` and its document dated by its line; no scan
+   runs and no mark moves. Run it again to fetch what a deadline or an expired session left and
+   to retry the failures: a line already fetched is skipped. The nightly retry pass retries
+   them too, but knows no line, so a document it stores is dated by the fetch.
 
 ### Schema notes
 

@@ -250,7 +250,7 @@ def test_the_retry_pass_stops_at_max_fetches(tmp_path, monkeypatch):
     monkeypatch.setattr(
         sharepoint_ingest,
         "fetch_and_ingest",
-        lambda conn, url, message_id: (
+        lambda conn, url, message_id, **_: (
             calls.append(url)
             or (SharepointFetchResult(url=url, status="http-error", error_message="x"), None)
         ),
@@ -296,7 +296,7 @@ def test_no_fetch_starts_once_the_time_budget_is_spent(tmp_path, monkeypatch):
     monkeypatch.setattr(
         sharepoint_ingest,
         "fetch_and_ingest",
-        lambda conn, url, message_id: (
+        lambda conn, url, message_id, **_: (
             calls.append(url)
             or (SharepointFetchResult(url=url, status="http-error", error_message="x"), None)
         ),

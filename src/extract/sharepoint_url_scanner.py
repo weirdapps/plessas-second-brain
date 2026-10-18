@@ -2,7 +2,7 @@
 
 import re
 from html import unescape  # NOT `import html`: the parameter below shadows it
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 
 # A quoted attribute value tells us exactly where the URL ends: at the
 # attribute's own closing quote. That is the only way to keep an apostrophe
@@ -124,3 +124,22 @@ def extract_sharepoint_urls(html: str | None) -> list[str]:
         cleaned.add(clean_url)
 
     return sorted(cleaned)  # Sort for deterministic output
+
+
+# What a URL keeps as it is when it is encoded: its delimiters, and "%" so that an escape it
+# already holds is not escaped twice. A space, a quote or a letter outside ASCII is encoded.
+_URL_SAFE = ":/?#[]@!$&'()*+,;=%~"
+
+
+def normalise_sharepoint_url(url: object) -> str | None:
+    """One URL, as the mail scan records it: encoded, its tracking parameters removed.
+
+    A URL given on its own rather than in markup (a Teams file entry's objectUrl, a line of a
+    URLs file) can hold its path unencoded, "Shared Documents/Plan 2027.pdf", and the scan
+    would cut it at the first space. Encoded first, it reads as the same link a mail or a
+    Teams message's HTML gives. None for anything that is not a SharePoint URL.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return None
+    found = extract_sharepoint_urls(quote(url.strip(), safe=_URL_SAFE))
+    return found[0] if len(found) == 1 else None

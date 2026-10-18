@@ -1347,6 +1347,13 @@ def cmd_teams_drop_raw_json(args):
     return 0
 
 
+def cmd_directory_sync(args):
+    """Look up colleagues in the organisation's directory (src/pipeline/directory_sync.py)."""
+    from src.pipeline import directory_sync
+
+    return directory_sync.run(args)
+
+
 def cmd_whatsapp_sync(args):
     """Ingest the pushed WhatsApp snapshot and its sessions (src/pipeline/whatsapp_sync.py)."""
     from src.pipeline import whatsapp_sync
@@ -2712,6 +2719,29 @@ def main():
     )
     parser_teams_sync.add_argument("--limit", type=int, help="Max threads to extract this run")
     parser_teams_sync.set_defaults(func=cmd_teams_sync)
+
+    # directory-sync command
+    parser_directory_sync = subparsers.add_parser(
+        "directory-sync",
+        help="Look up colleagues' title, department, office and manager in the "
+        "organisation's directory (teams-cli lookup-users)",
+    )
+    parser_directory_sync.add_argument(
+        "--limit",
+        type=int,
+        default=1000,
+        help="Look up at most this many addresses this run (default: 1000, 0 = all due)",
+    )
+    parser_directory_sync.add_argument(
+        "--domain",
+        action="append",
+        help="A mail domain to look up (repeatable; default: the domains of the owner's "
+        "addresses in BRAIN_USER_EMAIL_PATTERN)",
+    )
+    parser_directory_sync.add_argument(
+        "--dry-run", action="store_true", help="Count the addresses due; look nothing up"
+    )
+    parser_directory_sync.set_defaults(func=cmd_directory_sync)
 
     parser_teams_backfill = subparsers.add_parser(
         "teams-backfill-replies",

@@ -136,6 +136,19 @@ echo "$(ts) — start" >> "$LOG"
 "$PYTHON" -m src.cli teams-sync --concurrency 2 --workers 4 >> "$LOG" 2>&1
 rc=$?
 
+# The organisation's directory (title, department, manager) through the same Teams
+# session. Only after a good sync, whose auth it shares; only while the unit has time
+# left (TimeoutStartSec is 600 s, the sync takes about 190, and SECONDS counts from this
+# script's start), cut off well before the timeout; and never fatal: each chunk is
+# stored as it comes back, and what was not asked stays due for the next run.
+if [ "$rc" -eq 0 ] && [ "$SECONDS" -lt 420 ]; then
+  timeout $((540 - SECONDS)) "$PYTHON" -m src.cli directory-sync --limit 400 >> "$LOG" 2>&1
+  directory_rc=$?
+  if [ "$directory_rc" -ne 0 ]; then
+    echo "$(ts): directory-sync failed rc=$directory_rc (not fatal)" >> "$LOG"
+  fi
+fi
+
 failures=$(read_failures)
 if [ "$rc" -eq 0 ]; then
   write_state 0 ok

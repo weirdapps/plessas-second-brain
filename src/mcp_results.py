@@ -153,6 +153,8 @@ class SenderBrief(Fresh, total=False):
     name: Any
     email: Any
     role: Any
+    department: Any
+    manager: Any
     email_count: int
     top_topics: list[Any]
     recent_decisions: int

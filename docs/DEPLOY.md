@@ -518,7 +518,7 @@ every subcommand.
 | Unit | When | What it runs |
 | --- | --- | --- |
 | `sb-outlook-sync` | :10 at 01 and 07 to 22 | `sb-auth-watch.sh`, the Inbox, Archive and Sent Items exports, `inbox_reconcile`, `sync`, `sweep-files --policy` |
-| `sb-teams-sync` | :30 at 01 and 07 to 22 | `teams-sync` |
+| `sb-teams-sync` | :30 at 01 and 07 to 22 | `teams-sync`, then `directory-sync --limit 400` when the sync succeeded within 420 s of the unit's 600 (its failure is logged, not fatal) |
 | `sb-whatsapp-sync` | :55 at 01 and 07 to 22 | `whatsapp-sync`, after the Mac's :50 push (section 5) |
 | `sb-calendar-sync` | :48 at 07 to 22 | `calendar-sync` |
 | `sb-news-sync` | :50 at even hours | `news-sync` |
@@ -1556,3 +1556,8 @@ one pass, at the first job that writes. The versions that ask for a step:
   nothing needs stopping; the hourly embedding pass and `maint vectors-rebuild` fill it,
   the pass only once the index is in this code's space. A job still running the old code
   neither reads nor writes it.
+- **v40.** `directory_entries`, what the organisation's directory says of each colleague
+  (README, "Database schema", Directory). CREATE TABLE and one index on an empty table:
+  milliseconds, nothing needs stopping. `brain directory-sync` fills it and needs a
+  teams-cli with the `lookup-users` command; `sb-teams-sync.sh` runs it after `teams-sync`,
+  so install that wrapper into `~/.local/bin` after the pull.

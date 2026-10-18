@@ -46,6 +46,9 @@ def sender_brief(conn, name_or_email: str, days: int = 365) -> dict:
         "name": person.get("name", ""),
         "email": person.get("email", ""),
         "role": person.get("role", ""),
+        # From the organisation's directory, when it was asked (src/store/directory.py).
+        "department": person.get("department"),
+        "manager": ((person.get("directory") or {}).get("manager") or {}).get("name"),
         "email_count": ctx["email_count"],
         "top_topics": [t["topic"] for t in ctx["topics"][:5]],
         # The lists are capped now (see DEFAULT_CONTEXT_LIMIT), so len() would

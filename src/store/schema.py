@@ -512,6 +512,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_memory(conn)
     if current < 39:
         migrate_add_attachment_chunks(conn)
+    if current < 40:
+        migrate_add_directory(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -981,6 +983,39 @@ def migrate_add_item_state(conn: sqlite3.Connection) -> None:
         )"""
     )
     conn.commit()
+
+
+def migrate_add_directory(conn: sqlite3.Connection) -> None:
+    """v40: directory_entries, what the organisation's directory says of a colleague.
+
+    One row per address at the owner's own mail domains that `brain directory-sync` looked
+    up (src/store/directory.py): status 'ok' with the title, department, office, company,
+    whether the account is enabled and the manager, or 'not_found' for an address the
+    directory does not know (a group mailbox, a former colleague), remembered so it is not
+    asked again every night. checked_at says when; a lookup that failed writes nothing.
+    The manager index serves a person's direct reports. CREATE ... IF NOT EXISTS on an
+    empty table, so it takes milliseconds and running it again changes nothing.
+    """
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS directory_entries (
+            email TEXT PRIMARY KEY,
+            status TEXT NOT NULL CHECK (status IN ('ok', 'not_found')),
+            directory_id TEXT,
+            display_name TEXT,
+            job_title TEXT,
+            department TEXT,
+            office TEXT,
+            company TEXT,
+            account_enabled INTEGER,
+            manager_email TEXT,
+            manager_name TEXT,
+            manager_title TEXT,
+            checked_at TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_directory_manager ON directory_entries(manager_email)"
+    )
 
 
 def migrate_add_attachment_chunks(conn: sqlite3.Connection) -> None:

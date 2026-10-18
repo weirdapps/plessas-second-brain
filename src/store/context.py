@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 
 from src.store import envelope
 from src.store.consolidate import current_sql, history_left_out, open_status_sql
+from src.store.directory import directory_card
 from src.store.entities import entity_person_ids
 from src.store.greek import (
     PHRASE_MATCH,
@@ -143,6 +144,11 @@ def get_person_context(
 
     person = dict(person_row)
     person_id = person["id"]
+    # Title, unit, manager and direct reports, as the organisation's directory has them
+    # (src/store/directory.py); absent for an address it was never asked about.
+    card = directory_card(conn, person.get("email"))
+    if card is not None:
+        person["directory"] = card
     rows_of = json.dumps(entity_person_ids(conn, person_id))
     current_d = current_sql(conn, "d", "decisions", include_history)
     current_a = current_sql(conn, "a", "action_items", include_history)

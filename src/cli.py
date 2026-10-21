@@ -3032,6 +3032,10 @@ def main():
     consolidate.add_maint_parser(maint_subparsers)
     entities.add_maint_parser(maint_subparsers)
     topic_canon.add_maint_parser(maint_subparsers)
+    # teams-repair, teams-empty-summaries (src/extract/teams_repair.py): maint-only.
+    from src.extract import teams_repair
+
+    teams_repair.add_maint_parsers(maint_subparsers)
 
     # Parse and execute
     args = parser.parse_args()

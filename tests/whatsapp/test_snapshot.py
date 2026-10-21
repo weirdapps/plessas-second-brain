@@ -59,7 +59,7 @@ def test_the_snapshot_has_no_media_key_url_or_file_hash_column(tmp_path):
         "id", "chat_jid", "sender", "content", "timestamp", "is_from_me", "media_type", "filename",
     ]  # fmt: skip
     assert chat_cols == ["jid", "name"]
-    assert tables == {"chats", "messages", "contacts"}
+    assert tables == {"chats", "messages", "contacts", "lid_map"}
     raw = dest.read_bytes()
     assert b"mmg.example" not in raw
     assert bytes.fromhex("00112233") not in raw
@@ -216,10 +216,23 @@ def test_the_contact_store_keys_never_leave(tmp_path):
     conn = sqlite3.connect(dest)
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     columns = [r[1] for r in conn.execute("PRAGMA table_info(contacts)")]
+    pair_columns = [r[1] for r in conn.execute("PRAGMA table_info(lid_map)")]
     conn.close()
-    assert tables == {"chats", "messages", "contacts"}
+    assert tables == {"chats", "messages", "contacts", "lid_map"}
     assert columns == ["user", "name"]
+    assert pair_columns == ["lid", "pn"]
     assert IDENTITY_KEY not in dest.read_bytes()
+
+
+def test_the_id_pairs_of_the_people_in_the_snapshot_are_kept(tmp_path):
+    """The producer joins a contact's chat under their number to the one WhatsApp moved
+    to their anonymous id by these pairs; a pair of someone not in the snapshot stays."""
+    elsewhere = ("100000000000007", "30000000007")
+    dest, _ = _people_snapshot(tmp_path, lid_map=[(CAROL_LID, CAROL_PN), elsewhere])
+    conn = sqlite3.connect(dest)
+    pairs = conn.execute("SELECT lid, pn FROM lid_map").fetchall()
+    conn.close()
+    assert pairs == [(CAROL_LID, CAROL_PN)]
 
 
 def test_names_are_never_printed(tmp_path):

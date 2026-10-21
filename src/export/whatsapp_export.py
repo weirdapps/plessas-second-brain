@@ -105,12 +105,44 @@ def _read_contacts(src: sqlite3.Connection) -> dict[str, str]:
     }
 
 
+def _read_lid_map(src: sqlite3.Connection) -> dict[str, str]:
+    """number -> anonymous id (bare users), from the snapshot's lid_map; none in a
+    snapshot built before the table existed."""
+    has_table = src.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lid_map'"
+    ).fetchone()
+    if not has_table:
+        return {}
+    return {pn: lid for lid, pn in src.execute("SELECT lid, pn FROM lid_map") if lid and pn}
+
+
+def _moved_chats(conn: sqlite3.Connection, chats: list, lid_of: dict[str, str]) -> dict[str, str]:
+    """{chat JID under a number: the JID of the same person's chat under their anonymous id}.
+
+    WhatsApp moved contacts to anonymous ids (LIDs), and the bridge began a second
+    direct chat under the id, so one contact's conversation was split: on the
+    replica of 2026-10-20 one chat held three months under the number and another
+    everything since under the id. A chat under a number is the id's chat whenever
+    the person has one, in the snapshot or already stored.
+    """
+    direct = {jid for jid, _ in chats if chat_kind(jid) == "direct"}
+    direct |= {r[0] for r in conn.execute("SELECT chat_jid FROM whatsapp_chats")}
+    moved = {}
+    for jid in direct:
+        lid = lid_of.get(_user(jid)) if jid.endswith("@s.whatsapp.net") else None
+        if lid and f"{lid}@lid" in direct:
+            moved[jid] = f"{lid}@lid"
+    return moved
+
+
 def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SNAPSHOT) -> dict:
     """Upsert every chat and message in `snapshot`; return the counts.
 
-    Returns {"chats", "messages_inserted", "messages_updated", "skipped"}.
-    `skipped` counts rows whose timestamp is not a time, which cannot be placed
-    in a session or searched by date.
+    Returns {"chats", "messages_inserted", "messages_updated", "skipped",
+    "chats_merged"}. `skipped` counts rows whose timestamp is not a time, which
+    cannot be placed in a session or searched by date. `chats_merged` counts the
+    stored chats under a number joined to the same person's chat under an
+    anonymous id (_moved_chats).
     """
     src = _open_snapshot(Path(snapshot))
     try:
@@ -120,6 +152,7 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
             "filename FROM messages"
         ).fetchall()
         contacts = _read_contacts(src)
+        lid_of = _read_lid_map(src)
     finally:
         src.close()
 
@@ -140,7 +173,10 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
     touched_threads: set[int] = set()
     chat_ids: dict[str, int] = {}
 
+    moved = _moved_chats(conn, chats, lid_of)
+
     def chat_id(jid: str) -> int:
+        jid = moved.get(jid, jid)
         if jid not in chat_ids:
             name = names.get(jid)
             conn.execute(
@@ -157,6 +193,31 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
                 "SELECT id FROM whatsapp_chats WHERE chat_jid = ?", (jid,)
             ).fetchone()[0]
         return chat_ids[jid]
+
+    # A chat stored under a number before the snapshot carried the pairs joins the id's
+    # chat. Its sessions keep their ids, so their summaries, items and vectors go with
+    # them; each message keeps the JID the bridge files it under, which the upsert
+    # below matches on. The emptied chat is deleted.
+    merged = 0
+    for number_jid, lid_jid in sorted(moved.items()):
+        old = conn.execute(
+            "SELECT id FROM whatsapp_chats WHERE chat_jid = ?", (number_jid,)
+        ).fetchone()
+        if old is None:
+            continue
+        target = chat_id(lid_jid)
+        conn.execute("UPDATE whatsapp_messages SET chat_id = ? WHERE chat_id = ?", (target, old[0]))
+        conn.execute(
+            "UPDATE OR IGNORE whatsapp_threads SET chat_id = ? WHERE chat_id = ?", (target, old[0])
+        )
+        still_held = conn.execute(
+            "SELECT 1 FROM whatsapp_messages WHERE chat_id = ?1"
+            " UNION ALL SELECT 1 FROM whatsapp_threads WHERE chat_id = ?1 LIMIT 1",
+            (old[0],),
+        ).fetchone()
+        if still_held is None:
+            conn.execute("DELETE FROM whatsapp_chats WHERE id = ?", (old[0],))
+            merged += 1
 
     for mid, jid, sender, content, ts, from_me, media_type, filename in messages:
         if not mid or not jid or jid in _NOT_CONVERSATIONS:
@@ -190,7 +251,7 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
             filename or None,
         )
         existing = conn.execute(
-            "SELECT id, content, sender_name, media_type, thread_id FROM whatsapp_messages "
+            "SELECT id, content, sender_name, media_type, thread_id, sent_at FROM whatsapp_messages "
             "WHERE chat_jid = ? AND message_id = ?",
             (jid, mid),
         ).fetchone()
@@ -205,19 +266,27 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
             )
             inserted += 1
             continue
-        if (existing[1], existing[2], existing[3]) == (text, sender_name, media_type or None):
+        # The time too: a message the bridge re-dated kept its first time, and so did
+        # its session's bounds.
+        if (existing[1], existing[2], existing[3], existing[5]) == (
+            text,
+            sender_name,
+            media_type or None,
+            sent_at,
+        ):
             continue
         conn.execute(
             "UPDATE whatsapp_messages SET content = ?, sender_name = ?, media_type = ?, "
-            "filename = ? WHERE id = ?",
-            (text, sender_name, media_type or None, filename or None, existing[0]),
+            "filename = ?, sent_at = ? WHERE id = ?",
+            (text, sender_name, media_type or None, filename or None, sent_at, existing[0]),
         )
         updated += 1
         if existing[4] is not None:
             touched_threads.add(existing[4])
 
-    # A renamed sender is re-extracted, and the session's participant list is
-    # rebuilt the way bound_threads builds it, or the prompt keeps the old numbers.
+    # A renamed sender is re-extracted, and the session's participant list and bounds
+    # are rebuilt the way bound_threads builds them, or the prompt keeps the old
+    # numbers and a re-dated message its old place.
     for tid in touched_threads:
         participants = [
             r[0]
@@ -227,10 +296,13 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
                 (tid,),
             )
         ]
+        started, ended = conn.execute(
+            "SELECT MIN(sent_at), MAX(sent_at) FROM whatsapp_messages WHERE thread_id = ?", (tid,)
+        ).fetchone()
         conn.execute(
-            "UPDATE whatsapp_threads SET extraction_status = 'pending', participant_names = ? "
-            "WHERE id = ?",
-            (json.dumps(participants, ensure_ascii=False), tid),
+            "UPDATE whatsapp_threads SET extraction_status = 'pending', participant_names = ?, "
+            "started_at = ?, ended_at = ? WHERE id = ?",
+            (json.dumps(participants, ensure_ascii=False), started, ended, tid),
         )
     conn.execute(
         """
@@ -245,4 +317,5 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
         "messages_inserted": inserted,
         "messages_updated": updated,
         "skipped": skipped,
+        "chats_merged": merged,
     }

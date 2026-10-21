@@ -20,7 +20,10 @@ teams-repair, in one transaction (a dry run rolls it back, so its counts are exa
 Nothing is sent back to extraction. teams-empty-summaries is apart because it does:
 76 threads extracted on 2026-05-04 kept an empty summary, so they have no vector.
 Their decisions, actions and key facts (127 key facts) are deleted and the threads
-go back to 'pending', which the next teams-sync extracts: one model call each.
+go back to 'pending'. The next teams-sync reads each again: one with a substantive
+message is extracted, one model call; one without is marked 'skipped', like every
+thread with nothing to extract. All 76 held only call records (their participants and
+durations stay in teams_messages), so on 2026-10-21 all 76 were skipped.
 """
 
 import argparse
@@ -223,7 +226,10 @@ def cmd_teams_empty_summaries(args) -> int:
         f" {c['action_items']:,} actions {'to delete' if args.dry_run else 'deleted'}"
     )
     if c["threads"] and not args.dry_run:
-        print("  The next teams-sync extracts them, one model call each.")
+        print(
+            "  The next teams-sync reads them again: a thread with a substantive message"
+            " is extracted, one model call; one without is marked skipped."
+        )
     return 0
 
 

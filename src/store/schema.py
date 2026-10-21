@@ -577,7 +577,7 @@ def migrate_received_times_utc(conn: sqlite3.Connection) -> None:
     next run converts the rest. Then each email thread's newest time, which consolidation
     keeps, is recomputed from the converted times (recompute_thread_last_at).
     """
-    if not _table_exists(conn, "emails"):
+    if "source_class" not in {r[1] for r in conn.execute("PRAGMA table_info(emails)")}:
         return
     classes = ", ".join(f"'{c}'" for c in _NAIVE_RECEIVED_CLASSES)
     rows = conn.execute(
@@ -603,17 +603,30 @@ def recompute_thread_last_at(conn: sqlite3.Connection) -> None:
     Thread.last_at (src/store/consolidate.py) is the greatest date of the thread's messages,
     compared as text, so with both forms stored it could be the wrong message's, and the time
     of one converted since is the old one. A thread whose items did not change is not loaded
-    again, so it would keep it. The same messages: the thread key and the item-less test are
-    consolidate's own. Only the rows whose value changes are written.
+    again, so it would keep it. The same messages: the thread key and the item-less classes
+    are consolidate's (_email_key_sql, source_class.ITEMLESS_CLASSES), spelt out here, as a
+    migration keeps what it reads, and as importing consolidate would make the MCP server load
+    the model client at start (tests/mcp/test_eager_imports.py). Only changed rows are written.
     """
-    if not _table_exists(conn, "consolidation_threads"):
+    if (
+        not _table_exists(conn, "consolidation_threads")
+        or not conn.execute(
+            "SELECT 1 FROM consolidation_threads WHERE thread_key GLOB 'email*:*' LIMIT 1"
+        ).fetchone()
+    ):
         return
-    from src.store.consolidate import _email_key_sql, _itemless_sql
-
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(emails)")}
+    if not {"mailbox_name", "conversation_id", "source_class"} <= columns:
+        return
     newest = dict(
         conn.execute(
-            f"SELECT {_email_key_sql('e')} AS thread_key, MAX(NULLIF(e.date_received, ''))"
-            f" FROM emails e WHERE NOT {_itemless_sql(conn)} GROUP BY thread_key"
+            "SELECT CASE WHEN e.mailbox_name = 'News'"
+            " OR TRIM(COALESCE(e.conversation_id, '')) = '' OR e.conversation_id = ?"
+            " THEN 'email1:' || e.id ELSE 'email:' || e.conversation_id END AS thread_key,"
+            " MAX(NULLIF(e.date_received, '')) FROM emails e"
+            " WHERE COALESCE(e.source_class, 'mail') NOT IN ('news', 'automation')"
+            " GROUP BY thread_key",
+            (subject_to_conversation_id(""),),
         ).fetchall()
     )
     changes = [
@@ -650,10 +663,12 @@ def migrate_mail_hygiene(conn: sqlite3.Connection) -> None:
     shares, and 'failed' is never retried until the event is edited. 'pending' is the debt the
     next calendar-sync that lists it pays (a past event needs a --backfill of its month).
     """
-    if _table_exists(conn, "emails"):
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(emails)")}
+    if "mailbox_name" in columns:
         conn.execute(
             "UPDATE emails SET mailbox_name = 'Sent Items' WHERE mailbox_name = 'SentItems'"
         )
+    if {"sender_name", "sender_address", "source_class"} <= columns:
         _link_senders(conn)
     if _table_exists(conn, "calendar_events"):
         conn.execute(

@@ -124,6 +124,22 @@ def test_a_recipient_whose_name_is_null_loads():
     assert _name(conn, "jane.roe@example.com") == "Jane Roe"
 
 
+def test_a_sender_with_no_display_name_is_linked_by_address():
+    """Only a sender with both a name and an address got a 'sender' row; a system address
+    with no display name left its mail with none, as recipients never were (schema v41
+    repairs the stored rows)."""
+    conn = create_database(":memory:")
+    meta = _meta(1, {"name": "", "address": "notices@example.com"}, [])
+
+    assert load_single_email(conn, meta, _extraction())
+
+    row = conn.execute(
+        "SELECT p.name, p.email FROM email_people ep JOIN people p ON p.id = ep.person_id"
+        " WHERE ep.role_in_email = 'sender'"
+    ).fetchone()
+    assert tuple(row) == ("notices@example.com", "notices@example.com")
+
+
 def test_an_old_file_with_null_topics_decisions_and_actions_still_loads(tmp_path):
     facts = _conversation(tmp_path, {"topics": None, "decisions": None, "action_items": None})
 

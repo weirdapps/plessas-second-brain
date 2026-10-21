@@ -149,9 +149,18 @@ note_rc "$rc3"
 #   - pgrep: at 07:00/12:00 a daily/noon load is already running (and a long prior
 #     hourly load could still be going) — defer rather than double-extract or
 #     fight for the DB lock.
+#   - A load skipped on the sentinel makes the unit red (69) once the exports were
+#     fine. It used to leave it green, which was true while the daily and noon runs
+#     were the loaders; the hourly load is the main loader now, and on 2026-10-20,
+#     with the credential dead for 9.6 hours, the runs that staged mail and loaded
+#     none of it read green. A load skipped
+#     for another sync stays green: that sync drains the same staging. An export
+#     failure keeps its own code, which says more than this.
 rc4=0
+load_owed=0
 if [ -f "$HOME/.second-brain/needs_gcloud_reauth" ]; then
   echo "$(ts) — load skipped (needs_gcloud_reauth sentinel)" >> "$LOG"
+  load_owed=1
 elif pgrep -f "src\.cli sync" >/dev/null 2>&1; then
   echo "$(ts) — load skipped (another sync already running)" >> "$LOG"
 else
@@ -179,6 +188,9 @@ rc_sweep=$?
 echo "$(ts) - file sweep done (rc=$rc_sweep)" >> "$LOG"
 
 rc=$overall_rc
+if [ "$rc" -eq 0 ] && [ "$load_owed" -eq 1 ]; then
+  rc=69
+fi
 
 failures=$(read_failures)
 if [ "$rc" -eq 0 ]; then

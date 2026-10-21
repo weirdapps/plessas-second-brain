@@ -198,9 +198,11 @@ run_restore() {   # run_restore <restored-at> <gcloud-set-at|-> <unit>...
         log "auth-restore: $unit already ran since the restore; not running it again"
         continue
       fi
-      # Once a day is enough: a second daily sync costs twenty minutes and redoes the
-      # backup. But it exits 0 when it SKIPS on needs_gcloud_reauth, so only a success
-      # from before that sentinel went up proves it ran.
+      # Once a day is enough: a second daily sync costs twenty minutes. It exited 0
+      # when it SKIPPED on needs_gcloud_reauth until 2026-10-21 (69 since, which is
+      # not a success here), so only a success from before that sentinel went up
+      # proves it ran. A second run no longer redoes the backup: the wrapper keeps
+      # the day's snapshot.
       if [ "$unit" = sb-daily-sync.service ] && [ "$gcloud_set_at" != - ] \
          && [ "$ended" -lt "$gcloud_set_at" ] && _on_today "$ended"; then
         log "auth-restore: sb-daily-sync already succeeded today, before the outage; not running it again"

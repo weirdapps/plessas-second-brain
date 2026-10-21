@@ -44,7 +44,7 @@ section 6 shows the same schedule from the pipeline's side):
 | `systemd/sb-teams-sync.sh` | `sb-teams-sync` | :30 at 01 and 07 to 22 | `teams-sync` |
 | `systemd/sb-whatsapp-sync.sh` | `sb-whatsapp-sync` | :55 at 01 and 07 to 22 | `whatsapp-sync`, after the Mac's :50 push |
 | `systemd/sb-calendar-sync.sh` | `sb-calendar-sync` | :48 at 07 to 22 | `calendar-sync` |
-| `systemd/sb-news-sync.sh` | `sb-news-sync` | :50 at even hours | `news-sync` |
+| `systemd/sb-news-sync.sh` | `sb-news-sync` | :50 at even hours | `news-sync`, then `sync --lock-wait 600` to load what it staged |
 | `systemd/sb-conversation-sync.sh` | `sb-conversation-sync` | 08:45, 14:45, 20:45 | `export-conversations --days 7`, `extract-conversations`, `ingest-session-notes` |
 | `systemd/sb-daily-sync.sh` | `sb-daily-sync` | 07:05 | `scripts/backup_db.py`, `sync`, `src.store.action_lifecycle`, and the mail plugin's style-sync when installed |
 | `systemd/sb-noon-catchup.sh` | `sb-noon-catchup` | 13:17 | `sync --lock-wait 600` |
@@ -107,6 +107,17 @@ Some of the differences are legitimate (macOS and Linux differ on
 `launchctl`/`systemctl`, `stat`, `date`), some are probably rot. They are archived
 as-is rather than reconciled; unifying them is a separate exercise with live
 ingestion at stake.
+
+## A skip on a re-auth sentinel is red
+
+A systemd wrapper that leaves work undone because a session is dead
+(`~/.second-brain/needs_reauth`, `needs_gcloud_reauth`, `needs_teams_reauth`) exits
+69 (EX_UNAVAILABLE), never 0, and still runs whatever does not need that session:
+the morning backup, the calendar's facts, the Teams pull, the attachment stages that
+read files on disk. Each unit with `Restart=on-failure` lists 69 in
+`RestartPreventExitStatus=`, because sb-auth-watch, not a restart, clears the
+sentinel. A skip that is not missing work stays 0: another run holding the lock, an
+opt-out, a pilot that is off. `docs/DEPLOY.md` section 6 has the drop-ins.
 
 ## Verifying a change
 

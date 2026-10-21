@@ -16,10 +16,11 @@ ts() { date '+%Y-%m-%d %H:%M:%S'; }
 echo "=== Topic pages started: $(ts) ===" >> "$LOG_FILE"
 
 # Every page is a model call. Logged, because a skip that leaves no line cannot be
-# told from a run that never started.
+# told from a run that never started, and 69, not 0, because a night with no pages is
+# missing work, not a quiet night: the 0 here pinged hc-success@ green.
 if [ -f "$HOME/.second-brain/needs_gcloud_reauth" ]; then
   echo "$(ts) SKIP: needs_gcloud_reauth sentinel present" >> "$LOG_FILE"
-  exit 0
+  exit 69
 fi
 
 cd "$REPO_DIR" || exit 1

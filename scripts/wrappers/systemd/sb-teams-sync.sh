@@ -82,12 +82,29 @@ if [ -f "$SENTINEL" ]; then
   exit 69
 fi
 
-# Pre-flight: skip if gcloud ADC expired (Vertex AI extraction would fail).
-# auth-watch clears the sentinel on the next successful probe.
+# Pre-flight: gcloud ADC expired, so Vertex AI extraction would fail; auth-watch
+# clears the sentinel on the next successful probe. The pull does not need it, and
+# it is the step that cannot wait: each read takes a chat's newest page only, so an
+# outage long enough loses messages. This used to skip the whole run and exit 0. Now
+# the run pulls, bounds, resolves and embeds as usual and tries one thread
+# (--limit 1), which defers to 'pending' on the dead credential instead of every
+# pending thread failing in turn, and the unit ends 69 for the extraction it owes.
+limit_args=""
 if [ -f "$HOME/.second-brain/needs_gcloud_reauth" ]; then
-  echo "$(ts) — skip (gcloud reauth sentinel present)" >> "$LOG"
-  exit 0
+  echo "$(ts) gcloud reauth sentinel present: pulling, extraction owed" >> "$LOG"
+  limit_args="--limit 1"
 fi
+
+# Each teams-cli call below is bounded. A renew drives a headless Chrome: its launch
+# can wait three minutes before giving up, then 90 s of login and 40 s more, and all
+# of it came out of this unit's 600 s before the sync had started. In 139 renews on
+# the VPS to 2026-10-20 none took over 92 s (and one succeeded), so the bound only
+# caps the case not seen yet. -k because a wedged Chrome may ignore SIGTERM. A call
+# cut off reads as a failed call, so the exit codes below keep their meaning.
+# (The audit's "6m38s per attempt" was wall clock including RestartSec=300; each
+# attempt itself took 99 s.)
+PROBE_TIMEOUT_S="${SB_TEAMS_PROBE_TIMEOUT_S:-60}"
+RENEW_TIMEOUT_S="${SB_TEAMS_RENEW_TIMEOUT_S:-120}"
 
 # Pre-flight: confirm the Teams bearer is actually alive, and renew it if not.
 #
@@ -120,9 +137,10 @@ fi
 # clear it. This repo already has a history of sticky-latch reauth bugs. We
 # just skip this run and let the owner of the state machine decide.
 if command -v teams-cli >/dev/null 2>&1; then
-  if ! teams-cli health-check >/dev/null 2>&1; then
+  if ! timeout -k 10 "$PROBE_TIMEOUT_S" teams-cli health-check >/dev/null 2>&1; then
     echo "$(ts) — teams auth looks dead, attempting silent renew" >> "$LOG"
-    if teams-cli auth-renew >/dev/null 2>&1 && teams-cli health-check >/dev/null 2>&1; then
+    if timeout -k 10 "$RENEW_TIMEOUT_S" teams-cli auth-renew >/dev/null 2>&1 \
+       && timeout -k 10 "$PROBE_TIMEOUT_S" teams-cli health-check >/dev/null 2>&1; then
       echo "$(ts) — silent renew OK, continuing" >> "$LOG"
     else
       echo "$(ts) — fail (auth down and silent renew did not take; systemd will retry, or run: teams-cli login)" >> "$LOG"
@@ -133,7 +151,8 @@ fi
 
 cd "$PROJECT" || { echo "$(ts) — abort (cannot cd to $PROJECT)" >> "$LOG"; exit 1; }
 echo "$(ts) — start" >> "$LOG"
-"$PYTHON" -m src.cli teams-sync --concurrency 2 --workers 4 >> "$LOG" 2>&1
+# shellcheck disable=SC2086  # empty, or the one option and its value
+"$PYTHON" -m src.cli teams-sync --concurrency 2 --workers 4 $limit_args >> "$LOG" 2>&1
 rc=$?
 
 # The organisation's directory (title, department, manager) through the same Teams
@@ -147,6 +166,11 @@ if [ "$rc" -eq 0 ] && [ "$SECONDS" -lt 420 ]; then
   if [ "$directory_rc" -ne 0 ]; then
     echo "$(ts): directory-sync failed rc=$directory_rc (not fatal)" >> "$LOG"
   fi
+fi
+
+# Pulled under a dead gcloud credential: the extraction is owed (see above).
+if [ "$rc" -eq 0 ] && [ -n "$limit_args" ]; then
+  rc=69
 fi
 
 failures=$(read_failures)

@@ -13,8 +13,9 @@ behind needs_reauth for the calendar), but a skip that leaves no trace is
 indistinguishable from a job that never started. The attachment pass exited
 before its log file was even named, and the conversation sync skipped silently.
 
-The exit code of these skips stays 0 for now: 69, as the mail and Teams
-wrappers use, needs RestartPreventExitStatus=69 in each unit's drop-in first.
+Since 2026-10-21 these skips exit 69, as the mail and Teams wrappers' do, and a
+wrapper whose other stages do not need the dead session runs them and skips only
+the stage that does: tests/test_wrapper_sentinel_skips_are_red.py has the rest.
 """
 
 import subprocess
@@ -70,20 +71,21 @@ def test_the_attachment_pass_runs_while_the_outlook_session_is_dead(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("wrapper", "sentinel"),
+    ("wrapper", "sentinel", "runs_the_rest"),
     [
-        ("sb-attachment-pass.sh", "needs_gcloud_reauth"),
-        ("sb-calendar-sync.sh", "needs_gcloud_reauth"),
-        ("sb-calendar-sync.sh", "needs_reauth"),
-        ("sb-conversation-sync.sh", "needs_gcloud_reauth"),
+        ("sb-attachment-pass.sh", "needs_gcloud_reauth", True),
+        ("sb-calendar-sync.sh", "needs_gcloud_reauth", True),
+        ("sb-calendar-sync.sh", "needs_reauth", False),
+        ("sb-conversation-sync.sh", "needs_gcloud_reauth", True),
     ],
 )
-def test_every_sentinel_skip_is_logged(tmp_path, wrapper, sentinel):
+def test_every_sentinel_skip_is_logged(tmp_path, wrapper, sentinel, runs_the_rest):
     home = _home(tmp_path, sentinel)
 
     _run(wrapper, home)
 
-    assert not (home / "python-ran").exists(), f"{wrapper} ran past its {sentinel} gate"
+    if not runs_the_rest:
+        assert not (home / "python-ran").exists(), f"{wrapper} ran past its {sentinel} gate"
     logs = _logs(home)
     assert sentinel in logs and "skip" in logs.lower(), (
         f"{wrapper} skipped on {sentinel} without saying so in its log:\n{logs}"

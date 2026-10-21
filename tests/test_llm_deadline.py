@@ -47,6 +47,7 @@ UNIT_TIMEOUT_AND_BUDGET = {
     "sb-noon-catchup": (1800, 1590),
     "sb-outlook-sync": (1200, 990),
     "sb-teams-sync": (600, 390),
+    "sb-whatsapp-sync": (600, 390),
 }
 
 # PUSH_WAIT_SECONDS (900 + 120) plus one worst-case call (120). decide() grants a

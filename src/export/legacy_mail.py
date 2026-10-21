@@ -652,6 +652,8 @@ _COLUMNS = (
     ("no files", "no_files"),
     ("elsewhere", "held_elsewhere"),
     ("ambiguous", "ambiguous"),
+    ("duplicate", "duplicate"),
+    ("no key", "no_key"),
     ("not found", "not_found"),
     ("gone", "gone"),
     ("failed", "failed"),

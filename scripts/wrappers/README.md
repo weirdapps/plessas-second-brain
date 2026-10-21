@@ -31,7 +31,7 @@ upgrade.
 
 | Directory | Host | Scheduler | Count |
 | --- | --- | --- | --- |
-| `systemd/` | the producer (a Linux VPS) | `systemctl --user` timers, plus one long-running service | 15 |
+| `systemd/` | the producer (a Linux VPS) | `systemctl --user` timers, plus one long-running service | 14 |
 | `launchd/` | a Mac that holds a replica | LaunchAgents, and one Claude Code hook | 4, plus one plist template |
 
 What each one runs, and when on the reference deployment (Europe/Athens; the unit
@@ -54,7 +54,6 @@ section 6 shows the same schedule from the pipeline's side):
 | `systemd/sb-topic-pages.sh` | `sb-topic-pages` | 03:30 | `topic-pages`: the pages of the live topics with new evidence (`docs/DEPLOY.md`, section 6) |
 | `systemd/sb-briefs.sh` | `sb-briefs` | every 15 minutes, 07:00 to 21:45, until the pilot's date | `briefs`, the pre-meeting brief pilot; disables its own timer once the pilot has ended (`docs/DEPLOY.md`, section 6) |
 | `systemd/sb-mcp.sh` | `sb-mcp` | always on | `python -m src.mcp_server --http` with `BRAIN_ROLE=replica` (`docs/DEPLOY.md`, section 9) |
-| `systemd/sb-db-pull.sh` | nothing | | an old copy of the pull, kept as history: the producer runs no pull |
 | `launchd/sb-db-pull.sh` | a LaunchAgent | :45 every hour | the replica pull, and the copy of the encrypted backup archives (`docs/DEPLOY.md`, section 5) |
 | `launchd/wait-for-vps.sh` | `sb-db-pull.sh` | before each pull | waits up to 180 s for the producer to answer ssh |
 | `launchd/sync-whatsapp-to-vps.sh` | the LaunchAgent template beside it, `com.plessas.whatsapp-sync-vps.plist` | :50 every hour | the WhatsApp snapshot push (`docs/DEPLOY.md`, section 5) |
@@ -99,14 +98,12 @@ takes once a day) are for a hand run: no wrapper passes either.
 
 ## Two families, not one
 
-`systemd/` and `launchd/` are independent lineages. Exactly one name appears in
-both, `sb-db-pull.sh`, and the two copies differ: the launchd one is the live
-replica pull, the systemd one an old copy that no unit runs. Nothing is shared
-between the families, so do not read a matching filename as a matching script.
-Some of the differences are legitimate (macOS and Linux differ on
-`launchctl`/`systemctl`, `stat`, `date`), some are probably rot. They are archived
-as-is rather than reconciled; unifying them is a separate exercise with live
-ingestion at stake.
+`systemd/` and `launchd/` are independent lineages, and no name appears in both.
+Until 2026-10-21 `systemd/` also held an old copy of `sb-db-pull.sh` that no unit
+ran (the producer runs no pull); it was removed, and with it the one filename the
+two families shared. Some differences between the families are legitimate (macOS
+and Linux differ on `launchctl`/`systemctl`, `stat`, `date`), so do not expect a
+script of one to run on the other's host.
 
 ## A skip on a re-auth sentinel is red
 

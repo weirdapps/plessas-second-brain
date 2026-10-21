@@ -132,10 +132,11 @@ SYNC_FIXED_WORK_S = 80.0
 
 # Step 4b: entities for the people rows added since the last seed (src/store/entities.py).
 # They were seeded once by hand on 2026-10-16 and never again, so the 69 people added
-# after had none. The seed reads every person, about 10 s over 34K people on the replica,
-# so only the nightly unit runs it, and only there is its time held back from Step 2.
+# after had none. The seed reads every person: about 10 s over 34K people on the replica,
+# 11 s warm and 37 s cold on the producer (2026-10-21). So only the nightly unit runs it,
+# and only there is its time held back from Step 2.
 ENTITY_SEED_UNITS = frozenset({"sb-daily-sync"})
-ENTITY_SEED_OBSERVED_S = 30.0
+ENTITY_SEED_OBSERVED_S = 60.0
 
 # What the stages after Step 2 need, held back from the unit's remaining time.
 SYNC_AFTER_EXTRACTION_S = (
@@ -190,15 +191,31 @@ def _seed_entities_nightly(db_path: str) -> dict | None:
     from src.store import entities
     from src.store.schema import get_connection
 
+    # Planned outside the write lock, which seed_entities takes before it plans: the plan
+    # took 37 s cold on the producer on 2026-10-21, all of it holding the hourly writers
+    # beside this unit against their 60 s busy timeout. Only the write takes the lock. A
+    # person added between the two waits for the next night, and nothing else writes
+    # entities while this runs.
     conn = get_connection(db_path)
     try:
-        plan = entities.seed_entities(conn)
+        plan = entities.plan_seed(conn)
+        if conn.in_transaction:
+            conn.commit()
+        written = 0
+        if plan.new or plan.joins:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                written = entities.apply_plan(conn, plan)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.rollback()
+                raise
     except Exception as e:
         print(f"  Entity seed skipped: {e}", file=sys.stderr)
         return None
     finally:
         conn.close()
-    return {"entities": len(plan.new), "aliases": plan.counts["written"]}
+    return {"entities": len(plan.new), "aliases": written}
 
 
 def _holding_the_sync_lock(sync):

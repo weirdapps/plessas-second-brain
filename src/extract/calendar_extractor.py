@@ -32,6 +32,11 @@ MIN_TEXT = 50
 # How much of the text the prompt shows.
 MAX_TEXT = 4000
 
+# The reply's room, thinking included, as every other extraction route has
+# (src/extract/call_shape.py). At 1024 a long invitation's reply was cut inside its
+# JSON, failed as "not JSON" and was recorded 'failed', never offered again.
+MAX_TOKENS = 8192
+
 # The joining details an online meeting adds to an invitation. Teams sets them
 # between two rules of underscores, of one width, opened by a line naming the
 # service (an inner rule, narrower, splits off the dial-in part); Zoom and Webex
@@ -332,7 +337,7 @@ def extract_event(event: dict, body: str | None = None) -> dict:
     # Whoever sent the invite wrote all of it, the subject included.
     prompt = template.format(invite=fence(invite))
 
-    response = complete(max_tokens=1024, messages=[{"role": "user", "content": prompt}])
+    response = complete(max_tokens=MAX_TOKENS, messages=[{"role": "user", "content": prompt}])
 
     # First text block, never content[0]: extended thinking puts a ThinkingBlock there.
     # 86 events failed this way between 2026-08-12 and 2026-08-24 (calendar-sync.log),
@@ -340,6 +345,8 @@ def extract_event(event: dict, body: str | None = None) -> dict:
     # than constant. Unlike attachments there is no llm_error column here, so the
     # failure was visible only in the log.
     raw_text = _response_text(response)
+    if getattr(response, "stop_reason", None) == "max_tokens":
+        raise ValueError(f"calendar extraction reply cut short at max_tokens={MAX_TOKENS}")
 
     if invitation:
         return {

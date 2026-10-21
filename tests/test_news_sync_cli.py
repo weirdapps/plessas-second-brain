@@ -25,6 +25,7 @@ def news_export_stub(monkeypatch):
     module = types.ModuleType("src.export.news_export")
     module.PIPELINES = STUB_PIPELINES
     module.DEFAULT_RELEVANCE_THRESHOLD = real_news_export.DEFAULT_RELEVANCE_THRESHOLD
+    module.held_articles = real_news_export.held_articles
     module.export_news = create_autospec(
         real_news_export.export_news,
         return_value={"syntheses": 2, "articles": 7, "skipped": 3, "batch_files": ["batch-70000"]},

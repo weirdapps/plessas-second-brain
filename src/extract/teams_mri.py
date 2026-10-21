@@ -20,12 +20,17 @@ def resolve_mris(conn: sqlite3.Connection, max_per_run: int = 50) -> dict:
     Returns:
         {"resolved": <int>, "permanent_fail": <int>, "retryable_fail": <int>}
     """
+    # Only a person's MRI, 8:orgid:<aad-oid>, maps to anyone through Graph /users/{oid}.
+    # A thread (19:..., the sender of system messages), an app (28:...) or a meeting
+    # visitor (8:teamsvisitor:...) is nobody to look up. They used to be selected and
+    # written back as 'permanent_fail' rows, one per chat that ever logged a member
+    # change: 2,311 of the 2,709 such rows on the replica of 2026-10-20 were chat IDs.
     distinct = conn.execute(
         """
         SELECT DISTINCT m.sender_mri, m.sender_display_name, r.last_attempt_at AS prev_attempt
         FROM teams_messages m
         LEFT JOIN teams_mri_resolution r ON r.mri = m.sender_mri
-        WHERE m.sender_mri IS NOT NULL
+        WHERE m.sender_mri LIKE '8:orgid:%'
           AND (r.mri IS NULL OR r.status IN ('pending','failed'))
         -- Never-attempted MRIs first; among already-attempted, oldest-attempted first.
         ORDER BY (r.last_attempt_at IS NOT NULL), r.last_attempt_at
@@ -41,27 +46,6 @@ def resolve_mris(conn: sqlite3.Connection, max_per_run: int = 50) -> dict:
     for row in distinct:
         mri = row["sender_mri"]
         display = row["sender_display_name"]
-
-        # Only 8:orgid:<aad-oid> MRIs map to a person via Graph /users/{oid}.
-        # Channel/thread IDs (19:...@thread.v2) and bot/app MRIs (28:, 48:) are
-        # not users — resolve-mri rejects them ("Invalid MRI"), so without this
-        # guard they'd be re-attempted as retryable 'failed' on every sync
-        # forever (observed: ~1,050 such rows). Mark them permanent_fail once and
-        # skip the Graph call.
-        if not mri.startswith("8:orgid:"):
-            now = datetime.now(UTC).isoformat()
-            conn.execute(
-                """
-                INSERT INTO teams_mri_resolution(mri, status, last_attempt_at)
-                VALUES (?, 'permanent_fail', ?)
-                ON CONFLICT(mri) DO UPDATE SET
-                    status = 'permanent_fail',
-                    last_attempt_at = excluded.last_attempt_at
-                """,
-                (mri, now),
-            )
-            perm_fail += 1
-            continue
 
         try:
             payload = run_teams_cli(["resolve-mri", mri])
@@ -122,14 +106,38 @@ def resolve_mris(conn: sqlite3.Connection, max_per_run: int = 50) -> dict:
             else:
                 retry_fail += 1
 
+    link_senders(conn)
+
+    conn.commit()
+    return {
+        "resolved": resolved,
+        "permanent_fail": perm_fail,
+        "retryable_fail": retry_fail,
+    }
+
+
+def _is_404(stderr: str) -> bool:
+    """teams-cli serialises {status: 404} into stderr JSON on Graph 404."""
+    try:
+        return json.loads(stderr).get("status") == 404
+    except (json.JSONDecodeError, ValueError):
+        return "404" in stderr
+
+
+def link_senders(conn: sqlite3.Connection) -> dict:
+    """Link every message whose sender the cache has resolved: its person, and its
+    name when it was stored without one. Set-based and idempotent; the caller commits.
+
+    Returns {"persons_linked", "names_filled"}: messages given each.
+    """
     # Back-link every message whose sender is already in the cache, not just the
-    # ones the loop above happened to resolve this run. The per-MRI UPDATE inside
-    # the loop only saw the messages that existed at resolution time, and the
+    # ones resolve_mris happened to resolve this run. The per-MRI UPDATE inside
+    # its loop only saw the messages that existed at resolution time, and the
     # candidate query deliberately skips MRIs already at status='resolved', so
     # that MRI is never revisited; teams_export doesn't set the column at INSERT
     # time either. Every message arriving after its sender was resolved therefore
     # stayed NULL forever (measured: 10,210 rows, 42% of attributable traffic).
-    # Set-based and idempotent, and OUTSIDE the loop on purpose: the common case
+    # Set-based and idempotent, and outside resolve_mris' loop on purpose: the common case
     # is a warm cache with nothing new to resolve, which is exactly when the
     # arrears pile up.
     #
@@ -158,7 +166,7 @@ def resolve_mris(conn: sqlite3.Connection, max_per_run: int = 50) -> dict:
                )
         """
     )
-    conn.execute(
+    linked = conn.execute(
         """
         UPDATE teams_messages
            SET sender_person_id = (
@@ -179,18 +187,21 @@ def resolve_mris(conn: sqlite3.Connection, max_per_run: int = 50) -> dict:
                )
         """
     )
-
-    conn.commit()
-    return {
-        "resolved": resolved,
-        "permanent_fail": perm_fail,
-        "retryable_fail": retry_fail,
-    }
-
-
-def _is_404(stderr: str) -> bool:
-    """teams-cli serialises {status: 404} into stderr JSON on Graph 404."""
-    try:
-        return json.loads(stderr).get("status") == 404
-    except (json.JSONDecodeError, ValueError):
-        return "404" in stderr
+    # A message stored with no name takes the one its sender resolved to: 18 channel
+    # posts carried none in their payload.
+    named = conn.execute(
+        """
+        UPDATE teams_messages
+           SET sender_display_name = (
+                 SELECT r.display_name FROM teams_mri_resolution r
+                  WHERE r.mri = teams_messages.sender_mri AND r.status = 'resolved'
+               )
+         WHERE COALESCE(sender_display_name, '') = ''
+           AND is_system = 0
+           AND sender_mri IN (
+                 SELECT r.mri FROM teams_mri_resolution r
+                  WHERE r.status = 'resolved' AND COALESCE(r.display_name, '') <> ''
+               )
+        """
+    )
+    return {"persons_linked": linked.rowcount, "names_filled": named.rowcount}

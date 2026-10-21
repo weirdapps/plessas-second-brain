@@ -4,7 +4,7 @@
     whatsapp_snapshot.py SOURCE DEST
 
 SOURCE is the WhatsApp bridge's messages.db, opened read-only. DEST is written
-from scratch with three tables and exactly the columns listed below, and nothing
+from scratch with four tables and exactly the columns listed below, and nothing
 else: the bridge also keeps, for every media message, the CDN URL, the media key
 and the file hashes, which together download and decrypt that photo or voice
 note. The producer needs none of it, so none of it leaves this machine.
@@ -14,7 +14,9 @@ so the chat names the bridge keeps are numbers; the bridge's own store,
 whatsapp.db beside messages.db, knows their names. It is opened read-only too,
 and only a user id and a display name per person who appears in the snapshot
 leave this machine: the store also holds the account's encryption keys. When it
-is missing or unreadable the snapshot is built without names.
+is missing or unreadable the snapshot is built without names. The fourth table
+pairs the anonymous id and the number of each of those people, the two ids and
+nothing else, from the same store.
 
 Prints one JSON line of counts ({"chats", "messages", "contacts", "bytes"}) and
 never a message, a name or a number, because its output lands in a launchd log.
@@ -76,6 +78,7 @@ CREATE TABLE messages (
     PRIMARY KEY (id, chat_jid)
 );
 CREATE TABLE contacts (user TEXT PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE lid_map (lid TEXT PRIMARY KEY, pn TEXT NOT NULL);
 """
 
 
@@ -141,6 +144,11 @@ def _copy_contacts(conn, source):
     person set in WhatsApp, then a business name. An anonymous id and the phone
     number it maps to are one person, so each is tried with the other's entry
     too. Returns 0, and names nobody, when the store is missing or unreadable.
+
+    The pairs of anonymous id and number go into lid_map too, for the people in
+    the snapshot only: when WhatsApp moved a contact to an anonymous id, the bridge
+    began a second direct chat under it, and the producer joins the two by these
+    pairs (src/export/whatsapp_export.py).
     """
     store = os.path.join(os.path.dirname(source), CONTACT_STORE_NAME)
     if not os.path.isfile(store):
@@ -192,6 +200,14 @@ def _copy_contacts(conn, source):
                 named.append((user, candidate.strip()))
                 break
     conn.executemany("INSERT INTO contacts (user, name) VALUES (?, ?)", named)
+    conn.executemany(
+        "INSERT OR IGNORE INTO lid_map (lid, pn) VALUES (?, ?)",
+        [
+            (_user(lid), _user(pn))
+            for lid, pn in pairs
+            if _user(lid) and _user(pn) and (_user(lid) in wanted or _user(pn) in wanted)
+        ],
+    )
     return len(named)
 
 

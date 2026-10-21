@@ -64,6 +64,12 @@ def run(args):
             f"  {i['messages_inserted']} new, {i['messages_updated']} updated across "
             f"{i['chats']} chats"
             + (f"; {i['skipped']} with no usable time" if i["skipped"] else "")
+            + (
+                f"; {i['chats_merged']} chats under a number joined to the same"
+                " person's chat under an anonymous id"
+                if i.get("chats_merged")
+                else ""
+            )
         )
 
         print("Step 2/4: bounding sessions...")

@@ -271,17 +271,24 @@ def test_resolve_mris_propagates_auth_required(db):
             resolve_mris(db)
 
 
-def test_resolve_mris_skips_non_user_mri_without_graph_call(db):
-    # Channel/thread IDs (19:...@thread.v2) and bot MRIs (28:) are not people —
-    # resolve-mri rejects them. They must be marked permanent_fail WITHOUT a
-    # Graph call so they aren't retried as 'failed' on every sync forever.
-    _seed_chat_with_message(db, mri="19:eb01bc38049947f1@thread.v2", display="Some Channel")
+@pytest.mark.parametrize(
+    "mri",
+    [
+        "19:eb01bc38049947f1@thread.v2",
+        "28:00000000-0000-0000-0000-00000000b0b0",
+        "8:teamsvisitor:00000000000000000000000000000000",
+    ],
+)
+def test_resolve_mris_never_selects_a_sender_that_is_not_a_person(db, mri):
+    # A thread (19:, the sender of system messages), an app (28:) or a visitor is
+    # nobody Graph /users can name. They used to be written back as permanent_fail
+    # rows, one per chat: 2,311 of 2,709 such rows on the replica were chat IDs
+    # (audit 2026-10-20). Now they are never selected: no call and no row.
+    _seed_chat_with_message(db, mri=mri, display="Some Channel")
 
     with patch("src.extract.teams_mri.run_teams_cli") as mock:
         result = resolve_mris(db)
         mock.assert_not_called()
 
-    assert result["resolved"] == 0
-    assert result["permanent_fail"] == 1
-    cache = db.execute("SELECT status FROM teams_mri_resolution").fetchone()
-    assert cache["status"] == "permanent_fail"
+    assert result == {"resolved": 0, "permanent_fail": 0, "retryable_fail": 0}
+    assert db.execute("SELECT COUNT(*) FROM teams_mri_resolution").fetchone()[0] == 0

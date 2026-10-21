@@ -8,6 +8,45 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from datetime import datetime, timedelta
+
+# WhatsApp's coverage starts after the last silence this long, when what lies before it
+# is at most STRAY_SHARE of the messages. When the bridge was first linked, WhatsApp
+# gave it the last message of each older chat and nothing else: 21 messages from
+# 2022-06-15 to 2026-06-30, then everything from 2026-07-02, and stats read 'first:
+# 2022-06-15', so an empty answer said WhatsApp had been searched back to 2022. A long
+# history with an outage in it is no sliver, and keeps its first date.
+HISTORY_GAP_DAYS = 30
+STRAY_SHARE = 0.05
+
+
+def _at(stamp: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+
+
+def whatsapp_span(conn: sqlite3.Connection) -> dict:
+    """WhatsApp's coverage, as stats gives it: {"first", "last", "items"}, and
+    "earliest" and "earlier_items" when stray older messages were left out of "first"."""
+    try:
+        times = [
+            r[0] for r in conn.execute("SELECT sent_at FROM whatsapp_messages ORDER BY sent_at")
+        ]
+    except sqlite3.OperationalError:  # a store from before WhatsApp
+        times = []
+    if not times:
+        return {"first": None, "last": None, "items": 0}
+    cut = 0
+    for i in range(1, min(len(times), int(len(times) * STRAY_SHARE) + 1)):
+        before, after = _at(times[i - 1]), _at(times[i])
+        if before and after and after - before > timedelta(days=HISTORY_GAP_DAYS):
+            cut = i
+    span: dict = {"first": times[cut], "last": times[-1], "items": len(times)}
+    if cut:
+        span.update(earliest=times[0], earlier_items=cut)
+    return span
 
 
 def search_whatsapp(

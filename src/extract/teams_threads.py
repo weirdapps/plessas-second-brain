@@ -88,7 +88,7 @@ def bound_threads(conn: sqlite3.Connection) -> dict:
             """
             UPDATE teams_threads
             SET message_count = ?, started_at = ?, ended_at = ?,
-                participant_display_names = ?,
+                participants = ?, participant_display_names = ?,
                 extraction_status = 'pending'
             WHERE id = ?
             """,
@@ -96,6 +96,7 @@ def bound_threads(conn: sqlite3.Connection) -> dict:
                 agg["msg_count"],
                 agg["started"],
                 agg["ended"],
+                json.dumps(thread_participants(conn, tid)),
                 json.dumps(names),
                 tid,
             ),
@@ -103,6 +104,28 @@ def bound_threads(conn: sqlite3.Connection) -> dict:
 
     conn.commit()
     return {"threads_created": created, "threads_updated": len(updated_thread_ids)}
+
+
+def thread_participants(conn: sqlite3.Connection, thread_id: int) -> list[str]:
+    """The MRIs of everyone who wrote in a thread, in the order they first wrote.
+
+    teams_threads.participants was created with the table and never written: '[]'
+    on every chat session and NULL on every channel post (audit 2026-10-20). The
+    display names beside it are names, which anyone can share; these are the
+    senders themselves.
+    """
+    return [
+        r[0]
+        for r in conn.execute(
+            """
+            SELECT sender_mri FROM teams_messages
+            WHERE thread_id = ? AND is_system = 0 AND sender_mri IS NOT NULL
+            GROUP BY sender_mri
+            ORDER BY MIN(composed_at), sender_mri
+            """,
+            (thread_id,),
+        )
+    ]
 
 
 def _bound_chat_session_threads(conn: sqlite3.Connection) -> tuple[int, set[int]]:

@@ -146,11 +146,7 @@ def _extract_one_thread(conn: sqlite3.Connection, thread_id: int) -> str:
         (thread_id,),
     ).fetchall()
 
-    substantive = [
-        m
-        for m in messages
-        if not m["is_system"] and len(m["content_text"] or "") > MIN_SUBSTANTIVE_LENGTH
-    ]
+    substantive = substantive_messages(messages)
     total_chars = sum(len(m["content_text"] or "") for m in substantive)
     if len(substantive) < MIN_SUBSTANTIVE_MESSAGES or total_chars < MIN_SUBSTANTIVE_TOTAL_CHARS:
         conn.execute(
@@ -160,7 +156,7 @@ def _extract_one_thread(conn: sqlite3.Connection, thread_id: int) -> str:
         return "skipped"
 
     prompt_thread = {
-        "chat_label": f"{thread['team_name'] or '?'} / {thread['chat_topic'] or '?'}",
+        "chat_label": chat_label(thread),
         "thread_kind": thread["thread_kind"],
         "started_at": thread["started_at"],
         "ended_at": thread["ended_at"],
@@ -269,6 +265,53 @@ def _extract_one_thread(conn: sqlite3.Connection, thread_id: int) -> str:
         raise
 
     return "extracted"
+
+
+def substantive_messages(messages) -> list:
+    """The messages extraction reads, in order: written by someone, and longer than
+    MIN_SUBSTANTIVE_LENGTH."""
+    return [
+        m
+        for m in messages
+        if not m["is_system"] and len(m["content_text"] or "") > MIN_SUBSTANTIVE_LENGTH
+    ]
+
+
+# What a chat with no topic is called, by kind; a channel always has its team's.
+_CHAT_KIND_LABEL = {"oneOnOne": "DM", "group": "Group chat", "meeting": "Meeting chat"}
+# Names a label lists before it counts the rest.
+LABEL_NAMES = 3
+
+
+def chat_label(thread) -> str:
+    """What a thread's title and prompt call its chat: 'Team / Channel' for a channel
+    post, the topic of a named group or meeting chat, and otherwise who is in it.
+
+    Only a channel has a team and most chats have no topic, so the 'team / topic' every
+    thread was given read '? / ?' for every DM and unnamed group, and '? / <topic>' for
+    the rest: 7,109 titles on the replica of 2026-10-20. The owner is in every chat
+    and is left out of the names.
+    """
+    from src import config
+    from src.store.owner import is_owner_name
+
+    kind = thread["chat_kind"]
+    if kind == "channel":
+        return f"{thread['team_name'] or '?'} / {thread['chat_topic'] or '?'}"
+    if thread["chat_topic"]:
+        return thread["chat_topic"]
+    label = _CHAT_KIND_LABEL.get(kind, "Chat")
+    try:
+        names = json.loads(thread["participant_display_names"] or "[]")
+    except ValueError:
+        names = []
+    others = [
+        n for n in names if isinstance(n, str) and n and not is_owner_name(n, config.USER_NAME)
+    ]
+    if not others:
+        return label
+    more = len(others) - LABEL_NAMES
+    return f"{label} with {', '.join(others[:LABEL_NAMES])}" + (f" +{more}" if more > 0 else "")
 
 
 def _generate_title(thread: dict, messages: list[dict]) -> str:

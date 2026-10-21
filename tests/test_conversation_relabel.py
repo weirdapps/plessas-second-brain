@@ -190,6 +190,22 @@ def test_without_a_transcript_the_turns_text_decides(store, projects):
     assert (counts["by_text"], counts["misaligned"]) == (1, 0)
 
 
+def test_a_stored_session_the_re_auth_nudge_alone_opened_becomes_an_agent_session(store, projects):
+    nudge = "gcloud auth refreshed. If a task was genuinely in progress, continue it from where"
+    cid = _stored(
+        store,
+        "gone",
+        ("agent", "<local-command-caveat>Caveat</local-command-caveat>"),
+        ("user", nudge + " it stopped."),
+        ("assistant", "DONE!"),
+    )
+
+    counts = relabel_conversations(store, projects)
+
+    assert _speakers(store, cid) == ["agent", "agent", "assistant"]
+    assert counts["agent_sessions_after"] == 1
+
+
 def test_a_transcript_that_is_not_the_stored_copy_falls_back_to_the_text(store, projects):
     _transcript(projects, "s", _user("something else entirely"), _assistant("ok"))
     cid = _stored(store, "s", ("user", "plan the okapi"), ("assistant", "ok"), ("user", TASK))

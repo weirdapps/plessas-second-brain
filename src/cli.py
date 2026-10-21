@@ -234,10 +234,12 @@ def cmd_mail_reconcile(args):
     from src.export.outlook_cli import OutlookCliAuthRequired, OutlookCliError
     from src.export.state import write_json_atomic
 
-    writes = args.refetch or args.record_aliases or args.health_json is not None
+    writes = args.refetch or args.record_aliases or args.relabel or args.health_json is not None
     if writes and config.is_replica():
         print(
-            config.replica_refusal("mail-reconcile --refetch/--record-aliases/--health-json"),
+            config.replica_refusal(
+                "mail-reconcile --refetch/--record-aliases/--relabel/--health-json"
+            ),
             file=sys.stderr,
         )
         return 2
@@ -274,6 +276,15 @@ def cmd_mail_reconcile(args):
             finally:
                 conn.close()
             print(f"Aliases: {added:,} new of {len(report.copies):,} copies found by Message-ID")
+        if args.relabel:
+            from src.store.schema import get_connection as get_conn
+
+            conn = get_conn(str(args.db))
+            try:
+                moved = mr.apply_relabels(conn, report.relabels)
+            finally:
+                conn.close()
+            print(f"Folders: {moved:,} emails relabelled to the folder that holds them")
         if args.refetch:
             stats = mr.refetch(report.missing, concurrency=args.concurrency, limit=args.limit)
             print(
@@ -358,6 +369,11 @@ def _print_reconcile(report) -> None:
         )
     if len(report.missing) > 20:
         print(f"  ... and {len(report.missing) - 20:,} more (--json writes them all)")
+    moves = Counter(f"{old} -> {new}" for _, old, new in report.relabels)
+    print(
+        f"Held only in another folder: {len(report.relabels):,}"
+        + (f" {dict(sorted(moves.items()))}" if moves else "")
+    )
 
 
 def cmd_ingest_session_notes(args):
@@ -1759,6 +1775,10 @@ READ_ONLY_COMMANDS = frozenset(
         # `brain maint vectors-rebuild`: --estimate and --status read; the rest refuses on a
         # replica itself (exit 2).
         "vectors-rebuild",
+        # `brain maint mail-times` and `mail-attachments` (src/export/legacy_mail.py): the dry
+        # run reads; without it each refuses on a replica itself (exit 2).
+        "mail-times",
+        "mail-attachments",
     }
 )
 
@@ -2074,6 +2094,11 @@ def main():
         "--record-aliases",
         action="store_true",
         help="Note the Graph id of each copy found by its Message-ID under another id",
+    )
+    parser_reconcile.add_argument(
+        "--relabel",
+        action="store_true",
+        help="Give each stored email found only in another walked folder that folder",
     )
     parser_reconcile.add_argument(
         "--limit", type=int, default=0, help="--refetch at most this many (0 = all)"
@@ -3032,6 +3057,10 @@ def main():
     consolidate.add_maint_parser(maint_subparsers)
     entities.add_maint_parser(maint_subparsers)
     topic_canon.add_maint_parser(maint_subparsers)
+    # mail-times, mail-attachments (src/export/legacy_mail.py): maint-only.
+    from src.export import legacy_mail
+
+    legacy_mail.add_maint_parsers(maint_subparsers)
 
     # Parse and execute
     args = parser.parse_args()

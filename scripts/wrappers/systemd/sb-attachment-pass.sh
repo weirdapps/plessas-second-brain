@@ -119,14 +119,16 @@ run_stage "file sweep" "$PYTHON" -m src.cli sweep-files --policy
 # listings plus at most two calls (get-mail, download-attachments) per message
 # staged. --health-json leaves data/state/mail_loss.json, the given-up and
 # quarantined counts the health check reads, written even when the reconcile
-# fails. While the Outlook session is dead the stage is skipped, and logged:
+# fails. --relabel gives a stored email found only in another of the three folders
+# that folder (self-CC mail stored as Sent Items, from listings already made). While
+# the Outlook session is dead the stage is skipped, and logged:
 # sb-outlook-sync is red for it already, and every call here would fail.
 if [ -f "$OUTLOOK_SENTINEL" ]; then
   echo "$(date '+%Y-%m-%d %H:%M:%S') - mail reconcile skipped: needs_reauth sentinel present" >> "$LOG_FILE"
 else
   echo "$(date '+%Y-%m-%d %H:%M:%S') - starting mail reconcile" >> "$LOG_FILE"
   run_stage "mail reconcile" "$PYTHON" -m src.cli mail-reconcile --since 7d --refetch \
-    --limit "${SB_MAIL_RECONCILE_LIMIT:-100}" --health-json
+    --relabel --limit "${SB_MAIL_RECONCILE_LIMIT:-100}" --health-json
 fi
 
 # Every stage has run by here, so a restart would repeat the whole hour of LLM

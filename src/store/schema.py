@@ -575,7 +575,7 @@ def migrate_received_times_utc(conn: sqlite3.Connection) -> None:
     the same moment, changes nothing. In batches, each its own write transaction: a job that
     stops part way leaves rows of both forms, which every reader already handles, and the
     next run converts the rest. Then each email thread's newest time, which consolidation
-    keeps, is recomputed from the converted times (_recompute_thread_last_at).
+    keeps, is recomputed from the converted times (recompute_thread_last_at).
     """
     if not _table_exists(conn, "emails"):
         return
@@ -594,10 +594,10 @@ def migrate_received_times_utc(conn: sqlite3.Connection) -> None:
             updates[start : start + _RECEIVED_BATCH],
         )
         conn.commit()
-    _recompute_thread_last_at(conn)
+    recompute_thread_last_at(conn)
 
 
-def _recompute_thread_last_at(conn: sqlite3.Connection) -> None:
+def recompute_thread_last_at(conn: sqlite3.Connection) -> None:
     """consolidation_threads.last_at of every email thread, from its emails' received times.
 
     Thread.last_at (src/store/consolidate.py) is the greatest date of the thread's messages,

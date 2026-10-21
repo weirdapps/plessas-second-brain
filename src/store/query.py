@@ -1896,6 +1896,7 @@ def get_coverage(conn: sqlite3.Connection) -> dict:
     later. An agent that cannot see where a source starts reads an empty answer
     as 'nothing happened'.
     """
+    from src.store.whatsapp_query import whatsapp_span
 
     def span(sql: str) -> dict:
         try:
@@ -1914,7 +1915,9 @@ def get_coverage(conn: sqlite3.Connection) -> dict:
     return {
         "mailboxes": mailboxes,
         "teams": span("SELECT MIN(started_at), MAX(ended_at), COUNT(*) FROM teams_threads"),
-        "whatsapp": span("SELECT MIN(sent_at), MAX(sent_at), COUNT(*) FROM whatsapp_messages"),
+        # From where its history starts, not from the last messages of older chats the
+        # bridge was handed when it was linked (src/store/whatsapp_query.py).
+        "whatsapp": whatsapp_span(conn),
         # Meetings Outlook no longer lists are kept as cancelled, not deleted.
         # The span alone read four months of ten meetings each as covered: the
         # months beside it say which ones are not held in full.

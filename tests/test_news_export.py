@@ -288,13 +288,14 @@ def test_future_published_at_clamped_to_fetched_at(news_db, staging):
     assert rec["conversation_id"] == "news:digest:2026-06-21"
 
 
-def test_whitespace_only_content_skipped(news_db, staging):
-    """Articles whose content is blank after stripping are not exported."""
+def test_whitespace_only_content_keeps_its_headline(news_db, staging):
+    """An article whose content is blank after stripping is exported with its headline as
+    its text: 11 above the threshold were dropped whole (audit 2026-10-20)."""
     result = export_news(news_db, staging)
 
-    subjects = {r["subject"] for r in _records(result)}
-    assert "Empty body" not in subjects
-    assert result["articles"] == 2
+    (record,) = [r for r in _records(result) if r["subject"] == "Empty body"]
+    assert record["content"].splitlines()[0] == "Empty body"
+    assert result["articles"] == 3
 
 
 def test_exported_ids_are_skipped_and_counted(news_db, staging):
@@ -311,7 +312,7 @@ def test_exported_ids_are_skipped_and_counted(news_db, staging):
     assert not (ids & already)
     assert result["skipped"] == 2
     assert result["syntheses"] == 1
-    assert result["articles"] == 1
+    assert result["articles"] == 2
 
 
 def test_pipeline_filter(news_db, staging):
@@ -335,12 +336,12 @@ def test_batch_numbering_starts_at_70000_and_never_overwrites(news_db, staging):
     """Batches are numbered from 70000 upward, skipping numbers already on disk."""
     fresh = export_news(news_db, staging, batch_size=2)
     assert fresh["batch_files"][0].endswith(f"batch-{NEWS_BATCH_START}.json")
-    assert len(fresh["batch_files"]) == 2
+    assert len(fresh["batch_files"]) == 3
     assert fresh["batch_files"][1].endswith(f"batch-{NEWS_BATCH_START + 1}.json")
 
     existing = json.loads((staging / f"batch-{NEWS_BATCH_START}.json").read_text())
     rerun = export_news(news_db, staging, batch_size=100)
-    assert rerun["batch_files"] == [str(staging / f"batch-{NEWS_BATCH_START + 2}.json")]
+    assert rerun["batch_files"] == [str(staging / f"batch-{NEWS_BATCH_START + 3}.json")]
     # The pre-existing batch survived untouched
     assert json.loads((staging / f"batch-{NEWS_BATCH_START}.json").read_text()) == existing
 
@@ -387,14 +388,14 @@ def test_directory_path_returns_zeros(tmp_path, staging):
     assert result == ZEROS
 
 
-def test_markup_only_content_skipped(news_db, staging):
-    """Content that is markup only is empty once stripped, so it is not exported."""
-    _add_article(news_db, "https://example.com/a5", "Markup only", "<p>&nbsp;</p>")
+def test_markup_only_content_keeps_its_headline(news_db, staging):
+    """Content that is markup only is empty once stripped, so the headline stands in."""
+    message_id = _add_article(news_db, "https://example.com/a5", "Markup only", "<p>&nbsp;</p>")
 
     result = export_news(news_db, staging)
 
-    assert "Markup only" not in {r["subject"] for r in _records(result)}
-    assert result["articles"] == 2
+    assert _by_id(result, message_id)["content"].splitlines()[0] == "Markup only"
+    assert result["articles"] == 4
 
 
 def test_short_content_still_exported(news_db, staging):
@@ -439,7 +440,7 @@ def test_article_with_no_parseable_date_is_skipped_and_counted(news_db, staging)
     result = export_news(news_db, staging)
 
     assert "No usable date" not in {r["subject"] for r in _records(result)}
-    assert result["articles"] == 2
+    assert result["articles"] == 3
     assert result["skipped"] == 1
 
 

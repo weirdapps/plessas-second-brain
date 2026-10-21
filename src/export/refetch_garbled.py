@@ -276,6 +276,18 @@ def _attempts(record: dict) -> int:
         return 0
 
 
+def settled(record: dict | None) -> bool:
+    """Whether a row's record says its file is never asked for again, as plan() reads it: gone,
+    unmatched or ambiguous, or failed or not found MAX_ATTEMPTS times. A fetched row's file was
+    put back, and a row with no record has not been asked for yet."""
+    if not record:
+        return False
+    state = record.get("state")
+    return state in (GONE, UNMATCHED, AMBIGUOUS) or (
+        state in (FAILED, NOT_FOUND) and _attempts(record) >= MAX_ATTEMPTS
+    )
+
+
 def plan(conn: sqlite3.Connection, root: Path, stats: dict) -> tuple[list[Message], list[Message]]:
     """The messages to ask for, oldest mail first, each with the ids it may answer to, and the
     messages with no id the mailbox knows, for the lookup. Counts in `stats` the rows passed

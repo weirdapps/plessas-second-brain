@@ -593,7 +593,10 @@ TRANSCRIBE_NIGHTLY_BUDGET_S = 300.0
 def _print_transcription(stats: dict) -> None:
     print(f"  Transcribed: {stats['transcribed']} ({stats['empty']} showed no text)")
     print(f"  Failed: {stats['failed']}, deferred (out of time): {stats['deferred']}")
-    print(f"  Missing files: {stats['missing']}")
+    print(
+        f"  Missing files: {stats['missing']}"
+        f" ({stats.get('gone', 0)} gone for good, given up: refetch-garbled settled them)"
+    )
     print(f"  Attachment rows written: {stats['projected']}")
 
 
@@ -622,7 +625,7 @@ def cmd_transcribe_images(args) -> int:
     print(f"Content images to transcribe (a file on disk): {stats['candidates']}")
     if args.dry_run:
         todo = min(stats["candidates"], args.limit) if args.limit else stats["candidates"]
-        print(f"  Missing files: {stats['missing']}")
+        print(f"  Missing files: {stats['missing']} ({stats.get('gone', 0)} gone for good)")
         print(f"  Would transcribe: {todo} (one vision call each)")
         return 0
     _print_transcription(stats)

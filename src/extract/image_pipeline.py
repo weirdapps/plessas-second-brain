@@ -130,6 +130,23 @@ def _service_failed(e: Exception) -> bool:
     return is_transient(e) and not is_item_timeout(e)
 
 
+def _gone_for_good(conn: sqlite3.Connection, sha256: str, records: dict[int, dict]) -> bool:
+    """Whether every row of these bytes with a file path has a refetch-garbled record settled as
+    never to be asked for again (refetch_garbled.settled). A row with none, another email's copy
+    the refetch never asked for, may still bring the file back."""
+    from src.export.refetch_garbled import settled
+
+    rows = [
+        att_id
+        for (att_id,) in conn.execute(
+            "SELECT id FROM attachments WHERE sha256 = ? AND file_path IS NOT NULL"
+            " AND file_path NOT LIKE 'text:%'",
+            (sha256,),
+        )
+    ]
+    return bool(rows) and all(settled(records.get(att_id)) for att_id in rows)
+
+
 def run_transcription(
     conn: sqlite3.Connection,
     limit: int | None = None,
@@ -140,18 +157,34 @@ def run_transcription(
     """Transcribe the content images whose attachments hold no text from their file.
 
     Taken: TRANSCRIPTION_OWED_SQL, newest description first. An image with no file on disk is
-    counted `missing` and does not use up `limit`.
+    counted `missing` and does not use up `limit`. One whose every row of its bytes is settled by
+    refetch-garbled as never to be asked for again (gone from the mailbox, unmatched, ambiguous,
+    or out of attempts) is given up, counted `gone` as well: its transcription attempts are set
+    to VISION_ATTEMPTS_LIMIT, so it no longer owes one, and its rows' records say why. 146 such
+    images were counted missing every night on the producer (audit 2026-10-20).
 
     One call per image (image_vision.transcribe_image), then project_vision_text writes the
     text into the rows. A failure of the image counts an attempt; a failure of the service or
     of the host (_service_failed) is counted `failed` but offered again next run. `workers`
     and `deadline_s` work as in run_backfill.
 
-    Returns {candidates, missing, transcribed, empty, failed, deferred, projected}:
+    Returns {candidates, missing, gone, transcribed, empty, failed, deferred, projected}:
     `candidates` have a file on disk, and `empty` is an image that shows no text.
     """
+    from src.export.refetch_garbled import fetch_states
+
     stats = dict.fromkeys(
-        ("candidates", "missing", "transcribed", "empty", "failed", "deferred", "projected"), 0
+        (
+            "candidates",
+            "missing",
+            "gone",
+            "transcribed",
+            "empty",
+            "failed",
+            "deferred",
+            "projected",
+        ),
+        0,
     )
     hashes = [
         sha
@@ -161,16 +194,26 @@ def run_transcription(
         )
     ]
     todo: list[tuple[str, Path]] = []
+    records: dict[int, dict] | None = None
     for sha in hashes:
         path = file_on_disk(conn, sha)
         if path is None:
             stats["missing"] += 1
+            records = fetch_states(conn) if records is None else records
+            if _gone_for_good(conn, sha, records):
+                stats["gone"] += 1
+                if not dry_run:
+                    conn.execute(
+                        "UPDATE inline_images SET transcription_attempts = ? WHERE sha256 = ?",
+                        (VISION_ATTEMPTS_LIMIT, sha),
+                    )
             continue
         stats["candidates"] += 1
         if not limit or len(todo) < limit:
             todo.append((sha, path))
     if dry_run:
         return stats
+    conn.commit()
 
     deadline = None if deadline_s is None else time.monotonic() + deadline_s
 

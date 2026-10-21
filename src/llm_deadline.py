@@ -71,11 +71,16 @@ from src.llm_policy import MAX_ATTEMPTS, ROW_CAPS, backoff
 #
 # sb-briefs added 2026-10-21 (TimeoutStartSec=300, read live): it makes one model call
 # per meeting and had no deadline, so its calls planned retries against the flat 900 s
-# default inside a 300 s unit. sb-topic-pages is still absent and keeps that default.
+# default inside a 300 s unit.
 #
 # sb-whatsapp-sync added 2026-10-21 (TimeoutStartSec=600, read live): the same shape and
 # timeout as sb-teams-sync, a 300 s extraction slice inside a 600 s unit, and its calls
 # planned retries against the flat 900 s default, past the unit's SIGTERM.
+#
+# sb-topic-pages added 2026-10-21 (TimeoutStartSec=1800, read live): the last scheduled unit
+# without one. It starts pages until 1500 s, and a retry planned against the flat 900 s
+# default could outlast the unit. Its budget clears the token-push wait, which at 03:30 is
+# unlikely to be answered but holds nothing else up.
 _UNIT_TIMEOUT_SECONDS: dict[str, int] = {
     "sb-attachments": 3600,
     "sb-briefs": 300,
@@ -86,6 +91,7 @@ _UNIT_TIMEOUT_SECONDS: dict[str, int] = {
     "sb-noon-catchup": 1800,
     "sb-outlook-sync": 1200,
     "sb-teams-sync": 600,
+    "sb-topic-pages": 1800,
     "sb-whatsapp-sync": 600,
 }
 

@@ -9,7 +9,9 @@ import json
 import mimetypes
 import re
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from src.config import CURRENT_SCHEMA_VERSION
 from src.store.greek import register_sql_functions
@@ -514,9 +516,171 @@ def run_migrations(conn: sqlite3.Connection) -> None:
         migrate_add_attachment_chunks(conn)
     if current < 40:
         migrate_add_directory(conn)
+    if current < 41:
+        migrate_received_times_utc(conn)
+        migrate_mail_hygiene(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
+
+
+# A received time stored with no zone: the retired Apple Mail exporter wrote its Mac's wall
+# time, and ingest_document a file's mtime in local time, both on hosts that kept Athens time.
+NAIVE_RECEIVED_ZONE = ZoneInfo("Europe/Athens")
+_NAIVE_RECEIVED = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{6})?")
+# The classes whose naive times v41 converts. Session notes are dated by ingest time, which
+# their own repair replaces with the note's (src/export/session_notes.py).
+_NAIVE_RECEIVED_CLASSES = ("mail", "automation", "document")
+# Rows converted per transaction, so the jobs that start meanwhile wait seconds, not minutes.
+_RECEIVED_BATCH = 2000
+
+
+def received_time_utc(value: str | None) -> str | None:
+    """A received time stored with no zone, read as Athens wall time, in UTC with a Z: to the
+    second, as the export stores ReceivedDateTime ('2026-04-08T08:39:28' is
+    '2026-04-08T05:39:28Z'), or to the microsecond when it had them. None for any other value,
+    a converted one included, which makes the conversion its own guard.
+
+    In the hour the clocks go back a wall time names two moments: the first, summer time, is
+    taken (fold 0). One in the hour they skip names none, and is read with the offset before
+    the change. The store held neither on 2026-10-21.
+    """
+    text = value or ""
+    if not _NAIVE_RECEIVED.fullmatch(text):
+        return None
+    try:
+        moment = datetime.fromisoformat(text).replace(tzinfo=NAIVE_RECEIVED_ZONE)
+    except ValueError:
+        return None
+    utc = moment.astimezone(UTC)
+    return utc.strftime("%Y-%m-%dT%H:%M:%S" + (".%f" if len(text) > 19 else "") + "Z")
+
+
+def migrate_received_times_utc(conn: sqlite3.Connection) -> None:
+    """v41: every email's received time in UTC, as the export stores it.
+
+    The retired Apple Mail exporter stored the wall time of a Mac in Athens with no zone:
+    50,270 mail and automation rows, 2025-03-16 to 2026-06-09. Standalone documents are dated
+    by their file's mtime the same way (2,145 rows; 60 of 60 sampled equal the file's mtime
+    in Athens time). Every reader takes a time with no zone for UTC, the export's own form,
+    so each was two or three hours late: a day window put the last hours of a day under the
+    next one, and the order of mail put such a message after later ones. Of the 18,795 rows
+    live Outlook still held on 2026-10-21, 18,407 read in Athens time agree with its
+    ReceivedDateTime, 18,241 of them to the second; 384, 2026-05-31 to 06-05, were written on
+    a Mac in another zone and are an hour off, which `brain maint mail-times` corrects from
+    Outlook (src/export/legacy_mail.py).
+
+    Only values of the naive shape change (received_time_utc), each written only while it is
+    still the value read (compare and set), so a second run, or a second job running this at
+    the same moment, changes nothing. In batches, each its own write transaction: a job that
+    stops part way leaves rows of both forms, which every reader already handles, and the
+    next run converts the rest. Then each email thread's newest time, which consolidation
+    keeps, is recomputed from the converted times (_recompute_thread_last_at).
+    """
+    if not _table_exists(conn, "emails"):
+        return
+    classes = ", ".join(f"'{c}'" for c in _NAIVE_RECEIVED_CLASSES)
+    rows = conn.execute(
+        "SELECT id, date_received FROM emails"
+        f" WHERE source_class IN ({classes}) AND length(date_received) IN (19, 26)"
+    ).fetchall()
+    updates = [(utc, row[0], row[1]) for row in rows if (utc := received_time_utc(row[1]))]
+    if conn.in_transaction:
+        conn.commit()
+    for start in range(0, len(updates), _RECEIVED_BATCH):
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executemany(
+            "UPDATE emails SET date_received = ? WHERE id = ? AND date_received = ?",
+            updates[start : start + _RECEIVED_BATCH],
+        )
+        conn.commit()
+    _recompute_thread_last_at(conn)
+
+
+def _recompute_thread_last_at(conn: sqlite3.Connection) -> None:
+    """consolidation_threads.last_at of every email thread, from its emails' received times.
+
+    Thread.last_at (src/store/consolidate.py) is the greatest date of the thread's messages,
+    compared as text, so with both forms stored it could be the wrong message's, and the time
+    of one converted since is the old one. A thread whose items did not change is not loaded
+    again, so it would keep it. The same messages: the thread key and the item-less test are
+    consolidate's own. Only the rows whose value changes are written.
+    """
+    if not _table_exists(conn, "consolidation_threads"):
+        return
+    from src.store.consolidate import _email_key_sql, _itemless_sql
+
+    newest = dict(
+        conn.execute(
+            f"SELECT {_email_key_sql('e')} AS thread_key, MAX(NULLIF(e.date_received, ''))"
+            f" FROM emails e WHERE NOT {_itemless_sql(conn)} GROUP BY thread_key"
+        ).fetchall()
+    )
+    changes = [
+        (newest[key], key)
+        for key, last_at in conn.execute(
+            "SELECT thread_key, last_at FROM consolidation_threads WHERE thread_key GLOB 'email*:*'"
+        )
+        if key in newest and newest[key] != last_at
+    ]
+    if not changes:
+        return
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    conn.executemany("UPDATE consolidation_threads SET last_at = ? WHERE thread_key = ?", changes)
+    conn.commit()
+
+
+def migrate_mail_hygiene(conn: sqlite3.Connection) -> None:
+    """v41: three repairs of rows no later write touches again.
+
+    The Sent Items folder under the spelling an early run of the export took from the command
+    line, 'SentItems' (100 rows, 2026-04-20..22): the export and the reconcile spell it
+    'Sent Items', and a filter on either missed these.
+
+    The sender of a mail with no 'sender' row in email_people (20 rows from 2026-06 to 09, all
+    from system addresses), linked as the loader links one: the person found or created by
+    the From address, named by the display name or else by the address. The sender row was
+    gone on rows the loader had given one; nothing in the code deletes one whose person has
+    an address, so the link is restored here rather than its loss explained.
+
+    A calendar event whose extraction failed is offered again once: the one on record failed
+    because the reply was cut at the calendar extraction's max_tokens of 1024, which thinking
+    shares, and 'failed' is never retried until the event is edited. 'pending' is the debt the
+    next calendar-sync that lists it pays (a past event needs a --backfill of its month).
+    """
+    if _table_exists(conn, "emails"):
+        conn.execute(
+            "UPDATE emails SET mailbox_name = 'Sent Items' WHERE mailbox_name = 'SentItems'"
+        )
+        _link_senders(conn)
+    if _table_exists(conn, "calendar_events"):
+        conn.execute(
+            "UPDATE calendar_events SET llm_status = 'pending' WHERE llm_status = 'failed'"
+        )
+    conn.commit()
+
+
+def _link_senders(conn: sqlite3.Connection) -> None:
+    """A 'sender' row for each mail with a From address and none, as load_single_email writes."""
+    if not _table_exists(conn, "email_people"):
+        return
+    from src.store.normalizer import find_or_create_person
+
+    rows = conn.execute(
+        "SELECT e.id, e.sender_name, e.sender_address FROM emails e"
+        " WHERE e.source_class IN ('mail', 'automation') AND COALESCE(e.sender_address, '') != ''"
+        " AND NOT EXISTS (SELECT 1 FROM email_people ep"
+        " WHERE ep.email_id = e.id AND ep.role_in_email = 'sender')"
+    ).fetchall()
+    for email_id, name, address in rows:
+        person_id = find_or_create_person(conn, name or address, address, display_name=True)
+        conn.execute(
+            "INSERT OR IGNORE INTO email_people (email_id, person_id, role_in_email)"
+            " VALUES (?, ?, 'sender')",
+            (email_id, person_id),
+        )
 
 
 def migrate_add_whatsapp(conn: sqlite3.Connection) -> None:

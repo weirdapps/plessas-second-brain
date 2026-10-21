@@ -1663,6 +1663,32 @@ On the producer, in this order:
    `python scripts/health_check.py` (no `--email`, no `--hc-ping`) prints AUTH and
    LAST 24 HOURS.
 
+### One-off commands after the 2026-10-20 audit (Teams, WhatsApp, entities, News)
+
+No schema change. teams-access must have `list-messages --until` (its repo-autoupdate
+rebuild does it); until it has, a Teams pull reads one page a chat and says so once a run.
+Then on the producer, each with `--dry-run` first, in this order:
+
+1. `python -m src.cli maint teams-repair` fills the sender of every channel post from its
+   payload, writes thread participants and again the titles that began with a question
+   mark for a missing team, and deletes the MRI cache rows of senders that are no person;
+   no Teams or model call. Run it before `maint teams-drop-raw-json`, which drops the
+   payloads it reads. On a copy of the reference replica: 5,608 senders, 3,520 messages
+   linked to a person, 9,756 threads, 7,109 titles, 2,385 cache rows, in 3 s. The hourly
+   teams-sync resolves the senders not yet known, 50 a run.
+2. `python -m src.cli maint teams-empty-summaries` sends the 76 threads extracted with an
+   empty summary back to extraction after deleting their 127 key facts; the next
+   teams-sync extracts them, one model call each.
+3. `python -m src.cli maint entities --apply` seeds the people added since the last seed
+   (28 entities on the copy). From now on `sync` does it in sb-daily-sync.
+4. `python -m src.cli maint news-dedup` forgets the stored copies of a Google News article
+   held under several URLs, 683 rows and their vectors on the copy. It loads the vector
+   index once, so run it while no other job that loads it is running.
+
+On the Mac that runs the WhatsApp bridge, pull the checkout the snapshot job runs from: the
+snapshot then carries the id-number pairs, and the next whatsapp-sync joins each contact's
+chat under a number to their chat under an anonymous id.
+
 ### Schema notes
 
 A store that missed several releases takes every migration since its version in

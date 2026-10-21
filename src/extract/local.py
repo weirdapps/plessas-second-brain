@@ -546,6 +546,12 @@ def run_extraction(
     log("Loading staged emails...")
     all_emails = collect_emails()
     log(f"Total staged emails: {len(all_emails)}")
+    # The count of an email no longer staged is never cleared: a copy of it loaded or its
+    # batch was pruned, and nothing offers it again (65 such ids on the producer, 2026-10-20).
+    staged_ids = {str(e.get("message_id", "")) for e in all_emails}
+    for counts in (attempt_counts, timeout_counts):
+        for msg_id in [m for m in counts if m not in staged_ids]:
+            del counts[msg_id]
 
     pending = [e for e in all_emails if str(e.get("message_id", "")) not in processed_ids]
     # One copy of each message, the last staged, as collect_conversations keeps.

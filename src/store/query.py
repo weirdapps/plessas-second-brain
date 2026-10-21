@@ -1055,9 +1055,10 @@ def query_decisions(
     where_clauses.append(f"{_DECISION_DATE} <= strftime('%Y-%m-%dT%H:%M:%S', 'now')")
 
     if days is not None:
-        from datetime import datetime, timedelta
+        from datetime import UTC, datetime, timedelta
 
-        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+        # In UTC, as the store holds its times: the host's wall time cut off the first hours.
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
         where_clauses.append(f"{_DECISION_DATE} >= ?")
         params.append(cutoff)
 
@@ -1371,9 +1372,9 @@ def meeting_prep(
         Every email, decision, fact and action row carries its source_class.
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
-    from datetime import datetime, timedelta
+    from datetime import UTC, datetime, timedelta
 
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
     visible = visible_sql(conn, "e.id", include_news, include_automation)
     current_d = current_sql(conn, "d", "decisions", include_history)
     current_a = current_sql(conn, "a", "action_items", include_history)

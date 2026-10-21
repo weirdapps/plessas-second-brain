@@ -81,8 +81,8 @@ def conn():
 # --- schema v40 ---
 
 
-def test_schema_version_is_40():
-    assert CURRENT_SCHEMA_VERSION == 40
+def test_schema_version_is_40_or_later():
+    assert CURRENT_SCHEMA_VERSION >= 40
 
 
 def test_a_fresh_store_has_the_directory_table(conn):
@@ -96,7 +96,7 @@ def test_the_v40_migration_runs_once_and_again(tmp_path):
     c.execute("DROP TABLE directory_entries")
     set_schema_version(c, 39)
     run_migrations(c)
-    assert get_schema_version(c) == 40
+    assert get_schema_version(c) == CURRENT_SCHEMA_VERSION
     migrate_add_directory(c)  # a second run changes nothing
     assert [r[1] for r in c.execute("PRAGMA table_info(directory_entries)")] == COLUMNS
     c.close()

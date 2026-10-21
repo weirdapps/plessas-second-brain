@@ -110,6 +110,7 @@ DOWNLOAD_TIMEOUT_S = 300
 LOOKUP_WINDOW = timedelta(minutes=2)
 # The zone of a stored time that carries none: the retired Apple Mail exporter wrote its Mac's
 # local time. Read as UTC, as mail_reconcile.parse_when reads it, it is two or three hours off.
+# Schema v41 converts the stored ones to UTC (src/store/schema.py); this reads a store before it.
 NAIVE_TIME_ZONE = ZoneInfo("Europe/Athens")
 # The mail the mailbox keeps (audit code-ingest-03: nothing older was listed). Older mail that no
 # listing finds is gone; younger is looked for again.

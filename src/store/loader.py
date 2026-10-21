@@ -393,9 +393,12 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
 
     # Also add sender as a person. The header names below are the only ones that
     # may rename a person found by address (display_name=True): the model's
-    # people_roles names above never do.
-    if sender_name and sender_address:
-        sender_id = find_or_create_person(conn, sender_name, sender_address, display_name=True)
+    # people_roles names above never do. A sender with no display name is named by
+    # the address, as a recipient is: required, it left system mail with no sender.
+    if sender_address:
+        sender_id = find_or_create_person(
+            conn, sender_name or sender_address, sender_address, display_name=True
+        )
         conn.execute(
             "INSERT OR IGNORE INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, ?)",
             (email_id, sender_id, "sender"),

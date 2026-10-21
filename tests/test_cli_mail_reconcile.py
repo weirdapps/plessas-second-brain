@@ -85,7 +85,7 @@ def test_the_report_runs_on_a_replica(db, listing, monkeypatch, tmp_path, capsys
     assert written["counts"]["Archive"]["by_rfc822_id"] == 1
 
 
-@pytest.mark.parametrize("flag", ["--refetch", "--record-aliases"])
+@pytest.mark.parametrize("flag", ["--refetch", "--record-aliases", "--relabel"])
 def test_the_writes_are_refused_on_a_replica(db, listing, monkeypatch, capsys, flag):
     monkeypatch.setenv("BRAIN_ROLE", "replica")
 
@@ -116,6 +116,20 @@ def test_record_aliases_notes_the_copies_on_the_producer(db, listing, monkeypatc
     rows = conn.execute("SELECT message_id FROM email_aliases").fetchall()
     conn.close()
     assert [r[0] for r in rows] == ["AAMk-archive-1"]
+
+
+def test_relabel_gives_an_email_the_folder_that_holds_it(db, listing, monkeypatch, capsys):
+    """Stored from the Inbox, the message is in the Archive now: walked, the Inbox and the
+    Archive say so."""
+    args = ("--since", "2026-05-01", "--until", "2026-05-06", "--folders", "Archive,Inbox")
+
+    assert _run(monkeypatch, db, *args, "--relabel") == 0
+
+    assert "Inbox -> Archive" in capsys.readouterr().out
+    conn = get_connection(str(db))
+    rows = conn.execute("SELECT mailbox_name FROM emails").fetchall()
+    conn.close()
+    assert [r[0] for r in rows] == ["Archive"]
 
 
 @pytest.mark.parametrize(

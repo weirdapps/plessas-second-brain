@@ -6,7 +6,7 @@ to retrieve person, topic, conversation, and decision context from the knowledge
 
 import json
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from src.store import envelope
 from src.store.consolidate import current_sql, history_left_out, open_status_sql
@@ -113,7 +113,8 @@ def get_person_context(
     """
     register_sql_functions(conn)  # sb_fold et al., whoever opened conn
 
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    # In UTC, as the store holds its times: the host's wall time cut off the first hours.
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
     visible = visible_sql(conn, "e.id", include_news, include_automation)
 
     resolution = resolve_identity(conn, name_or_email, local_part=local_part)
@@ -613,7 +614,8 @@ def get_topic_context(
         and the row envelope (src/store/envelope.py)
     """
 
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    # In UTC, as the store holds its times: the host's wall time cut off the first hours.
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
     visible = visible_sql(conn, "e.id", include_news, include_automation)
     facts = not_boilerplate_sql(conn, "kf", include_boilerplate)
     current_d = current_sql(conn, "d", "decisions", include_history)

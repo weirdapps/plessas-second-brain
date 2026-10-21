@@ -100,6 +100,27 @@ def test_with_no_such_row_the_inbox_is_listed_once(db, mailbox):
     assert [c[c.index("--folder") + 1] for c in mailbox.calls].count("Inbox") == 1
 
 
+def test_a_times_listing_at_the_cap_relabels_none_by_age(db, mailbox, monkeypatch):
+    """A listing that reached --max may have lost its oldest messages (outlook-cli lists the
+    newest first), so its oldest time proves nothing about older mail. The Id listing is
+    refused at the cap before this; the times listing is a second call, and the Inbox can
+    reach the cap between the two."""
+    real = mailbox.__call__
+
+    def capped(args, timeout_sec=60):
+        if "ReceivedDateTime" in args:
+            cap = int(args[args.index("--max") + 1])
+            return [{"ReceivedDateTime": "2026-07-15T16:37:26Z"}] * cap
+        return real(args, timeout_sec)
+
+    monkeypatch.setattr(inbox_reconcile, "run_outlook_cli", capped)
+
+    result = inbox_reconcile.reconcile_moves(db, max_results=3, track_elsewhere=True)
+
+    assert result["by_age"] == 0
+    assert _mailboxes(db)["4101"] == "Inbox"
+
+
 def test_an_inbox_whose_times_cannot_be_read_relabels_none_by_age(db, mailbox):
     mailbox.folders["Inbox"] = [{"Id": "AAMk-kept", "InternetMessageId": "<kept@example.test>"}]
 

@@ -91,7 +91,12 @@ def list_folder_ids(folder: str, max_results: int = 5000) -> tuple[set[str], set
 
 
 def oldest_received(folder: str, max_results: int = 5000) -> datetime | None:
-    """When the oldest message in `folder` was received, or None when no time reads: one call."""
+    """When the oldest message in `folder` was received, or None when no time reads: one call.
+
+    None too for a listing that reached `max_results`: outlook-cli lists the newest first, so
+    a capped listing may have left out the oldest, and its oldest time would date the folder
+    too late. The Inbox listing before it is refused at the cap, but the Inbox can reach the
+    cap between the two calls."""
     items = run_outlook_cli(
         [
             "list-mail",
@@ -105,6 +110,8 @@ def oldest_received(folder: str, max_results: int = 5000) -> datetime | None:
         ],
         timeout_sec=120,
     )
+    if len(items or []) >= max_results:
+        return None
     times = []
     for item in items or []:
         try:

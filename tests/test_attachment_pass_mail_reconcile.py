@@ -56,6 +56,8 @@ def test_the_pass_reconciles_a_week_of_mail_with_a_budget_and_counters(tmp_path)
     args = call.split()
     assert args[args.index("--since") + 1] == "7d"
     assert "--refetch" in args and "--health-json" in args
+    # The stored folder of self-CC mail follows the copy Outlook still holds.
+    assert "--relabel" in args
     assert args[args.index("--limit") + 1] == "100"
 
 

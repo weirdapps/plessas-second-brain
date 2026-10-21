@@ -1798,3 +1798,35 @@ one pass, at the first job that writes. The versions that ask for a step:
   milliseconds, nothing needs stopping. `brain directory-sync` fills it and needs a
   teams-cli with the `lookup-users` command; `sb-teams-sync.sh` runs it after `teams-sync`,
   so install that wrapper into `~/.local/bin` after the pull.
+- **v41.** `emails.date_received` in UTC with a `Z` for mail, automation mail and
+  documents (README, "Database schema", Received times): the Apple Mail exporter's rows
+  and the standalone documents held Athens wall time with no zone. The migration rewrites
+  about 52,400 rows in batches of 2,000, each its own write transaction, so a job that
+  starts meanwhile waits seconds; 16 s on a copy of the replica. Two jobs running it at once
+  convert each row once, and one stopped part way leaves rows every reader handles, which
+  the next run finishes. Nothing needs stopping; `maint migrate` right after the pull runs it
+  at a time of your choosing. It also recomputes each email thread's newest time for the
+  consolidation pass, spells 'SentItems' as 'Sent Items', links the mails that had no
+  sender row, and offers again the one calendar event stored 'failed'. Then, on the
+  producer, in this order:
+
+  1. `install -m 755 scripts/wrappers/systemd/sb-attachment-pass.sh ~/.local/bin/`: the
+     nightly mail reconcile passes `--relabel`, which the code before v41 does not know.
+  2. `python -m src.cli maint mail-times --dry-run`, then without it: the received times a
+     Mac in another zone wrote, set from Outlook (384 rows of 2026-05-31..06-05 on the
+     replica, an hour each). A second run sets none.
+  3. `python -m src.cli mail-reconcile --since 365d --relabel`: the folder of the stored mail
+     the whole mailbox holds elsewhere (3,745 rows stored as Sent Items on the replica); the
+     nightly pass then keeps the last 7 days so. Read-only listings, about 4 minutes.
+  4. `python -m src.cli maint mail-attachments --since 2026-04-06 --until 2026-05-04 --dry-run`,
+     then without `--dry-run`: the April 2026 mail stored without its attachments (on the
+     replica: 3,515 emails checked, 708 with files, 889 files and 1,003 inline images to
+     fetch). Resumable and idempotent; run it before April 2027, when the mailbox no longer
+     keeps that mail (it keeps about a year: nothing before 2025-10-18 on 2026-10-21, so the
+     store's 2025-03 and 2025-04 mail cannot be backfilled). The nightly attachment pass reads,
+     summarises and embeds what it registered, or run `python -m src.cli process-attachments`.
+  5. After that pass, `python scripts/forget_duplicate_documents.py`, then with `--apply`:
+     some of those files were stored before as standalone documents, recovered from the old
+     exporter's folders, and search would return both.
+  6. `python -m src.cli maint calendar-backfill --since 2026-02-01 --until 2026-03-01`: the
+     calendar event offered again is in a month the backfill had recorded as listed.

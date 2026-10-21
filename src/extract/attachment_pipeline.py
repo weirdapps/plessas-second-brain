@@ -1550,7 +1550,11 @@ def ingest_document(
     message_id = _sha256_to_message_id(sha256)
     mime_type = _guess_mime_type(file_path)
     file_size = os.path.getsize(file_path)
-    file_mtime = datetime.fromtimestamp(os.path.getmtime(file_path)).isoformat()
+    # In UTC with a Z, as mail is dated: the host's wall time with no zone read as UTC, two or
+    # three hours late in Athens (schema v41 converted the rows stored so).
+    file_mtime = (
+        datetime.fromtimestamp(os.path.getmtime(file_path), UTC).isoformat().replace("+00:00", "Z")
+    )
     now = datetime.now().isoformat()
 
     label = source or Path(file_path).stem.replace("_", " ").replace("-", " ").title()

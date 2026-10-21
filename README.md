@@ -810,6 +810,8 @@ python -m src.cli maint reextract --stale --formats          # read with today's
 python -m src.cli maint reextract --ocr --limit 500          # OCR low-text scans and images again (grayscale second pass), in batches
 python -m src.cli maint ocr-regarble [--apply]              # find stored OCR text that is Greek read as Latin letters; --apply marks it and clears its summaries
 python -m src.cli maint refetch-garbled --limit 200         # producer: fetch back from the mailbox the swept originals of marked texts, by id, then by folder, time and subject; repeat until none is left to try
+python -m src.cli maint mail-attachments --since 2026-04-06 --until 2026-05-04 [--dry-run] [--limit N]   # stored mail with no attachment row: find its live message (id, Message-ID, or subject and time, never guessed) and download and register its files; resumable (src/export/legacy_mail.py)
+python -m src.cli maint mail-times [--dry-run]              # the Apple Mail exporter's received times a whole number of hours off Outlook's, set to Outlook's
 python -m src.cli maint reextract --garbled                 # read marked scans again, Greek first, and summarise the ones that now read
 python -m src.cli maint reextract --long --estimate          # price a re-summary before running it; changes nothing
 python -m src.cli maint reextract --long --no-spreadsheets   # documents only: leave workbooks out of the chosen rows and the estimate
@@ -1022,6 +1024,7 @@ skill/
 `data/brain.db` (SQLite). Migrations run automatically via `src/store/schema.py`, when a command that writes opens the store; the current schema version is `CURRENT_SCHEMA_VERSION` in `src/config.py` and is tracked in the `schema_version` table. [`docs/DEPLOY.md`](docs/DEPLOY.md#12-upgrading-a-producer), section 12, says when a migration wants the timers stopped.
 
 - **Core content**: `emails`, `topics`, `email_topics`, `decisions`, `action_items`, `commitments`, `people`, `email_people`, `key_facts`, and from v23 `email_html`: an HTML body is stored as the text a reader sees, and the HTML is kept here, zlib-compressed, for the SharePoint link scan and the inline-image positions
+- **Received times** (v41): `emails.date_received` is UTC with a `Z` for mail and documents (`2026-04-08T05:39:28Z`); news keeps its `+00:00`. Before v41 the retired Apple Mail exporter's rows (2025-03 to 2026-06) and standalone documents held Athens wall time with no zone; the migration converts them, DST aware, and `brain maint mail-times` sets from Outlook the rows a Mac in another zone wrote a whole number of hours off (384 on the replica of 2026-10-21, an hour each)
 - **Source class** (v33): `emails.source_class`, `NOT NULL DEFAULT 'mail'`, indexed (`idx_emails_source_class`). Set when a row is stored (the loader, `ingest_document`, `ingest_text_document`), by these rules, the first that matches:
 
   | Class | Rule |

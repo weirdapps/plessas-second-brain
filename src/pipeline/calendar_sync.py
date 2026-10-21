@@ -17,6 +17,20 @@ from src.pipeline import EXIT_REAUTH
 # the window, and a check that is always red is a check nobody reads.
 CALENDAR_FETCH_ALERT_RUNS = 3
 
+# How far back a plain run lists.
+LOOKBACK_DAYS = 7
+
+# An event changed after it left the plain run's week (a series edited, notes added to a
+# meeting gone by) kept its old etag and content for good: 15 of the 215 events of the 14
+# days around 2026-10-20 did. Once every DEEP_REFRESH_HOURS a plain run also lists the
+# DEEP_LOOKBACK_DAYS before that week, and fetches at most DEEP_FETCH_CAP changed events
+# there; a run the cap cut short leaves the rest to the next one. The time of the last
+# complete pass is kept in sync_metadata under DEEP_REFRESH_KEY.
+DEEP_REFRESH_KEY = "calendar_deep_listed"
+DEEP_REFRESH_HOURS = 24
+DEEP_LOOKBACK_DAYS = 30
+DEEP_FETCH_CAP = 100
+
 
 def _read_json_dict(path: Path) -> dict:
     import json
@@ -84,7 +98,7 @@ def _calendar_windows(conn, args, now: datetime) -> tuple[list[tuple[datetime, d
             )
         since = now - timedelta(days=365)
     else:
-        since = now - timedelta(days=7)
+        since = now - timedelta(days=LOOKBACK_DAYS)
     if not args.backfill:
         return [(since, until)], f"Calendar sync: {since.date()} to {until.date()}"
 
@@ -106,6 +120,43 @@ def _calendar_windows(conn, args, now: datetime) -> tuple[list[tuple[datetime, d
     if skipped:
         header += f"; {skipped} month(s) already listed in full skipped"
     return windows, header
+
+
+def _plain_run(args) -> bool:
+    return not (args.backfill or args.since or args.until)
+
+
+def _deep_refreshed_at(conn) -> datetime | None:
+    """When the last complete deep refresh began (DEEP_REFRESH_KEY), or None: none recorded,
+    or a value that does not read as a time with its zone."""
+    import sqlite3
+
+    try:
+        row = conn.execute(
+            "SELECT value FROM sync_metadata WHERE key = ?", (DEEP_REFRESH_KEY,)
+        ).fetchone()
+        last = datetime.fromisoformat(row[0]) if row else None
+    except (sqlite3.OperationalError, TypeError, ValueError):  # no sync_metadata yet
+        return None
+    return last if last is not None and last.tzinfo is not None else None
+
+
+def _deep_window(conn, args, now: datetime) -> tuple[datetime, datetime] | None:
+    """The older window a plain run also lists when the deep refresh is due (see
+    DEEP_REFRESH_KEY): the DEEP_LOOKBACK_DAYS before the plain run's week. None for a
+    backfill, a run given --since or --until, a refresh done in the last
+    DEEP_REFRESH_HOURS, and on a store that records none: the first plain run starts the
+    clock, as the consolidation's high-water mark does, so a new store or a new release
+    adds no listing to the run that meets it."""
+    from datetime import UTC, timedelta
+
+    last = _deep_refreshed_at(conn)
+    if not _plain_run(args) or last is None:
+        return None
+    if datetime.now(UTC) - last < timedelta(hours=DEEP_REFRESH_HOURS):
+        return None
+    end = now - timedelta(days=LOOKBACK_DAYS)
+    return end - timedelta(days=DEEP_LOOKBACK_DAYS), end
 
 
 def _calendar_unchanged(existing, list_change_key) -> bool:
@@ -191,6 +242,13 @@ def run(args):
 
     now = datetime.now()
     windows, header = _calendar_windows(conn, args, now)
+    # Listed after the plain window, so a run short of time has done the week first.
+    deep = _deep_window(conn, args, now)
+    if deep is not None:
+        windows.append(deep)
+        header += f"; changed events from {deep[0].date()} to {deep[1].date()}"
+    deep_fetched = deep_deferred = 0
+    deep_done = False
     print(header + (" (dry run: nothing is fetched or written)" if dry_run else ""))
 
     stats = {
@@ -229,8 +287,9 @@ def run(args):
             # can hold enough events to pass for a full one.
             mark_month_started(conn, month, datetime.now(UTC).isoformat())
         window_failures: list[str] = []
+        in_deep = (start, end) == deep
         try:
-            if args.backfill:
+            if args.backfill or in_deep:
                 # Each month on a bound of its own: a busy one splits into many calls.
                 raw_events = list_events(
                     start, end, failures=window_failures, max_calls=BACKFILL_LIST_CALLS
@@ -250,14 +309,18 @@ def run(args):
                 file=sys.stderr,
             )
             break
-        listed_until = end
+        # The furthest the listing reached: the deep window, listed last, ends earlier.
+        listed_until = end if listed_until is None else max(listed_until, end)
         print(
             f"  Fetched {len(raw_events)} events"
             + (f" for {month or start.date()}" if args.backfill else "")
         )
         for failure in window_failures:
             print(f"  Could not fetch {failure}", file=sys.stderr)
-        chunk_failures.extend(window_failures)
+        # A deep window listed in part is listed again on the next run (deep_done stays
+        # False); it says nothing about the plain window, so it does not fail the run.
+        if not in_deep:
+            chunk_failures.extend(window_failures)
         listed_ids = [raw.get("Id", "") for raw in raw_events]
         listed = set(listed_ids)
 
@@ -296,6 +359,13 @@ def run(args):
                 stats["skipped_unchanged"] += 1
                 unchanged_ids.append(event["outlook_event_id"])
                 continue
+            # The deep window fetches at most DEEP_FETCH_CAP; the rest wait for the next run.
+            if in_deep:
+                if deep_fetched >= DEEP_FETCH_CAP:
+                    stats["deferred"] += 1
+                    deep_deferred += 1
+                    continue
+                deep_fetched += 1
 
             # Fetch full event (list-calendar returns a subset without Attendees,
             # ResponseStatus, Type, SeriesMasterId etc. — get-event has everything)
@@ -462,6 +532,9 @@ def run(args):
             # backfill skips it, and coverage stops flagging it however few it holds.
             if month and len(failed_fetch_runs) == fetch_failures_before:
                 record_listed_month(conn, month, datetime.now(UTC).isoformat())
+            # Every changed event of the deep window fetched: done until it is due again.
+            if in_deep and not deep_deferred and len(failed_fetch_runs) == fetch_failures_before:
+                deep_done = True
         if session_expired:
             break
 
@@ -507,6 +580,14 @@ def run(args):
             stats["fetch_failed_known"] += 1
         else:
             stats["fetch_failed"] += 1
+
+    if deep_done or (_plain_run(args) and _deep_refreshed_at(conn) is None):
+        migrate_add_sync_metadata(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES (?, ?)",
+            (DEEP_REFRESH_KEY, datetime.now(UTC).isoformat()),
+        )
+        conn.commit()
 
     # Not either for a listing that never reached the present, as a backfill of
     # months gone by does not: it says nothing about the hourly window.

@@ -148,6 +148,21 @@ def test_an_email_that_both_fails_and_extracts_in_one_run_is_not_counted(run, mo
     assert json.loads(run.file("twice").read_text())["summary"] == "real"
 
 
+@pytest.mark.parametrize("kind", ["fault", "timeout"])
+def test_the_count_of_an_email_no_longer_staged_is_dropped(run, kind):
+    """An email that failed and then left staging (a copy of it loaded, its batch pruned) is
+    never offered again, so its count was kept for good: 65 such ids in the producer's state
+    on 2026-10-20, each also read as an email already failing by the model-down check."""
+    counts = {"fault": "failed_attempts", "timeout": "timeout_attempts"}[kind]
+    run.failure = lambda e: (e["message_id"], None, False, kind)
+    run([_mail("gone"), _mail("bad"), _mail("ok0")])
+    assert run.state()[counts] == {"gone": 1, "bad": 1}
+
+    run([_mail("bad"), _mail("ok1")])
+
+    assert run.state()[counts] == {"bad": 2}
+
+
 def test_quota_failures_never_count(run):
     run.failure = lambda e: (e["message_id"], None, True, None)
     for n in range(local.EMAIL_MAX_ATTEMPTS + 2):

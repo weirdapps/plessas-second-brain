@@ -47,16 +47,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from src.config import DEFAULT_DB, is_replica, replica_refusal
-from src.export.mail_reconcile import normalize_imid
+from src.export.mail_reconcile import LOCATION_KEY, normalize_imid
 from src.export.outlook_cli import OutlookCliAuthRequired, OutlookCliError, run_outlook_cli
+from src.export.refetch_garbled import received_span
 from src.store.schema import get_connection
 
 # Exit code for a run refused on a replica, the same as src.cli's. It was 5,
 # which every M365 wrapper here reads as "upstream misbehaved".
 REFUSED_ON_REPLICA = 2
 
-# sync_metadata key prefix of the per-email location record (see the docstring).
-LOCATION_KEY = "mail_location:"
+# sync_metadata key prefix of the per-email location record (see the docstring): defined
+# beside the mail reconcile, which reads the records too, as this module imports it.
 DELETED_ITEMS = "Deleted Items"
 # Listed beside the Inbox: the well-known alias outlook-cli resolves without a
 # folder lookup, and the name recorded. Later entries win, so mail in both reads
@@ -87,6 +88,40 @@ def list_folder_ids(folder: str, max_results: int = 5000) -> tuple[set[str], set
     outlook_ids = {m["Id"] for m in items if m.get("Id")}
     internet_ids = {m["InternetMessageId"] for m in items if m.get("InternetMessageId")}
     return outlook_ids, internet_ids
+
+
+def oldest_received(folder: str, max_results: int = 5000) -> datetime | None:
+    """When the oldest message in `folder` was received, or None when no time reads: one call.
+
+    None too for a listing that reached `max_results`: outlook-cli lists the newest first, so
+    a capped listing may have left out the oldest, and its oldest time would date the folder
+    too late. The Inbox listing before it is refused at the cap, but the Inbox can reach the
+    cap between the two calls."""
+    items = run_outlook_cli(
+        [
+            "list-mail",
+            "--folder",
+            folder,
+            "--select",
+            "ReceivedDateTime",
+            "--all",
+            "--max",
+            str(max_results),
+        ],
+        timeout_sec=120,
+    )
+    if len(items or []) >= max_results:
+        return None
+    times = []
+    for item in items or []:
+        try:
+            times.append(
+                datetime.fromisoformat(str(item["ReceivedDateTime"]).replace("Z", "+00:00"))
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    aware = [t for t in times if t.tzinfo is not None]
+    return min(aware) if aware else None
 
 
 def list_current_inbox_ids(max_results: int = 5000) -> tuple[set[str], set[str]]:
@@ -200,7 +235,27 @@ def reconcile_moves(
             if normalize_imid(r[1]) not in inbox_keys and str(r[0]) not in located
         ]
 
-        moved = by_outlook_id + by_internet_id
+        # Pass 3: AppleScript-sourced rows with no RFC822 Message-ID. Nothing matches
+        # them, so they stayed 'Inbox' for good (375 on 2026-10-21, against 71 messages
+        # in the live Inbox; 316 of them were in the live Archive). One received before the
+        # oldest message the Inbox holds cannot be in it. The Inbox is listed for its
+        # times only while such a row is left, and the exporter that wrote them is retired.
+        rows = conn.execute(
+            "SELECT message_id, date_received FROM emails WHERE mailbox_name = 'Inbox'"
+            " AND typeof(message_id) = 'integer' AND message_id >= 0"
+            " AND internet_message_id IS NULL"
+        ).fetchall()
+        oldest = oldest_received("Inbox", max_results) if rows else None
+        by_age = [
+            r[0]
+            for r in rows
+            if oldest is not None
+            and (span := received_span(r[1])) is not None
+            and span[1] < oldest
+            and str(r[0]) not in located
+        ]
+
+        moved = by_outlook_id + by_internet_id + by_age
         if moved:
             # Chunk the UPDATE — sqlite default parameter limit ~999.
             chunk = 500
@@ -220,6 +275,7 @@ def reconcile_moves(
         "scanned_inbox": len(outlook_ids),
         "by_outlook_id": len(by_outlook_id),
         "by_internet_id": len(by_internet_id),
+        "by_age": len(by_age),
         "moved": len(moved),
         "status": "ok",
     }
@@ -376,11 +432,12 @@ def main() -> int:
         return 75
 
     logger.info(
-        "Reconciled: live_inbox=%d moved=%d (by_outlook_id=%d by_internet_id=%d) → %s",
+        "Reconciled: live_inbox=%d moved=%d (by_outlook_id=%d by_internet_id=%d by_age=%d) → %s",
         result["scanned_inbox"],
         result["moved"],
         result["by_outlook_id"],
         result["by_internet_id"],
+        result.get("by_age", 0),
         args.target_mailbox,
     )
     if "located" in result:

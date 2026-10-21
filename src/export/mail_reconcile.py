@@ -12,16 +12,18 @@ A listed message counts as held when the store has it:
     staged           in a staging batch, on its way in (the producer's)
     by_subject_time  for a row stored before Message-IDs were captured (about
                      2026-04-20) only: the same subject, normalised on both sides,
-                     within SUBJECT_TIME_TOLERANCE. Old rows hold naive local time,
-                     newer ones UTC.
+                     within SUBJECT_TIME_TOLERANCE. Until schema v41 those rows held
+                     Athens wall time with no zone, read here as UTC; the tolerance
+                     still covers a store not yet migrated.
     newer            received after the store's newest mail: not synced yet
 
 and as missing otherwise. Listing goes through outlook-cli; the store is opened
-read-only, so the report runs on a replica. Two writes are the producer's alone:
+read-only, so the report runs on a replica. Three writes are the producer's alone:
 refetch() stages the missing messages by Graph id through the export's own path,
-so the next sync extracts and loads them, and record_aliases() notes the Graph id
+so the next sync extracts and loads them, record_aliases() notes the Graph id
 of every copy found by its Message-ID under another id, which lets the attachment
-registrar claim the directories downloaded under those ids.
+registrar claim the directories downloaded under those ids, and apply_relabels()
+gives a stored email found only in another walked folder that folder (plan_relabels).
 
 The producer's nightly attachment pass runs it over the last seven days with
 --refetch, and write_mail_loss() leaves what the health check reads in
@@ -55,6 +57,10 @@ logger = logging.getLogger(__name__)
 
 # The counters the health check reads, under the data home's state directory.
 MAIL_LOSS_FILE = "mail_loss.json"
+
+# sync_metadata key prefix of the record the Inbox reconcile keeps of a stored email found in
+# Deleted Items or Junk Email (src/export/inbox_reconcile.py), by the email's message_id.
+LOCATION_KEY = "mail_location:"
 
 DEFAULT_FOLDERS = ("Archive", "Sent Items", "Inbox")
 # The export's own spelling, which the store's mailbox_name carries.
@@ -156,6 +162,11 @@ class Store:
     imids: dict[str, int] = field(default_factory=dict)  # normalised Message-ID -> emails.id
     subject_times: dict[str, list[datetime]] = field(default_factory=dict)
     newest: datetime | None = None
+    # For --relabel: Graph id or alias -> emails.id, emails.id -> the folder it records, and
+    # the emails the Inbox reconcile records as deleted or junk (src/export/inbox_reconcile.py).
+    email_of: dict[str, int] = field(default_factory=dict)
+    mailbox_of: dict[int, str] = field(default_factory=dict)
+    located: set[int] = field(default_factory=set)
 
     def near(self, subject: str, when: datetime | None) -> bool:
         """Whether a row without a Message-ID has this subject within the tolerance."""
@@ -186,6 +197,8 @@ def read_store(conn: sqlite3.Connection) -> Store:
         "SELECT id, message_id, subject, date_received, mailbox_name FROM emails"
     ):
         store.message_ids.add(str(message_id))
+        store.email_of[str(message_id)] = email_id
+        store.mailbox_of[email_id] = mailbox
         if mailbox in NOT_MAIL:
             continue
         when = parse_when(received)
@@ -200,9 +213,19 @@ def read_store(conn: sqlite3.Connection) -> Store:
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'email_aliases'"
     ).fetchone()
     if has_aliases:
-        store.message_ids.update(
-            str(r[0]) for r in conn.execute("SELECT message_id FROM email_aliases")
-        )
+        for alias, email_id in conn.execute("SELECT message_id, email_id FROM email_aliases"):
+            store.message_ids.add(str(alias))
+            store.email_of.setdefault(str(alias), email_id)
+    has_metadata = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_metadata'"
+    ).fetchone()
+    if has_metadata:
+        for (key,) in conn.execute(
+            "SELECT key FROM sync_metadata WHERE key GLOB ?", (LOCATION_KEY + "*",)
+        ):
+            email_id = store.email_of.get(key[len(LOCATION_KEY) :])
+            if email_id is not None:
+                store.located.add(email_id)
     return store
 
 
@@ -231,8 +254,11 @@ def read_staged(staging_dir: Path | None) -> tuple[set[str], set[str]]:
     return ids, imids
 
 
-def list_folder(folder: str, since: datetime, until: datetime) -> list[dict]:
-    """Every message in `folder` received in [since, until), a window at a time."""
+def list_folder(
+    folder: str, since: datetime, until: datetime, select: str = LIST_SELECT
+) -> list[dict]:
+    """Every message in `folder` received in [since, until), a window at a time, with the
+    fields `select` names."""
     items: dict[str, dict] = {}
     start = since
     while start < until:
@@ -252,7 +278,7 @@ def list_folder(folder: str, since: datetime, until: datetime) -> list[dict]:
                 "--top",
                 str(LIST_PAGE),
                 "--select",
-                LIST_SELECT,
+                select,
             ],
             timeout_sec=LIST_TIMEOUT_S,
         )
@@ -308,6 +334,8 @@ class Report:
     missing: list[dict] = field(default_factory=list)
     # (Graph id, emails.id) of each copy found by its Message-ID under another id.
     copies: list[tuple[str, int]] = field(default_factory=list)
+    # (emails.id, the folder it records, a folder that holds it): see plan_relabels.
+    relabels: list[tuple[int, str, str]] = field(default_factory=list)
 
     def as_json(self) -> dict:
         return {
@@ -337,10 +365,19 @@ def reconcile(
     staged = read_staged(staging_dir)
     cutoff = min(store.newest, until) if store.newest else None
     report = Report(since=since, until=until, cutoff=cutoff)
+    held_in: dict[int, list[str]] = defaultdict(list)
+    walked: list[str] = []
     for name in folders:
         folder = canonical_folder(name)
+        walked.append(folder)
         listed = list_folder(folder, since, until)
         kinds = classify(listed, store, staged, cutoff)
+        for m in kinds["by_id"]:
+            holder = store.email_of.get(str(m.get("Id")))
+            if holder is not None:
+                held_in[holder].append(folder)
+        for m in kinds["by_rfc822_id"]:
+            held_in[store.imids[normalize_imid(m.get("InternetMessageId"))]].append(folder)
         report.counts[folder] = {"listed": len(listed), **{k: len(v) for k, v in kinds.items()}}
         report.missing.extend(
             {
@@ -357,7 +394,43 @@ def reconcile(
             for m in kinds["by_rfc822_id"]
         )
     report.missing.sort(key=lambda m: str(m.get("ReceivedDateTime") or ""))
+    report.relabels = plan_relabels(store, held_in, walked)
     return report
+
+
+def plan_relabels(
+    store: Store, held_in: dict[int, list[str]], walked: list[str]
+) -> list[tuple[int, str, str]]:
+    """(emails.id, the folder it records, the first walked folder holding it) for each stored
+    email the walk found only in folders other than its own, when its own was walked too.
+
+    The owner sends with a copy to himself and clears Sent Items, so his message is stored
+    under the folder of the copy it was stored from while Outlook holds it elsewhere: on
+    2026-10-20, 44 messages of the last 30 days stored as 'Sent Items' were in the live Inbox
+    or Archive. An email the Inbox reconcile records as deleted or junk keeps its label: that
+    record is its, and says where the message went.
+    """
+    relabels = []
+    for email_id, folders in held_in.items():
+        recorded = store.mailbox_of.get(email_id)
+        own = canonical_folder(recorded or "")
+        if recorded is None or own not in walked or own in folders or email_id in store.located:
+            continue
+        relabels.append((email_id, recorded, folders[0]))
+    return sorted(relabels)
+
+
+def apply_relabels(conn: sqlite3.Connection, relabels: list[tuple[int, str, str]]) -> int:
+    """Write each new folder while the email still records the one read; how many."""
+    written = 0
+    for email_id, recorded, folder in relabels:
+        cur = conn.execute(
+            "UPDATE emails SET mailbox_name = ? WHERE id = ? AND mailbox_name = ?",
+            (folder, email_id, recorded),
+        )
+        written += cur.rowcount
+    conn.commit()
+    return written
 
 
 def record_aliases(conn: sqlite3.Connection, copies: list[tuple[str, int]]) -> int:

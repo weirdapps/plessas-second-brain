@@ -2175,8 +2175,59 @@ def check_news(db, news_db=None, now=None):
 
     result["lag"] = _utc(upstream) - ingested_at
     result["stale"] = result["lag"] > STALE_THRESHOLDS["news"]
+    missing = _news_digest_not_arrived(db, path, now)
+    if missing is not None:
+        result["unarrived"] = missing
+        result["stale"] = True
     result["status"] = "STALE" if result["stale"] else "OK"
     return result
+
+
+# How long a digest news-reader has written may take to reach the store. sb-news-sync stages
+# at :50 on even hours with up to two minutes of jitter and, since 2026-10-21, loads in the
+# same run: at most ten minutes waiting for a load already running, then a few to load. So
+# a digest is in the store at most about 2 h 17 min after it is written. The 12-hour lag
+# above never fired: it compares the newest upstream item of ANY relevance with the newest
+# ingested one, and before the 08:50 staging that gap is eight to ten healthy hours after
+# the quiet night, so its threshold had to sit above that. A digest, written every one to
+# two hours through the day, either arrived within its cycle or did not.
+NEWS_ARRIVAL_GRACE = timedelta(hours=2, minutes=30)
+
+
+def _news_digest_not_arrived(db, news_db: Path, now: datetime) -> str | None:
+    """When the newest digest that should be in the store by now is not, when it was written.
+
+    Only the digests `news-sync` stages (src/export/news_export.py): a pipeline it reads,
+    a synthesis with text. None also when the upstream holds none, or has no such columns.
+    """
+    from src.export.news_export import PIPELINES
+
+    cutoff = now - NEWS_ARRIVAL_GRACE
+    placeholders = ",".join("?" * len(PIPELINES))
+    try:
+        con = sqlite3.connect(f"file:{news_db}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = con.execute(
+                "SELECT id, pipeline, created_at FROM digests"
+                f" WHERE pipeline IN ({placeholders})"
+                " AND length(trim(COALESCE(synthesis_text, ''), ' ' || char(9, 10, 13))) > 0"
+                " ORDER BY created_at DESC LIMIT 50",
+                list(PIPELINES),
+            ).fetchall()
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+    for digest_id, pipeline, created_at in rows:
+        written = _utc(created_at)
+        if written is None or written > cutoff:
+            continue
+        held = db.execute(
+            "SELECT 1 FROM emails WHERE message_id = ?",
+            (f"news:synthesis:{pipeline}:{digest_id}",),
+        ).fetchone()
+        return None if held else str(created_at)
+    return None
 
 
 def _replica_is_fresh(db_path: Path | None = None, now: datetime | None = None) -> bool:
@@ -2409,12 +2460,13 @@ def check_sentinels(state_dir: Path | None = None):
 
     Two filenames were hardcoded, so a `needs_*` file written by any job added
     later was invisible — a blocking condition nobody would ever be told about.
-    The two known names stay in the set so they still report absent-and-OK when
-    the state dir is empty.
+    The known names stay in the set so they still report absent-and-OK when
+    the state dir is empty. `age` is how long one has been up: its writers create it
+    only when absent, so its mtime is the moment it went up.
     """
     state_dir = state_dir or STATE_DIR
     results = {}
-    known = ("needs_reauth", "needs_gcloud_reauth")
+    known = ("needs_reauth", "needs_gcloud_reauth", "needs_teams_reauth")
     discovered = {p.name for p in state_dir.glob("needs_*")} if state_dir.exists() else set()
     sentinels = {name: state_dir / name for name in sorted(discovered.union(known))}
     for name, path in sentinels.items():
@@ -2423,11 +2475,375 @@ def check_sentinels(state_dir: Path | None = None):
             results[name] = {
                 "present": True,
                 "since": mtime.isoformat(),
+                "age": max(timedelta(0), datetime.now() - mtime),
                 "status": "BLOCKING",
             }
         else:
             results[name] = {"present": False, "status": "OK"}
     return results
+
+
+# --- AUTH: the sessions the jobs depend on ---------------------------------------------------
+#
+# On 2026-10-20 the Outlook, Teams and gcloud sessions all lapsed while the Mac's token push
+# could not reach the producer, and the nightly report had no row for any of them. Each row
+# reads only the expiry its session file records, never a token or a cookie.
+OUTLOOK_SESSION = Path.home() / ".outlook-cli" / "session.json"
+TEAMS_SESSION = Path.home() / ".teams-cli" / "session.json"
+TEAMS_MULTI_TOKENS = Path.home() / ".teams-cli" / "multi-tokens.json"
+# REQUIRED_AUDIENCES in teams-access's src/commands/auth-renew.ts: what teams-sync needs.
+TEAMS_REQUIRED_AUDIENCES = (
+    "https://graph.microsoft.com",
+    "https://chatsvcagg.teams.microsoft.com",
+)
+# The required audiences live about an hour and the Mac's push renews them every 15
+# minutes, so at 23:50 a Mac asleep since late evening leaves them lapsed by under an hour,
+# most nights. Lapsed longer than this, the push has stopped while the Mac was up, as on
+# 2026-10-20: a WARN. Teams ingest itself is judged under LAST 24 HOURS.
+TEAMS_TOKEN_EXPIRED_WARN = timedelta(hours=2)
+# Where sb-auth-watch.sh looks for gcloud, in its order (auth_check_gcloud_adc).
+GCLOUD_CANDIDATES = (
+    "/opt/homebrew/bin/gcloud",
+    str(Path.home() / "google-cloud-sdk" / "bin" / "gcloud"),
+    "/usr/local/bin/gcloud",
+    "/usr/bin/gcloud",
+)
+GCLOUD_PROBE_TIMEOUT_S = 60
+
+
+def _json_file(path: Path):
+    """The parsed file, or None when it is absent; raises ValueError when unreadable."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise ValueError(f"{path.name} unreadable ({type(e).__name__})") from None
+
+
+def check_outlook_session(path: Path | None = None, now: datetime | None = None) -> dict:
+    """The outlook-cli session's expiry: `bearer.expiresAt`, which outlook-access derives
+    from the token's own exp claim (src/session/schema.ts) and judges expiry by."""
+    path = Path(path or OUTLOOK_SESSION)
+    now = now or datetime.now(UTC)
+    row: dict = {"name": "Outlook session", "remaining": None}
+    try:
+        data = _json_file(path)
+    except ValueError as e:
+        return {**row, "status": "FAIL", "note": str(e)}
+    if data is None:
+        return {**row, "status": "N/A", "note": "no session file"}
+    raw = (data.get("bearer") or {}).get("expiresAt") if isinstance(data, dict) else None
+    expires = _utc(raw) if isinstance(raw, str) else None
+    if expires is None:
+        return {**row, "status": "FAIL", "note": "no readable bearer.expiresAt"}
+    remaining = expires - now
+    row["remaining"] = remaining
+    stamp = expires.strftime("%Y-%m-%d %H:%M UTC")
+    if remaining <= timedelta(0):
+        return {**row, "status": "FAIL", "note": f"expired {stamp}; the mail export is down"}
+    return {**row, "status": "OK", "note": f"expires in {format_age(remaining)} ({stamp})"}
+
+
+def _audience_expiries(data) -> dict:
+    """{audience: exp seconds} from session.json's `tokens`, or multi-tokens.json's top level."""
+    tokens = data.get("tokens") if isinstance(data, dict) and "tokens" in data else data
+    if not isinstance(tokens, dict):
+        return {}
+    return {
+        aud: entry.get("exp")
+        for aud, entry in tokens.items()
+        if isinstance(entry, dict) and isinstance(entry.get("exp"), int | float)
+    }
+
+
+def check_teams_session(
+    path: Path | None = None, now: datetime | None = None, multi_path: Path | None = None
+) -> dict:
+    """The Teams session's shortest-lived required audience, from the `exp` each
+    per-audience token carries: session.json's `tokens` (what teams-cli reads), else
+    multi-tokens.json (the per-audience map the capture writes)."""
+    now = now or datetime.now(UTC)
+    row: dict = {"name": "Teams session", "remaining": None, "audience": None}
+    expiries: dict = {}
+    for candidate in (Path(path or TEAMS_SESSION), Path(multi_path or TEAMS_MULTI_TOKENS)):
+        try:
+            data = _json_file(candidate)
+        except ValueError as e:
+            return {**row, "status": "FAIL", "note": str(e)}
+        if data is not None:
+            expiries = _audience_expiries(data)
+            break
+    else:
+        return {**row, "status": "N/A", "note": "no session file"}
+    missing = [aud for aud in TEAMS_REQUIRED_AUDIENCES if aud not in expiries]
+    if missing:
+        return {**row, "status": "FAIL", "note": "no token for " + ", ".join(missing)}
+    audience = min(TEAMS_REQUIRED_AUDIENCES, key=lambda aud: expiries[aud])
+    remaining = datetime.fromtimestamp(expiries[audience], UTC) - now
+    row.update(remaining=remaining, audience=audience)
+    if remaining > timedelta(0):
+        return {**row, "status": "OK", "note": f"{audience} expires in {format_age(remaining)}"}
+    lapsed = -remaining
+    if lapsed > TEAMS_TOKEN_EXPIRED_WARN:
+        return {
+            **row,
+            "status": "WARN",
+            "note": f"{audience} expired {format_age(lapsed)} ago: no token push since",
+        }
+    return {
+        **row,
+        "status": "OK",
+        "note": f"{audience} expired {format_age(lapsed)} ago; the next push renews it",
+    }
+
+
+def _gcloud_bin() -> str | None:
+    for candidate in GCLOUD_CANDIDATES:
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which("gcloud")
+
+
+def check_gcloud_adc(gcloud: str | None = None, run=None) -> dict:
+    """Can gcloud's application-default credential still mint an access token?
+
+    The probe sb-auth-watch.sh runs. The token goes to /dev/null, never into this
+    process, and so does stderr; only the exit status is read.
+    """
+    run = run or subprocess.run
+    row: dict = {"name": "gcloud ADC"}
+    gcloud = gcloud or _gcloud_bin()
+    if not gcloud:
+        return {**row, "status": "N/A", "note": "gcloud not installed"}
+    try:
+        result = run(
+            [gcloud, "auth", "application-default", "print-access-token"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=GCLOUD_PROBE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return {**row, "status": "FAIL", "note": f"no answer in {GCLOUD_PROBE_TIMEOUT_S} s"}
+    except OSError as e:
+        return {**row, "status": "FAIL", "note": f"could not run gcloud ({type(e).__name__})"}
+    if result.returncode != 0:
+        return {
+            **row,
+            "status": "FAIL",
+            "note": f"cannot mint an access token (exit {result.returncode}): extraction is down",
+        }
+    return {**row, "status": "OK", "note": "mints an access token"}
+
+
+def check_auth() -> list[dict]:
+    return [check_outlook_session(), check_teams_session(), check_gcloud_adc()]
+
+
+# --- LAST 24 HOURS: what each job did, from the user journal ---------------------------------
+#
+# The report judged each job by systemd's last Result, so a day of failures and skips that
+# ended in one good run read as healthy (2026-10-20, above). The user journal holds every
+# run: the job result systemd logs at each run's end, and the exit status of each one that
+# failed. One read for the jobs, one for the exits, a few hundred lines a day, no wrapper
+# log format to parse.
+RECENT_WINDOW = timedelta(hours=24)
+# Back far enough to find the good run before the window, which a daily job had a day ago.
+RECENT_LOOKBACK = timedelta(hours=48)
+# The widest gap between good runs each job's timer allows on the reference producer
+# (docs/DEPLOY.md section 6), plus its jitter and the run itself, with slack.
+JOB_MAX_GAP = {
+    # 01:10 and 07:10 to 22:10: the 01 -> 07 night is six hours.
+    "sb-outlook-sync.service": timedelta(hours=7),
+    "sb-teams-sync.service": timedelta(hours=7),
+    "sb-whatsapp-sync.service": timedelta(hours=7),
+    # 07:48 to 22:48: nine hours overnight.
+    "sb-calendar-sync.service": timedelta(hours=10),
+    # Every 15 minutes, 07:00 to 21:45: nine and a quarter hours overnight.
+    "sb-briefs.service": timedelta(hours=10),
+    # Even hours at :50.
+    "sb-news-sync.service": timedelta(hours=3),
+    # 08:45, 14:45, 20:45: twelve hours overnight.
+    "sb-conversation-sync.service": timedelta(hours=13),
+    # Every four hours, with five minutes of jitter.
+    "sb-auth-watch.service": timedelta(hours=5),
+}
+# A job with a timer and no entry above runs at least daily: daily sync, noon catch-up,
+# attachments, topic pages, the health check itself.
+JOB_MAX_GAP_DEFAULT = timedelta(hours=26)
+# What a wrapper exits when it skipped work on a re-auth sentinel (EX_UNAVAILABLE).
+EXIT_SKIPPED_ON_SENTINEL = 69
+# systemd's catalog id for "<unit>: Main process exited, code=..., status=...".
+_JOURNAL_EXIT_MESSAGE_ID = "98e322203f7a4ed290d09fe03c09fe15"
+
+
+def _journalctl_bin() -> str:
+    for candidate in ("/usr/bin/journalctl", "/bin/journalctl"):
+        if os.path.exists(candidate):
+            return candidate
+    return shutil.which("journalctl") or "journalctl"
+
+
+def _journal(run, since: datetime, *matches: str) -> list[dict]:
+    """The user journal's sb-* records since `since`, as dicts; raises OSError when unreadable."""
+    cmd = [
+        _journalctl_bin(),
+        "--user",
+        f"--since=@{int(since.timestamp())}",
+        "--no-pager",
+        "-o",
+        "json",
+        "-u",
+        "sb-*",
+        *matches,
+    ]
+    try:
+        result = run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise OSError(f"journalctl did not run ({type(e).__name__})") from None
+    if result.returncode != 0:
+        raise OSError(f"journalctl exit {result.returncode}")
+    records = []
+    for line in (result.stdout or "").splitlines():
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            continue
+    return records
+
+
+def _active_timer_services(run) -> set[str] | None:
+    """The services whose sb-* timer is active, or None when systemctl cannot say."""
+    try:
+        result = run(
+            [
+                systemctl_bin(),
+                "--user",
+                "list-units",
+                "--type=timer",
+                "--all",
+                "--no-legend",
+                "--plain",
+                "sb-*",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    services = set()
+    for line in (result.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[0].endswith(".timer") and parts[2] == "active":
+            services.add(parts[0].removesuffix(".timer") + ".service")
+    return services
+
+
+def _job_verdict(desc: str, runs: list, now: datetime, max_gap: timedelta | None) -> dict:
+    """One job's day from its runs, [(ended, ok, exit status)] in time order."""
+    window_start = now - RECENT_WINDOW
+    recent = [r for r in runs if r[0] >= window_start]
+    failed = [r for r in recent if not r[1]]
+    skipped = [r for r in failed if r[2] == EXIT_SKIPPED_ON_SENTINEL]
+    good = [r[0] for r in runs if r[1]]
+    # Every stretch between good runs that reaches into the window, and the open one to
+    # now. With no good run in the lookback the stretch is at least the lookback.
+    gaps = [b - a for a, b in zip(good, good[1:], strict=False) if b >= window_start]
+    gaps.append(now - good[-1] if good else RECENT_LOOKBACK)
+    longest = max(gaps)
+    job = {
+        "desc": desc,
+        "runs": len(recent),
+        "failed": len(failed),
+        "skipped": len(skipped),
+        "codes": Counter(r[2] for r in failed),
+        "longest_gap": longest,
+        "max_gap": max_gap,
+        "status": "OK",
+    }
+    if max_gap is not None and longest > max_gap:
+        job["status"] = "STALE"
+    elif skipped:
+        job["status"] = "WARN"
+    return job
+
+
+def check_recent_runs(units: dict, now: datetime | None = None, run=None) -> dict:
+    """Per scheduled job: the runs of the last 24 hours that failed or were skipped on a
+    re-auth sentinel, and the longest stretch without a good run, against its timer.
+
+    STALE when that stretch is longer than the timer allows: missing work, even when the
+    job has recovered by report time. WARN when runs were skipped on a sentinel (exit 69)
+    inside it. A failure the next run or a retry made good is counted, not an issue.
+    Long-running services and jobs whose timer is off are not held to a gap.
+    """
+    run = run or subprocess.run
+    now = now or datetime.now(UTC)
+    if IS_MACOS:
+        return {"status": "N/A", "note": "the jobs run on the producer", "jobs": {}}
+    since = now - RECENT_LOOKBACK
+    try:
+        jobs = _journal(run, since, "JOB_TYPE=start")
+        exits = _journal(run, since, f"MESSAGE_ID={_JOURNAL_EXIT_MESSAGE_ID}")
+    except OSError as e:
+        return {"status": "WARN", "note": f"the journal could not be read: {e}", "jobs": {}}
+    status_of = {
+        r.get("USER_INVOCATION_ID"): int(r["EXIT_STATUS"])
+        for r in exits
+        if str(r.get("EXIT_STATUS", "")).isdigit()
+    }
+    runs: dict[str, list] = {}
+    for r in jobs:
+        result = r.get("JOB_RESULT")
+        unit = str(r.get("USER_UNIT") or r.get("UNIT") or "")
+        if not result or unit not in units:
+            continue
+        try:
+            ended = datetime.fromtimestamp(int(r["__REALTIME_TIMESTAMP"]) / 1_000_000, UTC)
+        except (KeyError, ValueError):
+            continue
+        ok = result == "done"
+        runs.setdefault(unit, []).append(
+            (ended, ok, None if ok else status_of.get(r.get("USER_INVOCATION_ID")))
+        )
+    timers = _active_timer_services(run)
+    out: dict[str, dict] = {}
+    for unit, desc in units.items():
+        if unit in SYSTEMD_SERVICES:
+            continue
+        timed = timers is None or unit in timers
+        max_gap = JOB_MAX_GAP.get(unit, JOB_MAX_GAP_DEFAULT) if timed else None
+        out[unit] = _job_verdict(desc or unit, sorted(runs.get(unit, [])), now, max_gap)
+    worst = "OK"
+    for job in out.values():
+        if job["status"] == "STALE":
+            worst = "STALE"
+        elif job["status"] == "WARN" and worst == "OK":
+            worst = "WARN"
+    return {"status": worst, "note": "", "jobs": out}
+
+
+def recent_run_line(job: dict) -> str:
+    """What a job's day comes to, for the report and its issue list."""
+    parts = []
+    if job["max_gap"] is not None and job["status"] == "STALE":
+        parts.append(
+            f"{format_age(job['longest_gap'])} without a good run"
+            f" (its timer allows {format_age(job['max_gap'])})"
+        )
+    if job["skipped"]:
+        runs = "run" if job["skipped"] == 1 else "runs"
+        parts.append(f"{job['skipped']} {runs} skipped on a re-auth sentinel (exit 69)")
+    others = job["failed"] - job["skipped"]
+    if others:
+        codes = ", ".join(
+            f"{code if code is not None else '?'} x{n}"
+            for code, n in sorted(job["codes"].items(), key=lambda kv: str(kv[0]))
+            if code != EXIT_SKIPPED_ON_SENTINEL
+        )
+        parts.append(f"{others} failed ({codes})")
+    return "; ".join(parts)
 
 
 def check_wrapper_drift(repo_root: Path | None = None, bin_dir: Path | None = None):
@@ -2514,7 +2930,7 @@ def format_age(td):
     return f"{total_secs // 86400}d {(total_secs % 86400) // 3600}h"
 
 
-def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
+def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None, auth=None, recent=None):
     now = datetime.now()
     lines = []
     issues = []
@@ -2537,7 +2953,9 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
         lines.append("")
         lines.append("BLOCKING SENTINELS:")
         for s in blocking:
-            lines.append(f"  {s}: present since {sentinels[s]['since']}")
+            age = sentinels[s].get("age")
+            held = f" ({format_age(age)})" if age is not None else ""
+            lines.append(f"  {s}: present since {sentinels[s]['since']}{held}")
         issues.extend(blocking)
 
     # Data sources
@@ -2665,7 +3083,12 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
             if not_content:
                 extra = extra[:-1] + f"; {not_content} not content)"
         elif c["name"] == "News":
-            if c.get("stale"):
+            if c.get("unarrived"):
+                extra = (
+                    f" (a digest written {str(c['unarrived'])[:16]} is not in the store"
+                    f" {format_age(NEWS_ARRIVAL_GRACE)} on)"
+                )
+            elif c.get("stale"):
                 extra = f" (upstream {format_age(c.get('lag'))} ahead of last ingested)"
             elif c.get("note"):
                 extra = f" ({c['note']})"
@@ -2730,6 +3153,40 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None):
         lines.append("")
         lines.append("  NOTE: job health is not verifiable from this host — these jobs run on")
         lines.append("        the VPS and are asserted by the health check that runs there.")
+
+    # The sessions the jobs run on, read from their own files (check_auth). Outside the
+    # DATA SOURCES block on purpose: the freshness ping judges the data, and a session that
+    # lapsed shows there once its source goes stale.
+    if auth:
+        lines.append("")
+        lines.append("AUTH")
+        lines.append("-" * 55)
+        for row in auth:
+            lines.append(f"  {row['name']:<28} {row['status']:<6} {row.get('note', '')}")
+            if row["status"] in ("FAIL", "WARN", "STALE"):
+                issues.append(f"{row['name']}: {row['status']}")
+
+    # The day behind the report (check_recent_runs): a job that failed or skipped for hours
+    # and recovered by 23:50 reads OK under SCHEDULED JOBS, which sees only the last run.
+    if recent and recent.get("status") != "N/A":
+        lines.append("")
+        lines.append("LAST 24 HOURS")
+        lines.append("-" * 55)
+        if recent.get("note"):
+            lines.append(f"  {recent['note']}")
+            if recent["status"] != "OK":
+                issues.append(f"Last 24 hours: {recent['note']}")
+        clean = 0
+        for _unit, job in sorted(recent.get("jobs", {}).items(), key=lambda kv: kv[1]["desc"]):
+            said = recent_run_line(job)
+            if not said:
+                clean += 1
+                continue
+            lines.append(f"  {job['desc']:<28} {job['status']:<6} {said}")
+            if job["status"] != "OK":
+                issues.append(f"{job['desc']}: {said}")
+        if clean:
+            lines.append(f"  {clean} more jobs ran clean")
 
     # Job logs. This result used to be computed and dropped: build_report took
     # `logs` and never read it, so a job holding a healthy systemd unit while
@@ -3213,6 +3670,8 @@ def main():
     logs = check_sync_logs()
     sentinels = check_sentinels()
     wrappers = check_wrapper_drift()
+    auth = check_auth()
+    recent = check_recent_runs({} if IS_MACOS else systemd_units())
 
     # Detect fixable issues
     fixable = []
@@ -3237,7 +3696,9 @@ def main():
 
     fix_actions = auto_fix(fixable) if args.fix else []
 
-    text_report, issues = build_report(checks, jobs, logs, sentinels, fix_actions, wrappers)
+    text_report, issues = build_report(
+        checks, jobs, logs, sentinels, fix_actions, wrappers, auth=auth, recent=recent
+    )
     print(text_report)
 
     # Before the email, not after: a send_email failure exits 1, and the ping is

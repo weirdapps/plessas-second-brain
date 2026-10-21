@@ -39,6 +39,7 @@ from src.cli import main as cli_main
 # 210s reserve (max_call 120 + shutdown grace 90) is held back.
 UNIT_TIMEOUT_AND_BUDGET = {
     "sb-attachments": (3600, 3390),
+    "sb-briefs": (300, 90),
     "sb-calendar-sync": (900, 690),
     "sb-conversation-sync": (900, 690),
     "sb-daily-sync": (1800, 1590),
@@ -181,7 +182,7 @@ def test_the_checked_in_timeout_table_is_what_production_actually_reads(unit, bu
     assert llm_deadline._llm_budget_seconds(unit, 120.0) == budget
 
 
-def test_the_timeout_table_holds_exactly_the_eight_scheduled_units():
+def test_the_timeout_table_holds_exactly_the_scheduled_units():
     """Set equality, so an ADDED key is caught as well as a changed or renamed one.
 
     The per-unit test above cannot see a spurious eleventh entry: nothing asks about a
@@ -198,20 +199,21 @@ def test_the_timeout_table_holds_exactly_the_eight_scheduled_units():
 def test_every_scheduled_unit_has_a_positive_margin():
     """Nothing in the estate refuses to boot under the 210s reserve.
 
-    The smallest unit is 600s and lands at +390. Verified independently rather than
-    taken on trust, because a reserve that bricks a production unit is the one failure
-    mode of this whole mechanism.
+    The smallest unit is sb-briefs at 300s, which lands at +90: one call and its
+    grace, no more (added 2026-10-21; until then the smallest was 600s at +390).
+    Verified independently rather than taken on trust, because a reserve that bricks
+    a production unit is the one failure mode of this whole mechanism.
 
     Would this pass with the behaviour removed? It is a guard rather than a behaviour,
     so the mutation it answers is to the reserve, not to this file: any reserve at or
-    above 600 makes _llm_budget_seconds raise for the 10-minute unit and this test
+    above 300 makes _llm_budget_seconds raise for the 5-minute unit and this test
     error out.
     """
     margins = {
         unit: llm_deadline._llm_budget_seconds(unit, 120.0, unit_timeout_seconds=timeout)
         for unit, (timeout, _) in UNIT_TIMEOUT_AND_BUDGET.items()
     }
-    assert min(margins.values()) == 390
+    assert min(margins.values()) == 90
     assert all(m > 0 for m in margins.values())
 
 

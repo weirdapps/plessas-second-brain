@@ -268,3 +268,61 @@ def test_a_dry_run_calls_nothing_and_sends_nothing(store, tmp_path, monkeypatch)
 
     assert (calls, sent, stats["qualified"]) == ([], [], 1)
     assert not (tmp_path / "state" / "briefs.jsonl").exists()
+
+
+# ------------------------------------------------------------ the deadline
+#
+# sb-briefs runs under TimeoutStartSec=300 and had no LLM deadline: the unit was not in
+# src/llm_deadline's table, so each call's policy planned against the flat 900 s default
+# and a slot with two meetings could start a second call that systemd would kill. The
+# unit's deadline is now installed like every other unit's, and no brief starts after it.
+
+TWO = [OUTSIDER, ("Other Partner", "other@partner.example.org")]
+
+
+def _two_meetings(store):
+    _meeting(store, [TWO[0]])
+    _meeting(store, [TWO[1]], minutes=40)
+
+
+def test_no_brief_starts_once_the_units_deadline_has_passed(store, tmp_path, monkeypatch):
+    calls: list = []
+    _reply(monkeypatch, calls)
+    _two_meetings(store)
+    # Read once for the deadline itself, then before each brief.
+    clock = iter([1000.0, 1000.0, 1200.0])
+
+    stats = briefs.run_briefs(
+        store,
+        now=NOW,
+        environ={**ENV, "PTS_LLM_DEADLINE": "1100"},
+        pattern=PATTERN,
+        send=lambda *a: True,
+        log=tmp_path / "state" / "briefs.jsonl",
+        say=lambda _: None,
+        clock=lambda: next(clock),
+    )
+
+    assert (len(calls), stats["sent"], stats["deferred"]) == (1, 1, 1)
+    log = (tmp_path / "state" / "briefs.jsonl").read_text().splitlines()
+    records = [json.loads(line) for line in log]
+    assert [r.get("error") for r in records] == [None, "deadline"]
+    assert records[1]["sent"] is False
+
+
+def test_without_a_unit_deadline_every_due_brief_is_written(store, tmp_path, monkeypatch):
+    calls: list = []
+    _reply(monkeypatch, calls)
+    _two_meetings(store)
+
+    stats, sent = _run(store, tmp_path)
+
+    assert (len(calls), len(sent), stats["deferred"]) == (2, 2, 0)
+
+
+def test_the_briefs_unit_has_a_deadline():
+    from src import llm_deadline
+
+    assert llm_deadline._UNIT_TIMEOUT_SECONDS["sb-briefs"] == 300
+    # 300 s less one worst-case call (120) and the shutdown grace (90).
+    assert llm_deadline._llm_budget_seconds("sb-briefs", 120.0) == 90

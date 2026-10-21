@@ -2164,6 +2164,16 @@ def main():
         help="wide workbooks summarised from a digest that left out their newest columns",
     )
     parser_reextract.add_argument(
+        "--decoding",
+        action="store_true",
+        help="UTF-16 texts stored as Latin-1, Word files whose converter output failed to decode",
+    )
+    parser_reextract.add_argument(
+        "--failed",
+        action="store_true",
+        help="summaries that failed under a call shape before v2-text (2026-10-16)",
+    )
+    parser_reextract.add_argument(
         "--no-spreadsheets",
         action="store_true",
         dest="no_spreadsheets",
@@ -3032,6 +3042,10 @@ def main():
     consolidate.add_maint_parser(maint_subparsers)
     entities.add_maint_parser(maint_subparsers)
     topic_canon.add_maint_parser(maint_subparsers)
+    # strip-nul (src/store/nul_text.py): maint-only, with no old spelling.
+    from src.store import nul_text
+
+    nul_text.add_maint_parser(maint_subparsers)
 
     # Parse and execute
     args = parser.parse_args()

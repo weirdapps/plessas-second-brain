@@ -200,6 +200,20 @@ def test_planning_again_changes_nothing(tmp_path):
     assert set(plan.spans) == {attachment_id}
 
 
+def test_a_text_holding_a_nul_is_cut_once(tmp_path):
+    """SQLite's length() stops at a NUL, and the chunk key took the length both ways: three
+    documents on the producer were cut again on every pass, 52 times in a week, and each time
+    their chunk vectors were dropped and paid for again (audit 2026-10-20)."""
+    conn = _store(tmp_path)
+    text = _paragraphs(20)
+    attachment_id = factories.attachment(
+        conn, filename="scan.pdf", text=text[:9_000] + "\x00" + text[9_000:], summary="s"
+    )
+    assert plan_chunks(conn).changed == {attachment_id}
+
+    assert plan_chunks(conn).changed == set()
+
+
 def test_a_text_read_again_is_chunked_again(tmp_path):
     conn = _store(tmp_path)
     attachment_id = _long(conn)

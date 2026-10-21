@@ -943,3 +943,155 @@ def test_the_wide_flag_reaches_the_command(monkeypatch):
     cli.main()
 
     assert (got["wide"], got["estimate"]) == (True, True)
+
+
+# --- --decoding: texts a reader decoded wrongly ------------------------------------------------
+#
+# A UTF-16 card statement was read as Latin-1 (its byte-order mark stored as "ÿþ", a NUL after
+# every Latin letter), and a Greek agenda failed whole on antiword's output (UnicodeDecodeError).
+# Both readers decode by the bytes now (tests/test_text_decoding.py); --decoding reads those rows
+# again and summarises them, the right text replacing the longer wrong one.
+
+STATEMENT = "Ημερομηνία\tΠοσό\r\n" + "".join(f"2026-03-{d:02d}\t{d},50\r\n" for d in range(1, 30))
+
+
+def test_decoding_reads_a_utf16_text_stored_as_latin1_again(store):
+    path, conn, root, _removed, summarised = store
+    body = STATEMENT.encode("utf-16")
+    att = _row(conn, root, "statement.csv", body.decode("latin-1"), body=body, mime="text/csv")
+    _row(conn, root, "plain.csv", WORDS * 3, body=WORDS * 3, mime="text/csv")
+
+    stats = _run(path, root, "decoding")
+
+    text, llm = _content(conn, att, "extracted_text, llm_status")
+    assert stats["selected"] == 1
+    assert text.startswith("Ημερομηνία") and "\x00" not in text
+    assert llm == "extracted" and summarised == [att]
+
+
+def test_decoding_selects_the_row_once_the_nuls_are_stripped(store):
+    """`maint strip-nul` may run first: the mark read as Latin-1 still says what the row is."""
+    path, conn, root, _removed, _summarised = store
+    body = STATEMENT.encode("utf-16")
+    att = _row(conn, root, "statement.csv", body.decode("latin-1").replace("\x00", ""), body=body)
+
+    _run(path, root, "decoding")
+
+    assert _content(conn, att, "extracted_text")[0].startswith("Ημερομηνία")
+
+
+def test_decoding_reads_a_word_file_whose_converter_output_failed(store, monkeypatch):
+    path, conn, root, _removed, summarised = store
+    att = _row(
+        conn,
+        root,
+        "agenda.doc",
+        None,
+        status="failed",
+        error="UnicodeDecodeError: 'utf-8' codec can't decode byte 0xed in position 9",
+        llm="pending",
+        body=b"\xd0\xcf\x11\xe0",
+        mime="application/msword",
+    )
+    monkeypatch.setattr(
+        rx,
+        "extract_text_from_file",
+        lambda *a, **k: {
+            "text": WORDS * 3,
+            "method": "antiword",
+            "status": "extracted",
+            "error": None,
+        },
+    )
+
+    stats = _run(path, root, "decoding")
+
+    status, method = _content(conn, att, "extraction_status, extraction_method")
+    assert (stats["reread"], status, method) == (1, "extracted", "antiword")
+    assert summarised == [att]
+
+
+def test_decoding_selects_nothing_once_the_rows_are_read_right(store):
+    path, conn, root, _removed, _summarised = store
+    body = STATEMENT.encode("utf-16")
+    _row(conn, root, "statement.csv", body.decode("latin-1"), body=body)
+    _run(path, root, "decoding")
+
+    assert _run(path, root, "decoding")["selected"] == 0
+
+
+# --- --failed: summaries that failed under the call shape before v2-text ----------------------
+#
+# 14 summaries failed for good before v2-text became the default on 2026-10-16: three images on
+# an old parser's IndexError, eight short session notes the model refused, three replies that
+# were not JSON. Each failure belongs to the request it was made from, and those requests are
+# no longer sent. --failed summarises them again; a failure under today's shape is its verdict
+# and is not taken again, so a second run selects nothing.
+
+
+def _failed(conn, att, when):
+    conn.execute(
+        "UPDATE attachment_content SET llm_status = 'failed', summary = NULL,"
+        " llm_error = 'ValueError: Failed to parse JSON', llm_extracted_at = ?"
+        " WHERE attachment_id = ?",
+        (when, att),
+    )
+    conn.commit()
+
+
+def test_failed_summarises_again_a_summary_that_failed_under_the_older_shape(store, monkeypatch):
+    path, conn, root, _removed, summarised = store
+    old = _row(conn, root, "note.txt", WORDS * 3)
+    _failed(conn, old, "2026-10-15T23:08:46.40774Z")
+    recent = _row(conn, root, "other.txt", WORDS * 4)
+    _failed(conn, recent, "2026-10-17T09:00:00+00:00")
+    monkeypatch.setattr(rx, "extract_text_from_file", lambda *a: pytest.fail("the file was read"))
+
+    stats = _run(path, root, "failed")
+
+    assert (stats["selected"], stats["resummarise"]) == (1, 1)
+    assert summarised == [old]
+    assert tuple(_content(conn, old, "llm_status, summary")) == ("extracted", "new summary")
+    assert _content(conn, recent, "llm_status")[0] == "failed"
+
+
+def test_failed_takes_a_local_stamp_as_the_instant_it_was(store):
+    """Stamps written before `maint utc-stamps` are Athens time with no offset."""
+    path, conn, root, _removed, summarised = store
+    att = _row(conn, root, "note.txt", WORDS * 3)
+    _failed(conn, att, "2026-09-30T19:06:36.45016")
+
+    _run(path, root, "failed")
+
+    assert summarised == [att]
+
+
+def test_failed_selects_nothing_the_second_time(store, monkeypatch):
+    path, conn, root, _removed, _summarised = store
+    att = _row(conn, root, "note.txt", WORDS * 3)
+    _failed(conn, att, "2026-10-11T21:40:13.65871Z")
+    monkeypatch.setattr(
+        attachment_pipeline,
+        "_extract_one_attachment",
+        lambda row, *a, **k: (row[0], row[5], None, "ValueError: refused", False),
+    )
+
+    _run(path, root, "failed")
+
+    assert _content(conn, att, "llm_status")[0] == "failed"
+    assert _run(path, root, "failed")["selected"] == 0
+
+
+@pytest.mark.parametrize("flag", ["decoding", "failed"])
+def test_the_new_selectors_reach_the_command(flag, monkeypatch):
+    import sys
+
+    from src import cli
+
+    got: dict = {}
+    monkeypatch.setattr(cli, "cmd_reextract", lambda args: got.update(vars(args)))
+    monkeypatch.setattr(sys, "argv", ["brain", "maint", "reextract", f"--{flag}", "--estimate"])
+
+    cli.main()
+
+    assert got[flag] is True

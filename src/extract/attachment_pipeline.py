@@ -22,7 +22,11 @@ from typing import Any, NamedTuple
 
 from src.config import ATTACHMENTS_DIR, DATA_ROOT, DEFAULT_DB
 from src.extract.attachment_digest import is_spreadsheet, spreadsheet_digest
-from src.extract.attachment_extractors import ZIP_MIME_TYPES, extract_text_from_file
+from src.extract.attachment_extractors import (
+    ZIP_MIME_TYPES,
+    extract_text_from_file,
+    without_nul,
+)
 from src.extract.call_shape import Request, call_shape, max_tokens_attempts
 from src.extract.ocr_garble import is_garbled
 from src.extract.vertex_auth import touch_sentinel
@@ -1710,7 +1714,8 @@ def ingest_text_document(
     The file a SharePoint link or a session note came from is not kept, so Phase 1's work is
     done by the caller and the content row is complete from the start. Phase 1 selects only
     attachments without a content row and never sees this document; Phase 2 selects extracted
-    rows still pending and summarises it.
+    rows still pending and summarises it. The text is stored redacted and without NULs, as
+    Phase 1 stores what it reads (attachment_extractors.without_nul).
 
     The message id is the hash of the source bytes, as for ingest_document: the same file
     ingested twice collides and the second is skipped. The three rows are written in one
@@ -1763,7 +1768,7 @@ def ingest_text_document(
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
                 attachment_id,
-                redact_secrets(text) if text else text,
+                without_nul(redact_secrets(text)) if text else text,
                 method,
                 status,
                 error,

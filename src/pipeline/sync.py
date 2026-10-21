@@ -130,6 +130,13 @@ CHUNK_EMBED_SYNC_DEADLINE_S = 60.0
 # the whole index. Mail fetch is SYNC_WRAPPER_FETCH_OBSERVED_S above.
 SYNC_FIXED_WORK_S = 80.0
 
+# Step 4b: entities for the people rows added since the last seed (src/store/entities.py).
+# They were seeded once by hand on 2026-10-16 and never again, so the 69 people added
+# after had none. The seed reads every person, about 10 s over 34K people on the replica,
+# so only the nightly unit runs it, and only there is its time held back from Step 2.
+ENTITY_SEED_UNITS = frozenset({"sb-daily-sync"})
+ENTITY_SEED_OBSERVED_S = 30.0
+
 # What the stages after Step 2 need, held back from the unit's remaining time.
 SYNC_AFTER_EXTRACTION_S = (
     SYNC_FIXED_WORK_S
@@ -164,11 +171,34 @@ def _extract_deadline_s() -> float | None:
         return None
     else:
         slice_s = EXTRACT_SYNC_DEADLINE_S
+    after_s = SYNC_AFTER_EXTRACTION_S + (ENTITY_SEED_OBSERVED_S if unit in ENTITY_SEED_UNITS else 0)
     try:
-        left = float(os.environ["PTS_LLM_DEADLINE"]) - time.time() - SYNC_AFTER_EXTRACTION_S
+        left = float(os.environ["PTS_LLM_DEADLINE"]) - time.time() - after_s
     except (KeyError, ValueError):
         return slice_s
     return max(0.0, min(slice_s, left))
+
+
+def _seed_entities_nightly(db_path: str) -> dict | None:
+    """Step 4b: seed the entities of people added since the last seed, in the nightly
+    unit only. None when this is another run, or when the seed failed, which fails no
+    sync: the next night tries again."""
+    from src.llm_deadline import _detect_systemd_unit
+
+    if _detect_systemd_unit() not in ENTITY_SEED_UNITS:
+        return None
+    from src.store import entities
+    from src.store.schema import get_connection
+
+    conn = get_connection(db_path)
+    try:
+        plan = entities.seed_entities(conn)
+    except Exception as e:
+        print(f"  Entity seed skipped: {e}", file=sys.stderr)
+        return None
+    finally:
+        conn.close()
+    return {"entities": len(plan.new), "aliases": plan.counts["written"]}
 
 
 def _holding_the_sync_lock(sync):
@@ -357,6 +387,10 @@ def run(args):
         print(f"Dedup: {reduced} duplicates merged")
     else:
         print("\nNo new emails — skipping dedup")
+
+    seeded = _seed_entities_nightly(db_path)
+    if seeded is not None:
+        print(f"\nStep 4b: Entities: {seeded['entities']} new, {seeded['aliases']} aliases written")
 
     # Step 5, the embeddings, waits for the end of the run: Step 9.
 

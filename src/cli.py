@@ -1433,7 +1433,7 @@ def cmd_news_sync(args):
     """Stage news-reader syntheses and articles as batches for the next sync."""
     import tempfile
 
-    from src.export.news_export import PIPELINES, export_news
+    from src.export.news_export import PIPELINES, export_news, held_articles
     from src.store.schema import get_connection
 
     news_db = Path(args.news_db)
@@ -1444,8 +1444,10 @@ def cmd_news_sync(args):
     pipelines = args.pipeline or list(PIPELINES)
     staging_dir = DATA_ROOT / "staging"
 
-    # Already-loaded or already-staged news items, so re-runs skip them
+    # Already-loaded or already-staged news items, so re-runs skip them, and the Google
+    # News articles held under one URL, so a copy under another is skipped too.
     exported_ids = _staged_news_ids(staging_dir)
+    held = held_articles(staging_dir)
     db_path = str(args.db)
     if Path(db_path).exists():
         try:
@@ -1454,6 +1456,7 @@ def cmd_news_sync(args):
                 "SELECT message_id FROM emails WHERE message_id LIKE 'news:%'"
             ).fetchall()
             exported_ids |= {r[0] for r in rows}
+            held.add_store(conn)
             conn.close()
         except Exception:
             pass
@@ -1473,6 +1476,7 @@ def cmd_news_sync(args):
                 pipelines=pipelines,
                 exported_ids=exported_ids,
                 limit=args.limit,
+                held=held,
             )
         print("\nDRY RUN — nothing written.")
         print(f"  Would stage syntheses: {preview['syntheses']}")
@@ -1487,6 +1491,7 @@ def cmd_news_sync(args):
         pipelines=pipelines,
         exported_ids=exported_ids,
         limit=args.limit,
+        held=held,
     )
 
     print(f"\nSyntheses: {result['syntheses']}")
@@ -3057,6 +3062,13 @@ def main():
     consolidate.add_maint_parser(maint_subparsers)
     entities.add_maint_parser(maint_subparsers)
     topic_canon.add_maint_parser(maint_subparsers)
+    # teams-repair, teams-empty-summaries (src/extract/teams_repair.py) and news-dedup
+    # (src/export/news_export.py): maint-only.
+    from src.export import news_export
+    from src.extract import teams_repair
+
+    teams_repair.add_maint_parsers(maint_subparsers)
+    news_export.add_maint_parser(maint_subparsers)
     # mail-times, mail-attachments (src/export/legacy_mail.py): maint-only.
     from src.export import legacy_mail
 

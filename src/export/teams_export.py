@@ -6,13 +6,14 @@ Phase 1 supports channel scope only. Group / 1-on-1 chats land in Phase 2/3.
 import json
 import re
 import sqlite3
+import sys
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from html.entities import html5
 from typing import Literal
 
-from src.export.teams_cli import TeamsCliAuthRequired, run_teams_cli
+from src.export.teams_cli import TeamsCliAuthRequired, TeamsCliError, run_teams_cli
 from src.extract.html_text import html_to_text
 from src.redact import redact_payload, redact_secrets
 
@@ -135,13 +136,29 @@ def _is_system_message(msg_type: str | None) -> bool:
     return msg_type is not None and msg_type.startswith(SYSTEM_MESSAGE_TYPES)
 
 
+# A sender as the service names it: a person '8:orgid:<oid>', an app '28:<id>' or a
+# thread '19:<id>@thread.v2', which writes the system messages.
+_BARE_MRI = re.compile(r"\d+:\S+")
+
+
 def _extract_mri(from_url: str | None) -> str | None:
-    """Pull '8:orgid:<oid>' out of '.../contacts/8:orgid:<oid>'."""
+    """The sender's MRI ('8:orgid:<oid>') from a message's `from`.
+
+    Chat messages give it as a contacts URL ('.../contacts/8:orgid:<oid>') and channel
+    posts bare. Only the URL was read, so every channel post was stored with no sender
+    and no person: 4,817 of them on the replica of 2026-10-20.
+    """
     if not from_url:
         return None
-    if "/contacts/" not in from_url:
-        return None
-    return from_url.rsplit("/contacts/", 1)[1]
+    if "/contacts/" in from_url:
+        return from_url.rsplit("/contacts/", 1)[1]
+    return from_url if _BARE_MRI.fullmatch(from_url) else None
+
+
+def _sender_name(msg: dict) -> str | None:
+    """The sender's display name, or the name in the sender's token when the message
+    carries no other (1 of 4,817 channel posts)."""
+    return msg.get("imDisplayName") or msg.get("imdisplayname") or msg.get("fromDisplayNameInToken")
 
 
 # Permanent upstream errors that no amount of retrying will fix. Matching one
@@ -169,6 +186,35 @@ _PERMANENT_ERROR_PATTERNS = (
 def _is_permanent_error(err: BaseException) -> bool:
     msg = str(err)
     return any(p in msg for p in _PERMANENT_ERROR_PATTERNS)
+
+
+# 3. "HTTP_404" / "Graph 404": the service cannot find the chat. Two meeting chats
+#    answered "Location lookup failed" on every run from 2026-09-29, two errors an
+#    hour for three weeks. A chat just created can 404 for a while, so a 404 is a
+#    candidate only once the chat has had no good read for PERSISTENT_404_DAYS (or
+#    none since it was first seen that long ago), and it goes through the breaker
+#    below with the 403s. A token lapse answers 401 (exit 4, which stops the run)
+#    or 403, never 404.
+_NOT_FOUND_PATTERNS = ("HTTP_404", "Graph 404")
+PERSISTENT_404_DAYS = 7
+
+
+def _is_not_found(err: BaseException) -> bool:
+    msg = str(err)
+    return any(p in msg for p in _NOT_FOUND_PATTERNS)
+
+
+def _unread_for_days(chat: sqlite3.Row, days: int) -> bool:
+    """Whether a chat's last good read, or its discovery if it never had one, is at
+    least `days` old. A stamp that does not parse says nothing, so it is not."""
+    stamp = chat["last_pulled_at"] or chat["first_seen_at"]
+    try:
+        since = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=UTC)
+    return datetime.now(UTC) - since >= timedelta(days=days)
 
 
 # A 403 is only evidence about one chat if the rest of the run is fine. Teams
@@ -298,12 +344,20 @@ def _discover_chat_chats(conn: sqlite3.Connection) -> dict:
     return {"chats_inserted": inserted, "chats_updated": updated}
 
 
-# teams-cli list-messages reads a single page, 50 messages by default, and does
-# not page backwards. A chat that got more than one page between two polls kept
-# only the newest page and lost the rest for good, so chat-scope reads ask for
-# 200, the page Teams' own client requests. It is a stopgap: the real fix is for
-# the CLI to follow backwardLink until it reaches a message already stored.
+# teams-cli list-messages reads a single page, 50 messages by default. A chat that
+# got more than one page between two polls kept only the newest page and lost the
+# rest for good, so chat-scope reads ask for 200, the page Teams' own client
+# requests.
 CHAT_PAGE_SIZE = 200
+
+# And a chat read pages back (teams-cli --until, --max-pages) until it reaches the
+# newest message the chat already has stored: the busiest chat fills 200 in about 37
+# hours, and the outage of 2026-10-20 lasted 23. A normal hour stops on the first
+# page; ten pages is 2,000 messages, about a week of the busiest chat. Reaching the
+# cap is printed, never silent.
+CHAT_MAX_PAGES = 10
+# What a teams-cli from before --until says to it.
+_NO_PAGING = "unknown option"
 
 
 def pull_messages(
@@ -315,9 +369,10 @@ def pull_messages(
     messages already stored. So every chat is pulled at least once whatever its
     age (2026-09-29 spec E3), and after that a quiet chat older than a year
     leaves the rotation unless it has stored messages.
-    teams-cli list-messages does NOT expose a sync-state cursor and reads one
-    page only (CHAT_PAGE_SIZE for chats), so each run re-reads the newest page
-    and relies on UNIQUE(teams_message_id) for dedup. The teams_chats.sync_state
+    teams-cli list-messages does NOT expose a sync-state cursor. A chat already
+    holding messages is read back to the newest of them (CHAT_MAX_PAGES pages of
+    CHAT_PAGE_SIZE at most), a channel and a chat never read take one page, and
+    UNIQUE(teams_message_id) dedups the overlap. The teams_chats.sync_state
     column is vestigial in Phase 1; kept for forward-compatibility.
 
     Args:
@@ -349,7 +404,8 @@ def pull_messages(
     # DESC.
     rows = conn.execute(
         """
-        SELECT id, teams_chat_id, chat_kind, team_uuid, channel_id, sync_state
+        SELECT id, teams_chat_id, chat_kind, team_uuid, channel_id, sync_state,
+               first_seen_at, last_pulled_at
         FROM teams_chats
         WHERE ingest_disabled = 0
           AND chat_kind IN ('channel', 'oneOnOne', 'group', 'meeting')
@@ -394,6 +450,8 @@ def pull_messages(
     # Concurrency wired in but defaulted to sequential for Phase 1 simplicity;
     # parallelism is a Phase 2 follow-up if throughput becomes an issue.
     _ = concurrency
+    # Off for the rest of the run once the installed teams-cli refuses --until.
+    paging = {"on": True}
 
     for chat in rows:
         if deadline is not None and time.monotonic() >= deadline:
@@ -414,16 +472,10 @@ def pull_messages(
                     "--channel",
                     chat["channel_id"],
                 ]
+                payload = run_teams_cli(args)
             else:
                 # oneOnOne / group / meeting: chat-scope read via chatsvc
-                args = [
-                    "list-messages",
-                    "--page-size",
-                    str(CHAT_PAGE_SIZE),
-                    "--chat",
-                    chat["teams_chat_id"],
-                ]
-            payload = run_teams_cli(args)
+                payload = _read_chat(conn, chat, paging)
             inserted += _persist_messages(conn, chat["id"], payload)
             conn.execute(
                 "UPDATE teams_chats SET last_pulled_at = ? WHERE id = ?",
@@ -436,7 +488,9 @@ def pull_messages(
             errors += 1
             import sys
 
-            if _is_permanent_error(e):
+            if _is_permanent_error(e) or (
+                _is_not_found(e) and _unread_for_days(chat, PERSISTENT_404_DAYS)
+            ):
                 if _NO_GENERAL_CHANNEL_PATTERN in str(e):
                     no_general_channel.append(chat["id"])
                 else:
@@ -492,6 +546,48 @@ def pull_messages(
         "errors": errors,
         "deferred": deferred,
     }
+
+
+def _read_chat(conn: sqlite3.Connection, chat: sqlite3.Row, paging: dict) -> dict:
+    """One chat's newest messages, back to the newest one it already has stored.
+
+    A chat with nothing stored takes one page, as before. A teams-cli from before
+    --until refuses the flag; the chat is then read one page, and so is every chat
+    after it in this run, which the deploy order (CLI first) makes a one-run event.
+    """
+    newest = conn.execute(
+        "SELECT MAX(composed_at) FROM teams_messages WHERE chat_id = ? AND composed_at <> ''",
+        (chat["id"],),
+    ).fetchone()[0]
+    head = ["list-messages", "--page-size", str(CHAT_PAGE_SIZE)]
+    # The chat id stays last: the callers' logs and tests read it there.
+    tail = ["--chat", chat["teams_chat_id"]]
+    if newest is None or not paging["on"]:
+        return run_teams_cli(head + tail)
+    try:
+        payload = run_teams_cli(
+            [*head, "--until", newest, "--max-pages", str(CHAT_MAX_PAGES), *tail]
+        )
+    except TeamsCliAuthRequired:
+        raise
+    except TeamsCliError as e:
+        if _NO_PAGING not in (e.stderr or ""):
+            raise
+        paging["on"] = False
+        print(
+            "pull_messages: this teams-cli does not page back (no --until); reading one page"
+            " a chat for the rest of the run. Update teams-access.",
+            file=sys.stderr,
+        )
+        return run_teams_cli(head + tail)
+    if isinstance(payload, dict) and payload.get("complete") is False:
+        print(
+            f"pull_messages: chat={chat['teams_chat_id']} stopped at the page cap"
+            f" ({CHAT_MAX_PAGES} pages of {CHAT_PAGE_SIZE}) before reaching its newest stored"
+            f" message ({newest}): the messages between are not read",
+            file=sys.stderr,
+        )
+    return payload
 
 
 def _persist_messages(conn: sqlite3.Connection, chat_id: int, payload: dict) -> int:
@@ -630,7 +726,7 @@ def _store_message(
     # and keeps its XML: as text its fields would run together, and system
     # messages stay out of threads, extraction and vectors.
     content_text = content_html if system else _message_text(content_html)
-    sender_display = msg.get("imDisplayName") or msg.get("imdisplayname")
+    sender_display = _sender_name(msg)
     sender_mri = _extract_mri(msg.get("from"))
     composite_id = f"{chat_id}::{upstream_id}"
     # Teams never passes through data/staging, so the redaction that
@@ -794,6 +890,77 @@ def backfill_channel_replies(conn: sqlite3.Connection) -> dict:
         if n % 100 == 0:
             conn.commit()
     conn.commit()
+    return counts
+
+
+def _payload_message(raw_json: str | None) -> dict:
+    """The message a stored payload holds: a channel post's envelope's, or the payload."""
+    try:
+        raw = json.loads(raw_json) if raw_json else None
+    except ValueError:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    msg = raw.get("message", raw)
+    return msg if isinstance(msg, dict) else {}
+
+
+def backfill_senders(conn: sqlite3.Connection, *, dry_run: bool = False) -> dict:
+    """Fill the sender of stored messages from their payloads; no Teams call.
+
+    Until _extract_mri read a bare MRI, every channel post was stored with no
+    sender_mri, so no person either (4,817 on the replica of 2026-10-20), and a
+    message whose payload named its sender only in the token kept no name. This
+    reads each such row's payload once and fills both, then links the senders the
+    MRI cache already knows (teams_mri.link_senders); the hourly resolve_mris looks
+    up the rest and links them the same way. Idempotent. A dry run counts inside a
+    transaction it rolls back.
+
+    Returns {"senders_filled", "without_sender", "names_filled", "persons_linked"}:
+    rows given an MRI, rows with no MRI left (no payload, or none named), and rows
+    given a name or a person, from a payload or from the cache.
+    """
+    if conn.in_transaction:
+        conn.commit()
+    try:
+        counts = fill_senders(conn)
+    except BaseException:
+        conn.rollback()
+        raise
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return counts
+
+
+def fill_senders(conn: sqlite3.Connection) -> dict:
+    """backfill_senders' writes, in the caller's transaction, which it leaves open."""
+    from src.extract.teams_mri import link_senders
+
+    counts = {"senders_filled": 0, "without_sender": 0, "names_filled": 0, "persons_linked": 0}
+    rows = conn.execute(
+        "SELECT id, sender_mri, sender_display_name, raw_json FROM teams_messages"
+        " WHERE sender_mri IS NULL OR COALESCE(sender_display_name, '') = '' ORDER BY id"
+    ).fetchall()
+    for row_id, mri, name, raw_json in rows:
+        msg = _payload_message(raw_json)
+        if mri is None:
+            mri = _extract_mri(msg.get("from"))
+            if mri is None:
+                counts["without_sender"] += 1
+            else:
+                conn.execute("UPDATE teams_messages SET sender_mri = ? WHERE id = ?", (mri, row_id))
+                counts["senders_filled"] += 1
+        if not name and _sender_name(msg):
+            conn.execute(
+                "UPDATE teams_messages SET sender_display_name = ? WHERE id = ?",
+                (_sender_name(msg), row_id),
+            )
+            counts["names_filled"] += 1
+    linked = link_senders(conn)
+    counts["persons_linked"] = linked["persons_linked"]
+    counts["names_filled"] += linked["names_filled"]
     return counts
 
 

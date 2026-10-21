@@ -365,6 +365,8 @@ Each stored occurrence carries `is_recurring` and its series in `recurrence_mast
 - `teams_thread_context(thread_id)`. Deprecated, going in the next release: `get_item(kind="teams", ref=thread_id)` reads the same thread. Full thread with decisions, actions, facts.
 - `teams_chat_summary(chat_id, days)`. Deprecated, going in the next release: no call in six weeks; `search_teams` and `get_item` read the same chats. Recent activity per chat or channel.
 
+A chat that already holds messages is read back to the newest of them (teams-cli `list-messages --until`, at most `CHAT_MAX_PAGES`, ten pages of 200), so an outage of up to about a week of the busiest chat loses nothing; a read the cap stops says so on stderr, and a teams-cli from before `--until` is read one page a chat. A channel is read one page of 50 posts, which on the replica of 2026-10-20 its busiest channel had never filled in 30 hours (31 posts at most).
+
 A channel thread holds the post and its replies, each reply a message of its own, and a post is dated by when it was written, not by its newest reply. A message edited or deleted after it was first stored is brought up to date on a later pull: the edit replaces the text, a deletion blanks it, and either sends the thread back to extraction. Before 2026-10-11, replies stayed inside the post's stored payload, out of search and extraction, and the first draft of an edited message and the text of a deleted one were kept. On a store from before then, `brain maint teams-backfill-replies` stores the replies its posts hold, once ([`docs/DEPLOY.md`](docs/DEPLOY.md#12-upgrading-a-producer), section 12).
 
 A message's text is what a reader sees of it: no tags, entities decoded, a block or a line break on a line of its own, and the visible text of a mention, a link (its address after it, as in a mail body) and an emoji kept. The HTML is kept beside it. The content's shape decides, not the type the payload declares: the services declare an HTML body as text, and until this change the text of every HTML message was its markup, so `search_teams` matched words such as `itemtype` and `nbsp` and the model read the tags. System messages (calls, membership changes) keep the service's XML. `brain maint teams-strip-html` converts the text stored before, once (section 12 of `docs/DEPLOY.md`).
@@ -795,6 +797,9 @@ python -m src.cli maint calendar-backfill             # fill them a month at a t
 python -m src.cli maint teams-backfill-replies    # once, on the producer: store the channel replies stored posts hold; no Teams call
 python -m src.cli maint teams-strip-html          # once, on the producer: convert message text stored as HTML (--dry-run counts); no Teams or model call
 python -m src.cli maint teams-drop-raw-json [--dry-run] [--limit N]   # once, on the producer, after teams-backfill-replies: drop the raw Teams payloads (DEPLOY section 12)
+python -m src.cli maint teams-repair [--dry-run]  # once, on the producer, before teams-drop-raw-json: channel senders from the payloads, thread participants, '? / ' titles, non-person MRI cache rows; no Teams or model call
+python -m src.cli maint teams-empty-summaries [--dry-run]   # once: threads extracted with an empty summary go back to extraction (one model call each, in the next teams-sync)
+python -m src.cli maint news-dedup [--dry-run]    # once, on the producer: forget the stored copies of a Google News article held under several URLs (loads the vector index once)
 python -m src.cli maint split-html                # after v23, on the producer: HTML bodies loaded before it (DEPLOY section 12)
 python -m src.cli maint prune-staged
 python -m src.cli maint import-people [--file canonical_people.json]
@@ -924,6 +929,7 @@ src/
     teams_mri.py               Teams MRI to display-name resolution
     teams_pipeline.py          Thread extraction dispatcher
     teams_threads.py           Message to thread bounding
+    teams_repair.py            maint teams-repair and teams-empty-summaries: mend what earlier Teams code stored
     whatsapp_threads.py        `whatsapp-sync` step 2: gap-bounded sessions per chat
     whatsapp_pipeline.py       `whatsapp-sync` step 3: extract every changed session, the Teams way
     whatsapp_prompt.py         WhatsApp session extraction prompt

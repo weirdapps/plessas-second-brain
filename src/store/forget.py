@@ -35,18 +35,26 @@ def _marks(n: int) -> str:
 def forget_documents(conn: sqlite3.Connection, message_ids) -> dict:
     """Delete the documents with these message ids, their children and their vectors."""
     ids = [int(m) for m in message_ids]
-    stats = {"emails": 0, "attachments": 0, "vectors": 0}
-    vectors: set[int] = set()
+    email_ids: list[int] = []
     for start in range(0, len(ids), CHUNK):
         chunk = ids[start : start + CHUNK]
-        email_ids = [
+        email_ids += [
             r[0]
             for r in conn.execute(
                 f"SELECT id FROM emails WHERE message_id IN ({_marks(len(chunk))})", chunk
             )
         ]
-        if not email_ids:
-            continue
+    return forget_emails(conn, email_ids)
+
+
+def forget_emails(conn: sqlite3.Connection, ids) -> dict:
+    """Delete the rows of emails with these row ids (a document or a news item is one),
+    their children and their vectors. Commits after each chunk."""
+    ids = [int(i) for i in ids]
+    stats = {"emails": 0, "attachments": 0, "vectors": 0}
+    vectors: set[int] = set()
+    for start in range(0, len(ids), CHUNK):
+        email_ids = ids[start : start + CHUNK]
         em = _marks(len(email_ids))
         att_ids = [
             r[0]

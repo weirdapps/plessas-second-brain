@@ -57,20 +57,29 @@ def test_topic_pages_runs_the_nightly_job_and_passes_its_code_through(home):
     assert _run(TOPIC_PAGES, home, FAKE_RC="1").returncode == 1
 
 
+def _pilot_runs(home):
+    settings = home / ".config" / "second-brain" / "briefs.env"
+    settings.parent.mkdir(parents=True)
+    settings.write_text("BRAIN_BRIEF_PILOT_UNTIL=2099-12-31\n")
+
+
 @pytest.mark.parametrize("wrapper", [TOPIC_PAGES, BRIEFS])
 def test_an_expired_gcloud_credential_skips_the_run(home, wrapper):
+    """69, not 0: a skip is work not done (tests/test_wrapper_sentinel_skips_are_red.py)."""
+    _pilot_runs(home)
     (home / ".second-brain").mkdir()
     (home / ".second-brain" / "needs_gcloud_reauth").touch()
 
-    assert _run(wrapper, home).returncode == 0
+    assert _run(wrapper, home).returncode == 69
     assert not (home / "argv").exists()
 
 
 def test_an_expired_outlook_session_skips_the_briefs(home):
+    _pilot_runs(home)
     (home / ".second-brain").mkdir()
     (home / ".second-brain" / "needs_reauth").touch()
 
-    assert _run(BRIEFS, home).returncode == 0
+    assert _run(BRIEFS, home).returncode == 69
     assert not (home / "argv").exists()
 
 

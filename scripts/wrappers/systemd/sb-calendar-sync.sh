@@ -17,19 +17,33 @@ mkdir -p "$LOG_DIR"
 
 echo "=== Calendar sync started: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
 
+# A skip on a sentinel exits 69 (EX_UNAVAILABLE), as sb-outlook-sync.sh does: exit 0
+# recorded success and pinged hc-success@ for runs that did nothing, and on 2026-10-20
+# the calendar was one of ten jobs that read green through a ten-hour auth outage.
+# Every stage of calendar-sync starts with outlook-cli, so a dead Outlook session
+# leaves nothing to run.
 if [ -f "$SENTINEL" ]; then
   echo "Skipping (needs_reauth sentinel present)" >> "$LOG_FILE"
-  exit 0
+  exit 69
 fi
 
+# A dead gcloud credential stops only the body extraction. The listing, the times,
+# attendees and cancellations come from Outlook, and the briefs and meeting prep read
+# them, so they still go in; --skip-extraction leaves each body worth reading 'pending'
+# for the next run with a credential. The run stays red, because that part is owed.
+EXTRACT_FLAG=""
 if [ -f "$GCLOUD_SENTINEL" ]; then
-  echo "Skipping (needs_gcloud_reauth sentinel present)" >> "$LOG_FILE"
-  exit 0
+  echo "Extraction skipped (needs_gcloud_reauth sentinel present); listing only" >> "$LOG_FILE"
+  EXTRACT_FLAG="--skip-extraction"
 fi
 
 cd "$REPO_DIR"
-"$PYTHON" -m src.cli calendar-sync >> "$LOG_FILE" 2>&1
+# shellcheck disable=SC2086  # empty, or the one flag
+"$PYTHON" -m src.cli calendar-sync $EXTRACT_FLAG >> "$LOG_FILE" 2>&1
 EXIT_CODE=$?
+if [ "$EXIT_CODE" -eq 0 ] && [ -n "$EXTRACT_FLAG" ]; then
+  EXIT_CODE=69
+fi
 
 if [ $EXIT_CODE -eq 0 ]; then
   echo "$(date '+%Y-%m-%d %H:%M:%S') — ok" >> "$LOG_FILE"

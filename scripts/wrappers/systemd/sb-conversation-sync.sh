@@ -45,11 +45,15 @@ fi
 echo $$ > "$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 
-# Extraction needs Vertex. Logged, because this skip used to be silent, and a
-# skip that leaves no line cannot be told from a run that never started.
+# Extraction needs Vertex; the export and the session notes read local files and do
+# not. So a dead gcloud credential skips the extraction alone, and the run ends 69
+# (EX_UNAVAILABLE) rather than 0: on 2026-10-20 this skip exited 0 and pinged green
+# with nothing extracted. Logged, because this skip used to be silent, and a skip
+# that leaves no line cannot be told from a run that never started.
+gcloud_down=0
 if [ -f "$HOME/.second-brain/needs_gcloud_reauth" ]; then
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: needs_gcloud_reauth sentinel present" >> "$LOG_FILE"
-  exit 0
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP extraction: needs_gcloud_reauth sentinel present" >> "$LOG_FILE"
+  gcloud_down=1
 fi
 
 echo "=== Conversation sync started: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
@@ -62,8 +66,11 @@ cd "$REPO_DIR" || exit 1
 # not fail it: a corrupt session file stays in the 7-day window for a week.
 "$PYTHON" -m src.cli export-conversations --days 7 >> "$LOG_FILE" 2>&1
 export_rc=$?
-"$PYTHON" -m src.cli extract-conversations --workers 2 >> "$LOG_FILE" 2>&1
-extract_rc=$?
+extract_rc=0
+if [ "$gcloud_down" -eq 0 ]; then
+  "$PYTHON" -m src.cli extract-conversations --workers 2 >> "$LOG_FILE" 2>&1
+  extract_rc=$?
+fi
 # Notes the sessions wrote (.md, .txt, .csv), stored as text-only documents. Only the
 # transcripts changed since the last scan are read (src/export/session_notes.py).
 "$PYTHON" -m src.cli ingest-session-notes >> "$LOG_FILE" 2>&1
@@ -74,5 +81,9 @@ if [ "$export_rc" -ne 0 ] || [ "$extract_rc" -ne 0 ] || [ "$notes_rc" -ne 0 ]; t
   if [ "$export_rc" -ne 0 ]; then exit "$export_rc"; fi
   if [ "$extract_rc" -ne 0 ]; then exit "$extract_rc"; fi
   exit "$notes_rc"
+fi
+if [ "$gcloud_down" -eq 1 ]; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') exported, extraction owed (exit 69)" >> "$LOG_FILE"
+  exit 69
 fi
 echo "$(date '+%Y-%m-%d %H:%M:%S') ok" >> "$LOG_FILE"

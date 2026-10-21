@@ -27,10 +27,13 @@ echo "=== Noon catchup started: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
 # 09-11 while the staged mail waited. The real dependency is guarded immediately
 # below.
 
-# Skip if gcloud ADC expired: extraction calls Vertex, as in sb-daily-sync.sh.
+# Skip if gcloud ADC expired: extraction calls Vertex, as in sb-daily-sync.sh, and
+# sync begins with it, so nothing here is worth running without it. 69, not 0: on
+# 2026-10-20 this skipped the whole catch-up and pinged green. retry.conf carries
+# RestartPreventExitStatus=69, since auth-watch, not a restart, clears the sentinel.
 if [ -f "$HOME/.second-brain/needs_gcloud_reauth" ]; then
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: needs_gcloud_reauth sentinel present" >> "$LOG_FILE"
-  exit 0
+  exit 69
 fi
 
 # One sync at a time: sync takes a lock, and --lock-wait is how long to wait for

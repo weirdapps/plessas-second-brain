@@ -31,6 +31,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -295,16 +296,19 @@ def run_briefs(
     send: Callable[[str, str, str], bool] = send_to_owner,
     log: Path | None = None,
     say: Callable[[str], None] = print,
+    clock: Callable[[], float] = time.time,
 ) -> dict:
-    """One pass of the pilot. Returns counts: upcoming, qualified, sent, skipped, failed."""
+    """One pass of the pilot. Returns counts: upcoming, qualified, sent, skipped, failed,
+    deferred (due, but the unit's LLM deadline had passed)."""
     from src import config
+    from src.llm_policy import resolve_deadline
     from src.store.calendar_query import athens_time
 
     now = now or datetime.now(UTC)
     pattern = config.USER_EMAIL_PATTERN if pattern is None else pattern
     log = log or log_path()
     stats: dict[str, Any] = {"upcoming": 0, "qualified": 0, "sent": 0, "skipped": 0}
-    stats.update({"failed": 0, "cost_usd": 0.0})
+    stats.update({"failed": 0, "deferred": 0, "cost_usd": 0.0})
     active, why = pilot_state(environ, now.date())
     if not active:
         say(f"briefs: {why}")
@@ -316,6 +320,12 @@ def run_briefs(
         stats["state"] = "no owner address"
         return stats
     until = environ.get("BRAIN_BRIEF_PILOT_UNTIL", "").strip()
+    # The unit's deadline, which src/llm_deadline exports for sb-briefs as for the other
+    # units, read the way every caller reads it: no brief starts once it has passed. It
+    # holds back one worst-case call and the shutdown grace from TimeoutStartSec=300, so
+    # a brief begun just before it still ends, mail included, before systemd stops the
+    # unit. Unset (a hand run) it is the policy's own default budget.
+    deadline = resolve_deadline(clock(), environ)
     briefed, per_day = _sent_before(log)
     events = upcoming(conn, now)
     stats["upcoming"] = len(events)
@@ -344,6 +354,12 @@ def run_briefs(
             "reason": reason,
             "attendees": len(people),
         }
+        if clock() >= deadline:
+            # Logged unsent, so the pilot's record shows the brief that was due.
+            stats["deferred"] += 1
+            _append(log, {**record, "sent": False, "error": "deadline"})
+            say(f"  meeting {event['id']}: no brief, the unit's LLM deadline has passed")
+            continue
         try:
             reply = ask(build_prompt(conn, event, people))
             if not reply.text.strip() or reply.stop_reason in ("refusal", "max_tokens"):

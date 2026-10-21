@@ -50,11 +50,12 @@ def test_failures_are_counted_in_its_state_file(home):
     assert state["consecutive_failures"] == 0
 
 
-def test_an_expired_gcloud_credential_skips_the_run(home):
+def test_an_expired_gcloud_credential_ingests_and_owes_the_extraction(home):
+    """The messages need no model; the run tries one session and ends 69."""
     (home / ".second-brain").mkdir()
     (home / ".second-brain" / "needs_gcloud_reauth").touch()
-    assert _run(home).returncode == 0
-    assert not (home / "argv").exists()
+    assert _run(home).returncode == 69
+    assert (home / "argv").read_text().strip() == "-m src.cli whatsapp-sync --limit 1"
 
 
 def test_it_parses_with_the_interpreter_it_names():

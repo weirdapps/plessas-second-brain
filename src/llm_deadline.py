@@ -58,7 +58,7 @@ from src.llm_policy import MAX_ATTEMPTS, ROW_CAPS, backoff
 
 # Effective TimeoutStartSec of each scheduled second-brain unit, read live from the VPS
 # on 2026-08-11 with `systemctl --user show sb-<name>.service -p TimeoutStartUSec`.
-# These eight are the whole scheduled set (sb-curate-docs and sb-reverse-ingest were
+# Those eight were the whole scheduled set then (sb-curate-docs and sb-reverse-ingest were
 # retired on 2026-10-07 and their entries removed). A unit missing from this map gets no
 # deadline rather than a guessed one.
 #
@@ -68,8 +68,14 @@ from src.llm_policy import MAX_ATTEMPTS, ROW_CAPS, backoff
 # (catchup-timeout.conf, 2026-09-11, so a recovery run is not killed mid-catch-up).
 # The smaller of table and live wins, so the stale 300s entries kept both 15-minute
 # units at a 90s budget: the one attempt, no retry, the drop-in was written to end.
+#
+# sb-briefs added 2026-10-21 (TimeoutStartSec=300, read live): it makes one model call
+# per meeting and had no deadline, so its calls planned retries against the flat 900 s
+# default inside a 300 s unit. sb-topic-pages and sb-whatsapp-sync are still absent and
+# keep that default.
 _UNIT_TIMEOUT_SECONDS: dict[str, int] = {
     "sb-attachments": 3600,
+    "sb-briefs": 300,
     "sb-calendar-sync": 900,
     "sb-conversation-sync": 900,
     "sb-daily-sync": 1800,
@@ -79,7 +85,7 @@ _UNIT_TIMEOUT_SECONDS: dict[str, int] = {
     "sb-teams-sync": 600,
 }
 
-# TimeoutStopSec on all eight units, which is also the user manager's
+# TimeoutStopSec on every unit in the table, which is also the user manager's
 # DefaultTimeoutStopUSec. Held back from the budget so a terminal GIVE_UP still has room
 # to finish its bookkeeping and flush its logs before systemd's SIGTERM.
 _SHUTDOWN_GRACE_SECONDS = 90

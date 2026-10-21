@@ -521,7 +521,7 @@ every subcommand.
 | `sb-teams-sync` | :30 at 01 and 07 to 22 | `teams-sync`, then `directory-sync --limit 400` when the sync succeeded within 420 s of the unit's 600 (its failure is logged, not fatal) |
 | `sb-whatsapp-sync` | :55 at 01 and 07 to 22 | `whatsapp-sync`, after the Mac's :50 push (section 5) |
 | `sb-calendar-sync` | :48 at 07 to 22 | `calendar-sync` |
-| `sb-news-sync` | :50 at even hours | `news-sync` |
+| `sb-news-sync` | :50 at even hours | `news-sync`, then `sync --lock-wait 600` to load what it staged |
 | `sb-conversation-sync` | 08:45, 14:45, 20:45 | `export-conversations --days 7`, `extract-conversations`, `ingest-session-notes` |
 | `sb-daily-sync` | 07:05 | `scripts/backup_db.py` (section 8), `sync` with a 900 s extraction slice, `action_lifecycle` |
 | `sb-noon-catchup` | 13:17 | `sync` with a 900 s extraction slice |
@@ -534,6 +534,94 @@ every subcommand.
 
 The Mac that holds a replica pulls it at :45 (section 5), pushes WhatsApp at :50 if
 it runs the bridge, and runs the weekly restore drill ([`RESTORE.md`](RESTORE.md)).
+
+### Units: exit codes, retries and alerts
+
+Each unit runs its wrapper, and the wrapper's exit code is what systemd, the retry
+drop-ins and the alerts act on:
+
+| Code | Means | Restarted |
+| --- | --- | --- |
+| 0 | the work ran, or another run holding the lock is doing it, or an opt-out | no |
+| 69 | work skipped on a re-auth sentinel (`needs_reauth`, `needs_gcloud_reauth`, `needs_teams_reauth`): the session is dead and sb-auth-watch, not a restart, clears it | no |
+| 75 | the run finished and failed (`sync` on a quota pause or a dead model), or Teams auth may clear within minutes | per unit, below |
+| 65 | the nightly attachment pass ran every stage and one failed | no |
+
+A wrapper that meets a sentinel still runs the stages that do not need that session:
+the daily backup, the calendar's times and attendees (`calendar-sync --skip-extraction`),
+the Teams pull and the WhatsApp ingest (`--limit 1`: one extraction, which defers), the
+conversation export, the attachment stages that read files on disk, the mail exports.
+Until 2026-10-21 ten wrappers exited 0 on a sentinel: on 2026-10-20 that gave 62 green
+runs that did no work.
+
+**Retry drop-ins.** A unit with `Restart=on-failure` lists 69 in
+`RestartPreventExitStatus=`, as `sb-outlook-sync` and `sb-teams-sync` have since
+2026-09-19: a sentinel skip exits within a second, so restarting on it spends the
+unit's whole start limit before sb-auth-watch can clear the sentinel, and refuses the
+start it then asks for. On the reference producer, in each unit's `retry.conf`:
+
+```ini
+# sb-attachments.service.d/retry.conf
+RestartPreventExitStatus=65 69
+# sb-conversation-sync.service.d/retry.conf (it listed none)
+RestartPreventExitStatus=69
+# sb-daily-sync.service.d/retry.conf and sb-noon-catchup.service.d/retry.conf
+RestartPreventExitStatus=75 69
+```
+
+`sb-calendar-sync`, `sb-briefs`, `sb-topic-pages`, `sb-whatsapp-sync` and
+`sb-news-sync` have no `Restart=` and need nothing. `RestartPreventExitStatus=` is a
+list, and a second line adds to it, so append the code or rewrite the line whole.
+
+**Paging on a failure streak.** `OnFailure=hc-fail@<unit>` pages through a gate,
+`~/.local/bin/hc-failstreak.sh`, that sends the failure ping only on the Nth
+consecutive failed run of a unit named in `~/.config/hc-failstreak.conf` ("slug N";
+a success resets the count). The units that turned red on a sentinel want these lines,
+N from each one's cadence:
+
+```text
+sb-briefs            6   # every 15 minutes: 90 minutes, more than the hour sb-auth-watch takes to clear a sentinel
+sb-whatsapp-sync     2   # hourly, like sb-teams-sync, sb-outlook-sync and sb-calendar-sync (already 2)
+sb-conversation-sync 2   # three times a day: two missed runs, six hours or more
+sb-news-sync         2   # every two hours; now it also loads, so one locked database is a blip
+```
+
+The daily units (`sb-daily-sync`, `sb-noon-catchup`, `sb-attachments`,
+`sb-topic-pages`) stay unlisted, N=1: one skipped run is a whole day's work, and the
+gate restarts a streak whose last failure is over 24 hours old, so for a unit that runs
+once a day an N of 2 would never page at all.
+
+**Memory.** `sb-daily-sync` runs with no `MemoryMax` and every morning overlaps
+`sb-outlook-sync` (`MemoryMax=6G`): its backup reads the whole store from 07:05 while
+the hourly run starts at 07:10. Over 14 days to 2026-10-20 its peaks were 3.8 to 5.6 GB
+(median 4.8) against 4.4 to 5.4 GB for the overlapping hourly run, on a 7.7 GB host with
+4 GB of swap; most of each peak is page cache from reading `brain.db`, which the kernel
+reclaims before it kills. A runaway guard sized like the hourly unit's:
+
+```ini
+# ~/.config/systemd/user/sb-daily-sync.service.d/memory.conf
+# Runaway guard only, above the observed 5.6 GB peak; no MemoryHigh, which would
+# slow a backup that legitimately reads the whole store.
+[Service]
+MemoryMax=6G
+```
+
+Prevent the overlap with the schedule, not a lock: a lock would make the hourly mail
+wait out a twelve-minute backup inside its own 20-minute timeout, while the daily job
+needs nothing from 07:05. Its `sync` loads only what the hourly run staged, which at
+06:15 is the 01:10 run's, already loaded. Move it with a timer drop-in, and move the
+schedules of its two Healthchecks checks (`sb-daily-sync`, `brain-backup`) with it:
+
+```ini
+# ~/.config/systemd/user/sb-daily-sync.timer.d/schedule.conf
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 06:15:00 Europe/Athens
+```
+
+06:15 plus the five minutes of jitter and its longest run (21 minutes) ends by 06:41,
+clear of the attachment pass (02:00; its longest run in those 14 days took 35 minutes),
+restic (02:40), topic pages (03:30) and the news run at 06:50.
 
 ### Topic pages and the brief pilot
 
@@ -655,6 +743,31 @@ pipeline itself. STALE in any of them fails the freshness ping, like any other S
 | Attachment lag | The oldest attachment waiting for its text, and the oldest text waiting for a summary. WARN past a day. The MCP `stats` tool returns the same counts and ages. | |
 | Backups | The newest `brain-*.db` snapshot and the newest `brain-*.db.zst.enc` archive, STALE past 26 h; the last restore drill, WARN past 35 days ([`RESTORE.md`](RESTORE.md)). Not judged on a replica. | `BRAIN_BACKUP_DIR` (default `$BRAIN_DATA_DIR/backups`), `BRAIN_BACKUP_OFFSITE_DIR` (default its `offsite`), `BRAIN_RESTORE_DRILL_STAMP` |
 | Mail loss | Messages the export gave up fetching, and staging batches quarantined as unreadable. WARN on any quarantined batch, and on a message given up in the last week; the cursor files keep their give-ups for good, so older ones are reported, not warned on. | Read from `state/mail_loss.json` while it is under two days old, else counted from the cursor files |
+| News | STALE when the newest digest news-reader wrote more than 2 h 30 min ago is not in the store: the news run stages at :50 on even hours and loads in the same run, so a digest arrives within about 2 h 17 min. Also STALE when the newest upstream item is 12 h ahead of the newest ingested one, the old rule, which at 23:50 could only catch a pipeline dead since before noon. | `BRAIN_NEWS_DB` |
+
+Two sections follow SCHEDULED JOBS, outside the block the freshness ping reads, since
+they describe the sessions and the day rather than the data as it is now. Their FAIL,
+WARN and STALE lines are issues, so `--email-if-issues` mails them.
+
+- **AUTH**: the Outlook session's `bearer.expiresAt` (FAIL once past), the Teams
+  session's shortest-lived required audience (`https://graph.microsoft.com`,
+  `https://chatsvcagg.teams.microsoft.com`; WARN once lapsed by more than two hours,
+  since the laptop's push renews it every 15 minutes and a laptop asleep at 23:50 leaves
+  it lapsed by less), and whether gcloud's application-default credential still mints
+  an access token (the probe sb-auth-watch runs, its output discarded). Each reads only
+  an expiry field; no token is printed. A host without the file or the tool reads N/A.
+  BLOCKING SENTINELS gives each sentinel's age.
+- **LAST 24 HOURS**, on a systemd host: per job, from the user journal (`journalctl
+  --user -u 'sb-*'`), the runs that failed, those skipped on a re-auth sentinel (exit
+  69), and the longest stretch without a good run, including the one that ended at the
+  next good run. STALE when that stretch is longer than the job's timer allows (7 h for
+  the hourly mail, Teams and WhatsApp jobs, 10 h for the calendar and the briefs, 3 h for
+  news, 13 h for conversations, 5 h for sb-auth-watch, 26 h for a daily job); WARN when
+  any run was skipped on a sentinel. A failure a retry or the next run made good is
+  counted, not an issue. A job whose timer is off, and the long-running services, are
+  not held to a gap. On 2026-10-20 every unit's last run had succeeded by 23:51 and the
+  report read healthy; this section reads Teams 23 h 20 min without a good run and the
+  hourly mail 7 h 34 min, both STALE.
 
 The golden query loads the whole embedding index (1.78 GB on the reference producer
 in the legacy space, about 0.35 GB once rebuilt in this code's, section 12) into the
@@ -853,7 +966,11 @@ the server does not answer, refuses the token, or answers on data more than 7 ho
 old (`BRAIN_MCP_PROBE_MAX_AGE_HOURS`; the server's own `stale` flag turns at 3 hours,
 which every night's gap in the mail timer passes). The probe exits 0 whatever it finds:
 the ping carries the finding. The nightly report shows the same line under SCHEDULED
-JOBS on a systemd host that has the token file.
+JOBS on a systemd host that has the token file, so without the probe's timer a server
+that stops answering at 08:00 is first reported at 23:50. On the reference producer
+the nightly line has run since the token file was written, while the two drop-ins
+above and the probe's two units, documented here, were not installed as of 2026-10-21
+(section 12, "After 2026-10-21", has the steps).
 
 ## 10. Files are inputs
 
@@ -1512,6 +1629,39 @@ stops returning data: fetch the documents shared with you that no mail or messag
    runs and no mark moves. Run it again to fetch what a deadline or an expired session left and
    to retry the failures: a line already fetched is skipped. The nightly retry pass retries
    them too, but knows no line, so a document it stores is dated by the fetch.
+
+### After 2026-10-21 (red sentinel skips, the 24-hour view, the news load)
+
+No schema change. The health check and the briefs run from the checkout, so they change
+with the pull; the wrappers do not, and their retry drop-ins must know exit 69 first.
+On the producer, in this order:
+
+1. The retry drop-ins (section 6, "Units: exit codes, retries and alerts"): add 69 to
+   `RestartPreventExitStatus=` for `sb-attachments`, `sb-conversation-sync`,
+   `sb-daily-sync` and `sb-noon-catchup`, then `systemctl --user daemon-reload`. Before
+   the wrappers: a unit that restarts on 69 spends its start limit in seconds.
+2. The failure-streak lines for `sb-briefs`, `sb-whatsapp-sync`,
+   `sb-conversation-sync` and `sb-news-sync` (same section).
+3. Install the changed wrappers:
+   `install -m 755 scripts/wrappers/systemd/sb-{attachment-pass,auth-watch,briefs,calendar-sync,conversation-sync,daily-sync,news-sync,noon-catchup,outlook-sync,teams-sync,topic-pages,whatsapp-sync}.sh ~/.local/bin/`.
+   Before the next 23:50 health check: until `sb-news-sync.sh` loads what it stages,
+   the 21:00 digest waits for the 01:10 load and the new News rule reads STALE, as it
+   should.
+4. The archive no longer holds `systemd/sb-db-pull.sh`, an old copy of the replica pull
+   that nothing on the producer ran. Retire the installed one, which a check comparing
+   the installed copies with the archive both ways would report as unarchived:
+   `mv ~/.local/bin/sb-db-pull.sh ~/.local/bin/sb-db-pull.sh.retired-20261021`.
+5. Section 9's alerts for `sb-mcp` and the bot: create their two Healthchecks checks
+   (a long period; the failure ping is the signal), add the two `healthcheck.conf`
+   drop-ins, and install and enable `sb-mcp-probe.service` and `.timer` with the
+   producer's own paths, then `systemctl --user daemon-reload &&
+   systemctl --user enable --now sb-mcp-probe.timer`.
+6. Optional, section 6, "Memory": the `MemoryMax=6G` drop-in for `sb-daily-sync`, and
+   its timer moved to 06:15 with its `sb-daily-sync` and `brain-backup` checks.
+7. Check: `systemctl --user show sb-attachments sb-conversation-sync sb-daily-sync
+   sb-noon-catchup -p RestartPreventExitStatus`, then
+   `python scripts/health_check.py` (no `--email`, no `--hc-ping`) prints AUTH and
+   LAST 24 HOURS.
 
 ### Schema notes
 

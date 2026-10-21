@@ -30,13 +30,18 @@ OUTLOOK_SENTINEL="$HOME/.second-brain/needs_reauth"
 # in sb-outlook-sync.sh: the alias, not a pinned version, follows node upgrades.
 export PATH="$PATH:$HOME/.local/share/fnm/aliases/default/bin"
 
-# gcloud ADC expired → Vertex AI extraction would fail. Skip until auth-watch
-# clears the sentinel (its hourly probe restores it on first successful refresh).
-# Logged, because this check used to run before LOG_FILE was named, and a skip
-# that leaves no line cannot be told from a pass that never started.
+# gcloud ADC expired → the Vertex stages would fail: Phase 2 and the image pass,
+# skipped until auth-watch clears the sentinel (its hourly probe restores it on
+# first successful refresh). The others read files on disk or call sharepoint-cli
+# and outlook-cli, so they still run, and the pass ends 69 (EX_UNAVAILABLE) for
+# the stages it owes. It skipped whole and exited 0 until 2026-10-21: a night of
+# registration and text extraction lost to a dead credential none of it uses, and
+# a green ping for it. Logged, because this check used to run before LOG_FILE was
+# named, and a skip that leaves no line cannot be told from a pass that never started.
+gcloud_down=0
 if [ -f "$GCLOUD_SENTINEL" ]; then
-  echo "$(date '+%Y-%m-%d %H:%M:%S') — SKIP: needs_gcloud_reauth sentinel present" >> "$LOG_FILE"
-  exit 0
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - SKIP Phase 2 and images: needs_gcloud_reauth sentinel present" >> "$LOG_FILE"
+  gcloud_down=1
 fi
 
 cd "$PROJECT" || exit 1
@@ -79,13 +84,15 @@ run_stage "text extraction" "$PYTHON" -m src.cli process-attachments --phase 1 -
 # this ran from 20:16 until systemd killed the unit at 21:00. Budget for the
 # hour: registration + Phase 1 take ~16 min, leaving ~44; 30 here keeps room for
 # the image and SharePoint passes below.
-echo "$(date '+%Y-%m-%d %H:%M:%S') — starting attachment summary" >> "$LOG_FILE"
-run_stage "attachment summary" \
-  "$PYTHON" -m src.cli process-attachments --phase 2 --workers 4 --deadline-s 1800
+if [ "$gcloud_down" -eq 0 ]; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - starting attachment summary" >> "$LOG_FILE"
+  run_stage "attachment summary" \
+    "$PYTHON" -m src.cli process-attachments --phase 2 --workers 4 --deadline-s 1800
 
-# Image classification backfill (Stage 1 + Stage 3 vision)
-echo "$(date '+%Y-%m-%d %H:%M:%S') — starting image classification" >> "$LOG_FILE"
-run_stage "image classification" "$PYTHON" -m src.cli process-images --limit 500
+  # Image classification backfill (Stage 1 + Stage 3 vision)
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - starting image classification" >> "$LOG_FILE"
+  run_stage "image classification" "$PYTHON" -m src.cli process-images --limit 500
+fi
 
 # SharePoint URL fetch backfill
 echo "$(date '+%Y-%m-%d %H:%M:%S') — starting SharePoint fetch" >> "$LOG_FILE"
@@ -131,5 +138,16 @@ fi
 # any other failure.
 if [ "$overall_rc" -ne 0 ]; then
   exit 65
+fi
+# Every stage that could run ran and passed, and the two that need the model are
+# owed. 69, prevented from restarting in retry.conf like 65: auth-watch, not a
+# restart, clears the sentinel. A failed stage above outranks it, since it is the
+# one a person has to look at.
+#
+# The mail reconcile's own skip on needs_reauth stays out of this: it reads the last
+# 7 days, so the next night's pass covers the night it missed, and sb-outlook-sync is
+# red for the dead session already.
+if [ "$gcloud_down" -eq 1 ]; then
+  exit 69
 fi
 exit 0

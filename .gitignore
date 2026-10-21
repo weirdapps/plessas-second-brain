@@ -1,4 +1,6 @@
-data/
+# Anchored, and with no trailing slash: on the producer data is a symlink to the data
+# disk, which `data/` (directories only) did not match, so `git status` showed `?? data`.
+/data
 __pycache__/
 *.pyc
 .pytest_cache/

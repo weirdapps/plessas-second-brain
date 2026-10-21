@@ -237,6 +237,23 @@ each one whole; the first run after the change reads every snapshot once. restic
 holds whichever snapshot is newest when it runs, so it trails the live database by
 up to a day.
 
+**The attachment tree.** An excludes file that also leaves out `attachments/` and
+`sharepoint/` (files are inputs, [`DEPLOY.md`](DEPLOY.md) section 10) drops every
+file left on disk, and the database holds only what was read out of them. Most have
+another master, the mailbox or SharePoint, for as long as it keeps them; some have
+none. On the reference producer, 2026-10-21: 12,629 files, 26.9 GiB. Of the files
+attached to stored mail, and so in the mailbox while it keeps the message, 14.0 GiB are
+encrypted originals the store could not read, 9.9 GiB were kept by review for text too
+thin for their size, 1.1 GiB were skipped and 0.3 GiB await the sweep; `sharepoint/`
+was empty between fetches. The files with no master, documents ingested from disk and
+mail whose message row is gone, were hardlinked once into a `kept-originals/`
+directory outside `attachments/`, which the backup keeps at no extra space on disk:
+770 files, 1.3 GiB. Another 81 files of that kind (154 MiB, registered April to
+September) are not linked, nor are 111 files (52 MiB) that no row names: check that
+each has a copy elsewhere and link those that do not. Nothing links new ones, so
+re-run the linking after each review, or keep `attachments/` in the backup until
+something does it on its own.
+
 To restore from it, on the producer, as the user the restic job runs as and with
 its repository and password in the environment. `--host` matters on a repository
 other machines back up to as well: `latest` is otherwise the newest snapshot of

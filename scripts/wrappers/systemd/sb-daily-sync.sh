@@ -65,14 +65,6 @@ fi
 echo $$ > "$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 
-# Skip extraction phase if gcloud ADC expired — the email loop would otherwise
-# burn CONSECUTIVE_FAIL_THRESHOLD calls and enter a 1h QUOTA PAUSE for an issue
-# that is not quota. auth-watch clears the sentinel on its next successful probe.
-if [ -f "$HOME/.second-brain/needs_gcloud_reauth" ]; then
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP: needs_gcloud_reauth sentinel present" >> "$LOG_FILE"
-  exit 0
-fi
-
 echo "=== Daily sync started: $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$LOG_FILE"
 
 # WAL checkpoint: flush pending WAL pages before starting, to reduce lock
@@ -106,15 +98,41 @@ PING_ENV="$HOME/.config/healthchecks-ping.env"
 [ -f "$PING_ENV" ] && . "$PING_ENV"
 export HC_PING_URL="${HC_PING_URL:-}"
 
-"$PYTHON" "$REPO_DIR/scripts/backup_db.py" \
-  --db "$DB" \
-  --local-dir "$DATA_DIR/backups" --local-keep 7 \
-  --offsite-dir "$DATA_DIR/backups/offsite" \
-  --key-file "$HOME/.second-brain/backup.key" \
-  --gfs-daily 14 --gfs-weekly 8 \
-  --hc-slug brain-backup \
-  >> "$LOG_FILE" 2>&1 \
-  || echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: backup step failed (non-fatal)" >> "$LOG_FILE"
+#
+# Once a day. This unit runs again the same day when its retry restarts it, and when
+# sb-auth-watch's restore starts it after an outage, which since 2026-10-21 includes
+# every morning a gcloud skip made it red. The second backup took twelve minutes and
+# replaced the morning's snapshot. Today's snapshot stands when it exists, and so does
+# its encrypted archive where the key makes one; a day missing either takes it again.
+BACKUP_KEY="$HOME/.second-brain/backup.key"
+TODAY=$(date +%Y%m%d)
+if [ -f "$DATA_DIR/backups/brain-$TODAY.db" ] \
+   && { [ ! -f "$BACKUP_KEY" ] || [ -f "$DATA_DIR/backups/offsite/brain-$TODAY.db.zst.enc" ]; }; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] backup already taken today (brain-$TODAY.db); not taking another" >> "$LOG_FILE"
+else
+  "$PYTHON" "$REPO_DIR/scripts/backup_db.py" \
+    --db "$DB" \
+    --local-dir "$DATA_DIR/backups" --local-keep 7 \
+    --offsite-dir "$DATA_DIR/backups/offsite" \
+    --key-file "$BACKUP_KEY" \
+    --gfs-daily 14 --gfs-weekly 8 \
+    --hc-slug brain-backup \
+    >> "$LOG_FILE" 2>&1 \
+    || echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: backup step failed (non-fatal)" >> "$LOG_FILE"
+fi
+
+# Skip the sync if gcloud ADC expired: the email loop would otherwise burn
+# CONSECUTIVE_FAIL_THRESHOLD calls and enter a 1h QUOTA PAUSE for an issue that is
+# not quota. auth-watch clears the sentinel on its next successful probe, and its
+# restore starts this unit again. After the backup, not before it: the gate used to
+# sit above it, so a gcloud outage at 07:05 cost the day's snapshot as well as the
+# day's load, and the 0 it exited with pinged green. 69, which retry.conf does not
+# restart on, since a restart cannot clear the sentinel.
+if [ -f "$HOME/.second-brain/needs_gcloud_reauth" ]; then
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] SKIP sync: needs_gcloud_reauth sentinel present" >> "$LOG_FILE"
+  echo "" >> "$LOG_FILE"
+  exit 69
+fi
 
 # Engine selection: Claude whenever claude_extract has a credential, Vertex
 # under either project name or the direct API.

@@ -7,9 +7,11 @@
 # without the Teams auth steps: the input is a file the bridge's Mac pushed at
 # :50, not an API.
 #
-# :55 is the widest gap on the brain.db write lock: calendar (:48) and news
-# (:50, even hours) are done by about :51, outlook starts at :10, and
-# sb-teams-sync (:30, up to 11 minutes) is long finished.
+# :55 is the widest gap on the brain.db write lock: calendar (:48) is done by
+# about :51, outlook starts at :10, and sb-teams-sync (:30, up to 11 minutes) is
+# long finished. On even hours news (:50) now loads what it stages too (since
+# 2026-10-21) and can still be writing at :55; what covers that overlap is the
+# store's 60 s busy timeout, so a "database is locked" in this log means it did not.
 #
 # Exit codes are the CLI's: 0 ok, 66 the snapshot is missing or unreadable (a
 # broken push, which should page), 1 anything else.
@@ -45,19 +47,27 @@ if [ "${SB_WHATSAPP_SYNC_DISABLED:-0}" = "1" ]; then
   exit 0
 fi
 
-# gcloud ADC expired: extraction and embedding would fail. sb-auth-watch owns
-# the sentinel and clears it on its next good probe; the snapshot is a whole
-# copy, so the next run catches up everything this one skipped.
+# gcloud ADC expired: extraction would fail, and sb-auth-watch owns the sentinel
+# and clears it on its next good probe. The ingest does not need it: the messages are
+# stored and searchable without the model, and the embeddings go through the Gemini
+# API. So the run ingests and tries one session (--limit 1), which defers to
+# 'pending' on the dead credential instead of every session failing in turn, and
+# ends 69, not 0: on 2026-10-20 this skipped whole and pinged hc-success@ green.
+limit_args=""
 if [ -f "$HOME/.second-brain/needs_gcloud_reauth" ]; then
-  echo "$(ts) skip (gcloud reauth sentinel present)" >> "$LOG"
-  exit 0
+  echo "$(ts) gcloud reauth sentinel present: ingest only, extraction owed" >> "$LOG"
+  limit_args="--limit 1"
 fi
 
 cd "$PROJECT" || { echo "$(ts) abort (cannot cd to $PROJECT)" >> "$LOG"; exit 1; }
 echo "$(ts) start" >> "$LOG"
 # The CLI prints counts only, never a message, so its output is safe in this log.
-"$PYTHON" -m src.cli whatsapp-sync >> "$LOG" 2>&1
+# shellcheck disable=SC2086  # empty, or the one option and its value
+"$PYTHON" -m src.cli whatsapp-sync $limit_args >> "$LOG" 2>&1
 rc=$?
+if [ "$rc" -eq 0 ] && [ -n "$limit_args" ]; then
+  rc=69
+fi
 
 failures=$(read_failures)
 if [ "$rc" -eq 0 ]; then

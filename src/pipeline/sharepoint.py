@@ -96,13 +96,14 @@ def run(args):
     # What the old scanner and the old page fetch left in sharepoint_links: queued for the
     # retry pass, not fetched, so no tenant is needed (src/export/sharepoint_repair.py).
     if getattr(args, "repair_links", False):
-        from src.export.sharepoint_repair import reread_pages, rescan_links
+        from src.export.sharepoint_repair import reread_pages, rescan_links, unheld_files
 
         conn = get_connection(db_path)
         run_migrations(conn)
         try:
             links = rescan_links(conn, apply=not args.dry_run)
             pages = reread_pages(conn, apply=not args.dry_run)
+            files = unheld_files(conn, apply=not args.dry_run)
         finally:
             conn.close()
         print(
@@ -111,6 +112,10 @@ def run(args):
         )
         print(
             f"Unread pages: {pages['links']:,} link(s) to {pages['pages']:,} page(s) offered again"
+        )
+        print(
+            f"Files with no text: {files['links']:,} link(s) to {files['files']:,} file(s)"
+            " offered again"
         )
         print(
             "DRY RUN: nothing changed"

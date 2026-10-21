@@ -110,6 +110,65 @@ def test_text_that_is_not_a_workbook_adds_nothing(db, tmp_path):
     assert "figures" not in stats
 
 
+def test_a_workbook_stored_as_a_text_only_document_is_recorded_as_an_edition(db, tmp_path):
+    """A SharePoint file is read by its fetch and stored through ingest_text_document, which
+    Phase 1 never sees: 22 workbooks fetched on 2026-10-18 went past the hook (audit
+    2026-10-20)."""
+    from src.extract.attachment_extractors import extract_text_from_file
+    from src.extract.attachment_pipeline import ingest_text_document
+
+    path = tmp_path / "Volumes 2026-07.xlsx"
+    _workbook(path, 7)
+    read = extract_text_from_file(str(path), XLSX)
+    conn = _conn(db)
+
+    outcome = ingest_text_document(
+        conn,
+        source="sharepoint",
+        key="a7" * 32,
+        filename=path.name,
+        mime_type=XLSX,
+        text=read["text"],
+        sha256="a7" * 32,
+        method=read["method"],
+        status=read["status"],
+        error=read["error"],
+        subject="[SharePoint] Volumes",
+        sender_name="SharePoint",
+        date="2026-07-28T08:00:00Z",
+    )
+
+    edition = conn.execute(
+        "SELECT status FROM figure_editions WHERE attachment_id = ?", (outcome["attachment_id"],)
+    ).fetchone()
+    conn.close()
+    assert edition is not None
+
+
+def test_a_text_only_document_that_is_not_a_workbook_records_no_edition(db):
+    from src.extract.attachment_pipeline import ingest_text_document
+
+    conn = _conn(db)
+    ingest_text_document(
+        conn,
+        source="session-note",
+        key="/notes/plan.md",
+        filename="plan.md",
+        mime_type="text/markdown",
+        text="A plan, long enough to be stored as the text of a document. " * 3,
+        sha256="b8" * 32,
+        method="session-note",
+        status="extracted",
+        error=None,
+        subject="[Session note] plan.md",
+        sender_name="Claude session",
+        date="2026-07-28T08:00:00Z",
+    )
+
+    assert conn.execute("SELECT count(*) FROM figure_editions").fetchone()[0] == 0
+    conn.close()
+
+
 def _heavy_hour(db, tmp_path) -> None:
     """Twelve editions of a 200-row, 9-month workbook in one hour: more than a day of real
     report mail (no hour of the reference replica's last 30 days brought more than 8)."""

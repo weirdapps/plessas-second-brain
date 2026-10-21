@@ -1874,8 +1874,9 @@ MAINT_COMMANDS: dict[str, tuple[str, dict[str, bool], str]] = {
     "sharepoint-repair-links": (
         "process-sharepoint",
         {"repair_links": True},
-        "Queue again the SharePoint links the old scanner mangled and the pages read "
-        "without their text (process-sharepoint --repair-links)",
+        "Queue again the SharePoint links the old scanner mangled, the pages read "
+        "without their text and the files recorded ok with none (process-sharepoint "
+        "--repair-links)",
     ),
 }
 
@@ -2462,7 +2463,8 @@ def main():
         "--repair-links",
         action="store_true",
         help="Drop the links an email no longer yields and record what it does, offer again "
-        "the pages recorded ok without their text, then exit; fetches nothing (--dry-run counts)",
+        "the pages recorded ok without their text and the files recorded ok with no document, "
+        "then exit; fetches nothing (--dry-run counts)",
     )
     parser_process_sp.add_argument(
         "--urls-file",

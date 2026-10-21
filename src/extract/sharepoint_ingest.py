@@ -12,6 +12,7 @@ all. The document is dated by what the link was found in (link_date).
 import hashlib
 import sqlite3
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -83,6 +84,10 @@ def _held_twin(conn: sqlite3.Connection, sha: str):
     return row[0] if row else None
 
 
+class NoText(Exception):
+    """A fetched file with no text to store; the message is the reader's status and reason."""
+
+
 def ingest_fetched_file(
     conn: sqlite3.Connection,
     path: Path,
@@ -96,10 +101,11 @@ def ingest_fetched_file(
     The same bytes stored before are not extracted again. Bytes another attachment holds as
     text (a mail attachment, most often, that the link shares too) make no document either: the
     message id of what holds them comes back, so search finds one copy, not twins. With
-    `require_text`, a file that yields no text makes no document and (None, False) comes back: a
-    view link often returns the browser page (an .aspx viewer, a sign-in or error page) instead
-    of the file. The backlog pass keeps its default, because a file left on disk needs its row
-    for the sweep to know it was read (the sweep counts a held twin's bytes as read).
+    `require_text`, a file that yields no text makes no document and NoText is raised with the
+    reader's verdict: a view link often returns the browser page (an .aspx viewer, a sign-in or
+    error page) instead of the file, and a rights-protected file is ciphertext. The backlog pass
+    keeps its default, because a file left on disk needs its row for the sweep to know it was
+    read (the sweep counts a held twin's bytes as read).
     """
     sha = sha256_of_file(path)
     message_id = _sha256_to_message_id(sha)
@@ -111,7 +117,7 @@ def ingest_fetched_file(
     mime = _guess_mime_type(str(path))
     result = extract_text_from_file(str(path), mime)
     if require_text and not result["text"]:
-        return None, False
+        raise NoText(f"{result['status']}: {result['error'] or 'no reason given'}")
     ingest_text_document(
         conn,
         source="sharepoint",
@@ -208,9 +214,18 @@ def fetch_and_ingest(
         result = sharepoint_fetcher.fetch_sharepoint_link(url, Path(tmp))
         document = None
         if result.status == "ok" and result.local_path and result.local_path.is_file():
-            document, _ = ingest_fetched_file(
-                conn, result.local_path, url, _dated(), require_text=True
-            )
+            try:
+                document, _ = ingest_fetched_file(
+                    conn, result.local_path, url, _dated(), require_text=True
+                )
+            except NoText as e:
+                # Fetched, but nothing to store, as for a page above. Recorded 'ok' this settled
+                # the link with no document and never offered it again: 15 links to 11 files on
+                # 2026-10-18, rights-protected workbooks, a saved .msg and decks of pictures
+                # (audit 2026-10-20).
+                result = replace(
+                    result, status="no-text", error_message=f"the file holds no text to store ({e})"
+                )
     return result, document
 
 

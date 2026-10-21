@@ -1776,6 +1776,10 @@ def ingest_text_document(
                 llm_status_for(error),
             ),
         )
+    # A workbook goes to the figures hook as Phase 1 sends one: 22 fetched from SharePoint on
+    # 2026-10-18 went past it (audit 2026-10-20), and only the backfill would have found them.
+    if attachment_id is not None and status == "extracted" and is_spreadsheet(method):
+        _ingest_figures(conn, [attachment_id])
     return {
         "skipped": False,
         "message_id": message_id,

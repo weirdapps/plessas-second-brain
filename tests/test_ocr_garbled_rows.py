@@ -257,6 +257,90 @@ def test_a_marked_image_is_transcribed_and_its_text_replaced(store, monkeypatch)
     assert (method, error, summary, llm) == ("vision", None, DESCRIPTION, "extracted")
 
 
+# An image the transcription owes is read from a file of its bytes. On the producer 146 content
+# images owed one with every such file gone and refetch-garbled settled on each of their rows: the
+# mailbox no longer held the message (228 rows), or held nothing or several matches (14). Each night
+# counted them missing and nothing could ever transcribe them (audit 2026-10-20). Given up, they
+# stop owing; the refetch record of each row says why.
+
+
+def _gone(conn, att, state="gone", attempts=1):
+    import json
+    from pathlib import Path
+
+    from src.store.file_sweep import REFETCH_KEY
+
+    Path(
+        conn.execute("SELECT file_path FROM attachments WHERE id = ?", (att,)).fetchone()[0]
+    ).unlink()
+    if state:
+        conn.execute(
+            "INSERT INTO sync_metadata (key, value) VALUES (?, ?)",
+            (f"{REFETCH_KEY}{att}", json.dumps({"state": state, "attempts": attempts})),
+        )
+    conn.commit()
+
+
+def _owed(conn):
+    from src.store.file_sweep import TRANSCRIPTION_OWED_SQL
+
+    return conn.execute(
+        f"SELECT count(*) FROM inline_images ii WHERE {TRANSCRIPTION_OWED_SQL}"
+    ).fetchone()[0]
+
+
+@pytest.mark.parametrize(("state", "attempts"), [("gone", 1), ("unmatched", 1), ("failed", 3)])
+def test_a_marked_image_gone_for_good_stops_owing(store, monkeypatch, state, attempts):
+    _path, conn, tmp_path, _summarised = store
+    _gone(conn, _content_image(conn, tmp_path), state, attempts)
+    monkeypatch.setattr("src.extract.claude_extract.complete", lambda **k: pytest.fail("called"))
+
+    stats = run_transcription(conn)
+
+    assert (stats["missing"], stats["gone"]) == (1, 1)
+    assert _owed(conn) == 0
+    assert run_transcription(conn)["missing"] == 0
+
+
+@pytest.mark.parametrize(("state", "attempts"), [(None, 0), ("failed", 1), ("not_found", 2)])
+def test_a_marked_image_the_refetch_may_still_find_keeps_owing(store, state, attempts):
+    _path, conn, tmp_path, _summarised = store
+    _gone(conn, _content_image(conn, tmp_path), state, attempts)
+
+    stats = run_transcription(conn)
+
+    assert (stats["missing"], stats["gone"]) == (1, 0)
+    assert _owed(conn) == 1
+
+
+def test_an_image_one_of_whose_rows_was_never_asked_for_keeps_owing(store):
+    """Another email's copy of the bytes, with no refetch record, may still bring the file back."""
+    _path, conn, tmp_path, _summarised = store
+    att = _content_image(conn, tmp_path)
+    path, sha = conn.execute(
+        "SELECT file_path, sha256 FROM attachments WHERE id = ?", (att,)
+    ).fetchone()
+    copy = conn.execute(
+        "INSERT INTO attachments (email_id, message_id, filename, mime_type, file_size,"
+        " file_path, exported_at, sha256) VALUES (1, 7, 'copy.png', 'image/png', 1, ?,"
+        " '2026-09-01', ?)",
+        (path + ".copy", sha),
+    ).lastrowid
+    _content(conn, copy, garble(GREEK))
+    _gone(conn, att)
+
+    assert run_transcription(conn)["gone"] == 0
+    assert _owed(conn) == 1
+
+
+def test_a_dry_run_gives_nothing_up(store):
+    _path, conn, tmp_path, _summarised = store
+    _gone(conn, _content_image(conn, tmp_path))
+
+    assert run_transcription(conn, dry_run=True)["gone"] == 1
+    assert _owed(conn) == 1
+
+
 def test_a_marked_image_already_transcribed_takes_its_transcription(store):
     _path, conn, tmp_path, _summarised = store
     att = _content_image(conn, tmp_path, transcribed=True)

@@ -12,7 +12,7 @@ from argparse import Namespace
 import pytest
 
 from src.export.sharepoint_fetcher import record_link_in_db, retry_candidates
-from src.export.sharepoint_repair import refused_links, reread_pages, rescan_links
+from src.export.sharepoint_repair import refused_links, reread_pages, rescan_links, unheld_files
 from src.store.email_html import save_html
 from src.store.schema import create_database
 
@@ -204,6 +204,47 @@ def test_the_page_dry_run_changes_nothing(conn):
     assert retry_candidates(conn) == []
 
 
+# --- Files recorded 'ok' that made no document -------------------------------------------------
+#
+# A fetched file with no text to store made no document, and the link was recorded 'ok', which
+# settled it with nothing held: 15 links to 11 files on the producer, fetched on 2026-10-18 (audit
+# 2026-10-20). The fetch records such a file 'no-text' now; the repair marks the old ones so, with
+# fetched_at cleared, and the retry pass fetches them once more.
+
+SHEET = "https://contoso.sharepoint.com/:x:/g/personal/ann/EQsheet"
+
+
+def test_files_recorded_ok_with_no_document_are_offered_again(conn):
+    record_link_in_db(conn, url=SHEET, message_id="teams:7", status="ok", file_name="a.xlsx")
+    record_link_in_db(conn, url=f"{SHEET}2", message_id="AAMk-1", status="ok", file_name="a.xlsx")
+    held = "https://contoso.sharepoint.com/sites/Team/Shared/plan.pdf"
+    record_link_in_db(
+        conn, url=held, message_id="AAMk-1", status="ok", document_message_id=_shell_document(conn)
+    )
+    page = f"{SITE}/Launch.aspx"
+    record_link_in_db(conn, url=page, message_id="AAMk-1", status="ok")
+
+    stats = unheld_files(conn, apply=True)
+
+    assert stats == {"links": 2, "files": 1}
+    links = _links(conn)
+    assert links[SHEET] == links[f"{SHEET}2"] == ("no-text", False, 1)
+    assert links[held][0] == links[page][0] == "ok", "a held file and a page are not this one's"
+    assert sorted(u for u, _m in retry_candidates(conn) if u.startswith(SHEET)) == [
+        SHEET,
+        f"{SHEET}2",
+    ]
+
+
+def test_the_file_repair_dry_run_changes_nothing_and_a_second_run_finds_none(conn):
+    record_link_in_db(conn, url=SHEET, message_id="teams:7", status="ok")
+
+    assert unheld_files(conn, apply=False) == {"links": 1, "files": 1}
+    assert _links(conn)[SHEET][0] == "ok"
+    unheld_files(conn, apply=True)
+    assert unheld_files(conn, apply=True) == {"links": 0, "files": 0}
+
+
 def test_the_cli_repairs_both_and_fetches_nothing(tmp_path, monkeypatch, capsys):
     from src import cli
     from src.export import sharepoint_fetcher
@@ -213,6 +254,7 @@ def test_the_cli_repairs_both_and_fetches_nothing(tmp_path, monkeypatch, capsys)
     _email(c, "AAMk-1")
     _given_up(c, f"{SITE}/Sales-Rally-Q2-")
     record_link_in_db(c, url=f"{SITE}/Launch.aspx", message_id="AAMk-1", status="ok")
+    record_link_in_db(c, url=SHEET, message_id="teams:7", status="ok")
     c.close()
     for name in ("fetch_sharepoint_link", "fetch_sharepoint_page"):
         monkeypatch.setattr(sharepoint_fetcher, name, lambda *a, **k: pytest.fail("fetched"))
@@ -224,6 +266,7 @@ def test_the_cli_repairs_both_and_fetches_nothing(tmp_path, monkeypatch, capsys)
     assert rc == 0
     out = capsys.readouterr().out
     assert "1 dropped" in out and "1 recorded" in out and "1 link(s) to 1 page(s)" in out
+    assert "Files with no text: 1 link(s) to 1 file(s)" in out
 
 
 # --- Links our own tenant refuses: what the owner asks access to ---------------------------

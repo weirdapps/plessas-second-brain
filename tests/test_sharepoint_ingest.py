@@ -327,15 +327,41 @@ def test_the_nightly_pass_gives_the_sharepoint_stage_a_budget():
 
 def test_a_fetched_page_with_nothing_to_extract_makes_no_document(conn, monkeypatch):
     """A view link can return the browser page instead of the file (an .aspx viewer, a sign-in
-    or error page). There is no text to store, so no document is made; the link still counts
-    as fetched, so it is not retried every night."""
+    or error page). There is no text to store, so no document is made, and the link is not
+    settled: recorded 'ok' it held nothing and was never offered again (15 links to 11 files on
+    the producer, audit 2026-10-20). It is retried on the attempt cap and its cool-off."""
+    from src.export.sharepoint_fetcher import retry_candidates
+
     page = "<!DOCTYPE html><html><head><script>var app = {};</script></head><body></body></html>"
     _fake_fetch(monkeypatch, body=page, name="Doc.aspx")
 
     result, document = fetch_and_ingest(conn, URL, "AAMk-1")
+    record_link_in_db(
+        conn, url=URL, message_id="AAMk-1", status=result.status, document_message_id=document
+    )
 
-    assert (result.status, document) == ("ok", None)
+    assert (result.status, document) == ("no-text", None)
+    assert "no text" in result.error_message
     assert conn.execute("SELECT COUNT(*) FROM attachments").fetchone()[0] == 0
+    assert [u for u, _m in retry_candidates(conn)] == [URL]
+
+
+def test_a_rights_protected_file_says_why_it_holds_no_text(conn, monkeypatch):
+    """Most of the 11 files were workbooks under Information Rights Management: ciphertext
+    whatever the fetch, and the reader's verdict says so."""
+    from tests.ole_fixtures import RMS_NAMES, ole_file
+
+    def fake(url, out_dir, managed_host=None):
+        f = Path(out_dir) / "Budget.xlsx"
+        f.write_bytes(ole_file(RMS_NAMES))
+        return SharepointFetchResult(url=url, status="ok", local_path=f, file_name=f.name)
+
+    monkeypatch.setattr(sharepoint_fetcher, "fetch_sharepoint_link", fake)
+
+    result, document = fetch_and_ingest(conn, URL.replace("Plan.txt", "Budget.xlsx"), "AAMk-1")
+
+    assert (result.status, document) == ("no-text", None)
+    assert "encrypted" in result.error_message
 
 
 PAGE = "https://contoso.sharepoint.com/sites/News/SitePages/Launch.aspx?e=1"
@@ -599,6 +625,23 @@ def test_viewer_links_on_one_web_each_fetch_their_own_file(conn, tmp_path, tenan
     assert sorted(calls) == sorted([plan, budget])
     assert links[plan][1] != links[budget][1]
     assert "budget for next year" in _text_of(conn, links[budget][1])
+
+
+def test_a_file_with_no_text_is_counted_failed_and_left_unsettled(
+    conn, tmp_path, tenant, monkeypatch, capsys
+):
+    sheet = "https://contoso.sharepoint.com/sites/team/Shared%20Documents/Budget.xlsx"
+    record_link_in_db(conn, url=sheet, message_id="teams:7", status="stale")
+    _fake_fetch(monkeypatch, body="", name="Budget.xlsx")
+
+    _process(tmp_path / "brain.db")
+
+    assert "URLs failed: 1" in capsys.readouterr().out
+    assert _links(tmp_path / "brain.db")[sheet] == ("no-text", None)
+    fetched_at = conn.execute(
+        "SELECT fetched_at FROM sharepoint_links WHERE url = ?", (sheet,)
+    ).fetchone()[0]
+    assert fetched_at is None
 
 
 def test_a_link_that_is_not_content_is_not_counted_as_failed(

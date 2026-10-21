@@ -175,7 +175,12 @@ def _stored(conn: sqlite3.Connection) -> dict[int, dict]:
     return out
 
 
-def _write(conn: sqlite3.Connection, aid: int, cid: int, extracted_at, text: str) -> list:
+def _write(
+    conn: sqlite3.Connection, aid: int, cid: int, extracted_at, text: str, text_chars: int
+) -> list:
+    """Cut `text` and record its chunks. `text_chars` is its length as eligible() measured it,
+    SQLite's length(), and so as the next pass compares it: a NUL ends that count, and Python's
+    len() of the same text, stored here until 2026-10-21, never matched it again."""
     spans = [(no, start, end) for no, (start, end) in enumerate(split_text(text))]
     now = utc_now()
     conn.execute("DELETE FROM attachment_chunks WHERE attachment_id = ?", (aid,))
@@ -184,7 +189,7 @@ def _write(conn: sqlite3.Connection, aid: int, cid: int, extracted_at, text: str
         "end_char, chars, text_chars, text_extracted_at, chunked_at) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
-            (aid, no, cid, start, end, end - start, len(text), extracted_at, now)
+            (aid, no, cid, start, end, end - start, text_chars, extracted_at, now)
             for no, start, end in spans
         ],
     )
@@ -213,8 +218,8 @@ def plan_chunks(conn: sqlite3.Connection, *, deadline: float | None = None) -> C
         if entry is not None and entry["key"] == _key(cid, n, extracted_at):
             plan.spans[aid] = entry["spans"]
         else:
-            todo.append((aid, cid, extracted_at, entry is not None))
-    for aid, cid, extracted_at, had_rows in sorted(todo, reverse=True):
+            todo.append((aid, cid, extracted_at, entry is not None, n))
+    for aid, cid, extracted_at, had_rows, n in sorted(todo, reverse=True):
         if deadline is not None and time.monotonic() >= deadline:
             plan.deferred += 1
             if had_rows:
@@ -223,7 +228,7 @@ def plan_chunks(conn: sqlite3.Connection, *, deadline: float | None = None) -> C
         row = conn.execute(
             "SELECT extracted_text FROM attachment_content WHERE id = ?", (cid,)
         ).fetchone()
-        plan.spans[aid] = _write(conn, aid, cid, extracted_at, (row[0] if row else "") or "")
+        plan.spans[aid] = _write(conn, aid, cid, extracted_at, (row[0] if row else "") or "", n)
         plan.changed.add(aid)
         conn.commit()
     if gone:

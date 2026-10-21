@@ -412,3 +412,141 @@ def test_a_document_another_source_holds_is_kept_when_the_note_changes(conn, tmp
         "SELECT COUNT(*) FROM emails WHERE message_id = ?", (shared["message_id"],)
     ).fetchone()[0]
     assert kept == 1
+
+
+# --- dates ---------------------------------------------------------------------------------------
+#
+# Claude Code writes the request it sends as an "api-request-blob" record: no timestamp, and every
+# earlier tool call and result in it again. Read as turns, a blob replayed each Write with no time,
+# and a note came out undated, filed under the time it was ingested in the producer's local time
+# with no zone: 57 notes, 3 hours to 18 days off (audit 2026-10-20). It replayed each Edit too, onto
+# a text it had already changed, so the replay lost track of the file.
+
+
+def _blob(*blocks, session="s1"):
+    """An api-request-blob record: the messages of a request, again, with no timestamp."""
+    return {
+        "type": "api-request-blob",
+        "sessionId": session,
+        "hash": "ab" * 32,
+        "message": {"role": "assistant", "content": list(blocks)},
+    }
+
+
+def _block_of(record):
+    return record["message"]["content"][0]
+
+
+def test_a_replayed_request_leaves_the_note_its_own_time(tmp_path):
+    write, done = _use(1, "Write", file_path="/n/a.md", content=LONG), _result(1)
+
+    notes = _notes(tmp_path, write, done, _blob(_block_of(write)), _blob(_block_of(done)))
+
+    assert notes["/n/a.md"].written_at == "2026-09-30T10:00:01Z"
+
+
+def test_a_replayed_edit_does_not_lose_track_of_the_note(tmp_path):
+    write, wrote = _use(1, "Write", file_path="/n/a.md", content="alpha beta"), _result(1)
+    edit = _use(2, "Edit", file_path="/n/a.md", old_string="beta", new_string="gamma")
+
+    notes = _notes(
+        tmp_path,
+        write,
+        wrote,
+        edit,
+        _result(2),
+        _blob(_block_of(edit)),
+        _blob(_block_of(_result(2))),
+        _use(3, "Edit", file_path="/n/a.md", old_string="gamma", new_string="delta"),
+        _result(3),
+    )
+
+    assert notes["/n/a.md"].text == "alpha delta"
+
+
+def test_a_call_with_no_time_of_its_own_takes_the_time_before_it(tmp_path):
+    write = _use(1, "Write", file_path="/n/a.md", content=LONG)
+    del write["timestamp"]
+    before = {"type": "system", "timestamp": "2026-09-30T09:59:58Z", "content": "hook"}
+
+    notes = _notes(tmp_path, before, write, _result(1))
+
+    assert notes["/n/a.md"].written_at == "2026-09-30T09:59:58Z"
+
+
+def test_a_note_with_no_time_at_all_is_dated_in_utc(conn, tmp_path):
+    from src.store.stamps import has_offset
+
+    write = _use(1, "Write", file_path="/n/a.md", content=LONG)
+    done = _result(1)
+    del write["timestamp"], done["timestamp"]
+
+    ingest_session_notes(conn, [_write(tmp_path / "s.jsonl", [write, done])])
+
+    date = conn.execute(
+        "SELECT date_received FROM emails WHERE sender_address = 'session-note@documents.local'"
+    ).fetchone()[0]
+    assert has_offset(date)
+
+
+def _undated(conn, tmp_path, session="s1"):
+    """A note as the producer holds the 57: its document dated by the ingest, in local time with
+    no zone, and no written_at."""
+    ingest_session_notes(conn, [_session(tmp_path, session, LONG)])
+    conn.execute("UPDATE session_notes SET written_at = ''")
+    conn.execute(
+        "UPDATE emails SET date_received = '2026-10-16T20:45:54.123814'"
+        " WHERE sender_address = 'session-note@documents.local'"
+    )
+    conn.commit()
+
+
+def _dates(conn):
+    return conn.execute(
+        "SELECT sn.written_at, e.date_received FROM session_notes sn"
+        " JOIN emails e ON e.message_id = sn.message_id"
+    ).fetchall()
+
+
+def test_an_undated_note_read_again_takes_its_time(conn, tmp_path):
+    _undated(conn, tmp_path)
+
+    stats = ingest_session_notes(conn, [_session(tmp_path, "s1", LONG)])
+
+    assert stats["dated"] == 1
+    assert [tuple(r) for r in _dates(conn)] == [("2026-09-30T10:00:01Z", "2026-09-30T10:00:01Z")]
+
+
+def test_session_note_dates_reads_the_undated_sessions_again(conn, tmp_path, monkeypatch):
+    from src.export.session_notes import date_undated_notes
+
+    proj = _projects(tmp_path, monkeypatch)
+    _undated(conn, proj, session="s1")
+    nested = proj / "s1" / "subagents"
+    nested.mkdir(parents=True)
+    _session(nested, "agent-1", LONG + " Agent.", path="/n/spec.md")
+    _session(proj, "other", LONG + " Other.", path="/n/other.md")
+
+    dry = date_undated_notes(conn, apply=False)
+    assert (dry["undated"], dry["transcripts"], dry["dated"]) == (1, 2, 0)
+    assert [tuple(r) for r in _dates(conn)][0][0] == ""
+
+    stats = date_undated_notes(conn, apply=True)
+
+    assert (stats["dated"], stats["left"]) == (1, 0)
+    assert date_undated_notes(conn, apply=True)["undated"] == 0
+
+
+def test_the_command_counts_by_default_and_refuses_on_a_replica(tmp_path, monkeypatch, capsys):
+    from tests.brain_cli import brain
+
+    _projects(tmp_path, monkeypatch)
+    db = tmp_path / "brain.db"
+    create_database(str(db)).close()
+
+    code, out, _ = brain(monkeypatch, capsys, "--db", str(db), "maint", "session-note-dates")
+    assert code == 0 and "dry run" in out
+
+    monkeypatch.setenv("BRAIN_ROLE", "replica")
+    code, _, err = brain(monkeypatch, capsys, "--db", str(db), "maint", "session-note-dates")
+    assert code == 2 and "replica" in err

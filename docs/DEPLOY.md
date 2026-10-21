@@ -1605,6 +1605,42 @@ need the Gemini API):
 gemini-embedding-001 queries at 768 dimensions match as if it had been built so; it adds
 no chunks and keeps the old model.
 
+### One-off commands after the sources audit of 2026-10-20 (attachments, SharePoint, notes, conversations)
+
+No schema change and no wrapper change. Each command below is a dry run first; the counts are
+the replica's of 2026-10-21. Run steps 2 and 3 when no other vector job runs: reextract drops
+the vectors of what it summarises again, which loads the index.
+
+1. `python -m src.cli maint strip-nul`, then `--apply`: 54 texts with 12,752 NUL characters,
+   3 of them cut into chunks. The next embedding pass cuts 14 documents once (the 3 it cut on
+   every pass, and 11 it never cut); a second run finds nothing.
+2. `python -m src.cli maint reextract --decoding --estimate`, then without `--estimate`: reads
+   again 28 UTF-16 card statements stored as Latin-1 and 2 copies of a Word agenda that failed to
+   decode, and summarises them (14 calls, about $0.40).
+3. `python -m src.cli maint reextract --failed --estimate`, then without `--estimate`: the 14
+   summaries that failed under the call shape before v2-text (about $1.60). One that fails again
+   is not taken again.
+4. `python -m src.cli maint sharepoint-repair-links --dry-run`, then without it: marks the 15
+   file links recorded `ok` with no document `no-text`, so the nightly retry pass fetches them
+   again (it also drops the links the old scanner mangled: 156 on the replica).
+5. `python -m src.cli maint figures-backfill --apply`: records the 22 SharePoint workbooks of
+   2026-10-18 as editions; the figures hook takes such workbooks from now on.
+6. `python -m src.cli maint session-note-dates`, then `--apply`: reads again the transcripts of
+   the sessions whose notes are held undated (40 notes from 13 sessions) and dates each by its
+   transcript, in UTC.
+7. `python -m src.cli maint relabel-conversations --dry-run`, then without it: the re-auth nudge
+   is no longer an owner turn, so the stored nudge turns become `agent` (700 turns, 152 sessions
+   that held nothing else becoming agent sessions, beside 87 turns any run would relabel now).
+8. The conversations the 7-day scan never loaded:
+   `python -m src.cli export-conversations --days 47` (back to 5 Sep from 21 Oct: a day more for
+   each day later), which stages 32 sessions of 5 Sep to 3 Oct and 50 loaded ones that went on
+   after their load, then
+   `python -m src.cli extract-conversations --workers 2`; the next hourly sync loads them, or
+   `python -m src.cli load`. The 97 sessions that held only the nudge no longer qualify.
+
+The 146 content images whose files are gone for good stop owing a transcription at the nightly
+image pass, with nothing to run (`maint transcribe-images --dry-run` counts them `gone`).
+
 ### After the Teams SharePoint links (no schema change)
 
 `process-sharepoint` now reads Teams after mail: the files sent with a message and the links

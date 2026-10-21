@@ -609,7 +609,10 @@ TRANSCRIBE_NIGHTLY_BUDGET_S = 300.0
 def _print_transcription(stats: dict) -> None:
     print(f"  Transcribed: {stats['transcribed']} ({stats['empty']} showed no text)")
     print(f"  Failed: {stats['failed']}, deferred (out of time): {stats['deferred']}")
-    print(f"  Missing files: {stats['missing']}")
+    print(
+        f"  Missing files: {stats['missing']}"
+        f" ({stats.get('gone', 0)} gone for good, given up: refetch-garbled settled them)"
+    )
     print(f"  Attachment rows written: {stats['projected']}")
 
 
@@ -638,7 +641,7 @@ def cmd_transcribe_images(args) -> int:
     print(f"Content images to transcribe (a file on disk): {stats['candidates']}")
     if args.dry_run:
         todo = min(stats["candidates"], args.limit) if args.limit else stats["candidates"]
-        print(f"  Missing files: {stats['missing']}")
+        print(f"  Missing files: {stats['missing']} ({stats.get('gone', 0)} gone for good)")
         print(f"  Would transcribe: {todo} (one vision call each)")
         return 0
     _print_transcription(stats)
@@ -1899,8 +1902,9 @@ MAINT_COMMANDS: dict[str, tuple[str, dict[str, bool], str]] = {
     "sharepoint-repair-links": (
         "process-sharepoint",
         {"repair_links": True},
-        "Queue again the SharePoint links the old scanner mangled and the pages read "
-        "without their text (process-sharepoint --repair-links)",
+        "Queue again the SharePoint links the old scanner mangled, the pages read "
+        "without their text and the files recorded ok with none (process-sharepoint "
+        "--repair-links)",
     ),
 }
 
@@ -2194,6 +2198,16 @@ def main():
         help="wide workbooks summarised from a digest that left out their newest columns",
     )
     parser_reextract.add_argument(
+        "--decoding",
+        action="store_true",
+        help="UTF-16 texts stored as Latin-1, Word files whose converter output failed to decode",
+    )
+    parser_reextract.add_argument(
+        "--failed",
+        action="store_true",
+        help="summaries that failed under a call shape before v2-text (2026-10-16)",
+    )
+    parser_reextract.add_argument(
         "--no-spreadsheets",
         action="store_true",
         dest="no_spreadsheets",
@@ -2482,7 +2496,8 @@ def main():
         "--repair-links",
         action="store_true",
         help="Drop the links an email no longer yields and record what it does, offer again "
-        "the pages recorded ok without their text, then exit; fetches nothing (--dry-run counts)",
+        "the pages recorded ok without their text and the files recorded ok with no document, "
+        "then exit; fetches nothing (--dry-run counts)",
     )
     parser_process_sp.add_argument(
         "--urls-file",
@@ -3073,6 +3088,13 @@ def main():
     from src.export import legacy_mail
 
     legacy_mail.add_maint_parsers(maint_subparsers)
+    # strip-nul (src/store/nul_text.py) and session-note-dates (src/export/session_notes.py):
+    # maint-only, with no old spelling.
+    from src.export import session_notes
+    from src.store import nul_text
+
+    nul_text.add_maint_parser(maint_subparsers)
+    session_notes.add_maint_parser(maint_subparsers)
 
     # Parse and execute
     args = parser.parse_args()

@@ -31,6 +31,17 @@
             Summarised again, from the stored text; the file is not read. The first run records
             when it began (sync_metadata reextract_wide_since), and a row summarised since is
             not taken again
+    decoding text a reader decoded wrongly, read again with the decoding of 2026-10-21
+            (attachment_extractors._text_encodings, _decode_output): a UTF-16 export read as
+            Latin-1, its byte-order mark stored as "ÿþ" or "þÿ" and a NUL after every Latin
+            letter (28 rows, audit 2026-10-20), and a Word file whose converter output failed to
+            decode (UnicodeDecodeError). The text read now replaces the stored one whatever its
+            length, as for garbled, and is summarised
+    failed  a summary that failed for good under a call shape before v2-text, the default since
+            V2_TEXT_SINCE: an old parser's IndexError, a refusal, a reply that was not JSON (14
+            rows, audit 2026-10-20). Each failure belongs to the request it was made from, and
+            that request is no longer sent. Summarised again from the stored text; one that fails
+            again carries a later stamp and is not taken again
 
 A row is updated in place, so its id, and the vector keyed on it, stay its own. A re-read that
 comes back with no text leaves a row that already had text untouched (counted as kept): a
@@ -101,9 +112,16 @@ from src.llm_cost import TokenBudget
 from src.redact import redact_secrets
 from src.store.file_hashes import locate_file
 from src.store.file_sweep import OCR_GARBLED_SQL, PARTIAL_SINCE_KEY, PARTIAL_SQL, UNREAD_SQL
-from src.store.stamps import instant, utc_now
+from src.store.stamps import instant, instant_sql, utc_now
 
 OLD_TEXT_CAP = 100_000
+
+# When v2-text, the call shape of today's summaries, reached the producer: #224 merged at 11:48
+# UTC on 2026-10-16 and the hourly update pulls within the hour. The failed selector takes the
+# failures stamped before it.
+V2_TEXT_SINCE = datetime(2026, 10, 16, 13, tzinfo=UTC)
+# A UTF-16 byte-order mark, as a reader that took the file for Latin-1 stored it.
+_MARKS_READ_AS_LATIN1 = ("ÿþ", "þÿ")
 
 # When the spreadsheet digest reached the producer: a long workbook summarised since was
 # summarised from its digest (attachment_pipeline._route), one summarised before from its parts,
@@ -189,7 +207,29 @@ SELECTORS: dict[str, tuple[str, bool]] = {
         f" WHERE f.key = '{FULL_PARTS_KEY}' || ac.attachment_id)",
         False,
     ),
+    # A text-only document kept no file to read again.
+    "decoding": (
+        "a.file_path NOT LIKE 'text:%' AND ((ac.extraction_method = 'direct_read'"
+        " AND substr(ac.extracted_text, 1, 2) IN ("
+        + ", ".join(f"'{mark}'" for mark in _MARKS_READ_AS_LATIN1)
+        + "))"
+        " OR (ac.extraction_status = 'failed'"
+        " AND ac.extraction_error LIKE 'UnicodeDecodeError%'))",
+        True,
+    ),
+    "failed": (
+        "ac.llm_status = 'failed' AND ac.extraction_status = 'extracted'"
+        f" AND {instant_sql('ac.llm_extracted_at')}"
+        f" < julianday('{V2_TEXT_SINCE.isoformat()}')",
+        False,
+    ),
 }
+
+
+def _read_as_latin1(text: str | None, method: str | None) -> bool:
+    """Whether a stored text is a UTF-16 file the plain-text reader took for Latin-1."""
+    return method == "direct_read" and text is not None and text.startswith(_MARKS_READ_AS_LATIN1)
+
 
 # The images pass owns these rows (src/extract/image_*.py): never selected, never written.
 NOT_VISION = "COALESCE(extraction_method, '') != 'vision'"
@@ -451,8 +491,12 @@ def reextract(
                 (ac_id,),
             ).fetchone()
             # A reading no longer marked as Greek read as Latin look-alikes replaces one that was,
-            # whatever its length: the stored text's words were wrong, not too few.
-            mended = is_garbled(stored_error) and not is_garbled(result["error"])
+            # whatever its length: the stored text's words were wrong, not too few. So does a
+            # UTF-16 file read as such where it was stored as Latin-1, twice as long.
+            mended = (is_garbled(stored_error) and not is_garbled(result["error"])) or (
+                _read_as_latin1(stored, stored_method)
+                and not _read_as_latin1(text, result["method"])
+            )
             # A reader that says it stopped early (pages left unread) has not read it again.
             close = (
                 bool(stored)

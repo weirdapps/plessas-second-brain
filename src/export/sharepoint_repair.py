@@ -10,8 +10,13 @@ made by the scanner: it is dropped, and what the email does link to is recorded 
 Unread pages. A page link recorded 'ok' whose document is not the page's own text, none at
 all or the script shell an older fetch saved as a file, is offered again.
 
-Neither repair fetches anything: the retry pass reads what they queue (`brain
-process-sharepoint`, or the nightly run). With apply False both only count.
+Files with no text. A file link recorded 'ok' with no document: the fetched file had no text to
+store, and 'ok' settled the link with nothing held (15 links to 11 files on 2026-10-18, audit
+2026-10-20). The fetch records such a file 'no-text' now; the old ones are marked so and offered
+again.
+
+No repair fetches anything: the retry pass reads what they queue (`brain
+process-sharepoint`, or the nightly run). With apply False they only count.
 """
 
 import sqlite3
@@ -122,6 +127,28 @@ def reread_pages(conn: sqlite3.Connection, *, apply: bool) -> dict:
         )
         conn.commit()
     return {"links": len(chosen), "pages": len({target_of(url) for url in chosen})}
+
+
+def unheld_files(conn: sqlite3.Connection, *, apply: bool) -> dict:
+    """Offer again the file links recorded 'ok' with no document.
+
+    Each is recorded as the fetch records such a file now: 'no-text', fetched_at cleared, one
+    attempt spent, so retry_candidates offers it and the health check counts it as not fetched.
+    A page link is reread_pages' to judge. Counts the links and the files they name.
+    """
+    rows = conn.execute(
+        "SELECT url, file_name FROM sharepoint_links"
+        " WHERE last_status = 'ok' AND document_message_id IS NULL"
+    ).fetchall()
+    chosen = [(url, name) for url, name in rows if link_kind(url) == "file"]
+    if apply and chosen:
+        conn.executemany(
+            "UPDATE sharepoint_links SET last_status = 'no-text', fetched_at = NULL, attempts = 1"
+            " WHERE url = ? AND last_status = 'ok' AND document_message_id IS NULL",
+            [(url,) for url, _name in chosen],
+        )
+        conn.commit()
+    return {"links": len(chosen), "files": len({name or url for url, name in chosen})}
 
 
 def _document_key(url: str) -> tuple[str, str, str]:

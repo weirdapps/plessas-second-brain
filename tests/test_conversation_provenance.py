@@ -183,6 +183,45 @@ def test_a_session_the_owner_typed_nothing_into_is_an_agent_session(tmp_path):
     assert "user" not in _speakers(conv)
 
 
+NUDGE = (
+    "gcloud auth refreshed. If a task was genuinely in progress, continue it from where it"
+    " stopped. If you were not doing anything, or the task was already finished, do not invent"
+    " or imagine work: just output DONE! and stop."
+)
+
+
+def test_the_re_auth_nudge_is_not_the_owners_though_it_arrives_typed(tmp_path):
+    """A login script pastes it into every idle session after a re-authentication, so Claude
+    Code records it as typed. 97 sessions held nothing but the nudge and an answer of DONE!, each
+    an owner session by that turn alone, and every one would have been extracted and stored
+    (audit 2026-10-20). The harness's records now make one turn, too short to export."""
+    stub = [
+        _user("<local-command-caveat>Caveat: local commands</local-command-caveat>", isMeta=True),
+        _user("<command-name>/clear</command-name>"),
+        _typed(NUDGE),
+        _assistant("DONE!"),
+    ]
+    assert _parse(tmp_path, *stub) is None
+
+    conv = _parse(tmp_path, *stub, _typed(NUDGE), _assistant("DONE!"), name="twice.jsonl")
+
+    assert conv["kind"] == "agent"
+    assert "user" not in _speakers(conv)
+
+
+def test_a_session_the_nudge_reached_mid_task_stays_the_owners(tmp_path):
+    conv = _parse(
+        tmp_path,
+        _typed("rename the okapi table"),
+        _assistant("renaming"),
+        _typed(NUDGE),
+        _assistant("carrying on with the rename"),
+    )
+
+    assert conv["kind"] == "owner"
+    assert _speakers(conv) == ["user", "assistant", "agent", "assistant"]
+
+
 def test_a_single_exchange_is_still_too_short_to_export(tmp_path):
     assert _parse(tmp_path, _typed("hello"), _assistant("hi")) is None
 

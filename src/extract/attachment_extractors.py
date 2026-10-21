@@ -129,6 +129,15 @@ OCR_MAX_PIXELS = 178_956_970
 ZIP_MIME_TYPES = frozenset({"application/zip", "application/x-zip-compressed"})
 
 
+def without_nul(text: str | None) -> str | None:
+    """`text` with its NUL characters taken out: how every text is stored (extract_text_from_file,
+    attachment_pipeline.ingest_text_document). SQLite's length() ends a text at its first NUL and
+    Python's len() does not; 54 stored texts held them (PDF fonts that map glyphs to U+0000, files
+    read byte by byte, Mac resource forks in archives), and the chunk pass, measuring both ways,
+    cut three documents again on every embedding pass and never cut eleven (audit 2026-10-20)."""
+    return text.replace("\x00", "") if text and "\x00" in text else text
+
+
 def extract_text_from_file(
     file_path: str,
     mime_type: str,
@@ -145,15 +154,17 @@ def extract_text_from_file(
     _depth is how deep inside archives this file sits; only _extract_zip passes it.
     zip_seconds is how long an archive may spend reading members, ZIP_MAX_SECONDS when None;
     ocr_seconds how long a scan may spend on its pages, OCR_MAX_SECONDS when None. reextract
-    passes math.inf for both, since a one-time recovery run has the time. A text cut at
-    MAX_TEXT_CHARS says so in the error. An OCR reading that is Greek in Latin look-alike letters
+    passes math.inf for both, since a one-time recovery run has the time. The text holds no NUL
+    (without_nul). A text cut at MAX_TEXT_CHARS says so in the error. An OCR reading that is Greek in Latin look-alike letters
     (src/extract/ocr_garble.py) keeps its text and carries the ocr_garbled mark in the error:
     Phase 2 does not summarise it and the sweep keeps its file.
     """
     result = _extract_by_type(
         file_path, mime_type, _depth, zip_seconds=zip_seconds, ocr_seconds=ocr_seconds
     )
-    text = result.get("text")
+    text = without_nul(result.get("text"))
+    if text is not result.get("text"):
+        result = {**result, "text": text}
     error = result.get("error") or ""
     if text and len(text) >= MAX_TEXT_CHARS and "file kept" not in error:
         note = f"text cut at {MAX_TEXT_CHARS:,} characters; the rest is unread, file kept"
@@ -492,6 +503,24 @@ _DOC_CONVERTERS = (
 )
 
 
+def _decode_output(raw: bytes) -> str:
+    """A converter's output as text, its line ends as Python's text mode leaves them.
+
+    antiword and textutil write UTF-8, but antiword writes a character a Word file holds outside
+    Unicode's planes as an encoded surrogate, which is not UTF-8: a Greek agenda failed whole on
+    one such run (UnicodeDecodeError, audit 2026-10-20). Output that is UTF-8 but for a few such
+    sequences keeps its UTF-8, with those marked as U+FFFD. Output in which most bytes over 0x7F
+    are not UTF-8 is a single-byte code page (catdoc writes the locale's), read as Greek, the
+    language of this mail."""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("utf-8", "replace")
+        if text.count("�") * 10 > sum(1 for b in raw if b > 0x7F):
+            text = raw.decode("cp1253", "replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _extract_doc(path: str) -> dict:
     """Extract text from legacy .doc files via the first available converter."""
     import subprocess
@@ -501,7 +530,6 @@ def _extract_doc(path: str) -> dict:
             result = subprocess.run(
                 [*argv, path],
                 capture_output=True,
-                text=True,
                 timeout=30,
             )
         except FileNotFoundError:
@@ -509,7 +537,7 @@ def _extract_doc(path: str) -> dict:
         except subprocess.TimeoutExpired as e:
             return {"text": None, "method": method, "status": "failed", "error": str(e)}
 
-        text = _truncate(result.stdout)
+        text = _truncate(_decode_output(result.stdout))
         if _apply_noise_filter(text):
             return {
                 "text": None,
@@ -1838,9 +1866,28 @@ def _extract_mso(
     }
 
 
+# Byte-order marks, longest first: UTF-32's little-endian mark starts with UTF-16's.
+_BOMS = (
+    (b"\xff\xfe\x00\x00", "utf-32"),
+    (b"\x00\x00\xfe\xff", "utf-32"),
+    (b"\xff\xfe", "utf-16"),
+    (b"\xfe\xff", "utf-16"),
+)
+
+
+def _text_encodings(path: str) -> tuple[str, ...]:
+    """The encodings a text file is tried in: the one its byte-order mark names first, then
+    UTF-8 and Latin-1. Latin-1 decodes any bytes, so a UTF-16 export of a card statement was
+    stored as Latin-1, its mark read as "ÿþ" and a NUL after every Latin letter (28 rows,
+    audit 2026-10-20)."""
+    head = _magic(path)
+    marked = next((enc for mark, enc in _BOMS if head.startswith(mark)), None)
+    return ((marked,) if marked else ()) + ("utf-8", "latin-1", "cp1253")
+
+
 def _extract_plain_text(path: str) -> dict:
     """Read plain text, CSV, or markdown files directly."""
-    for encoding in ("utf-8", "latin-1", "cp1253"):
+    for encoding in _text_encodings(path):
         try:
             with open(path, encoding=encoding) as f:
                 text = f.read()
@@ -1932,7 +1979,7 @@ def _extract_sniffed_text(path: str, kind: str) -> dict:
 
 def _extract_html(path: str) -> dict:
     """Read HTML files and strip tags."""
-    for encoding in ("utf-8", "latin-1", "cp1253"):
+    for encoding in _text_encodings(path):
         try:
             with open(path, encoding=encoding) as f:
                 raw = f.read()

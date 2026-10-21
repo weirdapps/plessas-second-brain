@@ -199,13 +199,26 @@ def decrypt_decompress(enc_path: str, dest_path: str, key_file: str) -> str:
     return dest_path
 
 
+# SQLite's files beside a database: a snapshot opened in WAL mode can leave -wal and -shm.
+SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
+
+
 def prune_rolling(directory: str, pattern: str, keep: int) -> list[str]:
-    """Keep the newest ``keep`` files matching ``pattern`` (by name); delete the rest."""
+    """Keep the newest ``keep`` files matching ``pattern`` (by name); delete the rest.
+
+    A deleted database's sidecars go with it, and so do sidecars whose database is
+    already gone: ``brain-*.db`` never matched them, so on the producer the prune of
+    brain-20261011.db left its -wal and -shm behind on the data disk.
+    """
     files = sorted(glob(os.path.join(directory, pattern)), reverse=True)
     removed = []
     for old in files[keep:]:
         os.unlink(old)
         removed.append(old)
+    for suffix in SQLITE_SIDECARS:
+        for sidecar in glob(os.path.join(directory, pattern + suffix)):
+            if not os.path.exists(sidecar[: -len(suffix)]):
+                os.unlink(sidecar)
     return removed
 
 

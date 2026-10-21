@@ -98,6 +98,24 @@ class TestRetention:
         assert "brain-20260701.db" not in remaining
         assert len(removed) == 3
 
+    def test_prune_rolling_takes_a_snapshots_sidecars_with_it(self, tmp_path):
+        """A snapshot is a WAL database once it has been opened in WAL mode, and its
+        -wal and -shm can outlive the open. The prune matched `brain-*.db` only, so on
+        the producer brain-20261011.db went and its -wal and -shm stayed behind. Those
+        of a snapshot still kept stay; strays from an earlier prune go now."""
+        stamps = [f"202607{d:02d}" for d in range(1, 10)]  # 20260701..20260709
+        self._touch(tmp_path, stamps, ".db")
+        for suffix in ("-wal", "-shm", "-journal"):
+            self._touch(tmp_path, ["20260701", "20260709"], f".db{suffix}")
+        self._touch(tmp_path, ["20260601"], ".db-shm")  # its database pruned long ago
+
+        backup_db.prune_rolling(str(tmp_path), backup_db.LOCAL_PATTERN, keep=7)
+
+        left = {p.name for p in tmp_path.iterdir()}
+        assert not any(n.startswith(("brain-20260701.", "brain-20260601.")) for n in left)
+        assert {"brain-20260709.db-wal", "brain-20260709.db-shm"} <= left
+        assert "brain-20260709.db-journal" in left
+
     def test_prune_gfs_keeps_daily_plus_weekly(self, tmp_path):
         # 14 consecutive daily (all within the daily window) ...
         daily = [f"202607{d:02d}" for d in range(1, 15)]  # 20260701..20260714

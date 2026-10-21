@@ -3044,10 +3044,13 @@ def main():
     consolidate.add_maint_parser(maint_subparsers)
     entities.add_maint_parser(maint_subparsers)
     topic_canon.add_maint_parser(maint_subparsers)
-    # strip-nul (src/store/nul_text.py): maint-only, with no old spelling.
+    # strip-nul (src/store/nul_text.py) and session-note-dates (src/export/session_notes.py):
+    # maint-only, with no old spelling.
+    from src.export import session_notes
     from src.store import nul_text
 
     nul_text.add_maint_parser(maint_subparsers)
+    session_notes.add_maint_parser(maint_subparsers)
 
     # Parse and execute
     args = parser.parse_args()

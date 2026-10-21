@@ -34,11 +34,11 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 
 from src.config import CLAUDE_CODE_PROJECTS_DIR
 from src.export.conversation_export import (
+    _CONTENT_TYPES,
     _extract_text_content,
     is_agent_record,
     is_owner_record,
@@ -47,6 +47,7 @@ from src.extract.attachment_extractors import _apply_noise_filter
 from src.extract.attachment_pipeline import _guess_mime_type, ingest_text_document
 from src.store.findings import sync_note_findings
 from src.store.forget import forget_documents
+from src.store.stamps import utc_now
 
 NOTE_SUFFIXES = (".md", ".txt", ".csv")
 # On the first scan, transcripts older than this are left to the backfill (--all).
@@ -137,11 +138,20 @@ def _replay(text: str, edits) -> str | None:
 
 
 def collect_session_notes(jsonl_path: Path) -> dict[str, Note]:
-    """path -> the last version of each note this transcript wrote."""
+    """path -> the last version of each note this transcript wrote.
+
+    Only the turns are read, the records conversation export reads (_CONTENT_TYPES). Claude Code
+    also writes each request it sends as an "api-request-blob" record, with no timestamp and
+    every earlier tool call and result in it again: read as turns, it replayed each Write with no
+    time, so 57 notes were filed under the hour they were ingested, in local time (audit
+    2026-10-20), and each Edit onto a text it had already changed, which lost track of the file.
+    A call whose record carries no time takes the last time before it.
+    """
     notes: dict[str, Note] = {}
     lost: set[str] = set()
     pending: dict[str, tuple[str, dict, str]] = {}
     session_id = jsonl_path.stem
+    last_stamp = ""
     records = list(_records(jsonl_path))
     for record in records:
         # Every field is checked for its type: a transcript is third-party input to this code,
@@ -149,12 +159,16 @@ def collect_session_notes(jsonl_path: Path) -> dict[str, Note]:
         sid = record.get("sessionId")
         if isinstance(sid, str) and sid:
             session_id = sid
+        stamp = record.get("timestamp")
+        if isinstance(stamp, str) and stamp:
+            last_stamp = stamp
+        if record.get("type") not in _CONTENT_TYPES:
+            continue
         message = record.get("message")
         content = message.get("content") if isinstance(message, dict) else None
         if not isinstance(content, list):
             continue
-        stamp = record.get("timestamp")
-        timestamp = stamp if isinstance(stamp, str) else ""
+        timestamp = last_stamp
         for block in content:
             if not isinstance(block, dict):
                 continue
@@ -233,6 +247,19 @@ def _store_note(conn: sqlite3.Connection, note: Note, stats: dict) -> None:
     if held:
         if held[2] == sha:
             stats["unchanged"] += 1
+            if not held[1] and note.written_at:
+                # Stored undated (collect_session_notes): it takes its time now, and so does
+                # its document, unless another source's document holds these bytes.
+                conn.execute(
+                    "UPDATE session_notes SET written_at = ? WHERE path = ?",
+                    (note.written_at, note.path),
+                )
+                conn.execute(
+                    "UPDATE emails SET date_received = ? WHERE message_id = ?"
+                    " AND sender_address = 'session-note@documents.local'",
+                    (note.written_at, held[0]),
+                )
+                stats["dated"] += 1
             _sync_findings(conn, note, stats)
             conn.commit()
             return
@@ -255,7 +282,8 @@ def _store_note(conn: sqlite3.Connection, note: Note, stats: dict) -> None:
         error=None,
         subject=f"[Session note] {note.path}",
         sender_name="Claude session",
-        date=note.written_at or datetime.now().isoformat(),
+        # In UTC, as the transcript's own times are, when the transcript gives none.
+        date=note.written_at or utc_now(),
     )
     conn.execute(
         """INSERT INTO session_notes (path, message_id, session_id, written_at, sha256)
@@ -293,6 +321,7 @@ def ingest_session_notes(conn: sqlite3.Connection, jsonl_files) -> dict:
             "stored",
             "replaced",
             "unchanged",
+            "dated",
             "older",
             "errors",
             "findings_accepted",
@@ -358,3 +387,80 @@ def transcripts_to_scan(conn: sqlite3.Connection, all_files: bool) -> list[Path]
         if seen.get(str(f)) != (st.st_size, st.st_mtime_ns):
             todo.append(f)
     return todo
+
+
+def _session_of(jsonl_path: Path) -> str | None:
+    """The session a transcript belongs to: its own name at the top of a project, the directory
+    it sits under for a subagent's or a workflow's."""
+    try:
+        inside = jsonl_path.resolve().relative_to(CLAUDE_CODE_PROJECTS_DIR.resolve())
+    except (OSError, ValueError):
+        return None
+    return Path(inside.parts[1]).stem if len(inside.parts) >= 2 else None
+
+
+def _undated(conn: sqlite3.Connection) -> list[str]:
+    """The session of each note held with no written_at, one per note."""
+    return [
+        sid or ""
+        for (sid,) in conn.execute(
+            "SELECT session_id FROM session_notes WHERE COALESCE(written_at, '') = ''"
+        )
+    ]
+
+
+def date_undated_notes(conn: sqlite3.Connection, *, apply: bool) -> dict:
+    """`brain maint session-note-dates`: read again the transcripts of the sessions whose notes
+    are held undated, so each takes its time (_store_note) and its document with it, in UTC.
+
+    Counts: undated (notes), sessions, transcripts (theirs, held on this host), dated, left
+    (still undated: a transcript gone, or a note no transcript writes now). A second run finds
+    what the first left. Reads no other transcript; `ingest-session-notes --all` reads them all.
+    """
+    sessions = _undated(conn)
+    wanted = set(sessions)
+    files = [f for f in _transcripts() if _session_of(f) in wanted]
+    stats = {
+        "undated": len(sessions),
+        "sessions": len(wanted),
+        "transcripts": len(files),
+        "dated": 0,
+        "left": len(sessions),
+    }
+    if apply and files:
+        stats["dated"] = ingest_session_notes(conn, files)["dated"]
+        stats["left"] = len(_undated(conn))
+    return stats
+
+
+def cmd_session_note_dates(args) -> int:
+    from src.store.schema import get_connection, run_migrations
+
+    conn = get_connection(str(args.db))
+    try:
+        run_migrations(conn)
+        stats = date_undated_notes(conn, apply=args.apply)
+    finally:
+        conn.close()
+    print(
+        f"{stats['undated']:,} session note(s) held undated, from {stats['sessions']:,}"
+        f" session(s); {stats['transcripts']:,} of their transcript(s) on this host"
+    )
+    if args.apply:
+        print(f"dated {stats['dated']:,}; {stats['left']:,} still undated")
+    else:
+        print("dry run: nothing read or written; --apply reads the transcripts again")
+    return 0
+
+
+def add_maint_parser(maint_subparsers) -> None:
+    """`brain maint session-note-dates`."""
+    parser = maint_subparsers.add_parser(
+        "session-note-dates",
+        help="Date the session notes stored undated by their transcripts' own times, in UTC",
+        description=date_undated_notes.__doc__,
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="Count only (default)")
+    mode.add_argument("--apply", action="store_true", help="Read their transcripts again")
+    parser.set_defaults(func=cmd_session_note_dates)

@@ -798,7 +798,7 @@ python -m src.cli maint teams-backfill-replies    # once, on the producer: store
 python -m src.cli maint teams-strip-html          # once, on the producer: convert message text stored as HTML (--dry-run counts); no Teams or model call
 python -m src.cli maint teams-drop-raw-json [--dry-run] [--limit N]   # once, on the producer, after teams-backfill-replies: drop the raw Teams payloads (DEPLOY section 12)
 python -m src.cli maint teams-repair [--dry-run]  # once, on the producer, before teams-drop-raw-json: channel senders from the payloads, thread participants, '? / ' titles, non-person MRI cache rows; no Teams or model call
-python -m src.cli maint teams-empty-summaries [--dry-run]   # once: threads extracted with an empty summary go back to extraction (one model call each, in the next teams-sync)
+python -m src.cli maint teams-empty-summaries [--dry-run]   # once: threads extracted with an empty summary go back to extraction (the next teams-sync extracts each with a substantive message, one model call, and marks the rest skipped)
 python -m src.cli maint news-dedup [--dry-run]    # once, on the producer: forget the stored copies of a Google News article held under several URLs (loads the vector index once)
 python -m src.cli maint split-html                # after v23, on the producer: HTML bodies loaded before it (DEPLOY section 12)
 python -m src.cli maint prune-staged

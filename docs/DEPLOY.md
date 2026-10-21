@@ -1713,8 +1713,10 @@ Then on the producer, each with `--dry-run` first, in this order:
    linked to a person, 9,756 threads, 7,109 titles, 2,385 cache rows, in 3 s. The hourly
    teams-sync resolves the senders not yet known, 50 a run.
 2. `python -m src.cli maint teams-empty-summaries` sends the 76 threads extracted with an
-   empty summary back to extraction after deleting their 127 key facts; the next
-   teams-sync extracts them, one model call each.
+   empty summary back to extraction after deleting their 127 key facts. The next
+   teams-sync extracts each thread with a substantive message, one model call, and marks
+   the rest skipped. On the producer all 76 held only call records, so all 76 were
+   skipped (2026-10-21); the calls' participants and durations stay in teams_messages.
 3. `python -m src.cli maint entities --apply` seeds the people added since the last seed
    (28 entities on the copy). From now on `sync` does it in sb-daily-sync.
 4. `python -m src.cli maint news-dedup` forgets the stored copies of a Google News article

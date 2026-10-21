@@ -809,7 +809,10 @@ python -m src.cli maint reextract --garbled                 # read marked scans 
 python -m src.cli maint reextract --long --estimate          # price a re-summary before running it; changes nothing
 python -m src.cli maint reextract --long --no-spreadsheets   # documents only: leave workbooks out of the chosen rows and the estimate
 python -m src.cli maint reextract --wide --estimate          # wide workbooks summarised from a digest that left out their newest columns: price, then run without --estimate
+python -m src.cli maint reextract --decoding                # read again the UTF-16 texts stored as Latin-1 and the Word files whose converter output failed to decode
+python -m src.cli maint reextract --failed --estimate       # summaries that failed under a call shape before v2-text: price, then run without --estimate
 python -m src.cli maint utc-stamps [--apply]                 # attachment and sync stamps stored in local time, converted to UTC (dry run by default)
+python -m src.cli maint strip-nul [--apply]                  # take the NUL characters out of the stored attachment texts (dry run by default)
 python -m src.cli maint sharepoint-shells [--apply]          # forget the hollow SharePoint documents an old fetch left; queue the links not held
 python -m src.cli maint calendar-bodies --limit 500          # fetch the text of calendar events stored without it; no model call
 python -m src.cli maint topic-pages [--topic NAME] [--estimate]  # every live topic's page again (or one), new evidence or not; --estimate prices it
@@ -822,9 +825,10 @@ python -m src.cli maint reextract --full-parts 1234 5678     # summarise these a
 python -m src.cli maint retry-stubs [--dry-run]   # extract again the emails loaded without an extraction after failing three runs
 python -m src.cli maint transcribe-images --limit 100      # transcribe content images whose attachments hold no text
 python -m src.cli maint relabel-conversations [--dry-run]    # once, on the producer: stored turns the owner did not type become 'agent' (DEPLOY section 12)
+python -m src.cli maint session-note-dates [--apply]         # date the session notes stored undated by their transcripts' own times (dry run by default)
 python -m src.cli maint sharepoint-ingest-fetched           # store the files earlier SharePoint fetches left on disk
 python -m src.cli maint sharepoint-refetch-content --max-fetches 0 --deadline-s 1800  # read again the links recorded ok with no text
-python -m src.cli maint sharepoint-repair-links [--dry-run] # queue again the links the old scanner mangled and the pages read without their text
+python -m src.cli maint sharepoint-repair-links [--dry-run] # queue again the links the old scanner mangled, the pages read without their text and the files recorded ok with none
 python -m src.cli maint scrub [--apply] [--vacuum] [--files DIR ...]   # scripts/scrub_secrets.py, its own options; it scrubs the configured store, so --db is refused
 python -m src.cli maint forget-itemless [--apply]          # count, then delete, the decisions, actions and commitments of news and automation mail
 python -m src.cli maint mark-boilerplate [--apply] [--min-threads 5]   # count, then mark, key-fact text that recurs in 5+ distinct threads; nothing deleted

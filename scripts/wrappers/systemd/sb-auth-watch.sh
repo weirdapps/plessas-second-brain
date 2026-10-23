@@ -804,6 +804,37 @@ if [ "$TEAMS_WAS_BLOCKED" = "1" ] && [ ! -f "$TEAMS_SENTINEL" ]; then
   restored="$restored teams"
 fi
 
+# A sync that ended failed for want of a credential is owed a run once that
+# credential probes healthy, whether or not a sentinel ever went up (2026-10-23).
+# The blocks above catch only a sentinel clearing, and most gaps never latch one:
+# a token expires on this host, sb-teams-sync ends 69 or 75 on its own pre-flight,
+# and the run waited for the next hourly tick although the laptop's push had fixed
+# it. sb-creds-arrived.path now starts this script whenever a credential file
+# changes, so the owed run follows the push within a minute.
+#
+# The codes are the ones a missing credential ends each wrapper with: Teams 69 (an
+# expired token, or its sentinel) and 75 (a renew that did not take); mail 69 (its
+# sentinel, or a load owed on gcloud) and 4 (the session died mid-export). Never
+# while needs_gcloud_reauth is up: both would only end 69 again, every push.
+_owed() {   # _owed <unit> <codes as an ERE alternation>
+  local out
+  command -v systemctl >/dev/null 2>&1 || return 1
+  out=$(systemctl --user show -p ActiveState -p ExecMainStatus "$1" 2>/dev/null) || return 1
+  grep -qx 'ActiveState=failed' <<< "$out" && grep -qxE "ExecMainStatus=($2)" <<< "$out"
+}
+if [ "$fire_teams" = "0" ] && [ ! -f "$TEAMS_SENTINEL" ] && [ ! -f "$TEAMS_SUSPECT" ] \
+   && [ ! -f "$GCLOUD_SENTINEL" ] && _owed sb-teams-sync.service '69|75'; then
+  log "auth-trigger: teams-sync failed waiting on a credential that probes healthy now; queueing it"
+  fire_teams=1
+  restored="$restored teams-owed"
+fi
+if [ "$fire_outlook_sync" = "0" ] && [ ! -f "$SENTINEL" ] && [ ! -f "$GCLOUD_SENTINEL" ] \
+   && _owed sb-outlook-sync.service '69|4'; then
+  log "auth-trigger: outlook-sync failed waiting on a credential that probes healthy now; queueing it"
+  fire_outlook_sync=1
+  restored="$restored outlook-owed"
+fi
+
 if [ "$fire_daily$fire_calendar$fire_teams$fire_attachments$fire_outlook_sync" != "00000" ]; then
   echo "$(ts) — === auth-watch restoration trigger ===" >> "$TRIGGERED_LOG"
   # In the order the restore starts them: the daily sync, then mail, calendar,

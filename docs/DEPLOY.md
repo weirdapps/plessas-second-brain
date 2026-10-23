@@ -526,7 +526,7 @@ every subcommand.
 | `sb-daily-sync` | 07:05 | `scripts/backup_db.py` (section 8), `sync` with a 900 s extraction slice, `action_lifecycle` |
 | `sb-noon-catchup` | 13:17 | `sync` with a 900 s extraction slice |
 | `sb-attachments` | 02:00 | `sb-attachment-pass.sh`: `register-attachments`, Phase 1 (900 s), Phase 2 (1,800 s), `process-images --limit 500`, `process-sharepoint`, the orphan reaper, `sweep-files`, `mail-reconcile --since 7d` |
-| `sb-auth-watch` | every 4 hours, and before each `sb-outlook-sync` run | `sb-auth-watch.sh`: checks the Outlook and Teams sessions and renews them |
+| `sb-auth-watch` | every 4 hours, before each `sb-outlook-sync` run, and whenever a pushed credential file changes (`sb-creds-arrived.path`) | `sb-auth-watch.sh`: checks the Outlook, Teams and gcloud credentials, clears the sentinels they no longer justify, and queues the syncs those held back or that ended failed waiting on a credential that now probes healthy |
 | `sb-health-check` | 23:50 | `scripts/health_check.py --fix --email-if-issues`, then the freshness ping (section 7) |
 | `sb-topic-pages` | 03:30 | `topic-pages`: the live topics' pages with new evidence (below) |
 | `sb-briefs` | every 15 minutes, 07:00 to 21:45, during the pilot | `briefs`: the pre-meeting brief pilot (below) |
@@ -543,7 +543,7 @@ drop-ins and the alerts act on:
 | Code | Means | Restarted |
 | --- | --- | --- |
 | 0 | the work ran, or another run holding the lock is doing it, or an opt-out | no |
-| 69 | work skipped on a re-auth sentinel (`needs_reauth`, `needs_gcloud_reauth`, `needs_teams_reauth`): the session is dead and sb-auth-watch, not a restart, clears it | no |
+| 69 | work skipped on a re-auth sentinel (`needs_reauth`, `needs_gcloud_reauth`, `needs_teams_reauth`), or, on Linux, on a Teams token past its expiry: the credential is dead and the next push, through sb-auth-watch, not a restart, brings the run back | no |
 | 75 | the run finished and failed (`sync` on a quota pause or a dead model), or Teams auth may clear within minutes | per unit, below |
 | 65 | the nightly attachment pass ran every stage and one failed | no |
 
@@ -584,6 +584,31 @@ sb-briefs            6   # every 15 minutes: 90 minutes, more than the hour sb-a
 sb-whatsapp-sync     2   # hourly, like sb-teams-sync, sb-outlook-sync and sb-calendar-sync (already 2)
 sb-conversation-sync 2   # three times a day: two missed runs, six hours or more
 sb-news-sync         2   # every two hours; now it also loads, so one locked database is a blip
+```
+
+**Waiting for a credential.** On a producer whose credentials arrive from another
+host's push, a run of 69s means that host is away, and one check that measures the
+pushed credentials (here `vps-creds-fresh`, 4 h grace) is the alert for it. A third
+field on a line, `wait=M`, makes a failure that ended 69 need a streak of M instead
+of N, and the unit's own grace is raised past the credential check's, so a sync that
+stops running still pages:
+
+```text
+sb-teams-sync    2 wait=6   # grace 5 h
+sb-outlook-sync  2 wait=6   # grace 5 h
+sb-calendar-sync 2 wait=6   # grace 5 h
+```
+
+A credential arriving starts sb-auth-watch through a path unit, and its pass queues each
+sync owed a run, so the catch-up follows the push instead of the next tick:
+
+```ini
+# ~/.config/systemd/user/sb-creds-arrived.path, then: systemctl --user enable --now sb-creds-arrived.path
+[Path]
+PathChanged=%h/.teams-cli/multi-tokens.json
+PathChanged=%h/.outlook-cli/session.json
+PathChanged=%h/.config/gcloud/application_default_credentials.json
+Unit=sb-auth-watch.service
 ```
 
 The daily units (`sb-daily-sync`, `sb-noon-catchup`, `sb-attachments`,

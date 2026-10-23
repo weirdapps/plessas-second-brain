@@ -136,8 +136,37 @@ RENEW_TIMEOUT_S="${SB_TEAMS_RENEW_TIMEOUT_S:-120}"
 # from here would block every later sync on a blip until auth-watch happened to
 # clear it. This repo already has a history of sticky-latch reauth bugs. We
 # just skip this run and let the owner of the state machine decide.
+#
+# AN EXPIRED TOKEN ON LINUX WAITS FOR THE LAPTOP (2026-10-23). The renew below has
+# never worked on the producer (1 success in 347), because silent SSO needs device
+# trust it cannot hold; only the laptop's token push renews Teams there. With the
+# required audiences already past their exp, the renew and the four retries 75 buys
+# could only fail: on 2026-10-23 the laptop slept from 17:27 to 19:43 and this unit
+# spent seven attempts of about 100 s and 850 MB each on a token that had expired.
+# So that case exits 69 (no retry, see retry.conf) and the push restarts the run:
+# a credential arriving starts sb-auth-watch (sb-creds-arrived.path), whose probe
+# then finds this unit failed and owed. A token that has not expired, a file that
+# cannot be read, or a Mac keeps the renew and the 75 retry, for a 401 or a 429
+# that clears by itself.
+TEAMS_TOKENS="${SB_TEAMS_TOKENS:-$HOME/.teams-cli/multi-tokens.json}"
+TEAMS_SYNC_PLATFORM="${TEAMS_SYNC_PLATFORM:-$(uname -s)}"
+
+# Seconds left in the shortest-lived audience teams-cli requires (its
+# REQUIRED_AUDIENCES), negative once expired; prints nothing when unreadable.
+teams_token_ttl() {
+  /usr/bin/jq -r --argjson now "$(date +%s)" \
+    '[.["https://graph.microsoft.com"].exp, .["https://chatsvcagg.teams.microsoft.com"].exp]
+     | if all(type == "number") then (min - $now | floor) else empty end' \
+    "$TEAMS_TOKENS" 2>/dev/null
+}
+
 if command -v teams-cli >/dev/null 2>&1; then
   if ! timeout -k 10 "$PROBE_TIMEOUT_S" teams-cli health-check >/dev/null 2>&1; then
+    ttl=$(teams_token_ttl)
+    if [ "$TEAMS_SYNC_PLATFORM" = Linux ] && [ -n "$ttl" ] && [ "$ttl" -le 0 ]; then
+      echo "$(ts): skip (teams token expired $(( -ttl ))s ago; no renew on Linux, waiting for the laptop's push)" >> "$LOG"
+      exit 69
+    fi
     echo "$(ts) — teams auth looks dead, attempting silent renew" >> "$LOG"
     if timeout -k 10 "$RENEW_TIMEOUT_S" teams-cli auth-renew >/dev/null 2>&1 \
        && timeout -k 10 "$PROBE_TIMEOUT_S" teams-cli health-check >/dev/null 2>&1; then

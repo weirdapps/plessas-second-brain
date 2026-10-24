@@ -360,3 +360,22 @@ def test_no_sentinel_branch_exits_0(wrapper):
                     break
                 branch.append(following.strip())
             assert "exit 0" not in branch, f"{wrapper}:{i + 1} exits 0 on a sentinel"
+
+
+def test_a_second_daily_run_still_pings_the_backup_check(tmp_path):
+    """brain-backup is an oncalendar check on the 07:05 slot. On 2026-10-24 a restore run
+    at 05:34 took the day's snapshot and pinged before that slot; the 07:05 run found
+    the snapshot, skipped the backup, sent nothing, and the check went down at 08:10
+    with a good snapshot on disk. The skip stands on today's file, so it says so."""
+    home = _home(tmp_path)
+    (home / "tools" / "curl").write_text('#!/bin/bash\necho "curl $*" >> "$HOME/calls.log"\n')
+    (home / "tools" / "curl").chmod(0o755)
+    stamp = subprocess.run(["date", "+%Y%m%d"], capture_output=True, text=True).stdout.strip()
+    backups = home / "SourceCode" / "plessas-second-brain" / "data" / "backups"
+    backups.mkdir(parents=True)
+    (backups / f"brain-{stamp}.db").write_text("")
+
+    _run("sb-daily-sync.sh", home, HC_PING_URL="https://hc.invalid/ping/key")
+
+    pings = [c for c in _calls(home) if c.startswith("curl ")]
+    assert any(c.endswith("https://hc.invalid/ping/key/brain-backup") for c in pings), pings

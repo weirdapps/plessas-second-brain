@@ -728,7 +728,6 @@ python -m src.cli ingest --url https://example.com/article
 python -m src.cli ingest-session-notes [--all]         # notes Claude sessions wrote, as text-only documents, and their findings blocks
 python -m src.cli findings [--accepted]                # the findings sessions filed: the rejected ones with why, for review (read-only)
 python -m src.cli topic-pages [--estimate]             # nightly: the pages of the live topics with new evidence (Topic pages and findings)
-python -m src.cli briefs [--dry-run]                   # every 15 minutes: the pre-meeting brief pilot (Pre-meeting briefs)
 
 # Housekeeping
 python -m src.cli load                      # creates brain.db on a fresh host and loads what was extracted
@@ -877,7 +876,6 @@ src/
     calendar_sync.py           `calendar-sync`: list, fetch, extract and load what changed
     calendar_bodies.py         `calendar-bodies`: the text of the events stored before it was kept
     topic_pages.py             `topic-pages`: one call a live topic's page, the citation check, the row
-    briefs.py                  `briefs`: the pre-meeting brief pilot, its stop rule, owner-only mail
     sharepoint.py              `process-sharepoint`: retry pass, mail and Teams link scans, fetch, store
   export/
     outlook_export.py          Hourly Outlook ingestion via outlook-cli
@@ -1189,19 +1187,9 @@ Without the secret the name checks print `SKIP` and the job still passes on the 
 
 Dependabot is configured for the `uv` ecosystem (see `.github/dependabot.yml`), so PRs update `uv.lock`.
 
-### Pre-meeting briefs (pilot)
-
-Push nobody asked for goes unread: in six weeks the owner asked for no briefing and ran no morning digest, and OpenAI and Microsoft withdrew their generic daily feeds in the summer of 2026, while briefs bound to an event survived. So this is a two-week pilot with a stop rule, not a feature (`src/pipeline/briefs.py`). Every 15 minutes the producer looks at the meetings starting 30 to 45 minutes after the quarter hour, not cancelled and not declined. One qualifies when someone from outside the owner's domain attends, or someone he has not met in the last 90 days, unless it is an occurrence of a recurring internal series or more than 20 others attend. For each, one call (through `claude_extract.complete()`, plain text) turns `meeting_prep`'s dossiers of the first six attendees, the outside or unmet ones first, into a brief of at most 250 words (WHO, OPEN ITEMS, WATCH), mailed through the path the health check mails by: `outlook-cli send-mail` to `HEALTH_EMAIL_TO`.
-
-- **Owner only.** Nothing is sent unless `HEALTH_EMAIL_TO` is a single address that `BRAIN_USER_EMAIL_PATTERN` lists as the owner's.
-- **It ends by itself.** Nothing is sent after `BRAIN_BRIEF_PILOT_UNTIL` (`YYYY-MM-DD`), which the install sets to the install date plus 14 days, nor while it is unset; the wrapper then disables its own timer. Moving the date and enabling the timer again is the only way on. `BRAIN_BRIEFS_OFF=1` is the kill switch.
-- **Logged.** Each brief is a line of `state/briefs.jsonl` under the data home (0600): the meeting's id and start, why it qualified, the model, tokens and cost, and whether the mail went, no subject or name. A meeting already briefed is not briefed again, and at most 8 go a day.
-
-On a replica's calendar the rule would have picked 53 of the 245 meetings of the 30 days to 2026-10-16, on 19 days, one to six a day; a brief's call is about 8,000 tokens in and 400 out, about $0.03. `python -m src.cli briefs --dry-run` lists what the next pass would brief, with no call and no mail, on a replica too. [`docs/DEPLOY.md`](docs/DEPLOY.md), section 6, has the install.
-
 ### Scheduling
 
-The pipeline is CLI commands, so any scheduler runs it: cron, launchd or systemd timers. `sync` stages no mail itself, it extracts and loads what `outlook_export` (or your own exporter) staged, and it covers mail only: `calendar-sync`, `teams-sync`, `whatsapp-sync`, `news-sync` and `process-sharepoint` each want their own schedule, and a nightly `process-attachments` pass reads what the hourly slice leaves, `topic-pages` writes the live topics' pages each night, and `briefs` runs every 15 minutes during the pilot. The hourly `calendar-sync` lists the week behind and the 30 days ahead; a month it never reached is filled by the one-off `brain maint calendar-backfill`, not by a schedule.
+The pipeline is CLI commands, so any scheduler runs it: cron, launchd or systemd timers. `sync` stages no mail itself, it extracts and loads what `outlook_export` (or your own exporter) staged, and it covers mail only: `calendar-sync`, `teams-sync`, `whatsapp-sync`, `news-sync` and `process-sharepoint` each want their own schedule, and a nightly `process-attachments` pass reads what the hourly slice leaves, and `topic-pages` writes the live topics' pages each night. The hourly `calendar-sync` lists the week behind and the 30 days ahead; a month it never reached is filled by the one-off `brain maint calendar-backfill`, not by a schedule.
 
 [`docs/DEPLOY.md`](docs/DEPLOY.md), section 6, has the recipes, the stages of one `sync` in order, and the reference deployment's hourly and nightly units; section 5 has the two-host shape (one producer that ingests, workstations that read a pulled replica) and the `loginctl enable-linger` without which `systemd --user` timers die at logout.
 

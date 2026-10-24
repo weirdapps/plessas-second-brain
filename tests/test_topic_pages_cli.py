@@ -1,8 +1,7 @@
-"""`brain topic-pages` and `brain briefs`: what each runs, and where each may run.
+"""`brain topic-pages`: what it runs, and where it may run.
 
-Both write or mail only on the producer. Their read-only halves (`topic-pages --estimate`,
-`briefs --dry-run`) run on a replica, so a Mac can price the pages or list the briefs
-from its pulled copy.
+It writes only on the producer. Its read-only half (`topic-pages --estimate`) runs on a
+replica, so a Mac can price the pages from its pulled copy.
 """
 
 import json
@@ -68,7 +67,7 @@ def test_the_estimate_runs_on_a_replica_and_calls_nothing(db, monkeypatch, capsy
     assert "to_build 1" in out and "cost_usd" in out
 
 
-@pytest.mark.parametrize("argv", [["topic-pages"], ["maint", "topic-pages"], ["briefs"]])
+@pytest.mark.parametrize("argv", [["topic-pages"], ["maint", "topic-pages"]])
 def test_a_replica_refuses_the_writing_half(db, monkeypatch, capsys, argv):
     path, _ = db
     monkeypatch.setenv("BRAIN_ROLE", "replica")
@@ -99,13 +98,3 @@ def test_the_findings_review_runs_on_a_replica(db, monkeypatch, capsys):
     code, out, _ = brain(monkeypatch, capsys, "--db", str(path), "findings")
 
     assert code == 0 and out.startswith("findings: none held")
-
-
-def test_briefs_dry_run_runs_on_a_replica(db, monkeypatch, capsys):
-    path, _ = db
-    monkeypatch.setenv("BRAIN_ROLE", "replica")
-    monkeypatch.setenv("BRAIN_BRIEF_PILOT_UNTIL", "2999-01-01")
-
-    code, out, _ = brain(monkeypatch, capsys, "--db", str(path), "briefs", "--dry-run")
-
-    assert code == 0 and "upcoming 0" in out

@@ -69,10 +69,6 @@ from src.llm_policy import MAX_ATTEMPTS, ROW_CAPS, backoff
 # The smaller of table and live wins, so the stale 300s entries kept both 15-minute
 # units at a 90s budget: the one attempt, no retry, the drop-in was written to end.
 #
-# sb-briefs added 2026-10-21 (TimeoutStartSec=300, read live): it makes one model call
-# per meeting and had no deadline, so its calls planned retries against the flat 900 s
-# default inside a 300 s unit.
-#
 # sb-whatsapp-sync added 2026-10-21 (TimeoutStartSec=600, read live): the same shape and
 # timeout as sb-teams-sync, a 300 s extraction slice inside a 600 s unit, and its calls
 # planned retries against the flat 900 s default, past the unit's SIGTERM.
@@ -83,7 +79,6 @@ from src.llm_policy import MAX_ATTEMPTS, ROW_CAPS, backoff
 # unlikely to be answered but holds nothing else up.
 _UNIT_TIMEOUT_SECONDS: dict[str, int] = {
     "sb-attachments": 3600,
-    "sb-briefs": 300,
     "sb-calendar-sync": 900,
     "sb-conversation-sync": 900,
     "sb-daily-sync": 1800,

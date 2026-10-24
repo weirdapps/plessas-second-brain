@@ -529,7 +529,6 @@ every subcommand.
 | `sb-auth-watch` | every 4 hours, before each `sb-outlook-sync` run, and whenever a pushed credential file changes (`sb-creds-arrived.path`) | `sb-auth-watch.sh`: checks the Outlook, Teams and gcloud credentials, clears the sentinels they no longer justify, and queues the syncs those held back or that ended failed waiting on a credential that now probes healthy |
 | `sb-health-check` | 23:50 | `scripts/health_check.py --fix --email-if-issues`, then the freshness ping (section 7) |
 | `sb-topic-pages` | 03:30 | `topic-pages`: the live topics' pages with new evidence (below) |
-| `sb-briefs` | every 15 minutes, 07:00 to 21:45, during the pilot | `briefs`: the pre-meeting brief pilot (below) |
 | `sb-mcp` | always on | `python -m src.mcp_server --http` (section 9) |
 
 The Mac that holds a replica pulls it at :45 (section 5), pushes WhatsApp at :50 if
@@ -569,8 +568,8 @@ RestartPreventExitStatus=69
 RestartPreventExitStatus=75 69
 ```
 
-`sb-calendar-sync`, `sb-briefs`, `sb-topic-pages`, `sb-whatsapp-sync` and
-`sb-news-sync` have no `Restart=` and need nothing. `RestartPreventExitStatus=` is a
+`sb-calendar-sync`, `sb-topic-pages`, `sb-whatsapp-sync` and `sb-news-sync` have no
+`Restart=` and need nothing. `RestartPreventExitStatus=` is a
 list, and a second line adds to it, so append the code or rewrite the line whole.
 
 **Paging on a failure streak.** `OnFailure=hc-fail@<unit>` pages through a gate,
@@ -580,7 +579,6 @@ a success resets the count). The units that turned red on a sentinel want these 
 N from each one's cadence:
 
 ```text
-sb-briefs            6   # every 15 minutes: 90 minutes, more than the hour sb-auth-watch takes to clear a sentinel
 sb-whatsapp-sync     2   # hourly, like sb-teams-sync, sb-outlook-sync and sb-calendar-sync (already 2)
 sb-conversation-sync 2   # three times a day: two missed runs, six hours or more
 sb-news-sync         2   # every two hours; now it also loads, so one locked database is a blip
@@ -648,16 +646,17 @@ OnCalendar=*-*-* 06:15:00 Europe/Athens
 clear of the attachment pass (02:00; its longest run in those 14 days took 35 minutes),
 restic (02:40), topic pages (03:30) and the news run at 06:50.
 
-### Topic pages and the brief pilot
+### Topic pages
 
-Two units beside the others, on the producer, after pulling the release that brings
-them (README, "Topic pages and findings" and "Pre-meeting briefs (pilot)"). Each runs
-its archived wrapper through a host-local shim, as the others do: copy
-`~/scripts/run-sb-calendar-sync.sh` to `run-sb-topic-pages.sh` and `run-sb-briefs.sh`,
-each exec'ing its own wrapper (the shim sources the Vertex environment both calls need).
+One unit beside the others, on the producer, after pulling the release that brings
+it (README, "Topic pages and findings"). It runs its archived wrapper through a
+host-local shim, as the others do: copy `~/scripts/run-sb-calendar-sync.sh` to
+`run-sb-topic-pages.sh`, exec'ing its own wrapper (the shim sources the Vertex
+environment its calls need). The pre-meeting brief pilot that once ran beside it was
+removed on 2026-10-25 by owner decision: no automatic briefs.
 
 ```bash
-install -m 755 scripts/wrappers/systemd/sb-topic-pages.sh scripts/wrappers/systemd/sb-briefs.sh ~/.local/bin/
+install -m 755 scripts/wrappers/systemd/sb-topic-pages.sh ~/.local/bin/
 python -m src.cli maint migrate                  # schema v36: topic_pages and findings, two new tables
 python -m src.cli topic-pages --estimate         # the topics picked and the first build's price; no call
 python -m src.cli maint topic-pages              # the first build: about $1 for 20 pages, 10-15 minutes
@@ -690,51 +689,8 @@ rest for the next one. It exits 1 only when pages were due and every one of them
 failed. A night rebuilds the pages whose evidence holds an item they were not written
 from: 6 to 16 of 20 a night on the reference store, about $0.25-0.90.
 
-The brief pilot reads its settings from one owner-only file, which the install writes
-with the pilot's last day, 14 days on:
-
-```bash
-(umask 077 && mkdir -p ~/.config/second-brain && {
-  echo "BRAIN_BRIEF_PILOT_UNTIL=$(date -d '+14 days' +%F)"
-  echo "HEALTH_EMAIL_TO=owner@example.com"   # one of the addresses BRAIN_USER_EMAIL_PATTERN lists
-} > ~/.config/second-brain/briefs.env)
-python -m src.cli briefs --dry-run               # what the next pass would brief; no call, no mail
-```
-
-```ini
-# ~/.config/systemd/user/sb-briefs.service
-[Unit]
-Description=second-brain pre-meeting brief pilot
-
-[Service]
-Type=oneshot
-ExecStart=%h/scripts/run-sb-briefs.sh
-TimeoutStartSec=300
-
-# ~/.config/systemd/user/sb-briefs.timer
-[Unit]
-Description=second-brain pre-meeting brief pilot, on the quarter hours
-
-[Timer]
-OnCalendar=*-*-* 07..21:00/15:00 Europe/Athens
-AccuracySec=1s
-
-[Install]
-WantedBy=timers.target
-```
-
 Then `systemctl --user daemon-reload && systemctl --user enable --now
-sb-topic-pages.timer sb-briefs.timer`. The brief timer fires on the quarter hours,
-with no randomized delay: each run briefs the meetings 30 to 45 minutes after its
-quarter hour, so each meeting falls in one run's window, and the log
-(`state/briefs.jsonl`) keeps a late run from briefing one twice.
-
-The pilot stops by itself. After the date in `briefs.env` the command sends nothing
-and says `pilot ended on <date>`, and the wrapper then runs `systemctl --user disable
---now sb-briefs.timer`. To extend it, move the date and enable the timer again. To
-stop it at once, `BRAIN_BRIEFS_OFF=1` in the same file (the timer keeps running and
-sends nothing), or disable the timer. To judge it, read the log: the meetings briefed
-and what each cost, against what you did with the mails.
+sb-topic-pages.timer`.
 
 Nor does it close action items: extraction only appends, so run
 `python -m src.store.action_lifecycle` after a successful sync. It drops
@@ -786,7 +742,7 @@ WARN and STALE lines are issues, so `--email-if-issues` mails them.
   --user -u 'sb-*'`), the runs that failed, those skipped on a re-auth sentinel (exit
   69), and the longest stretch without a good run, including the one that ended at the
   next good run. STALE when that stretch is longer than the job's timer allows (7 h for
-  the hourly mail, Teams and WhatsApp jobs, 10 h for the calendar and the briefs, 3 h for
+  the hourly mail, Teams and WhatsApp jobs, 10 h for the calendar, 3 h for
   news, 13 h for conversations, 5 h for sb-auth-watch, 26 h for a daily job); WARN when
   any run was skipped on a sentinel. A failure a retry or the next run made good is
   counted, not an issue. A job whose timer is off, and the long-running services, are
@@ -1454,9 +1410,9 @@ On the producer, with the environment the timers run with:
 
 1. **The schema.** `python -m src.cli maint migrate`, or the first job that writes:
    v36 adds two tables (below); nothing needs stopping.
-2. **The units.** Section 6, "Topic pages and the brief pilot": install the two
-   wrappers and shims, price and run the first build, write `briefs.env`, enable
-   the two timers.
+2. **The unit.** Section 6, "Topic pages": install the wrapper and shim, price and
+   run the first build, enable the timer. (The brief pilot this step also installed
+   was removed on 2026-10-25.)
 3. **Topics to name or skip.** `python -m src.cli topic-pages --estimate` prints the
    topics the rule picks. Put a topic whose tags fragment in `BRAIN_TOPIC_PAGES`
    (`"budget 2027|business plan 2027"` makes one page of both), and a tag the rule
@@ -1693,7 +1649,7 @@ stops returning data: fetch the documents shared with you that no mail or messag
 
 ### After 2026-10-21 (red sentinel skips, the 24-hour view, the news load)
 
-No schema change. The health check and the briefs run from the checkout, so they change
+No schema change. The health check runs from the checkout, so it changes
 with the pull; the wrappers do not, and their retry drop-ins must know exit 69 first.
 On the producer, in this order:
 
@@ -1701,10 +1657,10 @@ On the producer, in this order:
    `RestartPreventExitStatus=` for `sb-attachments`, `sb-conversation-sync`,
    `sb-daily-sync` and `sb-noon-catchup`, then `systemctl --user daemon-reload`. Before
    the wrappers: a unit that restarts on 69 spends its start limit in seconds.
-2. The failure-streak lines for `sb-briefs`, `sb-whatsapp-sync`,
-   `sb-conversation-sync` and `sb-news-sync` (same section).
+2. The failure-streak lines for `sb-whatsapp-sync`, `sb-conversation-sync` and
+   `sb-news-sync` (same section).
 3. Install the changed wrappers:
-   `install -m 755 scripts/wrappers/systemd/sb-{attachment-pass,auth-watch,briefs,calendar-sync,conversation-sync,daily-sync,news-sync,noon-catchup,outlook-sync,teams-sync,topic-pages,whatsapp-sync}.sh ~/.local/bin/`.
+   `install -m 755 scripts/wrappers/systemd/sb-{attachment-pass,auth-watch,calendar-sync,conversation-sync,daily-sync,news-sync,noon-catchup,outlook-sync,teams-sync,topic-pages,whatsapp-sync}.sh ~/.local/bin/`.
    Before the next 23:50 health check: until `sb-news-sync.sh` loads what it stages,
    the 21:00 digest waits for the 01:10 load and the new News rule reads STALE, as it
    should.

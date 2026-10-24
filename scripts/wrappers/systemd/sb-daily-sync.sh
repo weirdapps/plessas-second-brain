@@ -109,6 +109,11 @@ TODAY=$(date +%Y%m%d)
 if [ -f "$DATA_DIR/backups/brain-$TODAY.db" ] \
    && { [ ! -f "$BACKUP_KEY" ] || [ -f "$DATA_DIR/backups/offsite/brain-$TODAY.db.zst.enc" ]; }; then
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] backup already taken today (brain-$TODAY.db); not taking another" >> "$LOG_FILE"
+  # brain-backup is an oncalendar check on this unit's 07:05 slot. A restore run before
+  # the slot takes the snapshot and pings ahead of it, so without a ping here the check
+  # went down at 08:10 on 2026-10-24 with the day's snapshot on disk. The ping stands on
+  # the same files the skip does.
+  [ -n "$HC_PING_URL" ] && curl -fsS -m 10 --retry 2 -o /dev/null "${HC_PING_URL}/brain-backup" 2>/dev/null || true
 else
   "$PYTHON" "$REPO_DIR/scripts/backup_db.py" \
     --db "$DB" \

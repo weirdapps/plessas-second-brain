@@ -536,13 +536,6 @@ def cmd_findings(args):
     return cmd(args)
 
 
-def cmd_briefs(args):
-    """One pass of the pre-meeting brief pilot (src/pipeline/briefs.py)."""
-    from src.pipeline.briefs import run
-
-    return run(args)
-
-
 def cmd_figures_backfill(args):
     """Read every report edition's figures into the numbers registry (src/store/figures.py)."""
     from src.store.figures import cmd
@@ -1775,8 +1768,7 @@ READ_ONLY_COMMANDS = frozenset(
         "scrub",
         # --estimate reads; building pages refuses on a replica itself.
         "topic-pages",
-        # --dry-run reads; a pass that may mail refuses on a replica itself.
-        "briefs",
+        # The findings list reads only.
         "findings",
         # `brain maint figures-backfill`: the same; its dry run opens the store read-only.
         "figures-backfill",
@@ -2339,18 +2331,6 @@ def main():
     )
     parser_findings.add_argument("--limit", type=int, default=100, help="At most this many")
     parser_findings.set_defaults(func=cmd_findings)
-
-    parser_briefs = subparsers.add_parser(
-        "briefs",
-        help="Mail the owner a brief before each qualifying meeting 30-45 minutes ahead "
-        "(the pilot; every 15 minutes)",
-    )
-    parser_briefs.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="List what it would brief; no model call, no mail (runs on a replica)",
-    )
-    parser_briefs.set_defaults(func=cmd_briefs)
 
     parser_shells = subparsers.add_parser(
         "sharepoint-shells",

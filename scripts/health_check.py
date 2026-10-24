@@ -2659,8 +2659,6 @@ JOB_MAX_GAP = {
     "sb-whatsapp-sync.service": timedelta(hours=7),
     # 07:48 to 22:48: nine hours overnight.
     "sb-calendar-sync.service": timedelta(hours=10),
-    # Every 15 minutes, 07:00 to 21:45: nine and a quarter hours overnight.
-    "sb-briefs.service": timedelta(hours=10),
     # Even hours at :50.
     "sb-news-sync.service": timedelta(hours=3),
     # 08:45, 14:45, 20:45: twelve hours overnight.

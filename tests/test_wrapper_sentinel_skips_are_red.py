@@ -79,18 +79,10 @@ def _logs(home: Path) -> str:
     return "".join(p.read_text() for p in sorted((home / ".second-brain" / "logs").glob("*.log")))
 
 
-def _pilot_on(home: Path) -> None:
-    settings = home / ".config" / "second-brain" / "briefs.env"
-    settings.parent.mkdir(parents=True)
-    settings.write_text("BRAIN_BRIEF_PILOT_UNTIL=2099-12-31\n")
-
-
 @pytest.mark.parametrize(
     ("wrapper", "sentinel"),
     [
         ("sb-calendar-sync.sh", "needs_reauth"),
-        ("sb-briefs.sh", "needs_gcloud_reauth"),
-        ("sb-briefs.sh", "needs_reauth"),
         ("sb-noon-catchup.sh", "needs_gcloud_reauth"),
         ("sb-topic-pages.sh", "needs_gcloud_reauth"),
     ],
@@ -98,7 +90,6 @@ def _pilot_on(home: Path) -> None:
 def test_a_whole_run_skipped_on_a_sentinel_is_red(tmp_path, wrapper, sentinel):
     """Every stage of these needs the dead session, so nothing runs, and the unit fails."""
     home = _home(tmp_path, sentinel)
-    _pilot_on(home)
 
     result = _run(wrapper, home)
 
@@ -109,8 +100,8 @@ def test_a_whole_run_skipped_on_a_sentinel_is_red(tmp_path, wrapper, sentinel):
 
 
 def test_the_calendar_keeps_its_facts_while_gcloud_is_down(tmp_path):
-    """Times, attendees and cancellations come from Outlook, not the model: the briefs and
-    meeting prep read them. --skip-extraction leaves each body 'pending' for the next run."""
+    """Times, attendees and cancellations come from Outlook, not the model: meeting prep
+    reads them. --skip-extraction leaves each body 'pending' for the next run."""
     home = _home(tmp_path, "needs_gcloud_reauth")
 
     result = _run("sb-calendar-sync.sh", home)
@@ -297,45 +288,10 @@ def test_the_hourly_load_skipped_for_a_running_sync_stays_green(tmp_path):
     assert result.returncode == 0
 
 
-def test_a_briefs_kill_switch_is_not_a_skip(tmp_path):
-    """With the pilot off nothing was going to be sent: the command says so and the unit
-    stays green, sentinel or not."""
-    home = _home(tmp_path, "needs_reauth")
-    settings = home / ".config" / "second-brain" / "briefs.env"
-    settings.parent.mkdir(parents=True)
-    settings.write_text("BRAIN_BRIEF_PILOT_UNTIL=2099-12-31\nBRAIN_BRIEFS_OFF=1\n")
-
-    result = _run("sb-briefs.sh", home)
-
-    assert _calls(home) == ["-m src.cli briefs"]
-    assert result.returncode == 0
-
-
-def test_a_briefs_pilot_that_has_ended_still_stops_itself_under_a_sentinel(tmp_path):
-    """The command is what says the pilot ended, and the wrapper disables the timer on that
-    line: a sentinel in front of it would keep a finished pilot red every 15 minutes."""
-    home = _home(
-        tmp_path,
-        "needs_gcloud_reauth",
-        body='echo "briefs: pilot ended on 2026-01-01; nothing sent"\nexit 0\n',
-    )
-    settings = home / ".config" / "second-brain" / "briefs.env"
-    settings.parent.mkdir(parents=True)
-    settings.write_text("BRAIN_BRIEF_PILOT_UNTIL=2026-01-01\n")
-    (home / "tools" / "systemctl").write_text('#!/bin/bash\necho "$@" >> "$HOME/systemctl"\n')
-    (home / "tools" / "systemctl").chmod(0o755)
-
-    result = _run("sb-briefs.sh", home)
-
-    assert result.returncode == 0
-    assert (home / "systemctl").read_text().strip() == "--user disable --now sb-briefs.timer"
-
-
 @pytest.mark.parametrize(
     "wrapper",
     [
         "sb-attachment-pass.sh",
-        "sb-briefs.sh",
         "sb-calendar-sync.sh",
         "sb-conversation-sync.sh",
         "sb-daily-sync.sh",

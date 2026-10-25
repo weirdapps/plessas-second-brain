@@ -980,6 +980,118 @@ def encryption_of(path: str) -> dict | None:
     return None
 
 
+_MERGE_CELL = re.compile(rb'<(?:\w+:)?mergeCell\s+ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"')
+# A sheet's XML is read for its merges in chunks this size, overlapping by a tag's length.
+_MERGE_CHUNK = 1 << 20
+# A sheet with more merges across columns than this is no report header: read as before.
+_MERGE_MAX = 20_000
+
+
+def _merged_spans(fh, sheet_path: str | None) -> dict[int, list[tuple[int, int]]]:
+    """The cells merged across columns on one row, by row: {row: [(first, last) column]},
+    1-based. Read-only openpyxl does not keep merges, so they come from the sheet's XML,
+    scanned as bytes so a large sheet costs no parse."""
+    import zipfile
+
+    from openpyxl.utils.cell import column_index_from_string
+
+    if not sheet_path:
+        return {}
+    spans: dict[int, list[tuple[int, int]]] = {}
+    found = 0
+    try:
+        with zipfile.ZipFile(fh) as zf, zf.open(sheet_path.lstrip("/")) as xml:
+            tail = b""
+            while chunk := xml.read(_MERGE_CHUNK):
+                buf = tail + chunk
+                for m in _MERGE_CELL.finditer(buf):
+                    c1, r1, c2, r2 = m.groups()
+                    first, last = (
+                        column_index_from_string(c1.decode()),
+                        column_index_from_string(c2.decode()),
+                    )
+                    if r1 == r2 and last > first:
+                        spans.setdefault(int(r1), []).append((first, last))
+                        found += 1
+                if found > _MERGE_MAX:
+                    return {}
+                tail = buf[-200:]
+    except (KeyError, zipfile.BadZipFile, ValueError, OSError):
+        return {}
+    # A merge found in the overlap of two chunks is listed twice.
+    return {r: sorted(set(s)) for r, s in spans.items()}
+
+
+# How many rows of column groups above a table's header row are spread over its columns.
+_GROUP_ROWS = 3
+
+
+def _spread_merged(
+    rows: list[list[str]], numbers: list[int], spans: dict[int, list[tuple[int, int]]]
+) -> None:
+    """Repeat each merged column group over the columns of the header row it heads, so a
+    group merged over its columns ("DEBIT" over "Purchases | Refunds" over "€ | #") is stored
+    as wide as that header and a reader can tell which group each figure sits under.
+
+    `rows` are a sheet's non-empty rows and `numbers` their row numbers in the sheet. A
+    table's header row is the row of words right above its first row of figures, and its
+    groups are the up to _GROUP_ROWS rows above that. A group's text goes to each column of
+    its span where the header row has a cell, when there are two or more; a column a group
+    row leaves empty under a spread group (a group with no level under it) takes the text of
+    the group above. The header row and the figures are never changed, so a value merged over
+    several columns there stays one cell and the data keeps its width."""
+
+    def at(cells: list[str], k: int) -> str:
+        return cells[k - 1] if k <= len(cells) else ""
+
+    def put(cells: list[str], k: int, text: str) -> None:
+        cells.extend([""] * (k - len(cells)))
+        cells[k - 1] = text
+
+    for h in range(1, len(rows) - 1):
+        if _figures_row(rows[h]) or not _figures_row(rows[h + 1]):
+            continue
+        bottom = {k for k, c in enumerate(rows[h], 1) if c.strip()}
+        band = []
+        for g in range(h - 1, max(-1, h - 1 - _GROUP_ROWS), -1):
+            if _figures_row(rows[g]) or numbers[g] not in spans:
+                break
+            band.append(g)
+        spread: dict[int, set[int]] = {}
+        for g in band:
+            cells, done = rows[g], set()
+            for first, last in spans[numbers[g]]:
+                text = at(cells, first)
+                starts = [k for k in range(first, last + 1) if k in bottom]
+                if not text.strip() or len(starts) < 2:
+                    continue
+                put(cells, first, "")
+                for k in starts:
+                    put(cells, k, text)
+                done.update(starts)
+            spread[g] = done
+        for g in reversed(band[:-1]):
+            above = rows[g - 1]
+            for k in sorted(spread[g - 1] & bottom):
+                if not at(rows[g], k).strip():
+                    put(rows[g], k, at(above, k))
+                    spread[g].add(k)
+
+
+def _figures_row(cells: list[str]) -> bool:
+    """A row whose filled cells are mostly figures: a table's data, not its header."""
+    filled = [c for c in cells if c.strip()]
+    return bool(filled) and 2 * sum(_is_figure(c) for c in filled) > len(filled)
+
+
+def _is_figure(cell: str) -> bool:
+    try:
+        float(cell.replace(",", ""))
+    except ValueError:
+        return False
+    return True
+
+
 def _extract_excel(path: str) -> dict:
     """Extract every row of every sheet from .xlsx files via openpyxl.
 
@@ -999,11 +1111,16 @@ def _extract_excel(path: str) -> dict:
             # Read-only mode stops at the size the sheet declares, and real files understate it.
             if hasattr(ws, "reset_dimensions"):
                 ws.reset_dimensions()
-            rows_text = []
-            for row in ws.iter_rows(values_only=True):
+            spans = _merged_spans(fh, getattr(ws, "_worksheet_path", None))
+            rows, numbers = [], []
+            for number, row in enumerate(ws.iter_rows(values_only=True), ws.min_row or 1):
                 cells = [str(c) if c is not None else "" for c in row]
                 if any(c.strip() for c in cells):
-                    rows_text.append(" | ".join(c for c in cells if c.strip()))
+                    rows.append(cells)
+                    numbers.append(number)
+            if spans:
+                _spread_merged(rows, numbers, spans)
+            rows_text = [" | ".join(c for c in cells if c.strip()) for cells in rows]
 
             if rows_text:
                 parts.append(f"--- Sheet: {sheet_name} ---\n" + "\n".join(rows_text))

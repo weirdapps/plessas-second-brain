@@ -42,12 +42,13 @@ import unicodedata
 from collections import Counter
 from collections.abc import Iterator
 from datetime import date
+from itertools import groupby
 from typing import NamedTuple
 
 from src.store.greek import search_fold
 
 # Bumped when the parse changes what it reads, so a backfill can tell old rows from new.
-PARSER_VERSION = 2
+PARSER_VERSION = 3
 
 # A sheet of more non-empty rows is a data extract, not a report: left unread, cheaply.
 SHEET_MAX_ROWS = 3_000
@@ -61,6 +62,8 @@ MAX_FIGURES = 20_000
 HEADER_LINES = 12
 # How far above a table its header is looked for.
 HEADER_SCAN_ROWS = 12
+# How many rows of column groups above a header are read, the nearest first.
+GROUP_ROWS = 3
 LABEL_CHARS = 160
 HEADER_CHARS = 120
 # A table whose rows lead with more label cells lists records (orders, cases), not figures.
@@ -531,6 +534,7 @@ SKIP_REASONS = (
     "capped",
     "long_sheets",
     "no_header",
+    "totals",
 )
 
 _NUMBER = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
@@ -722,9 +726,17 @@ def _groups(above: list[_Row], header: "_Header", first: int) -> list[str]:
     width = len(cells)
     groups = [""] * width
     plain = [_clean(search_fold(c)) for c in cells]
-    for row in reversed(above[max(0, header.start - 2) : header.start]):
+    for row in reversed(above[max(0, header.start - GROUP_ROWS) : header.start]):
         names = [" ".join(c.split()) for c in row.cells]
         k = len(names)
+        if k == width and _spread(names) and not row.data:
+            # A merged group the reader repeated over each column it spans: one name a column,
+            # a group with no level under it given once.
+            groups = [
+                g if g == n or g.startswith(f"{n} / ") else f"{n} / {g}" if g else n
+                for n, g in zip(names, groups, strict=True)
+            ]
+            continue
         if (
             k < 2
             or k >= width
@@ -740,6 +752,15 @@ def _groups(above: list[_Row], header: "_Header", first: int) -> list[str]:
             f"{names[i // span]} / {g}" if g else names[i // span] for i, g in enumerate(groups)
         ]
     return groups
+
+
+def _spread(names: list[str]) -> bool:
+    """Whether names stand in runs of two or more, each a word, as a merged cell repeated over
+    its columns leaves them: "DEBIT | DEBIT | CREDIT | CREDIT"."""
+    if not all(_LETTER.search(n) for n in names):
+        return False
+    runs = [len(list(g)) for _, g in groupby(names)]
+    return len(runs) >= 2 and min(runs) >= 2
 
 
 def _keys(cells: list[str]) -> list[str]:
@@ -979,6 +1000,12 @@ class _SheetReader:
         across = [h for h in heads if h is not None]
         if _monthly(across):
             heads = [_as_month(h) if h is not None else None for h in heads]
+        if by_period and not across:
+            # Periods down the rows: a row with none of its own sums them, and dated by the
+            # report or the email it would read as the newest period.
+            kept = [p for p in placed if p.found is not None]
+            self.skipped["totals"] += len(placed) - len(kept)
+            placed = kept
         # "MtD 2026" names no year's figure but one to the report's date.
         sources = ["header"] * len(cells)
         as_of = self._as_of()

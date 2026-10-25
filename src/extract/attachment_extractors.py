@@ -983,6 +983,8 @@ def encryption_of(path: str) -> dict | None:
 _MERGE_CELL = re.compile(rb'<(?:\w+:)?mergeCell\s+ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"')
 # A sheet's XML is read for its merges in chunks this size, overlapping by a tag's length.
 _MERGE_CHUNK = 1 << 20
+# A sheet with more merges across columns than this is no report header: read as before.
+_MERGE_MAX = 20_000
 
 
 def _merged_spans(fh, sheet_path: str | None) -> dict[int, list[tuple[int, int]]]:
@@ -996,6 +998,7 @@ def _merged_spans(fh, sheet_path: str | None) -> dict[int, list[tuple[int, int]]
     if not sheet_path:
         return {}
     spans: dict[int, list[tuple[int, int]]] = {}
+    found = 0
     try:
         with zipfile.ZipFile(fh) as zf, zf.open(sheet_path.lstrip("/")) as xml:
             tail = b""
@@ -1009,6 +1012,9 @@ def _merged_spans(fh, sheet_path: str | None) -> dict[int, list[tuple[int, int]]
                     )
                     if r1 == r2 and last > first:
                         spans.setdefault(int(r1), []).append((first, last))
+                        found += 1
+                if found > _MERGE_MAX:
+                    return {}
                 tail = buf[-200:]
     except (KeyError, zipfile.BadZipFile, ValueError, OSError):
         return {}
@@ -1021,13 +1027,14 @@ _GROUP_ROWS = 3
 
 
 def _spread_merged(
-    rows: list[list[str]], spans: dict[int, list[tuple[int, int]]], first_row: int
+    rows: list[list[str]], numbers: list[int], spans: dict[int, list[tuple[int, int]]]
 ) -> None:
     """Repeat each merged column group over the columns of the header row it heads, so a
     group merged over its columns ("DEBIT" over "Purchases | Refunds" over "€ | #") is stored
     as wide as that header and a reader can tell which group each figure sits under.
 
-    A table's header row is the row of words right above its first row of figures, and its
+    `rows` are a sheet's non-empty rows and `numbers` their row numbers in the sheet. A
+    table's header row is the row of words right above its first row of figures, and its
     groups are the up to _GROUP_ROWS rows above that. A group's text goes to each column of
     its span where the header row has a cell, when there are two or more; a column a group
     row leaves empty under a spread group (a group with no level under it) takes the text of
@@ -1047,13 +1054,13 @@ def _spread_merged(
         bottom = {k for k, c in enumerate(rows[h], 1) if c.strip()}
         band = []
         for g in range(h - 1, max(-1, h - 1 - _GROUP_ROWS), -1):
-            if _figures_row(rows[g]) or g + first_row not in spans:
+            if _figures_row(rows[g]) or numbers[g] not in spans:
                 break
             band.append(g)
         spread: dict[int, set[int]] = {}
         for g in band:
             cells, done = rows[g], set()
-            for first, last in spans[g + first_row]:
+            for first, last in spans[numbers[g]]:
                 text = at(cells, first)
                 starts = [k for k in range(first, last + 1) if k in bottom]
                 if not text.strip() or len(starts) < 2:
@@ -1105,18 +1112,15 @@ def _extract_excel(path: str) -> dict:
             if hasattr(ws, "reset_dimensions"):
                 ws.reset_dimensions()
             spans = _merged_spans(fh, getattr(ws, "_worksheet_path", None))
-            rows = []
-            for row in ws.iter_rows(values_only=True):
+            rows, numbers = [], []
+            for number, row in enumerate(ws.iter_rows(values_only=True), ws.min_row or 1):
                 cells = [str(c) if c is not None else "" for c in row]
-                if spans or any(c.strip() for c in cells):
+                if any(c.strip() for c in cells):
                     rows.append(cells)
+                    numbers.append(number)
             if spans:
-                _spread_merged(rows, spans, ws.min_row or 1)
-            rows_text = [
-                " | ".join(c for c in cells if c.strip())
-                for cells in rows
-                if any(c.strip() for c in cells)
-            ]
+                _spread_merged(rows, numbers, spans)
+            rows_text = [" | ".join(c for c in cells if c.strip()) for cells in rows]
 
             if rows_text:
                 parts.append(f"--- Sheet: {sheet_name} ---\n" + "\n".join(rows_text))

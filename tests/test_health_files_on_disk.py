@@ -13,6 +13,7 @@ import os
 import sqlite3
 import time
 from collections.abc import Generator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,7 @@ def _stored(
     hours_old: float,
     mime: str = "application/pdf",
     content: bool = True,
+    stored_hours_ago: float | None = None,
 ) -> None:
     d = root / f"AAMk-{name}"
     d.mkdir(parents=True, exist_ok=True)
@@ -55,9 +57,17 @@ def _stored(
     )
     if content:
         db.execute(
-            "INSERT INTO attachment_content (attachment_id, extraction_status, llm_status)"
-            " VALUES (?, 'extracted', 'pending')",
-            (cur.lastrowid,),
+            "INSERT INTO attachment_content"
+            " (attachment_id, extraction_status, llm_status, extracted_at)"
+            " VALUES (?, 'extracted', 'pending', ?)",
+            (
+                cur.lastrowid,
+                None
+                if stored_hours_ago is None
+                else datetime.fromtimestamp(time.time() - stored_hours_ago * 3600, UTC)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            ),
         )
     db.commit()
     when = time.time() - hours_old * 3600
@@ -78,6 +88,22 @@ def test_report_only_is_ok_however_much_waits(db, tmp_path):
 def test_a_stalled_sweep_warns_once_deletion_is_on(db, tmp_path):
     _policy(tmp_path, apply=True)
     _stored(db, tmp_path / "att", "late.pdf", hours_old=7)
+    row = hc.check_files_on_disk(db)
+    assert row["status"] == "WARN" and row["stalled"] == 1
+
+
+def test_an_old_file_whose_text_was_just_stored_is_not_stalled(db, tmp_path):
+    """The check can run while a sync is storing text: six files that had waited 7h 40m for
+    it read as a stopped sweep a minute before the sweep removed them (2026-10-25 23:52)."""
+    _policy(tmp_path, apply=True)
+    _stored(db, tmp_path / "att", "fresh.pdf", hours_old=8, stored_hours_ago=0.02)
+    row = hc.check_files_on_disk(db)
+    assert row["status"] == "OK" and row["stalled"] == 0
+
+
+def test_a_file_stored_long_ago_and_still_there_is_stalled(db, tmp_path):
+    _policy(tmp_path, apply=True)
+    _stored(db, tmp_path / "att", "stuck.pdf", hours_old=30, stored_hours_ago=7)
     row = hc.check_files_on_disk(db)
     assert row["status"] == "WARN" and row["stalled"] == 1
 

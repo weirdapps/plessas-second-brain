@@ -28,6 +28,7 @@ import urllib.request
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import (  # noqa: E402
@@ -1227,6 +1228,24 @@ def check_mail_loss(state_dir=None, staging_dir=None, now=None):
     }
 
 
+def _hours_since_stored(db, f, now: float) -> float:
+    """How long a removable file has been removable: since its text was stored, or its own
+    age when no row says when. The check can run while a sync stores text, and an old file
+    stored a minute ago is not a stopped sweep (2026-10-25 23:52, six files)."""
+    age_h = (now - f.mtime) / 3600
+    if not f.attachment_ids:
+        return age_h
+    marks = ",".join("?" * len(f.attachment_ids))
+    (julian,) = db.execute(
+        f"SELECT MAX({instant_sql('extracted_at')}) FROM attachment_content"
+        f" WHERE attachment_id IN ({marks})",
+        f.attachment_ids,
+    ).fetchone()
+    if julian is None:
+        return age_h
+    return min(age_h, (now - (julian - 2440587.5) * 86400) / 3600)
+
+
 def check_files_on_disk(db):
     """Attachment and SharePoint files the VPS still holds, by state (src/store/file_sweep.py).
 
@@ -1256,7 +1275,12 @@ def check_files_on_disk(db):
         total_bytes += f.size
         age_h = (now - f.mtime) / 3600
         covered = policy.apply and (cutoff is None or f.mtime >= cutoff)
-        if f.state == file_sweep.DELETABLE and covered and age_h > file_sweep.STALL_HOURS:
+        if (
+            f.state == file_sweep.DELETABLE
+            and covered
+            and age_h > file_sweep.STALL_HOURS
+            and _hours_since_stored(db, f, now) > file_sweep.STALL_HOURS
+        ):
             stalled += 1
         if f.state == file_sweep.PENDING_IMAGE and age_h > file_sweep.IMAGE_WAIT_HOURS:
             image_late += 1
@@ -2666,6 +2690,10 @@ JOB_MAX_GAP = {
     # Every four hours, with five minutes of jitter.
     "sb-auth-watch.service": timedelta(hours=5),
 }
+# The zone the timers' OnCalendar lines name. Gaps are measured on its wall clock, as the
+# allowances above are: the night clocks go back is an hour longer in UTC, and read 13h 0m
+# against conversation sync's 13h with every run good (2026-10-25).
+TIMER_ZONE = ZoneInfo("Europe/Athens")
 # A job with a timer and no entry above runs at least daily: daily sync, noon catch-up,
 # attachments, topic pages, the health check itself.
 JOB_MAX_GAP_DEFAULT = timedelta(hours=26)
@@ -2738,6 +2766,11 @@ def _active_timer_services(run) -> set[str] | None:
     return services
 
 
+def _wall(t: datetime) -> datetime:
+    """An instant as the timers' wall clock reads it, to subtract one from another."""
+    return t.astimezone(TIMER_ZONE).replace(tzinfo=None)
+
+
 def _job_verdict(desc: str, runs: list, now: datetime, max_gap: timedelta | None) -> dict:
     """One job's day from its runs, [(ended, ok, exit status)] in time order."""
     window_start = now - RECENT_WINDOW
@@ -2747,8 +2780,8 @@ def _job_verdict(desc: str, runs: list, now: datetime, max_gap: timedelta | None
     good = [r[0] for r in runs if r[1]]
     # Every stretch between good runs that reaches into the window, and the open one to
     # now. With no good run in the lookback the stretch is at least the lookback.
-    gaps = [b - a for a, b in zip(good, good[1:], strict=False) if b >= window_start]
-    gaps.append(now - good[-1] if good else RECENT_LOOKBACK)
+    gaps = [_wall(b) - _wall(a) for a, b in zip(good, good[1:], strict=False) if b >= window_start]
+    gaps.append(_wall(now) - _wall(good[-1]) if good else RECENT_LOOKBACK)
     longest = max(gaps)
     job = {
         "desc": desc,

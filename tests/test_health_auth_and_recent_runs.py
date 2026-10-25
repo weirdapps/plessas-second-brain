@@ -543,3 +543,40 @@ def test_auth_rows_reach_the_report_and_its_issues(hc):
     assert "Outlook session" in block and "expired 2026-10-20 11:57 UTC" in block
     assert "Outlook session: FAIL" in issues
     assert not any(i.startswith("Teams session") for i in issues)
+
+
+def test_the_autumn_clock_change_does_not_make_a_job_stale(hc):
+    """The timers run on Athens wall time, so the night clocks go back is an hour longer in
+    UTC: conversation sync 20:47 EEST to 08:48 EET read as 13h 0m against 13h (2026-10-25)."""
+    now = datetime(2026, 10, 25, 21, 52, tzinfo=UTC)
+    journal = Journal(timers=("sb-conversation-sync",))
+    for stamp in (
+        "2026-10-24T05:48",
+        "2026-10-24T11:47",
+        "2026-10-24T17:47",  # 20:47 EEST
+        "2026-10-25T06:48",  # 08:48 EET
+        "2026-10-25T12:47",
+        "2026-10-25T18:47",
+    ):
+        journal.run("sb-conversation-sync", datetime.fromisoformat(stamp).replace(tzinfo=UTC))
+
+    r = hc.check_recent_runs(
+        {"sb-conversation-sync.service": "Conversation sync"}, now=now, run=journal
+    )
+
+    job = r["jobs"]["sb-conversation-sync.service"]
+    assert job["status"] == "OK"
+    assert job["longest_gap"] == timedelta(hours=12, minutes=1)
+
+
+def test_a_real_miss_on_the_clock_change_night_is_still_stale(hc):
+    now = datetime(2026, 10, 25, 21, 52, tzinfo=UTC)
+    journal = Journal(timers=("sb-conversation-sync",))
+    journal.run("sb-conversation-sync", datetime(2026, 10, 24, 17, 47, tzinfo=UTC))
+    journal.run("sb-conversation-sync", datetime(2026, 10, 25, 12, 47, tzinfo=UTC))
+
+    r = hc.check_recent_runs(
+        {"sb-conversation-sync.service": "Conversation sync"}, now=now, run=journal
+    )
+
+    assert r["jobs"]["sb-conversation-sync.service"]["status"] == "STALE"

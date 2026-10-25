@@ -10,7 +10,7 @@ an MCP server's PATH does not include.
 
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -42,7 +42,9 @@ class TestGetFreshness:
         assert "stale_warning" not in out
 
     def test_an_old_sync_is_stale_and_says_so(self):
-        old = (datetime.now() - timedelta(hours=29)).isoformat()
+        # With its zone: naive local time 29h back spans an hour more on the night clocks
+        # go back, and read 30.0 (2026-10-26).
+        old = (datetime.now(UTC) - timedelta(hours=29)).isoformat()
         out = get_freshness(_db(old))
         assert out["stale"] is True
         assert 28 < out["age_hours"] < 30

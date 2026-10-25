@@ -699,3 +699,97 @@ def test_a_total_row_under_dates_down_the_rows_is_no_day_of_its_own(tmp_path):
 
     assert sorted({f.period for f in parsed.figures}) == ["2026-10-01", "2026-10-02"]
     assert parsed.skipped["totals"] == 1
+
+
+def test_tables_side_by_side_under_one_header_row_keep_their_months(tmp_path):
+    """Two year blocks side by side, each led by the same corner header, over rows led by a
+    group label named once: the dump drops the empty cell over the group column and the
+    right block's empty label cells, so the first row is as wide as the header while its
+    figures sit one column right of their months."""
+    this_year = [datetime(2026, m, d) for m, d in ((1, 31), (2, 28), (3, 31))]
+    last_year = [datetime(2025, m, d) for m, d in ((10, 31), (11, 30), (12, 31))]
+    corner = "Based on application date"
+    text = _dump(
+        tmp_path,
+        {
+            "Dashboard": [
+                [None, corner, *this_year, "YTD", corner, *last_year, "YTD"],
+                ["Items", "Total applications", 10, 11, 12, 33, None, 20, 21, 22, 63],
+                [None, "Pending", 1, 2, 3, 6, None, 4, 5, 6, 15],
+                [None, "Booked", 7, 8, 9, 24, None, 1, 1, 1, 3],
+            ]
+        },
+    )
+
+    parsed = parse_workbook(text, filename="Applications_2026-03-21.xlsx", email_date=MAILED)
+
+    def months(label):
+        return {f.period: f.value for f in parsed.figures if f.label == label and not f.header}
+
+    assert months("Items / Total applications") == {
+        "2026-01": 10,
+        "2026-02": 11,
+        "2026-03": 12,
+        "2025-10": 20,
+        "2025-11": 21,
+        "2025-12": 22,
+    }
+    assert months("Items / Pending") == {
+        "2026-01": 1,
+        "2026-02": 2,
+        "2026-03": 3,
+        "2025-10": 4,
+        "2025-11": 5,
+        "2025-12": 6,
+    }
+    totals = {f.value for f in parsed.figures if f.label == "Items / Booked" and f.header}
+    assert totals == {24, 3}
+    assert all(corner.lower() not in f.header.lower() for f in parsed.figures)
+    assert parsed.skipped["unaligned_rows"] == 0
+
+
+def test_a_group_row_is_not_joined_to_a_header_short_of_empty_cells(tmp_path):
+    """A row of column groups over a header with two empty cells: joined at their boundary
+    they are exactly as wide as the data, which read every figure two columns left of its
+    header. The header is not split by a line break, so the table has no header to read."""
+    quarters = ["Q2 2026", "Q1 2026", "Q4 2025"]
+    text = _dump(
+        tmp_path,
+        {
+            "Evolution": [
+                ["Market share evolution"],
+                [None, "Market", None, None, None, "Ours", None, None, "Our share"],
+                ["Cards ('000s)", None, *quarters, None, *quarters[:2], "% Q2 2026"],
+                ["Debit", 1.5, 100, 90, 80, 2.5, 30, 28, 0.3],
+                ["Credit", 0.5, 50, 45, 40, 1.5, 10, 9, 0.2],
+            ]
+        },
+    )
+
+    parsed = parse_workbook(text, filename="Cards Q2 2026.xlsx", email_date=MAILED)
+
+    assert parsed.figures == []
+    assert parsed.skipped["no_header"] == 1
+
+
+def test_a_group_row_over_a_header_as_wide_as_the_data_names_the_columns(tmp_path):
+    """The same groups over a header with no empty cell: the header is read as it stands."""
+    text = _dump(
+        tmp_path,
+        {
+            "Evolution": [
+                [None, "Market", None, "Ours", None],
+                ["Cards ('000s)", "Q2 2026", "Q1 2026", "% D qoq", "Q4 2025"],
+                ["Debit", 100, 90, 0.1, 80],
+            ]
+        },
+    )
+
+    parsed = parse_workbook(text, filename="Cards Q2 2026.xlsx", email_date=MAILED)
+
+    assert sorted((f.header, f.period, f.value) for f in parsed.figures) == [
+        ("", "2025-Q4", 80),
+        ("", "2026-Q1", 90),
+        ("", "2026-Q2", 100),
+        ("% D qoq", "2026-Q2", 0.1),
+    ]

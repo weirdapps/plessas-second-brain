@@ -17,8 +17,13 @@ empty cell leaves no trace and a cell holding a line break splits its row. So:
   values then under the header's last columns; or as wide as its header's value columns when
   the row labels have no header cell of their own. Any other row is left out and counted
   (`unaligned_rows`), never guessed: a figure under the wrong header is worse than none.
+- Tables side by side under one header row, each block led by the same corner cell, over
+  rows led by a group label the header has no cell for: the corner's repeats are dropped
+  when they are exactly the cells the rows have no figure under, so each figure keeps its
+  own column's period.
 - A header split over several lines by line breaks is joined again: the lines just above
-  the data, merged at their boundary cells, until they are as wide as the data.
+  the data, merged at their boundary cells, until they are as wide as the data. A row of
+  column groups over a whole row of period headers is never joined to it.
 - The cell a figure names is its place in the stored text, R<row>C<cell>, counting the
   non-empty rows and cells as stored, with the character offset get_item pages from. The
   workbook's own A1 address cannot be recovered from the dump.
@@ -48,7 +53,7 @@ from typing import NamedTuple
 from src.store.greek import search_fold
 
 # Bumped when the parse changes what it reads, so a backfill can tell old rows from new.
-PARSER_VERSION = 3
+PARSER_VERSION = 4
 
 # A sheet of more non-empty rows is a data extract, not a report: left unread, cheaply.
 SHEET_MAX_ROWS = 3_000
@@ -675,7 +680,7 @@ def _find_header(above: list[_Row], width: int, values: int) -> _Header | None:
     for end in range(len(above), base, -1):
         for k in range(2, min(HEADER_LINES, end - base) + 1):
             lines = above[end - k : end]
-            if any(r.data for r in lines):
+            if any(r.data for r in lines) or _over_periods(lines):
                 break
             merged = _merge(lines)
             if len(merged) == width and _headerish(merged):
@@ -692,6 +697,24 @@ def _find_header(above: list[_Row], width: int, values: int) -> _Header | None:
                     return None
                 return _Header(cells, i, i + 1, True)
     return None
+
+
+def _names_period(cell: str) -> bool:
+    return next(_matches(search_fold(cell)), None) is not None
+
+
+def _over_periods(lines: list[_Row]) -> bool:
+    """Whether the lines are column groups over a whole row of period headers, not one header
+    split by line breaks: a line of two or more names, none a period, above a last line that
+    names three periods or more on its own. A header short of its empty cells joined to such
+    a group row can come out exactly as wide as the data, every figure then read under the
+    header of another column."""
+    if sum(_names_period(c) for c in lines[-1].cells) < 3:
+        return False
+    return any(
+        len(row.cells) >= 2 and all(_LETTER.search(c) and not _names_period(c) for c in row.cells)
+        for row in lines[:-1]
+    )
 
 
 # What the header over a column of periods says: such a header is never over a value.
@@ -980,7 +1003,30 @@ class _SheetReader:
             placed.append(_Placed(row, labels, shift, year, section, found))
         return placed, wide
 
+    def _side_by_side(self, header: _Header, rows: list[_Row]) -> _Header:
+        """A header over tables side by side, each block led by the same corner cell
+        ("Based on date | Jan | Feb | YTD | Based on date | Jan | Feb | YTD"), over rows led by
+        a group label the header has no cell for: the dump drops the empty cell over the
+        group column and the rows' empty cells under the repeated corner, so a row with its
+        group label is as wide as the header with every figure a column right of its own.
+        When the corner's repeats are exactly the cells the rows have no figure under, they
+        are dropped and the corner padded to the rows' labels; any other header is kept."""
+        cells = header.cells
+        full = [r for r in rows if r.data and not r.mixed and len(r.cells) == len(cells)]
+        if header.corner or not full:
+            return header
+        wide = Counter(r.labels for r in full).most_common(1)[0][0]
+        first = next((i for i, c in enumerate(cells) if self._period(c) is not None), wide)
+        if not 0 < first < wide:
+            return header
+        corner = {_clean(search_fold(c)) for c in cells[:first]}
+        values = [c for c in cells[first:] if _clean(search_fold(c)) not in corner]
+        if len(values) != len(cells) - wide:
+            return header
+        return header._replace(cells=[""] * (wide - first) + cells[:first] + values)
+
     def _read_table(self, header: _Header, rows: list[_Row], above: list[_Row]) -> None:
+        header = self._side_by_side(header, rows)
         placed, wide = self._place(header, rows)
         if not placed:
             return

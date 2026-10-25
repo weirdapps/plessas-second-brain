@@ -615,3 +615,87 @@ def test_a_row_with_no_label_takes_the_label_above_it_in_its_column(tmp_path):
 def test_text_that_is_no_workbook_dump_gives_nothing():
     parsed = parse_workbook("Just a paragraph.", filename="x.xlsx", email_date=MAILED)
     assert parsed.figures == []
+
+
+def _merged_report(tmp_path) -> str:
+    """A paginated report exported to Excel: a title merged over
+    the date column, three levels of column groups in merged cells over "€ | #" pairs, a group
+    with no level under it, and one value merged over two columns in its header and in every
+    data row alike."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Daily turnover"
+    ws["A1"] = "DAILY CARD MOVEMENTS"
+    ws.merge_cells("A1:F1")
+    ws["H1"] = "Complete until"
+    ws["J1"] = datetime(2026, 10, 2)
+    for cell, text, span in [
+        ("B2", "DEBIT", "B2:H2"),
+        ("I2", "CREDIT", "I2:L2"),
+        ("B3", "Purchases", "B3:F3"),
+        ("G3", "Refunds", "G3:H3"),
+        ("I3", "Purchases", "I3:J3"),
+        ("K3", "Instalments", "K3:L3"),
+        ("B4", "Domestic", "B4:C4"),
+        ("D4", "Abroad", "D4:F4"),
+        ("G4", "Domestic", "G4:H4"),
+        ("I4", "Domestic", "I4:J4"),
+    ]:
+        ws[cell] = text
+        ws.merge_cells(span)
+    ws.append(["Date", "€", "#", "€", None, "#", "€", "#", "€", "#", "€", "#"])
+    ws.merge_cells("D5:E5")
+    for r, day in ((6, 1), (7, 2)):
+        ws.append(
+            [datetime(2026, 10, day), 100 * day, day, 50 * day, None, 5 * day, 9, 1, 70, 7, 30, 3]
+        )
+        ws.merge_cells(f"D{r}:E{r}")
+    path = tmp_path / "Daily card turnover.xlsx"
+    wb.save(path)
+    result = extract_text_from_file(str(path), XLSX)
+    assert result["status"] == "extracted"
+    return result["text"]
+
+
+def test_merged_column_groups_name_each_value_column(tmp_path):
+    """Each value column is named by every merged group above it, down to its own "€" or
+    "#": a header of "€" alone leaves every figure of such a report unsearchable."""
+    text = _merged_report(tmp_path)
+
+    parsed = parse_workbook(text, filename="Daily card turnover.xlsx", email_date=MAILED)
+
+    day1 = {f.header: f.value for f in parsed.figures if f.period == "2026-10-01"}
+    assert day1 == {
+        "DEBIT / Purchases / Domestic / €": 100,
+        "DEBIT / Purchases / Domestic / #": 1,
+        "DEBIT / Purchases / Abroad / €": 50,
+        "DEBIT / Purchases / Abroad / #": 5,
+        "DEBIT / Refunds / Domestic / €": 9,
+        "DEBIT / Refunds / Domestic / #": 1,
+        "CREDIT / Purchases / Domestic / €": 70,
+        "CREDIT / Purchases / Domestic / #": 7,
+        "CREDIT / Instalments / €": 30,
+        "CREDIT / Instalments / #": 3,
+    }
+    assert parsed.skipped["unaligned_rows"] == 0
+
+
+def test_a_total_row_under_dates_down_the_rows_is_no_day_of_its_own(tmp_path):
+    """The sum row under a run of days has no date: dated by the email it read as the newest
+    day, so the month's total answered for "the latest day"."""
+    text = _dump(
+        tmp_path,
+        {
+            "Daily": [
+                ["Date", "Purchases", "Refunds"],
+                [datetime(2026, 10, 1), 100, 1],
+                [datetime(2026, 10, 2), 120, 2],
+                [None, 220, 3],
+            ]
+        },
+    )
+
+    parsed = parse_workbook(text, filename="Daily cards.xlsx", email_date=MAILED)
+
+    assert sorted({f.period for f in parsed.figures}) == ["2026-10-01", "2026-10-02"]
+    assert parsed.skipped["totals"] == 1

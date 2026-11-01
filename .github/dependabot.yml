@@ -8,6 +8,10 @@ updates:
       interval: "weekly"
       day: "monday"
       time: "09:00"
+    # A release this young is not offered yet: a hijacked package is usually yanked
+    # within days, before an auto-merge and the hourly producer pull would run it.
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     reviewers:
       - "weirdapps"
@@ -36,6 +40,10 @@ updates:
       interval: "weekly"
       day: "monday"
       time: "09:00"
+    # A release this young is not offered yet: a hijacked package is usually yanked
+    # within days, before an auto-merge and the hourly producer pull would run it.
+    cooldown:
+      default-days: 7
     labels:
       - "dependencies"
       - "ci"

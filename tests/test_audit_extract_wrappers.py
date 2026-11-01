@@ -8,6 +8,7 @@ src.extract.local rejects. Finding cli-7.
 """
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -40,7 +41,7 @@ def _run(script: Path, *args: str, env_extra: dict[str, str], home: Path):
 
 
 @pytest.mark.parametrize(
-    ("script", "module"), [("brain", "src.cli"), ("run_extract.sh", "src.extract.local")]
+    ("script", "module"), [("brain", "-P -m src.cli"), ("run_extract.sh", "-m src.extract.local")]
 )
 def test_uses_the_explicit_override(tmp_path, script, module):
     py = _fake_python(tmp_path / "override" / "python")
@@ -52,7 +53,7 @@ def test_uses_the_explicit_override(tmp_path, script, module):
         home=tmp_path / "home",
     )
     assert result.returncode == 0, result.stderr
-    assert f"fake-python -m {module} --limit 3" in result.stdout
+    assert f"fake-python {module} --limit 3" in result.stdout
 
 
 @pytest.mark.parametrize("script", ["brain", "run_extract.sh"])
@@ -61,7 +62,7 @@ def test_finds_the_shared_venv_the_producer_uses(tmp_path, script):
     _fake_python(home / ".venvs" / "second-brain" / "bin" / "python")
     result = _run(_copy(script, tmp_path / "repo"), "stats", env_extra={}, home=home)
     assert result.returncode == 0, result.stderr
-    assert "fake-python -m" in result.stdout
+    assert re.search(r"fake-python (-P )?-m ", result.stdout)
 
 
 @pytest.mark.parametrize("script", ["brain", "run_extract.sh"])
@@ -70,7 +71,7 @@ def test_prefers_the_in_repo_venv(tmp_path, script):
     _fake_python(repo / ".venv" / "bin" / "python")
     result = _run(_copy(script, repo), env_extra={}, home=tmp_path / "home")
     assert result.returncode == 0, result.stderr
-    assert "fake-python -m" in result.stdout
+    assert re.search(r"fake-python (-P )?-m ", result.stdout)
 
 
 @pytest.mark.parametrize("script", ["brain", "run_extract.sh"])

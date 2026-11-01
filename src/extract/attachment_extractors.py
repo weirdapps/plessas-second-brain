@@ -7,6 +7,7 @@ encrypted at rest are recognised and recorded as such. No API calls — all loca
 
 import html
 import io
+import math
 import os
 import re
 import struct
@@ -127,6 +128,10 @@ OCR_TEXT_METHODS = frozenset({"ocr", "pymupdf+tesseract", "zip"})
 # 342-megapixel page needs gigabytes and minutes, and Phase 1 cannot stop an item mid-file.
 OCR_MAX_PIXELS = 178_956_970
 ZIP_MIME_TYPES = frozenset({"application/zip", "application/x-zip-compressed"})
+# The most pixels a PDF page is rendered at for OCR. 200 dpi stays for every real page (A0 is
+# 62 Mpx); a larger one is rendered at a lower dpi. MuPDF allocates the whole pixmap before any
+# check runs, so a 4 KB PDF holding one 6000 pt page took 1.73 GB at 200 dpi.
+PDF_RENDER_MAX_PIXELS = 64_000_000
 
 
 def without_nul(text: str | None) -> str | None:
@@ -435,7 +440,7 @@ def _read_scanned_pages(path: str, pages: list[str], seconds: float) -> dict:
                     if i and time.monotonic() - started > seconds:
                         note = f"time budget spent, {left} pages left unread"
                         break
-                    pix = doc[n].get_pixmap(dpi=200)
+                    pix = doc[n].get_pixmap(dpi=_render_dpi(doc[n]))
                     reading = _read_page(Image.open(io.BytesIO(pix.tobytes("png")))).strip()
                     left -= 1
                     if len(reading) > len(pages[n].strip()):
@@ -630,6 +635,16 @@ _XML_RUNS = {
 }
 
 
+def _render_dpi(page, dpi: int = 200) -> int:
+    """The dpi to render a PDF page at: `dpi`, lowered so the page stays within
+    PDF_RENDER_MAX_PIXELS."""
+    points = abs(page.rect.width * page.rect.height)
+    if not points:
+        return dpi
+    fit = int(72 * math.sqrt(PDF_RENDER_MAX_PIXELS / points))
+    return max(1, min(dpi, fit))
+
+
 def _xml_paragraphs(xml: str, ns: str) -> list[str]:
     """The text of each paragraph of one Office XML part, empty paragraphs dropped."""
     out = []
@@ -642,6 +657,24 @@ def _xml_paragraphs(xml: str, ns: str) -> list[str]:
         if line:
             out.append(line)
     return out
+
+
+_SHAPE_OPEN = re.compile(r"<p:sp\b")
+
+
+def _xml_shapes(xml: str) -> list[str]:
+    """Each <p:sp> element of a slide part, from its opening tag to its closing one.
+
+    The same shapes re.findall(r"<p:sp\\b.*?</p:sp>", xml, re.DOTALL) returns, found by
+    splitting on the closing tag: that pattern retried every unclosed opening tag to the
+    end of the part, quadratic time on a hostile notes part (240 KB took 44 s).
+    """
+    shapes = []
+    for chunk in xml.split("</p:sp>")[:-1]:
+        start = _SHAPE_OPEN.search(chunk)
+        if start:
+            shapes.append(chunk[start.start() :] + "</p:sp>")
+    return shapes
 
 
 def _read_member(zf, name: str) -> bytes | None:
@@ -718,7 +751,7 @@ def _pptx_xml_text(path: str) -> str:
                 xml = notes.decode("utf-8", "replace")
                 body = [
                     line
-                    for shape in re.findall(r"<p:sp\b.*?</p:sp>", xml, flags=re.DOTALL)
+                    for shape in _xml_shapes(xml)
                     if 'type="body"' in shape
                     for line in _xml_paragraphs(shape, "a")
                 ]
@@ -1444,7 +1477,7 @@ def _ocr_pdf_pages(path: str, seconds: float | None = None, gray: bool = False) 
             if page_num and time.monotonic() - started > budget:
                 note = f"time budget spent, {doc.page_count - page_num} pages left unread"
                 break
-            pix = page.get_pixmap(dpi=200)
+            pix = page.get_pixmap(dpi=_render_dpi(page))
             img = Image.open(io.BytesIO(pix.tobytes("png")))
             if gray:
                 img = _grayscale(img)

@@ -10,6 +10,7 @@ the host could otherwise read the whole store.
 from __future__ import annotations
 
 import hmac
+import os
 import stat
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -30,8 +31,11 @@ def load_token(path: str) -> str:
         raise ValueError("BRAIN_MCP_TOKEN_FILE is not set; --http needs a bearer token file")
     token_file = Path(path).expanduser()
     try:
-        if token_file.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        info = token_file.stat()
+        if info.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
             raise ValueError(f"{token_file} is readable by others; chmod 600 it")
+        if info.st_uid != os.getuid():
+            raise ValueError(f"{token_file} belongs to another user; write your own token file")
         token = token_file.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise ValueError(f"cannot read the token file {token_file}: {exc.strerror}") from exc

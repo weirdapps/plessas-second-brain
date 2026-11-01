@@ -8,14 +8,15 @@
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 # The checkout on the module path, so `-m src.cli` resolves from any directory (the
 # project installs no package). Not a cd: a relative path in the arguments, as in
-# `brain ingest ./report.pdf`, names a file where brain was run.
+# `brain ingest ./report.pdf`, names a file where brain was run. -P keeps that
+# directory off the module path, so a stray argparse.py there is never imported.
 export PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}"
 for _py in \
   "${SECOND_BRAIN_VENV_PYTHON:-}" \
   "$REPO_DIR/.venv/bin/python" \
   "$REPO_DIR/venv/bin/python" \
   "$HOME/.venvs/second-brain/bin/python"; do
-  [ -n "$_py" ] && [ -x "$_py" ] && exec "$_py" -m src.cli "$@"
+  [ -n "$_py" ] && [ -x "$_py" ] && exec "$_py" -P -m src.cli "$@"
 done
 
 echo "Error: no second-brain virtual environment found (.venv, venv, ~/.venvs/second-brain)" >&2

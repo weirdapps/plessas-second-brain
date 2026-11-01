@@ -776,6 +776,12 @@ def _value_hints(items: list[Item]) -> list[tuple[Item, Item]]:
 # --- writing labels ----------------------------------------------------------------------
 
 
+# Every column _prior records: the only names revert() writes back, whatever the stored JSON says.
+_PRIOR_COLUMNS = frozenset(
+    {"canonical_id", "superseded_by", "invalid_at", "status", "closed_by", "closed_at"}
+)
+
+
 def _prior(conn: sqlite3.Connection, table: str, item_id: int) -> dict | None:
     columns = ["canonical_id", "superseded_by", "invalid_at"]
     if table in ("action_items", "commitments"):
@@ -892,7 +898,9 @@ def revert(conn: sqlite3.Connection, target: str) -> int:
         (target,),
     ).fetchall()
     for label_id, table, item_id, prior in rows:
-        values = json.loads(prior or "{}")
+        values = {
+            key: value for key, value in json.loads(prior or "{}").items() if key in _PRIOR_COLUMNS
+        }
         if table not in STATE_TABLES or not values:
             continue
         sets = ", ".join(f"{column} = ?" for column in values)

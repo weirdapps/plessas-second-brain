@@ -831,6 +831,13 @@ server, or would spawn it per request, should use the HTTP mode instead.
 # 1. A token only the owner can read
 (umask 077 && mkdir -p ~/.config/second-brain && { [ -s ~/.config/second-brain/mcp-token ] || openssl rand -hex 32 > ~/.config/second-brain/mcp-token; })
 
+# To rotate it (after any leak): the line above keeps an existing token, so write a
+# new one, then restart the server and every client that read the old one at start.
+# The brain bot reads the file at start; the probe reads it on every run.
+#   (umask 077 && openssl rand -hex 32 > ~/.config/second-brain/mcp-token.new \
+#     && mv ~/.config/second-brain/mcp-token.new ~/.config/second-brain/mcp-token)
+#   systemctl --user restart sb-mcp telegram-brain
+
 # 2. The wrapper (archived at scripts/wrappers/systemd/sb-mcp.sh)
 install -m 755 scripts/wrappers/systemd/sb-mcp.sh ~/.local/bin/sb-mcp.sh
 ```

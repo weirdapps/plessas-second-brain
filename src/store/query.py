@@ -92,6 +92,13 @@ def _sanitize_fts5_query(keyword: str, names: NameForms | None = None) -> str:
     return _all_of([_fts5_word(w, names) for w in kept])
 
 
+def fts5_quote(text: str) -> str:
+    """Text as one FTS5 string: internal double quotes doubled, NUL dropped. SQLite ends
+    a string at a NUL, so a query holding one failed every search with "unterminated
+    string" instead of matching."""
+    return '"' + text.replace("\x00", "").replace('"', '""') + '"'
+
+
 def _fts5_word(word: str, names: NameForms | None = None) -> str:
     """One query word in FTS5 syntax: its folded form quoted, with its stem beside it
     as a prefix term when it has one (greek.query_stem), and with `names` the word's
@@ -103,7 +110,7 @@ def _fts5_word(word: str, names: NameForms | None = None) -> str:
     from src.store.greek import fold, query_stem
 
     # Escape any internal double quotes per FTS5 phrase syntax
-    exact = '"' + fold(word).replace('"', '""') + '"'
+    exact = fts5_quote(fold(word))
     stem = query_stem(word)
     terms = [exact] + ([f'"{stem}"*'] if stem else [])
     for form in names.alternatives(word) if names else ():
@@ -166,9 +173,9 @@ def fts5_phrase(keyword: str) -> str:
     words = [w for w in keyword.split() if any(c.isalnum() for c in w)]
     stems = [query_stem(w) for w in words]
     if not any(stems):
-        return '"' + fold(keyword).replace('"', '""') + '"'
+        return fts5_quote(fold(keyword))
     return " + ".join(
-        f'"{stem}"*' if stem else '"' + fold(word).replace('"', '""') + '"'
+        f'"{stem}"*' if stem else fts5_quote(fold(word))
         for word, stem in zip(words, stems, strict=True)
     )
 

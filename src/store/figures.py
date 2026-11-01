@@ -698,7 +698,7 @@ def _words(query: str) -> list[_Word]:
 
 
 def _term(text: str) -> str:
-    return '"' + text.replace('"', '""') + '"'
+    return '"' + text.replace("\x00", "").replace('"', '""') + '"'
 
 
 def _terms(word: _Word) -> str:

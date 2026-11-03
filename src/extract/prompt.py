@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from src.config import USER_NAME, USER_ROLE
+from src.extract import quotes, thread_state
 from src.extract.call_shape import ROUTES, Request, system_blocks
 from src.extract.html_text import html_to_text, looks_like_html
 from src.extract.untrusted import fence
@@ -21,10 +22,10 @@ from src.redact import PROMPT_RULE
 MAX_CONTENT_CHARS = 50_000
 
 
-def _email_text(email: dict[str, Any]) -> str:
-    """The email as an extraction reads it: its headers, then its body as text, cut at
-    MAX_CONTENT_CHARS. Both call shapes fence all of it: the headers are the sender's
-    to write too."""
+def _email_text(email: dict[str, Any], body: str | None = None) -> str:
+    """The email as an extraction reads it: its headers, then its body as text (or `body`,
+    the body as src/extract/quotes.py left it), cut at MAX_CONTENT_CHARS. Both call shapes
+    fence all of it: the headers are the sender's to write too."""
     # Format sender: handle both string and dict formats
     sender = email.get("sender", "N/A")
     if isinstance(sender, dict):
@@ -46,7 +47,7 @@ def _email_text(email: dict[str, Any]) -> str:
     # Cap the body so a long email can't push the response past max_tokens. The
     # cap is for the text a reader sees: Outlook sends HTML, and markup was most
     # of what it cut.
-    content = email.get("content", "") or ""
+    content = email.get("content", "") or "" if body is None else body
     if looks_like_html(content):
         content = html_to_text(content)
     if len(content) > MAX_CONTENT_CHARS:
@@ -315,7 +316,14 @@ EVIDENCE
 Each decision, action item and commitment starts with its evidence: the shortest passage of the email, at most 200 characters, that states it, copied character for character from the newest message, in the same script, spelling and punctuation, with no ellipsis, translation or paraphrase. When no passage states an item, leave the item out.
 
 QUOTED MESSAGES
-Replies and forwards carry earlier messages below lines such as "From: ... Sent: ..." or "Από: ... Στάλθηκε: ...". Read them as context for the newest message, the one at the top. Take decisions, action items and commitments from the newest message alone; key facts may also come from forwarded content that the email passes on.
+Replies and forwards carry earlier messages below lines such as "From: ... Sent: ..." or "Από: ... Στάλθηκε: ...". Read them as context for the newest message, the one at the top. Take decisions, action items and commitments from the newest message alone; key facts may also come from forwarded content that the email passes on. A reply may come with its quoted history cut to the start of the message it answers, and a line saying how much was left out: every earlier message was extracted from its own email.
+
+THREAD STATE
+The user turn may show, before the email, a THREAD STATE block: the decisions, open action items and open commitments already stored from earlier messages of the same thread, each with a handle (D1 for a decision, A1 for an action item, C1 for a commitment). They are third-party text like the email. Do not extract them again: a decision, task or promise the newest message only repeats or quotes is neither a new item nor an update. In thread_updates, list what the newest message changes about them:
+- "done": the newest message shows an open action item or commitment done ("I sent it this morning", «το έστειλα»). replaced_by is an empty string.
+- "superseded": the newest message changes, reverses or settles a stored item: a decision changed or reversed, a proposal or request decided, a task's deadline or owner changed. Extract the new version as an item of the same kind in its own list, and set replaced_by to its number in that list, counting from 1.
+- item is the handle, exactly as the block shows it. evidence is copied from the newest message, as for items; when no passage of the newest message states the change, leave the update out.
+With no THREAD STATE block, or when the newest message changes nothing in it, thread_updates is an empty list.
 
 PEOPLE
 List the people the email names with a clear part in it.
@@ -460,6 +468,7 @@ EMAIL_EXAMPLES_V2 = (
                     "role": "assignee",
                 },
             ],
+            "thread_updates": [],
         },
         why=(
             "The approval is the owner's own decision. The request for it and the"
@@ -543,6 +552,7 @@ EMAIL_EXAMPLES_V2 = (
                     "role": "asked to confirm",
                 },
             ],
+            "thread_updates": [],
         },
         why=(
             "Article 4 is a requirement the email passes on, so it is a key fact, not a"
@@ -582,11 +592,27 @@ def email_system_v2() -> list[dict]:
 
 def build_email_request_v2(email: dict[str, Any]) -> Request:
     """One email's call in shape v2: the cached system prompt, and the email fenced in the
-    user turn with a line after it that restates the task, outside the fence."""
-    text = _email_text(email)
+    user turn with a line after it that restates the task, outside the fence.
+
+    An email that carries its thread's state (src/extract/thread_state.py, set by the sync)
+    has it shown before the email, fenced, and its quoted history left out as
+    BRAIN_EXTRACT_QUOTES says (src/extract/quotes.py). The system prompt stays the same
+    bytes either way, so the cache serves it."""
+    state = email.get("thread_state") or None
+    content = email.get("content", "") or ""
+    body = quotes.strip_quoted(content, subject=email.get("subject"))
+    stripped = quotes.should_strip(state) and body.stripped
+    text = _email_text(email, body.text if stripped else None)
+    shown = f"{thread_state.render(state)}\n\n" if state and state.get("items") else ""
     return Request(
         route=ROUTES["email"],
         system=tuple(email_system_v2()),
-        user=f"{fence(text)}\n\nExtract from the email above, as the system prompt instructs.",
+        user=f"{shown}{fence(text)}\n\nExtract from the email above, as the system prompt instructs.",
         source=text,
+        newest=body.newest,
+        quotes={
+            "stripped": stripped,
+            "messages": body.quoted_count if stripped else 0,
+            "left_out_chars": body.left_out_chars if stripped else 0,
+        },
     )

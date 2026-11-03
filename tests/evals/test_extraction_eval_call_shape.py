@@ -80,6 +80,7 @@ def v2_reply(case, quote=True):
             "commitments": [],
             "key_facts": [],
             "people": [],
+            "thread_updates": [],
         },
         ensure_ascii=False,
     )

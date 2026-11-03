@@ -302,6 +302,27 @@ def _note_stored(conn: sqlite3.Connection, metadata: dict) -> bool:
     return True
 
 
+def conversation_id_of(metadata: dict) -> str:
+    """The thread a staged email is stored under.
+
+    Primary: Outlook ConversationId (authoritative — set by the Outlook server).
+    Fallback: references/in_reply_to/subject normalization (handles Greek
+    Re:/Fwd:/Απ: when ConversationId is missing — rare for Outlook, common for
+    legacy Apple Mail exports)."""
+    in_reply_to = metadata.get("in_reply_to", "")
+    references = metadata.get("references", "")
+    outlook_conv_id = metadata.get("conversation_id", "")
+    if outlook_conv_id:
+        return outlook_conv_id
+    if references:
+        root_msg_id = references.strip().split()[0]
+        return hashlib.sha256(root_msg_id.encode()).hexdigest()[:16]
+    if in_reply_to:
+        return hashlib.sha256(in_reply_to.strip().encode()).hexdigest()[:16]
+    normalized = normalize_subject(metadata.get("subject", ""))
+    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
 def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict) -> bool:
     """Load a single email with its extraction into the database.
 
@@ -328,24 +349,9 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
     sender_name = metadata.get("sender", {}).get("name")
     sender_address = metadata.get("sender", {}).get("address")
 
-    # Compute conversation_id.
-    # Primary: Outlook ConversationId (authoritative — set by the Outlook server).
-    # Fallback: references/in_reply_to/subject normalization (handles Greek
-    # Re:/Fwd:/Απ: when ConversationId is missing — rare for Outlook, common for
-    # legacy Apple Mail exports).
     in_reply_to = metadata.get("in_reply_to", "")
     references = metadata.get("references", "")
-    outlook_conv_id = metadata.get("conversation_id", "")
-    if outlook_conv_id:
-        conversation_id = outlook_conv_id
-    elif references:
-        root_msg_id = references.strip().split()[0]
-        conversation_id = hashlib.sha256(root_msg_id.encode()).hexdigest()[:16]
-    elif in_reply_to:
-        conversation_id = hashlib.sha256(in_reply_to.strip().encode()).hexdigest()[:16]
-    else:
-        normalized = normalize_subject(metadata.get("subject", ""))
-        conversation_id = hashlib.sha256(normalized.encode()).hexdigest()[:16]
+    conversation_id = conversation_id_of(metadata)
 
     # The body as the text a reader sees; an HTML body is kept beside it.
     body, html = split_body(metadata.get("content"))
@@ -431,6 +437,11 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
                 (email_id, cc_id, "cc"),
             )
     _link_commitment_people(conn, metadata, commitments)
+    # What the newest message changes about the thread's stored items (issue 164), once its
+    # own items and people are written, through the consolidation checks.
+    from .thread_updates import apply as apply_thread_updates
+
+    apply_thread_updates(conn, email_id, conversation_id, extraction)
 
     # Forward hook: Stage 1 image classification for inline images
     try:

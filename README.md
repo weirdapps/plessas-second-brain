@@ -530,6 +530,7 @@ Used in extraction prompts and stale-thread detection.
 - `BRAIN_GEMINI_MODEL`: Gemini model override (default `gemini-2.5-flash`).
 - `BRAIN_TEAMS_MODEL`, `BRAIN_WHATSAPP_MODEL`: overrides for Teams thread and WhatsApp session extraction.
 - `BRAIN_EXTRACT_CALL_SHAPE`: `v2-text` (default), `v1` or `v2`, how the Claude extraction calls are built; see the next section. `v1` is the way back to the calls as they were before 2026-10-16.
+- `BRAIN_EXTRACT_QUOTES`: `auto` (default), `strip` or `keep`, when an email's quoted history is left out of its v2 call; see [Quoted history and thread state](#quoted-history-and-thread-state). Any other value stops the calls.
 
 ### Extraction call shape
 
@@ -554,6 +555,15 @@ Schema v2, against v1: `people` is an array of `name_as_written`, `name_latin`, 
 The loader takes v1 and v2 extractions side by side, for good: staging and extraction files from before still load. A v2 extraction fills the same columns, its ISO `language` going in `emails.language` as Teams and WhatsApp store theirs, and a person's address is taken from the model only when it is one of the email's own header addresses, the person then being the header's. Since schema v35 it also fills the item-state columns ([Database schema](#database-schema)): a decision's `status`, `owner_role` and `evidence`, and its `decision_date`, the date of the email that states it (v2 takes decisions from the newest message alone); an action's `direction` and `evidence`; a commitment's `due`, `direction`, `status` (`open`), `evidence`, and `by_person_id` and `to_person_id`, the people rows of the names the model or the headers give. `evidence` is stored only when the parser found the quote in the source: a paraphrase is not evidence, and the item is kept without it. A v1 extraction leaves those columns NULL. `item_kind`, `name_latin` and `evidence_found` stay in the extraction file under `data/extracted/`.
 
 Every Claude call's line in the usage log (`llm-usage-YYYY-MM.jsonl`) records, besides the tokens, its thinking tokens, its cache writes by time to live, the refusal category, the request and response ids, its `max_tokens`, its effort, and `prompt_hash`, the hash of its system prompt and schema: equal hashes mean byte-identical instructions. A field the platform did not report is null.
+
+### Quoted history and thread state
+
+Quoted reply chains were 46.5% of the text sent to the model, and each reply extracted its history again as new rows (audit 2026-10, issue 164). Every message of a thread is extracted from its own email, so for new mail the sync's extraction (`run_extraction` with the store) now gives each email the state of its thread and leaves out the history it quotes.
+
+- **Thread state** (`src/extract/thread_state.py`): what the store holds from the earlier messages of the email's thread (same `conversation_id`, an earlier date): its current decisions, open action items and commitments not done, the newest 40, each with a handle (`D1`, `A1`, `C1`). The v2 and v2-text user turn shows it, fenced, before the email; the system prompt stays the same bytes, so the cache still serves it. `earlier_messages` counts those stored messages and those staged in the same run.
+- **Quoted history** (`src/extract/quotes.py`): the first quoted message ends the newest one: in HTML Outlook's `divRplyFwdMsg`, `appendonsend` and `mail-editor-reference-message-container`, Gmail's `gmail_quote`, Apple Mail's `<blockquote type="cite">` and Yahoo's `yahoo_quoted`; in text an Outlook header block (From, then Sent or Date, then To, Cc or Subject; in Greek Από, Στάλθηκε or Ημερομηνία, Προς, Κοιν. or Θέμα), `-----Original Message-----`, and a Gmail attribution (`On ... wrote:`, «Στις ... έγραψε:») unless answers are written between the quoted lines. A line that only mentions From or Sent, a signature, and a body that is all quote are not split. The call keeps the newest message, the first 1,500 characters of the message it answers as context, and a line saying how much was left out. A forward (subject `FW:`, `Fwd:`, `Πρ:`, `Προώθηση:`, or a forwarded-message rule first) is never stripped, and nor is a body that would come out no shorter. `BRAIN_EXTRACT_QUOTES=auto` strips only an email with a thread state that counts an earlier message, `strip` always (for the eval), `keep` never. v1 and the Gemini engine are not affected; nor is `maint reextract-stacked`, whose emails carry no state.
+- **Deltas** (`thread_updates` in schema v2): the model lists what the newest message changes about the state: an item `superseded` (a decision changed, reversed or settled, a task's deadline or owner changed), with `replaced_by` naming the new item of the same kind in its answer, or an action or commitment `done`, each with an `evidence` quote that the parser must find in the newest message itself. Only updates to handles the state showed survive the extraction.
+- **Written as consolidation labels** (`src/store/thread_updates.py`): when the email loads, each update becomes a `superseded_by` or `completed_by` label and goes through `consolidate.check_labels`, every rule of the consolidation pass included ([Decisions and actions](#decisions-and-actions)): only the owner closes an action, only someone already on the thread changes anything, only a decision made supersedes a decision made, the owner's own item is `contested_by` rather than hidden, and a reply over the label cap is applied not at all. Labels are logged in `item_labels` with method `extraction` under the thread key, so `brain maint consolidate --revert email:<conversation_id>` puts a load back. No schema change: the v35 state columns and the v38 `item_labels` table hold it all. The extraction file keeps `thread_state_ids` and `quotes` (stripped, quoted messages, characters left out).
 
 ### Vertex AI
 
@@ -902,6 +912,8 @@ src/
     attachment_prompt.py       Attachment summarization prompt
     teams_prompt.py            Teams thread extraction prompt
     untrusted.py               Fences third-party text in extraction prompts
+    quotes.py                  Where a reply's newest message ends; what of its quoted history the call keeps
+    thread_state.py            A thread's stored decisions, open actions and commitments, for its next email's call
     local.py                   Concurrent extraction dispatcher
     extraction_files.py        Where an email's extraction file lives; read back by the exact id
     news_extract.py            News items without the model: the synthesis brief or the article's opening
@@ -963,6 +975,7 @@ src/
     action_lifecycle.py        Dedups action items, ages out stale ones, marks one done
     item_cleanup.py            One-off item clean-ups: forget-itemless, mark-boilerplate, reextract-stacked
     consolidate.py             Marks items duplicate, superseded or done per thread, never deletes; the current-state filter
+    thread_updates.py          A new email's thread updates, written through the consolidation checks
     entities.py                Entities behind people rows, adjudication proposals, entity-ranked ids for recall
     topic_canon.py             Topic families: folding, containment, 256-d synonyms; family expansion for topic reads
     conversation_query.py      Claude Code conversation search

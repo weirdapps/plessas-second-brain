@@ -69,6 +69,7 @@ from src.evals import (
 from src.extract import schema_v2
 from src.extract.call_shape import CALL_SHAPE_VAR, structured_outputs, uses_schema_v2
 from src.extract.call_shape import call_shape as configured_call_shape
+from src.extract.quotes import quotes_mode
 from src.store.owner import is_owner_address, owner_address_sql, owner_addresses
 
 # --- the label vocabulary -------------------------------------------------------------
@@ -1634,6 +1635,9 @@ def run(
         "model": served[0][0] if served else current.model,
         "configured_model": current.model,
         "call_shape": shape,
+        # BRAIN_EXTRACT_QUOTES (src/extract/quotes.py): cases carry no thread state, so
+        # "auto" sends them whole and "strip" leaves their quoted history out.
+        "quotes": quotes_mode(),
         "prompt_sha": prompt_sha(shape),
         # Calls that carried output_config.format: under v2 each extraction call, under any
         # other shape none (_recorded stops such a call).

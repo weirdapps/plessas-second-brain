@@ -76,6 +76,7 @@ def gold_reply(case):
         "commitments": [],
         "key_facts": [],
         "people": [],
+        "thread_updates": [],
     }
     return "```json\n" + json.dumps(answer, ensure_ascii=False) + "\n```"
 

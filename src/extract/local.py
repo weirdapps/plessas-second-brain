@@ -415,6 +415,40 @@ def _without_stored_copies(
     return kept
 
 
+def _with_thread_state(pending: list[dict], staged: list[dict], db_path) -> None:
+    """Give each pending email the stored state of its thread (src/extract/thread_state.py):
+    its extraction is shown what the store holds of the earlier messages, reports what the
+    email changes about it, and leaves out the quoted history those messages were extracted
+    from (src/extract/quotes.py). Only on the sync's path: a re-extraction of history
+    (src/store/item_cleanup.py) never reaches here. News never reaches the model."""
+    if not (db_path and Path(db_path).exists()):
+        return
+    from src.extract.news_extract import is_news
+    from src.extract.thread_state import thread_state
+    from src.store.loader import conversation_id_of
+
+    by_thread: dict[str, list[dict]] = {}
+    for e in staged:
+        by_thread.setdefault(conversation_id_of(e), []).append(e)
+    conn = sqlite3.connect(str(db_path), timeout=60)
+    given = 0
+    try:
+        for email in pending:
+            if is_news(email):
+                continue
+            siblings = by_thread.get(conversation_id_of(email), [])
+            state = thread_state(conn, email, staged=siblings)
+            if state is not None:
+                email["thread_state"] = state
+                given += 1
+    except sqlite3.Error as e:
+        log(f"Thread state left out: {type(e).__name__}: {e}")
+    finally:
+        conn.close()
+    if given:
+        log(f"Gave {given} emails the state of their thread")
+
+
 def _has_extraction(message_id: str) -> bool:
     """Whether an extraction file for the email is on disk (extraction_files.py names)."""
     return (
@@ -560,6 +594,7 @@ def run_extraction(
     # once per copy, in parallel, three and four times in a run.
     pending = list({str(e.get("message_id", "")): e for e in pending}.values())
     pending = _without_stored_copies(pending, all_emails, processed_ids, db_path)
+    _with_thread_state(pending, all_emails, db_path)
     log(f"Pending extraction: {len(pending)} emails")
     if deadline is not None:
         # By the mail's own date, not staging order: Archive and Sent bootstraps

@@ -804,23 +804,179 @@ def test_a_found_message_without_the_rows_bytes_puts_nothing_back(store, mailbox
     assert mailbox.asked() == [LISTED]
 
 
-def test_several_matching_messages_are_ambiguous_and_none_is_guessed(store, mailbox):
+def test_several_messages_holding_the_rows_bytes_are_ambiguous_and_none_is_guessed(store, mailbox):
     path, conn, root = store
     att = _apple(conn, root, subject="Scan")
     mailbox.files("Archive", LISTED, RECEIVED, "Scan", ("scan.png", SCAN))
-    # A reply forty seconds later has the same subject once normalised.
+    # A reply forty seconds later has the same subject once normalised, and the same file.
     later = _utc(WHEN + timedelta(seconds=40))
     mailbox.files("Archive", LISTED_2, later, "RE: scan", ("scan.png", SCAN))
 
     stats = _run(path, root)
     again = _run(path, root)
 
-    assert (mailbox.asked(), _files(root)) == ([], [])
-    assert (stats["lookup"]["ambiguous"], stats["lookup"]["ambiguous_files"]) == (1, 1)
+    assert (mailbox.asked(), _files(root)) == ([LISTED, LISTED_2], [])
+    lookup = stats["lookup"]
+    assert (lookup["ambiguous"], lookup["ambiguous_files"]) == (1, 1)
+    assert (lookup["resolved_by_sha256"], lookup["fetched"]) == (0, 0)
     record = rg.fetch_states(conn)[att]
     assert (record["state"], record["folder"], record["candidates"]) == ("ambiguous", "Archive", 2)
+    assert record["sha256_matches"] == 2
     assert (again["ambiguous_before"], again["lookup"]["messages_tried"]) == (1, 0)
     assert mailbox.listed() == ["Archive"]
+
+
+# --- several candidates: resolved only by the row's own sha256 ---------------------------------
+
+LISTED_3 = "AAMkAGQ0TESTLISTEDMESSAGE00000000003AAA="
+
+
+def _burst(mailbox, *holdings, subject="Scan"):
+    """A scanner burst: one message per entry, ten seconds apart from WHEN, all under `subject`,
+    each holding the files given. Returns their ids in order."""
+    ids = []
+    for i, files in enumerate(holdings):
+        mid = f"AAMkAGQ0TESTBURSTMESSAGE{i:014d}AAA="
+        mailbox.files("Archive", mid, _utc(WHEN + timedelta(seconds=10 * i)), subject, *files)
+        ids.append(mid)
+    return ids
+
+
+def test_the_one_candidate_holding_the_rows_bytes_is_resolved_by_sha256(store, mailbox):
+    path, conn, root = store
+    att = _apple(conn, root, subject="Scan")
+    ids = _burst(
+        mailbox,
+        [("scan.png", _bytes("page 1"))],
+        [("scan.png", SCAN), ("logo.png", LOGO)],
+        [("scan.png", _bytes("page 3"))],
+    )
+
+    stats = _run(path, root)
+    again = _run(path, root)
+
+    restored = root / str(NUMBER) / "scan.png"
+    assert restored.read_bytes() == SCAN
+    assert _files(root) == [f"{NUMBER}/scan.png"]
+    assert _attachment(conn, att)["file_removed_at"] is None
+    assert mailbox.asked()[:3] == ids
+    lookup = stats["lookup"]
+    assert (lookup["resolved_by_sha256"], lookup["found"], lookup["fetched"]) == (1, 1, 1)
+    assert lookup["ambiguous"] == 0
+    record = rg.fetch_states(conn)[att]
+    assert (record["state"], record["by"], record["via"]) == ("fetched", "lookup", ids[1])
+    assert (record["resolved_by"], record["candidates"]) == ("sha256", 3)
+    assert again["already_fetched"] == 1
+    assert len(mailbox.asked()) == 3
+
+
+def test_candidates_none_of_which_holds_the_rows_bytes_stay_ambiguous(store, mailbox):
+    path, conn, root = store
+    att = _apple(conn, root, subject="Scan")
+    _burst(mailbox, [("scan.png", _bytes("page 1"))], [("scan.png", _bytes("page 2"))])
+
+    stats = _run(path, root)
+
+    assert _files(root) == []
+    assert (stats["lookup"]["ambiguous"], stats["lookup"]["resolved_by_sha256"]) == (1, 0)
+    record = rg.fetch_states(conn)[att]
+    assert (record["state"], record["sha256_matches"]) == ("ambiguous", 0)
+
+
+def test_more_candidates_than_the_cap_are_ambiguous_and_not_downloaded(store, mailbox):
+    path, conn, root = store
+    att = _apple(conn, root, subject="Scan")
+    _burst(mailbox, *[[("scan.png", SCAN)]] * (rg.MAX_SHA256_CANDIDATES + 1))
+
+    stats = _run(path, root)
+    again = _run(path, root)
+
+    assert (mailbox.asked(), _files(root)) == ([], [])
+    assert stats["lookup"]["ambiguous"] == 1
+    record = rg.fetch_states(conn)[att]
+    assert (record["state"], record["candidates"]) == ("ambiguous", rg.MAX_SHA256_CANDIDATES + 1)
+    assert record["sha256_matches"] is None
+    assert again["ambiguous_before"] == 1
+
+
+def test_the_cap_is_small():
+    assert 2 <= rg.MAX_SHA256_CANDIDATES <= 5
+
+
+def test_a_candidate_that_fails_to_download_fails_the_row_and_it_is_tried_again(store, mailbox):
+    """The candidate that failed might hold the bytes too: nothing is put back on that run."""
+    path, conn, root = store
+    att = _apple(conn, root, subject="Scan")
+    ids = _burst(mailbox, [("scan.png", SCAN)], [("scan.png", _bytes("page 2"))])
+    mailbox.errors[ids[1]] = _unavailable()
+
+    first = _run(path, root)
+    del mailbox.errors[ids[1]]
+    second = _run(path, root)
+
+    assert (first["lookup"]["failed"], first["lookup"]["fetched"]) == (1, 0)
+    assert first["lookup"]["resolved_by_sha256"] == 0
+    assert (second["lookup"]["resolved_by_sha256"], second["lookup"]["fetched"]) == (1, 1)
+    record = rg.fetch_states(conn)[att]
+    assert (record["state"], record["via"], record["attempts"]) == ("fetched", ids[0], 2)
+
+
+def test_a_candidate_gone_before_its_download_leaves_the_row_to_look_up_again(store, mailbox):
+    path, conn, root = store
+    att = _apple(conn, root, subject="Scan")
+    ids = _burst(mailbox, [("scan.png", SCAN)], [("scan.png", _bytes("page 2"))])
+    del mailbox.messages[ids[1]]  # listed, then deleted before it was downloaded
+
+    stats = _run(path, root)
+
+    assert _files(root) == []
+    assert (stats["lookup"]["not_found"], stats["lookup"]["resolved_by_sha256"]) == (1, 0)
+    assert rg.fetch_states(conn)[att]["state"] == "not_found"
+
+
+def test_reauthentication_while_checking_candidates_stops_the_run(store, mailbox):
+    path, conn, root = store
+    att = _apple(conn, root, subject="Scan")
+    ids = _burst(mailbox, [("scan.png", SCAN)], [("scan.png", _bytes("page 2"))])
+    mailbox.errors[ids[1]] = OutlookCliAuthRequired("session expired")
+
+    stats = _run(path, root)
+
+    assert (stats["stopped"], stats["stop_exit_code"]) == (True, 4)
+    assert _files(root) == []
+    assert att not in rg.fetch_states(conn)
+
+
+def test_an_ambiguous_record_from_before_the_sha256_check_is_looked_up_again(store, mailbox):
+    path, conn, root = store
+    att = _apple(conn, root, subject="Scan")
+    old = {"state": "ambiguous", "attempts": 1, "by": "lookup", "folder": "Archive"}
+    conn.execute(
+        "INSERT INTO sync_metadata (key, value) VALUES (?, ?)",
+        (f"{rg.REFETCH_KEY}{att}", json.dumps({**old, "candidates": 2})),
+    )
+    conn.commit()
+    assert not rg.settled({**old, "candidates": 2})
+    _burst(mailbox, [("scan.png", _bytes("page 1"))], [("scan.png", SCAN)])
+
+    stats = _run(path, root)
+
+    assert stats["ambiguous_before"] == 0
+    assert stats["lookup"]["resolved_by_sha256"] == 1
+    assert (root / str(NUMBER) / "scan.png").read_bytes() == SCAN
+    assert rg.settled({**old, "candidates": 2, "sha256_matches": 0})
+    assert rg.settled({**old, "candidates": 9, "sha256_matches": None})
+
+
+def test_the_command_prints_the_rows_resolved_by_sha256(store, mailbox, monkeypatch, capsys):
+    path, conn, root = store
+    _apple(conn, root, subject="Scan")
+    _burst(mailbox, [("scan.png", _bytes("page 1"))], [("scan.png", SCAN)])
+
+    code = _cli(monkeypatch, path, "--root", str(root))
+
+    assert code == 0
+    assert "resolved by sha256" in capsys.readouterr().out
 
 
 def test_no_match_past_the_retention_edge_is_gone_and_not_looked_up_again(store, mailbox):

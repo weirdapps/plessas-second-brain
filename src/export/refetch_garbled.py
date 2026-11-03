@@ -29,8 +29,11 @@ time LOOKUP_WINDOW either side, a stored time with no zone read as NAIVE_TIME_ZO
 the one the email records, when the reconcile walks it, then the others it walks, since mail filed
 from the Inbox has moved to Archive; the first folder with a match decides. Exactly one message:
 its attachments are downloaded, and a row's file is put back only if its sha256 is the row's, so
-a row with no hash is not looked up, nor is an email with no subject or time. Several: none is
-guessed at. At most MAX_CONCURRENCY outlook-cli calls run at once here too.
+a row with no hash is not looked up, nor is an email with no subject or time. Several, up to
+MAX_SHA256_CANDIDATES: each one's attachments are downloaded, and the message is taken only when
+exactly one of them holds a file whose sha256 is one of the rows' (counted resolved_by_sha256).
+More than that, or none or several holding the bytes: none is guessed at. At most MAX_CONCURRENCY
+outlook-cli calls run at once here too: a message's candidates are downloaded one after another.
 
 What happens to each row, recorded in sync_metadata under file_sweep.REFETCH_KEY + attachment id
 as JSON {state, attempts, last_attempt_at, and fetched_at or gone_at}; a record the lookup wrote
@@ -46,7 +49,10 @@ also says "by": "lookup", and in which folder the message matched:
     gone       every id answered 404: the mailbox no longer holds the message. For the lookup:
                nothing matched, and the email is older than RETENTION, the mail the mailbox
                keeps. Dated, and not asked for again
-    ambiguous  the lookup matched several messages. Not looked up again
+    ambiguous  the lookup matched several messages, and their sha256 did not single out one
+               (sha256_matches: how many held the bytes, null when there were more than
+               MAX_SHA256_CANDIDATES to download). Not looked up again. A record from before the
+               sha256 check, with no sha256_matches, is looked up once more
     not_found  the lookup matched nothing, and the email is younger than RETENTION: looked up
                again on later runs, MAX_ATTEMPTS attempts in all, then given up
     failed     outlook-cli failed otherwise (exit 5, or no answer within DOWNLOAD_TIMEOUT_S, or
@@ -115,6 +121,11 @@ NAIVE_TIME_ZONE = ZoneInfo("Europe/Athens")
 # The mail the mailbox keeps (audit code-ingest-03: nothing older was listed). Older mail that no
 # listing finds is gone; younger is looked for again.
 RETENTION = timedelta(days=365)
+# The most messages matching one email whose attachments are downloaded to find the one holding
+# its row's sha256. A scanner sends bursts under one subject (124 of the 709 emails with no
+# mailbox id matched several messages within LOOKUP_WINDOW, audit 2026-10-11); a few cover most of
+# them, and every candidate past the first costs a download.
+MAX_SHA256_CANDIDATES = 3
 
 FETCHED = "fetched"
 UNMATCHED = "unmatched"
@@ -157,6 +168,7 @@ LOOKUP_COUNTS = (
     "messages_tried",
     "found",
     "fetched",
+    "resolved_by_sha256",
     "unmatched",
     "ambiguous",
     "ambiguous_files",
@@ -279,13 +291,15 @@ def _attempts(record: dict) -> int:
 
 def settled(record: dict | None) -> bool:
     """Whether a row's record says its file is never asked for again, as plan() reads it: gone,
-    unmatched or ambiguous, or failed or not found MAX_ATTEMPTS times. A fetched row's file was
-    put back, and a row with no record has not been asked for yet."""
+    unmatched or ambiguous after the sha256 check, or failed or not found MAX_ATTEMPTS times. A
+    fetched row's file was put back, and a row with no record has not been asked for yet."""
     if not record:
         return False
     state = record.get("state")
-    return state in (GONE, UNMATCHED, AMBIGUOUS) or (
-        state in (FAILED, NOT_FOUND) and _attempts(record) >= MAX_ATTEMPTS
+    return (
+        state in (GONE, UNMATCHED)
+        or (state == AMBIGUOUS and "sha256_matches" in record)
+        or (state in (FAILED, NOT_FOUND) and _attempts(record) >= MAX_ATTEMPTS)
     )
 
 
@@ -322,7 +336,7 @@ def plan(conn: sqlite3.Connection, root: Path, stats: dict) -> tuple[list[Messag
         if state == UNMATCHED:
             stats["unmatched_before"] += 1
             continue
-        if state == AMBIGUOUS:
+        if state == AMBIGUOUS and settled(record):
             stats["ambiguous_before"] += 1
             continue
         if state in (FAILED, NOT_FOUND) and _attempts(record) >= MAX_ATTEMPTS:
@@ -412,30 +426,71 @@ def _put_back(rows: list[Row], download: Path, root: Path) -> dict[int, tuple[Pa
     return placed
 
 
+def _download(mid: str, out: Path) -> Outcome | None:
+    """Download every attachment of message `mid` into `out`. None when it did; otherwise GONE
+    (the mailbox holds no message under the id), FAILED or STOPPED."""
+    try:
+        run_outlook_cli(
+            ["download-attachments", mid, "--out", str(out), "--include-inline"],
+            timeout_sec=DOWNLOAD_TIMEOUT_S,
+        )
+    except OutlookCliAuthRequired:
+        return Outcome(STOPPED, error="outlook-cli needs re-authentication", exit_code=4)
+    except OutlookCliError as e:
+        if _not_found(e):
+            return Outcome(GONE)
+        logger.warning("download-attachments failed for %s: %s", mid, e)
+        if e.exit_code != 5:
+            return Outcome(STOPPED, error=str(e), exit_code=e.exit_code)
+        return Outcome(FAILED, error=f"outlook-cli exit {e.exit_code}")
+    except subprocess.TimeoutExpired:
+        logger.warning("download-attachments timed out for %s", mid)
+        return Outcome(FAILED, error=f"no answer in {DOWNLOAD_TIMEOUT_S} s")
+    return None
+
+
 def fetch_message(message: Message, root: Path) -> Outcome:
     """Ask for the message under each of its ids until one answers, and put back its rows'
     files. Files only: the database is the caller's."""
     with tempfile.TemporaryDirectory(prefix="sb-refetch-") as download:
         for mid in message.ids:
-            try:
-                run_outlook_cli(
-                    ["download-attachments", mid, "--out", download, "--include-inline"],
-                    timeout_sec=DOWNLOAD_TIMEOUT_S,
+            failure = _download(mid, Path(download))
+            if failure is None:
+                return Outcome(
+                    FETCHED, placed=_put_back(message.rows, Path(download), root), via=mid
                 )
-            except OutlookCliAuthRequired:
-                return Outcome(STOPPED, error="outlook-cli needs re-authentication", exit_code=4)
-            except OutlookCliError as e:
-                if _not_found(e):
-                    continue
-                logger.warning("download-attachments failed for %s: %s", mid, e)
-                if e.exit_code != 5:
-                    return Outcome(STOPPED, error=str(e), exit_code=e.exit_code)
-                return Outcome(FAILED, error=f"outlook-cli exit {e.exit_code}")
-            except subprocess.TimeoutExpired:
-                logger.warning("download-attachments timed out for %s", mid)
-                return Outcome(FAILED, error=f"no answer in {DOWNLOAD_TIMEOUT_S} s")
-            return Outcome(FETCHED, placed=_put_back(message.rows, Path(download), root), via=mid)
+            if failure.state != GONE:
+                return failure
     return Outcome(GONE)
+
+
+def resolve_by_sha256(message: Message, matches: list[dict], note: dict, root: Path) -> Outcome:
+    """Several messages matched: download each one's attachments, up to MAX_SHA256_CANDIDATES,
+    and put back the rows' files from the one message holding a file with a row's sha256. None or
+    several holding one: AMBIGUOUS. A candidate that failed or is gone might hold the bytes too,
+    so nothing is put back then, and the row is tried again. Files only."""
+    if len(matches) > MAX_SHA256_CANDIDATES:
+        return Outcome(AMBIGUOUS, note={**note, "sha256_matches": None})
+    wanted = {row.sha256 for row in message.rows}
+    with tempfile.TemporaryDirectory(prefix="sb-refetch-") as tmp:
+        holding = []
+        for i, match in enumerate(matches):
+            mid = str(match["Id"])
+            out = Path(tmp) / str(i)
+            out.mkdir()
+            failure = _download(mid, out)
+            if failure is not None:
+                if failure.state == GONE:  # moved or deleted since it was listed: look again
+                    return Outcome(NOT_FOUND, note=note)
+                failure.note = note
+                return failure
+            if wanted & {sha256_of_file(f) for f in out.iterdir() if f.is_file()}:
+                holding.append((mid, out))
+        if len(holding) != 1:
+            return Outcome(AMBIGUOUS, note={**note, "sha256_matches": len(holding)})
+        mid, out = holding[0]
+        placed = _put_back(message.rows, out, root)
+    return Outcome(FETCHED, placed=placed, via=mid, note={**note, "resolved_by": "sha256"})
 
 
 def received_span(value) -> tuple[datetime, datetime] | None:
@@ -512,7 +567,7 @@ def look_up(message: Message, root: Path) -> Outcome:
         matches = [m for m in listed if normalize_subject(m.get("Subject")) == subject]
         if len(matches) > 1:
             note = {**LOOKED_UP, "folder": folder, "candidates": len(matches)}
-            return Outcome(AMBIGUOUS, note=note)
+            return resolve_by_sha256(message, matches, note, root)
         if matches:
             outcome = fetch_message(replace(message, ids=[str(matches[0]["Id"])]), root)
             if outcome.state == GONE:  # moved or deleted since it was listed: look again
@@ -561,6 +616,8 @@ def _record(conn: sqlite3.Connection, message: Message, outcome: Outcome, counts
         )
     if outcome.state == FETCHED:
         counts["found"] += 1
+        if outcome.note.get("resolved_by") == "sha256":
+            counts["resolved_by_sha256"] += 1
     else:
         counts[outcome.state] += 1
         counts[f"{outcome.state}_files"] += len(message.rows)
@@ -712,6 +769,11 @@ def cmd(args) -> int:
             lines += [
                 ("messages looked up", f"{lookup['messages_tried']:,}"),
                 ("messages found", f"{lookup['found']:,}"),
+                (
+                    "  of them resolved by sha256",
+                    f"{lookup['resolved_by_sha256']:,}, one of up to"
+                    f" {MAX_SHA256_CANDIDATES} matching messages held the bytes",
+                ),
                 ("files fetched", f"{lookup['fetched']:,}"),
                 ("files not in their message", f"{lookup['unmatched']:,}"),
                 (

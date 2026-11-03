@@ -463,8 +463,30 @@ def _check_evidence(result: dict, source: str) -> None:
         logger.warning("%d of %d evidence quotes are not in the source text", missed, len(items))
 
 
+def _check_thread_updates(result: dict, newest: str | None) -> None:
+    """Keep the thread updates whose change is in the vocabulary, each marked
+    `evidence_found`: whether its quote is in the newest message, spacing aside; never
+    without one. A quote from the quoted history is no evidence of what the newest message
+    changes."""
+    from src.extract.schema_v2 import THREAD_CHANGES
+
+    haystack = _squash(newest) if newest is not None else None
+    kept = []
+    for update in result.get("thread_updates", []):
+        if update.get("change") not in THREAD_CHANGES:
+            continue
+        quote = _squash(update.get("evidence", ""))
+        update["evidence_found"] = bool(quote) and haystack is not None and quote in haystack
+        kept.append(update)
+    result["thread_updates"] = kept
+
+
 def parse_extraction_v2(
-    raw_response: str, *, kind: str = "email", source: str | None = None
+    raw_response: str,
+    *,
+    kind: str = "email",
+    source: str | None = None,
+    newest: str | None = None,
 ) -> dict[str, Any]:
     """A reply in schema v2 (`kind` "email" or "attachment"), normalised for the loader.
 
@@ -474,7 +496,9 @@ def parse_extraction_v2(
     an enum folded, or its default when it is outside the vocabulary; a deadline a
     YYYY-MM-DD date or None; an item without its text dropped; any key the schema does
     not name left out. With `source`, the text the model read, each decision, action item
-    and commitment gets `evidence_found`: whether its quote is in that text.
+    and commitment gets `evidence_found`: whether its quote is in that text. An email's
+    thread updates are checked against `newest`, the newest message alone (source when not
+    given), and one whose change is outside the vocabulary is dropped.
 
     The result carries `extraction_schema: 2`, which is how the loader tells it from a v1
     extraction. Raises ValueError when the reply holds no JSON object.
@@ -489,5 +513,7 @@ def parse_extraction_v2(
     }
     if source is not None:
         _check_evidence(result, source)
+    if "thread_updates" in result:
+        _check_thread_updates(result, source if newest is None else newest)
     result["extraction_schema"] = 2
     return result

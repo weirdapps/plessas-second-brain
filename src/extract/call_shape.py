@@ -196,6 +196,10 @@ class Request:
     user: str
     source: str = ""
     structured: bool = field(default_factory=structured_outputs)
+    # An email's newest message, which its thread updates are checked against, and what
+    # was left out of its quoted history (src/extract/quotes.py); empty for other routes.
+    newest: str = ""
+    quotes: dict = field(default_factory=dict)
 
     @property
     def blocks(self) -> list[dict]:

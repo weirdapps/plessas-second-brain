@@ -45,6 +45,9 @@ OWNER_ROLES = (
 )
 DECISION_STATUSES = ("made", "proposed", "requested")
 DIRECTIONS = ("owner_owes", "owed_to_owner", "third_party")
+# What the newest message of a thread changes about an item of its stored state (issue 164):
+# superseded by an item of this answer, or done.
+THREAD_CHANGES = ("superseded", "done")
 # The email vocabularies of schema v1 (src/extract/parser.py): emails.sentiment and
 # emails.urgency hold them, and the person and sender dossiers count them.
 SENTIMENTS = ("directive", "collaborative", "informational", "escalation", "celebratory")
@@ -60,6 +63,8 @@ ENUM_DEFAULTS = {
     "owner_role": "third_party",
     "status": "made",
     "direction": "third_party",
+    # Not a change: an update outside the vocabulary is dropped, never guessed.
+    "change": "unknown",
 }
 
 # The text of each list's items: an item without it is dropped.
@@ -68,6 +73,7 @@ ITEM_TEXT = {
     "action_items": "task",
     "commitments": "commitment",
     "people": "name_as_written",
+    "thread_updates": "item",
 }
 # The lists whose items carry an evidence quote.
 EVIDENCED = ("decisions", "action_items", "commitments")
@@ -123,6 +129,17 @@ COMMITMENT = _object(
         "due": _DATE_OR_NULL,
     }
 )
+# A change the newest message makes to an item of the thread state: `item` is its handle
+# (D1, A1, C1), `replaced_by` for a change "superseded" the number, from 1, of the item of
+# the same kind in this answer that replaces it, empty for "done".
+THREAD_UPDATE = _object(
+    {
+        "evidence": _TEXT,
+        "item": _TEXT,
+        "change": _enum(THREAD_CHANGES),
+        "replaced_by": _TEXT,
+    }
+)
 PERSON = _object({"name_as_written": _TEXT, "name_latin": _TEXT, "email": _TEXT, "role": _TEXT})
 
 EMAIL_SCHEMA_V2 = _object(
@@ -138,6 +155,7 @@ EMAIL_SCHEMA_V2 = _object(
         "commitments": _array(COMMITMENT),
         "key_facts": _TEXTS,
         "people": _array(PERSON),
+        "thread_updates": _array(THREAD_UPDATE),
     }
 )
 # An attachment's extraction: the fields Phase 2 stores (attachment_content.summary and

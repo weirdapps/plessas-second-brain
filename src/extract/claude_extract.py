@@ -620,7 +620,19 @@ def _extract_one_v2(email: dict, budget: Any = None) -> dict:
         raise refusal_error(response)
     if stop == "max_tokens":
         raise ValueError(f"LLM response truncated at max_tokens={max_tokens}")
-    extraction = parse_extraction_v2(_response_text(response), kind="email", source=request.source)
+    extraction = parse_extraction_v2(
+        _response_text(response), kind="email", source=request.source, newest=request.newest
+    )
+    # Only a change to an item the state showed, quoted from the newest message, is kept;
+    # the loader checks each again against the store (src/store/thread_updates.py).
+    state = email.get("thread_state") or None
+    ids = {i["handle"]: [i["table"], i["id"]] for i in state["items"]} if state else {}
+    extraction["thread_updates"] = [
+        u for u in extraction.get("thread_updates", []) if u["item"] in ids and u["evidence_found"]
+    ]
+    if state:
+        extraction["thread_state_ids"] = ids
+    extraction["quotes"] = request.quotes
     extraction["message_id"] = email["message_id"]
     return extraction
 

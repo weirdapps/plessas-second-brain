@@ -113,6 +113,7 @@ def _reply(**over):
         "commitments": [],
         "key_facts": [],
         "people": [],
+        "thread_updates": [],
     }
     reply.update(over)
     return reply

@@ -74,6 +74,9 @@ os.environ.pop("BRAIN_QUERY_STEMMING", None)
 # parts. A shell that set it would change the calls every parts test counts; a test sets it
 # when it means to.
 os.environ.pop("BRAIN_ATTACHMENT_FULL_PARTS_UPTO", None)
+# Quoted history is left out as BRAIN_EXTRACT_QUOTES says (src/extract/quotes.py). A shell
+# that set it would change every email request a test builds; a test sets it when it means to.
+os.environ.pop("BRAIN_EXTRACT_QUOTES", None)
 # A replica's pull job stamps ~/.second-brain/db-pull.stamp, and write commands
 # refuse to run where it exists. CI has no stamp, so a test driving a write
 # command would pass there and exit 2 on a replica. tests/test_replica_guard.py

@@ -1530,8 +1530,8 @@ def search_attachments(
     the owner's automation mail are left out unless included, and `excluded`
     counts those among the best matches. A row semantic search alone found says
     matched_in 'semantic', or 'chunk' when a passage of a long document matched,
-    with chunk_offset: get_item(kind='attachment', ref, offset=chunk_offset) opens
-    it, and get_item reads the full text a page at a time. Ranked by relevance and
+    with chunk_offset: read('attachment:<ref>', offset=chunk_offset) opens
+    it, and read pages the full text. Ranked by relevance and
     recency; the editions, versions and copies of one file are one row, the newest,
     with `older_editions` and their refs in `editions`.
     """
@@ -1606,7 +1606,7 @@ def figures(
     A metric is one row label and column header of one sheet of one report series (a recurring
     workbook, by filename and sender). Rows holding every word come first, newest period
     first; rows holding some follow, flagged partial_match. latest.source is attachment:<id>;
-    get_item(kind='attachment', ref, offset=latest.offset) shows the cell's row. period_source
+    read('attachment:<id>', offset=latest.offset) shows the cell's row. period_source
     says where the period was read: header, row, sheet, filename or email. A % value is as the
     workbook stores it, usually a fraction. With `period` each row says `held`, and one not held
     gives the latest held, with "not held; latest held: <period>" in `reason`. Name the report
@@ -1931,7 +1931,7 @@ def search_conversations(
 
     When the query cannot be embedded, semantic mode ranks around the best keyword
     matches and marks each row in `semantic`, as search_emails does.
-    get_item(kind='conversation', ref) reads a session found here.
+    read('conversation:<ref>') reads a session found here.
     """
     _check_choice("search_type", search_type, _SEARCH_TYPES)
     limit = _cap(limit)
@@ -2317,7 +2317,7 @@ def search_teams(
 ) -> ResultsResult:
     """Find what was said in Microsoft Teams chats and channels: thread summaries and titles, raw message text, or both.
 
-    get_item(kind='teams', ref) reads a thread found here.
+    read('teams:<ref>') reads a thread found here.
     """
     from src.store.teams_query import search_teams as q
 

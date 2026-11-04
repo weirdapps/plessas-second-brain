@@ -5,7 +5,7 @@ queries; nothing is compiled ahead of the question. A page is: one per person, t
 mail thread and meeting series that is active enough to need one, kept in `pages` and
 served beside the dossier.
 
-A page has two parts, both cited line by line as [kind:id, date] (get_item reads each):
+A page has two parts, both cited line by line as [kind:id, date] (read('kind:id') opens each):
 
   skeleton   read by SQL, deterministically, for every entity a sync touched (the
              sync's Step 8c, `refresh`): counts, dates, the newest threads, decisions,

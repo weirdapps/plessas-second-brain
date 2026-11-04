@@ -1564,15 +1564,18 @@ def cmd_migrate(args):
     backup = None
     if not dry_run:
         backup = _gated_backup(conn, getattr(args, "backup", None))
-    from src.store import thread_identity
+    from src.store import thread_identity, vector_store
 
-    counts_before = ledger.counts(conn) | thread_identity.counts(conn)
+    def _counts():
+        return ledger.counts(conn) | thread_identity.counts(conn) | vector_store.counts(conn)
+
+    counts_before = _counts()
     if conn.in_transaction:
         conn.commit()
     conn.execute("BEGIN IMMEDIATE")
     try:
         applied = apply_gated(conn, backup)
-        counts_after = ledger.counts(conn) | thread_identity.counts(conn)
+        counts_after = _counts()
         if dry_run:
             conn.rollback()
         else:

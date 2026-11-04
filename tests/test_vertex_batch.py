@@ -693,7 +693,7 @@ def test_reextract_jobs_drop_the_vectors_of_what_they_load(cloud, store, monkeyp
     loaded, kept = add(conn, SHORT), add(conn, SHORT + " B")
     removed: list = []
     monkeypatch.setattr(
-        "src.store.embeddings.remove_vectors", lambda ids: removed.append(sorted(ids))
+        "src.store.embeddings.remove_vectors", lambda ids, conn=None: removed.append(sorted(ids))
     )
     summary = vertex_batch.submit(str(path), origin="reextract")
     cloud.jobs.finish(summary["job"], [ok(f"ac{loaded}-s"), failed(f"ac{kept}-s")])
@@ -998,7 +998,7 @@ def test_reextract_batch_sends_one_row_per_document_and_copies_at_collect(
     atts = [a for (a,) in conn.execute("SELECT id FROM attachments ORDER BY id")]
     removed: list = []
     monkeypatch.setattr(
-        "src.store.embeddings.remove_vectors", lambda ids: removed.append(sorted(ids))
+        "src.store.embeddings.remove_vectors", lambda ids, conn=None: removed.append(sorted(ids))
     )
 
     assert cli.cmd_reextract(_rx_args(path, tmp_path, full_parts=atts, batch=True)) == 0

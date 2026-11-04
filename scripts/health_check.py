@@ -1638,7 +1638,17 @@ def check_embeddings(db, npz_path: Path | None = None, now: datetime | None = No
     import numpy as np
 
     npz = npz_path or DB_PATH.parent / "embeddings.npz"
-    if not npz.exists():
+    from src.store import vector_store
+
+    table = npz_path is None and vector_store.enabled(db)
+    if table:
+        ids = np.array([r[0] for r in db.execute("SELECT id FROM vectors")], dtype=np.int64)
+        newest = db.execute("SELECT MAX(written_at) FROM vectors").fetchone()[0]
+        current = now or datetime.now()
+        written = datetime.fromtimestamp(newest, current.tzinfo) if newest is not None else None
+        age = current - written if written is not None else None
+        space = vector_store.stored_space(db)
+    elif not npz.exists():
         return {
             "name": "Embeddings",
             "embedded": 0,
@@ -1646,29 +1656,31 @@ def check_embeddings(db, npz_path: Path | None = None, now: datetime | None = No
             "age": None,
             "status": "WARN",
         }
-    try:
-        # Without pickle: the index holds plain number arrays, and a pickled one
-        # could run whatever code it carries the moment this check opened it.
-        d = np.load(str(npz), allow_pickle=False)
-        ids = d["ids"] if "ids" in d else np.array([], dtype=np.int64)
-    except (OSError, ValueError) as e:
-        return {
-            "name": "Embeddings",
-            "embedded": 0,
-            "total_emails": total_emails,
-            "age": None,
-            "status": "WARN",
-            "note": f"index unreadable: {e}",
-        }
+    else:
+        try:
+            # Without pickle: the index holds plain number arrays, and a pickled one
+            # could run whatever code it carries the moment this check opened it.
+            d = np.load(str(npz), allow_pickle=False)
+            ids = d["ids"] if "ids" in d else np.array([], dtype=np.int64)
+        except (OSError, ValueError) as e:
+            return {
+                "name": "Embeddings",
+                "embedded": 0,
+                "total_emails": total_emails,
+                "age": None,
+                "status": "WARN",
+                "note": f"index unreadable: {e}",
+            }
+        # Presence and vector count both freeze the instant the stage dies, so the
+        # two signals this check used could not tell a live index from one written
+        # months ago. The file's mtime is the only thing here that keeps moving; in
+        # the vectors table (issue 171), the newest row's written_at.
+        age = (now or datetime.now()) - datetime.fromtimestamp(npz.stat().st_mtime)
+        space = _index_space(npz)
     n = len(ids)
-    # Presence and vector count both freeze the instant the stage dies, so the
-    # two signals this check used could not tell a live index from one written
-    # months ago. The file's mtime is the only thing here that keeps moving.
-    age = (now or datetime.now()) - datetime.fromtimestamp(npz.stat().st_mtime)
-    stale = age > STALE_THRESHOLDS["embeddings"]
+    stale = age is None or age > STALE_THRESHOLDS["embeddings"]
     from src.store.embeddings import chunks_wanted
 
-    space = _index_space(npz)
     coverage = _embedding_coverage(db, ids, chunks=bool(space and chunks_wanted(space)))
     gaps = {
         name: (have, want)
@@ -1694,6 +1706,7 @@ def check_embeddings(db, npz_path: Path | None = None, now: datetime | None = No
         "coverage": coverage,
         "gaps": gaps,
         "rebuild": rebuild,
+        "store": "table" if table else "npz",
         "status": "STALE" if stale else ("WARN" if gaps or stalled else "OK"),
     }
     if stalled and rebuild:

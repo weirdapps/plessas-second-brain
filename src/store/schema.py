@@ -535,7 +535,7 @@ def run_migrations(conn: sqlite3.Connection, gated: bool = False) -> None:
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
     if gated:
-        apply_gated(conn)
+        apply_gated(conn, owner=False)
         conn.commit()
 
 
@@ -553,19 +553,24 @@ GATED_TABLE = """CREATE TABLE IF NOT EXISTS gated_migrations (
 
 
 def _gated_steps():
-    from src.store import ledger, thread_identity
+    from src.store import ledger, thread_identity, vector_store
 
     # (name, function): the item ledger (v42 while numbered), then the parents a commitment
     # can have besides an email (v43), then the thread ids recomputed and the rollup table
-    # (issue 179).
+    # (issue 179), then the vector index moved from embeddings.npz into the store (issue 171).
     return (
         ("item_ledger", ledger.migrate),
         ("commitment_parents", ledger.migrate_commitment_parents),
         ("thread_identity", thread_identity.migrate),
+        ("vectors", vector_store.migrate),
     )
 
 
-GATED_MIGRATIONS = ("item_ledger", "commitment_parents", "thread_identity")
+GATED_MIGRATIONS = ("item_ledger", "commitment_parents", "thread_identity", "vectors")
+# The gated steps a new store does not take on its own (create_database, run_migrations with
+# `gated`): `vectors` copies in the vectors of embeddings.npz, which lives outside brain.db,
+# so it is the owner's step even on a new store. Only `brain maint migrate --apply-gated`.
+OWNER_ONLY_GATED = frozenset({"vectors"})
 
 
 def _tables(conn: sqlite3.Connection) -> set[str]:
@@ -585,11 +590,13 @@ def pending_gated(conn: sqlite3.Connection) -> list[str]:
     return [name for name in GATED_MIGRATIONS if name not in done]
 
 
-def apply_gated(conn: sqlite3.Connection, backup: str | None = None) -> list[str]:
+def apply_gated(
+    conn: sqlite3.Connection, backup: str | None = None, *, owner: bool = True
+) -> list[str]:
     """Apply the pending gated migrations in order and record each; the names applied.
     Nothing is committed here: the caller commits, or rolls back for a dry run (DDL is
-    transactional in SQLite)."""
-    pending = set(pending_gated(conn))
+    transactional in SQLite). `owner` False (a new store) leaves OWNER_ONLY_GATED pending."""
+    pending = set(pending_gated(conn)) - (set() if owner else OWNER_ONLY_GATED)
     if not pending:
         return []
     conn.execute(GATED_TABLE)

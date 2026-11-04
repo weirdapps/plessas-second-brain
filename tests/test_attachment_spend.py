@@ -578,7 +578,8 @@ def test_the_reextract_estimate_counts_every_part_up_to_the_threshold(db, monkey
 def vectors(monkeypatch):
     removed: list = []
     monkeypatch.setattr(
-        "src.store.embeddings.remove_vectors", lambda ids: removed.extend(ids) or len(ids)
+        "src.store.embeddings.remove_vectors",
+        lambda ids, conn=None: removed.extend(ids) or len(ids),
     )
     return removed
 

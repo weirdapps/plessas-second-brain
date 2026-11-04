@@ -1877,3 +1877,28 @@ one pass, at the first job that writes. The versions that ask for a step:
     `python -m src.cli maint thread-identity-revert --apply --backup ~/brain-before-revert.db`
     puts every mapped email back on its old id, marks the step not applied (the loader
     then threads as before) and clears `thread_rollups`; `thread_id_map` stays.
+- **Gated: `vectors`** (issue 171, `src/store/vector_store.py`). The vector index moves from
+  `embeddings.npz` into a `vectors` table in `brain.db`: one row per vector (`id` in the
+  index's namespaces, `kind`, `parent_id`, `dim`, `template`, `vec` in int8, `written_at`
+  in Unix seconds), the model and task in `sync_metadata` (`embedding_space`) as before.
+  From then on every writer inserts, replaces and deletes rows in its own transaction
+  (no whole-file rewrite), every search reads the table, and `embeddings.npz` is left
+  exactly as it was, unread. A new store does not take this step on its own (it copies data
+  from outside `brain.db`): only `--apply-gated` applies it, with the same steps 1 to 5.
+  On an APFS clone of the replica (2026-11-04, 247,833 vectors of 768 dimensions): the dry
+  run 98 s and the apply 31 s (backup included) on the Mac; the table 204 MB plus 8 MB of
+  indexes against 383 MB for the float16 npz (`brain.db` 7.20 -> 7.41 GB); cosine of every
+  vector with its int8 copy at least 0.99977; on 50 fixed queries the top 1 identical 50 of
+  50, top-10 overlap 0.974, recall's email candidates 0.984; search p50 60 -> 53 ms, the
+  recall candidates p95 99 -> 114 ms; the first search after a write loads the table in
+  1.1 s (the npz 0.4 s), resident memory unchanged (vectors widened to float16 in memory).
+  After it:
+
+  - `sb-db-pull.sh` still copies `embeddings.npz`, which nothing reads any more; the copy
+    can go once the step has run on the producer (scripts/wrappers, a separate change).
+  - `maint vectors-rebuild` swaps into the table and keeps the rows it replaced as
+    `embeddings.npz.pre-rebuild`; `slice_index` refuses, since the table is already 768.
+  - To undo it, with the timers stopped: `DROP TABLE vectors` and
+    `DELETE FROM gated_migrations WHERE name = 'vectors'`. The npz is the index again,
+    without the vectors written since the step: `python -m src.cli embed` adds back the
+    emails, attachments and chunks, and the next teams-sync and whatsapp-sync theirs.

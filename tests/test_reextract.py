@@ -22,7 +22,8 @@ def store(tmp_path, monkeypatch):
     conn.commit()
     removed: list = []
     monkeypatch.setattr(
-        "src.store.embeddings.remove_vectors", lambda ids: removed.append(sorted(ids)) or len(ids)
+        "src.store.embeddings.remove_vectors",
+        lambda ids, conn=None: removed.append(sorted(ids)) or len(ids),
     )
     summarised: list = []
     monkeypatch.setattr(

@@ -155,12 +155,16 @@ def build_prompt(kind: str, page: dict, evidence: Evidence) -> str:
 
     facts = {k: v for k, v in page["facts"].items() if v not in (None, [], "")}
     rows = [f"[{k}] {d or 'undated'}: {t}" for k, (d, t) in evidence.rows.items()]
-    head = f"The {kind}: {page['name']}. Facts: {json.dumps(facts, ensure_ascii=False)}."
+    # The name (a mail subject, a person's display name) and the facts come from third-party
+    # text too, so they go inside the fence with the rows; only the owner's corrections,
+    # which he wrote, stay outside it.
+    named = [f"Name: {page['name']}", f"Facts: {json.dumps(facts, ensure_ascii=False)}", ""]
+    head = f"One {kind} page."
     if page["corrections"]:
         head += "\nThe owner's corrections (true; do not cite): " + "; ".join(
             c["text"] for c in page["corrections"]
         )
-    return head + "\n\n" + fence("\n".join(rows))
+    return head + "\n\n" + fence("\n".join(named + rows))
 
 
 # --- the check -----------------------------------------------------------------------------

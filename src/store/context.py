@@ -809,6 +809,8 @@ def get_topic_context(
         "key_facts": key_facts,
         "key_facts_total": key_facts_total,
     }
+    # With the topic registry (issue 180): the chats and meetings tagged with the family.
+    out.update(topic_registry.chat_rows(conn, ids, cutoff, limit))
     left = _history(
         decisions=decisions_all - decisions_total,
         open_actions=open_actions_all - open_actions_total,

@@ -141,6 +141,12 @@ class TopicContext(Fresh, total=False):
     open_actions_total: int
     key_facts: list[Any]
     key_facts_total: int
+    teams_threads: Rows
+    teams_threads_total: int
+    whatsapp_sessions: Rows
+    whatsapp_sessions_total: int
+    meetings: Rows
+    meetings_total: int
     reason: str
     coverage: Coverage
     truncated: Truncated

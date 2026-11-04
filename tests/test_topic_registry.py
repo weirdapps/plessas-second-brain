@@ -365,3 +365,68 @@ def test_the_command_counts_then_writes(tmp_path, monkeypatch, capsys):
     assert maint.cmd_topic_registry(_args(tmp_path / "brain.db", apply=True)) == 0
     out = capsys.readouterr().out
     assert "'placed': 2" in out and "'unplaced': 0" in out
+
+
+# --- part 2: topics asked of chats and meetings ------------------------------------------------
+
+
+def test_topics_are_asked_only_with_the_env_and_the_step(conn, old, monkeypatch):
+    monkeypatch.setenv(tr.CHAT_TOPICS_ENV, "")
+    assert not tr.asks_topics(conn)
+    monkeypatch.setenv(tr.CHAT_TOPICS_ENV, "1")
+    assert tr.asks_topics(conn)
+    assert not tr.asks_topics(old)
+
+
+def test_a_thread_prompt_gains_the_topics_key_before_key_facts():
+    from src.extract.teams_prompt import build_prompt
+
+    system, user = build_prompt({"chat_label": "Okapi"}, [])
+    s2, u2 = tr.with_topics(system, user)
+    assert s2.startswith(system) and tr.TOPICS_RULE in s2
+    assert u2.index('"topics"') < u2.index('"key_facts"')
+    with pytest.raises(ValueError):
+        tr.with_topics(system, "no keys here")
+
+
+def test_a_calendar_prompt_gains_the_ask_before_its_closing_line():
+    prompt = "Extract JSON.\nRespond with ONLY the JSON object, no other text."
+    out = tr.with_calendar_topics(prompt)
+    assert out.index('"topics"') < out.index("Respond with ONLY")
+    with pytest.raises(ValueError):
+        tr.with_calendar_topics("nothing")
+
+
+def test_replace_links_swaps_a_parents_topics(conn):
+    thread = f.teams_thread(conn)
+    tr.replace_links(conn, "teams", thread, {"topics": ["Okapi budget", 3, " ", "Cards"]})
+    tr.replace_links(conn, "teams", thread, {"topics": ["Cards"]})
+    names = [
+        r[0]
+        for r in conn.execute(
+            "SELECT t.name FROM teams_thread_topics l JOIN topics t ON t.id = l.topic_id"
+            " WHERE l.thread_id = ?",
+            (thread,),
+        )
+    ]
+    assert names == ["cards"]
+    assert tr.topics_of({"topics": "not a list"}) == []
+    assert tr.replace_links(conn, "teams", thread, None) == 0
+
+
+def test_topic_context_lists_the_chats_and_meetings_of_the_alias_set(conn, old):
+    _tag(conn, "okapi budget", 2)
+    thread = f.teams_thread(conn, title="Okapi chat")
+    event = f.calendar_event(conn, subject="Okapi review", body_summary="Budget review.")
+    tr.link_topics(conn, "teams", thread, ["Okapi Budget"])
+    tr.link_topics(conn, "calendar", event, ["okapi budgets"])
+    tr.apply_plan(conn, tr.plan_batch(conn, _vectors({}), limit=10))
+
+    out = get_topic_context(conn, "okapi budget")
+
+    assert [r["title"] for r in out["teams_threads"]] == ["Okapi chat"]
+    assert out["teams_threads_total"] == 1
+    assert [r["subject"] for r in out["meetings"]] == ["Okapi review"]
+    assert out["whatsapp_sessions_total"] == 0
+    _tag(old, "okapi budget", 1)
+    assert "teams_threads" not in get_topic_context(old, "okapi budget")

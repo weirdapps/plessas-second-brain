@@ -547,3 +547,126 @@ def counts(conn: sqlite3.Connection) -> dict[str, int]:
     placed = {r[0] for r in conn.execute("SELECT topic_id FROM topic_aliases")}
     out["unplaced"] = sum(1 for t, n in uses.items() if n > 0 and t not in placed)
     return out
+
+
+# --- topics of chats and meetings (issue 180, part 2) --------------------------------------------
+
+# Teams threads, WhatsApp sessions and calendar events are asked for topics only with this
+# set to 1 and on a store with the step: the prompts go out unchanged otherwise (owner rule:
+# ship, check the eval, then widen).
+CHAT_TOPICS_ENV = "BRAIN_EXTRACT_CHAT_TOPICS"
+
+TOPICS_RULE = (
+    "Also write topics: 1 to 5 short topic tags (2-4 words each, in the thread's language,"
+    " product names and acronyms exact) naming what the thread is about, as an archive"
+    " would file it; no people's names, no dates."
+)
+_TOPICS_KEY = '  "topics": ["<topic tag>"],\n'
+_KEY_FACTS_KEY = '  "key_facts": [\n'
+_CALENDAR_TOPICS = (
+    'Add to the JSON object a key "topics": a list of 1 to 5 short topic tags (2-4 words each,'
+    " in the event's language, product names and acronyms exact) naming what the meeting is"
+    " about, as an archive would file it; no people's names, no dates, an empty list when the"
+    " text says nothing of it.\n"
+)
+_CALENDAR_ANCHOR = "Respond with ONLY the JSON object"
+
+
+def asks_topics(conn: sqlite3.Connection) -> bool:
+    """Whether a chat or calendar extraction asks for topics: the env set and the step taken."""
+    import os
+
+    return os.environ.get(CHAT_TOPICS_ENV, "").strip().lower() in ("1", "true", "on") and enabled(
+        conn
+    )
+
+
+def with_topics(system: str, user: str) -> tuple[str, str]:
+    """A Teams or WhatsApp thread prompt that also asks for topics: the rule after the
+    system prompt, the key before key_facts in the JSON the user turn asks for."""
+    if _KEY_FACTS_KEY not in user:
+        raise ValueError("not a thread prompt: no key_facts key")
+    head, _, tail = user.rpartition(_KEY_FACTS_KEY)
+    return f"{system} {TOPICS_RULE}", head + _TOPICS_KEY + _KEY_FACTS_KEY + tail
+
+
+def with_calendar_topics(prompt: str) -> str:
+    """A calendar prompt that also asks for topics, the ask just before its closing line."""
+    if _CALENDAR_ANCHOR not in prompt:
+        raise ValueError("not a calendar prompt: no closing line")
+    head, _, tail = prompt.rpartition(_CALENDAR_ANCHOR)
+    return head + _CALENDAR_TOPICS + _CALENDAR_ANCHOR + tail
+
+
+def topics_of(data) -> list[str]:
+    """The topic tags of an extraction: strings only, at most 5."""
+    raw = data.get("topics") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return []
+    return [t.strip() for t in raw if isinstance(t, str) and t.strip()][:5]
+
+
+def replace_links(conn: sqlite3.Connection, source: str, parent_id: int, data) -> int:
+    """A parent's topic links as this extraction gives them: the old ones go first. The
+    links added; 0, with nothing deleted, without the step. The caller commits."""
+    if not enabled(conn):
+        return 0
+    table, column = LINKS[source]
+    conn.execute(f"DELETE FROM {table} WHERE {column} = ?", (parent_id,))
+    return link_topics(conn, source, parent_id, topics_of(data))
+
+
+# What topic_context lists of a family's chats and meetings: key, link table, parent column,
+# parent table, columns, the date it is ordered and cut by.
+_CHAT_ROWS = (
+    (
+        "teams_threads",
+        "teams_thread_topics",
+        "thread_id",
+        "teams_threads",
+        "p.id AS thread_id, p.title, p.summary, p.ended_at AS date",
+        "p.ended_at",
+    ),
+    (
+        "whatsapp_sessions",
+        "whatsapp_thread_topics",
+        "thread_id",
+        "whatsapp_threads",
+        "p.id AS thread_id, p.title, p.summary, p.ended_at AS date",
+        "p.ended_at",
+    ),
+    (
+        "meetings",
+        "event_topics",
+        "event_id",
+        "calendar_events",
+        "p.id AS event_id, p.subject, p.body_summary AS summary, p.start_at AS date",
+        "p.start_at",
+    ),
+)
+
+
+def chat_rows(conn: sqlite3.Connection, ids: list[int], since: str, limit: int) -> dict:
+    """The Teams threads, WhatsApp sessions and meetings tagged with any topic of `ids`
+    since `since`, newest first, at most `limit` each, with `<key>_total`. {} without the
+    step, so topic_context's answer keeps its shape before it."""
+    if not enabled(conn):
+        return {}
+    out: dict = {}
+    family = json.dumps(ids)
+    for key, link, column, parent, columns, date in _CHAT_ROWS:
+        where = (
+            f"p.id IN (SELECT l.{column} FROM {link} l"
+            " WHERE l.topic_id IN (SELECT value FROM json_each(?))) AND " + date + " >= ?"
+        )
+        out[key] = [
+            dict(r)
+            for r in conn.execute(
+                f"SELECT {columns} FROM {parent} p WHERE {where} ORDER BY {date} DESC LIMIT ?",
+                (family, since, limit),
+            )
+        ]
+        out[f"{key}_total"] = conn.execute(
+            f"SELECT COUNT(*) FROM {parent} p WHERE {where}", (family, since)
+        ).fetchone()[0]
+    return out

@@ -1997,3 +1997,10 @@ one pass, at the first job that writes. The versions that ask for a step:
   - `topic_context` and every topic filter read the alias set beside the topic family,
     and a query naming a canonical reads its head. To undo it, drop the five tables
     and the `gated_migrations` row, or restore the backup of step 4.
+  - Topics of chats and meetings, off by default: `BRAIN_EXTRACT_CHAT_TOPICS=1` in the
+    jobs' environment asks each Teams thread, WhatsApp session and calendar event the
+    jobs extract from then on for 1 to 5 topic tags (one more key in the same call, no
+    extra call; the calendar only on its v1 route). History is not re-extracted: a
+    calendar event already stored is read again only when Outlook changes it. Check the
+    extraction eval on a few days of it before widening; unset, the prompts are byte for
+    byte as before.

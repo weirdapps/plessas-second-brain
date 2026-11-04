@@ -27,6 +27,7 @@ from src.extract.claude_extract import _response_text, complete, refusal_error
 from src.extract.html_text import html_to_text, looks_like_html
 from src.extract.untrusted import fence
 from src.redact import PROMPT_RULE, redact_secrets
+from src.store.topic_registry import topics_of, with_calendar_topics
 
 # Attendee names the prompt shows; the rest are counted. Events average 48
 # attendees and reach 500, and the list was most of the input: p95 11,038 tokens.
@@ -432,7 +433,7 @@ def _request(invitation: bool, invite: str) -> Request:
     )
 
 
-def event_prompt_hash(event: dict, body: str | None) -> str | None:
+def event_prompt_hash(event: dict, body: str | None, topics: bool = False) -> str | None:
     """sha256 of what the model would read for this event: the invite and the prompt
     around it. The fence tag is random per call, so it is left out. None when the
     body leaves nothing to extract.
@@ -446,6 +447,8 @@ def event_prompt_hash(event: dict, body: str | None) -> str | None:
     if invite is None:
         return None
     if not v2_route("calendar"):
+        if topics:
+            template = with_calendar_topics(template)
         return hashlib.sha256(f"{template}\x00{invite}".encode()).hexdigest()
     # v2 and v2-text: the system blocks as sent and the schema when it goes as structured
     # output, the same for every occurrence of a series; the fenced user turn without its
@@ -463,7 +466,7 @@ def event_prompt_hash(event: dict, body: str | None) -> str | None:
     return hashlib.sha256(f"{fixed}\x00{invite}".encode()).hexdigest()
 
 
-def extract_event(event: dict, body: str | None = None) -> dict:
+def extract_event(event: dict, body: str | None = None, topics: bool = False) -> dict:
     """
     Run LLM extraction on a calendar event.
 
@@ -474,7 +477,9 @@ def extract_event(event: dict, body: str | None = None) -> dict:
     Returns:
         dict with body_summary, decisions, action_items. An invitation's summary
         is its purpose, agenda and who is expected, and it has no decisions or
-        action items whatever the model returns.
+        action items whatever the model returns. With `topics` (issue 180; the v1 route
+        only, BRAIN_EXTRACT_CHAT_TOPICS on a store with the gated topic_registry), also
+        "topics", the event's topic tags.
     """
     invitation, template, invite = _prompt_parts(event, body)
     # No text to read: an empty result, no LLM call
@@ -485,6 +490,8 @@ def extract_event(event: dict, body: str | None = None) -> dict:
 
     # Whoever sent the invite wrote all of it, the subject included.
     prompt = template.format(invite=fence(invite))
+    if topics:
+        prompt = with_calendar_topics(prompt)
 
     response = complete(max_tokens=MAX_TOKENS, messages=[{"role": "user", "content": prompt}])
 
@@ -498,12 +505,16 @@ def extract_event(event: dict, body: str | None = None) -> dict:
         raise ValueError(f"calendar extraction reply cut short at max_tokens={MAX_TOKENS}")
 
     if invitation:
-        return {
+        result = {
             "body_summary": invitation_summary(_json_object(raw_text)),
             "decisions": [],
             "action_items": [],
         }
-    return parse_extraction_response(raw_text)
+    else:
+        result = parse_extraction_response(raw_text)
+    if topics:
+        result["topics"] = topics_of(_json_object(raw_text))
+    return result
 
 
 def _extract_event_v2(invitation: bool, invite: str) -> dict:

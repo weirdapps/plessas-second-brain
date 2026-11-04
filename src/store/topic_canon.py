@@ -61,6 +61,10 @@ def topic_family_ids(
             (json.dumps(sorted(heads)), *(() if narrower else SYNONYM_METHODS)),
         )
     )
+    # With the topic registry (issue 180), every alias of the topic's canonical too.
+    from src.store.topic_registry import alias_ids
+
+    members.update(alias_ids(conn, topic_id))
     return [topic_id] + sorted(members - {topic_id})
 
 
@@ -68,14 +72,24 @@ def family_of_matching_sql(conn: sqlite3.Connection) -> str:
     """A SELECT of topic ids taking one parameter, a LIKE pattern: the topics whose name
     matches it and the family of each (topic_family_ids), for a topic filter that matched
     names by LIKE. Without the table, the matching topics alone, as before v38."""
+    from src.store.topic_registry import aliases_of_sql, enabled
+
+    # With the topic registry (issue 180), the aliases of the matching topics' canonicals.
+    aliases = (
+        " UNION " + aliases_of_sql().format(ids="SELECT id FROM sb_m") if enabled(conn) else ""
+    )
     if not _has_table(conn):
-        return "SELECT id FROM topics WHERE name LIKE ?"
+        if not aliases:
+            return "SELECT id FROM topics WHERE name LIKE ?"
+        return "WITH sb_m(id) AS (SELECT id FROM topics WHERE name LIKE ?) SELECT id FROM sb_m" + (
+            aliases
+        )
     return (
         "WITH sb_m(id) AS (SELECT id FROM topics WHERE name LIKE ?),"
         " sb_h(id) AS (SELECT id FROM sb_m UNION SELECT f.head_id FROM topic_family f"
         f" JOIN sb_m ON f.topic_id = sb_m.id WHERE f.method IN {SYNONYM_METHODS!r})"
         " SELECT id FROM sb_h UNION SELECT f.topic_id FROM topic_family f"
-        " JOIN sb_h ON f.head_id = sb_h.id"
+        " JOIN sb_h ON f.head_id = sb_h.id" + aliases
     )
 
 
@@ -88,6 +102,16 @@ def resolve_topic(conn: sqlite3.Connection, name: str):
     normalized = normalize_topic(name)
     if not any(ch.isalnum() for ch in normalized):
         return None
+    # A canonical topic's name (issue 180) that is no raw topic's: its head.
+    from src.store.topic_registry import head_for_name
+
+    head = head_for_name(conn, normalized)
+    if head is not None and (
+        conn.execute("SELECT 1 FROM topics WHERE name = ?", (normalized,)).fetchone() is None
+    ):
+        return conn.execute(
+            "SELECT id, name, display_name FROM topics WHERE id = ?", (head,)
+        ).fetchone()
     return conn.execute(
         """
         SELECT t.id, t.name, t.display_name FROM topics t

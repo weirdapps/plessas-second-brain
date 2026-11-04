@@ -582,13 +582,22 @@ GATED_TABLE = """CREATE TABLE IF NOT EXISTS gated_migrations (
 
 
 def _gated_steps():
-    from src.store import extraction_fields, ledger, person_identity, thread_identity, vector_store
+    from src.store import (
+        extraction_fields,
+        ledger,
+        person_identity,
+        thread_identity,
+        topic_registry,
+        vector_store,
+    )
 
     # (name, function): the item ledger (v42 while numbered), then the parents a commitment
     # can have besides an email (v43), then the thread ids recomputed and the rollup table
     # (issue 179), then identities split from mentions with their identifiers, the enum
     # header role and the merge log (issue 170), then the vector index moved from
-    # embeddings.npz into the store (issue 171).
+    # embeddings.npz into the store (issue 171), then emails.item_kind
+    # (issue 211), then the canonical topics, their aliases and the topic links of chats
+    # and meetings (issue 180), empty until a batch fills them.
     return (
         ("item_ledger", ledger.migrate),
         ("commitment_parents", ledger.migrate_commitment_parents),
@@ -596,6 +605,7 @@ def _gated_steps():
         ("person_identity", person_identity.migrate),
         ("vectors", vector_store.migrate),
         ("extraction_item_kind", extraction_fields.migrate),
+        ("topic_registry", topic_registry.migrate),
     )
 
 
@@ -606,6 +616,7 @@ GATED_MIGRATIONS = (
     "person_identity",
     "vectors",
     "extraction_item_kind",
+    "topic_registry",
 )
 # The gated steps a new store does not take on its own (create_database, run_migrations with
 # `gated`): `vectors` copies in the vectors of embeddings.npz, which lives outside brain.db,

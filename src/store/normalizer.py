@@ -72,6 +72,11 @@ def find_or_create_topic(conn: sqlite3.Connection, name: str, parent_id: int | N
         (normalized, name, parent_id),
     )
     assert cursor.lastrowid is not None  # mypy: INSERT always sets it
+    # Placed under its canonical topic when its folded words match an alias (issue 180);
+    # a no-op on a store without the gated topic_registry step.
+    from src.store.topic_registry import map_new_topic
+
+    map_new_topic(conn, cursor.lastrowid, name)
     return cursor.lastrowid
 
 

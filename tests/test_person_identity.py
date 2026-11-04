@@ -76,9 +76,9 @@ def _roles(db, email_id):
 
 
 def test_the_step_is_named_and_last_and_waits_on_a_legacy_store():
-    # vectors (issue 171) and extraction_item_kind (issue 211) come after it, and a new
+    # vectors (issue 171) and extraction_item_kind (issue 211) come after it (then topic_registry, issue 180), and a new
     # store leaves vectors to the owner.
-    assert GATED_MIGRATIONS[-3:] == ("person_identity", "vectors", "extraction_item_kind")
+    assert GATED_MIGRATIONS[3:6] == ("person_identity", "vectors", "extraction_item_kind")
     db = _legacy()
     assert pending_gated(db) == ["person_identity", "vectors"]
     assert "person_identifiers" not in {

@@ -21,7 +21,7 @@ from src.extract.call_shape import (
     Request,
     max_tokens_attempts,
     system_blocks,
-    uses_schema_v2,
+    v2_route,
 )
 from src.extract.claude_extract import _response_text, complete, refusal_error
 from src.extract.html_text import html_to_text, looks_like_html
@@ -445,7 +445,7 @@ def event_prompt_hash(event: dict, body: str | None) -> str | None:
     invitation, template, invite = _prompt_parts(event, body)
     if invite is None:
         return None
-    if not uses_schema_v2():
+    if not v2_route("calendar"):
         return hashlib.sha256(f"{template}\x00{invite}".encode()).hexdigest()
     # v2 and v2-text: the system blocks as sent and the schema when it goes as structured
     # output, the same for every occurrence of a series; the fenced user turn without its
@@ -480,7 +480,7 @@ def extract_event(event: dict, body: str | None = None) -> dict:
     # No text to read: an empty result, no LLM call
     if invite is None:
         return {"body_summary": "", "decisions": [], "action_items": []}
-    if uses_schema_v2():
+    if v2_route("calendar"):
         return _extract_event_v2(invitation, invite)
 
     # Whoever sent the invite wrote all of it, the subject included.

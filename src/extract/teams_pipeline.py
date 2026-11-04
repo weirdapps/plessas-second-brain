@@ -353,7 +353,7 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
     """
     import os
 
-    from src.extract.call_shape import thread_call, uses_schema_v2
+    from src.extract.call_shape import thread_call, v2_route
     from src.extract.claude_extract import _response_text, complete
     from src.extract.teams_prompt import cached_prompt
 
@@ -365,9 +365,10 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
     # v2: 8,192 at a pinned effort, and once more at twice that (src/extract/call_shape.py).
     budgets, pinned = thread_call("teams", 2048)
     system: str | list[dict] = system_prompt
-    if uses_schema_v2():
-        # v2 and v2-text: the instructions and the keys cached in the system prompt
-        # with worked examples (issue 211); v1 sends the prompts as built.
+    if v2_route("teams"):
+        # v2 and v2-text, once BRAIN_EXTRACT_V2_ROUTES names the route: the instructions
+        # and the keys cached in the system prompt with worked examples (issue 211);
+        # otherwise the prompts go as built.
         system, user_prompt = cached_prompt("teams", system_prompt, user_prompt)
     for max_tokens in budgets:
         resp = complete(

@@ -4,7 +4,8 @@ Thinking counts toward max_tokens, and at 2,048 it cut 13% of Teams calls short;
 thread cut short failed its parse and was sent again next run. v1 keeps the 2,048 calls as
 they were and asks once more at the route's budget after a max_tokens stop. v2 gives them 8,192, pins the effort, and asks once more at twice the budget
 after a max_tokens stop, with no schema; their system prompt is cached with worked
-examples (issue 211, tests/test_thread_cached_prompt.py).
+examples only once BRAIN_EXTRACT_V2_ROUTES names the route (issue 211,
+tests/test_thread_cached_prompt.py).
 """
 
 from types import SimpleNamespace
@@ -81,9 +82,8 @@ def test_v2_pins_the_effort_and_raises_the_budget(monkeypatch, model, pipeline, 
     [sent] = model.calls
     assert sent["max_tokens"] == call_shape.ROUTES[route].max_tokens >= 8192
     assert sent["output_config"] == {"effort": call_shape.ROUTES[route].effort}
-    assert sent["system"][0] == {"type": "text", "text": "the system prompt"}
-    assert sent["system"][-1]["cache_control"] == call_shape.CACHE_CONTROL
-    assert sent["messages"][0]["content"].startswith("the thread")
+    assert sent["system"] == "the system prompt"
+    assert sent["messages"] == [{"role": "user", "content": "the thread"}]
 
 
 @pytest.mark.parametrize(("pipeline", "_route"), ROUTES)

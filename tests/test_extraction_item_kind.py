@@ -135,3 +135,52 @@ def test_a_replaced_extraction_on_a_bare_store_writes_no_kind(bare):
     replace_extraction(bare, email_id, metadata(), wrong=v2_reply(), right=v2_reply())
 
     assert "item_kind" not in _columns(bare)
+
+
+# --- the Latin name, in #170's identifier table ---------------------------------------
+
+
+def _names(conn):
+    return {
+        (r[0], r[1])
+        for r in conn.execute(
+            "SELECT value, source FROM person_identifiers WHERE kind = 'name'"
+            " AND source = 'extraction_v2'"
+        )
+    }
+
+
+def test_a_v2_person_keeps_the_name_as_written_and_the_latin_one(gated):
+    """person_identifiers kind 'name' (issue 170): the Latin form a v2 extraction gives
+    finds the person later under either spelling."""
+    reply = v2_reply()
+    reply["people"][1] = {
+        **reply["people"][1],
+        "name_as_written": "Άννα Εξάμπλ",
+        "name_latin": "Anna Exampl",
+    }
+
+    load_single_email(gated, metadata(), reply)
+
+    names = _names(gated)
+    assert ("Άννα Εξάμπλ", "extraction_v2") in names
+    assert ("Anna Exampl", "extraction_v2") in names
+
+
+def test_a_v1_extraction_records_no_extraction_name(gated):
+    load_single_email(gated, metadata(), V1_EXTRACTION)
+
+    assert _names(gated) == set()
+
+
+def test_without_person_identity_the_names_are_not_recorded(tmp_path):
+    from src.store.schema import _gated_steps
+
+    conn = create_database(str(tmp_path / "pre170.db"), gated=False)
+    for name, step in _gated_steps():
+        if name == extraction_fields.NAME:
+            step(conn)
+
+    assert load_single_email(conn, metadata(), v2_reply())
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "person_identifiers" not in tables

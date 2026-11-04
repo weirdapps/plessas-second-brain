@@ -635,10 +635,19 @@ def _write_extraction(
     # Load people and their roles: people_roles in schema v1, people in schema v2
     people_ids: dict[str, int] = {}
     named = [] if items_only else _named_people(extraction, metadata)
+    # The names a v2 extraction gives a person, as written and in Latin letters, are
+    # noted as that person's identifiers (issue 211) on a store with the gated
+    # person_identity (issue 170); a v1 extraction's are not.
+    from .person_identity import active as identities_active
+    from .person_identity import record as record_identifier
+
+    note_names = extraction.get("extraction_schema") == 2 and identities_active(conn)
     for person_name, person_email, roles, names in named:
         person_id = find_or_create_person(conn, person_name, person_email)
         for name in names:
             people_ids.setdefault(search_fold(name), person_id)
+            if note_names:
+                record_identifier(conn, person_id, "name", name, "extraction_v2")
 
         for role in roles:
             if isinstance(role, dict):

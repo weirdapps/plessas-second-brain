@@ -54,6 +54,12 @@ def response(text='{"summary": "s"}', stop="end_turn"):
     )
 
 
+@pytest.fixture(autouse=True)
+def _opted_in(monkeypatch):
+    """These tests are of the routes once the owner names them (BRAIN_EXTRACT_V2_ROUTES)."""
+    monkeypatch.setenv("BRAIN_EXTRACT_V2_ROUTES", "teams,whatsapp")
+
+
 @pytest.fixture
 def model(monkeypatch, tmp_path):
     stub = SimpleNamespace(calls=[])
@@ -189,6 +195,22 @@ def test_the_two_routes_keep_their_own_instructions(monkeypatch, model):
 @pytest.mark.parametrize(("pipeline", "build", "_route"), ROUTES)
 def test_v1_sends_the_prompts_as_built(monkeypatch, model, pipeline, build, _route):
     monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", "v1")
+    system, user = build(THREAD, MESSAGES)
+
+    pipeline._call_llm(system, user)
+
+    [sent] = model.calls
+    assert sent["system"] == system
+    assert sent["messages"] == [{"role": "user", "content": user}]
+
+
+@pytest.mark.parametrize("shape", ["v2", "v2-text"])
+@pytest.mark.parametrize(("pipeline", "build", "_route"), ROUTES)
+def test_not_opted_in_the_prompts_go_as_built(monkeypatch, model, shape, pipeline, build, _route):
+    """The default: a deploy leaves the thread prompts as they were (the pinned effort and
+    the larger budget of #209 still apply)."""
+    monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", shape)
+    monkeypatch.setenv("BRAIN_EXTRACT_V2_ROUTES", "")
     system, user = build(THREAD, MESSAGES)
 
     pipeline._call_llm(system, user)

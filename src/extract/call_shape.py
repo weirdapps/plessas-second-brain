@@ -78,6 +78,36 @@ def uses_schema_v2(shape: str | None = None) -> bool:
     return (shape or call_shape()) != V1
 
 
+# The routes whose v2 requests are opt-in (issue 211): the calendar route, and the cached
+# system prompts of the Teams and WhatsApp routes. A deploy must not change those requests
+# before the owner has run the eval on them, so each stays as it was (v1's calendar call,
+# the thread prompts as built) until BRAIN_EXTRACT_V2_ROUTES names it. Ship, check the
+# eval, then widen.
+V2_ROUTES_VAR = "BRAIN_EXTRACT_V2_ROUTES"
+OPT_IN_ROUTES = ("calendar", "teams", "whatsapp")
+
+
+def v2_route(name: str, shape: str | None = None) -> bool:
+    """Whether the opt-in route `name` takes its v2 request: the call shape (the configured
+    one when None) asks for schema v2, and BRAIN_EXTRACT_V2_ROUTES, a list separated by
+    commas, empty by default, names it.
+
+    A name that is not one of OPT_IN_ROUTES stops the call with ClaudeNotConfigured, as a
+    mistyped call shape does: a typo must not leave a route off while the owner believes
+    it on."""
+    raw = os.environ.get(V2_ROUTES_VAR, "")
+    named = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    wrong = sorted(named - set(OPT_IN_ROUTES))
+    if wrong:
+        from src.extract.claude_extract import ClaudeNotConfigured
+
+        raise ClaudeNotConfigured(
+            f"{V2_ROUTES_VAR}={raw!r} names {', '.join(wrong)}, not a route: name any of"
+            f" {', '.join(OPT_IN_ROUTES)}, or leave it empty"
+        )
+    return name in named and uses_schema_v2(shape)
+
+
 def structured_outputs(shape: str | None = None) -> bool:
     """Whether calls in `shape` (the configured one when None) send `output_config.format`:
     v2 alone."""

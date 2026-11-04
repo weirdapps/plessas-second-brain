@@ -53,6 +53,12 @@ def response(answer, stop="end_turn"):
     )
 
 
+@pytest.fixture(autouse=True)
+def _opted_in(monkeypatch):
+    """These tests are of the route once the owner names it (BRAIN_EXTRACT_V2_ROUTES)."""
+    monkeypatch.setenv("BRAIN_EXTRACT_V2_ROUTES", "calendar")
+
+
 @pytest.fixture
 def model(monkeypatch, tmp_path):
     stub = SimpleNamespace(calls=[], replies=[])
@@ -81,6 +87,24 @@ def test_v1_sends_the_calendar_call_as_it_always_did(monkeypatch, model):
     assert set(sent) == {"model", "max_tokens", "messages"}
     assert sent["max_tokens"] == calendar_extractor.MAX_TOKENS
     assert sent["messages"][0]["content"].startswith("You are reading a calendar invitation")
+
+
+@pytest.mark.parametrize("shape", ["v2", "v2-text"])
+def test_not_opted_in_the_calendar_call_and_hash_are_v1s(monkeypatch, model, shape):
+    """The default: a deploy leaves the calendar request and its hash as they were."""
+    monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", shape)
+    monkeypatch.setenv("BRAIN_EXTRACT_V2_ROUTES", "")
+    model.replies = [response(INVITATION_ANSWER)]
+    _, template, invite = calendar_extractor._prompt_parts(AHEAD, _AGENDA)
+
+    extract_event(AHEAD, _AGENDA)
+
+    [sent] = model.calls
+    assert set(sent) == {"model", "max_tokens", "messages"}
+    assert (
+        event_prompt_hash(AHEAD, _AGENDA)
+        == hashlib.sha256(f"{template}\x00{invite}".encode()).hexdigest()
+    )
 
 
 def test_v1_keeps_its_prompt_hash(monkeypatch):
@@ -210,7 +234,7 @@ def test_the_hash_moves_with_the_call_shape(monkeypatch):
     """What the model reads differs by shape, so an extraction made under one is not on
     record for another."""
     hashes = set()
-    for shape in ("v1", "v2", "v2-text"):
+    for shape in ("v1", "v2", "v2-text"):  # opted in (the fixture)
         monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", shape)
         hashes.add(event_prompt_hash(AHEAD, _AGENDA))
 

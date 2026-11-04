@@ -529,6 +529,13 @@ def cmd_topic_pages(args):
     return cmd(args)
 
 
+def cmd_pages(args):
+    """Write the synthesis of the compiled pages marked dirty (src/pipeline/pages.py)."""
+    from src.pipeline.pages import cmd
+
+    return cmd(args)
+
+
 def cmd_findings(args):
     """The findings sessions filed, and the rejected ones with why (src/store/findings.py)."""
     from src.store.findings import cmd
@@ -1915,6 +1922,8 @@ READ_ONLY_COMMANDS = frozenset(
         "scrub",
         # --estimate reads; building pages refuses on a replica itself.
         "topic-pages",
+        # --estimate, --status and --overrides read; the rest refuses on a replica itself.
+        "pages",
         # The findings list reads only.
         "findings",
         # `brain maint figures-backfill`: the same; its dry run opens the store read-only.
@@ -2467,6 +2476,54 @@ def main():
         help="Start no page after this many seconds (default 1500)",
     )
     parser_topic_pages.set_defaults(func=cmd_topic_pages)
+
+    parser_pages = subparsers.add_parser(
+        "pages",
+        help="Write the synthesis of the compiled pages marked dirty (nightly; one model "
+        "call a page, --llm-calls at most)",
+    )
+    parser_pages.add_argument(
+        "--llm-calls", type=int, default=40, help="Most model calls this run (default 40)"
+    )
+    parser_pages.add_argument(
+        "--kind",
+        action="append",
+        choices=("person", "topic", "thread", "series"),
+        help="Only pages of this kind. Repeatable",
+    )
+    parser_pages.add_argument(
+        "--full",
+        action="store_true",
+        help="Every eligible page again into a new generation, swapped in per kind once whole",
+    )
+    parser_pages.add_argument(
+        "--estimate",
+        action="store_true",
+        help="Count and price the calls; no model call, nothing written (runs on a replica)",
+    )
+    parser_pages.add_argument(
+        "--refresh", action="store_true", help="Compile the skeletons as the sync does; no call"
+    )
+    parser_pages.add_argument("--status", action="store_true", help="Pages, written and dirty")
+    parser_pages.add_argument(
+        "--override",
+        nargs=3,
+        metavar=("KIND", "KEY", "ACTION"),
+        help="Add a correction: ACTION hide, drop_ref (with --ref) or correct (with --text)",
+    )
+    parser_pages.add_argument("--ref", help="The item a drop_ref drops, as kind:id")
+    parser_pages.add_argument("--text", help="The owner's line a correct adds")
+    parser_pages.add_argument("--overrides", action="store_true", help="List the corrections")
+    parser_pages.add_argument(
+        "--remove-override", type=int, metavar="ID", help="Remove one correction"
+    )
+    parser_pages.add_argument(
+        "--deadline-s",
+        type=float,
+        default=1500.0,
+        help="Start no page after this many seconds (default 1500)",
+    )
+    parser_pages.set_defaults(func=cmd_pages)
 
     parser_findings = subparsers.add_parser(
         "findings",

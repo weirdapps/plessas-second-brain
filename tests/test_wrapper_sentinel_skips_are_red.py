@@ -85,6 +85,7 @@ def _logs(home: Path) -> str:
         ("sb-calendar-sync.sh", "needs_reauth"),
         ("sb-noon-catchup.sh", "needs_gcloud_reauth"),
         ("sb-topic-pages.sh", "needs_gcloud_reauth"),
+        ("sb-pages.sh", "needs_gcloud_reauth"),
     ],
 )
 def test_a_whole_run_skipped_on_a_sentinel_is_red(tmp_path, wrapper, sentinel):
@@ -299,6 +300,7 @@ def test_the_hourly_load_skipped_for_a_running_sync_stays_green(tmp_path):
         "sb-outlook-sync.sh",
         "sb-teams-sync.sh",
         "sb-topic-pages.sh",
+        "sb-pages.sh",
         "sb-whatsapp-sync.sh",
         "sb-news-sync.sh",
     ],

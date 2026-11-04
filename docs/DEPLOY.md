@@ -692,6 +692,55 @@ from: 6 to 16 of 20 a night on the reference store, about $0.25-0.90.
 Then `systemctl --user daemon-reload && systemctl --user enable --now
 sb-topic-pages.timer`.
 
+### Compiled pages
+
+The page layer (README, "People and topics", issue 169) needs the gated step
+`page_layer` (section 12) first: the sync then compiles the skeletons every hour. The
+synthesis is a job of its own, nightly after the topic pages, through a host-local
+shim like the others (copy `~/scripts/run-sb-topic-pages.sh` to `run-sb-pages.sh`,
+exec'ing `sb-pages.sh`). Nothing installs or enables it: `scripts/deploy.sh` leaves a
+wrapper with no installed copy alone.
+
+```bash
+install -m 755 scripts/wrappers/systemd/sb-pages.sh ~/.local/bin/
+python -m src.cli pages --status                 # pages, written and dirty, per kind
+python -m src.cli pages --estimate --llm-calls 2000   # the whole first build's price; no call
+python -m src.cli pages --full --llm-calls 400   # the history, a night at a time, swapped per kind when whole
+```
+
+```ini
+# ~/.config/systemd/user/sb-pages.service
+[Unit]
+Description=second-brain compiled pages (the synthesis of the pages marked dirty)
+
+[Service]
+Type=oneshot
+ExecStart=%h/scripts/run-sb-pages.sh
+TimeoutStartSec=1800
+
+# ~/.config/systemd/user/sb-pages.timer
+[Unit]
+Description=second-brain compiled pages, nightly after the topic pages
+
+[Timer]
+OnCalendar=*-*-* 04:10:00 Europe/Athens
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+```
+
+The nightly run writes at most `BRAIN_PAGES_LLM_CALLS` (40) pages, new ones first, then
+those new items, an override or a forgotten item made dirty, and starts none after
+1,500 s. On the clone a call cost about $0.013, so 40 a night is about $0.55; the first
+build of 962 pages is priced at about $20 by the estimate and cost about $12.50 at the
+measured rate. It exits 1 only when pages were due and every call failed.
+Corrections: `pages --override person 123 correct --text "..."`, `--override thread
+ID drop_ref --ref email:456`, `--override topic c12 hide`; `--overrides` lists them,
+`--remove-override ID` takes one back. A page is never edited.
+
+Then `systemctl --user daemon-reload && systemctl --user enable --now sb-pages.timer`.
+
 Nor does it close action items: extraction only appends, so run
 `python -m src.store.action_lifecycle` after a successful sync. It drops
 re-extracted duplicates and marks actions expired once their deadline, or

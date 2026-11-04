@@ -13,6 +13,7 @@ import pytest
 
 SYSTEMD = Path(__file__).parent.parent / "scripts" / "wrappers" / "systemd"
 TOPIC_PAGES = SYSTEMD / "sb-topic-pages.sh"
+PAGES = SYSTEMD / "sb-pages.sh"
 
 
 @pytest.fixture
@@ -57,3 +58,12 @@ def test_an_expired_gcloud_credential_skips_the_run(home):
 
     assert _run(TOPIC_PAGES, home).returncode == 69
     assert not (home / "argv").exists()
+
+
+def test_pages_runs_the_synthesis_within_its_budget_and_passes_its_code_through(home):
+    """sb-pages (issue 169): the compiled pages' nightly synthesis."""
+    subprocess.run(["/bin/bash", "-n", str(PAGES)], check=True)
+    assert _run(PAGES, home).returncode == 0
+    assert (home / "argv").read_text().strip() == "-m src.cli pages --llm-calls 40"
+    assert _run(PAGES, home, BRAIN_PAGES_LLM_CALLS="5", FAKE_RC="1").returncode == 1
+    assert (home / "argv").read_text().splitlines()[-1] == "-m src.cli pages --llm-calls 5"

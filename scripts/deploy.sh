@@ -74,9 +74,14 @@ running_jobs() {
     --plain --no-legend 'sb-*.service' 2>/dev/null | awk '{print $1}' | grep -Ev "$LONG_RUNNING"
 }
 
-check_out="$("$PYTHON" -m src.cli maint migrate --check 2>&1)"
+# The verdict is the first line on stdout; the CLI's own log lines go to stderr, kept
+# for the failure message only.
+check_err="$(mktemp)"
+check_out="$("$PYTHON" -m src.cli maint migrate --check 2>"$check_err")"
 check_rc=$?
-say "schema: $(printf '%s' "$check_out" | head -1)"
+check_stderr="$(cat "$check_err")"
+rm -f "$check_err"
+say "schema: $(printf '%s\n' "$check_out" | head -1)"
 if [ "$check_rc" -eq 3 ]; then
   timers="$(systemctl --user list-units --type=timer --state=active --plain --no-legend \
     'sb-*.timer' 2>/dev/null | awk '{print $1}' | tr '\n' ' ')"
@@ -113,7 +118,7 @@ if [ "$check_rc" -eq 3 ]; then
   restart_timers
   trap - EXIT
 elif [ "$check_rc" -ne 0 ]; then
-  say "FAILED: brain maint migrate --check exited $check_rc: $check_out"
+  say "FAILED: brain maint migrate --check exited $check_rc: $check_out $check_stderr"
   exit 1
 fi
 

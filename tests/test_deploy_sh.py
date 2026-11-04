@@ -55,7 +55,10 @@ exit 0
         venv / "python",
         f"""echo "python $*" >> {log}
 case "$*" in
-  *--check*) echo "store v41, code v42"; exit ${{CHECK_RC:-0}} ;;
+  *--check*)
+    # As on the VPS: the CLI's own INFO line on stderr comes first.
+    echo "[2026-11-04 13:02:06,876] INFO no systemd unit for this process" >&2
+    echo "store v41, code v42"; exit ${{CHECK_RC:-0}} ;;
   *migrate*) exit ${{MIGRATE_RC:-0}} ;;
 esac
 exit 0
@@ -180,3 +183,18 @@ def test_deploy_logs_to_the_data_home(host):
     _run(host)
     log = host["home"] / ".second-brain" / "logs" / "deploy.log"
     assert log.exists() and "deploy" in log.read_text()
+
+
+def test_the_schema_line_logs_the_checks_verdict_not_a_log_line(host):
+    proc, _ = _run(host, CHECK_RC="3")
+    assert proc.returncode == 0, proc.stderr
+    log = (host["home"] / ".second-brain" / "logs" / "deploy.log").read_text()
+    assert "schema: store v41, code v42" in log
+    assert "schema: [" not in log and "INFO no systemd unit" not in log
+
+
+def test_a_failed_check_logs_its_stderr(host):
+    proc, _ = _run(host, CHECK_RC="1")
+    assert proc.returncode != 0
+    log = (host["home"] / ".second-brain" / "logs" / "deploy.log").read_text()
+    assert "exited 1" in log and "INFO no systemd unit" in log

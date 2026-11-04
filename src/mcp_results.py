@@ -89,6 +89,7 @@ class ResultsResult(Fresh):
 
 @with_config(_OPEN)
 class PersonContext(Fresh, total=False):
+    page: dict[str, Any]
     person: dict[str, Any] | None
     resolved_by: str | None
     match_count: int
@@ -130,6 +131,7 @@ class TopicPage(Fresh, total=False):
 @with_config(_OPEN)
 class TopicContext(Fresh, total=False):
     topic_page: dict[str, Any]
+    page: dict[str, Any]
     topic: dict[str, Any] | None
     email_count: int
     recent_emails: Rows
@@ -208,6 +210,7 @@ class RecallResult(TypedDict):
     calendar_events: Rows
     person_context: NotRequired[dict[str, Any] | None]
     topic_context: NotRequired[dict[str, Any] | None]
+    pages: NotRequired[Rows]
 
 
 @with_config(_OPEN)
@@ -226,6 +229,7 @@ class StaleThreads(Fresh):
 class MeetingPrep(Fresh, total=False):
     attendees: Rows
     meetings: dict[str, Rows]
+    series_pages: Rows
     topic_context: dict[str, Any] | None
     reason: str
     coverage: Coverage

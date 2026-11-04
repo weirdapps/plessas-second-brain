@@ -366,6 +366,35 @@ def test_topic_pages_citing_forgotten_items_go(tmp_path, roots):
     assert [r[0] for r in conn.execute("SELECT topic FROM topic_pages")] == ["b"]
 
 
+def test_compiled_pages_citing_forgotten_items_lose_them(tmp_path, roots):
+    """Issue 169: a page that cited a forgotten item keeps none of its text; one that did
+    not keeps its synthesis."""
+    from src.store import pages
+
+    conn = _store(tmp_path / "brain.db", vectors=False)
+    old = _email(conn, roots, 1, OLD)
+    new = _email(conn, roots, 2, NEW)
+    for key, ref in (("conv1", f"email:{old['email']}"), ("conv2", f"email:{new['email']}")):
+        line = {"text": f"cites {ref}", "refs": [ref], "date": None}
+        skeleton = {"name": key, "facts": {}, "sections": {"status": [line]}}
+        conn.execute(
+            "INSERT INTO pages (kind, entity_key, generation, display_name, skeleton,"
+            " skeleton_at, synthesis, evidence_keys) VALUES ('thread', ?, 0, ?, ?, 'x', ?, ?)",
+            (key, key, json.dumps(skeleton), json.dumps([line]), json.dumps([ref])),
+        )
+    conn.commit()
+
+    result = retention.forget(conn, cutoff=CUTOFF, apply=True)
+
+    assert result.tables["pages"] == 1
+    held = dict(conn.execute("SELECT entity_key, synthesis FROM pages"))
+    assert "conv1" not in held or held["conv1"] is None
+    assert held["conv2"] is not None
+    assert pages.page_for_thread(conn, "conv1") is None or "email:" not in str(
+        pages.page_for_thread(conn, "conv1")["synthesis"]
+    )
+
+
 def test_only_the_sources_named(tmp_path, roots):
     conn = _store(tmp_path / "brain.db", vectors=False)
     _populate(conn, roots)

@@ -53,8 +53,8 @@ def gated(tmp_path):
 
 def test_it_is_gated_and_last():
     assert extraction_fields.NAME in GATED_MIGRATIONS
-    # After it, topic_registry (issue 180).
-    assert GATED_MIGRATIONS[-2:] == (extraction_fields.NAME, "topic_registry")
+    # After it, topic_registry (issue 180) and page_layer (issue 169).
+    assert GATED_MIGRATIONS[-3:] == (extraction_fields.NAME, "topic_registry", "page_layer")
 
 
 def test_the_numbered_migrations_leave_it_out(bare):

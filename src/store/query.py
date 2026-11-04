@@ -12,7 +12,7 @@ from collections.abc import Hashable
 from typing import Any
 
 from src.config import USER_EMAIL_PATTERN
-from src.store import envelope, ranking
+from src.store import envelope, pages, ranking
 from src.store.consolidate import current_sql, history_left_out, open_status_sql
 from src.store.cross_script import NameForms, name_forms
 from src.store.entities import entity_person_ids
@@ -1467,6 +1467,10 @@ def meeting_prep(
             continue
         dossier["resolved_name"] = person_row["name"]
         dossier["resolved_email"] = person_row["email"]
+        # Their compiled page (issue 169), when the page layer holds one.
+        person_page = pages.brief(pages.page_for_person(conn, person_row["id"]))
+        if person_page is not None:
+            dossier["page"] = person_page
         rows_of = json.dumps(entity_person_ids(conn, person_row["id"]))
 
         # One row per email, as in person_context: email_people is keyed by
@@ -1635,6 +1639,11 @@ def meeting_prep(
 
         result["topic_context"] = topic_ctx
 
+    # The pages of the meeting series these meetings belong to (issue 169).
+    series_pages = _series_pages(conn, result["meetings"])
+    if series_pages:
+        result["series_pages"] = series_pages
+
     # Each row says what it stands for (src/store/envelope.py): its email, or the email
     # a decision, fact or action was taken from; a meeting its own.
     for dossier in result["attendees"]:
@@ -1646,6 +1655,23 @@ def meeting_prep(
     for meetings in result["meetings"].values():
         envelope.calendar(conn, meetings)
     return result
+
+
+def _series_pages(conn: sqlite3.Connection, meetings: dict) -> list[dict]:
+    """The compiled pages of the series the listed meetings recur in, once each."""
+    ids = [m["id"] for rows in meetings.values() for m in rows if m.get("id") is not None]
+    if not ids or not pages.enabled(conn):
+        return []
+    masters = [
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT recurrence_master_id FROM calendar_events"
+            " WHERE id IN (SELECT value FROM json_each(?)) AND recurrence_master_id IS NOT NULL",
+            (json.dumps(ids),),
+        )
+    ]
+    found = (pages.brief(pages.page_for_series(conn, m)) for m in masters)
+    return [p for p in found if p is not None]
 
 
 # Replies Outlook sends for the owner when he answers a meeting invitation: the

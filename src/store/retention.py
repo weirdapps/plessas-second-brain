@@ -96,6 +96,9 @@ COVERED = frozenset(
         "conversation_turns",
         "conversation_topics",
         "topic_pages",
+        # The compiled pages (issue 169): every page citing a forgotten item loses its
+        # synthesis and is compiled again from what is left (pages.invalidate_refs).
+        "pages",
         "vectors",
     }
 )
@@ -128,6 +131,11 @@ KEPT = frozenset(
         "session_note_transcripts",
         "sharepoint_links",
         "findings",
+        # The page layer's bookkeeping: entity keys, ids and the owner's own corrections.
+        "page_generations",
+        "page_dirty",
+        "page_overrides",
+        "page_watermarks",
         "job_runs",
         "sync_metadata",
         "schema_version",
@@ -418,6 +426,7 @@ def _forgotten_refs(conn: sqlite3.Connection) -> set[str]:
         ("whatsapp", "_f_whatsapp_threads"),
         ("event", "_f_events"),
         ("meeting", "_f_events"),
+        ("calendar", "_f_events"),
         ("conversation", "_f_conversations"),
     ):
         refs |= {f"{prefix}:{r[0]}" for r in conn.execute(f"SELECT id FROM {temp}")}
@@ -620,6 +629,11 @@ def forget(
         pages = _delete_pages(conn, refs, cutoff)
         if pages:
             result.tables["topic_pages"] = pages
+        from src.store import pages as page_layer
+
+        compiled = page_layer.invalidate_refs(conn, refs)
+        if compiled:
+            result.tables["pages"] = compiled
         result.tables.update(figures)
         if vector_store.enabled(conn):
             result.vector_backend = "vectors table"

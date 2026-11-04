@@ -397,6 +397,10 @@ def get_person_context(
 
     teams = _person_teams(conn, person_id, cutoff, limit)
     whatsapp = _person_whatsapp(conn, person["name"], cutoff, limit)
+    # Their compiled page (issue 169, src/store/pages.py), when the page layer holds one.
+    from src.store import pages
+
+    page = pages.brief(pages.page_for_person(conn, person_id))
 
     del person["id"]
 
@@ -427,7 +431,8 @@ def get_person_context(
     )
     if left:
         out["history_left_out"] = left
-    return out
+    # The page first: compiled ahead of the question, cited, derived (the rows stay the evidence).
+    return {"page": page, **out} if page else out
 
 
 def _no_whatsapp() -> dict:
@@ -930,10 +935,19 @@ def topic_page_first(conn: sqlite3.Connection, out: dict) -> dict:
 
     A page (src/store/topic_pages.py) is a cited account of a live topic, written by a
     model from the store's items and rebuilt when new ones arrive. It is derived, so the
-    rows after it stay the evidence.
+    rows after it stay the evidence. With the page layer (issue 169), the topic's compiled
+    page goes first as `page` too.
     """
+    from src.store import pages
     from src.store.topic_pages import find_page
 
     topic = out.get("topic") or {}
     page = find_page(conn, topic.get("name") or "", fuzzy=False) if topic else None
+    # The topic's compiled page (issue 169): keyed on its canonical topic when placed.
+    compiled = None
+    if topic and pages.enabled(conn):
+        row = conn.execute("SELECT id FROM topics WHERE name = ?", (topic["name"],)).fetchone()
+        compiled = pages.brief(pages.page_for_topic(conn, row[0])) if row else None
+    if compiled:
+        out = {"page": compiled, **out}
     return {"topic_page": page, **out} if page else out

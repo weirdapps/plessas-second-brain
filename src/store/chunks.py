@@ -274,3 +274,47 @@ def chunk_texts(
     text = (row[0] if row else "") or ""
     title = filename or "none"
     return [f"title: {title} | text: {head}\n\n{text[start:end]}" for _no, start, end in spans]
+
+
+# --- email bodies and attachment copies (issue 171, a store whose vectors are in its table) ---
+
+
+def email_body(content: str | None, subject: str | None) -> str:
+    """The part of a body its chunks are cut from: the newest message when the quoted history
+    can be left out (src/extract/quotes.py, as the extraction does), the whole text when it
+    cannot (a forward, a short quote, no quote)."""
+    from src.extract.quotes import strip_quoted
+
+    body = strip_quoted(content, subject=subject)
+    return (body.newest if body.stripped else body.text) or ""
+
+
+def email_chunk_texts(subject, sender, date, summary, body: str, spans) -> list[str]:
+    """The text of each chunk vector of an email: 'title: <subject> | text: <sender>, <date>.
+    <summary>' as its contextual header, then the passage."""
+    meta = ", ".join(part for part in ((sender or "").strip(), (date or "")[:10]) if part)
+    summary = (summary or "").strip()
+    head = f"{meta}. {summary}" if meta and summary else meta or summary
+    title = (subject or "").strip() or "none"
+    return [f"title: {title} | text: {head}\n\n{body[start:end]}" for start, end in spans]
+
+
+def copy_attachments(conn: sqlite3.Connection, aids) -> set[int]:
+    """The attachments among `aids` whose bytes (sha256) an attachment of a lower id among them
+    already holds: of each file, the first is cut into vectors and the copies are not."""
+    aids = sorted(int(a) for a in aids)
+    if not aids:
+        return set()
+    import json
+
+    seen: set[str] = set()
+    copies: set[int] = set()
+    for aid, sha in conn.execute(
+        "SELECT id, sha256 FROM attachments WHERE id IN (SELECT value FROM json_each(?))"
+        " AND COALESCE(sha256, '') <> '' ORDER BY id",
+        (json.dumps(aids),),
+    ):
+        if sha in seen:
+            copies.add(int(aid))
+        seen.add(sha)
+    return copies

@@ -3238,6 +3238,10 @@ def main():
     from src.store import people_maint
 
     people_maint.add_maint_parsers(maint_subparsers)
+    # vectors-backfill (src/store/vector_backfill.py, issue 171).
+    from src.store import vector_backfill
+
+    vector_backfill.add_maint_parser(maint_subparsers)
     entities.add_maint_parser(maint_subparsers)
     topic_canon.add_maint_parser(maint_subparsers)
     # teams-repair, teams-empty-summaries (src/extract/teams_repair.py) and news-dedup

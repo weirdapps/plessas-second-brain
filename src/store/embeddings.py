@@ -25,14 +25,21 @@ import time
 import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 
 from src.config import DATA_ROOT, embed_backend
 from src.store import vector_store
-from src.store.chunks import chunk_texts, plan_chunks
+from src.store.chunks import (
+    chunk_texts,
+    copy_attachments,
+    email_body,
+    email_chunk_texts,
+    plan_chunks,
+    split_text,
+)
 from src.store.schema import SUMMARISED_ATTACHMENT_IDS_SQL
 from src.store.source_class import hidden_ids_sql, with_source_class
 
@@ -104,6 +111,27 @@ CHUNK_TEXTS_PER_PASS = 3_000
 # onto its attachment's summary vector (-attachment_content.id) by arithmetic alone.
 CHUNK_ID_OFFSET = -1_000_000_000_000
 CHUNK_STRIDE = 1_000
+
+# The passages of email bodies (issue 171), only in a store whose vectors are in its table,
+# live below every other namespace: an email chunk's id is
+# EMAIL_CHUNK_ID_OFFSET - (emails.id * CHUNK_STRIDE + chunk_no), so its email is read off its
+# id, and attachment chunks own (EMAIL_CHUNK_ID_OFFSET, CHUNK_ID_OFFSET].
+EMAIL_CHUNK_ID_OFFSET = -(2**62)
+# The newest message of a body (quoted history left out) shorter than this is left to the
+# email's summary vector: 845 emails a month passed it on the owner's store (2026-10),
+# about 1,660 chunks.
+EMAIL_CHUNK_MIN_CHARS = 2_000
+# The classes whose bodies are chunked: news and the owner's automation mail are left out of
+# search by default, and their bodies are the same report again and again.
+EMAIL_CHUNK_CLASSES = ("mail", "document")
+# The sync_metadata key of the highest email id the hourly pass has looked at for chunks;
+# mail below it waits for `brain maint vectors-backfill`.
+EMAIL_CHUNKS_UPTO_KEY = "email_chunks_upto"
+# Summaries in a store whose vectors are in its table are embedded at this width
+# (Matryoshka): its first 768 dimensions, scaled to unit length, are the 768-dimension vector
+# (cosine 1.000000 on three texts, 2026-11-04), so they are searched beside the older 768
+# rows by that prefix, and a later re-embed (vectors-backfill --summaries) lifts the rest.
+TABLE_SUMMARY_DIM = 1536
 
 # In-process cache of the embedding index, keyed by file mtime. query_semantic and
 # the hybrid-recall candidate helper both hit this, so a long-lived process (the MCP
@@ -661,6 +689,8 @@ def _rows_of(result, n: int, space: dict, where: str) -> np.ndarray:
             "refusing to misalign the index"
         )
     rows = np.asarray([emb.values for emb in returned], dtype=np.float32)
+    # gemini-embedding-2 returns 1536 unnormalised too (norm 1.18, 2026-11-04); its rows go
+    # to the vectors table, which keeps a direction and scales each row at load.
     if space["model"] == LEGACY_MODEL and int(space["dim"]) < NATIVE_DIM and rows.size:
         norms = np.linalg.norm(rows, axis=1, keepdims=True)
         norms[norms == 0] = 1
@@ -906,13 +936,35 @@ def chunk_of(vector_id: int) -> tuple[int, int]:
     return divmod(CHUNK_ID_OFFSET - int(vector_id), CHUNK_STRIDE)
 
 
+def email_chunk_vector_id(email_id: int, chunk_no: int) -> int:
+    """The index id of chunk `chunk_no` of the body of email `email_id`."""
+    return EMAIL_CHUNK_ID_OFFSET - (int(email_id) * CHUNK_STRIDE + int(chunk_no))
+
+
+def email_chunk_of(vector_id: int) -> tuple[int, int]:
+    """(emails.id, chunk_no) of an email chunk vector's id."""
+    return divmod(EMAIL_CHUNK_ID_OFFSET - int(vector_id), CHUNK_STRIDE)
+
+
+def is_attachment_chunk(vector_id: int) -> bool:
+    return EMAIL_CHUNK_ID_OFFSET < int(vector_id) <= CHUNK_ID_OFFSET
+
+
+def is_email_chunk(vector_id: int) -> bool:
+    return int(vector_id) <= EMAIL_CHUNK_ID_OFFSET
+
+
 def _parents(ids: np.ndarray) -> np.ndarray:
-    """Each vector's item: a chunk's attachment summary id (-attachment_content.id), every
-    other vector's own id. `ids` itself when the index holds no chunk."""
+    """Each vector's item: an attachment chunk's attachment summary id
+    (-attachment_content.id), an email chunk's email id, every other vector's own id. `ids`
+    itself when the index holds no chunk."""
     if not len(ids) or ids.min() > CHUNK_ID_OFFSET:
         return ids
-    chunk = ids <= CHUNK_ID_OFFSET
-    return np.where(chunk, -((CHUNK_ID_OFFSET - ids) // CHUNK_STRIDE), ids)
+    out = np.where(ids <= CHUNK_ID_OFFSET, -((CHUNK_ID_OFFSET - ids) // CHUNK_STRIDE), ids)
+    email = ids <= EMAIL_CHUNK_ID_OFFSET
+    if email.any():
+        out = np.where(email, (EMAIL_CHUNK_ID_OFFSET - ids) // CHUNK_STRIDE, out)
+    return out
 
 
 # --- the items of each kind --------------------------------------------------------------
@@ -993,6 +1045,102 @@ def summary_items(conn: sqlite3.Connection, space: dict) -> list[tuple[int, str]
     items += [(TEAMS_THREAD_ID_OFFSET - tid, text) for tid, text in _teams_rows(conn, space)]
     items += [(WHATSAPP_THREAD_ID_OFFSET - tid, text) for tid, text in _whatsapp_rows(conn, space)]
     return items
+
+
+class EmailChunks:
+    """The chunks of the bodies of a run of emails, in id order, and how far a pass may move
+    the watermark (EMAIL_CHUNKS_UPTO_KEY) once it knows which chunks it embedded: past every
+    email whose chunks are all in, and no further than the first one that is not."""
+
+    def __init__(self, upto: int | None, examined: list[tuple[int, list[int]]], pairs):
+        self.upto = upto
+        self.examined = examined
+        self.pairs = pairs
+
+    def advance(self, conn: sqlite3.Connection, embedded: set[int]) -> None:
+        mark = self.upto
+        for email_id, vids in self.examined:
+            if any(v not in embedded for v in vids):
+                break
+            mark = email_id
+        if mark is not None and mark != self.upto:
+            conn.execute(
+                "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES (?, ?)",
+                (EMAIL_CHUNKS_UPTO_KEY, str(mark)),
+            )
+            conn.commit()
+
+
+def _email_chunk_rows(conn: sqlite3.Connection, where: str, args: tuple, order: str):
+    classes = ", ".join(f"'{c}'" for c in EMAIL_CHUNK_CLASSES)
+    return conn.execute(
+        "SELECT id, subject, sender_name, date_received, summary, content FROM emails"
+        f" WHERE COALESCE(summary, '') <> '' AND COALESCE(source_class, 'mail') IN ({classes})"
+        f" AND {where} ORDER BY id {order}",
+        args,
+    )
+
+
+def email_chunk_pairs(row) -> list[tuple[int, str]]:
+    """(vector id, text) of the chunks of one email row; none for a short body."""
+    body = email_body(row["content"], row["subject"])
+    if len(body) <= EMAIL_CHUNK_MIN_CHARS:
+        return []
+    spans = split_text(body)
+    texts = email_chunk_texts(
+        row["subject"], row["sender_name"], row["date_received"], row["summary"], body, spans
+    )
+    return [(email_chunk_vector_id(row["id"], no), t) for no, t in enumerate(texts)]
+
+
+def new_email_chunks(conn: sqlite3.Connection, space: dict, cap: int) -> EmailChunks:
+    """The chunks of the mail that came since the watermark, at most `cap` texts. With no
+    watermark yet, the mail received since the gated step `vectors` (a day of slack): the rest
+    of the history is `maint vectors-backfill`'s."""
+    row = conn.execute(
+        "SELECT value FROM sync_metadata WHERE key = ?", (EMAIL_CHUNKS_UPTO_KEY,)
+    ).fetchone()
+    if row is not None:
+        upto: int | None = int(row[0])
+        rows = _email_chunk_rows(conn, "id > ?", (upto,), "ASC")
+    else:
+        applied = conn.execute(
+            "SELECT applied_at FROM gated_migrations WHERE name = ?", (vector_store.NAME,)
+        ).fetchone()
+        since = (datetime.fromisoformat(applied[0]) - timedelta(days=1)).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        upto = None
+        rows = _email_chunk_rows(conn, "substr(date_received, 1, 19) >= ?", (since,), "ASC")
+    held = {email_chunk_of(v)[0] for v in vector_store.held_ids_of_kind(conn, "email_chunk")}
+    examined: list[tuple[int, list[int]]] = []
+    pairs: list[tuple[int, str]] = []
+    for r in rows:
+        mine = [] if r["id"] in held else email_chunk_pairs(r)
+        if pairs and len(pairs) + len(mine) > cap:
+            break
+        examined.append((int(r["id"]), [v for v, _t in mine]))
+        pairs += mine
+    if row is None and not examined:
+        top = conn.execute("SELECT MAX(id) FROM emails").fetchone()[0]
+        upto = int(top) if top is not None else None
+        if upto is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES (?, ?)",
+                (EMAIL_CHUNKS_UPTO_KEY, str(upto)),
+            )
+            conn.commit()
+    return EmailChunks(upto, examined, pairs)
+
+
+def email_chunk_span(conn: sqlite3.Connection, email_id: int, chunk_no: int):
+    """(start, end) of chunk `chunk_no` in the body its chunks were cut from, read again from
+    the email (the cut is deterministic); None when it is gone."""
+    row = conn.execute("SELECT subject, content FROM emails WHERE id = ?", (email_id,)).fetchone()
+    if row is None:
+        return None
+    spans = split_text(email_body(row[1], row[0]))
+    return spans[chunk_no] if 0 <= chunk_no < len(spans) else None
 
 
 def chunk_ids(plan) -> set[int]:
@@ -1095,16 +1243,27 @@ def build_index(
     chunk_pairs: list[tuple[int, str]] = []
     gone_chunks: set[int] = set()
     deadline = None
+    table = vector_store.enabled(conn)
+    email_chunks: EmailChunks | None = None
     if chunks_wanted(space):
         if chunk_deadline_s is not None:
             deadline = time.monotonic() + chunk_deadline_s
+        if table and not force:
+            # The bodies of the mail that came since the last pass, first: a few a pass.
+            email_chunks = new_email_chunks(conn, space, CHUNK_TEXTS_PER_PASS)
+            chunk_pairs += email_chunks.pairs
         plan = _plan_chunks(conn, deadline)
         if plan is not None:
             wanted = chunk_ids(plan)
             recut = {plan.content[a] for a in plan.changed}
-            held = {v for v in existing_ids if v <= CHUNK_ID_OFFSET}
+            held = {v for v in existing_ids if is_attachment_chunk(v)}
             gone_chunks = {v for v in held if v not in wanted or chunk_of(v)[0] in recut}
             missing = {v for v in wanted if v not in held or v in gone_chunks}
+            if table:
+                # Of the copies of one file (sha256), only the first is cut into vectors; the
+                # vectors a copy already holds wait for `maint vectors-backfill`.
+                copied = {plan.content[a] for a in copy_attachments(conn, plan.spans)}
+                missing = {v for v in missing if chunk_of(v)[0] not in copied}
             aids = sorted(
                 (
                     a
@@ -1121,6 +1280,8 @@ def build_index(
                 _log(f"{plan.deferred} documents wait for the next pass to be cut into chunks")
 
     if not to_embed and not chunk_pairs and not gone_chunks:
+        if email_chunks is not None:
+            email_chunks.advance(conn, set())
         _log("All emails and attachments already have embeddings.")
         return 0
 
@@ -1128,6 +1289,10 @@ def build_index(
 
     client = _get_client()
     ids = [t[0] for t in to_embed]
+    if table:
+        return _embed_into_table(
+            conn, client, space, to_embed, chunk_pairs, deadline, gone_chunks, force, email_chunks
+        )
     with in_space(space):
         new_vectors = (
             generate_embeddings([t[1] for t in to_embed], client)
@@ -1144,9 +1309,6 @@ def build_index(
                     np.vstack([new_vectors, chunk_vectors]) if len(new_vectors) else chunk_vectors
                 )
     offered = {**space, "dim": _width(new_vectors) or int(space["dim"])}
-
-    if vector_store.enabled(conn):
-        return _save_to_table(conn, ids, new_vectors, offered, gone_chunks, force)
 
     with _index_lock():
         # A force rebuild rewrites the file from what this function owns
@@ -1204,42 +1366,89 @@ def build_index(
     return len(ids)
 
 
-def _save_to_table(
-    conn: sqlite3.Connection, ids: list[int], vectors, space: dict, gone_chunks: set[int], force
+def summary_space(space: dict, table: bool) -> dict:
+    """The space summaries are embedded in: TABLE_SUMMARY_DIM wide in a store whose vectors are
+    in its table and in this code's model, else the index's own."""
+    if table and space.get("model") == EMBEDDING_MODEL and int(space["dim"]) < TABLE_SUMMARY_DIM:
+        return {**space, "dim": TABLE_SUMMARY_DIM}
+    return space
+
+
+def _same_family(held: dict, offered: dict) -> None:
+    """In the table a row keeps its own width, so model, task and template must match, not
+    the dimension."""
+    keys = ("model", "task", "template")
+    if any(held.get(k) != offered.get(k) for k in keys):
+        _refuse_mix(held, offered)
+
+
+def _embed_into_table(
+    conn, client, space, to_embed, chunk_pairs, deadline, gone_chunks, force, email_chunks
 ) -> int:
-    """build_index's save on a store whose vectors are in its table: the rows it made, added in
-    one transaction, less those another writer added meanwhile; the chunk and conversation
-    vectors no row stands for any more, deleted. A force pass starts the table over."""
+    """build_index for a store whose vectors are in its table: the summaries at
+    summary_space, the chunks at the index's width, each saved as rows of their own width."""
+    with in_space(summary_space(space, True)):
+        summaries = (
+            generate_embeddings([t[1] for t in to_embed], client)
+            if to_embed
+            else np.empty((0, 0), dtype=np.float32)
+        )
+    with in_space(space):
+        done_chunks: list[int] = []
+        chunk_vectors = np.empty((0, 0), dtype=np.float32)
+        if chunk_pairs:
+            chunk_vectors = _embed_until([t[1] for t in chunk_pairs], client, deadline)
+            if len(chunk_vectors) < len(chunk_pairs):
+                _log(f"{len(chunk_pairs) - len(chunk_vectors)} chunks wait for the next pass")
+            done_chunks = [p[0] for p in chunk_pairs[: len(chunk_vectors)]]
+    groups = [([t[0] for t in to_embed], summaries), (done_chunks, chunk_vectors)]
+    saved = _save_to_table(conn, groups, space, gone_chunks, force)
+    if email_chunks is not None:
+        email_chunks.advance(conn, set(done_chunks))
+    return saved
+
+
+def _save_to_table(
+    conn: sqlite3.Connection, groups, space: dict, gone_chunks: set[int], force
+) -> int:
+    """build_index's save on a store whose vectors are in its table: each group of (ids,
+    vectors) added in one transaction, less the ids another writer added meanwhile; the chunk
+    and conversation vectors no row stands for any more, deleted. A force pass starts the
+    table over."""
     if conn.in_transaction:
         conn.commit()
+    template = int(space["template"])
+    total = sum(len(ids) for ids, _v in groups)
     conn.execute("BEGIN IMMEDIATE")
     try:
+        stored = vector_store.stored_space(conn)
+        if stored is not None and total:
+            _same_family(stored, space)
         if force:
-            vector_store.replace_all(conn, ids, vectors, int(space["template"]))
+            conn.execute("DELETE FROM vectors")
+            present: set[int] = set()
         else:
-            stored = vector_store.stored_space(conn)
-            if stored is not None and len(vectors):
-                _merge_space(stored, int(stored.get("dim") or 0), space)
             present = vector_store.held_ids(conn) - gone_chunks
-            fresh = [i for i, vid in enumerate(ids) if vid not in present]
-            gone_conversations = _conversation_vectors_gone(
-                conn, sorted(present) + [ids[i] for i in fresh]
-            )
-            fresh = [i for i in fresh if ids[i] not in gone_conversations]
-            gone = gone_conversations | gone_chunks
-            if gone:
-                _log(f"Dropping {len(gone)} vectors of items no longer stored or cut again")
-                vector_store.delete(conn, gone, with_chunks=False)
-            vector_store.write(
-                conn, [ids[i] for i in fresh], np.asarray(vectors)[fresh], int(space["template"])
-            )
+        new_ids = [vid for ids, _v in groups for vid in ids if vid not in present]
+        gone = gone_chunks | (
+            set() if force else _conversation_vectors_gone(conn, sorted(present) + new_ids)
+        )
+        if gone and not force:
+            _log(f"Dropping {len(gone)} vectors of items no longer stored or cut again")
+            vector_store.delete(conn, gone, with_chunks=False)
+        for ids, vectors in groups:
+            fresh = [i for i, vid in enumerate(ids) if vid not in present and vid not in gone]
+            if fresh:
+                vector_store.write(
+                    conn, [ids[i] for i in fresh], np.asarray(vectors)[fresh], template
+                )
         conn.commit()
     except BaseException:
         conn.rollback()
         raise
-    _log(f"Saved {len(ids)} embeddings to the vectors table")
-    _record_space(conn, space)
-    return len(ids)
+    _log(f"Saved {total} embeddings to the vectors table")
+    _record_space(conn, {**space, "dim": int(space["dim"])} if stored is None else stored)
+    return total
 
 
 def _conversation_vectors_gone(conn: sqlite3.Connection, ids) -> set[int]:
@@ -1273,9 +1482,11 @@ def _kind_mask(ids, kinds) -> np.ndarray:
     """
     mask = np.zeros(len(ids), dtype=bool)
     if "email" in kinds:
-        mask |= ids > 0
+        mask |= (ids > 0) | (ids <= EMAIL_CHUNK_ID_OFFSET)
     if "attachment" in kinds:
-        mask |= ((ids < 0) & (ids > CONVERSATION_ID_OFFSET)) | (ids <= CHUNK_ID_OFFSET)
+        mask |= ((ids < 0) & (ids > CONVERSATION_ID_OFFSET)) | (
+            (ids <= CHUNK_ID_OFFSET) & (ids > EMAIL_CHUNK_ID_OFFSET)
+        )
     if "conversation" in kinds:
         mask |= (ids <= CONVERSATION_ID_OFFSET) & (ids > TEAMS_THREAD_ID_OFFSET)
     if "teams_thread" in kinds:
@@ -1561,7 +1772,7 @@ def query_semantic(
     )
     top_indices = _top_indices(similarities, ids, limit, kinds, allowed_ids, excluded)
     spans = _chunk_spans(
-        conn, (chunk_of(int(ids[i])) for i in top_indices if int(ids[i]) <= CHUNK_ID_OFFSET)
+        conn, (chunk_of(int(ids[i])) for i in top_indices if is_attachment_chunk(int(ids[i])))
     )
 
     # Fetch details (positive IDs = emails, negative IDs = attachments)
@@ -1570,20 +1781,25 @@ def query_semantic(
         item_id = int(ids[idx])
         similarity = float(similarities[idx])
 
-        if item_id > 0:
-            # Email
+        if item_id > 0 or is_email_chunk(item_id):
+            # Email, or a passage of its body shown as the email
+            email_id, chunk_no = (item_id, None) if item_id > 0 else email_chunk_of(item_id)
             row = conn.execute(
                 """
                 SELECT id as email_id, date_received as date, subject, summary
                 FROM emails WHERE id = ?
             """,
-                (item_id,),
+                (email_id,),
             ).fetchone()
 
             if row:
                 result = dict(row)
                 result["type"] = "email"
                 result["similarity"] = round(similarity, 4)
+                if chunk_no is not None:
+                    span = email_chunk_span(conn, email_id, chunk_no)
+                    if span is not None:
+                        result.update(chunk_fields(chunk_no, span[0], span[1]))
                 results.append(result)
         elif item_id <= CHUNK_ID_OFFSET:
             # A passage of an attachment, shown as its attachment
@@ -1697,6 +1913,8 @@ def _vector_id_to_email_id(conn: sqlite3.Connection, item_id: int) -> int | None
     """
     if item_id > 0:
         return item_id
+    if is_email_chunk(item_id):
+        return email_chunk_of(item_id)[0]
     if item_id <= CHUNK_ID_OFFSET:
         item_id = -chunk_of(item_id)[0]
     elif item_id <= CONVERSATION_ID_OFFSET:
@@ -1776,7 +1994,7 @@ def _other_kinds(
         int(ids[i])
         for i in _top_indices(similarities, ids, limit, {"attachment"}, excluded_ids=hidden)
     ]
-    texts = [chunk_of(v)[0] if v <= CHUNK_ID_OFFSET else -v for v in best]
+    texts = [chunk_of(v)[0] if is_attachment_chunk(v) else -v for v in best]
     if texts:
         attachment_of = dict(
             conn.execute(
@@ -1788,7 +2006,7 @@ def _other_kinds(
         found["attachment"] = list(
             dict.fromkeys(attachment_of[t] for t in texts if t in attachment_of)
         )
-        spans = _chunk_spans(conn, (chunk_of(v) for v in best if v <= CHUNK_ID_OFFSET))
+        spans = _chunk_spans(conn, (chunk_of(v) for v in best if is_attachment_chunk(v)))
         for (_content_id, chunk_no), (attachment_id, start, end) in spans.items():
             chunks[attachment_id] = chunk_fields(chunk_no, start, end)
     for kind, vector_kind, offset in (
@@ -1830,7 +2048,7 @@ def _append_to_index(
     if conn is not None and vector_store.enabled(conn):
         stored = vector_store.stored_space(conn)
         if stored is not None:
-            _merge_space(stored, int(stored.get("dim") or 0), space)
+            _same_family(stored, space)
         vector_store.write(conn, ids, vectors, int(space["template"]))
         conn.commit()
         return space
@@ -1932,7 +2150,7 @@ def build_teams_index(conn, force: bool = False, limit: int = 0) -> int:
 
     ids = [p[0] for p in pairs]
     texts = [p[1] for p in pairs]
-    with in_space(space):
+    with in_space(summary_space(space, vector_store.enabled(conn))):
         vecs = generate_embeddings(texts)
 
     # Persist to embeddings.npz alongside email/conversation entries.
@@ -2029,7 +2247,7 @@ def build_whatsapp_index(conn, force: bool = False, limit: int = 0) -> int:
         pairs = pairs[:limit]
     if not pairs:
         return 0
-    with in_space(space):
+    with in_space(summary_space(space, vector_store.enabled(conn))):
         vecs = generate_embeddings([p[1] for p in pairs])
     saved = _append_to_index(
         ids=[WHATSAPP_THREAD_ID_OFFSET - p[0] for p in pairs], vectors=vecs, space=space, conn=conn

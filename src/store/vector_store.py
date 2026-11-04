@@ -7,7 +7,8 @@ that searches loads its own copy. The step moves it into brain.db, one row per v
 - `id` is the index id, in the namespaces embeddings.py gives them (emails positive,
   attachments negative, conversations, Teams, WhatsApp and chunks below their offsets);
 - `kind` and `parent_id` say what the vector stands for: a chunk's parent is its
-  attachment's summary vector, every other vector is its own parent;
+  attachment's summary vector, every other vector is its own parent (`email_chunk`, a
+  passage of an email's body, is the kind the next part of issue 171 writes);
 - `vec` is the vector in int8, one byte a dimension, scaled to its own largest component
   (quantise): the cosine of a vector with its int8 copy is above 0.9997 (all 247,833 of
   the owner's, measured 2026-11-04);
@@ -45,8 +46,8 @@ WRITE_BLOCK = 5_000
 
 TABLE = """CREATE TABLE IF NOT EXISTS vectors (
     id INTEGER PRIMARY KEY,
-    kind TEXT NOT NULL CHECK (kind IN
-        ('email', 'attachment', 'chunk', 'conversation', 'teams_thread', 'whatsapp_thread')),
+    kind TEXT NOT NULL CHECK (kind IN ('email', 'attachment', 'chunk', 'email_chunk',
+        'conversation', 'teams_thread', 'whatsapp_thread')),
     parent_id INTEGER NOT NULL,
     dim INTEGER NOT NULL,
     template INTEGER NOT NULL,

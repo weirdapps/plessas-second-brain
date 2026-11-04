@@ -39,6 +39,7 @@ from src.cli import main as cli_main
 # 210s reserve (max_call 120 + shutdown grace 90) is held back.
 UNIT_TIMEOUT_AND_BUDGET = {
     "sb-attachments": (3600, 3390),
+    "sb-backfill": (3600, 3390),
     "sb-calendar-sync": (900, 690),
     "sb-conversation-sync": (900, 690),
     "sb-daily-sync": (1800, 1590),
@@ -221,12 +222,13 @@ def test_every_scheduled_unit_has_a_positive_margin():
 
 
 def test_only_the_long_units_can_fund_a_token_push_wait():
-    """Six units can afford the wait, five cannot. The split is the point of the port.
+    """Seven units can afford the wait, five cannot. The split is the point of the port.
 
-    CAPABILITY, NOT PRACTICE. This is the set whose BUDGET clears the bar. Each of the six
+    CAPABILITY, NOT PRACTICE. This is the set whose BUDGET clears the bar. Each of the seven
     has a wrapper that runs src.cli (`grep -c src.cli scripts/wrappers/systemd/<wrapper>`
-    returns 6, 2, 1, 2, 1 and 1 for sb-attachment-pass, sb-daily-sync, sb-news-sync,
-    sb-noon-catchup, sb-pages and sb-topic-pages), so the hook that installs PTS_LLM_DEADLINE runs for every one of them
+    returns 6, 1, 2, 1, 2, 1 and 1 for sb-attachment-pass, sb-backfill, sb-daily-sync,
+    sb-news-sync, sb-noon-catchup, sb-pages and sb-topic-pages; sb-backfill's one line is
+    the function every one of its four calls goes through), so the hook that installs PTS_LLM_DEADLINE runs for every one of them
     and the table is not a claim about production that nobody checked. Until 2026-10-07 two
     more units cleared the bar. sb-reverse-ingest ran src.cli. sb-curate-docs cleared it on
     paper and never got that budget: its wrapper called scripts/curate_documents_daily.py
@@ -235,7 +237,7 @@ def test_only_the_long_units_can_fund_a_token_push_wait():
 
     Would this pass with the behaviour removed? No. Under today's flat 900s default,
     900 < 1140, so NO unit funds a wait and the qualifying set is empty rather than
-    these six. Under a per-unit budget it is exactly these six.
+    these seven. Under a per-unit budget it is exactly these seven.
     """
     funds_wait = {
         unit
@@ -245,6 +247,7 @@ def test_only_the_long_units_can_fund_a_token_push_wait():
     }
     assert funds_wait == {
         "sb-attachments",
+        "sb-backfill",
         "sb-daily-sync",
         "sb-news-sync",
         "sb-noon-catchup",

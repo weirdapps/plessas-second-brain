@@ -83,6 +83,7 @@ from src.llm_policy import MAX_ATTEMPTS, ROW_CAPS, backoff
 # starting no page after 1500 s.
 _UNIT_TIMEOUT_SECONDS: dict[str, int] = {
     "sb-attachments": 3600,
+    "sb-backfill": 3600,
     "sb-calendar-sync": 900,
     "sb-conversation-sync": 900,
     "sb-daily-sync": 1800,

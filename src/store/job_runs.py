@@ -147,7 +147,11 @@ def record(job: str, db_path: str) -> Generator[Run]:
         status = "ok" if code == 0 else "failed"
         raise
     except BaseException as exc:
-        status, code, error = "failed", 1, f"{type(exc).__name__}: {exc}"[:2000]
+        # The row replicates and is readable through sql_query: credentials masked, and
+        # the text kept short, since an exception can quote what it failed on.
+        from src.redact import redact_secrets
+
+        status, code, error = "failed", 1, redact_secrets(f"{type(exc).__name__}: {exc}")[:500]
         raise
     finally:
         finished = _now()

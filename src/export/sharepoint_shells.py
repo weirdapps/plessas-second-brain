@@ -152,12 +152,12 @@ def retire(conn: sqlite3.Connection, found: dict[str, list[int]]) -> dict:
 
 def cmd(args) -> int:
     """`brain maint sharepoint-shells [--apply]`: a dry run unless --apply."""
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     conn = get_connection(str(args.db))
     try:
         if args.apply:
-            run_migrations(conn)
+            ensure_schema(conn)
         found = classify(conn)
         print(f"sharepoint-shells {'APPLIED' if args.apply else 'DRY RUN (nothing written)'}:")
         for name, label in (

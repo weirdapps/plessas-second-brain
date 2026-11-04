@@ -436,8 +436,9 @@ def set_schema_version(conn: sqlite3.Connection, version: int) -> None:
 def run_migrations(conn: sqlite3.Connection, gated: bool = False) -> None:
     """Run all pending migrations based on schema version.
 
-    Every job that writes calls this on opening the store, so a numbered migration merged
-    reaches the producer's store at its next pull. The gated ones (GATED_MIGRATIONS) are
+    `brain maint migrate` calls this (from scripts/deploy.sh after a pull), and
+    create_database on a new store; a job calls ensure_schema, which refuses a store this
+    would migrate (issue 173). The gated ones (GATED_MIGRATIONS) are
     named, not numbered: they run only with `gated`, which `brain maint migrate
     --apply-gated` and create_database pass, and whether they are applied is recorded in
     gated_migrations, not in schema_version. So a numbered migration added later runs on a
@@ -531,12 +532,40 @@ def run_migrations(conn: sqlite3.Connection, gated: bool = False) -> None:
     if current < 41:
         migrate_received_times_utc(conn)
         migrate_mail_hygiene(conn)
+    if current < 42:
+        migrate_add_job_runs(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
     if gated:
         apply_gated(conn, owner=False)
         conn.commit()
+
+
+class SchemaBehind(RuntimeError):
+    """The store is at an older numbered version than the code (issue 173)."""
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """What a job calls on opening the store: refuse a store the code is ahead of.
+
+    The numbered migrations run once per release, from scripts/deploy.sh (`brain maint
+    migrate`) with the sb-* timers stopped, not from whichever job opens the store first
+    after a pull. So a job that finds the store behind stops, naming both versions, and
+    changes nothing; the deploy migrates it. BRAIN_MIGRATE_ON_OPEN=1 brings back the
+    migration on open for a host with no deploy step. A store at the code's version, or
+    ahead of it (code rolled back), opens as before.
+    """
+    import os
+
+    current = get_schema_version(conn)
+    if current < CURRENT_SCHEMA_VERSION and os.environ.get("BRAIN_MIGRATE_ON_OPEN") != "1":
+        raise SchemaBehind(
+            f"the store is at schema v{current} and the code at v{CURRENT_SCHEMA_VERSION}: "
+            "jobs do not migrate. Run scripts/deploy.sh (or `brain maint migrate` with the "
+            "sb-* timers stopped); BRAIN_MIGRATE_ON_OPEN=1 migrates on open instead."
+        )
+    run_migrations(conn)
 
 
 # --- gated migrations ---------------------------------------------------------------------
@@ -1273,6 +1302,39 @@ def migrate_add_item_state(conn: sqlite3.Connection) -> None:
         )"""
     )
     conn.commit()
+
+
+def migrate_add_job_runs(conn: sqlite3.Connection) -> None:
+    """v42: job_runs, one row per job run and one per stage of it (issue 173).
+
+    `brain <command>` opens a run (stage 'run', status 'running' until it ends, so a run
+    killed by its unit's timeout stays visible), the stages a job marks close one another,
+    and every Claude call's tokens are added to the run and to the stage it fell in; the
+    usage log (llm-usage-*.jsonl) carries the same run_id. src/store/job_runs.py writes it.
+    An empty table: milliseconds, and running it again changes nothing.
+    """
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS job_runs (
+            id INTEGER PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            job TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            status TEXT NOT NULL CHECK (status IN ('running', 'ok', 'failed')),
+            exit_code INTEGER,
+            error TEXT,
+            llm_calls INTEGER NOT NULL DEFAULT 0,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            host TEXT,
+            pid INTEGER,
+            UNIQUE (run_id, stage)
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_job_runs_job_started ON job_runs(job, started_at)")
 
 
 def migrate_add_directory(conn: sqlite3.Connection) -> None:

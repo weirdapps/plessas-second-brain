@@ -1135,31 +1135,54 @@ it at batch rates.
 
 ## 12. Upgrading a producer
 
-A `git pull` changes the code and nothing else. After one, on the producer:
+A `git pull` changes the code and nothing else. `scripts/deploy.sh` does the rest, as one
+reconciliation: run it from the checkout after a pull (the reference deployment's hourly
+pull runs it as the repository's hook whenever new commits arrive), and run it again at
+any time, since a second run changes nothing. In order, it stops at the first step that
+fails and exits non-zero, and logs to `~/.second-brain/logs/deploy.log`:
 
-1. `uv sync --frozen` when `uv.lock` changed (with `UV_PROJECT_ENVIRONMENT` set for
-   a venv outside the checkout, section 2).
-2. `systemctl --user try-restart sb-mcp.service`, if you run it: the HTTP server
-   keeps serving the code it started with (section 9). A scheduled job starts the
-   new code on its next run.
-3. Install each wrapper the pull changed:
-   `install -m 755 scripts/wrappers/systemd/<name>.sh ~/.local/bin/`
-   (`scripts/wrappers/README.md`). Until then the timers run the old copy, and the
-   nightly report lists it under WRAPPER DRIFT.
-4. The schema. A new version applies when the first job that writes opens the
-   store (`sync`, `teams-sync`, `whatsapp-sync`, `calendar-sync`,
-   `process-sharepoint`, `load` and most one-off commands), or by hand with
-   `python -m src.cli maint migrate`. Readers never migrate: `brain tool`, the MCP
-   server and a replica read the file as it is, and a replica gets the new version
-   with its next pull. Most migrations take well under a second and need nothing
-   stopped. The few that rewrite many rows or index a large table want the timers
-   stopped while they run (the notes below say which):
-   `systemctl --user stop 'sb-*.timer'`, let the running `sb-*` jobs exit, pull,
-   `python -m src.cli maint migrate`, then `systemctl --user start 'sb-*.timer'`.
-   A host that pulls on a schedule of its own (a hook or a timer) needs that
-   schedule held as well, or its next pull is migrated by whichever job starts
-   first, with the timers running.
-5. The one-off commands the release lists, below.
+1. `uv sync --frozen --no-dev --inexact` into `UV_PROJECT_ENVIRONMENT`
+   (`~/.venvs/second-brain` when unset, the venv the wrappers run; section 2).
+2. Each wrapper in `scripts/wrappers/systemd/` whose installed copy in `~/.local/bin`
+   differs (`cmp`) is installed with `install -m 755` (`scripts/wrappers/README.md`). One
+   with no installed copy has no unit yet: it is named in the log and left for you,
+   with its unit.
+3. The schema, once, when `python -m src.cli maint migrate --check` says the store is
+   behind the code (exit 3): the active `sb-*.timer`s are stopped, the running `sb-*`
+   jobs are let finish (up to `SB_DEPLOY_WAIT_SECONDS`, 900 by default; past that the
+   migration is held and the deploy fails), `python -m src.cli maint migrate` runs, and
+   the same timers start again whatever happened. Numbered migrations only: a **gated**
+   one is never applied here (`brain maint migrate --apply-gated --backup PATH`, after
+   `--dry-run`, is the owner's step), and `--check` names the gated ones still waiting.
+4. `systemctl --user try-restart sb-mcp.service`, when the unit exists: the HTTP server
+   keeps serving the code it started with (section 9).
+
+**Jobs do not migrate.** A job that opens a store the code is ahead of stops with
+`the store is at schema vN and the code at vM` and changes nothing
+(`src/store/schema.py` `ensure_schema`), so between a pull and its deploy every `sb-*`
+job exits 1, and the next one after the deploy runs. Readers never migrate either:
+`brain tool`, the MCP server and a replica read the file as it is, and a replica gets
+the new version with its next pull. A host with no deploy step can set
+`BRAIN_MIGRATE_ON_OPEN=1` in the jobs' environment for the old behaviour, a job migrating
+on open. By hand, the same as step 3: `systemctl --user stop 'sb-*.timer'`, let the
+running `sb-*` jobs exit, `python -m src.cli maint migrate`, then
+`systemctl --user start 'sb-*.timer'`.
+
+Then the one-off commands the release lists, below.
+
+**Per-run metrics** (schema v42): every `brain <command>` that writes leaves a row in
+`job_runs` for the run (`stage = 'run'`, `status` `running` until it ends, so a run its
+unit's timeout killed stays visible, then `ok` or `failed` with its exit code and error)
+and one for each stage it marks (`sync`: `staged_batches`, `extract`, `load`, ...,
+`embeddings`), with the Claude calls and tokens spent in each; the same `run_id` is on
+each call's line in `llm-usage-YYYY-MM.jsonl`. For example, the last day's spend by job:
+
+```sql
+SELECT job, COUNT(*) runs, SUM(status = 'failed') failed, SUM(input_tokens) input,
+       SUM(output_tokens) output
+FROM job_runs WHERE stage = 'run' AND started_at >= datetime('now', '-1 day')
+GROUP BY job ORDER BY input DESC;
+```
 
 On a checkout from before 2026-10-11, which has no `maint`, drop `maint` from the
 commands in this section and spell `maint calendar-backfill` as

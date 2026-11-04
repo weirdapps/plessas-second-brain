@@ -139,7 +139,7 @@ def test_v41_runs_from_v40_and_stamps_the_version(conn):
 
     run_migrations(conn)
 
-    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION == 41
+    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION == 42
     assert _date(conn, email_id) == "2026-04-08T05:39:28Z"
 
 

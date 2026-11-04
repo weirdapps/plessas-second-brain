@@ -1073,7 +1073,7 @@ def cmd(args) -> int:
     """`brain maint figures-backfill`: a dry run unless --apply; --estimate parses a sample;
     --reparse reads again what an older parser read."""
     from src.config import is_replica, replica_refusal
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
     from src.store.sql_readonly import connect_read_only
 
     if args.apply and is_replica():
@@ -1114,7 +1114,7 @@ def cmd(args) -> int:
         return 0
     conn = get_connection(str(args.db))
     try:
-        run_migrations(conn)
+        ensure_schema(conn)
         if args.reset:
             reset(conn)
         forget_orphans(conn)
@@ -1141,7 +1141,7 @@ def cmd(args) -> int:
 
 def _reparse_cmd(args) -> int:
     """`figures-backfill --reparse [--apply] [--limit N]`."""
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
     from src.store.sql_readonly import connect_read_only
 
     if not args.apply:
@@ -1159,7 +1159,7 @@ def _reparse_cmd(args) -> int:
         return 0
     conn = get_connection(str(args.db))
     try:
-        run_migrations(conn)
+        ensure_schema(conn)
         forget_orphans(conn)
         register_editions(conn)
         started = time.perf_counter()

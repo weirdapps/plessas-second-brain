@@ -1078,10 +1078,10 @@ def cmd_entities(args) -> int:
     """`brain maint entities`: a dry run unless --apply; --adjudicate asks the model."""
     from src.config import EXTRACT_ENGINE
     from src.llm_cost import TokenBudget
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     conn = get_connection(str(args.db))
-    run_migrations(conn)
+    ensure_schema(conn)
     try:
         if args.revert_proposed:
             taken = revert_proposed(conn, args.revert_proposed)

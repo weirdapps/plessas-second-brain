@@ -10,7 +10,9 @@ liveness stamps the health check reads.
 **Pulling the repository changes nothing that runs.** The live copies are
 `~/.local/bin/*.sh` on each host, and that is what the units and LaunchAgents
 execute. A change is made here, reviewed and merged like any other, and then
-installed by hand on the host that runs it:
+installed on the host that runs it. On the producer `scripts/deploy.sh`, which the
+hourly pull runs, installs each systemd wrapper whose installed copy differs (`cmp`);
+a wrapper with no installed copy yet, and every launchd one, is installed by hand:
 
 ```bash
 # on the producer, after pulling a change to a systemd wrapper

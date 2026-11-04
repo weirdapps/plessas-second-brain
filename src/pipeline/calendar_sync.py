@@ -218,7 +218,7 @@ def run(args):
         refresh_self_flags,
         series_extraction,
     )
-    from src.store.schema import get_connection, migrate_add_sync_metadata, run_migrations
+    from src.store.schema import ensure_schema, get_connection, migrate_add_sync_metadata
 
     db_path = str(args.db)
     if not Path(db_path).exists():
@@ -234,7 +234,7 @@ def run(args):
         conn = connect_read_only(db_path)
     else:
         conn = get_connection(db_path)
-        run_migrations(conn)
+        ensure_schema(conn)
 
     proxy_emails = None
     if not dry_run:

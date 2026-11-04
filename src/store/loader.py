@@ -55,10 +55,10 @@ def load_extractions(
         raise FileNotFoundError(f"Staging directory not found: {staging_dir}")
 
     # Open database connection, at the schema this code writes (email_html, v23)
-    from .schema import get_connection, run_migrations
+    from .schema import ensure_schema, get_connection
 
     conn = get_connection(db_path)
-    run_migrations(conn)
+    ensure_schema(conn)
     if touched_people is not None:
         _record_people_writes(conn)
 
@@ -871,7 +871,7 @@ def load_conversations(db_path: str) -> int:
     from src.config import DATA_ROOT
     from src.export.conversation_export import read_staged_conversations
 
-    from .schema import get_connection, run_migrations
+    from .schema import ensure_schema, get_connection
 
     staging_dir = DATA_ROOT / "staging" / "conversations"
     extracted_dir = DATA_ROOT / "extracted" / "conversations"
@@ -880,7 +880,7 @@ def load_conversations(db_path: str) -> int:
         return 0
 
     conn = get_connection(db_path)
-    run_migrations(conn)
+    ensure_schema(conn)
 
     # Each extraction loads with the copy of its session it read, where that is
     # still staged, not with the newest copy, which is ahead of it when the

@@ -1853,3 +1853,27 @@ one pass, at the first job that writes. The versions that ask for a step:
   actions, counterparts found by a hard identifier only; 760 name-only pairs are counted
   and never written, issue 170), `--apply` writes them, and the line it prints names
   the run id that `maint consolidate --revert` takes.
+- **Gated: `thread_identity`** (issue 179, `src/store/thread_identity.py`). Applied by the
+  same `--apply-gated` run, after the two above, and with the same steps 1 to 5. It touches
+  only mail with no Outlook ConversationId (the retired Apple Mail export, 2025-03 to
+  2026-06): a reply joins the thread of the earliest message its References or
+  In-Reply-To names that the store holds (by Message-ID only, never by name), and a
+  subject-only thread is cut at every silence over 14 days (the first run keeps its id).
+  Each such email's id before and after goes to `thread_id_map` (`old_id`, `new_id`,
+  `rule` `reference`/`subject_gap`/`kept`); no row is deleted, and only
+  `emails.conversation_id` changes, which no full-text trigger watches. It also creates
+  `thread_rollups`, empty. On a copy of the replica (2026-11-04) the dry run of all three
+  steps took 110 s: 1,258 legacy replies re-rooted, 5,374 emails moved to a later run of
+  their subject, 43,527 mapped unchanged, mail threads 34,425 -> 35,456, the largest
+  680 -> 679 (a daily report whose silences never pass 14 days). After it:
+
+  - Thread rollups fill as threads grow (the loader rebuilds the thread of each new
+    email, by rule, no model call). History, in batches, newest first, when the owner
+    schedules it: `python -m src.cli maint thread-rollups --limit 500` counts,
+    `--apply` writes.
+  - Consolidation state is keyed by thread, so a re-keyed thread is consolidated again,
+    under its new key, the next time it gets mail; the old keys' rows stay as history.
+  - To undo it: `python -m src.cli maint thread-identity-revert` counts, then
+    `python -m src.cli maint thread-identity-revert --apply --backup ~/brain-before-revert.db`
+    puts every mapped email back on its old id, marks the step not applied (the loader
+    then threads as before) and clears `thread_rollups`; `thread_id_map` stays.

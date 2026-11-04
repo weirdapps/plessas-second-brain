@@ -1564,13 +1564,15 @@ def cmd_migrate(args):
     backup = None
     if not dry_run:
         backup = _gated_backup(conn, getattr(args, "backup", None))
-    counts_before = ledger.counts(conn)
+    from src.store import thread_identity
+
+    counts_before = ledger.counts(conn) | thread_identity.counts(conn)
     if conn.in_transaction:
         conn.commit()
     conn.execute("BEGIN IMMEDIATE")
     try:
         applied = apply_gated(conn, backup)
-        counts_after = ledger.counts(conn)
+        counts_after = ledger.counts(conn) | thread_identity.counts(conn)
         if dry_run:
             conn.rollback()
         else:
@@ -2996,7 +2998,8 @@ def main():
         "--apply-gated",
         action="store_true",
         help="Also apply the gated migrations (the item ledger and commitments from Teams "
-        "and WhatsApp, issue 168). Needs --backup, or --dry-run first.",
+        "and WhatsApp, issue 168; thread ids recomputed and thread rollups, issue 179). "
+        "Needs --backup, or --dry-run first.",
     )
     parser_migrate.add_argument(
         "--backup",
@@ -3180,6 +3183,10 @@ def main():
     from src.store import entity_pass
 
     entity_pass.add_maint_parser(maint_subparsers)
+    # thread-rollups, thread-identity-revert (src/store/thread_maint.py, issue 179).
+    from src.store import thread_maint
+
+    thread_maint.add_maint_parsers(maint_subparsers)
     entities.add_maint_parser(maint_subparsers)
     topic_canon.add_maint_parser(maint_subparsers)
     # teams-repair, teams-empty-summaries (src/extract/teams_repair.py) and news-dedup

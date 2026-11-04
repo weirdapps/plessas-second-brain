@@ -95,11 +95,13 @@ def thread_state(
     it. {"conversation_id", "earlier_messages", "items": [{"handle", "table", "id",
     "line"}]}, items oldest first."""
     from src.store.loader import conversation_id_of
+    from src.store.thread_identity import thread_id
 
     before = _day(email.get("date_received"))
     if not before:
         return None
-    conversation_id = conversation_id_of(email)
+    # The thread the loader will store it under (issue 179: re-rooted once the step is in).
+    conversation_id, _ = thread_id(conn, email)
     message_id = str(email.get("message_id", ""))
     stored = conn.execute(
         "SELECT COUNT(*) FROM emails WHERE conversation_id = ?"

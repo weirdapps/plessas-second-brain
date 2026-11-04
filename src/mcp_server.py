@@ -95,6 +95,8 @@ for _module in (
     "src.store.query",
     "src.store.recall",
     "src.store.teams_query",
+    "src.store.thread_identity",
+    "src.store.thread_rollups",
     "src.store.topic_pages",
     "src.store.whatsapp_query",
 ):

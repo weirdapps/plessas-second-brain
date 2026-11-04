@@ -1965,6 +1965,13 @@ one pass, at the first job that writes. The versions that ask for a step:
     vectors (no model call for those); `--apply --summaries --limit 5000` embeds that many
     768 summaries again at 1536. `maint vectors-rebuild` puts every summary back at 768
     and drops the email chunks; the backfill then adds them again.
+  - Recall's semantic candidates on such a store (part 3): each bucket still ranks its own
+    kind by each item's best vector, and an item under `BRAIN_SEMANTIC_FLOOR` (0.55) is
+    none. One pool fused by reciprocal rank across the summary and passage lists was
+    measured on the owner's 45 labelled questions and dropped: recall@10 of the bundle 0.807
+    -> 0.700, hybrid 0.869 -> 0.790. Once `--summaries` has lifted every summary to 1536,
+    `BRAIN_WIDE_SUMMARIES=1` scores them at that width; run `scripts/retrieval_eval.py
+    --run-qa` with and without it before leaving it on.
 - **Gated: `extraction_item_kind`** (issue 211, `src/store/extraction_fields.py`). Applied by
   the same `--apply-gated` run, after the five above, with the same steps 1 to 5. ADD
   COLUMN only: `emails.item_kind`, empty; the loader fills it from each v2 extraction it

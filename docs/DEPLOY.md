@@ -1508,7 +1508,9 @@ environment the timers run with, in this order:
    `python -m src.cli maint topic-canon --apply --embed` embeds the 60,303 remaining
    names at 256 dimensions through the embedding client (the Gemini API key: about
    $0.05; the vectors are kept in `topic_vectors.npz` under the data root, so a second
-   run sends only new names) and writes the synonyms. Not beside another embedding job
+   run sends only new names; a cache from before issue 282, of gemini-embedding-001
+   vectors, is set aside and the names embedded again) and writes the synonyms, at cosine
+   0.98 since issue 282 (the floor measured on gemini-embedding-2). Not beside another embedding job
    (section 6): it holds about 70 MB of vectors and a 140 MB block of similarities.
 4. **Wait for `reextract-stacked`.** The backfill should read each thread's items once
    they are final: run step 5 after `maint reextract-stacked` counts 0.

@@ -12,25 +12,32 @@ Claude Code, link or copy it to `~/.claude/skills/second-brain/SKILL.md` (or a p
 
 ## 1. Route by what is asked
 
+Twelve tools. Every row says its `kind` and `ref`, and `read("<kind>:<ref>")` opens it.
+Every narrowing goes in one `filter` object (person, topic, since, until, days, kinds,
+chat, workspace, include_news, include_automation, include_history, include_agents);
+a key a tool cannot honour is refused by name, so read the refusal and drop it.
+
 | The question | First call | Then, if needed |
 | --- | --- | --- |
-| A number or KPI ("digital share of loans in August", "contact-centre calls last week") | `figures(query, period=...)` | `search_attachments` for the report, `get_item(kind="attachment", ref, offset)` for the cell's context |
-| Find a document or an email | `search_attachments(query)` / `search_emails(query)` | `get_item` on the hit; a `matched_in: "chunk"` row names the passage offsets |
-| Status or timeline of a live topic | `topic_page(topic)` | `topic_context(topic)`, `query_decisions(topic=...)`, then primary items for anything load-bearing |
+| A number or KPI ("digital share of loans in August", "contact-centre calls last week") | `figures(query, period=...)` | `search(query, source="attachment")` for the report, `read("attachment:<ref>", offset=...)` for the cell's context |
+| Find a document or an email | `search(query, source="attachment")` / `search(query)` | `read` on the hit; a `matched_in: "chunk"` row names the passage offset |
+| Mail by person, topic or dates | `search(query, filter={"person": ..., "since": ...})` | `read("email:<ref>")` for the body and thread |
+| Status or timeline of a live topic | `topic_context(topic, detail="page")` | `topic_context(topic)`, `query_items("decisions", filter={"topic": ...})`, then primary items for anything load-bearing |
 | Who is X, history with X | `person_context(name_or_email, detail="card")` | `detail="full"` for the dossier; pass an address when you have one |
-| Prepare a meeting | `meeting_prep(people=[...], topic=...)` | `topic_page` for its topic |
-| What did we decide about Y | `query_decisions(topic=Y)` | `get_item` on the source row for the exact wording |
-| What do I owe / what is owed to me | `query_actions(status="open")`, `stale_threads()` | the source email through `get_item` |
-| A task from an emailed brief | `search_emails` for the brief, `get_item(kind="email", ref)` for the whole mail | `recall` for related material |
-| Anything else, or unsure | `recall(query)` | the per-kind tool that matched |
+| Prepare a meeting | `meeting_prep(people, filter={"topic": ...})` | `topic_context(topic, detail="page")` |
+| What did we decide about Y | `query_items("decisions", filter={"topic": Y})` | `read` on the source row for the exact wording |
+| What do I owe / what is owed to me | `query_items("actions", status="open")`, `query_items("stale")` | the source email through `read` |
+| Teams, WhatsApp, calendar, past sessions, images | `search(query, source="teams" / "whatsapp" / "calendar" / "conversation" / "image")` | `read("teams:<ref>")` and so on |
+| Anything else, or unsure | `recall(query)` | `search` with the source that matched |
 | Mail from the last hours | `outlook_live_search(since_minutes=...)` | the store lags the mailbox |
-| Counts, trends, aggregates, full text | `sql_schema()`, then `sql_query(sql)` | its description names the key columns (`emails.date_received`, not `date`) |
+| Counts, trends, aggregates, full text | `sql_query()` for the tables, `sql_query(table=...)` for columns, then `sql_query(sql)` | its description names the key columns (`emails.date_received`, not `date`) |
 
 `recall` fans out over every index (email, attachments, Teams, WhatsApp, conversations,
 decisions, actions, commitments, images, calendar), each bucket keyword plus semantic
 plus recency, and opens with `summary`. Use `detail="concise"` when you only need to
-see what exists, `kinds=[...]` to narrow, and `include_context=true` only for a person
-or topic dossier in the same answer.
+see what exists, `filter={"kinds": [...]}` to narrow, and `include_context=true` only
+for a person or topic dossier in the same answer. List answers put their rows under
+`result`.
 
 ## 2. Write the query like the corpus
 
@@ -49,14 +56,11 @@ or topic dossier in the same answer.
 | --- | --- | --- |
 | `data_as_of`, `stale`, `_stale_warning` | The store is a replica and can lag | For anything recent, say how fresh it is; use `outlook_live_search` |
 | `reason`, `coverage` on an empty list | What was searched and the dates each source covers | An empty result inside coverage is evidence; outside it, it is a gap, not an absence |
-| `excluded` | Matches the default filter hid (news, the owner's own automation mail) | Ask again with `include_news` / `include_automation` when they could answer |
-| `history_left_out` | Duplicate or superseded items hidden | `include_history=true` when the history itself is the question |
+| `excluded` | Matches the default filter hid (news, the owner's own automation mail) | Ask again with `filter={"include_news": true}` / `include_automation` when they could answer |
+| `history_left_out` | Duplicate or superseded items hidden | `filter={"include_history": true}` when the history itself is the question |
 | `truncated` | Rows cut to fit the answer budget | Narrow the query or lower `limit` |
 | `partial_match` | Only some words matched | Treat as weaker |
 | `semantic` other than `ok` | Semantic search was unavailable; the answer is keyword-only | Say so if the question was conceptual |
-
-`email_thread`, `teams_thread_context`, `conversation_context`, `sender_brief` and
-`teams_chat_summary` are deprecated: use `get_item` and `person_context(detail="card")`.
 
 ## 4. Answer rules
 
@@ -69,7 +73,7 @@ or topic dossier in the same answer.
 3. **Topic pages and findings are derived.** Use them to orient; verify any number or
    decision you will put in a deliverable against the primary item they cite.
 4. **Say what you could not see**: spoken meetings and calls, mailboxes the store does
-   not hold, and anything before a source's coverage start (`stats().coverage`).
+   not hold, and anything before a source's coverage start (`stats()` coverage).
 
 ## 5. File back what you verified
 

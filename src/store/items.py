@@ -1,4 +1,4 @@
-"""One reader for the item behind any row's `ref`, for the get_item MCP tool.
+"""One reader for the item behind any row's `ref`, for the read MCP tool.
 
 Every row a search returns says its `kind` and `ref` (src/store/envelope.py), and most
 kinds had no reader: an attachment's text, a WhatsApp session and a meeting by id
@@ -42,13 +42,13 @@ class ItemRefused(ValueError):
 
 # Where a ref of each kind comes from, for the message when it matches nothing.
 _FROM = {
-    "email": "search_emails, query_emails or recall",
-    "attachment": "search_attachments or recall",
-    "teams": "search_teams or recall",
-    "whatsapp": "search_whatsapp or recall",
-    "calendar": "query_calendar_events or recall",
-    "conversation": "search_conversations or recall",
-    "image": "attachment_image_search or recall",
+    "email": "search or recall",
+    "attachment": "search source=attachment or recall",
+    "teams": "search source=teams or recall",
+    "whatsapp": "search source=whatsapp or recall",
+    "calendar": "search source=calendar or recall",
+    "conversation": "search source=conversation or recall",
+    "image": "search source=image or recall",
 }
 
 

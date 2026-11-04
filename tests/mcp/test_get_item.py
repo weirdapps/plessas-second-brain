@@ -38,11 +38,20 @@ def _write(store, sql: str, *args) -> None:
 # ------------------------------------------------------------ the schema
 
 
-def test_it_takes_every_kind_a_row_can_be():
-    schema = listed_tools()["get_item"].input_schema["properties"]
+def test_read_takes_every_kind_a_row_can_be():
+    from mcp.server.mcpserver.exceptions import ToolError
 
-    assert schema["kind"]["enum"] == list(envelope.KINDS)
-    assert {"integer", "string"} == {option["type"] for option in schema["ref"]["anyOf"]}
+    from src.mcp_surface import _parse_ref
+
+    schema = listed_tools()["read"].input_schema["properties"]
+
+    for kind in envelope.KINDS:
+        assert _parse_ref(f"{kind}:7")[0] == kind
+    assert _parse_ref("email:7") == ("email", 7)
+    assert _parse_ref("conversation:7") == ("conversation", "7")
+    with pytest.raises(ToolError, match="<kind>:<ref>"):
+        _parse_ref("mail:7")
+    assert schema["ref"]["type"] == "string"
     assert schema["offset"]["minimum"] == 0
     assert (schema["max_chars"]["minimum"], schema["max_chars"]["maximum"]) == (1000, 30000)
     assert schema["max_chars"]["default"] == 20000
@@ -199,13 +208,13 @@ def test_an_image_comes_with_where_it_appeared(store):
 @pytest.mark.parametrize(
     "kind, ref, hint",
     [
-        ("email", 999, "search_emails"),
-        ("attachment", 999, "search_attachments"),
-        ("teams", 999, "search_teams"),
-        ("whatsapp", 999, "search_whatsapp"),
-        ("calendar", 999, "query_calendar_events"),
-        ("conversation", "nope", "search_conversations"),
-        ("image", "nope", "attachment_image_search"),
+        ("email", 999, "a search or recall row"),
+        ("attachment", 999, "search source=attachment"),
+        ("teams", 999, "search source=teams"),
+        ("whatsapp", 999, "search source=whatsapp"),
+        ("calendar", 999, "search source=calendar"),
+        ("conversation", "nope", "search source=conversation"),
+        ("image", "nope", "search source=image"),
     ],
 )
 def test_an_unknown_ref_says_where_refs_come_from(store, kind, ref, hint):

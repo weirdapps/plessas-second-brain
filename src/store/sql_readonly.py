@@ -1,4 +1,4 @@
-"""Read-only SQL over brain.db, for the sql_query and sql_schema MCP tools.
+"""Read-only SQL over brain.db, for the sql_query MCP tool (with no sql, the schema).
 
 Every other tool returns summaries and snippets. This is how an agent counts
 something the curated tools cannot express, or reads a full body. It must never
@@ -243,7 +243,7 @@ def _schema_hint(conn: sqlite3.Connection, sql: str, message: str) -> str:
             ]
             close = difflib.get_close_matches(name, tables, n=4, cutoff=0.5)
             near = f" Tables with a close name: {', '.join(close)}." if close else ""
-            return f".{near} sql_schema() lists every table."
+            return f".{near} sql_query with no sql lists every table."
         named = _named_tables(conn, sql)
         qualifier, _, column = name.rpartition(".")
         if qualifier and qualifier.lower() in named:
@@ -251,7 +251,7 @@ def _schema_hint(conn: sqlite3.Connection, sql: str, message: str) -> str:
         else:
             tables = list(dict.fromkeys(named.values()))
         if not tables:
-            return ". sql_schema(table) gives a table's columns."
+            return ". sql_query(table=...) gives a table's columns."
         columns = {table: _columns(conn, table) for table in tables}
         every = [(table, col) for table, cols in columns.items() for col in cols]
         names = [col for _, col in every]
@@ -266,7 +266,7 @@ def _schema_hint(conn: sqlite3.Connection, sql: str, message: str) -> str:
             parts.append(f" {table} has: {', '.join(cols)}.")
         return "." + "".join(parts)
     except sqlite3.Error:
-        return ". sql_schema(table) gives a table's columns."
+        return ". sql_query(table=...) gives a table's columns."
 
 
 def run_query(sql: str, limit: int = MAX_ROWS, db_path: Path | None = None) -> dict:
@@ -364,7 +364,7 @@ def describe(table: str | None = None, db_path: Path | None = None) -> dict:
             ).fetchone()
             if found is None:
                 return {
-                    "error": f"no table or view named {table!r}; call sql_schema() for the list"
+                    "error": f"no table or view named {table!r}; call sql_query with no sql for the list"
                 }
             columns = [
                 dict(r)

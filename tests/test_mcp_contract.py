@@ -26,10 +26,9 @@ from tests.mcp_listing import listed_tools, registered_tool
 
 
 def test_the_tool_count_is_unchanged():
-    # 27 until recall_preference and recent_conversations were retired, 25 until
-    # get_item, 26 until topic_page, 27 until figures; five of those 28 are deprecated
-    # and go in the next release.
-    assert len(listed_tools()) == 28
+    # 28 until issue 172 folded them into twelve (src/mcp_surface.py).
+    assert sorted(listed_tools()) == sorted(CALLS)
+    assert len(listed_tools()) == 12
 
 
 def test_every_tool_says_whether_it_reads_or_writes():
@@ -70,11 +69,16 @@ def test_every_limit_is_bounded_in_the_schema():
 @pytest.mark.parametrize(
     "tool, param, values",
     [
-        ("search_emails", "search_type", ["keyword", "semantic"]),
-        ("search_conversations", "search_type", ["keyword", "semantic"]),
-        ("search_teams", "kind", ["thread", "message", "both"]),
+        ("search", "search_type", ["keyword", "semantic"]),
+        (
+            "search",
+            "source",
+            ["email", "attachment", "teams", "whatsapp", "conversation", "image", "calendar"],
+        ),
         ("sharepoint_index", "operation", ["list_stale", "list_unfetched", "refetch"]),
-        ("query_actions", "status", ["open", "expired", "done"]),
+        ("query_items", "kind", ["decisions", "actions", "stale"]),
+        ("query_items", "status", ["open", "expired", "done"]),
+        ("topic_context", "detail", ["full", "concise", "page"]),
     ],
 )
 def test_the_choices_are_enums(tool, param, values):
@@ -84,13 +88,15 @@ def test_the_choices_are_enums(tool, param, values):
 @pytest.mark.parametrize(
     "tool, arguments",
     [
-        ("search_emails", {"query": "x", "search_type": "Semantic"}),
-        ("search_teams", {"query": "x", "kind": "threads"}),
-        ("query_actions", {"status": "completed"}),
-        ("search_emails", {"query": "x", "limit": 0}),
-        ("search_attachments", {"query": "x", "limit": 201}),
+        ("search", {"query": "x", "search_type": "Semantic"}),
+        ("search", {"query": "x", "source": "emails"}),
+        ("query_items", {"kind": "actions", "status": "completed"}),
+        ("search", {"query": "x", "limit": 0}),
+        ("search", {"query": "x", "source": "attachment", "limit": 201}),
         ("recall", {"query": "x", "limit_per_kind": 11}),
-        ("search_whatsapp", {"query": "x", "days": 0}),
+        ("search", {"query": "x", "source": "whatsapp", "filter": {"days": 0}}),
+        ("search", {"query": "x", "filter": {"persons": "Alice"}}),
+        ("recall", {"query": "x", "filter": {"kinds": ["mail"]}}),
     ],
 )
 def test_the_schema_refuses_what_the_tool_cannot_honour(tool, arguments):
@@ -122,9 +128,12 @@ def test_the_instructions_fit_and_lead_with_routing(tmp_path, monkeypatch, repli
 
     text = mcp_server._instructions()
 
-    assert len(text) <= 4000  # Claude Code keeps 4,096 since v2.1.296
+    assert len(text) < 2000  # issue 172: under the 2,048 Claude Code once kept
     assert text.startswith("Routing.")
     assert "Not covered:" in text
+    # Every tool a question is routed to; sharepoint_index is upkeep, found by name.
+    for name in set(listed_tools()) - {"sharepoint_index"}:
+        assert f"`{name}`" in text, name
 
 
 # -------------------------------------------------------------- tools/call
@@ -190,47 +199,59 @@ def store(tmp_path, monkeypatch):
 
 
 CALLS = {
+    "recall": {"query": "okapi", "include_context": True},
+    "search": {"query": "okapi"},
+    "read": {"ref": "email:1"},
     "person_context": {"name_or_email": "Alice"},
     "topic_context": {"topic": "okapi"},
-    "topic_page": {"topic": "okapi"},
-    "sender_brief": {"name_or_email": "alice@example.com"},
-    "email_thread": {"email_id": 1},
-    "search_emails": {"query": "okapi"},
-    "recall": {"query": "okapi", "include_context": True},
-    "query_emails": {"keyword": "okapi"},
-    "query_decisions": {},
-    "query_actions": {},
-    "stale_threads": {},
-    "meeting_prep": {"people": "Alice Smith", "topic": "okapi"},
-    "search_attachments": {"query": "okapi"},
+    "meeting_prep": {"people": "Alice Smith", "filter": {"topic": "okapi"}},
+    "query_items": {"kind": "decisions"},
     "figures": {"query": "okapi"},
-    "query_calendar_events": {"keyword": "okapi"},
-    "stats": {},
-    "search_conversations": {"query": "okapi"},
-    "conversation_context": {"session_id": "s1"},
-    "sharepoint_index": {"operation": "list_stale"},
-    "attachment_image_search": {"query": "okapi"},
-    "outlook_live_search": {},
-    "search_teams": {"query": "okapi"},
-    "search_whatsapp": {"query": "okapi"},
-    "teams_thread_context": {"thread_id": 1},
-    "teams_chat_summary": {"chat_id": 1},
     "sql_query": {"sql": "SELECT id, subject FROM emails"},
-    "sql_schema": {"table": "emails"},
-    "get_item": {"kind": "email", "ref": 1},
+    "stats": {},
+    "outlook_live_search": {},
+    "sharepoint_index": {"operation": "list_stale"},
 }
+
+# Every source and mode the folded tools route to, called through the surface.
+ROUTES = {
+    "search email": ("search", {"query": "okapi"}),
+    "search email listing": ("search", {"query": "okapi", "filter": {"person": "Alice"}}),
+    "search attachment": ("search", {"query": "okapi", "source": "attachment"}),
+    "search teams": ("search", {"query": "okapi", "source": "teams"}),
+    "search whatsapp": ("search", {"query": "okapi", "source": "whatsapp"}),
+    "search conversation": ("search", {"query": "okapi", "source": "conversation"}),
+    "search image": ("search", {"query": "okapi", "source": "image"}),
+    "search calendar": ("search", {"query": "okapi", "source": "calendar"}),
+    "read conversation": ("read", {"ref": "conversation:s1"}),
+    "read teams": ("read", {"ref": "teams:1"}),
+    "topic_context page": ("topic_context", {"topic": "okapi", "detail": "page"}),
+    "person_context card": ("person_context", {"name_or_email": "Alice", "detail": "card"}),
+    "query_items actions": ("query_items", {"kind": "actions"}),
+    "query_items stale": ("query_items", {"kind": "stale"}),
+    "sql_query schema": ("sql_query", {"table": "emails"}),
+}
+
+
+def _call(name: str, arguments: dict):
+    """The tool `name` as tools/call runs it, past argument validation."""
+    return registered_tool(name).fn(**arguments)
 
 
 def test_the_sample_calls_cover_every_tool():
     assert set(CALLS) == set(listed_tools())
 
 
-@pytest.mark.parametrize("name", sorted(CALLS))
-def test_every_result_goes_out_whole_as_structured_content(store, name):
+@pytest.mark.parametrize(
+    "name, arguments",
+    [*((n, a) for n, a in CALLS.items()), *ROUTES.values()],
+    ids=[*CALLS, *ROUTES],
+)
+def test_every_result_goes_out_whole_as_structured_content(store, name, arguments):
     """Output validation runs on every call: a key the schema does not list must
     still go through, and a value of the wrong type would turn the call into an
     error."""
-    result = getattr(mcp_server, name)(**CALLS[name])
+    result = _call(name, arguments)
 
     sent = registered_tool(name).fn_metadata.convert_result(result)
 
@@ -244,13 +265,20 @@ def test_every_result_goes_out_whole_as_structured_content(store, name):
 @pytest.mark.parametrize(
     "call, hint",
     [
-        (lambda: mcp_server.email_thread(email_id=999), "search_emails"),
-        (lambda: mcp_server.teams_thread_context(thread_id=999), "search_teams"),
-        (lambda: mcp_server.teams_chat_summary(chat_id=999), "search_teams"),
-        (lambda: mcp_server.conversation_context(session_id="nope"), "search_conversations"),
-        (lambda: mcp_server.sql_schema(table="nope"), "sql_schema"),
-        (lambda: mcp_server.query_emails(), "search_emails"),
-        (lambda: mcp_server.sql_query(sql="SELECT nope FROM emails"), "no such column"),
+        (lambda: _call("read", {"ref": "email:999"}), "search"),
+        (lambda: _call("read", {"ref": "teams:999"}), "search"),
+        (lambda: _call("read", {"ref": "conversation:nope"}), "search"),
+        (lambda: _call("read", {"ref": "999"}), "<kind>:<ref>"),
+        (lambda: _call("read", {"ref": "email:1", "part": "nope"}), "has no part"),
+        (lambda: _call("sql_query", {"table": "nope"}), "sql_query"),
+        (lambda: _call("search", {}), "needs a query"),
+        (lambda: _call("search", {"query": "x", "filter": {"chat": "x"}}), "chat"),
+        (
+            lambda: _call("search", {"query": "x", "source": "teams", "search_type": "semantic"}),
+            "keyword only",
+        ),
+        (lambda: _call("query_items", {"kind": "stale", "status": "done"}), "actions only"),
+        (lambda: _call("sql_query", {"sql": "SELECT nope FROM emails"}), "no such column"),
     ],
 )
 def test_a_failure_is_a_tool_error_that_says_what_to_do(store, call, hint):
@@ -263,15 +291,18 @@ def test_a_failure_is_a_tool_error_that_says_what_to_do(store, call, hint):
 @pytest.mark.parametrize(
     "call, key",
     [
-        (lambda: mcp_server.search_emails("zzyzx"), "result"),
-        (lambda: mcp_server.search_attachments("zzyzx"), "result"),
-        (lambda: mcp_server.query_emails(keyword="zzyzx"), "result"),
-        (lambda: mcp_server.query_decisions(topic="zzyzx"), "result"),
-        (lambda: mcp_server.search_conversations("zzyzx"), "result"),
-        (lambda: mcp_server.search_teams("zzyzx"), "results"),
-        (lambda: mcp_server.search_whatsapp("zzyzx"), "results"),
-        (lambda: mcp_server.query_calendar_events(keyword="zzyzx"), "events"),
-        (lambda: mcp_server.attachment_image_search("zzyzx"), "results"),
+        (lambda: _call("search", {"query": "zzyzx"}), "result"),
+        (lambda: _call("search", {"query": "zzyzx", "source": "attachment"}), "result"),
+        (lambda: _call("search", {"query": "zzyzx", "filter": {"topic": "okapi"}}), "result"),
+        (
+            lambda: _call("query_items", {"kind": "decisions", "filter": {"topic": "zzyzx"}}),
+            "result",
+        ),
+        (lambda: _call("search", {"query": "zzyzx", "source": "conversation"}), "result"),
+        (lambda: _call("search", {"query": "zzyzx", "source": "teams"}), "result"),
+        (lambda: _call("search", {"query": "zzyzx", "source": "whatsapp"}), "result"),
+        (lambda: _call("search", {"query": "zzyzx", "source": "calendar"}), "result"),
+        (lambda: _call("search", {"query": "zzyzx", "source": "image"}), "result"),
     ],
 )
 def test_nothing_matched_is_an_empty_list_with_a_reason(store, call, key):
@@ -327,7 +358,7 @@ def test_only_the_refetch_opens_the_store_read_write(store, tmp_path, monkeypatc
     monkeypatch.setattr(config, "REPLICA_STAMP", tmp_path / "no-pull-stamp")
     if on_replica:
         monkeypatch.setenv("BRAIN_ROLE", "replica")
-    calls = {name: (name, args) for name, args in CALLS.items()}
+    calls = {name: (name, args) for name, args in CALLS.items()} | ROUTES
     calls["sharepoint_index refetch"] = ("sharepoint_index", {"operation": "refetch", "url": LINK})
     opened: list[str] = []
     real = sqlite3.connect
@@ -344,9 +375,9 @@ def test_only_the_refetch_opens_the_store_read_write(store, tmp_path, monkeypatc
         opened.clear()
         if on_replica and label == "sharepoint_index refetch":
             with pytest.raises(ToolError, match="Refusing"):
-                getattr(mcp_server, tool)(**args)
+                _call(tool, args)
         else:
-            getattr(mcp_server, tool)(**args)
+            _call(tool, args)
         seen[label] = set(opened)
 
     assert {label for label, modes in seen.items() if "read-write" in modes} == (

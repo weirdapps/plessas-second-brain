@@ -50,7 +50,6 @@ def db(tmp_path, monkeypatch):
 CASES = [
     ("person_context", {"name_or_email": "x"}, "src.store.context:get_person_context", "limit"),
     ("topic_context", {"topic": "okapi"}, "src.store.context:get_topic_context", "limit"),
-    ("email_thread", {"email_id": 1}, "src.store.query:query_thread", "limit"),
     ("search_emails", {"query": "okapi"}, "src.store.query:query_by_keyword", "limit"),
     (
         "search_emails",

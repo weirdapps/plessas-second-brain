@@ -1,4 +1,4 @@
-"""Tests for the read-only SQL layer behind the sql_query and sql_schema tools."""
+"""Tests for the read-only SQL layer behind the sql_query tool (and its schema)."""
 
 import sqlite3
 from pathlib import Path
@@ -426,8 +426,8 @@ def test_the_routing_text_names_the_sql_tools():
     # Under tool search only tool names and this text load at session start.
     from src.mcp_server import _INSTRUCTIONS
 
-    assert "`sql_schema`" in _INSTRUCTIONS
     assert "`sql_query`" in _INSTRUCTIONS
+    assert "no sql: the schema" in _INSTRUCTIONS
 
 
 def test_the_sql_query_docstring_states_the_live_limits():

@@ -11,7 +11,6 @@ from src.mcp_server import (
     query_decisions,
     search_attachments,
     search_emails,
-    sender_brief,
     stale_threads,
     stats,
     topic_context,
@@ -93,17 +92,17 @@ def test_topic_context_not_found(mock_get_conn, mock_conn):
 
 
 @patch("src.mcp_server._get_conn")
-def test_sender_brief_known(mock_get_conn, mock_conn):
+def test_the_card_of_a_known_sender(mock_get_conn, mock_conn):
     mock_get_conn.return_value = mock_conn
-    result = sender_brief("alice@example.com")
+    result = person_context("alice@example.com", detail="card")
     assert result["known"] is True
     assert result["name"] == "Alice Smith"
 
 
 @patch("src.mcp_server._get_conn")
-def test_sender_brief_unknown(mock_get_conn, mock_conn):
+def test_the_card_of_an_unknown_sender(mock_get_conn, mock_conn):
     mock_get_conn.return_value = mock_conn
-    result = sender_brief("nobody@example.com")
+    result = person_context("nobody@example.com", detail="card")
     assert result["known"] is False
 
 

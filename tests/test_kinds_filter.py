@@ -45,29 +45,35 @@ def _more_mail(path, n=30):
     conn.close()
 
 
-@pytest.mark.parametrize(
-    "tool, allowed",
-    [
-        ("recall", ALL_KINDS),
-        ("search_emails", [k for k in ALL_KINDS if k not in ("calendar", "image")]),
-        ("query_emails", ["email", "news", "document"]),
-    ],
-)
-def test_kinds_is_an_optional_list_of_named_kinds(tool, allowed):
-    schema = listed_tools()[tool].input_schema["properties"]["kinds"]
+def test_kinds_is_an_optional_list_of_named_kinds():
+    schema = listed_tools()["search"].input_schema["$defs"]["Filter"]["properties"]["kinds"]
 
-    branch = next(b for b in schema["anyOf"] if b.get("type") == "array")
-    assert branch["items"]["enum"] == allowed
-    assert branch["minItems"] == 1
+    assert schema["items"]["enum"] == ALL_KINDS
+    assert schema["minItems"] == 1
     assert schema["description"]
 
 
 def test_an_empty_or_unknown_kind_is_refused_before_the_tool_runs():
     for kinds in ([], ["mail"]):
         with pytest.raises(ValidationError):
-            registered_tool("search_emails").fn_metadata.validate_arguments(
-                {"query": "x", "kinds": kinds}
+            registered_tool("search").fn_metadata.validate_arguments(
+                {"query": "x", "filter": {"kinds": kinds}}
             )
+
+
+@pytest.mark.parametrize(
+    "arguments, allowed",
+    [
+        ({"query": "okapi", "filter": {"kinds": ["teams"]}}, "document, email, news"),
+        (
+            {"query": "okapi", "search_type": "semantic", "filter": {"kinds": ["calendar"]}},
+            "attachment, conversation",
+        ),
+    ],
+)
+def test_search_refuses_a_kind_its_mode_cannot_hold(store, arguments, allowed):
+    with pytest.raises(ToolError, match=allowed):
+        registered_tool("search").fn(**arguments)
 
 
 def test_documents_only_finds_the_document_behind_a_page_of_mail(store):
@@ -93,7 +99,7 @@ def test_naming_news_lets_it_in(store):
 
 
 def test_keyword_search_refuses_a_kind_it_cannot_hold(store):
-    with pytest.raises(ToolError, match="search_teams"):
+    with pytest.raises(ToolError, match="search source=teams"):
         mcp_server.search_emails("okapi", kinds=["teams"])
 
 

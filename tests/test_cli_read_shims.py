@@ -1,4 +1,4 @@
-"""The seventeen read commands that mirrored the MCP tools, deprecated for one release.
+"""The sixteen read commands that mirrored the MCP tools, deprecated for one release.
 
 Each still takes its old arguments, prints one line on stderr naming the `brain tool`
 call that replaces it, and makes that call, so its answer is the tool's JSON and a
@@ -19,70 +19,73 @@ from tests.mcp_listing import allow_an_event_loop, registered_tool
 
 # (the old command line, the tool it now calls, the arguments it passes)
 SHIMS = [
-    (["query", "thread", "1"], "email_thread", {"email_id": 1, "limit": 20}),
-    (["query", "thread", "1", "--limit", "0"], "email_thread", {"email_id": 1, "limit": 1}),
+    (["query", "thread", "1"], "read", {"ref": "email:1", "part": "thread"}),
+    (["query", "thread", "1", "--limit", "0"], "read", {"ref": "email:1", "part": "thread"}),
     (
         ["query", "person", "Alice", "--limit", "5", "-v"],
-        "query_emails",
-        {"person": "Alice", "limit": 5},
+        "search",
+        {"filter": {"person": "Alice"}, "limit": 5},
     ),
-    (["query", "topic", "okapi"], "query_emails", {"topic": "okapi", "limit": 20}),
-    (["query", "keyword", "okapi plan"], "search_emails", {"query": "okapi plan", "limit": 20}),
+    (["query", "topic", "okapi"], "search", {"filter": {"topic": "okapi"}, "limit": 20}),
+    (["query", "keyword", "okapi plan"], "search", {"query": "okapi plan", "limit": 20}),
     (
         ["query", "date", "2026-09-01", "2026-10-01"],
-        "query_emails",
-        {"start_date": "2026-09-01", "end_date": "2026-10-01", "limit": 20},
+        "search",
+        {"filter": {"since": "2026-09-01", "until": "2026-10-01"}, "limit": 20},
     ),
     (
         ["query", "decisions", "--topic", "okapi"],
-        "query_decisions",
-        {"topic": "okapi", "limit": 20},
+        "query_items",
+        {"kind": "decisions", "filter": {"topic": "okapi"}, "limit": 20},
     ),
     (
         ["query", "decisions", "--person", "Bob", "--limit", "500"],
-        "query_decisions",
-        {"person": "Bob", "limit": 200},
+        "query_items",
+        {"kind": "decisions", "filter": {"person": "Bob"}, "limit": 200},
     ),
-    (["query", "actions"], "query_actions", {"status": "open", "limit": 20}),
+    (["query", "actions"], "query_items", {"kind": "actions", "status": "open", "limit": 20}),
     (
         ["query", "actions", "--owner", "Alice", "--status", "expired"],
-        "query_actions",
-        {"owner": "Alice", "status": "expired", "limit": 20},
+        "query_items",
+        {"kind": "actions", "status": "expired", "filter": {"person": "Alice"}, "limit": 20},
     ),
     (
         ["query", "combined", "--person", "Alice", "--keyword", "okapi", "--start", "2026-09-01"],
-        "query_emails",
-        {"person": "Alice", "keyword": "okapi", "start_date": "2026-09-01", "limit": 20},
+        "search",
+        {"query": "okapi", "filter": {"person": "Alice", "since": "2026-09-01"}, "limit": 20},
     ),
     (
         ["query", "semantic", "the okapi plan"],
-        "search_emails",
+        "search",
         {"query": "the okapi plan", "search_type": "semantic", "limit": 20},
     ),
     (
         ["prep", "alice@example.com, bob@example.com", "--topic", "okapi", "--days", "30"],
         "meeting_prep",
-        {"people": "alice@example.com, bob@example.com", "topic": "okapi", "days": 30},
+        {"people": "alice@example.com, bob@example.com", "filter": {"topic": "okapi", "days": 30}},
     ),
     (
         ["prep", "alice@example.com", "--limit", "3"],
         "meeting_prep",
-        {"people": "alice@example.com", "days": 365},
+        {"people": "alice@example.com", "filter": {"days": 365}},
     ),
-    (["stale"], "stale_threads", {"days": 5, "max_days": 30, "limit": 20}),
+    (
+        ["stale"],
+        "query_items",
+        {"kind": "stale", "older_than_days": 5, "filter": {"days": 30}, "limit": 20},
+    ),
     (
         ["stale", "--days", "3", "--max-days", "60", "--limit", "5"],
-        "stale_threads",
-        {"days": 3, "max_days": 60, "limit": 5},
+        "query_items",
+        {"kind": "stale", "older_than_days": 3, "filter": {"days": 60}, "limit": 5},
     ),
     (["stats"], "stats", {}),
     (
         ["teams-search", "okapi", "--kind", "thread", "--limit", "5"],
-        "search_teams",
-        {"query": "okapi", "kind": "thread", "limit": 5},
+        "search",
+        {"query": "okapi", "source": "teams", "limit": 5},
     ),
-    (["teams-thread", "1"], "teams_thread_context", {"thread_id": 1}),
-    (["teams-chat", "1", "--days", "7"], "teams_chat_summary", {"chat_id": 1, "days": 7}),
+    (["teams-thread", "1"], "read", {"ref": "teams:1"}),
     (["teams-stats"], "sql_query", {"sql": cli.TEAMS_STATS_SQL}),
     (["sharepoint-refused"], "sharepoint_index", {"operation": "list_stale"}),
 ]
@@ -90,10 +93,10 @@ IDS = [" ".join(argv) for argv, _, _ in SHIMS]
 
 
 def test_every_read_command_of_the_mirror_is_covered():
-    """The seventeen: nine query types and eight commands."""
+    """The sixteen: nine query types and seven commands (teams-chat went with its tool)."""
     commands = {tuple(argv[:2]) if argv[0] == "query" else (argv[0],) for argv, _, _ in SHIMS}
 
-    assert len(commands) == 17
+    assert len(commands) == 16
 
 
 @pytest.mark.parametrize(("argv", "tool", "arguments"), SHIMS, ids=IDS)
@@ -164,8 +167,7 @@ def test_query_thread_answers_with_the_thread(store, monkeypatch, capsys):
 
     answer = json.loads(out)
     assert code == 0
-    assert answer["thread_total"] == 2
-    assert [e["email_id"] for e in answer["emails"]] == [1, 2]
+    assert [e["ref"] for e in answer["item"]["thread"]] == [1, 2]
 
 
 def test_keyword_search_flags_rows_holding_only_some_words(store, monkeypatch, capsys):
@@ -184,7 +186,7 @@ def test_teams_search_flags_rows_holding_only_some_words(store, monkeypatch, cap
         monkeypatch, capsys, "--db", str(store), "teams-search", "okapi ανύπαρκτηλέξη"
     )
 
-    rows = json.loads(out)["results"]
+    rows = json.loads(out)["result"]
     assert code == 0
     assert rows
     assert all(row["partial_match"] for row in rows)

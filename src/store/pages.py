@@ -957,7 +957,7 @@ def _render(kind: str, key: str, row: dict, skel: dict, synthesis, corrections) 
         f"Compiled {row['skeleton_at']}"
         + (f"; synthesis {row['built_at']}" if row.get("built_at") else "")
         + ". Derived from the store's items: every line cites [kind:id, date], and"
-        " get_item(kind, ref) reads each."
+        " read('kind:id') opens each."
     )
     if corrections:
         out += ["", "## Owner corrections"]

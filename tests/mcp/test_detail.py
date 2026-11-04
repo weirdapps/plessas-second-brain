@@ -5,7 +5,7 @@ tokens a call, most of it summaries and snippets an agent scanning for "is there
 anything, and where" never reads. detail="concise" keeps one short line per row (what
 it is, where to read it, who and when) and holds the answer to 10,000 characters;
 get_item reads any row whole. person_context also takes detail="card", the short
-card sender_brief gave, so that tool can go.
+card sender_brief gave, and that tool went in issue 172.
 """
 
 import pytest
@@ -31,7 +31,7 @@ def store(tmp_path, monkeypatch):
     [
         ("recall", ["full", "concise"]),
         ("person_context", ["full", "concise", "card"]),
-        ("topic_context", ["full", "concise"]),
+        ("topic_context", ["full", "concise", "page"]),
         ("meeting_prep", ["full", "concise"]),
     ],
 )
@@ -144,11 +144,17 @@ def test_a_concise_person_keeps_who_they_are_and_the_totals(store):
         assert short[key] == full[key]
 
 
-def test_the_card_is_what_sender_brief_gave(store):
-    card = mcp_server.person_context("alice@example.com", detail="card")
-    brief = mcp_server.sender_brief("alice@example.com")
+def test_the_card_is_the_bridge_card_with_the_header(store):
+    from src.bridge import sender_brief
 
-    assert card == brief
+    card = mcp_server.person_context("alice@example.com", detail="card")
+    conn = mcp_server._get_conn()
+    try:
+        brief = sender_brief(conn, "alice@example.com")
+    finally:
+        conn.close()
+
+    assert {k: v for k, v in card.items() if k in brief} == brief
     assert card["known"] is True
 
 

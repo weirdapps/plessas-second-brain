@@ -1113,6 +1113,9 @@ def _deprecated_read(args, old: str, tool: str, arguments: dict) -> int:
     from src import mcp_call
 
     given = {key: value for key, value in arguments.items() if value is not None}
+    narrowed = {k: v for k, v in (given.pop("filter", None) or {}).items() if v is not None}
+    if narrowed:
+        given["filter"] = narrowed
     words = ["brain"]
     if Path(args.db) != DEFAULT_DB:
         words += ["--db", str(args.db)]
@@ -1127,78 +1130,92 @@ def _deprecated_read(args, old: str, tool: str, arguments: dict) -> int:
 
 
 def cmd_query_person(args):
-    """Deprecated: `brain tool query_emails` with a person."""
+    """Deprecated: `brain tool search` with a person filter."""
     return _deprecated_read(
-        args, "query person", "query_emails", {"person": args.name, "limit": _limit(args.limit)}
+        args,
+        "query person",
+        "search",
+        {"filter": {"person": args.name}, "limit": _limit(args.limit)},
     )
 
 
 def cmd_query_topic(args):
-    """Deprecated: `brain tool query_emails` with a topic."""
+    """Deprecated: `brain tool search` with a topic filter."""
     return _deprecated_read(
-        args, "query topic", "query_emails", {"topic": args.topic, "limit": _limit(args.limit)}
+        args,
+        "query topic",
+        "search",
+        {"filter": {"topic": args.topic}, "limit": _limit(args.limit)},
     )
 
 
 def cmd_query_keyword(args):
-    """Deprecated: `brain tool search_emails`; attachments are `brain tool search_attachments`."""
+    """Deprecated: `brain tool search`; attachments are its source "attachment"."""
     return _deprecated_read(
-        args, "query keyword", "search_emails", {"query": args.keyword, "limit": _limit(args.limit)}
+        args, "query keyword", "search", {"query": args.keyword, "limit": _limit(args.limit)}
     )
 
 
 def cmd_query_date(args):
-    """Deprecated: `brain tool query_emails` with a start and an end date."""
+    """Deprecated: `brain tool search` with since and until."""
     return _deprecated_read(
         args,
         "query date",
-        "query_emails",
-        {"start_date": args.start, "end_date": args.end, "limit": _limit(args.limit)},
+        "search",
+        {"filter": {"since": args.start, "until": args.end}, "limit": _limit(args.limit)},
     )
 
 
 def cmd_query_decisions(args):
-    """Deprecated: `brain tool query_decisions`."""
+    """Deprecated: `brain tool query_items` kind decisions."""
     return _deprecated_read(
         args,
         "query decisions",
-        "query_decisions",
-        {"topic": args.topic, "person": args.person, "limit": _limit(args.limit)},
+        "query_items",
+        {
+            "kind": "decisions",
+            "filter": {"topic": args.topic, "person": args.person},
+            "limit": _limit(args.limit),
+        },
     )
 
 
 def cmd_query_actions(args):
-    """Deprecated: `brain tool query_actions`."""
+    """Deprecated: `brain tool query_items` kind actions."""
     return _deprecated_read(
         args,
         "query actions",
-        "query_actions",
-        {"owner": args.owner, "status": args.status, "limit": _limit(args.limit)},
+        "query_items",
+        {
+            "kind": "actions",
+            "status": args.status,
+            "filter": {"person": args.owner},
+            "limit": _limit(args.limit),
+        },
     )
 
 
 def cmd_query_thread(args):
-    """Deprecated: `brain tool email_thread`."""
+    """Deprecated: `brain tool read` of the email, its thread part."""
     return _deprecated_read(
-        args,
-        "query thread",
-        "email_thread",
-        {"email_id": args.email_id, "limit": _limit(args.limit)},
+        args, "query thread", "read", {"ref": f"email:{args.email_id}", "part": "thread"}
     )
 
 
 def cmd_query_combined(args):
-    """Deprecated: `brain tool query_emails` with the filters given."""
+    """Deprecated: `brain tool search` with the filters given."""
     return _deprecated_read(
         args,
         "query combined",
-        "query_emails",
+        "search",
         {
-            "person": args.person,
-            "topic": args.topic,
-            "keyword": args.keyword,
-            "start_date": args.start,
-            "end_date": args.end,
+            "query": args.keyword,
+            "filter": {
+                "person": args.person,
+                "topic": args.topic,
+                "since": args.start,
+                "until": args.end,
+            },
             "limit": _limit(args.limit),
         },
     )
@@ -1210,7 +1227,7 @@ def cmd_prep(args):
         args,
         "prep",
         "meeting_prep",
-        {"people": args.people, "topic": args.topic, "days": args.days},
+        {"people": args.people, "filter": {"topic": args.topic, "days": args.days}},
     )
 
 
@@ -1381,27 +1398,18 @@ def cmd_whatsapp_sync(args):
 
 
 def cmd_teams_search(args):
-    """Deprecated: `brain tool search_teams`."""
+    """Deprecated: `brain tool search` with source teams."""
     return _deprecated_read(
         args,
         "teams-search",
-        "search_teams",
-        {"query": args.query, "kind": args.kind, "limit": _limit(args.limit)},
+        "search",
+        {"query": args.query, "source": "teams", "limit": _limit(args.limit)},
     )
 
 
 def cmd_teams_thread(args):
-    """Deprecated: `brain tool teams_thread_context`."""
-    return _deprecated_read(
-        args, "teams-thread", "teams_thread_context", {"thread_id": args.thread_id}
-    )
-
-
-def cmd_teams_chat(args):
-    """Deprecated: `brain tool teams_chat_summary`."""
-    return _deprecated_read(
-        args, "teams-chat", "teams_chat_summary", {"chat_id": args.chat_id, "days": args.days}
-    )
+    """Deprecated: `brain tool read` of the Teams thread."""
+    return _deprecated_read(args, "teams-thread", "read", {"ref": f"teams:{args.thread_id}"})
 
 
 def cmd_teams_stats(args):
@@ -1784,12 +1792,17 @@ def cmd_import_people(args):
 
 
 def cmd_stale(args):
-    """Deprecated: `brain tool stale_threads`."""
+    """Deprecated: `brain tool query_items` kind stale."""
     return _deprecated_read(
         args,
         "stale",
-        "stale_threads",
-        {"days": args.days, "max_days": args.max_days, "limit": _limit(args.limit)},
+        "query_items",
+        {
+            "kind": "stale",
+            "older_than_days": args.days,
+            "filter": {"days": args.max_days},
+            "limit": _limit(args.limit),
+        },
     )
 
 
@@ -1809,11 +1822,11 @@ def cmd_embed(args):
 
 
 def cmd_query_semantic(args):
-    """Deprecated: `brain tool search_emails` with search_type semantic."""
+    """Deprecated: `brain tool search` with search_type semantic."""
     return _deprecated_read(
         args,
         "query semantic",
-        "search_emails",
+        "search",
         {"query": args.query, "search_type": "semantic", "limit": _limit(args.limit)},
     )
 
@@ -1912,7 +1925,6 @@ READ_ONLY_COMMANDS = frozenset(
         "stats",
         "teams-search",
         "teams-thread",
-        "teams-chat",
         "teams-stats",
         "prune-staged",
         # Its writes (--refetch, --record-aliases) refuse on a replica themselves.
@@ -2771,7 +2783,7 @@ def main():
 
     # Query subcommands
     parser_query = subparsers.add_parser(
-        "query", help="Deprecated: brain tool (query_emails, search_emails, query_decisions...)"
+        "query", help="Deprecated: brain tool (search, read, query_items...)"
     )
     query_subparsers = parser_query.add_subparsers(dest="query_type", help="Query type")
 
@@ -2781,41 +2793,35 @@ def main():
         p.add_argument("-v", "--verbose", action="store_true", help="Ignored: the answer is JSON")
 
     # Query thread
-    parser_query_thread = query_subparsers.add_parser(
-        "thread", help="Deprecated: brain tool email_thread"
-    )
+    parser_query_thread = query_subparsers.add_parser("thread", help="Deprecated: brain tool read")
     parser_query_thread.add_argument("email_id", type=int, help="Email ID")
     add_common_query_args(parser_query_thread)
     parser_query_thread.set_defaults(func=cmd_query_thread)
 
     # Query by person
     parser_query_person = query_subparsers.add_parser(
-        "person", help="Deprecated: brain tool query_emails"
+        "person", help="Deprecated: brain tool search"
     )
     parser_query_person.add_argument("name", help="Person name or email")
     add_common_query_args(parser_query_person)
     parser_query_person.set_defaults(func=cmd_query_person)
 
     # Query by topic
-    parser_query_topic = query_subparsers.add_parser(
-        "topic", help="Deprecated: brain tool query_emails"
-    )
+    parser_query_topic = query_subparsers.add_parser("topic", help="Deprecated: brain tool search")
     parser_query_topic.add_argument("topic", help="Topic name")
     add_common_query_args(parser_query_topic)
     parser_query_topic.set_defaults(func=cmd_query_topic)
 
     # Query by keyword
     parser_query_keyword = query_subparsers.add_parser(
-        "keyword", help="Deprecated: brain tool search_emails"
+        "keyword", help="Deprecated: brain tool search"
     )
     parser_query_keyword.add_argument("keyword", help="Search keyword")
     add_common_query_args(parser_query_keyword)
     parser_query_keyword.set_defaults(func=cmd_query_keyword)
 
     # Query by date range
-    parser_query_date = query_subparsers.add_parser(
-        "date", help="Deprecated: brain tool query_emails"
-    )
+    parser_query_date = query_subparsers.add_parser("date", help="Deprecated: brain tool search")
     parser_query_date.add_argument("start", help="Start date (YYYY-MM-DD)")
     parser_query_date.add_argument("end", help="End date (YYYY-MM-DD)")
     add_common_query_args(parser_query_date)
@@ -2823,7 +2829,7 @@ def main():
 
     # Query decisions
     parser_query_decisions = query_subparsers.add_parser(
-        "decisions", help="Deprecated: brain tool query_decisions"
+        "decisions", help="Deprecated: brain tool query_items"
     )
     parser_query_decisions.add_argument("--topic", help="Filter by topic")
     parser_query_decisions.add_argument("--person", help="Filter by person (decided_by)")
@@ -2832,7 +2838,7 @@ def main():
 
     # Query action items
     parser_query_actions = query_subparsers.add_parser(
-        "actions", help="Deprecated: brain tool query_actions"
+        "actions", help="Deprecated: brain tool query_items"
     )
     parser_query_actions.add_argument("--owner", help="Filter by owner")
     parser_query_actions.add_argument(
@@ -2843,7 +2849,7 @@ def main():
 
     # Query combined
     parser_query_combined = query_subparsers.add_parser(
-        "combined", help="Deprecated: brain tool query_emails"
+        "combined", help="Deprecated: brain tool search"
     )
     parser_query_combined.add_argument("--person", help="Filter by person")
     parser_query_combined.add_argument("--topic", help="Filter by topic")
@@ -3005,7 +3011,7 @@ def main():
     parser_teams_drop_raw.set_defaults(func=cmd_teams_drop_raw_json)
 
     parser_teams_search = subparsers.add_parser(
-        "teams-search", help="Deprecated: brain tool search_teams"
+        "teams-search", help="Deprecated: brain tool search"
     )
     parser_teams_search.add_argument("query", help="Search query")
     parser_teams_search.add_argument(
@@ -3014,18 +3020,9 @@ def main():
     parser_teams_search.add_argument("--limit", type=int, default=20)
     parser_teams_search.set_defaults(func=cmd_teams_search)
 
-    parser_teams_thread = subparsers.add_parser(
-        "teams-thread", help="Deprecated: brain tool teams_thread_context"
-    )
+    parser_teams_thread = subparsers.add_parser("teams-thread", help="Deprecated: brain tool read")
     parser_teams_thread.add_argument("thread_id", type=int)
     parser_teams_thread.set_defaults(func=cmd_teams_thread)
-
-    parser_teams_chat = subparsers.add_parser(
-        "teams-chat", help="Deprecated: brain tool teams_chat_summary"
-    )
-    parser_teams_chat.add_argument("chat_id", type=int)
-    parser_teams_chat.add_argument("--days", type=int, default=30)
-    parser_teams_chat.set_defaults(func=cmd_teams_chat)
 
     parser_teams_stats = subparsers.add_parser(
         "teams-stats", help="Deprecated: brain tool sql_query (README)"
@@ -3135,7 +3132,7 @@ def main():
     parser_import.set_defaults(func=cmd_import_people)
 
     # Stale command
-    parser_stale = subparsers.add_parser("stale", help="Deprecated: brain tool stale_threads")
+    parser_stale = subparsers.add_parser("stale", help="Deprecated: brain tool query_items")
     parser_stale.add_argument(
         "--days", type=int, default=5, help="Stale threshold in days (default: 5)"
     )
@@ -3166,7 +3163,7 @@ def main():
 
     # Query semantic
     parser_query_semantic = query_subparsers.add_parser(
-        "semantic", help="Deprecated: brain tool search_emails, search_type semantic"
+        "semantic", help="Deprecated: brain tool search, search_type semantic"
     )
     parser_query_semantic.add_argument("query", help="Natural language search query")
     add_common_query_args(parser_query_semantic)

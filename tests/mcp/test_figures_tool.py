@@ -80,4 +80,4 @@ def test_a_replica_older_than_the_registry_says_how_it_comes(store):
 
 
 def test_the_instructions_route_numbers_to_figures():
-    assert "`figures` first" in mcp_server._instructions()
+    assert "`figures` for a number" in mcp_server._instructions()

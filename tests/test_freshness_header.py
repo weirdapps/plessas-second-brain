@@ -40,7 +40,7 @@ def test_every_tool_declares_the_header_in_its_output_schema():
 
 @pytest.mark.parametrize("name", sorted(seeded_store.CALLS))
 def test_every_result_opens_with_the_header(store, name):
-    result = getattr(mcp_server, name)(**seeded_store.CALLS[name])
+    result = seeded_store.call(name)
 
     sent = registered_tool(name).fn_metadata.convert_result(result)
 
@@ -56,7 +56,7 @@ def test_the_header_is_the_stores_own_freshness(tmp_path, monkeypatch, name):
     path = seeded_store.build(tmp_path / "brain.db", synced=SYNCED)
     seeded_store.serve(path, monkeypatch)
 
-    result = getattr(mcp_server, name)(**seeded_store.CALLS[name])
+    result = seeded_store.call(name)
 
     assert result["data_as_of"] == SYNCED
 
@@ -66,7 +66,7 @@ def test_a_stale_store_says_so_beside_the_header(tmp_path, monkeypatch, name):
     path = seeded_store.build(tmp_path / "brain.db", synced="2026-01-01T00:00:00Z")
     seeded_store.serve(path, monkeypatch)
 
-    result = getattr(mcp_server, name)(**seeded_store.CALLS[name])
+    result = seeded_store.call(name)
 
     keys = list(result)
     assert result["stale"] is True
@@ -99,9 +99,9 @@ def test_sql_tools_read_the_header_from_the_store_they_query(tmp_path, monkeypat
 def test_query_actions_answers_with_rows_under_result(store):
     """A bare list could carry no header; its structured content was {"result": [...]}
     already, as the five list tools #183 converted."""
-    result = mcp_server.query_actions()
+    result = seeded_store.call("query_items", {"kind": "actions"})
 
-    sent = registered_tool("query_actions").fn_metadata.convert_result(result)
+    sent = registered_tool("query_items").fn_metadata.convert_result(result)
 
     assert [row["task"] for row in result["result"]] == [
         "Draft the okapi budget",

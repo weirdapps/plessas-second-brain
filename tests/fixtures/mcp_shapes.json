@@ -1,168 +1,4 @@
 {
-  "attachment_image_search": {
-    "input_schema": {
-      "properties": [
-        "limit",
-        "query"
-      ],
-      "required": [
-        "query"
-      ]
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "count",
-        "coverage",
-        "data_as_of",
-        "reason",
-        "results",
-        "stale",
-        "truncated"
-      ],
-      "required": [
-        "count",
-        "data_as_of",
-        "results",
-        "stale"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "results",
-      "count"
-    ],
-    "rows": {
-      "results": [
-        "date",
-        "description",
-        "kind",
-        "occurrences",
-        "ref",
-        "sha256",
-        "who"
-      ],
-      "results[].occurrences": [
-        "message_id",
-        "position_in_body",
-        "sender_email"
-      ]
-    }
-  },
-  "conversation_context": {
-    "input_schema": {
-      "properties": [
-        "include_agents",
-        "session_id"
-      ],
-      "required": [
-        "session_id"
-      ]
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "action_items",
-        "data_as_of",
-        "decisions",
-        "key_facts",
-        "kind",
-        "session_id",
-        "stale",
-        "summary",
-        "topics",
-        "truncated",
-        "turns"
-      ],
-      "required": [
-        "data_as_of",
-        "stale"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "id",
-      "session_id",
-      "started_at",
-      "ended_at",
-      "workspace",
-      "project_name",
-      "turn_count",
-      "summary",
-      "topics_summary",
-      "kind",
-      "turns",
-      "decisions",
-      "action_items",
-      "key_facts",
-      "topics"
-    ],
-    "rows": {
-      "turns": [
-        "content_length",
-        "has_code",
-        "has_tool_use",
-        "speaker",
-        "summary",
-        "timestamp",
-        "turn_index"
-      ]
-    }
-  },
-  "email_thread": {
-    "input_schema": {
-      "properties": [
-        "email_id",
-        "limit"
-      ],
-      "required": [
-        "email_id"
-      ]
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "data_as_of",
-        "email_id",
-        "emails",
-        "stale",
-        "thread_total",
-        "truncated"
-      ],
-      "required": [
-        "data_as_of",
-        "email_id",
-        "emails",
-        "stale",
-        "thread_total"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "email_id",
-      "emails",
-      "thread_total"
-    ],
-    "rows": {
-      "emails": [
-        "date",
-        "email_id",
-        "kind",
-        "mailbox",
-        "ref",
-        "sender_address",
-        "sender_name",
-        "sentiment",
-        "source_class",
-        "subject",
-        "summary",
-        "who"
-      ]
-    }
-  },
   "figures": {
     "input_schema": {
       "properties": [
@@ -179,16 +15,16 @@
         "_stale_warning",
         "coverage",
         "data_as_of",
-        "mode",
+        "excluded",
+        "history_left_out",
         "reason",
         "result",
         "stale",
+        "summary",
         "truncated"
       ],
       "required": [
         "data_as_of",
-        "mode",
-        "result",
         "stale"
       ]
     },
@@ -220,118 +56,12 @@
       ]
     }
   },
-  "get_item": {
-    "input_schema": {
-      "properties": [
-        "include_agents",
-        "kind",
-        "max_chars",
-        "offset",
-        "ref"
-      ],
-      "required": [
-        "kind",
-        "ref"
-      ]
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "data_as_of",
-        "item",
-        "kind",
-        "next_offset",
-        "offset",
-        "ref",
-        "returned_chars",
-        "stale",
-        "text",
-        "total_chars",
-        "truncated"
-      ],
-      "required": [
-        "data_as_of",
-        "item",
-        "kind",
-        "next_offset",
-        "offset",
-        "ref",
-        "returned_chars",
-        "stale",
-        "text",
-        "total_chars"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "kind",
-      "ref",
-      "item",
-      "text",
-      "offset",
-      "returned_chars",
-      "total_chars",
-      "next_offset"
-    ],
-    "rows": {
-      "item.attachments": [
-        "extraction_status",
-        "file_size",
-        "filename",
-        "is_inline",
-        "mime_type",
-        "ref",
-        "text_chars"
-      ],
-      "item.extracted.action_items": [
-        "attachment_id",
-        "deadline",
-        "owner",
-        "status",
-        "task"
-      ],
-      "item.extracted.commitments": [
-        "by_person",
-        "commitment",
-        "to_person"
-      ],
-      "item.extracted.decisions": [
-        "attachment_id",
-        "decided_by",
-        "decision",
-        "decision_date"
-      ],
-      "item.extracted.key_facts": [
-        "attachment_id",
-        "fact"
-      ],
-      "item.people": [
-        "email",
-        "name",
-        "role",
-        "role_text"
-      ],
-      "item.thread": [
-        "date",
-        "kind",
-        "ref",
-        "subject",
-        "summary",
-        "who"
-      ]
-    }
-  },
   "meeting_prep": {
     "input_schema": {
       "properties": [
-        "days",
         "detail",
-        "include_automation",
-        "include_history",
-        "include_news",
-        "people",
-        "topic"
+        "filter",
+        "people"
       ],
       "required": [
         "people"
@@ -340,14 +70,14 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
-        "attendees",
         "coverage",
         "data_as_of",
-        "meetings",
+        "excluded",
+        "history_left_out",
         "reason",
-        "series_pages",
+        "result",
         "stale",
-        "topic_context",
+        "summary",
         "truncated"
       ],
       "required": [
@@ -520,22 +250,18 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
-        "clamped",
-        "count",
         "coverage",
         "data_as_of",
-        "messages",
+        "excluded",
+        "history_left_out",
         "reason",
-        "since_minutes",
+        "result",
         "stale",
+        "summary",
         "truncated"
       ],
       "required": [
-        "clamped",
-        "count",
         "data_as_of",
-        "messages",
-        "since_minutes",
         "stale"
       ]
     },
@@ -554,11 +280,8 @@
   "person_context": {
     "input_schema": {
       "properties": [
-        "days",
         "detail",
-        "include_automation",
-        "include_history",
-        "include_news",
+        "filter",
         "limit",
         "name_or_email"
       ],
@@ -569,32 +292,15 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
-        "communication_pattern",
         "coverage",
         "data_as_of",
-        "decisions",
-        "decisions_total",
-        "email_count",
-        "known",
-        "last_met",
-        "match_count",
-        "meeting_count_30d",
-        "next_meeting",
-        "open_actions",
-        "open_actions_total",
-        "other_candidates",
-        "page",
-        "person",
+        "excluded",
+        "history_left_out",
         "reason",
-        "recent_emails",
-        "resolved_by",
-        "sentiment_distribution",
+        "result",
         "stale",
-        "teams",
-        "topics",
-        "topics_total",
-        "truncated",
-        "whatsapp"
+        "summary",
+        "truncated"
       ],
       "required": [
         "data_as_of",
@@ -691,17 +397,18 @@
       ]
     }
   },
-  "query_actions": {
+  "query_items": {
     "input_schema": {
       "properties": [
-        "include_automation",
-        "include_history",
-        "include_news",
+        "filter",
+        "kind",
         "limit",
-        "owner",
+        "older_than_days",
         "status"
       ],
-      "required": []
+      "required": [
+        "kind"
+      ]
     },
     "output_schema": {
       "properties": [
@@ -709,136 +416,15 @@
         "coverage",
         "data_as_of",
         "excluded",
+        "history_left_out",
         "reason",
         "result",
         "stale",
+        "summary",
         "truncated"
       ],
       "required": [
         "data_as_of",
-        "result",
-        "stale"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "excluded",
-      "result"
-    ],
-    "rows": {
-      "result": [
-        "action_id",
-        "date",
-        "deadline",
-        "email_id",
-        "email_subject",
-        "kind",
-        "mailbox",
-        "overdue",
-        "owner",
-        "parent_date",
-        "ref",
-        "source",
-        "source_class",
-        "status",
-        "task",
-        "who"
-      ]
-    }
-  },
-  "query_calendar_events": {
-    "input_schema": {
-      "properties": [
-        "keyword",
-        "limit",
-        "max_attendees",
-        "person",
-        "since",
-        "until"
-      ],
-      "required": []
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "count",
-        "coverage",
-        "data_as_of",
-        "events",
-        "reason",
-        "stale",
-        "truncated"
-      ],
-      "required": [
-        "count",
-        "data_as_of",
-        "events",
-        "stale"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "events",
-      "count"
-    ],
-    "rows": {
-      "events": [
-        "attendees",
-        "attendees_total",
-        "body_summary",
-        "date",
-        "end_at",
-        "end_local",
-        "id",
-        "ingested_at",
-        "is_recurring",
-        "is_self_organized",
-        "kind",
-        "location",
-        "organizer",
-        "ref",
-        "response_status",
-        "start_at",
-        "start_local",
-        "subject",
-        "who"
-      ],
-      "events[].attendees": [
-        "email",
-        "name",
-        "status"
-      ]
-    }
-  },
-  "query_decisions": {
-    "input_schema": {
-      "properties": [
-        "days",
-        "include_automation",
-        "include_history",
-        "include_news",
-        "limit",
-        "person",
-        "topic"
-      ],
-      "required": []
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "coverage",
-        "data_as_of",
-        "excluded",
-        "reason",
-        "result",
-        "stale",
-        "truncated"
-      ],
-      "required": [
-        "data_as_of",
-        "result",
         "stale"
       ]
     },
@@ -867,20 +453,18 @@
       ]
     }
   },
-  "query_emails": {
+  "read": {
     "input_schema": {
       "properties": [
-        "end_date",
-        "include_automation",
-        "include_news",
-        "keyword",
-        "kinds",
-        "limit",
-        "person",
-        "start_date",
-        "topic"
+        "filter",
+        "max_chars",
+        "offset",
+        "part",
+        "ref"
       ],
-      "required": []
+      "required": [
+        "ref"
+      ]
     },
     "output_schema": {
       "properties": [
@@ -888,36 +472,74 @@
         "coverage",
         "data_as_of",
         "excluded",
+        "history_left_out",
         "reason",
         "result",
         "stale",
+        "summary",
         "truncated"
       ],
       "required": [
         "data_as_of",
-        "result",
         "stale"
       ]
     },
     "result_keys": [
       "data_as_of",
       "stale",
-      "excluded",
-      "result"
+      "kind",
+      "ref",
+      "item",
+      "text",
+      "offset",
+      "returned_chars",
+      "total_chars",
+      "next_offset"
     ],
     "rows": {
-      "result": [
-        "date",
-        "email_id",
-        "kind",
-        "mailbox",
+      "item.attachments": [
+        "extraction_status",
+        "file_size",
+        "filename",
+        "is_inline",
+        "mime_type",
         "ref",
-        "relevance_score",
-        "sender",
-        "source_class",
+        "text_chars"
+      ],
+      "item.extracted.action_items": [
+        "attachment_id",
+        "deadline",
+        "owner",
+        "status",
+        "task"
+      ],
+      "item.extracted.commitments": [
+        "by_person",
+        "commitment",
+        "to_person"
+      ],
+      "item.extracted.decisions": [
+        "attachment_id",
+        "decided_by",
+        "decision",
+        "decision_date"
+      ],
+      "item.extracted.key_facts": [
+        "attachment_id",
+        "fact"
+      ],
+      "item.people": [
+        "email",
+        "name",
+        "role",
+        "role_text"
+      ],
+      "item.thread": [
+        "date",
+        "kind",
+        "ref",
         "subject",
         "summary",
-        "topics",
         "who"
       ]
     }
@@ -925,13 +547,9 @@
   "recall": {
     "input_schema": {
       "properties": [
-        "days",
         "detail",
-        "include_automation",
+        "filter",
         "include_context",
-        "include_history",
-        "include_news",
-        "kinds",
         "limit_per_kind",
         "query"
       ],
@@ -942,43 +560,19 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
-        "actions",
-        "attachments",
-        "calendar_events",
-        "commitments",
-        "conversations",
         "coverage",
         "data_as_of",
-        "decisions",
-        "emails",
         "excluded",
-        "inline_images",
-        "pages",
-        "person_context",
-        "query",
+        "history_left_out",
         "reason",
+        "result",
         "stale",
         "summary",
-        "teams",
-        "topic_context",
-        "truncated",
-        "whatsapp"
+        "truncated"
       ],
       "required": [
-        "actions",
-        "attachments",
-        "calendar_events",
-        "commitments",
-        "conversations",
         "data_as_of",
-        "decisions",
-        "emails",
-        "inline_images",
-        "query",
-        "stale",
-        "summary",
-        "teams",
-        "whatsapp"
+        "stale"
       ]
     },
     "result_keys": [
@@ -1210,73 +804,16 @@
       ]
     }
   },
-  "search_attachments": {
+  "search": {
     "input_schema": {
       "properties": [
-        "include_automation",
-        "include_news",
-        "limit",
-        "query"
-      ],
-      "required": [
-        "query"
-      ]
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "coverage",
-        "data_as_of",
-        "excluded",
-        "reason",
-        "result",
-        "stale",
-        "truncated"
-      ],
-      "required": [
-        "data_as_of",
-        "result",
-        "stale"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "excluded",
-      "result"
-    ],
-    "rows": {
-      "result": [
-        "attachment_id",
-        "date",
-        "email_date",
-        "email_id",
-        "email_subject",
-        "filename",
-        "ingested_at",
-        "kind",
-        "mailbox",
-        "mime_type",
-        "ref",
-        "snippet",
-        "source_class",
-        "summary",
-        "who"
-      ]
-    }
-  },
-  "search_conversations": {
-    "input_schema": {
-      "properties": [
-        "include_agents",
+        "filter",
         "limit",
         "query",
         "search_type",
-        "workspace"
+        "source"
       ],
-      "required": [
-        "query"
-      ]
+      "required": []
     },
     "output_schema": {
       "properties": [
@@ -1284,68 +821,15 @@
         "coverage",
         "data_as_of",
         "excluded",
+        "history_left_out",
         "reason",
         "result",
         "stale",
-        "truncated"
-      ],
-      "required": [
-        "data_as_of",
-        "result",
-        "stale"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "result"
-    ],
-    "rows": {
-      "result": [
-        "conversation_id",
-        "date",
-        "ingested_at",
-        "kind",
-        "match_type",
-        "matched_in",
-        "project_name",
-        "ref",
-        "session_id",
-        "snippet",
         "summary",
-        "turn_count",
-        "who"
-      ]
-    }
-  },
-  "search_emails": {
-    "input_schema": {
-      "properties": [
-        "include_automation",
-        "include_news",
-        "kinds",
-        "limit",
-        "query",
-        "search_type"
-      ],
-      "required": [
-        "query"
-      ]
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "coverage",
-        "data_as_of",
-        "excluded",
-        "reason",
-        "result",
-        "stale",
         "truncated"
       ],
       "required": [
         "data_as_of",
-        "result",
         "stale"
       ]
     },
@@ -1373,175 +857,6 @@
       ]
     }
   },
-  "search_teams": {
-    "input_schema": {
-      "properties": [
-        "kind",
-        "limit",
-        "query"
-      ],
-      "required": [
-        "query"
-      ]
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "coverage",
-        "data_as_of",
-        "reason",
-        "results",
-        "stale",
-        "truncated"
-      ],
-      "required": [
-        "data_as_of",
-        "results",
-        "stale"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "results"
-    ],
-    "rows": {
-      "results": [
-        "channel_topic",
-        "chat_id",
-        "date",
-        "ended_at",
-        "kind",
-        "match",
-        "matched_in",
-        "message_count",
-        "participants",
-        "ref",
-        "snippet",
-        "started_at",
-        "summary",
-        "team_name",
-        "thread_id",
-        "title",
-        "who"
-      ]
-    }
-  },
-  "search_whatsapp": {
-    "input_schema": {
-      "properties": [
-        "chat",
-        "days",
-        "limit",
-        "query"
-      ],
-      "required": [
-        "query"
-      ]
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "coverage",
-        "data_as_of",
-        "reason",
-        "results",
-        "stale",
-        "truncated"
-      ],
-      "required": [
-        "data_as_of",
-        "results",
-        "stale"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "results"
-    ],
-    "rows": {
-      "results": [
-        "chat_id",
-        "chat_kind",
-        "chat_name",
-        "date",
-        "ended_at",
-        "kind",
-        "match",
-        "matched_in",
-        "message_count",
-        "participants",
-        "ref",
-        "snippet",
-        "started_at",
-        "summary",
-        "thread_id",
-        "title",
-        "who"
-      ]
-    }
-  },
-  "sender_brief": {
-    "input_schema": {
-      "properties": [
-        "days",
-        "name_or_email"
-      ],
-      "required": [
-        "name_or_email"
-      ]
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "coverage",
-        "data_as_of",
-        "department",
-        "email",
-        "email_count",
-        "known",
-        "last_contact",
-        "manager",
-        "match_count",
-        "name",
-        "open_actions_count",
-        "other_candidates",
-        "query",
-        "reason",
-        "recent_decisions",
-        "resolved_by",
-        "role",
-        "sentiment",
-        "stale",
-        "top_topics"
-      ],
-      "required": [
-        "data_as_of",
-        "stale"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "known",
-      "name",
-      "email",
-      "role",
-      "department",
-      "manager",
-      "email_count",
-      "top_topics",
-      "recent_decisions",
-      "open_actions_count",
-      "last_contact",
-      "sentiment",
-      "resolved_by",
-      "match_count",
-      "other_candidates"
-    ],
-    "rows": {}
-  },
   "sharepoint_index": {
     "input_schema": {
       "properties": [
@@ -1557,11 +872,12 @@
         "_stale_warning",
         "coverage",
         "data_as_of",
-        "document_message_id",
-        "links",
+        "excluded",
+        "history_left_out",
         "reason",
+        "result",
         "stale",
-        "status",
+        "summary",
         "truncated"
       ],
       "required": [
@@ -1582,31 +898,27 @@
     "input_schema": {
       "properties": [
         "limit",
-        "sql"
+        "sql",
+        "table"
       ],
-      "required": [
-        "sql"
-      ]
+      "required": []
     },
     "output_schema": {
       "properties": [
         "_stale_warning",
-        "columns",
         "coverage",
         "data_as_of",
+        "excluded",
+        "history_left_out",
         "reason",
-        "row_count",
-        "rows",
+        "result",
         "stale",
+        "summary",
         "truncated"
       ],
       "required": [
-        "columns",
         "data_as_of",
-        "row_count",
-        "rows",
-        "stale",
-        "truncated"
+        "stale"
       ]
     },
     "result_keys": [
@@ -1619,111 +931,6 @@
     ],
     "rows": {}
   },
-  "sql_schema": {
-    "input_schema": {
-      "properties": [
-        "table"
-      ],
-      "required": []
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "columns",
-        "data_as_of",
-        "indexes",
-        "stale",
-        "table",
-        "tables"
-      ],
-      "required": [
-        "data_as_of",
-        "stale"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "table",
-      "columns",
-      "indexes"
-    ],
-    "rows": {
-      "columns": [
-        "name",
-        "not_null",
-        "pk",
-        "type"
-      ],
-      "indexes": [
-        "name",
-        "unique"
-      ]
-    }
-  },
-  "stale_threads": {
-    "input_schema": {
-      "properties": [
-        "days",
-        "include_automation",
-        "include_history",
-        "include_news",
-        "limit",
-        "max_days"
-      ],
-      "required": []
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "coverage",
-        "data_as_of",
-        "overdue_actions",
-        "overdue_actions_total",
-        "reason",
-        "stale",
-        "stale_threads",
-        "stale_threads_total",
-        "stale_threads_unavailable",
-        "truncated"
-      ],
-      "required": [
-        "data_as_of",
-        "overdue_actions",
-        "overdue_actions_total",
-        "stale",
-        "stale_threads",
-        "stale_threads_total"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "stale_threads",
-      "stale_threads_total",
-      "overdue_actions",
-      "overdue_actions_total",
-      "stale_threads_unavailable"
-    ],
-    "rows": {
-      "overdue_actions": [
-        "action_id",
-        "date",
-        "days_overdue",
-        "deadline",
-        "email_id",
-        "email_subject",
-        "kind",
-        "owner",
-        "parent_date",
-        "ref",
-        "source",
-        "source_class",
-        "task",
-        "who"
-      ]
-    }
-  },
   "stats": {
     "input_schema": {
       "properties": [],
@@ -1732,32 +939,15 @@
     "output_schema": {
       "properties": [
         "_stale_warning",
-        "age_hours",
-        "attachments_awaiting_summary",
-        "attachments_awaiting_summary_oldest_hours",
-        "attachments_awaiting_text",
-        "attachments_awaiting_text_oldest_hours",
-        "attachments_extracted",
         "coverage",
         "data_as_of",
-        "earliest_email",
-        "embed_backend",
-        "last_embed_error",
-        "latest_email",
-        "source_class",
+        "excluded",
+        "history_left_out",
+        "reason",
+        "result",
         "stale",
-        "stale_warning",
-        "total_action_items",
-        "total_attachments",
-        "total_conversation_turns",
-        "total_conversations",
-        "total_decisions",
-        "total_documents",
-        "total_emails",
-        "total_key_facts",
-        "total_news_articles",
-        "total_people",
-        "total_topics"
+        "summary",
+        "truncated"
       ],
       "required": [
         "data_as_of",
@@ -1798,139 +988,11 @@
     ],
     "rows": {}
   },
-  "teams_chat_summary": {
-    "input_schema": {
-      "properties": [
-        "chat_id",
-        "days"
-      ],
-      "required": [
-        "chat_id"
-      ]
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "chat",
-        "coverage",
-        "data_as_of",
-        "last_messages",
-        "open_actions",
-        "reason",
-        "stale",
-        "threads",
-        "top_senders",
-        "truncated"
-      ],
-      "required": [
-        "data_as_of",
-        "stale"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "chat",
-      "threads",
-      "last_messages",
-      "top_senders",
-      "open_actions"
-    ],
-    "rows": {
-      "last_messages": [
-        "composed_at",
-        "content_text",
-        "sender_display_name"
-      ],
-      "open_actions": [
-        "deadline",
-        "owner",
-        "task"
-      ],
-      "threads": [
-        "date",
-        "ended_at",
-        "id",
-        "kind",
-        "message_count",
-        "ref",
-        "started_at",
-        "summary",
-        "title",
-        "who"
-      ],
-      "top_senders": [
-        "n",
-        "name"
-      ]
-    }
-  },
-  "teams_thread_context": {
-    "input_schema": {
-      "properties": [
-        "thread_id"
-      ],
-      "required": [
-        "thread_id"
-      ]
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "action_items",
-        "data_as_of",
-        "decisions",
-        "key_facts",
-        "messages",
-        "stale",
-        "thread",
-        "truncated"
-      ],
-      "required": [
-        "data_as_of",
-        "stale"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "thread",
-      "messages",
-      "decisions",
-      "action_items",
-      "key_facts"
-    ],
-    "rows": {
-      "action_items": [
-        "deadline",
-        "owner",
-        "status",
-        "task"
-      ],
-      "decisions": [
-        "decided_by",
-        "decision",
-        "decision_date"
-      ],
-      "messages": [
-        "composed_at",
-        "content_text",
-        "is_system",
-        "parent_message_id",
-        "sender_display_name",
-        "sender_mri",
-        "sender_person_id"
-      ]
-    }
-  },
   "topic_context": {
     "input_schema": {
       "properties": [
-        "days",
         "detail",
-        "include_automation",
-        "include_history",
-        "include_news",
+        "filter",
         "limit",
         "topic"
       ],
@@ -1943,28 +1005,13 @@
         "_stale_warning",
         "coverage",
         "data_as_of",
-        "decisions",
-        "decisions_total",
-        "email_count",
-        "key_facts",
-        "key_facts_total",
-        "key_people",
-        "key_people_total",
-        "meetings",
-        "meetings_total",
-        "open_actions",
-        "open_actions_total",
-        "page",
+        "excluded",
+        "history_left_out",
         "reason",
-        "recent_emails",
+        "result",
         "stale",
-        "teams_threads",
-        "teams_threads_total",
-        "topic",
-        "topic_page",
-        "truncated",
-        "whatsapp_sessions",
-        "whatsapp_sessions_total"
+        "summary",
+        "truncated"
       ],
       "required": [
         "data_as_of",
@@ -2046,67 +1093,6 @@
         "subject",
         "summary",
         "who"
-      ],
-      "topic_page.citations": [
-        "date",
-        "kind",
-        "ref",
-        "title"
-      ]
-    }
-  },
-  "topic_page": {
-    "input_schema": {
-      "properties": [
-        "topic"
-      ],
-      "required": [
-        "topic"
-      ]
-    },
-    "output_schema": {
-      "properties": [
-        "_stale_warning",
-        "data_as_of",
-        "findings",
-        "pages",
-        "reason",
-        "stale",
-        "topic_page",
-        "truncated"
-      ],
-      "required": [
-        "data_as_of",
-        "stale"
-      ]
-    },
-    "result_keys": [
-      "data_as_of",
-      "stale",
-      "topic_page",
-      "findings"
-    ],
-    "rows": {
-      "findings": [
-        "as_of",
-        "author_kind",
-        "claim",
-        "date",
-        "id",
-        "kind",
-        "loaded_at",
-        "note_path",
-        "ordinal",
-        "quote",
-        "reason",
-        "ref",
-        "session_id",
-        "source_date",
-        "source_ref",
-        "status",
-        "superseded_by",
-        "supersedes",
-        "value"
       ],
       "topic_page.citations": [
         "date",

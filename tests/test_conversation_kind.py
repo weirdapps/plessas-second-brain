@@ -2,7 +2,7 @@
 
 A teammate's or subagent's session, or one the owner typed nothing into, holds no
 owner turn. Stored with --include-agents, it stays out of search_conversations,
-conversation_context, recent_conversations, the preference facts and recall's
+read, recent_conversations, the preference facts and recall's
 conversations bucket unless include_agents asks for it.
 
 And what those tools return cannot read as a live harness event: a stored
@@ -129,14 +129,25 @@ def test_semantic_search_ranks_among_owner_sessions_only(index):
     assert [(r["session_id"], r["kind"]) for r in rows] == [("agent-session", "agent")]
 
 
+def _read(session_id: str, include_agents: bool = False) -> dict:
+    from tests.mcp_listing import registered_tool
+
+    return registered_tool("read").fn(
+        ref=f"conversation:{session_id}", filter={"include_agents": include_agents}
+    )
+
+
 def test_an_agent_session_is_read_only_when_asked_for(db):
     with pytest.raises(ToolError, match="include_agents"):
-        mcp_server.conversation_context("agent-session")
+        _read("agent-session")
 
-    out = mcp_server.conversation_context("agent-session", include_agents=True)
-    assert out["kind"] == "agent"
-    assert [t["speaker"] for t in out["turns"]] == ["agent", "assistant"]
-    assert mcp_server.conversation_context("owner-session")["kind"] == "owner"
+    out = _read("agent-session", include_agents=True)
+    assert out["item"]["kind"] == "agent"
+    assert [line.split("] ", 1)[1].split(":", 1)[0] for line in out["text"].split("\n\n")] == [
+        "agent",
+        "assistant",
+    ]
+    assert _read("owner-session")["item"]["kind"] == "owner"
 
 
 def test_recent_conversations_leaves_agent_sessions_out(conn):
@@ -201,7 +212,7 @@ def _assert_inert(value):
 
 def test_conversation_text_comes_back_with_harness_tags_escaped(tagged):
     _assert_inert(mcp_server.search_conversations("notes okapi")["result"])
-    _assert_inert(mcp_server.conversation_context("tagged-session")["key_facts"])
+    _assert_inert(_read("tagged-session")["item"]["extracted"]["key_facts"])
     _assert_inert(mcp_server.recall("notes okapi")["conversations"])
     out = mcp_server.sql_query(
         "SELECT content FROM conversation_turns WHERE content LIKE '%okapi <task%'"
@@ -210,6 +221,6 @@ def test_conversation_text_comes_back_with_harness_tags_escaped(tagged):
 
 
 def test_other_markup_is_left_alone(tagged):
-    facts = mcp_server.conversation_context("tagged-session")["key_facts"]
+    facts = _read("tagged-session")["item"]["extracted"]["key_facts"]
 
     assert "<summary>do X</summary>" in facts[0]

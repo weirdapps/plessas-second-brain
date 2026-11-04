@@ -585,6 +585,7 @@ def _gated_steps():
     from src.store import (
         extraction_fields,
         ledger,
+        pages,
         person_identity,
         thread_identity,
         topic_registry,
@@ -597,7 +598,9 @@ def _gated_steps():
     # header role and the merge log (issue 170), then the vector index moved from
     # embeddings.npz into the store (issue 171), then emails.item_kind
     # (issue 211), then the canonical topics, their aliases and the topic links of chats
-    # and meetings (issue 180), empty until a batch fills them.
+    # and meetings (issue 180), empty until a batch fills them, then the page layer
+    # (issue 169): compiled pages, their generations, dirty flags and overrides, empty
+    # until the first sync's refresh compiles them.
     return (
         ("item_ledger", ledger.migrate),
         ("commitment_parents", ledger.migrate_commitment_parents),
@@ -606,6 +609,7 @@ def _gated_steps():
         ("vectors", vector_store.migrate),
         ("extraction_item_kind", extraction_fields.migrate),
         ("topic_registry", topic_registry.migrate),
+        ("page_layer", pages.migrate),
     )
 
 
@@ -617,6 +621,7 @@ GATED_MIGRATIONS = (
     "vectors",
     "extraction_item_kind",
     "topic_registry",
+    "page_layer",
 )
 # The gated steps a new store does not take on its own (create_database, run_migrations with
 # `gated`): `vectors` copies in the vectors of embeddings.npz, which lives outside brain.db,

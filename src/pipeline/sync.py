@@ -593,6 +593,32 @@ def run(args):
     except Exception as e:
         print(f"  Consolidation skipped: {e}", file=sys.stderr)
 
+    # Step 8c: the page layer's skeletons (issue 169, src/store/pages.py): every person,
+    # topic, thread and meeting series with a page that this run's items (or the Teams,
+    # calendar and WhatsApp syncs' since the last run) touched is compiled again by SQL
+    # and marked dirty for the nightly synthesis. No model call; a no-op on a store
+    # without the gated page_layer step. A failure here fails no sync.
+    job_runs.mark_stage("pages")
+    print("\nStep 8c: Compiling the pages new items touched...")
+    try:
+        from src.store import pages
+
+        conn_pages = get_conn(db_path)
+        try:
+            compiled = pages.refresh(conn_pages)
+            conn_pages.commit()
+        finally:
+            conn_pages.close()
+        if compiled.get("enabled"):
+            print(
+                f"  {compiled['compiled']} pages compiled of {compiled['touched']} touched"
+                f"{' (first compile)' if compiled['first'] else ''}; {compiled['dirty']} dirty"
+            )
+        else:
+            print("  No page layer on this store (gated step page_layer)")
+    except Exception as e:
+        print(f"  Page compile skipped: {e}", file=sys.stderr)
+
     # Step 9: one embedding pass for everything this run stored: the mail of Step 3, the
     # attachment summaries of Step 6, the conversations of Step 7 (one loaded again has a new
     # id, which semantic search cannot find until it has a vector) and the image descriptions

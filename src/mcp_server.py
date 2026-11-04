@@ -93,6 +93,7 @@ for _module in (
     "src.store.greek",
     "src.store.items",
     "src.store.ledger",
+    "src.store.pages",
     "src.store.person_identity",
     "src.store.query",
     "src.store.recall",
@@ -734,7 +735,8 @@ def person_context(
     automation mail are left out unless included, and so are decisions and actions
     marked duplicate or superseded (history_left_out counts them, include_history
     keeps them). detail='card' gives a short card, 'concise' a short line per row;
-    meeting_prep takes several people.
+    meeting_prep takes several people. `page`, first when held, is their compiled
+    page: cited [kind:id, date] lines, derived (the rows stay the evidence).
     """
     from src.store.context import get_person_context
 
@@ -809,7 +811,8 @@ def topic_context(
     capped at `limit` and has a `<name>_total` sibling with the real count. News and
     the owner's automation mail are left out unless included, and so are items
     marked duplicate or superseded (history_left_out counts them). When no tag
-    matches, recall searches the text itself.
+    matches, recall searches the text itself. `page`, first when held, is the topic's
+    compiled page (its canonical topic's): cited [kind:id, date] lines, derived.
     """
     from src.store.context import get_topic_context, topic_page_first
 
@@ -1094,7 +1097,8 @@ def recall(
 
     It opens with `summary` (`semantic` first: 'ok', 'keyword_seeded: <error>' or
     'unavailable: <error>'), `data_as_of`, `stale`, `_stale_warning` when behind,
-    and `truncated` when the budget cut rows. Then ten buckets: emails (with
+    and `truncated` when the budget cut rows; `pages`, entity cards. Then ten
+    buckets: emails (with
     standalone documents), attachments, conversations, decisions, actions,
     commitments, inline_images, teams, whatsapp, calendar_events;
     `summary.kinds_with_results` names those with rows, and `kinds` keeps only rows
@@ -1147,6 +1151,10 @@ def recall(
             include_history=include_history,
         )
         fresh = _header(conn)
+        # The entity card on search (issue 169): the compiled pages the query names.
+        from src.store import pages as _pages
+
+        entity_cards = _pages.cards(conn, query)
         excluded = None
         if left_out:
             probes = []
@@ -1192,6 +1200,8 @@ def recall(
     for dossier in ("person_context", "topic_context"):
         if dossier in found:
             out[dossier] = found[dossier]
+    if entity_cards:
+        out["pages"] = _inert(entity_cards)
     out = _sized(out, detail)
     if "truncated" in out:
         # Next to the header, not at the end where a preview cannot see it.
@@ -1573,6 +1583,8 @@ def meeting_prep(
     left out unless included, and so are items marked duplicate or superseded (each
     dossier's history_left_out counts them). The budget cuts rows inside each
     dossier, which then says so in its own `truncated`, never a whole attendee.
+    An attendee's `page` and `series_pages` (the series the listed meetings recur in)
+    are compiled pages: cited [kind:id, date] lines, derived.
     """
     from src.store.query import meeting_prep as _mp
 
@@ -2728,6 +2740,54 @@ def get_item(
     }
     # Session notes and conversations hold harness tags verbatim.
     return cast(ItemResult, budget_response(_inert(out)))
+
+
+# --- MCP resources: the compiled pages (issue 169) --------------------------------------
+
+
+@mcp.resource(
+    "brain://pages",
+    name="pages",
+    description="Every compiled page held (person, topic, thread, meeting series): kind, key, "
+    "name and uri. Pages are derived; each line cites [kind:id, date].",
+    mime_type="application/json",
+)
+def pages_index() -> str:
+    from src.store import pages
+
+    conn = _get_conn()
+    try:
+        return json.dumps(
+            {"counts": pages.counts(conn), "pages": _inert(pages.list_pages(conn))},
+            ensure_ascii=False,
+        )
+    finally:
+        conn.close()
+
+
+@mcp.resource(
+    "brain://pages/{kind}/{key}",
+    name="page",
+    description="One compiled page as markdown: the owner's corrections, the synthesis and "
+    "the skeleton, every line citing [kind:id, date]; get_item reads each item. kind is "
+    "person (a people id), topic (c<canonical id> or t<topic id>), thread (a "
+    "conversation_id) or series (a calendar recurrence master id).",
+    mime_type="text/markdown",
+)
+def page_resource(kind: str, key: str) -> str:
+    from urllib.parse import unquote
+
+    from src.store import pages
+
+    key = unquote(key)
+    conn = _get_conn()
+    try:
+        page = pages.get_page(conn, kind, key)
+    finally:
+        conn.close()
+    if page is None:
+        return f"No {kind} page {key}: none compiled, hidden by an override, or no page layer.\n"
+    return _inert(page["markdown"])
 
 
 def _host_port(value: str) -> tuple[str, int]:

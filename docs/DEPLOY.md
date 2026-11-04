@@ -2004,3 +2004,17 @@ one pass, at the first job that writes. The versions that ask for a step:
     calendar event already stored is read again only when Outlook changes it. Check the
     extraction eval on a few days of it before widening; unset, the prompts are byte for
     byte as before.
+- **Gated: `page_layer`** (issue 169, `src/store/pages.py`). Applied by the same
+  `--apply-gated` run, after the seven above. It adds five empty tables and changes no
+  row: `pages`, `page_generations`, `page_dirty`, `page_overrides`, `page_watermarks`.
+  After it:
+
+  - The next hourly sync's Step 8c compiles every eligible page's skeleton by SQL (the
+    first run has no watermark, so it compiles them all; at most 1,000 pages, no model
+    call) and marks each dirty; every later run compiles only the pages its new rows
+    touched. The sync's log line says how many.
+  - The tools serve the skeleton at once (`page` in `person_context` and
+    `topic_context`, `series_pages` in `meeting_prep`, `pages` in `recall`, the
+    `brain://pages` resources). Nothing reads a page as a source.
+  - To undo it, drop the five tables and the `gated_migrations` row, or restore the
+    backup of step 4. No other table points at them.

@@ -211,6 +211,7 @@ def test_the_gated_step_fills_existing_rows_and_their_status(old):
     commitment = _row(old, "commitments", promise)
     assert commitment["due_date"] == "2026-11-10"
     assert commitment["counterpart_person_id"] == alice
+    assert commitment["counterpart_via"] == "address"
     assert commitment["owner_role"] == "assigned_to_owner"
 
 
@@ -428,6 +429,7 @@ def test_the_counterpart_of_an_action_the_owner_owes_is_who_asked(conn):
     ledger.reconcile(conn)
     row = _row(conn, "action_items", action)
     assert row["counterpart_person_id"] == f.person(conn, *ALICE)
+    assert row["counterpart_via"] == "address"
     assert row["owner_role"] == "assigned_to_owner"
 
 
@@ -440,6 +442,7 @@ def test_the_counterpart_of_an_action_owed_to_the_owner_is_its_owner(conn):
     ledger.reconcile(conn)
     row = _row(conn, "action_items", action)
     assert row["counterpart_person_id"] == alice
+    assert row["counterpart_via"] == "name"
     assert row["owner_role"] == "owner_assigned_other"
 
 

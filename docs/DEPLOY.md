@@ -1837,6 +1837,7 @@ one pass, at the first job that writes. The versions that ask for a step:
   From then on the hourly consolidation and the daily action lifecycle reconcile the
   ledger, about 2 s each, and the hourly pass per entity (`src/store/entity_pass.py`)
   takes the items stored since its first run. Its backfill is optional:
-  `python -m src.cli maint consolidate-entities` counts (1,554 labels on the copy: 400
-  decisions, 1,154 actions, 2.5 s), `--apply` writes them, and the line it prints names
+  `python -m src.cli maint consolidate-entities` counts (784 labels on the copy, all
+  actions, counterparts found by a hard identifier only; 760 name-only pairs are counted
+  and never written, issue 170), `--apply` writes them, and the line it prints names
   the run id that `maint consolidate --revert` takes.

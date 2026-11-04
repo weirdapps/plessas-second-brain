@@ -116,16 +116,49 @@ def test_a_done_action_does_not_absorb_an_open_one(conn):
 
 
 def test_an_item_from_the_owners_mail_is_never_hidden_behind_another(conn):
-    theirs = f.email(conn, subject="Plan", sender=ALICE, to=(OWNER,))
-    f.decision(conn, "Launch in April", email_id=theirs, decided_by=ALICE[0])
-    ours = f.email(conn, subject="Other plan", sender=OWNER, to=(ALICE,))
-    mine = f.decision(conn, "Launch in April", email_id=ours, decided_by=ALICE[0])
+    theirs = _owed_by_alice(conn, "Send the budget", "2026-10-01")
+    mine = _owed_by_alice(conn, "Send the budget", "2026-10-03", sender=OWNER)
     _ready(conn)
-    assert _row(conn, "decisions", mine)["counterpart_person_id"] == f.person(conn, *ALICE)
+    # The owner's own mail names Alice by a hard identifier only in a case this test
+    # stands for: give both rows the same address-found counterpart.
+    alice = _row(conn, "action_items", theirs)["counterpart_person_id"]
+    conn.execute(
+        "UPDATE action_items SET counterpart_person_id = ?, counterpart_via = 'address'"
+        " WHERE id = ?",
+        (alice, mine),
+    )
+    conn.commit()
 
     entity_pass.run(conn, since=None)
 
-    assert _row(conn, "decisions", mine)["canonical_id"] is None
+    assert _row(conn, "action_items", mine)["canonical_id"] is None
+
+
+def test_a_counterpart_matched_by_name_alone_never_joins_two_threads(conn):
+    """Issue 170: merge on a hard identifier only. Two same-hash actions owed to the owner
+    by 'Alice Smith', a name the model wrote, stay two items, listed as a candidate."""
+    f.person(conn, *ALICE)
+    one = f.email(
+        conn, subject="One", sender=OWNER, to=(ALICE,), date_received="2026-10-01T09:00:00Z"
+    )
+    two = f.email(
+        conn, subject="Two", sender=OWNER, to=(ALICE,), date_received="2026-10-02T09:00:00Z"
+    )
+    first = f.action_item(
+        conn, "Send the deck", email_id=one, owner=ALICE[0], direction="owed_to_owner"
+    )
+    again = f.action_item(
+        conn, "Send the deck", email_id=two, owner=ALICE[0], direction="owed_to_owner"
+    )
+    _ready(conn)
+    assert _row(conn, "action_items", first)["counterpart_via"] == "name"
+    assert _row(conn, "action_items", again)["counterpart_person_id"] is not None
+
+    result = entity_pass.run(conn, since=None)
+
+    assert result["labels"] == 0
+    assert result["name_only_candidates"] == 1
+    assert _row(conn, "action_items", again)["canonical_id"] is None
 
 
 def test_two_people_rows_of_one_entity_are_one_counterpart(conn):
@@ -152,14 +185,15 @@ def test_two_people_rows_of_one_entity_are_one_counterpart(conn):
     assert _row(conn, "action_items", again)["canonical_id"] == first
 
 
-def test_decisions_with_one_counterpart_consolidate_too(conn):
+def test_decisions_name_their_counterpart_by_name_only_and_stay_apart(conn):
     one = f.decision(conn, "Launch in April", decided_by=ALICE[0])
     two = f.decision(conn, "Launch in April", decided_by=ALICE[0])
     _ready(conn)
+    assert _row(conn, "decisions", one)["counterpart_via"] == "name"
 
     entity_pass.run(conn, since=None)
 
-    assert _row(conn, "decisions", two)["canonical_id"] == one
+    assert _row(conn, "decisions", two)["canonical_id"] is None
 
 
 def test_the_hourly_pass_starts_where_it_first_ran(conn):

@@ -356,14 +356,19 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
         conn, mailbox, sender_address, metadata.get("subject"), _header_addresses(metadata)
     )
 
-    # Insert email record
+    # Insert email record. With the gated extraction_item_kind (issue 211), what a v2
+    # extraction says the email is goes in the same INSERT, so no UPDATE re-indexes it.
+    from .extraction_fields import applied as kind_applied
+    from .extraction_fields import item_kind
+
+    kind = (", item_kind", ", ?", (item_kind(extraction),)) if kind_applied(conn) else ("", "", ())
     cursor = conn.execute(
-        """
+        f"""
         INSERT INTO emails (
             message_id, internet_message_id, date_received, sender_name, sender_address,
             subject, summary, sentiment, urgency, language, mailbox_name, content,
-            in_reply_to, "references", conversation_id, source_class
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            in_reply_to, "references", conversation_id, source_class{kind[0]}
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{kind[1]})
         """,
         (
             message_id,
@@ -382,6 +387,7 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
             references or None,
             conversation_id,
             source_class,
+            *kind[2],
         ),
     )
     email_id = cursor.lastrowid
@@ -629,10 +635,19 @@ def _write_extraction(
     # Load people and their roles: people_roles in schema v1, people in schema v2
     people_ids: dict[str, int] = {}
     named = [] if items_only else _named_people(extraction, metadata)
+    # The names a v2 extraction gives a person, as written and in Latin letters, are
+    # noted as that person's identifiers (issue 211) on a store with the gated
+    # person_identity (issue 170); a v1 extraction's are not.
+    from .person_identity import active as identities_active
+    from .person_identity import record as record_identifier
+
+    note_names = extraction.get("extraction_schema") == 2 and identities_active(conn)
     for person_name, person_email, roles, names in named:
         person_id = find_or_create_person(conn, person_name, person_email)
         for name in names:
             people_ids.setdefault(search_fold(name), person_id)
+            if note_names:
+                record_identifier(conn, person_id, "name", name, "extraction_v2")
 
         for role in roles:
             if isinstance(role, dict):
@@ -750,13 +765,19 @@ def replace_extraction(
     have one, and they stay. The email keeps its id, and with it its attachments,
     HTML and thread; its vector is the caller's to drop.
     """
+    from .extraction_fields import applied as kind_applied
+    from .extraction_fields import item_kind
+
+    kind = (", item_kind = ?", (item_kind(right),)) if kind_applied(conn) else ("", ())
     conn.execute(
-        "UPDATE emails SET summary = ?, sentiment = ?, urgency = ?, language = ? WHERE id = ?",
+        "UPDATE emails SET summary = ?, sentiment = ?, urgency = ?, language = ?"
+        f"{kind[0]} WHERE id = ?",
         (
             right.get("summary"),
             right.get("sentiment"),
             right.get("urgency"),
             right.get("language"),
+            *kind[1],
             email_id,
         ),
     )

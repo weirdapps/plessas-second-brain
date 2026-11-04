@@ -1965,3 +1965,12 @@ one pass, at the first job that writes. The versions that ask for a step:
     vectors (no model call for those); `--apply --summaries --limit 5000` embeds that many
     768 summaries again at 1536. `maint vectors-rebuild` puts every summary back at 768
     and drops the email chunks; the backfill then adds them again.
+- **Gated: `extraction_item_kind`** (issue 211, `src/store/extraction_fields.py`). Applied by
+  the same `--apply-gated` run, after the five above, with the same steps 1 to 5. ADD
+  COLUMN only: `emails.item_kind`, empty; the loader fills it from each v2 extraction it
+  loads or replaces afterwards, and history stays NULL (its kind is in the extraction files
+  under `data/extracted/`, for a backfill if wanted). On an APFS clone of the replica
+  (2026-11-04, schema 42, the three earlier gated steps already applied, before
+  `person_identity` and `vectors` existed) the dry run rolled back to no column, and the
+  applied step changed no row of the 55 tables besides its `gated_migrations` entry,
+  `integrity_check` ok, 3.4 s.

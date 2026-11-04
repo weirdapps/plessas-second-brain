@@ -78,6 +78,36 @@ def uses_schema_v2(shape: str | None = None) -> bool:
     return (shape or call_shape()) != V1
 
 
+# The routes whose v2 requests are opt-in (issue 211): the calendar route, and the cached
+# system prompts of the Teams and WhatsApp routes. A deploy must not change those requests
+# before the owner has run the eval on them, so each stays as it was (v1's calendar call,
+# the thread prompts as built) until BRAIN_EXTRACT_V2_ROUTES names it. Ship, check the
+# eval, then widen.
+V2_ROUTES_VAR = "BRAIN_EXTRACT_V2_ROUTES"
+OPT_IN_ROUTES = ("calendar", "teams", "whatsapp")
+
+
+def v2_route(name: str, shape: str | None = None) -> bool:
+    """Whether the opt-in route `name` takes its v2 request: the call shape (the configured
+    one when None) asks for schema v2, and BRAIN_EXTRACT_V2_ROUTES, a list separated by
+    commas, empty by default, names it.
+
+    A name that is not one of OPT_IN_ROUTES stops the call with ClaudeNotConfigured, as a
+    mistyped call shape does: a typo must not leave a route off while the owner believes
+    it on."""
+    raw = os.environ.get(V2_ROUTES_VAR, "")
+    named = {part.strip().lower() for part in raw.split(",") if part.strip()}
+    wrong = sorted(named - set(OPT_IN_ROUTES))
+    if wrong:
+        from src.extract.claude_extract import ClaudeNotConfigured
+
+        raise ClaudeNotConfigured(
+            f"{V2_ROUTES_VAR}={raw!r} names {', '.join(wrong)}, not a route: name any of"
+            f" {', '.join(OPT_IN_ROUTES)}, or leave it empty"
+        )
+    return name in named and uses_schema_v2(shape)
+
+
 def structured_outputs(shape: str | None = None) -> bool:
     """Whether calls in `shape` (the configured one when None) send `output_config.format`:
     v2 alone."""
@@ -94,9 +124,10 @@ class Route:
     schema: dict | None = None
 
     def output_config(self, structured: bool = True) -> dict:
-        """The effort, and with `structured` the schema as structured output where the
-        route has one; without it (v2-text) the effort alone."""
-        config: dict[str, Any] = {"effort": self.effort}
+        """The effort (route_effort: the pinned one, or the route's override), and with
+        `structured` the schema as structured output where the route has one; without it
+        (v2-text) the effort alone."""
+        config: dict[str, Any] = {"effort": route_effort(self)}
         if structured and self.schema is not None:
             config["format"] = {"type": "json_schema", "schema": self.schema}
         return config
@@ -117,12 +148,54 @@ ROUTES = {
     "attachment": Route("attachment", effort="high", max_tokens=8192, schema=ATTACHMENT_SCHEMA_V2),
     # Teams and WhatsApp: thinking counts toward max_tokens, and at 2,048 it cut 13% of
     # Teams calls short, so the budget is raised and the effort kept: what failed was the
-    # room, not the effort. No schema: their prompts and parsers are unchanged, and their
-    # system prompts are too short to cache (512 tokens is the least Sonnet 5.5 caches),
-    # so no marker either.
+    # room, not the effort. No schema: their parsers are unchanged. Their system prompts
+    # are cached with worked threads (teams_prompt.cached_prompt, issue 211).
     "teams": Route("teams", effort="high", max_tokens=8192),
     "whatsapp": Route("whatsapp", effort="high", max_tokens=8192),
+    # Calendar events (issue 211): two answer shapes, so two schemas, which the calendar
+    # extractor sets on a copy of this route by is_invitation
+    # (src/extract/calendar_extractor.py). 8,192 as since issue 203.
+    "calendar": Route("calendar", effort="high", max_tokens=8192),
 }
+
+
+# Each route's effort override (issue 211), for an effort sweep's result to reach
+# production without a code change: set, it replaces the route's pinned effort in every
+# call of that route under v2 and v2-text; v1 sends no effort. Spelled out, not built, so
+# a search for the variable finds it here.
+EFFORT_VARS = {
+    "email": "BRAIN_EXTRACT_EFFORT_EMAIL",
+    "attachment": "BRAIN_EXTRACT_EFFORT_ATTACHMENT",
+    "teams": "BRAIN_EXTRACT_EFFORT_TEAMS",
+    "whatsapp": "BRAIN_EXTRACT_EFFORT_WHATSAPP",
+    "calendar": "BRAIN_EXTRACT_EFFORT_CALENDAR",
+}
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def effort_var(route_name: str) -> str:
+    """The variable that overrides `route_name`'s effort."""
+    return EFFORT_VARS[route_name]
+
+
+def route_effort(route: Route) -> str:
+    """The effort `route`'s calls are sent at: its override when set, else the pinned one.
+
+    A value that is not an effort stops the call with ClaudeNotConfigured, as a mistyped
+    call shape does: a sweep's result must not silently run at another effort."""
+    var = EFFORT_VARS.get(route.name)
+    raw = os.environ.get(var, "") if var else ""
+    value = raw.strip().lower()
+    if not value:
+        return route.effort
+    if value not in EFFORTS:
+        from src.extract.claude_extract import ClaudeNotConfigured
+
+        raise ClaudeNotConfigured(
+            f"{var}={raw!r} is not an effort: set it to one of {', '.join(EFFORTS)},"
+            f" or unset it for {route.effort}"
+        )
+    return value
 
 
 def max_tokens_attempts(route: Route) -> tuple[int, int]:

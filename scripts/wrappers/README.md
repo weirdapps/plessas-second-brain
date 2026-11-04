@@ -33,7 +33,7 @@ upgrade.
 
 | Directory | Host | Scheduler | Count |
 | --- | --- | --- | --- |
-| `systemd/` | the producer (a Linux VPS) | `systemctl --user` timers, plus one long-running service | 13 |
+| `systemd/` | the producer (a Linux VPS) | `systemctl --user` timers, plus one long-running service | 15 |
 | `launchd/` | a Mac that holds a replica | LaunchAgents, and one Claude Code hook | 4, plus one plist template |
 
 What each one runs, and when on the reference deployment (Europe/Athens; the unit
@@ -54,7 +54,8 @@ section 6 shows the same schedule from the pipeline's side):
 | `systemd/sb-auth-watch.sh` | `sb-auth-watch`, and `sb-outlook-sync.sh` before each run | every 4 hours | checks the Outlook and Teams sessions, renews them, and sets or clears the re-auth sentinels |
 | `systemd/sb-health-check.sh` | `sb-health-check` | 23:50 | `scripts/health_check.py --fix --email-if-issues`, then the `sb-brain-freshness` ping (`docs/DEPLOY.md`, section 7) |
 | `systemd/sb-topic-pages.sh` | `sb-topic-pages` | 03:30 | `topic-pages`: the pages of the live topics with new evidence (`docs/DEPLOY.md`, section 6) |
-| `systemd/sb-pages.sh` | `sb-pages` (not installed until the owner sets it up) | 04:10 | `pages`: the synthesis of the compiled pages marked dirty, at most `BRAIN_PAGES_LLM_CALLS` (40) calls (`docs/DEPLOY.md`, section 6) |
+| `systemd/sb-pages.sh` | `sb-pages` (installed on the reference producer on 2026-11-04) | 04:10 | `pages`: the synthesis of the compiled pages marked dirty, at most `BRAIN_PAGES_LLM_CALLS` (40) calls (`docs/DEPLOY.md`, section 6) |
+| `systemd/sb-backfill.sh` | `sb-backfill` (temporary: it disables its own timer when done) | 04:45 | one batch of `maint topic-registry` and one of `maint vectors-backfill`, each after its dry run (`docs/DEPLOY.md`, section 6) |
 | `systemd/sb-mcp.sh` | `sb-mcp` | always on | `python -m src.mcp_server --http` with `BRAIN_ROLE=replica` (`docs/DEPLOY.md`, section 9) |
 | `launchd/sb-db-pull.sh` | a LaunchAgent | :45 every hour | the replica pull, and the copy of the encrypted backup archives (`docs/DEPLOY.md`, section 5) |
 | `launchd/wait-for-vps.sh` | `sb-db-pull.sh` | before each pull | waits up to 180 s for the producer to answer ssh |

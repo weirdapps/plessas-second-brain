@@ -529,6 +529,8 @@ every subcommand.
 | `sb-auth-watch` | every 4 hours, before each `sb-outlook-sync` run, and whenever a pushed credential file changes (`sb-creds-arrived.path`) | `sb-auth-watch.sh`: checks the Outlook, Teams and gcloud credentials, clears the sentinels they no longer justify, and queues the syncs those held back or that ended failed waiting on a credential that now probes healthy |
 | `sb-health-check` | 23:50 | `scripts/health_check.py --fix --email-if-issues`, then the freshness ping (section 7) |
 | `sb-topic-pages` | 03:30 | `topic-pages`: the live topics' pages with new evidence (below) |
+| `sb-pages` | 04:10 | `pages`: the synthesis of the compiled pages marked dirty (below) |
+| `sb-backfill` | 04:45, until done | `sb-backfill.sh`: one batch of `maint topic-registry` and one of `maint vectors-backfill`, then it disables its own timer (below) |
 | `sb-mcp` | always on | `python -m src.mcp_server --http` (section 9) |
 
 The Mac that holds a replica pulls it at :45 (section 5), pushes WhatsApp at :50 if
@@ -740,6 +742,60 @@ ID drop_ref --ref email:456`, `--override topic c12 hide`; `--overrides` lists t
 `--remove-override ID` takes one back. A page is never edited.
 
 Then `systemctl --user daemon-reload && systemctl --user enable --now sb-pages.timer`.
+
+### Backfill (temporary)
+
+The topic registry (gated step `topic_registry`) and the vectors history (gated step
+`vectors`) are placed in batches, a night at a time, by one temporary unit that retires
+itself. `sb-backfill.sh` reads each command's dry run first (`maint topic-registry
+--limit 1 --llm-calls 0`, its `'unplaced': N`; `maint vectors-backfill --summaries
+--limit 1`, its emails, copy chunks and summaries left), then runs one batch of what is
+left:
+
+1. `maint topic-registry --limit 5000 --llm-calls 20 --apply`, while topics are unplaced;
+2. `maint vectors-backfill --apply --limit 2000`, while email or copy chunks are left,
+   and only then `maint vectors-backfill --apply --summaries --limit 5000`.
+
+When both dry runs read zero, it runs `systemctl --user disable --now
+sb-backfill.timer` and logs it (`~/.second-brain/logs/backfill.log`). A dry run it cannot
+read is a failure, never a zero, so it cannot retire itself by mistake. It exits 1 when a
+batch or a count failed, 69 on `needs_gcloud_reauth`. On the reference store on
+2026-11-04: 157,749 topics unplaced (about 32 nights), 25,074 emails (74,885 chunks)
+and 30,091 copy chunks (about 13 nights), then the 768 summaries.
+
+At 04:45 it starts after the compiled pages are done (04:10, plus jitter, starting no page
+after 1,500 s) and its 3,600 s timeout ends it by 05:45, clear of restic (02:40), the
+attachment pass (02:00), the topic pages (03:30), the news run (06:50) and the daily sync.
+None of the four commands takes `state/sync.lock`, so the schedule is what keeps them apart.
+
+```bash
+install -m 755 scripts/wrappers/systemd/sb-backfill.sh ~/.local/bin/
+```
+
+```ini
+# ~/.config/systemd/user/sb-backfill.service
+[Unit]
+Description=second-brain backfill (topic registry and vectors, a batch a night; temporary)
+OnFailure=notify-failure@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/scripts/run-sb-backfill.sh
+TimeoutStartSec=3600
+
+# ~/.config/systemd/user/sb-backfill.timer
+[Unit]
+Description=second-brain backfill, nightly after the compiled pages, until done
+
+[Timer]
+OnCalendar=*-*-* 04:45:00 Europe/Athens
+
+[Install]
+WantedBy=timers.target
+```
+
+Then `systemctl --user daemon-reload && systemctl --user enable --now
+sb-backfill.timer`. Stop it early with `systemctl --user disable --now sb-backfill.timer`.
 
 Nor does it close action items: extraction only appends, so run
 `python -m src.store.action_lifecycle` after a successful sync. It drops

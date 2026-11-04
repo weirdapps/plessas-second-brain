@@ -26,7 +26,7 @@ from src.extract.teams_prompt import build_prompt, parse_response, with_commitme
 from src.extract.vertex_auth import touch_sentinel
 from src.llm_policy import Outcome
 from src.redact import redact_secrets
-from src.store import ledger
+from src.store import ledger, topic_registry
 
 # A "substantive" message is a non-system message above MIN_SUBSTANTIVE_LENGTH chars.
 # Channel posts are commonly single-message announcements (a post nobody replied to;
@@ -175,6 +175,10 @@ def _extract_one_thread(conn: sqlite3.Connection, thread_id: int) -> str:
     system_prompt, user_prompt = build_prompt(prompt_thread, prompt_messages)
     if ledger.takes_thread_commitments(conn, "teams_thread_id"):
         system_prompt, user_prompt = with_commitments(system_prompt, user_prompt)
+    # Topics (issue 180), only with BRAIN_EXTRACT_CHAT_TOPICS and the gated topic_registry.
+    asks_topics = topic_registry.asks_topics(conn)
+    if asks_topics:
+        system_prompt, user_prompt = topic_registry.with_topics(system_prompt, user_prompt)
 
     try:
         raw = _call_llm(system_prompt, user_prompt)
@@ -239,6 +243,8 @@ def _extract_one_thread(conn: sqlite3.Connection, thread_id: int) -> str:
             )
         # Commitments, on a store with the gated commitment parents (src/store/ledger.py); none before, as ever.
         ledger.write_thread_commitments(conn, "teams_thread_id", thread_id, data.get("commitments"))
+        if asks_topics:
+            topic_registry.replace_links(conn, "teams", thread_id, data)
         for f in data.get("key_facts", []):
             conn.execute(
                 "INSERT INTO key_facts(fact, teams_thread_id) VALUES (?, ?)",

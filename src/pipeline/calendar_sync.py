@@ -204,9 +204,11 @@ def run(args):
     )
     from src.export.outlook_cli import OutlookCliAuthRequired
     from src.extract.calendar_extractor import event_body_text, event_prompt_hash, extract_event
+    from src.extract.call_shape import v2_route
     from src.extract.policy_bridge import classify_exception, is_transient
     from src.extract.vertex_auth import touch_sentinel
     from src.llm_policy import Outcome
+    from src.store import topic_registry
     from src.store.calendar_coverage import mark_month_started, record_listed_month
     from src.store.calendar_loader import (
         adopt_reissued_occurrence,
@@ -235,6 +237,10 @@ def run(args):
     else:
         conn = get_connection(db_path)
         ensure_schema(conn)
+
+    # Topics (issue 180): asked of the v1 calendar route only, with BRAIN_EXTRACT_CHAT_TOPICS
+    # on a store with the gated topic_registry; a v2 route's prompts are left as they are.
+    asks_topics = not dry_run and topic_registry.asks_topics(conn) and not v2_route("calendar")
 
     proxy_emails = None
     if not dry_run:
@@ -450,8 +456,13 @@ def run(args):
             # extracting stays 'pending', or with the etag stored it would never be offered
             # again. Latent today, because sb-calendar-sync.sh runs the command bare.
             extraction = {"body_summary": "", "decisions": [], "action_items": []}
+            fresh = False  # a model call made this extraction in this run
             prior_status = existing["llm_status"] if existing else None
-            prompt_hash = event_prompt_hash(event, body_html)
+            prompt_hash = (
+                event_prompt_hash(event, body_html, topics=True)
+                if asks_topics
+                else event_prompt_hash(event, body_html)
+            )
             long_enough = prompt_hash is not None
             if args.skip_extraction:
                 llm_status = "pending" if long_enough or prior_status == "pending" else "skipped"
@@ -480,7 +491,12 @@ def run(args):
                 stats["series_shared"] += 1
             elif not args.skip_extraction and long_enough:
                 try:
-                    extraction = extract_event(event, body_html)
+                    extraction = (
+                        extract_event(event, body_html, topics=True)
+                        if asks_topics
+                        else extract_event(event, body_html)
+                    )
+                    fresh = True
                     llm_status = "extracted"
                     stats["extracted"] += 1
                 except Exception as e:
@@ -519,6 +535,14 @@ def run(args):
                 extraction_hash=prompt_hash,
                 keep_extraction=keep_extraction,
             )
+            if asks_topics and fresh:
+                # Topics (issue 180): a fresh extraction's tags replace the event's links.
+                row = conn.execute(
+                    "SELECT id FROM calendar_events WHERE outlook_event_id = ?",
+                    (event["outlook_event_id"],),
+                ).fetchone()
+                if row is not None:
+                    topic_registry.replace_links(conn, "calendar", row[0], extraction)
             stats["loaded"] += 1
 
         # A complete listing also says which stored events Outlook no longer holds;

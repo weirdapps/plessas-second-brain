@@ -30,7 +30,7 @@ from src.extract.vertex_auth import touch_sentinel
 from src.extract.whatsapp_prompt import build_prompt, parse_response
 from src.llm_policy import Outcome
 from src.redact import redact_secrets
-from src.store import ledger
+from src.store import ledger, topic_registry
 
 
 def _render(content: str | None, media_type: str | None, filename: str | None) -> str:
@@ -117,6 +117,10 @@ def _extract_one(conn: sqlite3.Connection, thread_id: int) -> str:
     )
     if ledger.takes_thread_commitments(conn, "whatsapp_thread_id"):
         system_prompt, user_prompt = with_commitments(system_prompt, user_prompt)
+    # Topics (issue 180), only with BRAIN_EXTRACT_CHAT_TOPICS and the gated topic_registry.
+    asks_topics = topic_registry.asks_topics(conn)
+    if asks_topics:
+        system_prompt, user_prompt = topic_registry.with_topics(system_prompt, user_prompt)
 
     # Nothing uncommitted may be held across the call: see the module docstring.
     conn.commit()
@@ -164,6 +168,8 @@ def _extract_one(conn: sqlite3.Connection, thread_id: int) -> str:
         ledger.write_thread_commitments(
             conn, "whatsapp_thread_id", thread_id, data.get("commitments")
         )
+        if asks_topics:
+            topic_registry.replace_links(conn, "whatsapp", thread_id, data)
         for f in data.get("key_facts", []):
             conn.execute(
                 "INSERT INTO key_facts (fact, whatsapp_thread_id) VALUES (?, ?)",

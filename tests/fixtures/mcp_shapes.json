@@ -1947,14 +1947,20 @@
         "key_facts_total",
         "key_people",
         "key_people_total",
+        "meetings",
+        "meetings_total",
         "open_actions",
         "open_actions_total",
         "reason",
         "recent_emails",
         "stale",
+        "teams_threads",
+        "teams_threads_total",
         "topic",
         "topic_page",
-        "truncated"
+        "truncated",
+        "whatsapp_sessions",
+        "whatsapp_sessions_total"
       ],
       "required": [
         "data_as_of",
@@ -1975,7 +1981,13 @@
       "open_actions",
       "open_actions_total",
       "key_facts",
-      "key_facts_total"
+      "key_facts_total",
+      "teams_threads",
+      "teams_threads_total",
+      "whatsapp_sessions",
+      "whatsapp_sessions_total",
+      "meetings",
+      "meetings_total"
     ],
     "rows": {
       "decisions": [

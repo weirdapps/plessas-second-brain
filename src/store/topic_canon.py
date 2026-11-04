@@ -191,9 +191,16 @@ def _words(name: str) -> frozenset[str]:
 
 
 def topic_uses(conn: sqlite3.Connection) -> dict[int, int]:
-    """How many emails and conversations each topic tags."""
+    """How many emails, conversations and (with the topic registry, issue 180) Teams
+    threads, WhatsApp sessions and calendar events each topic tags."""
     uses: dict[int, int] = {}
-    for table in ("email_topics", "conversation_topics"):
+    for table in (
+        "email_topics",
+        "conversation_topics",
+        "teams_thread_topics",
+        "whatsapp_thread_topics",
+        "event_topics",
+    ):
         try:
             for tid, n in conn.execute(f"SELECT topic_id, COUNT(*) FROM {table} GROUP BY topic_id"):
                 uses[tid] = uses.get(tid, 0) + n

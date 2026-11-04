@@ -186,12 +186,12 @@ def convert(conn: sqlite3.Connection, *, apply: bool) -> dict:
 
 def cmd(args) -> int:
     """`brain maint utc-stamps [--apply]`: a dry run unless --apply."""
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     conn = get_connection(str(args.db))
     try:
         if args.apply:
-            run_migrations(conn)
+            ensure_schema(conn)
         stats = convert(conn, apply=args.apply)
     finally:
         conn.close()

@@ -16,7 +16,7 @@ from src.config import USER_EMAIL_PATTERN
 from src.export.teams_cli import TeamsCliAuthRequired, TeamsCliError, run_teams_cli
 from src.pipeline import EXIT_REAUTH
 from src.store import directory
-from src.store.schema import get_connection, run_migrations
+from src.store.schema import ensure_schema, get_connection
 
 # Addresses per teams-cli call; the CLI batches them twenty to a Graph request.
 CHUNK = 200
@@ -50,7 +50,7 @@ def run(args) -> int:
 
     conn = get_connection(db_path)
     try:
-        run_migrations(conn)
+        ensure_schema(conn)
         due = directory.due_addresses(conn, domains, limit=args.limit or 0)
         print(f"Directory: {len(due):,} address(es) due at {', '.join(domains)}")
         if args.dry_run:

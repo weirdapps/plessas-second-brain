@@ -136,16 +136,16 @@ def test_resolve_due_without_a_seen_date_takes_full_dates_only():
 
 
 def test_the_migrations_jobs_run_stop_before_the_ledger(old):
-    assert get_schema_version(old) == CURRENT_SCHEMA_VERSION == 41
+    assert get_schema_version(old) == CURRENT_SCHEMA_VERSION == 42
     run_migrations(old)
-    assert get_schema_version(old) == 41
+    assert get_schema_version(old) == 42
     assert not ledger.enabled(old)
     assert "item_hash" not in _columns(old, "action_items")
 
 
 def test_the_gated_steps_add_the_ledger(old):
     run_migrations(old, gated=True)
-    assert get_schema_version(old) == config.CURRENT_SCHEMA_VERSION == 41
+    assert get_schema_version(old) == config.CURRENT_SCHEMA_VERSION == 42
     assert ledger.enabled(old)
     for table in ("decisions", "action_items", "commitments"):
         assert {"observed_at", "item_hash", "counterpart_person_id"} <= _columns(old, table)
@@ -156,7 +156,7 @@ def test_the_gated_steps_add_the_ledger(old):
 def test_jobs_keep_a_ledger_store_as_it_is(conn):
     run_migrations(conn)
     assert ledger.enabled(conn)
-    assert get_schema_version(conn) == 41
+    assert get_schema_version(conn) == 42
 
 
 def test_a_new_store_has_the_ledger(conn):

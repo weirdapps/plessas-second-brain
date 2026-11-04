@@ -2,7 +2,7 @@
 
 The consolidation pass (src/store/consolidate.py) takes one thread at a time, so the same
 request sent twice in two threads, or a decision reported in two separate mails, stays two
-current items. Schema v42 gives each item its counterpart (ledger.py
+current items. The gated item_ledger migration gives each item its counterpart (ledger.py
 counterpart_person_id) and a hash of its normalised text, which make that case a rule:
 
 - Only items whose counterpart a hard identifier found (ledger counterpart_via 'address':
@@ -26,7 +26,7 @@ counterpart_person_id) and a hash of its normalised text, which make that case a
 The hourly sync (consolidate.run_in_sync) takes the items stored since its last run; its
 first run records where it starts and takes nothing older. `brain maint
 consolidate-entities` is the backfill over every item, a dry run unless --apply. Nothing
-runs on a store without the ledger (v42 is gated, src/store/schema.py).
+runs on a store without the ledger (a gated migration, src/store/schema.py).
 """
 
 import json
@@ -205,7 +205,7 @@ def cmd_consolidate_entities(args) -> int:
     conn = get_connection(str(args.db))
     try:
         if not ledger.enabled(conn):
-            print("No item ledger: run `brain maint migrate --ledger` first (schema v42).")
+            print("No item ledger: run `brain maint migrate --apply-gated` first.")
             return 1
         result = run(conn, None)
         detail = ", ".join(f"{t} {n}" for t, n in result["by_table"].items())
@@ -231,7 +231,7 @@ def add_maint_parser(maint_subparsers) -> None:
     parser = maint_subparsers.add_parser(
         "consolidate-entities",
         help="Mark the same item asked in several threads of one counterpart as one "
-        "(schema v42; dry run unless --apply)",
+        "(after the gated item ledger; dry run unless --apply)",
         description=__doc__,
     )
     parser.add_argument("--apply", action="store_true", help="Write the labels")

@@ -11,7 +11,7 @@ import sqlite3
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from src.config import AUTO_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION
+from src.config import CURRENT_SCHEMA_VERSION
 from src.export.calendar_export import parse_event
 from src.store.schema import create_database, get_schema_version, run_migrations
 
@@ -84,7 +84,7 @@ def test_v25_marks_the_stored_graph_times_as_utc(tmp_path):
         "offset": ("2026-10-03T16:00:00+03:00", "2026-10-03T17:00:00+03:00"),
     }
     assert _times(conn) == after_one, "a second run changes nothing"
-    assert get_schema_version(conn) == AUTO_SCHEMA_VERSION
+    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION
 
 
 def test_a_fresh_store_loads_the_same_shape_the_migration_leaves(tmp_path):

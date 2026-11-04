@@ -1,6 +1,6 @@
 """Commitments beyond email (issue 168, part 3): Teams threads and WhatsApp sessions give
-commitments as mail does, into the same table under a parent column of their own (schema
-v43, gated with v42). A store before v43 has no such column, and its Teams and WhatsApp
+commitments as mail does, into the same table under a parent column of their own (a gated
+migration, applied with the ledger). A store before v43 has no such column, and its Teams and WhatsApp
 extractions write no commitment, as before. Every value is invented.
 """
 
@@ -66,10 +66,10 @@ def _columns(conn, table):
     return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
 
 
-def test_v43_is_gated_with_the_ledger(old):
+def test_the_commitment_parents_are_gated_with_the_ledger(old):
     assert "teams_thread_id" not in _columns(old, "commitments")
     run_migrations(old, gated=True)
-    assert get_schema_version(old) == config.CURRENT_SCHEMA_VERSION == 43
+    assert get_schema_version(old) == config.CURRENT_SCHEMA_VERSION
     assert {"teams_thread_id", "whatsapp_thread_id"} <= _columns(old, "commitments")
 
 

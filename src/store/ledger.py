@@ -1,4 +1,4 @@
-"""The item ledger (schema v42, issue 168): a lifecycle for decisions, actions and commitments
+"""The item ledger (gated migration item_ledger, issue 168): a lifecycle for decisions, actions and commitments
 that outlives the rows extraction writes.
 
 Every extraction path replaces its parent's items wholesale (the loader's replace_items, a
@@ -25,8 +25,9 @@ normalised text:
   comes back open if the item returns), and deletes the entries of a parent that is gone,
   so `forget` leaves nothing behind. resync() follows a revert, the one way back to open.
 
-Nothing here runs on a store without item_ledger: v42 is gated (src/store/schema.py), and
-until the owner runs `brain maint migrate --ledger` every function is a no-op.
+Nothing here runs on a store without item_ledger: it is a gated migration (src/store/schema.py
+GATED_MIGRATIONS), and
+until the owner runs `brain maint migrate --apply-gated` every function is a no-op.
 """
 
 import hashlib
@@ -44,7 +45,7 @@ TEXT_COLUMN = {"decisions": "decision", "action_items": "task", "commitments": "
 STATUSES = ("open", "done", "superseded", "expired", "dropped")
 CLOSED = ("done", "superseded", "expired")
 
-# The columns v42 adds: on every kind, and on the two that are owed by someone.
+# The columns the item_ledger migration adds: on every kind, and on the two that are owed by someone.
 COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
     "decisions": (
         ("observed_at", "TEXT"),
@@ -116,7 +117,7 @@ def _now() -> str:
 
 
 def enabled(conn: sqlite3.Connection) -> bool:
-    """Whether the store took the gated v42 step."""
+    """Whether the store took the gated item_ledger migration."""
     return (
         conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'item_ledger'"
@@ -396,7 +397,7 @@ def _counterpart(table: str, row: dict, people: _People) -> tuple[int | None, st
 
 
 def _stamp(conn: sqlite3.Connection, table: str, people: _People) -> list[dict]:
-    """Fill the v42 columns of the rows that have none; the rows stamped."""
+    """Fill the ledger columns of the rows that have none; the rows stamped."""
     have = _columns(conn, table)
     wanted = [
         c
@@ -640,7 +641,7 @@ def resync(conn: sqlite3.Connection, table: str, ids) -> int:
     return changed
 
 
-# v43: the parents a commitment can have besides an email (issue 168).
+# Gated migration commitment_parents: the parents a commitment can have besides an email (issue 168).
 COMMITMENT_PARENTS = (
     ("teams_thread_id", "teams_threads"),
     ("whatsapp_thread_id", "whatsapp_threads"),
@@ -648,9 +649,9 @@ COMMITMENT_PARENTS = (
 
 
 def migrate_commitment_parents(conn: sqlite3.Connection) -> None:
-    """v43: commitments from Teams threads and WhatsApp sessions, under a parent column of
+    """Gated migration commitment_parents: commitments from Teams threads and WhatsApp sessions, under a parent column of
     their own as decisions and actions have. ADD COLUMN with no default and two indexes on
-    columns that start empty: no row rewritten, milliseconds."""
+    columns that start empty: no row rewritten, milliseconds. The caller commits."""
     have = _columns(conn, "commitments")
     for column, parent in COMMITMENT_PARENTS:
         if column not in have:
@@ -660,11 +661,10 @@ def migrate_commitment_parents(conn: sqlite3.Connection) -> None:
         conn.execute(
             f"CREATE INDEX IF NOT EXISTS idx_commitments_{column} ON commitments({column})"
         )
-    conn.commit()
 
 
 def takes_thread_commitments(conn: sqlite3.Connection, column: str) -> bool:
-    """Whether the store holds commitments under `column` (v43), so a Teams or WhatsApp
+    """Whether the store holds commitments under `column` (gated commitment_parents), so a Teams or WhatsApp
     extraction asks for them."""
     return column in dict(COMMITMENT_PARENTS) and column in _columns(conn, "commitments")
 
@@ -682,7 +682,7 @@ def write_thread_commitments(
 ) -> int:
     """Replace the commitments of a Teams thread or WhatsApp session (`column` its parent
     column) with `commitments`, the extraction's list; the rows written. Nothing on a store
-    before v43, which has no such column: its thread extractions keep writing none. The
+    without that gated migration, which has no such column: its thread extractions keep writing none. The
     texts are masked as the loader masks an email's. The caller holds the transaction."""
     from src.redact import redact_secrets
 
@@ -709,11 +709,40 @@ def write_thread_commitments(
     return written
 
 
+def counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """What the gated steps change, as counts a person can compare before and after: rows,
+    labels by method, duplicates marked, action statuses, ledger entries by status."""
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    out: dict[str, int] = {}
+    for table in TABLES:
+        out[f"{table} rows"] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        out[f"{table} canonical_id set"] = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE canonical_id IS NOT NULL"
+        ).fetchone()[0]
+    for status, n in conn.execute(
+        "SELECT COALESCE(status, 'null'), COUNT(*) FROM action_items GROUP BY 1 ORDER BY 1"
+    ):
+        out[f"action_items status {status}"] = n
+    if "item_labels" in tables:
+        out["item_labels rows"] = conn.execute("SELECT COUNT(*) FROM item_labels").fetchone()[0]
+        for method, n in conn.execute(
+            "SELECT method, COUNT(*) FROM item_labels GROUP BY 1 ORDER BY 1"
+        ):
+            out[f"item_labels method {method}"] = n
+    if "item_ledger" in tables:
+        for table, status, n in conn.execute(
+            "SELECT item_table, status, COUNT(*) FROM item_ledger GROUP BY 1, 2 ORDER BY 1, 2"
+        ):
+            out[f"item_ledger {table} {status}"] = n
+    return out
+
+
 def migrate(conn: sqlite3.Connection) -> None:
-    """v42: the columns, the ledger and its indexes, then every stored row stamped and
+    """Gated migration item_ledger: the columns, the ledger and its indexes, then every stored row stamped and
     entered (reconcile). ADD COLUMN with no default rewrites no row; the stamping is one
     UPDATE per row, which touches no full-text index (each table's update trigger fires on
-    its text column alone), and commits once at the end."""
+    its text column alone). The caller commits (schema.apply_gated), or rolls back for a
+    dry run."""
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     for table, columns in COLUMNS.items():
         if table not in tables:
@@ -725,4 +754,3 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_item_hash ON {table}(item_hash)")
     conn.execute(LEDGER_TABLE)
     reconcile(conn)
-    conn.commit()

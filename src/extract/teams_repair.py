@@ -150,7 +150,7 @@ def reset_empty_summaries(conn: sqlite3.Connection, *, dry_run: bool = False) ->
     marks = ",".join("?" * len(ids))
     try:
         for table in THREAD_ITEMS:
-            # commitments has teams_thread_id from v43 on (src/store/ledger.py).
+            # commitments has teams_thread_id once the gated commitment_parents migration ran (src/store/ledger.py).
             if "teams_thread_id" not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
                 counts[table] = 0
                 continue

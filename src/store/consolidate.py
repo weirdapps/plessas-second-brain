@@ -908,7 +908,7 @@ def revert(conn: sqlite3.Connection, target: str) -> int:
         conn.execute(f"UPDATE {table} SET {sets} WHERE id = ?", (*values.values(), item_id))
         conn.execute("UPDATE item_labels SET undone_at = ? WHERE id = ?", (_now(), label_id))
         reverted.setdefault(table, set()).add(item_id)
-    # The ledger (schema v42) follows: a revert is the one way an entry goes back to open.
+    # The ledger (gated migration item_ledger) follows: a revert is the one way an entry goes back to open.
     from src.store import ledger
 
     for table, ids in reverted.items():
@@ -1720,7 +1720,7 @@ def run_in_sync(db_path: str, deadline_s: float) -> RunStats:
     conn = get_connection(db_path)
     try:
         run_migrations(conn)
-        # The ledger (schema v42) first, so the items this hour's syncs extracted again get
+        # The ledger (gated migration item_ledger) first, so the items this hour's syncs extracted again get
         # back the status they held, then again for the labels this pass wrote. A no-op on
         # a store without it.
         from src.store import ledger

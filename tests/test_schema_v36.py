@@ -9,7 +9,7 @@ rewrites no row and touches no full-text index, and running it again changes not
 
 import pytest
 
-from src.config import AUTO_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION
+from src.config import CURRENT_SCHEMA_VERSION
 from src.store.schema import (
     create_database,
     get_schema_version,
@@ -128,7 +128,7 @@ def test_migrating_a_v35_store_adds_both_tables_and_keeps_every_row(store):
     run_migrations(store)
     run_migrations(store)
 
-    assert get_schema_version(store) == AUTO_SCHEMA_VERSION
+    assert get_schema_version(store) == CURRENT_SCHEMA_VERSION
     assert _columns(store, "topic_pages") == TOPIC_PAGE_COLUMNS
     assert _columns(store, "findings") == FINDING_COLUMNS
     assert store.execute("SELECT id FROM emails").fetchall()[0][0] == email_id

@@ -1820,20 +1820,32 @@ one pass, at the first job that writes. The versions that ask for a step:
      exporter's folders, and search would return both.
   6. `python -m src.cli maint calendar-backfill --since 2026-02-01 --until 2026-03-01`: the
      calendar event offered again is in a month the backfill had recorded as listed.
-- **v42 and v43 (gated).** The item ledger (issue 168, `src/store/ledger.py`): `observed_at`,
-  `item_hash` and `counterpart_person_id` on decisions, action items and commitments,
-  `due_date` and `owner_role` on the last two, and `item_ledger`, one status per (kind,
-  parent, normalised-text hash) so extracting a parent again cannot reopen what was closed.
-  v43 adds `commitments.teams_thread_id` and `whatsapp_thread_id` (ADD COLUMN, two
-  indexes, milliseconds): from then on a Teams thread or WhatsApp session extracted is asked
-  for commitments too, and history is not extracted again.
-  **No job takes either**: they stop at v41, and the code runs as before until the step below.
-  The step stamps every stored item (271,699 rows) in one write transaction, 139 s on
-  a copy of the replica, and labels 522 exact duplicates within one parent (`item_labels`
-  method `ledger`, revertable with `maint consolidate --revert <run_id>`); it deletes no
-  row. On the producer, after a snapshot (`scripts/backup_db.py`, docs/RESTORE.md):
-  `systemctl --user stop 'sb-*.timer'`, let the running `sb-*` jobs exit,
-  `python -m src.cli maint migrate --ledger`, then `systemctl --user start 'sb-*.timer'`.
+- **Gated: `item_ledger` and `commitment_parents`** (issue 168, `src/store/ledger.py`). Not
+  numbered: no job applies them, schema_version stays 41, a numbered migration added later
+  runs whether they are applied or not, and `gated_migrations` records each one applied
+  (with the backup it stood on). `brain maint migrate` names the ones waiting.
+  `item_ledger` adds `observed_at`, `item_hash`, `counterpart_person_id` and
+  `counterpart_via` to decisions, action items and commitments, `due_date` and
+  `owner_role` to the last two, and `item_ledger`, one status per (kind, parent,
+  normalised-text hash), so extracting a parent again cannot reopen what was closed.
+  `commitment_parents` adds `commitments.teams_thread_id` and `whatsapp_thread_id`: from
+  then on a Teams thread or WhatsApp session extracted is asked for commitments too;
+  history is not extracted again. On a copy of the replica the two take 139 to 161 s in
+  one write transaction, stamp all 271,699 items, label 522 exact duplicates within one
+  parent (`item_labels` method `ledger`, revertable with `maint consolidate --revert
+  <run_id>`), and delete no row. On the producer, the only host to run it (the Mac
+  replica gets the result with its next pull and never runs it):
+
+  1. A restic snapshot (docs/RESTORE.md), and room for one more copy of `brain.db`.
+  2. `systemctl --user stop 'sb-*.timer'`, and let the running `sb-*` jobs exit: both
+     steps below hold the write lock for minutes.
+  3. `python -m src.cli maint migrate --apply-gated --dry-run`: everything in one
+     transaction, the counts it changes printed, rolled back. Nothing written.
+  4. `python -m src.cli maint migrate --apply-gated --backup ~/brain-before-gated.db`: the
+     backup is written first with sqlite's online backup (an existing file under an hour
+     old is taken instead; without `--backup` it refuses), then the same steps, committed.
+  5. `systemctl --user start 'sb-*.timer'`.
+
   From then on the hourly consolidation and the daily action lifecycle reconcile the
   ledger, about 2 s each, and the hourly pass per entity (`src/store/entity_pass.py`)
   takes the items stored since its first run. Its backfill is optional:

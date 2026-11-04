@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from src.config import AUTO_SCHEMA_VERSION
+from src.config import CURRENT_SCHEMA_VERSION
 from src.store.schema import (
     create_database,
     get_connection,
@@ -73,7 +73,7 @@ def test_legacy_db_gets_column_and_partial_unique_index(tmp_path: Path) -> None:
     assert row[1] is None
 
     version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-    assert version == AUTO_SCHEMA_VERSION
+    assert version == CURRENT_SCHEMA_VERSION
     conn.close()
 
 

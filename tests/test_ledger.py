@@ -2,8 +2,9 @@
 resolved due date, a hash of its normalised text, and a lifecycle status kept in a table
 keyed by that hash, so extracting a parent again cannot reopen what was closed.
 
-v42 is gated: the migrations every job runs on opening the store stop at v41, and only
-`brain maint migrate --ledger` (or a new, empty store) takes v42. Every value is invented.
+The ledger is a gated migration (tests/test_gated_migrations.py): the migrations every job
+runs on opening the store never take it; only `brain maint migrate --apply-gated` (or a
+new, empty store) does. Every value is invented.
 """
 
 import sqlite3
@@ -15,7 +16,7 @@ from src import config
 from src.store import consolidate, ledger
 from src.store.loader import replace_items, stored_email
 from src.store.schema import (
-    AUTO_SCHEMA_VERSION,
+    CURRENT_SCHEMA_VERSION,
     create_database,
     get_schema_version,
     run_migrations,
@@ -135,16 +136,16 @@ def test_resolve_due_without_a_seen_date_takes_full_dates_only():
 
 
 def test_the_migrations_jobs_run_stop_before_the_ledger(old):
-    assert get_schema_version(old) == AUTO_SCHEMA_VERSION == 41
+    assert get_schema_version(old) == CURRENT_SCHEMA_VERSION == 41
     run_migrations(old)
     assert get_schema_version(old) == 41
     assert not ledger.enabled(old)
     assert "item_hash" not in _columns(old, "action_items")
 
 
-def test_the_gated_steps_take_the_store_to_v43(old):
+def test_the_gated_steps_add_the_ledger(old):
     run_migrations(old, gated=True)
-    assert get_schema_version(old) == config.CURRENT_SCHEMA_VERSION == 43
+    assert get_schema_version(old) == config.CURRENT_SCHEMA_VERSION == 41
     assert ledger.enabled(old)
     for table in ("decisions", "action_items", "commitments"):
         assert {"observed_at", "item_hash", "counterpart_person_id"} <= _columns(old, table)
@@ -152,10 +153,10 @@ def test_the_gated_steps_take_the_store_to_v43(old):
         assert {"due_date", "owner_role"} <= _columns(old, table)
 
 
-def test_jobs_never_step_a_ledger_store_back(conn):
-    assert get_schema_version(conn) == 43
+def test_jobs_keep_a_ledger_store_as_it_is(conn):
     run_migrations(conn)
-    assert get_schema_version(conn) == 43
+    assert ledger.enabled(conn)
+    assert get_schema_version(conn) == 41
 
 
 def test_a_new_store_has_the_ledger(conn):
@@ -447,30 +448,6 @@ def test_the_counterpart_of_an_action_owed_to_the_owner_is_its_owner(conn):
 
 
 # --- how the owner runs it, and where it runs after ----------------------------------------
-
-
-def test_maint_migrate_alone_stops_at_v41_and_with_ledger_takes_the_gated_steps(
-    tmp_path, owner, monkeypatch, capsys
-):
-    from tests.brain_cli import brain
-
-    path = tmp_path / "old.db"
-    create_database(str(path), gated=False).close()
-    monkeypatch.setenv("BRAIN_ROLE", "producer")
-
-    code, out, _ = brain(monkeypatch, capsys, "--db", str(path), "maint", "migrate")
-    assert code == 0 and "already up to date" in out
-    check = sqlite3.connect(path)
-    check.row_factory = sqlite3.Row
-    assert get_schema_version(check) == 41
-    check.close()
-
-    code, out, _ = brain(monkeypatch, capsys, "--db", str(path), "maint", "migrate", "--ledger")
-    assert code == 0 and "41 to 43" in out
-    check = sqlite3.connect(path)
-    check.row_factory = sqlite3.Row
-    assert get_schema_version(check) == 43
-    check.close()
 
 
 def test_the_daily_lifecycle_records_what_it_expired(tmp_path, owner):

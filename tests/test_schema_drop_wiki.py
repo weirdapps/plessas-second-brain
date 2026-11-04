@@ -3,7 +3,7 @@
 import sqlite3
 from pathlib import Path
 
-from src.config import AUTO_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION
+from src.config import CURRENT_SCHEMA_VERSION
 from src.store.schema import (
     create_database,
     get_connection,
@@ -60,5 +60,5 @@ def test_drop_migration_removes_existing_wiki_tables(tmp_path: Path) -> None:
     run_migrations(conn)
     assert _wiki_objects(conn) == set()
     version = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-    assert version == AUTO_SCHEMA_VERSION
+    assert version == CURRENT_SCHEMA_VERSION
     conn.close()

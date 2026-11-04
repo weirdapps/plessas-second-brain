@@ -2,28 +2,15 @@
 
 Used when a document must not answer searches any more: a synced document byte-identical to
 a mail attachment (scripts/forget_duplicate_documents.py), and, in a later change, a session
-note replaced by its newer version. Every foreign key into emails and attachments is NO
-ACTION, so the children are deleted first. The full-text rows follow through their delete
-triggers. The vectors are an email's positive id and an attachment's -attachment_content.id
-(src/store/embeddings.py). The figures read from an attachment go with it, and its report series
-is read again without it (src/store/figures.py forget_attachments).
+note replaced by its newer version. Since the follow-up to issue 174 the deleting is
+src/store/retention.py's, the one forget path: the children before their parents (every
+foreign key into emails and attachments is NO ACTION), the full-text rows through their delete
+triggers, the vectors with their chunks, the figures of an attachment with its series read
+again, and the aliases, thread-id map rows, item labels and inline images this module left.
 """
 
 import sqlite3
 
-from src.store.embeddings import remove_vectors
-from src.store.figures import forget_attachments
-
-# Children of emails, deleted before their parents.
-_BY_EMAIL = (
-    "key_facts",
-    "decisions",
-    "action_items",
-    "email_topics",
-    "email_people",
-    "commitments",
-    "email_html",
-)
 # Stays well under SQLite's bound-variable limit on any build.
 CHUNK = 500
 
@@ -49,35 +36,17 @@ def forget_documents(conn: sqlite3.Connection, message_ids) -> dict:
 
 def forget_emails(conn: sqlite3.Connection, ids) -> dict:
     """Delete the rows of emails with these row ids (a document or a news item is one),
-    their children and their vectors. Commits after each chunk."""
+    everything they left and their vectors, through the one forget path
+    (src/store/retention.py, issue 174). Files stay on disk and no full-text index is
+    merged: the callers forget a replaced or duplicate document in passing."""
+    from src.store.retention import forget
+
     ids = [int(i) for i in ids]
-    stats = {"emails": 0, "attachments": 0, "vectors": 0}
-    vectors: set[int] = set()
-    for start in range(0, len(ids), CHUNK):
-        email_ids = ids[start : start + CHUNK]
-        em = _marks(len(email_ids))
-        att_ids = [
-            r[0]
-            for r in conn.execute(f"SELECT id FROM attachments WHERE email_id IN ({em})", email_ids)
-        ]
-        vectors.update(email_ids)
-        for table in _BY_EMAIL:
-            conn.execute(f"DELETE FROM {table} WHERE email_id IN ({em})", email_ids)
-        if att_ids:
-            am = _marks(len(att_ids))
-            vectors.update(
-                -r[0]
-                for r in conn.execute(
-                    f"SELECT id FROM attachment_content WHERE attachment_id IN ({am})", att_ids
-                )
-            )
-            conn.execute(f"DELETE FROM attachment_content WHERE attachment_id IN ({am})", att_ids)
-            conn.execute(f"DELETE FROM attachments WHERE id IN ({am})", att_ids)
-        conn.execute(f"DELETE FROM emails WHERE id IN ({em})", email_ids)
-        conn.commit()
-        # The figures read from those attachments (schema v37), and their series read again.
-        forget_attachments(conn, att_ids)
-        stats["emails"] += len(email_ids)
-        stats["attachments"] += len(att_ids)
-    stats["vectors"] = remove_vectors(vectors, conn=conn)
-    return stats
+    if not ids:
+        return {"emails": 0, "attachments": 0, "vectors": 0}
+    result = forget(conn, email_ids=ids, apply=True, files=False, purge=False)
+    return {
+        "emails": result.tables.get("emails", 0),
+        "attachments": result.tables.get("attachments", 0),
+        "vectors": result.vectors,
+    }

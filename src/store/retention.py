@@ -580,12 +580,18 @@ def forget(
     email_ids=None,
     sources: set[str] | None = None,
     apply: bool = False,
+    files: bool = True,
+    purge: bool = True,
 ) -> Result:
     """Forget the parents a cutoff (or a list of email ids) chooses; a dry run unless `apply`.
 
     One transaction: the dry run rolls it back. On apply, after the commit: the figure series
     of forgotten attachments are read again, the npz loses its vectors (a store without the
-    gated `vectors` step), the files go, and each touched full-text index is merged."""
+    gated `vectors` step), the files go, and each touched full-text index is merged.
+
+    `files` False leaves every file on disk, and `purge` False skips secure_delete and the
+    index merge: the jobs that forget a replaced or duplicate document in passing
+    (src/store/forget.py) keep their files and their run time."""
     from src.store import vector_store
 
     if (cutoff is None) == (email_ids is None):
@@ -593,7 +599,7 @@ def forget(
     chosen = set(SOURCES) if sources is None else set(sources)
     if conn.in_transaction:
         conn.commit()
-    if apply:
+    if apply and purge:
         conn.execute("PRAGMA secure_delete = ON")
     result = Result(applied=apply)
     fts = _fts_of(conn)
@@ -607,7 +613,7 @@ def forget(
         _derive(conn)
         att_ids = [r[0] for r in conn.execute("SELECT id FROM _f_attachments")]
         vector_ids = _vector_ids(conn)
-        files = _files(conn, cutoff, staging=chosen == set(SOURCES))
+        doomed = _files(conn, cutoff, staging=chosen == set(SOURCES)) if files else []
         figures = _figure_counts(conn, att_ids)
         refs = _forgotten_refs(conn)
         result.tables = _delete_rows(conn)
@@ -623,8 +629,8 @@ def forget(
             result.vectors = _npz_count(vector_ids)
         # Each delete trigger takes the row's full-text entry with it.
         result.fts = {fts[t]: n for t, n in result.tables.items() if t in fts}
-        result.files = len(files)
-        result.file_bytes = sum(_size(f) for f in files)
+        result.files = len(doomed)
+        result.file_bytes = sum(_size(f) for f in doomed)
         if not apply:
             conn.rollback()
             return result
@@ -641,8 +647,8 @@ def forget(
         from src.store.embeddings import remove_vectors
 
         result.vectors = remove_vectors(vector_ids, conn=conn)
-    _remove_files(files)
-    for table in result.fts:
+    _remove_files(doomed)
+    for table in result.fts if purge else ():
         conn.execute(f"INSERT INTO {table}({table}) VALUES ('optimize')")
     conn.commit()
     return result

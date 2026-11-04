@@ -34,9 +34,11 @@ from src.store.normalizer import normalize_topic
 from src.store.ordering import action_order, decision_dates, decision_order, parent_dates
 from src.store.person_resolve import IDENTIFIER_KINDS, resolve_identity
 from src.store.query import (
+    document_summaries,
     fts5_query_variants,
     query_by_keyword,
     search_attachments,
+    shell_key,
     thread_keys,
 )
 from src.store.source_class import (
@@ -406,20 +408,38 @@ def _more_editions(row: dict, refs: Iterable) -> dict:
     return row
 
 
+# The fusion keys whose emails are one row, its other members in `editions`: a dated
+# subject's series and an unthreaded shell's subject (query.shell_key).
+_COLLAPSED = frozenset({"series", "shell"})
+
+
 def _email_keys(conn: sqlite3.Connection, email_ids: list, series: bool) -> dict:
     """email id -> the key the fused email bucket counts it under: its thread, as keyword
-    search counts threads, or with `series` its dated subject's series of editions."""
+    search counts threads, or with `series` its dated subject's series of editions, or
+    for an unthreaded document, session note or news item its subject and class, as
+    keyword search collapses them (query.shell_key)."""
     threads = thread_keys(conn, email_ids)
-    keys = {eid: ("thread", t) for eid, t in threads.items() if t}
+    keys: dict = {eid: ("thread", t) for eid, t in threads.items() if t}
     if series:
-        rows = conn.execute(
-            "SELECT id, subject FROM emails WHERE id IN (SELECT value FROM json_each(?))",
-            (json.dumps(list(email_ids)),),
+        rows = with_source_class(
+            conn,
+            [
+                {"email_id": eid, "subject": subject}
+                for eid, subject in conn.execute(
+                    "SELECT id, subject FROM emails WHERE id IN (SELECT value FROM json_each(?))",
+                    (json.dumps(list(email_ids)),),
+                )
+            ],
         )
-        for eid, subject in rows:
-            name = ranking.series_key(subject, subject=True)
+        for row in rows:
+            eid = row["email_id"]
+            name = ranking.series_key(row["subject"], subject=True)
             if name:
                 keys[eid] = ("series", name)
+            elif eid not in keys:
+                shell = shell_key({**row, "thread": None})
+                if shell is not None:
+                    keys[eid] = shell
     return keys
 
 
@@ -477,7 +497,7 @@ def _hybrid_emails(
         members = _dedup([*sem_by_key.get(k, []), *entity_by_key.get(k, [])])
         source = envelope.SEMANTIC if k in sem_by_key else envelope.ENTITY
         if hit is not None:
-            if collapse and _key_kind(k) == "series":
+            if collapse and _key_kind(k) in _COLLAPSED:
                 hit = _more_editions(hit, [m for m in members if m != hit["email_id"]])
             out.append(hit)
             continue
@@ -495,7 +515,7 @@ def _hybrid_emails(
         found = [rows[m] for m in (members if collapse else members[:1]) if m in rows]
         if not found:
             continue
-        if collapse and _key_kind(k) == "series":
+        if collapse and _key_kind(k) in _COLLAPSED:
             found.sort(key=lambda r: r["date"] or "", reverse=True)
             hit = found[0]
             if len(found) > 1:
@@ -507,7 +527,9 @@ def _hybrid_emails(
         out.append(hit)
     with_source_class(conn, out)
     # The keyword hits came with their envelope; the semantic ones get theirs here.
-    envelope.emails(conn, [hit for hit in out if "ref" not in hit])
+    hydrated = [hit for hit in out if "ref" not in hit]
+    document_summaries(conn, hydrated)
+    envelope.emails(conn, hydrated)
     return out
 
 
@@ -970,8 +992,8 @@ def recall(
         )
     if asked("attachment"):
         # Attachments as their own kind. They DO feed the emails bucket via
-        # query_by_keyword, but last in its source waterfall and deduped by
-        # email_id: so an attachment whose parent email also matches is invisible,
+        # query_by_keyword, but as one of its stages, its row the parent email's
+        # thread: so an attachment whose parent email also matches is invisible,
         # which is the common case (a one-line "see attached" carrying the real
         # substance). This bucket surfaces the extracted text and LLM summary
         # directly, with the filename the caller needs to cite.

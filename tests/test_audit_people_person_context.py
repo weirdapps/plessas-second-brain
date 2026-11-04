@@ -10,6 +10,7 @@ search-6). Synthetic data only.
 
 from src.store.context import get_person_context
 from src.store.normalizer import find_or_create_person, find_or_create_topic
+from src.store.person_identity import HEADER_ROLES, link_role
 from src.store.schema import create_database
 
 
@@ -23,10 +24,13 @@ def _email(conn, message_id, date="2026-09-20T10:00:00"):
 
 def _link(conn, email_id, person_id, *roles):
     for role in roles:
-        conn.execute(
-            "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, ?)",
-            (email_id, person_id, role),
-        )
+        if role in HEADER_ROLES:
+            conn.execute(
+                "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, ?)",
+                (email_id, person_id, role),
+            )
+        else:  # the model's words: a 'mentioned' row (issue 170)
+            link_role(conn, email_id, person_id, role)
 
 
 def _one_email_two_roles():
@@ -57,7 +61,7 @@ def test_an_email_with_two_roles_counts_once():
 
     assert ctx["email_count"] == 1
     assert len(ctx["recent_emails"]) == 1
-    assert ctx["recent_emails"][0]["role_in_email"] in ("recipient", "FYI")
+    assert ctx["recent_emails"][0]["role_in_email"] in ("recipient", "mentioned")
     assert ctx["topics_total"] == 1
     assert ctx["topics"] == [{"topic": "Cards Migration", "count": 1}]
     assert sum(ctx["sentiment_distribution"].values()) == 1

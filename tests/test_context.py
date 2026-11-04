@@ -131,7 +131,8 @@ def sample_db():
         (bob_id,),
     )
     conn.execute(
-        "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (2, ?, 'decision-maker')",
+        "INSERT INTO email_people (email_id, person_id, role_in_email, role_text)"
+        " VALUES (2, ?, 'mentioned', 'decision-maker')",
         (charlie_id,),
     )
     conn.execute(

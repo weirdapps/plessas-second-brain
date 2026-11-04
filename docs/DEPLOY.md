@@ -1877,3 +1877,29 @@ one pass, at the first job that writes. The versions that ask for a step:
     `python -m src.cli maint thread-identity-revert --apply --backup ~/brain-before-revert.db`
     puts every mapped email back on its old id, marks the step not applied (the loader
     then threads as before) and clears `thread_rollups`; `thread_id_map` stays.
+- **Gated: `person_identity`** (issue 170, `src/store/person_identity.py`). Applied by the
+  same `--apply-gated` run, after the three above, with the same steps 1 to 5. A people row
+  with a hard identifier (address, Teams MRI, WhatsApp JID, phone) is an identity; one with
+  none is a mention, listed in `person_mentions` (the rows stay in `people`, which ten
+  tables point at; the view `person_identities` holds the others). `person_identifiers`
+  gets every address, resolved MRI and name a row went by; a hard one belongs to one row.
+  `email_people` is rebuilt: `role_in_email` becomes an enum (`sender`, `recipient`, `cc`,
+  `bcc`, `mentioned`) and the model's own words for a person it named move to
+  `role_text`, outside the primary key. `person_owner` fixes the owner's id, and the rows
+  at his other addresses are merged into it, logged. On a copy of the replica
+  (2026-11-04) the step took 13.5 s: `email_people` 1,427,599 -> 1,426,027 (several model
+  roles of one person in one email become one row), distinct roles 182,610 -> 4,
+  `mentioned` 506,356, 43,477 identifiers (7,820 address, 933 MRI, 34,724 name, 0 JID),
+  26,907 mentions, people 34,727 -> 34,726 (one merge: the owner's alias row into his
+  id), and no other row deleted. After it:
+
+  - The people dedup merges by itself only on a shared address (phases 5 and 6); a match
+    on a name alone (phases 2, 3, 4 and 7) goes to `person_review`. The owner clears it
+    with `python -m src.cli maint people-review` (lists), then `--merge-all`,
+    `--reject-all`, or `--merge ID ...` / `--reject ID ...`; a rejected pair is not asked
+    again. The first whole pass on the copy queued nothing: the dedup had settled the
+    table already.
+  - Every merge, by any path (dedup, review, fuzzy review, import-people, owner), is a
+    row of `person_merges` (rule, evidence, the row removed, every reference moved);
+    `python -m src.cli maint people-unmerge ID` puts one back.
+  - No step-wide revert: the backup of step 4 is the way back.

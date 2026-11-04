@@ -151,16 +151,25 @@ def find_or_create_person(
     Returns:
         Person ID (existing or newly created)
     """
+    from src.store import person_identity
+
     name = recover_garbled_greek(name) or name
+    # With the gated person_identity (issue 170) every address and name a row went by is
+    # an identifier, so an address merged away still finds the row it went to.
+    identities = person_identity.active(conn)
 
     # If email provided, use it as primary deduplication key
     if email:
         email_normalized = email.strip().lower()
 
-        cursor = conn.execute(
-            "SELECT id, name FROM people WHERE LOWER(email) = ?", (email_normalized,)
-        )
-        row = cursor.fetchone()
+        row = None
+        if identities and (held := person_identity.person_by(conn, "address", email)):
+            row = conn.execute("SELECT id, name FROM people WHERE id = ?", (held,)).fetchone()
+        if row is None:
+            cursor = conn.execute(
+                "SELECT id, name FROM people WHERE LOWER(email) = ?", (email_normalized,)
+            )
+            row = cursor.fetchone()
 
         if row:
             person_id, existing_name = row[0], row[1]
@@ -171,6 +180,10 @@ def find_or_create_person(
                 and (_stands_in_for_a_name(existing_name) or looks_garbled(existing_name))
             ):
                 conn.execute("UPDATE people SET name = ? WHERE id = ?", (name, person_id))
+            if identities:
+                person_identity.record(conn, person_id, "address", email, "loader")
+                if display_name and not _stands_in_for_a_name(name):
+                    person_identity.record(conn, person_id, "name", name, "header")
             return person_id
 
         # The address is not on record. A namesake without one is this person,
@@ -184,6 +197,8 @@ def find_or_create_person(
         ).fetchone()
         if row:
             conn.execute("UPDATE people SET email = ? WHERE id = ?", (email_normalized, row[0]))
+            if identities:
+                person_identity.record(conn, row[0], "address", email, "loader")
             return row[0]
     else:
         # No email provided - search by name
@@ -199,6 +214,13 @@ def find_or_create_person(
         (name, email.strip().lower() if email else None),
     )
     assert cursor.lastrowid is not None  # mypy: INSERT always sets it
+    if identities:
+        if email:
+            person_identity.record(conn, cursor.lastrowid, "address", email, "loader")
+            if not _stands_in_for_a_name(name):
+                person_identity.record(conn, cursor.lastrowid, "name", name, "loader")
+        else:
+            person_identity.note_mention(conn, cursor.lastrowid, name)
     return cursor.lastrowid
 
 

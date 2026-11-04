@@ -134,7 +134,7 @@ def apply_reviewed_merges(conn: sqlite3.Connection, rows: list[dict]) -> int:
             continue
         if conn.execute("SELECT 1 FROM people WHERE id = ?", (remove,)).fetchone() is None:
             continue
-        merge_person(conn, keep, remove)
+        merge_person(conn, keep, remove, method="review", evidence=f"fuzzy:{r.get('score')}")
         merged += 1
     conn.commit()
     return merged

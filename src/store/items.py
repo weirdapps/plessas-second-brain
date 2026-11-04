@@ -97,6 +97,13 @@ def _extracted(conn: sqlite3.Connection, column: str, item_id: Any, *, facts: bo
     return out
 
 
+def _role_text(conn: sqlite3.Connection) -> str:
+    """The model's words for a person it named (role 'mentioned'), on a store with the
+    gated person_identity (issue 170), where they left the role column."""
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(email_people)")}
+    return ", ep.role_text" if "role_text" in columns else ""
+
+
 def _unfolded(row: dict) -> dict:
     """A row without the folded *_f copies the full-text indexes read."""
     return {key: value for key, value in row.items() if not key.endswith("_f")}
@@ -131,7 +138,8 @@ def _email(conn: sqlite3.Connection, kind: str, ref: Any, **_: Any) -> dict:
         "language": row["language"],
         "people": _rows(
             conn,
-            "SELECT p.name, p.email, ep.role_in_email AS role FROM email_people ep "
+            f"SELECT p.name, p.email, ep.role_in_email AS role{_role_text(conn)} "
+            "FROM email_people ep "
             "JOIN people p ON p.id = ep.person_id WHERE ep.email_id = ? "
             f"ORDER BY ep.role_in_email <> 'sender', ep.role_in_email, p.name "
             f"LIMIT {EXTRACTED_ROWS}",

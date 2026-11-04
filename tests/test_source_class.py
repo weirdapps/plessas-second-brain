@@ -314,7 +314,8 @@ def _build(path, monkeypatch) -> dict:
         email_id = _document(conn, source, subject, sha)
         expected[email_id] = cls
         conn.execute(
-            "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, 'author')",
+            "INSERT INTO email_people (email_id, person_id, role_in_email, role_text)"
+            " VALUES (?, ?, 'mentioned', 'author')",
             (email_id, colleague),
         )
         conn.execute(

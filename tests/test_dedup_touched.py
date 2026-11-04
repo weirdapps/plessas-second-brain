@@ -26,7 +26,8 @@ from src.store.schema import create_database
 
 def _store(tmp_path, name="brain.db"):
     path = tmp_path / name
-    create_database(str(path)).close()
+    # Without the gated person_identity, whose name-only matches wait for review (issue 170).
+    create_database(str(path), gated=False).close()
     return str(path)
 
 

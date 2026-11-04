@@ -391,11 +391,20 @@ _EXAMPLE_WHY = {
 }
 
 
-def _example_text(invitation: bool) -> str:
+# The example events' topic tags, shown only when topics are asked for (issue 281).
+EXAMPLE_TOPICS: dict[bool, list[str]] = {
+    True: ["πορεία καρτών", "καμπάνια cashback", "wallet UAT"],
+    False: ["wallet go-live", "wallet UAT"],
+}
+
+
+def _example_text(invitation: bool, topics: bool = False) -> str:
     item = _EXAMPLE_INVITATION if invitation else _EXAMPLE_MEETING
-    shown = "\n\n".join(
-        json.dumps(answer, ensure_ascii=False, indent=2) for answer in EXAMPLE_ANSWERS[invitation]
-    )
+    answers = [
+        {**answer, "topics": EXAMPLE_TOPICS[invitation]} if topics else answer
+        for answer in EXAMPLE_ANSWERS[invitation]
+    ]
+    shown = "\n\n".join(json.dumps(answer, ensure_ascii=False, indent=2) for answer in answers)
     return (
         "WORKED EXAMPLE\n"
         "The example below shows what a good answer looks like: the event as it would"
@@ -405,6 +414,10 @@ def _example_text(invitation: bool) -> str:
 
 
 EXAMPLES: dict[bool, str] = {True: _example_text(True), False: _example_text(False)}
+EXAMPLES_WITH_TOPICS: dict[bool, str] = {
+    True: _example_text(True, topics=True),
+    False: _example_text(False, topics=True),
+}
 
 _EVIDENCE_RULE = (
     "\nStart each decision and action item with `evidence`: the sentence of the text it"
@@ -412,22 +425,32 @@ _EVIDENCE_RULE = (
 )
 
 
-def _instructions(invitation: bool) -> str:
+def _instructions(invitation: bool, topics: bool = False) -> str:
     """A template's instructions without the event: the text v1 sends around it, so an
-    edit of the template reaches v2 too."""
+    edit of the template reaches v2 too; with `topics`, the ask v1 adds (issue 281)."""
     template = _INVITATION_TEMPLATE if invitation else _PROMPT_TEMPLATE
     text = template.replace("{invite}", _EVENT_PLACE).replace("{{", "{").replace("}}", "}")
+    if topics:
+        text = with_calendar_topics(text)
     return text if invitation else text + _EVIDENCE_RULE
 
 
-def _request(invitation: bool, invite: str) -> Request:
-    """The event's call in shape v2 or v2-text, its route given the answer shape's schema."""
-    from src.extract.schema_v2 import CALENDAR_INVITATION_SCHEMA_V2, CALENDAR_MEETING_SCHEMA_V2
+def _request(invitation: bool, invite: str, topics: bool = False) -> Request:
+    """The event's call in shape v2 or v2-text, its route given the answer shape's schema;
+    with `topics` (issue 281), the topics key in the instructions, schema and example."""
+    from src.extract.schema_v2 import (
+        CALENDAR_INVITATION_SCHEMA_V2,
+        CALENDAR_MEETING_SCHEMA_V2,
+        with_topics,
+    )
 
     schema = CALENDAR_INVITATION_SCHEMA_V2 if invitation else CALENDAR_MEETING_SCHEMA_V2
+    if topics:
+        schema = with_topics(schema)
+    examples = (EXAMPLES_WITH_TOPICS if topics else EXAMPLES)[invitation]
     return Request(
         route=dataclasses.replace(ROUTES["calendar"], schema=schema),
-        system=tuple(system_blocks(_instructions(invitation), EXAMPLES[invitation])),
+        system=tuple(system_blocks(_instructions(invitation, topics), examples)),
         user=f"{fence(invite)}\n\n{RESTATE}",
         source=invite,
     )
@@ -453,7 +476,7 @@ def event_prompt_hash(event: dict, body: str | None, topics: bool = False) -> st
     # v2 and v2-text: the system blocks as sent and the schema when it goes as structured
     # output, the same for every occurrence of a series; the fenced user turn without its
     # tag, which is drawn per call; never the effort, which the model does not read.
-    request = _request(invitation, invite)
+    request = _request(invitation, invite, topics)
     fixed = json.dumps(
         {
             "system": request.blocks,
@@ -486,7 +509,7 @@ def extract_event(event: dict, body: str | None = None, topics: bool = False) ->
     if invite is None:
         return {"body_summary": "", "decisions": [], "action_items": []}
     if v2_route("calendar"):
-        return _extract_event_v2(invitation, invite)
+        return _extract_event_v2(invitation, invite, topics)
 
     # Whoever sent the invite wrote all of it, the subject included.
     prompt = template.format(invite=fence(invite))
@@ -517,7 +540,7 @@ def extract_event(event: dict, body: str | None = None, topics: bool = False) ->
     return result
 
 
-def _extract_event_v2(invitation: bool, invite: str) -> dict:
+def _extract_event_v2(invitation: bool, invite: str, topics: bool = False) -> dict:
     """extract_event in call shape v2 or v2-text: the cached system prompt of the event's
     answer shape, the fenced event, a pinned effort, once more at twice the budget after a
     max_tokens stop. Each decision and action item of a past meeting is marked
@@ -525,7 +548,7 @@ def _extract_event_v2(invitation: bool, invite: str) -> dict:
     for a refusal and ValueError for a reply still cut short or holding no JSON object."""
     from src.extract.parser import _check_evidence
 
-    request = _request(invitation, invite)
+    request = _request(invitation, invite, topics)
     for max_tokens in max_tokens_attempts(request.route):
         response = complete(**request.kwargs(max_tokens))
         if getattr(response, "stop_reason", None) != "max_tokens":
@@ -537,12 +560,17 @@ def _extract_event_v2(invitation: bool, invite: str) -> dict:
         raise ValueError(f"calendar extraction reply cut short at max_tokens={max_tokens}")
     raw_text = _response_text(response)
     if invitation:
-        return {
+        shown = {
             "body_summary": invitation_summary(_json_object(raw_text)),
             "decisions": [],
             "action_items": [],
         }
+        if topics:
+            shown["topics"] = topics_of(_json_object(raw_text))
+        return shown
     result = parse_extraction_response(raw_text)
+    if topics:
+        result["topics"] = topics_of(_json_object(raw_text))
     result["decisions"] = [d for d in result["decisions"] if isinstance(d, dict)]
     result["action_items"] = [a for a in result["action_items"] if isinstance(a, dict)]
     _check_evidence(result, request.source)

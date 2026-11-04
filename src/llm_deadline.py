@@ -77,6 +77,10 @@ from src.llm_policy import MAX_ATTEMPTS, ROW_CAPS, backoff
 # without one. It starts pages until 1500 s, and a retry planned against the flat 900 s
 # default could outlast the unit. Its budget clears the token-push wait, which at 03:30 is
 # unlikely to be answered but holds nothing else up.
+#
+# sb-pages added 2026-11-04 (issue 169; TimeoutStartSec=1800 in docs/DEPLOY.md section 6,
+# not installed yet): the compiled pages' synthesis, the same shape as sb-topic-pages,
+# starting no page after 1500 s.
 _UNIT_TIMEOUT_SECONDS: dict[str, int] = {
     "sb-attachments": 3600,
     "sb-calendar-sync": 900,
@@ -85,6 +89,7 @@ _UNIT_TIMEOUT_SECONDS: dict[str, int] = {
     "sb-news-sync": 1800,
     "sb-noon-catchup": 1800,
     "sb-outlook-sync": 1200,
+    "sb-pages": 1800,
     "sb-teams-sync": 600,
     "sb-topic-pages": 1800,
     "sb-whatsapp-sync": 600,

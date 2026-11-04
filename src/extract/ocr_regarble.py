@@ -109,7 +109,7 @@ def _apply(conn: sqlite3.Connection, found: list[tuple]) -> dict:
         from src.store.embeddings import remove_vectors
 
         # An attachment's vector is keyed on its negated content id (embeddings.build_index).
-        stats["vectors removed"] = remove_vectors([-ac_id for ac_id in cleared])
+        stats["vectors removed"] = remove_vectors([-ac_id for ac_id in cleared], conn=conn)
     return stats
 
 

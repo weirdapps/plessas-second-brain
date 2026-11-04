@@ -42,11 +42,12 @@ def owner(monkeypatch):
 
 
 def _legacy(path=":memory:"):
-    """A store with every gated step but this one, as the producer holds it today."""
+    """A store with every gated step before this one, as the producer holds it today
+    (vectors, issue 171, comes after it)."""
     db = create_database(str(path), gated=False)
     db.execute(GATED_TABLE)
     for name, step in _gated_steps():
-        if name != person_identity.NAME:
+        if name not in (person_identity.NAME, "vectors"):
             step(db)
             db.execute(
                 "INSERT INTO gated_migrations (name, applied_at, backup) VALUES (?, 'x', NULL)",
@@ -75,9 +76,10 @@ def _roles(db, email_id):
 
 
 def test_the_step_is_named_and_last_and_waits_on_a_legacy_store():
-    assert GATED_MIGRATIONS[-1] == "person_identity"
+    # vectors (issue 171) comes after it, and a new store leaves that one to the owner.
+    assert GATED_MIGRATIONS[-2:] == ("person_identity", "vectors")
     db = _legacy()
-    assert pending_gated(db) == ["person_identity"]
+    assert pending_gated(db) == ["person_identity", "vectors"]
     assert "person_identifiers" not in {
         r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
@@ -87,7 +89,7 @@ def test_the_step_is_named_and_last_and_waits_on_a_legacy_store():
 def test_a_new_store_takes_it():
     db = create_database(":memory:")
     assert person_identity.active(db)
-    assert pending_gated(db) == []
+    assert pending_gated(db) == ["vectors"], "the owner's step alone waits"
 
 
 # --- the backfill -------------------------------------------------------------------------

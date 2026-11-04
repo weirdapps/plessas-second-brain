@@ -998,7 +998,7 @@ def _collect_job(conn, key: str, record: dict) -> dict:
             # As reextract does online: a row with a new summary is embedded again.
             from src.store.embeddings import remove_vectors
 
-            remove_vectors([-ac_id for ac_id in loaded])
+            remove_vectors([-ac_id for ac_id in loaded], conn=conn)
     _close(conn, key, record, status.state, status.error, out["counts"])
     return out
 

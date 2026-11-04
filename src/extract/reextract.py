@@ -618,7 +618,11 @@ def reextract(
         stats["duplicates"] = len(copied)
         redone += copied
         if redone:
-            remove_vectors([-ac_id for ac_id in redone])
+            conn = _connect(db_path)
+            try:
+                remove_vectors([-ac_id for ac_id in redone], conn=conn)
+            finally:
+                conn.close()
     return stats
 
 

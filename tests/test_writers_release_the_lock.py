@@ -93,6 +93,6 @@ def test_reextract_commits_each_row(tmp_path, monkeypatch):
         "_extract_one_attachment",
         lambda row, *a, **k: (row[0], row[5], {"summary": "s"}, None, False),
     )
-    monkeypatch.setattr("src.store.embeddings.remove_vectors", lambda ids: 0)
+    monkeypatch.setattr("src.store.embeddings.remove_vectors", lambda ids, conn=None: 0)
 
     assert rx.reextract(str(path), {"capped"}, root=str(tmp_path / "att"))["reread"] == 2

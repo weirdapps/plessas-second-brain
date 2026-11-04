@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
-from src.config import CURRENT_SCHEMA_VERSION
+from src.config import AUTO_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION
 from src.export.teams_cli import TeamsCliAuthRequired, TeamsCliError
 from src.pipeline import EXIT_REAUTH, directory_sync
 from src.store import directory
@@ -96,7 +96,7 @@ def test_the_v40_migration_runs_once_and_again(tmp_path):
     c.execute("DROP TABLE directory_entries")
     set_schema_version(c, 39)
     run_migrations(c)
-    assert get_schema_version(c) == CURRENT_SCHEMA_VERSION
+    assert get_schema_version(c) == AUTO_SCHEMA_VERSION
     migrate_add_directory(c)  # a second run changes nothing
     assert [r[1] for r in c.execute("PRAGMA table_info(directory_entries)")] == COLUMNS
     c.close()

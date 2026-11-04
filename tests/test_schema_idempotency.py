@@ -19,6 +19,7 @@ import sqlite3
 import pytest
 
 from src.config import CURRENT_SCHEMA_VERSION
+from src.store import ledger
 from src.store.schema import (
     create_database,
     get_connection,
@@ -152,6 +153,9 @@ def reference(tmp_path_factory):
     fresh.close()
     seeded = create_database(str(root / "seeded.db"))
     _seed(seeded)
+    # As the hourly pass leaves it: its items stamped and entered in the ledger (v42).
+    ledger.reconcile(seeded)
+    seeded.commit()
     rows = _rows(seeded)
     seeded.close()
     return {"schema": schema, "rows": rows, "seeded": root / "seeded.db"}
@@ -182,7 +186,8 @@ def test_migrating_again_from_a_version_changes_nothing(reference, tmp_path, ver
 
     for _ in range(2):
         set_schema_version(conn, version)
-        run_migrations(conn)
+        # The whole chain, the gated v42 included, as `brain maint migrate --ledger` runs it.
+        run_migrations(conn, gated=True)
 
     assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION
     assert _schema(conn) == reference["schema"]

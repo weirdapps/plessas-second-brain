@@ -742,7 +742,7 @@ def test_v24_marks_the_stored_call_records_and_requeues_their_threads(tmp_path):
     alone, keeps its summary, which describes them."""
     import json
 
-    from src.config import CURRENT_SCHEMA_VERSION
+    from src.config import AUTO_SCHEMA_VERSION
     from src.store.schema import create_database, get_schema_version, run_migrations
 
     conn = create_database(str(tmp_path / "b.db"))
@@ -813,7 +813,7 @@ def test_v24_marks_the_stored_call_records_and_requeues_their_threads(tmp_path):
         "short": ("extracted", 6, "2026-09-01T10:11", "2026-09-01T10:16", ["Bob"]),
         "brief": ("extracted", 1, "2026-09-01T10:18", "2026-09-01T10:18", ["Bob"]),
     }
-    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION
+    assert get_schema_version(conn) == AUTO_SCHEMA_VERSION
 
 
 def test_a_chat_summary_leaves_system_messages_out(tmp_path):

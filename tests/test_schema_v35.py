@@ -14,7 +14,7 @@ import sqlite3
 
 import pytest
 
-from src.config import CURRENT_SCHEMA_VERSION
+from src.config import AUTO_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION
 from src.store.schema import (
     ITEM_STATE_COLUMNS,
     create_database,
@@ -126,7 +126,7 @@ def test_migrating_a_v34_store_adds_the_columns_and_keeps_every_row(store):
 
     run_migrations(store)
 
-    assert get_schema_version(store) == CURRENT_SCHEMA_VERSION
+    assert get_schema_version(store) == AUTO_SCHEMA_VERSION
     for table, rows in before.items():
         assert [c for c in _columns(store, table) if c in EXPECTED[table]] == EXPECTED[table]
         width = len(rows[0])

@@ -198,6 +198,11 @@ def run_action_lifecycle(
     deduped = dedup_exact_open_actions(conn)
     expired = expire_stale_actions(conn, expire_days)
     expired_undated = expire_undated_actions(conn, undated_expire_days)
+    # The ledger (schema v42) records what this run expired, and what a sync extracted
+    # again since; a no-op on a store without it.
+    from src.store import ledger
+
+    ledger.reconcile(conn)
 
     after_open = conn.execute("SELECT COUNT(*) FROM action_items WHERE status = 'open'").fetchone()[
         0

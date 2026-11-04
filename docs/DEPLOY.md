@@ -1820,3 +1820,16 @@ one pass, at the first job that writes. The versions that ask for a step:
      exporter's folders, and search would return both.
   6. `python -m src.cli maint calendar-backfill --since 2026-02-01 --until 2026-03-01`: the
      calendar event offered again is in a month the backfill had recorded as listed.
+- **v42 (gated).** The item ledger (issue 168, `src/store/ledger.py`): `observed_at`,
+  `item_hash` and `counterpart_person_id` on decisions, action items and commitments,
+  `due_date` and `owner_role` on the last two, and `item_ledger`, one status per (kind,
+  parent, normalised-text hash) so extracting a parent again cannot reopen what was closed.
+  **No job takes it**: they stop at v41, and the code runs as before until the step below.
+  The step stamps every stored item (271,699 rows) in one write transaction, 139 s on
+  a copy of the replica, and labels 522 exact duplicates within one parent (`item_labels`
+  method `ledger`, revertable with `maint consolidate --revert <run_id>`); it deletes no
+  row. On the producer, after a snapshot (`scripts/backup_db.py`, docs/RESTORE.md):
+  `systemctl --user stop 'sb-*.timer'`, let the running `sb-*` jobs exit,
+  `python -m src.cli maint migrate --ledger`, then `systemctl --user start 'sb-*.timer'`.
+  From then on the hourly consolidation and the daily action lifecycle reconcile the
+  ledger, about 2 s each.

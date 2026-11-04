@@ -8,7 +8,7 @@ the attachment directory downloaded under it could never be matched to an email.
 
 import sqlite3
 
-from src.config import CURRENT_SCHEMA_VERSION
+from src.config import AUTO_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION
 from src.store.schema import (
     create_database,
     get_connection,
@@ -57,7 +57,7 @@ def test_it_upgrades_a_store_that_predates_it(tmp_path):
     run_migrations(conn)
 
     assert "email_id" in _cols(conn, "email_aliases")
-    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION
+    assert get_schema_version(conn) == AUTO_SCHEMA_VERSION
     conn.close()
 
 

@@ -10,7 +10,7 @@ import sqlite3
 
 import pytest
 
-from src.config import CURRENT_SCHEMA_VERSION
+from src.config import AUTO_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION
 from src.store.schema import (
     create_database,
     get_schema_version,
@@ -81,7 +81,8 @@ def test_each_new_table_has_its_columns(store, table):
 def test_commitments_can_record_what_closed_them(store):
     columns = _columns(store, "commitments")
 
-    assert columns[-2:] == ["closed_by", "closed_at"]
+    start = columns.index("closed_by")
+    assert columns[start : start + 2] == ["closed_by", "closed_at"]
 
 
 def test_the_kinds_and_labels_are_checked(store):
@@ -130,7 +131,7 @@ def test_migrating_an_older_store_keeps_every_row(store):
 
     run_migrations(store)
 
-    assert get_schema_version(store) == CURRENT_SCHEMA_VERSION
+    assert get_schema_version(store) == AUTO_SCHEMA_VERSION
     after = store.execute("SELECT * FROM commitments").fetchall()
     assert [tuple(r)[: len(before[0])] for r in after] == [tuple(r) for r in before]
     assert tuple(after[0])[-2:] == (None, None)

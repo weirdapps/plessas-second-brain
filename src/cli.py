@@ -1513,7 +1513,10 @@ def cmd_migrate(args):
     print(f"Current schema version: {before}")
     print("Running migrations...")
 
-    run_migrations(conn)
+    # --ledger takes the gated migrations (src/store/schema.py run_migrations): v42, the
+    # item ledger, which stamps every stored decision, action and commitment. Take a
+    # snapshot first (docs/DEPLOY.md section 12).
+    run_migrations(conn, gated=getattr(args, "ledger", False))
 
     after = get_schema_version(conn)
     conn.close()
@@ -2888,6 +2891,12 @@ def main():
 
     # Migrate command
     parser_migrate = subparsers.add_parser("migrate", help="Run database migrations")
+    parser_migrate.add_argument(
+        "--ledger",
+        action="store_true",
+        help="Also run the gated v42 migration: the item ledger (issue 168), which stamps "
+        "every stored decision, action and commitment. Snapshot the store first.",
+    )
     parser_migrate.set_defaults(func=cmd_migrate)
 
     parser_classify = subparsers.add_parser(

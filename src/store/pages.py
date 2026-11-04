@@ -157,11 +157,37 @@ def _owner_ids(conn: sqlite3.Connection) -> set[int]:
     from src.store.owner import owner_address_sql
 
     ids = set()
-    fixed = person_identity.owner_id(conn)
-    if fixed is not None:
-        ids.add(fixed)
     condition, params = owner_address_sql("p.email", config.USER_EMAIL_PATTERN)
     ids |= {r[0] for r in conn.execute(f"SELECT id FROM people p WHERE {condition}", params)}
+    fixed = person_identity.owner_id(conn)
+    if fixed is not None:
+        # The owner's fixed id (person_owner, issue 170) and every row at an address or
+        # other hard identifier that id holds: a personal address the pattern leaves out
+        # is still the owner's.
+        ids.add(fixed)
+        held = conn.execute(
+            "SELECT kind, lower(value) FROM person_identifiers"
+            " WHERE person_id = ? AND kind <> 'name'",
+            (fixed,),
+        ).fetchall()
+        addresses = [v for k, v in held if k == "address"]
+        if addresses:
+            ids |= {
+                r[0]
+                for r in conn.execute(
+                    "SELECT id FROM people WHERE lower(email) IN (SELECT value FROM json_each(?))",
+                    (_in(addresses),),
+                )
+            }
+        ids |= {
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT i.person_id FROM person_identifiers i"
+                " JOIN (SELECT value AS pair FROM json_each(?)) h"
+                " ON i.kind || ' ' || lower(i.value) = h.pair",
+                (_in(f"{k} {v}" for k, v in held),),
+            )
+        }
     return ids
 
 
@@ -353,6 +379,7 @@ def _person_skeleton(conn: sqlite3.Connection, key: str) -> dict | None:
         lines["meetings"].append(
             _line(f"Last meeting: {_cut(last[2], 120)}", "calendar", *last[:2])
         )
+    lines["chats"] = _person_chats(conn, pid)
     return {
         "name": name or address or key,
         "facts": {
@@ -364,6 +391,48 @@ def _person_skeleton(conn: sqlite3.Connection, key: str) -> dict | None:
         },
         "sections": lines,
     }
+
+
+def _identifiers(conn: sqlite3.Connection, person_id: int, kind: str) -> list[str]:
+    """A person's identifiers of one kind (person_identity, issue 170); none without it."""
+    if not _table(conn, "person_identifiers"):
+        return []
+    return [
+        r[0]
+        for r in conn.execute(
+            "SELECT value FROM person_identifiers WHERE person_id = ? AND kind = ?",
+            (person_id, kind),
+        )
+    ]
+
+
+def _person_chats(conn: sqlite3.Connection, person_id: int) -> list[dict]:
+    """The newest Teams threads and WhatsApp sessions the person wrote in: Teams by the
+    sender's people id or a Teams MRI the person holds, WhatsApp by a JID they hold (no
+    name match: WhatsApp gives none to join on)."""
+    out = []
+    mris = _identifiers(conn, person_id, "mri")
+    for thread_id, last, title in conn.execute(
+        """SELECT t.id, MAX(m.composed_at), COALESCE(t.title, t.summary) FROM teams_messages m
+           JOIN teams_threads t ON t.id = m.thread_id
+           WHERE m.sender_person_id = ? OR m.sender_mri IN (SELECT value FROM json_each(?))
+           GROUP BY t.id ORDER BY 2 DESC LIMIT 3""",
+        (person_id, _in(mris)),
+    ):
+        out.append(_line(f"Teams: «{_cut(title, 120) or 'a chat'}»", "teams", thread_id, last))
+    jids = _identifiers(conn, person_id, "jid")
+    if jids:
+        for thread_id, last, title in conn.execute(
+            """SELECT t.id, MAX(m.sent_at), COALESCE(t.title, t.summary)
+               FROM whatsapp_messages m JOIN whatsapp_threads t ON t.id = m.thread_id
+               WHERE m.sender_jid IN (SELECT value FROM json_each(?)) AND m.is_from_me = 0
+               GROUP BY t.id ORDER BY 2 DESC LIMIT 3""",
+            (_in(jids),),
+        ):
+            out.append(
+                _line(f"WhatsApp: «{_cut(title, 120) or 'a chat'}»", "whatsapp", thread_id, last)
+            )
+    return out
 
 
 def _topic_skeleton(conn: sqlite3.Connection, key: str) -> dict | None:
@@ -710,8 +779,18 @@ def write_synthesis(
 
 # --- the sync's refresh -------------------------------------------------------------------
 
-# Each source a refresh follows, by the largest id it has seen.
-_SOURCES = ("emails", "calendar_events", "decisions", "action_items")
+# Each source a refresh follows, by the largest id it has seen. The chat sources were added
+# after the first release: on a store whose refresh already ran they start at their head,
+# so their arrival recompiles nothing.
+_SOURCES = (
+    "emails",
+    "calendar_events",
+    "decisions",
+    "action_items",
+    "teams_messages",
+    "whatsapp_messages",
+)
+_FIRST_SOURCES = ("emails", "calendar_events", "decisions", "action_items")
 
 
 def _watermark(conn: sqlite3.Connection, source: str) -> int | None:
@@ -766,6 +845,31 @@ def _touched(conn: sqlite3.Connection, marks: dict[str, int]) -> dict[str, set[s
                 (ids,),
             )
         }
+    # Chats mark the people who wrote them.
+    out["person"] |= {
+        str(r[0])
+        for r in conn.execute(
+            "SELECT DISTINCT sender_person_id FROM teams_messages"
+            " WHERE id > ? AND sender_person_id IS NOT NULL",
+            (marks["teams_messages"],),
+        )
+    }
+    if _table(conn, "person_identifiers"):
+        for kind, sql in (
+            ("mri", "SELECT DISTINCT sender_mri FROM teams_messages WHERE id > ?"),
+            ("jid", "SELECT DISTINCT sender_jid FROM whatsapp_messages WHERE id > ?"),
+        ):
+            source = "teams_messages" if kind == "mri" else "whatsapp_messages"
+            values = [r[0] for r in conn.execute(sql, (marks[source],)) if r[0]]
+            if values:
+                out["person"] |= {
+                    str(r[0])
+                    for r in conn.execute(
+                        "SELECT DISTINCT person_id FROM person_identifiers WHERE kind = ?"
+                        " AND value IN (SELECT value FROM json_each(?))",
+                        (kind, _in(values)),
+                    )
+                }
     if event_ids:
         ids = _in(event_ids)
         out["series"] |= {
@@ -800,8 +904,9 @@ def refresh(conn: sqlite3.Connection, *, kinds: Iterable[str] = KINDS) -> dict:
         s: conn.execute(f"SELECT COALESCE(MAX(id), 0) FROM {s}").fetchone()[0] for s in _SOURCES
     }
     held = {s: _watermark(conn, s) for s in _SOURCES}
-    first = any(v is None for v in held.values())
-    touched = None if first else _touched(conn, {s: v or 0 for s, v in held.items()})
+    first = any(held[s] is None for s in _FIRST_SOURCES)
+    marks = {s: current[s] if v is None else v for s, v in held.items()}
+    touched = None if first else _touched(conn, marks)
     stats: dict[str, Any] = {"enabled": True, "first": first, "touched": 0, "compiled": 0}
     for kind in kinds:
         keys = eligible(conn, kind)
@@ -929,6 +1034,7 @@ _SECTION_TITLES = {
     "actions": "Open actions",
     "open": "Still owed",
     "meetings": "Meetings",
+    "chats": "Teams and WhatsApp",
     "recent": "Recent meetings",
 }
 

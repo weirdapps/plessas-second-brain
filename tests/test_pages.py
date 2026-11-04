@@ -311,3 +311,90 @@ def test_a_skeleton_lists_current_items_once(store):
     texts = [line["text"] for line in pages.page_for_topic(store, topic_id)["lines"]]
     assert sum("budget v3" in t for t in texts) == 1
     assert not any("budget v1" in t for t in texts)
+
+
+# --- follow-up: chats mark person pages, and every owner row is excluded ------------------
+
+
+def _teams_message(conn, person_id, mri, title="Budget chat"):
+    chat = f.teams_chat(conn)
+    thread = f.teams_thread(conn, chat_id=chat, title=title)
+    conn.execute(
+        "UPDATE teams_messages SET sender_person_id = ?, sender_mri = ? WHERE id = ?",
+        (person_id, mri, f.teams_message(conn, thread_id=thread, chat_id=chat)),
+    )
+    conn.commit()
+    return thread
+
+
+def test_teams_activity_marks_a_person_page_dirty_with_the_thread_cited(store):
+    _thread(store, "Budget 2027", n=4)
+    pages.refresh(store)
+    store.execute("DELETE FROM page_dirty")
+    store.commit()
+    alice = _alice(store)
+
+    thread = _teams_message(store, alice, "8:orgid:alice")
+    pages.refresh(store)
+
+    dirty = {k for (k,) in store.execute("SELECT entity_key FROM page_dirty WHERE kind='person'")}
+    assert str(alice) in dirty
+    refs = {r for line in pages.page_for_person(store, alice)["lines"] for r in line["refs"]}
+    assert f"teams:{thread}" in refs
+
+
+def test_teams_activity_found_by_mri_identifier(store):
+    _thread(store, "Budget 2027", n=4)
+    alice = _alice(store)
+    store.execute(
+        "INSERT INTO person_identifiers (person_id, kind, value, source, created_at)"
+        " VALUES (?, 'mri', '8:orgid:alice', 'test', 'x')",
+        (alice,),
+    )
+    pages.refresh(store)
+    thread = _teams_message(store, None, "8:orgid:alice", title="By MRI")
+    pages.refresh(store)
+    refs = {r for line in pages.page_for_person(store, alice)["lines"] for r in line["refs"]}
+    assert f"teams:{thread}" in refs
+
+
+def test_new_sources_on_an_older_page_store_start_at_their_head_without_a_full_compile(store):
+    _thread(store, "Budget 2027", n=4)
+    pages.refresh(store)
+    store.execute(
+        "DELETE FROM page_watermarks WHERE source IN ('teams_messages', 'whatsapp_messages')"
+    )
+    store.execute("DELETE FROM page_dirty")
+    store.commit()
+    stats = pages.refresh(store)
+    assert stats["first"] is False and stats["touched"] == 0
+
+
+def test_every_row_of_the_owner_is_left_without_a_page(store):
+    """The owner's fixed id (person_owner) and every address it holds: a personal address
+    the owner pattern does not list gets no page either."""
+    from src.store import person_identity
+
+    personal = ("Owner Example", "owner.personal@example.org")
+    for i in range(4):
+        f.email(
+            store,
+            subject=f"Note to self {i}",
+            sender=personal,
+            to=(ALICE,),
+            conversation_id=f"self-{i}",
+            source_class="mail",
+        )
+    owner = f.person(store, *OWNER)
+    person_identity.set_owner(store, owner)
+    store.execute("DELETE FROM person_identifiers WHERE value = ?", (personal[1],))
+    store.execute(
+        "INSERT INTO person_identifiers (person_id, kind, value, source, created_at)"
+        " VALUES (?, 'address', ?, 'test', 'x')",
+        (owner, personal[1]),
+    )
+    store.commit()
+    pages.refresh(store)
+    row = store.execute("SELECT id FROM people WHERE email = ?", (personal[1],)).fetchone()[0]
+    assert pages.page_for_person(store, row) is None
+    assert pages.page_for_person(store, _alice(store)) is not None

@@ -74,6 +74,7 @@ def test_the_report_counts_vectors_by_kind_and_names_the_space(hc, tmp_path):
         "email": 2,
         "attachment": 1,
         "chunk": len(chunk_ids),
+        "email_chunk": 0,
         "conversation": 0,
         "teams": 1,
         "whatsapp": 0,

@@ -1563,12 +1563,21 @@ def _embedding_coverage(db, ids, chunks: bool = False) -> dict[str, tuple[int, i
             rows = db.execute("SELECT content_id, chunk_no FROM attachment_chunks").fetchall()
         except sqlite3.Error:
             rows = []
+        from src.store import vector_store
+
+        if rows and vector_store.enabled(db):
+            # A store whose vectors are in its table cuts one copy of each file (issue 171).
+            from src.store.chunks import copy_attachments
+
+            owner = dict(db.execute("SELECT content_id, attachment_id FROM attachment_chunks"))
+            copies = copy_attachments(db, set(owner.values()))
+            rows = [r for r in rows if owner.get(r[0]) not in copies]
         wanted = [chunk_vector_id(r[0], r[1]) for r in rows]
         coverage["chunks"] = (sum(1 for v in wanted if v in indexed), len(wanted))
     return coverage
 
 
-VECTOR_KINDS = ("email", "attachment", "chunk", "conversation", "teams", "whatsapp")
+VECTOR_KINDS = ("email", "attachment", "chunk", "email_chunk", "conversation", "teams", "whatsapp")
 
 
 def _vectors_by_kind(ids) -> dict[str, int]:
@@ -1578,6 +1587,7 @@ def _vectors_by_kind(ids) -> dict[str, int]:
     from src.store.embeddings import (
         CHUNK_ID_OFFSET,
         CONVERSATION_ID_OFFSET,
+        EMAIL_CHUNK_ID_OFFSET,
         TEAMS_THREAD_ID_OFFSET,
         WHATSAPP_THREAD_ID_OFFSET,
     )
@@ -1586,7 +1596,8 @@ def _vectors_by_kind(ids) -> dict[str, int]:
     masks = {
         "email": ids > 0,
         "attachment": (ids < 0) & (ids > CONVERSATION_ID_OFFSET),
-        "chunk": ids <= CHUNK_ID_OFFSET,
+        "chunk": (ids <= CHUNK_ID_OFFSET) & (ids > EMAIL_CHUNK_ID_OFFSET),
+        "email_chunk": ids <= EMAIL_CHUNK_ID_OFFSET,
         "conversation": (ids <= CONVERSATION_ID_OFFSET) & (ids > TEAMS_THREAD_ID_OFFSET),
         "teams": (ids <= TEAMS_THREAD_ID_OFFSET) & (ids > WHATSAPP_THREAD_ID_OFFSET),
         "whatsapp": (ids <= WHATSAPP_THREAD_ID_OFFSET) & (ids > CHUNK_ID_OFFSET),

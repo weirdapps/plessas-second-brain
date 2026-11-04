@@ -1952,3 +1952,16 @@ one pass, at the first job that writes. The versions that ask for a step:
     `DELETE FROM gated_migrations WHERE name = 'vectors'`. The npz is the index again,
     without the vectors written since the step: `python -m src.cli embed` adds back the
     emails, attachments and chunks, and the next teams-sync and whatsapp-sync theirs.
+  - What the hourly pass embeds once the step has run (issue 171, part 2): the bodies of
+    the mail that came since (`mail` and `document`; the newest message, quoted history
+    left out as the extraction does, over 2,000 characters) cut into chunks under the
+    email's subject, sender, date and summary; of the long attachments with the same
+    bytes, the first only; and every new summary at 1536 dimensions, searched by its
+    first 768 beside the older rows. On the clone: 845 emails a month pass the length,
+    about 1,660 chunks; 30,058 of the 91,895 chunk vectors belong to copies of 1,380 files.
+  - The history, in nightly batches on the producer, newest first:
+    `python -m src.cli maint vectors-backfill` counts (no model call, nothing written);
+    `--apply --limit 2000` chunks that many emails' bodies and drops the copies' chunk
+    vectors (no model call for those); `--apply --summaries --limit 5000` embeds that many
+    768 summaries again at 1536. `maint vectors-rebuild` puts every summary back at 768
+    and drops the email chunks; the backfill then adds them again.

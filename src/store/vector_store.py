@@ -78,6 +78,8 @@ def kind_of(vector_id: int) -> str:
     v = int(vector_id)
     if v > 0:
         return "email"
+    if v <= emb.EMAIL_CHUNK_ID_OFFSET:
+        return "email_chunk"
     if v <= emb.CHUNK_ID_OFFSET:
         return "chunk"
     if v <= emb.WHATSAPP_THREAD_ID_OFFSET:
@@ -94,6 +96,8 @@ def parent_of(vector_id: int) -> int:
     from src.store import embeddings as emb
 
     v = int(vector_id)
+    if v <= emb.EMAIL_CHUNK_ID_OFFSET:
+        return emb.email_chunk_of(v)[0]
     if v <= emb.CHUNK_ID_OFFSET:
         return -emb.chunk_of(v)[0]
     return v
@@ -161,7 +165,10 @@ def delete(conn: sqlite3.Connection, ids: Iterable[int], *, with_chunks: bool = 
     where = "id IN (SELECT value FROM json_each(?))"
     args: tuple = (drop,)
     if with_chunks:
-        where += " OR (kind = 'chunk' AND parent_id IN (SELECT value FROM json_each(?)))"
+        where += (
+            " OR (kind IN ('chunk', 'email_chunk')"
+            " AND parent_id IN (SELECT value FROM json_each(?)))"
+        )
         args = (drop, drop)
     removed = conn.execute(f"DELETE FROM vectors WHERE {where}", args).rowcount
     if removed:
@@ -178,6 +185,10 @@ def replace_all(conn: sqlite3.Connection, ids, vectors, template: int) -> int:
 
 def held_ids(conn: sqlite3.Connection) -> set[int]:
     return {int(r[0]) for r in conn.execute("SELECT id FROM vectors")}
+
+
+def held_ids_of_kind(conn: sqlite3.Connection, kind: str) -> set[int]:
+    return {int(r[0]) for r in conn.execute("SELECT id FROM vectors WHERE kind = ?", (kind,))}
 
 
 def counts(conn: sqlite3.Connection) -> dict[str, int]:
@@ -288,8 +299,8 @@ def load(conn: sqlite3.Connection) -> tuple[np.ndarray, np.ndarray, dict | None]
     writer rewrites a file; a process holds what it held before.
 
     Raises FileNotFoundError when the table holds no vector, as the npz reader does for no
-    file, so the callers' fallbacks are the same; IndexSpaceMismatch when its rows are of
-    two dimensions (a re-embed in progress that this reader cannot compare yet).
+    file, so the callers' fallbacks are the same. Rows of several widths are read on the
+    narrowest one's prefix.
     """
     from src.store import embeddings as emb
 
@@ -304,10 +315,11 @@ def load(conn: sqlite3.Connection) -> tuple[np.ndarray, np.ndarray, dict | None]
             raise FileNotFoundError(
                 "The vectors table holds no vector. Run 'python -m src.cli embed'."
             )
-        dims = [r[0] for r in conn.execute("SELECT DISTINCT dim FROM vectors")]
-        if len(dims) != 1:
-            raise emb.IndexSpaceMismatch(f"the vectors table holds rows of dimensions {dims}")
-        dim = int(dims[0])
+        # Rows of two widths (summaries at 1536 beside the older 768, issue 171) are read on
+        # their shared prefix: a Matryoshka vector's first dimensions, scaled to unit length,
+        # are the narrower vector itself.
+        dim = int(conn.execute("SELECT MIN(dim) FROM vectors").fetchone()[0])
+        mixed = conn.execute("SELECT 1 FROM vectors WHERE dim > ? LIMIT 1", (dim,)).fetchone()
         # Each block of rows is widened straight into the float16 array: no int8 copy of the
         # whole table is held beside it.
         ids = np.empty(n, dtype=np.int64)
@@ -320,10 +332,9 @@ def load(conn: sqlite3.Connection) -> tuple[np.ndarray, np.ndarray, dict | None]
                 break
             take = len(rows)
             ids[done : done + take] = [r[0] for r in rows]
+            blobs = (r[1][:dim] for r in rows) if mixed else (r[1] for r in rows)
             part = (
-                np.frombuffer(b"".join(r[1] for r in rows), dtype=np.int8)
-                .reshape(take, dim)
-                .astype(np.float32)
+                np.frombuffer(b"".join(blobs), dtype=np.int8).reshape(take, dim).astype(np.float32)
             )
             norms = np.sqrt(np.einsum("ij,ij->i", part, part))[:, None]
             norms[norms == 0] = 1

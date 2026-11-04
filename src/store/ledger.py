@@ -12,7 +12,8 @@ normalised text:
   start, the Teams or WhatsApp thread's first message, the conversation turn's time),
   `item_hash` (item_hash below), and on actions and commitments `due_date` (the deadline
   resolved to a day, resolve_due) and `owner_role` (from the schema v2 direction), plus
-  `counterpart_person_id`, the people row on the other side of the item from the owner.
+  `counterpart_person_id`, the people row on the other side of the item from the owner,
+  and `counterpart_via`, how it was found: 'address' (a hard identifier) or 'name'.
 - item_ledger holds one entry per (kind, parent, hash), the uniqueness rule, with its
   status: open, done, superseded, expired or dropped. A second row of one parent with the
   same hash is its exact duplicate: it gets canonical_id, logged in item_labels with method
@@ -49,6 +50,7 @@ COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("observed_at", "TEXT"),
         ("item_hash", "TEXT"),
         ("counterpart_person_id", "INTEGER"),
+        ("counterpart_via", "TEXT"),
     ),
     "action_items": (
         ("observed_at", "TEXT"),
@@ -56,6 +58,7 @@ COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("due_date", "TEXT"),
         ("owner_role", "TEXT"),
         ("counterpart_person_id", "INTEGER"),
+        ("counterpart_via", "TEXT"),
     ),
     "commitments": (
         ("observed_at", "TEXT"),
@@ -63,6 +66,7 @@ COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("due_date", "TEXT"),
         ("owner_role", "TEXT"),
         ("counterpart_person_id", "INTEGER"),
+        ("counterpart_via", "TEXT"),
     ),
 }
 
@@ -320,6 +324,11 @@ class _People:
             self._names[key] = rows[0][0] if len(rows) == 1 else None
         return self._names[key]
 
+    def address_of(self, person_id: int) -> str | None:
+        """The address of a people row, lower case; None for a row with none."""
+        row = self.conn.execute("SELECT email FROM people WHERE id = ?", (person_id,)).fetchone()
+        return (row[0] or "").strip().lower() or None if row else None
+
     def by_address(self, address: str | None) -> int | None:
         """The people row of that address, not the owner's."""
         from src.store.owner import is_owner_address
@@ -342,25 +351,45 @@ def _owner_role(table: str, row: dict, people: _People) -> str | None:
     return "assigned_to_owner" if people.is_owner_name(row.get("owner")) else None
 
 
-def _counterpart(table: str, row: dict, people: _People) -> int | None:
+def _counterpart(table: str, row: dict, people: _People) -> tuple[int | None, str | None]:
+    """The people row on the other side of the item from the owner, and how it was found:
+    'address' when a hard identifier names it (the parent email's From address, or a
+    commitment party whose people row has that address), 'name' when only a name does.
+    Only an 'address' counterpart may join items across threads (issue 170: merge on a
+    hard identifier alone); a 'name' one is kept for display."""
+    sender = row.get("sender_address")
+
+    def via_row(person_id: int | None) -> tuple[int | None, str | None]:
+        if person_id is None:
+            return None, None
+        hard = sender and people.address_of(person_id) == sender.strip().lower()
+        return person_id, "address" if hard else "name"
+
+    def named(person_id: int | None) -> tuple[int | None, str | None]:
+        return person_id, "name" if person_id is not None else None
+
+    def addressed(person_id: int | None) -> tuple[int | None, str | None]:
+        return person_id, "address" if person_id is not None else None
+
     direction = row.get("direction")
     if table == "decisions":
-        return people.by_name(row.get("decided_by"))
+        return named(people.by_name(row.get("decided_by")))
     if table == "commitments":
         if direction == "owner_owes":
-            return row.get("to_person_id")
+            return via_row(row.get("to_person_id"))
         found = row.get("by_person_id") or row.get("to_person_id")
         if found or row.get("email_id"):
-            return found
+            return via_row(found)
         # A Teams or WhatsApp commitment names its people only: the one who is not the owner.
         by, to = row.get("by_person"), row.get("to_person")
-        return people.by_name(to) if people.is_owner_name(by) else people.by_name(by)
+        return named(people.by_name(to) if people.is_owner_name(by) else people.by_name(by))
     owner = row.get("owner")
     if direction == "owed_to_owner":
-        return people.by_name(owner)
+        return named(people.by_name(owner))
     if direction == "owner_owes" or people.is_owner_name(owner):
-        return people.by_address(row.get("sender_address"))
-    return people.by_name(owner) or people.by_address(row.get("sender_address"))
+        return addressed(people.by_address(sender))
+    by_name = people.by_name(owner)
+    return named(by_name) if by_name else addressed(people.by_address(sender))
 
 
 # --- reconcile -----------------------------------------------------------------------------
@@ -418,8 +447,10 @@ def _stamp(conn: sqlite3.Connection, table: str, people: _People) -> list[dict]:
             values = {
                 "observed_at": row["observed"],
                 "item_hash": row["item_hash"],
-                "counterpart_person_id": _counterpart(table, row, people),
             }
+            values["counterpart_person_id"], values["counterpart_via"] = _counterpart(
+                table, row, people
+            )
             if table != "decisions":
                 deadline = row.get("deadline") if table == "action_items" else row.get("due")
                 values["due_date"] = resolve_due(deadline, _seen_day(row["observed"]))

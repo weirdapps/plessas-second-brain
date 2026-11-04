@@ -5,6 +5,11 @@ request sent twice in two threads, or a decision reported in two separate mails,
 current items. Schema v42 gives each item its counterpart (ledger.py
 counterpart_person_id) and a hash of its normalised text, which make that case a rule:
 
+- Only items whose counterpart a hard identifier found (ledger counterpart_via 'address':
+  the parent email's From address, or a commitment party with that address), as the
+  owner decided for people in issue 170. A counterpart matched by name alone keeps its
+  counterpart_person_id for display and is never consolidated; such pairs are counted as
+  name_only_candidates and left alone.
 - Items of one kind (decision, action, commitment), current (consolidate.current_sql), with
   the same item_hash, the same ledger status (an open action never joins a done one) and
   the same counterpart entity are one item when they fall within ENTITY_WINDOW_DAYS of
@@ -47,13 +52,17 @@ def _day(value: str | None) -> date | None:
         return None
 
 
-def _items(conn: sqlite3.Connection, table: str, since: int) -> list[dict]:
-    """The current items of `table` with a counterpart, each with its entity key, parent,
-    status, date and whether the owner sent it; only hashes some item past `since` holds."""
+def _items(conn: sqlite3.Connection, table: str, since: int, via: str = "address") -> list[dict]:
+    """The current items of `table` whose counterpart was found `via` ('address', a hard
+    identifier, or 'name'), each with its entity key, parent, status, date and whether the
+    owner sent it; only hashes some item past `since` holds. None on a store whose rows
+    say nothing of how their counterpart was found."""
     from src import config
     from src.store import consolidate
     from src.store.owner import is_owner_address
 
+    if "counterpart_via" not in ledger._columns(conn, table):
+        return []
     sender = (
         "(SELECT e.sender_address FROM emails e WHERE e.id = x.email_id)"
         if "email_id" in ledger._columns(conn, table)
@@ -66,12 +75,12 @@ def _items(conn: sqlite3.Connection, table: str, since: int) -> list[dict]:
         f" COALESCE((SELECT 'e' || a.entity_id FROM entity_aliases a WHERE a.kind = 'person'"
         f" AND a.value = CAST(x.counterpart_person_id AS TEXT)),"
         f" 'p' || x.counterpart_person_id) AS entity, {sender} AS sender_address"
-        f" FROM {table} x WHERE x.counterpart_person_id IS NOT NULL AND x.item_hash IS NOT NULL"
+        f" FROM {table} x WHERE x.counterpart_via = ? AND x.item_hash IS NOT NULL"
         f" AND {consolidate.current_sql(conn, 'x', table)} AND x.item_hash IN (SELECT y.item_hash FROM {table} y"
-        f" WHERE y.id > ? AND y.counterpart_person_id IS NOT NULL)"
+        f" WHERE y.id > ? AND y.counterpart_via = ?)"
         f" ORDER BY x.observed_at, x.id"
     )
-    cur = conn.execute(sql, (since,))
+    cur = conn.execute(sql, (via, since, via))
     names = [d[0] for d in cur.description]
     items = [dict(zip(names, r, strict=True)) for r in cur.fetchall()]
     for item in items:
@@ -134,7 +143,7 @@ def run(conn: sqlite3.Connection, since: dict[str, int] | None) -> dict:
     if not ledger.enabled(conn):
         return {"enabled": False}
     run_id = f"entity-{uuid.uuid4().hex[:12]}"
-    labels = 0
+    labels = candidates = 0
     by_table: dict[str, int] = {}
     for table in ledger.TABLES:
         mark = (since or {}).get(table, 0)
@@ -143,7 +152,16 @@ def run(conn: sqlite3.Connection, since: dict[str, int] | None) -> dict:
             _label(conn, table, item, target, run_id)
         by_table[table] = len(pairs)
         labels += len(pairs)
-    return {"enabled": True, "run_id": run_id, "labels": labels, "by_table": by_table}
+        # The same rule on counterparts matched by name alone: counted for review, never
+        # written (issue 170).
+        candidates += len(_plan(_items(conn, table, mark, via="name"), mark))
+    return {
+        "enabled": True,
+        "run_id": run_id,
+        "labels": labels,
+        "by_table": by_table,
+        "name_only_candidates": candidates,
+    }
 
 
 def _max_ids(conn: sqlite3.Connection) -> dict[str, int]:
@@ -200,6 +218,10 @@ def cmd_consolidate_entities(args) -> int:
         else:
             conn.rollback()
             print(f"dry run: {result['labels']} labels ({detail}); --apply writes them")
+        print(
+            f"{result['name_only_candidates']} more pairs match on a name alone: never"
+            " written (issue 170, hard identifiers only)"
+        )
     finally:
         conn.close()
     return 0

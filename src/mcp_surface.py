@@ -21,6 +21,7 @@ from typing import Annotated, Any, Literal, TypedDict, cast, get_args
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import ConfigDict, Field, with_config
 
+from src import mcp_scope
 from src import mcp_server as h
 from src.mcp_budget import budget_response
 from src.mcp_results import Result
@@ -108,8 +109,11 @@ def _take(tool: str, given: Filter | None, allowed: tuple[str, ...]) -> dict[str
 
 def _as_result(out: Any, key: str | None = None) -> Result:
     """`out` in the one envelope: its list `key` moved to `result` (and in `truncated`
-    too), held to the response budget."""
+    too), held to the response budget; `scope` named when the server has one."""
     out = dict(out)
+    allowed = mcp_scope.scope()
+    if allowed is not None:
+        out["scope"] = sorted(allowed)
     if key and key in out:
         out["result"] = out.pop(key)
         cut = out.get("truncated")
@@ -140,6 +144,7 @@ def recall(
     (default 365), kinds, include_news, include_automation, include_history. read(ref)
     opens any row.
     """
+    mcp_scope.refuse_mixed("recall")
     f = _take("recall", filter, ("days", "kinds", *_INCLUDES))
     return cast(
         Result,
@@ -218,6 +223,8 @@ def search(
         raise ToolError(
             f"search source={source} is keyword only; semantic is email or conversation"
         )
+    if source != "email":
+        mcp_scope.require(f"search source={source}", [source])
     words = query.strip()
     if source == "calendar":
         return _as_result(
@@ -235,6 +242,8 @@ def search(
         allowed = _SEMANTIC_KINDS if semantic else _EMAIL_KINDS
         if kinds and not set(kinds) <= allowed:
             raise ToolError(f"search source=email takes kinds {', '.join(sorted(allowed))}")
+        offered = [k for k in get_args(Kind) if k in allowed]
+        kinds = cast(Any, mcp_scope.narrow(kinds, offered))
         listing = any(f.get(k) for k in ("person", "topic", "since", "until"))
         includes = {
             "include_news": f.get("include_news", False),
@@ -374,6 +383,10 @@ def read(
     f = _take("read", filter, ("include_agents",))
     kind, key = _parse_ref(ref)
     if kind == "page":
+        mcp_scope.refuse_mixed("read of a compiled page")
+    else:
+        mcp_scope.require(f"read {kind}:{key}", [kind])
+    if kind == "page":
         found = _read_page(str(key))
         text = found["text"]
         if offset and offset >= len(text):
@@ -398,6 +411,10 @@ def read(
                 include_agents=f.get("include_agents", False),
             )
         )
+        # email, news and document share one table: a ref read as one may be another.
+        real = (out.get("item") or {}).get("kind")
+        if isinstance(real, str) and real != kind:
+            mcp_scope.require(f"read {kind}:{key} (a {real} row)", [real])
     if part is None:
         return _as_result(out)
     text_keys = ("text", "offset", "returned_chars", "total_chars", "next_offset")
@@ -442,6 +459,7 @@ def person_context(
     Read resolved_by, match_count and other_candidates before trusting a name match.
     Filter: days (default 365), include_news, include_automation, include_history.
     """
+    mcp_scope.refuse_mixed("person_context")
     f = _take("person_context", filter, _DOSSIER)
     return cast(
         Result,
@@ -477,6 +495,7 @@ def topic_context(
 
     Filter: days (default 365), include_news, include_automation, include_history.
     """
+    mcp_scope.refuse_mixed("topic_context")
     if detail == "page":
         _take("topic_context detail=page", filter, ())
         return cast(Result, h.topic_page(topic))
@@ -511,6 +530,7 @@ def meeting_prep(
 
     Filter: topic, days (default 365), include_news, include_automation, include_history.
     """
+    mcp_scope.refuse_mixed("meeting_prep")
     f = _take("meeting_prep", filter, ("topic", *_DOSSIER))
     return cast(
         Result,
@@ -566,6 +586,7 @@ def query_items(
     include_automation, include_history. Rows under `result`; stale gives
     `stale_threads` and `overdue_actions`.
     """
+    mcp_scope.refuse_mixed("query_items")
     f = _take(f"query_items kind={kind}", filter, _ITEM_FILTERS[kind])
     if status != "open" and kind != "actions":
         raise ToolError("query_items: status applies to kind=actions only")
@@ -634,6 +655,7 @@ def sql_query(
     is refused, and so is a query that reads or builds a value over 8 MiB: page long
     text with read.
     """
+    mcp_scope.refuse_mixed("sql_query")
     if sql is None:
         return cast(Result, h.sql_schema(table))
     if table is not None:
@@ -651,6 +673,7 @@ def sql_query(
     mime_type="application/json",
 )
 def status_resource() -> str:
+    mcp_scope.refuse_mixed("brain://status", resource=True)
     return json.dumps(h.stats(), ensure_ascii=False, default=str)
 
 
@@ -661,6 +684,7 @@ def status_resource() -> str:
     mime_type="application/json",
 )
 def schema_resource() -> str:
+    mcp_scope.refuse_mixed("brain://schema", resource=True)
     return json.dumps(h.sql_schema(None), ensure_ascii=False, default=str)
 
 
@@ -671,6 +695,7 @@ def schema_resource() -> str:
     mime_type="application/json",
 )
 def table_resource(table: str) -> str:
+    mcp_scope.refuse_mixed("brain://schema/{table}", resource=True)
     try:
         return json.dumps(h.sql_schema(table), ensure_ascii=False, default=str)
     except ToolError as exc:

@@ -57,9 +57,23 @@ def _guide_text(guide: str) -> str:
 def test_no_guide_calls_a_cut_tool(guide):
     text = _guide_text(guide)
     for name in GONE:
-        assert not re.search(rf"`{name}`|mcp__second-brain__{name}\b|brain tool {name}\b", text), (
-            f"{guide} names {name}; it is {GONE[name]} now"
-        )
+        assert not re.search(
+            rf"`{name}`|`{name}\(|mcp__second-brain__{name}\b|brain tool {name}\b", text
+        ), f"{guide} names {name}; it is {GONE[name]} now"
+
+
+@pytest.mark.parametrize("tool", sorted(listed_tools()))
+def test_no_tool_description_points_at_a_cut_tool(tool):
+    """A description loads with its tool: one naming get_item sent a client to nothing."""
+    from tests.mcp_listing import advertised_text
+
+    text = advertised_text(tool)
+    # Two removed names live on as result keys: query_items' stale_threads list and
+    # topic_context's topic_page.
+    for key in ("`stale_threads`", "`topic_page`"):
+        text = text.replace(key, "")
+    for name in GONE:
+        assert not re.search(rf"\b{name}\b", text), f"{tool} names {name}; it is {GONE[name]}"
 
 
 def test_every_filter_key_is_described():

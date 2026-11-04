@@ -102,6 +102,10 @@ def test_a_later_numbered_migration_runs_with_the_gated_ones_waiting_and_they_ap
 def test_applying_again_changes_nothing(tmp_path):
     db = _store(tmp_path / "brain.db", gated=True)
     before = ledger.counts(db)
+    # A new store leaves the owner's step (vectors, issue 171) to the owner; once taken, a
+    # second run applies nothing.
+    assert apply_gated(db, owner=False) == []
+    assert apply_gated(db) == ["vectors"]
     assert apply_gated(db) == []
     run_migrations(db, gated=True)
     assert ledger.counts(db) == before
@@ -116,9 +120,16 @@ def test_a_store_stamped_43_by_the_numbered_build_is_renumbered(tmp_path):
     run_migrations(db)
 
     assert get_schema_version(db) == CURRENT_SCHEMA_VERSION
-    # The two steps that build held are recorded; thread_identity (issue 179) and
-    # person_identity (issue 170) and topic_registry (issue 180) came after it.
-    assert pending_gated(db) == ["thread_identity", "person_identity", "topic_registry"]
+    # The two steps that build held are recorded; thread_identity (issue 179),
+    # person_identity (issue 170), vectors (issue 171) and extraction_item_kind (issue 211)
+    # and topic_registry (issue 180) came after it.
+    assert pending_gated(db) == [
+        "thread_identity",
+        "person_identity",
+        "vectors",
+        "extraction_item_kind",
+        "topic_registry",
+    ]
     db.close()
 
 

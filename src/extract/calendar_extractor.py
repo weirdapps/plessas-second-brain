@@ -10,12 +10,20 @@ its agenda and who is expected, and nothing decided. Only a single meeting alrea
 over is asked for decisions and action items, and only from notes or minutes of it.
 """
 
+import dataclasses
 import hashlib
 import json
 import re
 from datetime import UTC, datetime
 
-from src.extract.claude_extract import _response_text, complete
+from src.extract.call_shape import (
+    ROUTES,
+    Request,
+    max_tokens_attempts,
+    system_blocks,
+    v2_route,
+)
+from src.extract.claude_extract import _response_text, complete, refusal_error
 from src.extract.html_text import html_to_text, looks_like_html
 from src.extract.untrusted import fence
 from src.redact import PROMPT_RULE, redact_secrets
@@ -300,6 +308,130 @@ def _prompt_parts(event: dict, body: str | None) -> tuple[bool, str, str | None]
     return invitation, template, _invite_text(event, body, invitation)
 
 
+# Call shapes v2 and v2-text (issue 211). The instructions are the templates above with
+# the event moved out, into the user turn, so a prompt edit reaches both shapes; then a
+# worked example of the same answer shape, cached at the last block. Each answer shape
+# has its own schema, sent as structured output under v2, stated in the system prompt
+# under v2-text.
+_EVENT_PLACE = "The event is in the user turn, between the tags."
+RESTATE = "Extract from the calendar event above, as the system prompt instructs."
+
+_EXAMPLE_INVITATION = """Event subject: Monthly cards steering committee
+Organizer: Eleni Pappa
+Attendees: Nikos Antoniou, Maria Kostaki, Daniel Reed
+
+Event body/description:
+Μηνιαία επιτροπή καρτών.
+Ατζέντα: 1) πορεία έκδοσης νέων πιστωτικών, 2) καμπάνια cashback άνοιξης, 3) κατάσταση UAT του wallet.
+Ο Νίκος θα παρουσιάσει τα στοιχεία του μήνα. Διαβάστε το συνημμένο πριν τη συνάντηση."""
+
+_EXAMPLE_MEETING = """Event subject: Wallet go-live review
+Organizer: Daniel Reed
+Attendees: Sofia Marin, Eleni Pappa
+Date: 2026-04-27T09:00:00Z
+
+Event body/description:
+Notes of the review, 27 April.
+- UAT closed with two minor defects, both fixed.
+- Agreed: go-live on 30 April at 06:00, with the vendor on call.
+- Sofia to send the go-live note to the branches by 29 April.
+- Next quarter we may look into adding loyalty points (no decision)."""
+
+EXAMPLE_ANSWERS: dict[bool, list[dict]] = {
+    True: [
+        {
+            "purpose": "Η μηνιαία επιτροπή καρτών παρακολουθεί την πορεία των καρτών",
+            "agenda": [
+                "πορεία έκδοσης νέων πιστωτικών",
+                "καμπάνια cashback άνοιξης",
+                "κατάσταση UAT του wallet",
+            ],
+            "expected": "Ο Νίκος Αντωνίου παρουσιάζει τα στοιχεία του μήνα· όλοι διαβάζουν το συνημμένο",
+        }
+    ],
+    False: [
+        {
+            "body_summary": (
+                "The review closed UAT with its two minor defects fixed and set the wallet"
+                " go-live for 30 April at 06:00."
+            ),
+            "decisions": [
+                {
+                    "evidence": "Agreed: go-live on 30 April at 06:00, with the vendor on call.",
+                    "decision": "Wallet go-live on 30 April at 06:00, with the vendor on call",
+                    "decided_by": "Daniel Reed",
+                    "decision_date": "2026-04-27",
+                }
+            ],
+            "action_items": [
+                {
+                    "evidence": "Sofia to send the go-live note to the branches by 29 April.",
+                    "task": "Send the go-live note to the branches",
+                    "owner": "Sofia Marin",
+                    "deadline": "2026-04-29",
+                }
+            ],
+        }
+    ],
+}
+
+_EXAMPLE_WHY = {
+    True: (
+        "An invitation records what the meeting is for. The agenda items and the request"
+        " to read the attachment are not decisions or actions, and an invitation gives"
+        " none."
+    ),
+    False: (
+        "The notes record the go-live as agreed, so it is a decision, and the note to the"
+        " branches as a task with an owner and a day. Loyalty points are a topic for later"
+        " with no choice made: neither. Each item starts with the sentence of the notes it"
+        " rests on, copied exactly."
+    ),
+}
+
+
+def _example_text(invitation: bool) -> str:
+    item = _EXAMPLE_INVITATION if invitation else _EXAMPLE_MEETING
+    shown = "\n\n".join(
+        json.dumps(answer, ensure_ascii=False, indent=2) for answer in EXAMPLE_ANSWERS[invitation]
+    )
+    return (
+        "WORKED EXAMPLE\n"
+        "The example below shows what a good answer looks like: the event as it would"
+        " appear between the tags, then the answer, then why. Its people are fictional.\n\n"
+        f"{item}\n\nAnswer:\n{shown}\n\nWhy: {_EXAMPLE_WHY[invitation]}"
+    )
+
+
+EXAMPLES: dict[bool, str] = {True: _example_text(True), False: _example_text(False)}
+
+_EVIDENCE_RULE = (
+    "\nStart each decision and action item with `evidence`: the sentence of the text it"
+    " rests on, copied exactly."
+)
+
+
+def _instructions(invitation: bool) -> str:
+    """A template's instructions without the event: the text v1 sends around it, so an
+    edit of the template reaches v2 too."""
+    template = _INVITATION_TEMPLATE if invitation else _PROMPT_TEMPLATE
+    text = template.replace("{invite}", _EVENT_PLACE).replace("{{", "{").replace("}}", "}")
+    return text if invitation else text + _EVIDENCE_RULE
+
+
+def _request(invitation: bool, invite: str) -> Request:
+    """The event's call in shape v2 or v2-text, its route given the answer shape's schema."""
+    from src.extract.schema_v2 import CALENDAR_INVITATION_SCHEMA_V2, CALENDAR_MEETING_SCHEMA_V2
+
+    schema = CALENDAR_INVITATION_SCHEMA_V2 if invitation else CALENDAR_MEETING_SCHEMA_V2
+    return Request(
+        route=dataclasses.replace(ROUTES["calendar"], schema=schema),
+        system=tuple(system_blocks(_instructions(invitation), EXAMPLES[invitation])),
+        user=f"{fence(invite)}\n\n{RESTATE}",
+        source=invite,
+    )
+
+
 def event_prompt_hash(event: dict, body: str | None) -> str | None:
     """sha256 of what the model would read for this event: the invite and the prompt
     around it. The fence tag is random per call, so it is left out. None when the
@@ -310,10 +442,25 @@ def event_prompt_hash(event: dict, body: str | None) -> str | None:
     hash then means the extraction on record still stands. The occurrences of a
     series share it while their invitation does, and a meeting changes it once it
     is over, when it is read as a meeting."""
-    _, template, invite = _prompt_parts(event, body)
+    invitation, template, invite = _prompt_parts(event, body)
     if invite is None:
         return None
-    return hashlib.sha256(f"{template}\x00{invite}".encode()).hexdigest()
+    if not v2_route("calendar"):
+        return hashlib.sha256(f"{template}\x00{invite}".encode()).hexdigest()
+    # v2 and v2-text: the system blocks as sent and the schema when it goes as structured
+    # output, the same for every occurrence of a series; the fenced user turn without its
+    # tag, which is drawn per call; never the effort, which the model does not read.
+    request = _request(invitation, invite)
+    fixed = json.dumps(
+        {
+            "system": request.blocks,
+            "format": request.kwargs(0)["output_config"].get("format"),
+            "restate": RESTATE,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(f"{fixed}\x00{invite}".encode()).hexdigest()
 
 
 def extract_event(event: dict, body: str | None = None) -> dict:
@@ -333,6 +480,8 @@ def extract_event(event: dict, body: str | None = None) -> dict:
     # No text to read: an empty result, no LLM call
     if invite is None:
         return {"body_summary": "", "decisions": [], "action_items": []}
+    if v2_route("calendar"):
+        return _extract_event_v2(invitation, invite)
 
     # Whoever sent the invite wrote all of it, the subject included.
     prompt = template.format(invite=fence(invite))
@@ -355,3 +504,35 @@ def extract_event(event: dict, body: str | None = None) -> dict:
             "action_items": [],
         }
     return parse_extraction_response(raw_text)
+
+
+def _extract_event_v2(invitation: bool, invite: str) -> dict:
+    """extract_event in call shape v2 or v2-text: the cached system prompt of the event's
+    answer shape, the fenced event, a pinned effort, once more at twice the budget after a
+    max_tokens stop. Each decision and action item of a past meeting is marked
+    `evidence_found`: whether its quote is in the event's text. Raises ExtractionRefused
+    for a refusal and ValueError for a reply still cut short or holding no JSON object."""
+    from src.extract.parser import _check_evidence
+
+    request = _request(invitation, invite)
+    for max_tokens in max_tokens_attempts(request.route):
+        response = complete(**request.kwargs(max_tokens))
+        if getattr(response, "stop_reason", None) != "max_tokens":
+            break
+    stop = getattr(response, "stop_reason", None)
+    if stop == "refusal":
+        raise refusal_error(response)
+    if stop == "max_tokens":
+        raise ValueError(f"calendar extraction reply cut short at max_tokens={max_tokens}")
+    raw_text = _response_text(response)
+    if invitation:
+        return {
+            "body_summary": invitation_summary(_json_object(raw_text)),
+            "decisions": [],
+            "action_items": [],
+        }
+    result = parse_extraction_response(raw_text)
+    result["decisions"] = [d for d in result["decisions"] if isinstance(d, dict)]
+    result["action_items"] = [a for a in result["action_items"] if isinstance(a, dict)]
+    _check_evidence(result, request.source)
+    return result

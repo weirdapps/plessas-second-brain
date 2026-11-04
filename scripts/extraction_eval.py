@@ -38,10 +38,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.config import DEFAULT_DB  # noqa: E402
 from src.evals import connect_read_only, file_sha, inside_repo, text_sha  # noqa: E402
 from src.evals import extraction as ev  # noqa: E402
-from src.extract.call_shape import SHAPES, call_shape  # noqa: E402
+from src.extract.call_shape import (  # noqa: E402
+    EFFORTS,  # noqa: E402
+    SHAPES,
+    call_shape,
+)
 from src.extract.claude_extract import ClaudeNotConfigured  # noqa: E402
 
-EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+def _efforts(value: str) -> list[str]:
+    """--sweep's value: efforts separated by commas, each one of EFFORTS, none twice."""
+    efforts = [part.strip().lower() for part in value.split(",") if part.strip()]
+    wrong = [e for e in efforts if e not in EFFORTS]
+    if not efforts or wrong or len(set(efforts)) != len(efforts):
+        raise argparse.ArgumentTypeError(
+            f"{value!r}: give distinct efforts separated by commas, from {', '.join(EFFORTS)}"
+        )
+    return efforts
 
 
 def _synthetic_owner() -> tuple[str, str]:
@@ -229,6 +242,9 @@ def _run(args, files: ev.Files, cases: list[dict]) -> int:
         len(selected),
         args.reps,
     )
+    efforts = args.sweep or [args.effort]
+    if args.sweep:
+        print(f"  x {len(efforts)} efforts ({', '.join(efforts)}): one run each")
     if not _request_check(selected, args.call_shape):
         return 1
     if not args.yes:
@@ -236,12 +252,24 @@ def _run(args, files: ev.Files, cases: list[dict]) -> int:
         return 2
     if not _model_is_set():
         return 2
+    records = []
+    for effort in efforts:
+        records.append(_run_one(args, files, cases, selected, effort))
+    if args.sweep:
+        print("effort sweep, one run per effort (pass rate of applicable checks):")
+        for line in ev.sweep_table(records):
+            print(f"  {line}")
+    return 0
+
+
+def _run_one(args, files: ev.Files, cases: list[dict], selected: list[dict], effort) -> dict:
+    """One run at `effort` (None: each route's own), printed as it finishes."""
     record = ev.run(
         files,
         selected,
         reps=args.reps,
         workers=args.workers,
-        effort=args.effort,
+        effort=effort,
         judge=args.judge,
         set_sha=_set_sha(args, files, cases),
         aliases=_aliases(args, files),
@@ -265,7 +293,7 @@ def _run(args, files: ev.Files, cases: list[dict]) -> int:
     print(f"recorded in {files.results}; rows in {files.runs / (record['run_id'] + '.jsonl')}")
     if rows["errors"]:
         print(f"errors in {files.errors}")
-    return 0
+    return record
 
 
 def _calibrate(args, files: ev.Files, cases: list[dict]) -> int:
@@ -342,10 +370,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--force", action="store_true", help="let --build replace a set")
     parser.add_argument("--reps", type=int, default=2, help="extractions per case (default 2)")
     parser.add_argument("--workers", type=int, default=4, help="calls in flight (default 4)")
-    parser.add_argument(
+    effort = parser.add_mutually_exclusive_group()
+    effort.add_argument(
         "--effort",
         choices=EFFORTS,
-        help="send output_config.effort with every extraction: a sweep, since production sets none",
+        help="send output_config.effort with every extraction in place of the route's own"
+        " (src/extract/call_shape.py ROUTES)",
+    )
+    effort.add_argument(
+        "--sweep",
+        type=_efforts,
+        metavar="EFFORTS",
+        help="run once per effort, e.g. low,medium,high, and compare them (needs --run)",
     )
     parser.add_argument(
         "--case", action="append", default=[], metavar="ID", help="run only this case (repeatable)"

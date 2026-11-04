@@ -49,7 +49,7 @@ def store(tmp_path, monkeypatch):
             or (row[0], row[5], {"summary": "new summary", "language": "el"}, None, False)
         ),
     )
-    monkeypatch.setattr("src.store.embeddings.remove_vectors", lambda ids: len(ids))
+    monkeypatch.setattr("src.store.embeddings.remove_vectors", lambda ids, conn=None: len(ids))
     yield path, conn, tmp_path, summarised
     conn.close()
 

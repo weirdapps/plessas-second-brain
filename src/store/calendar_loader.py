@@ -128,6 +128,14 @@ def _resolve_person_id(conn: sqlite3.Connection, email: str) -> int | None:
     return row[0] if row else None
 
 
+def _evidence(item: dict) -> str | None:
+    """A v2 calendar item's quote (issue 211), masked, when the extractor found it in the
+    event's text; None for a paraphrase and for every v1 item, which has no quote."""
+    from src.store.loader import _evidence as quoted
+
+    return quoted(item, schema2=True)
+
+
 def load_event(
     conn: sqlite3.Connection,
     event: dict,
@@ -310,14 +318,15 @@ def load_event(
     for decision in extraction.get("decisions", []):
         conn.execute(
             """
-            INSERT INTO decisions (decision, decided_by, decision_date, event_id)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO decisions (decision, decided_by, decision_date, event_id, evidence)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
                 redact_secrets(decision.get("decision")),
                 decision.get("decided_by"),
                 _iso_date_or_none(decision.get("decision_date")),
                 event_id,
+                _evidence(decision),
             ),
         )
 
@@ -325,8 +334,8 @@ def load_event(
     for action in extraction.get("action_items", []):
         conn.execute(
             """
-            INSERT INTO action_items (task, owner, deadline, status, event_id)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO action_items (task, owner, deadline, status, event_id, evidence)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 redact_secrets(action.get("task")),
@@ -334,6 +343,7 @@ def load_event(
                 action.get("deadline"),
                 "open",
                 event_id,
+                _evidence(action),
             ),
         )
 

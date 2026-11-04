@@ -353,8 +353,9 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
     """
     import os
 
-    from src.extract.call_shape import thread_call
+    from src.extract.call_shape import thread_call, v2_route
     from src.extract.claude_extract import _response_text, complete
+    from src.extract.teams_prompt import cached_prompt
 
     # None lets complete() use the configured model, as every other call site
     # does. The old fallback skipped CLAUDE_EXTRACT_MODEL for a hardcoded 4.6
@@ -363,11 +364,17 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
     # Call shape v1: 2,048, and once more at 8,192 when the reply stops at max_tokens.
     # v2: 8,192 at a pinned effort, and once more at twice that (src/extract/call_shape.py).
     budgets, pinned = thread_call("teams", 2048)
+    system: str | list[dict] = system_prompt
+    if v2_route("teams"):
+        # v2 and v2-text, once BRAIN_EXTRACT_V2_ROUTES names the route: the instructions
+        # and the keys cached in the system prompt with worked examples (issue 211);
+        # otherwise the prompts go as built.
+        system, user_prompt = cached_prompt("teams", system_prompt, user_prompt)
     for max_tokens in budgets:
         resp = complete(
             model=model,
             max_tokens=max_tokens,
-            system=system_prompt,
+            system=system,
             messages=[{"role": "user", "content": user_prompt}],
             **pinned,
         )

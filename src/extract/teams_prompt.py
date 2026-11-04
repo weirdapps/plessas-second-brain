@@ -124,6 +124,30 @@ def with_commitments(system: str, user: str) -> tuple[str, str]:
     return f"{system} {COMMITMENT_RULE}", head + _COMMITMENTS_KEY + _KEY_FACTS_KEY + tail
 
 
+# Call shapes v2 and v2-text (issue 211): the JSON keys the user turn asked for move into
+# the system prompt, after the instructions, and worked examples follow, cached at the
+# last block. The keys are the same text for every thread, so the prompt is the same
+# bytes for every thread of a store; the user turn keeps the fenced thread and this line.
+_KEYS_MARK = "\n\nReturn JSON with these keys"
+RESTATE = "Extract from the thread above, as the system prompt instructs."
+
+
+def cached_prompt(route: str, system: str, user: str) -> tuple[list[dict], str]:
+    """A thread prompt built by build_prompt (and with_commitments, when asked) as v2 and
+    v2-text send it: system blocks, the instructions and the JSON keys then the route's
+    worked examples (src/extract/thread_examples.py), with one cache marker on the last;
+    and the user turn without the keys, ending with RESTATE. A user turn without the
+    keys is kept whole."""
+    from src.extract.call_shape import system_blocks
+    from src.extract.thread_examples import examples_text
+
+    thread, mark, keys = user.partition(_KEYS_MARK)
+    instructions = f"{system}{mark}{keys}".rstrip() if mark else system
+    commitments = '"commitments"' in keys
+    blocks = system_blocks(instructions, examples_text(route, commitments=commitments))
+    return blocks, f"{thread.rstrip()}\n\n{RESTATE}"
+
+
 def parse_response(text: str) -> dict:
     """Parse the LLM JSON response, with tolerance for code-fence wrappers."""
     s = text.strip()

@@ -201,17 +201,24 @@ def _call_llm(system_prompt: str, user_prompt: str) -> str:
     BRAIN_WHATSAPP_MODEL overrides the model; unset, complete() uses the
     configured one, as every other call site does.
     """
-    from src.extract.call_shape import thread_call
+    from src.extract.call_shape import thread_call, v2_route
     from src.extract.claude_extract import _response_text, complete
+    from src.extract.teams_prompt import cached_prompt
 
     # Call shape v1: 2,048, and once more at 8,192 when the reply stops at max_tokens.
     # v2: 8,192 at a pinned effort, and once more at twice that (src/extract/call_shape.py).
     budgets, pinned = thread_call("whatsapp", 2048)
+    system: str | list[dict] = system_prompt
+    if v2_route("whatsapp"):
+        # v2 and v2-text, once BRAIN_EXTRACT_V2_ROUTES names the route: the instructions
+        # and the keys cached in the system prompt with worked examples (issue 211);
+        # otherwise the prompts go as built.
+        system, user_prompt = cached_prompt("whatsapp", system_prompt, user_prompt)
     for max_tokens in budgets:
         resp = complete(
             model=os.environ.get("BRAIN_WHATSAPP_MODEL") or None,
             max_tokens=max_tokens,
-            system=system_prompt,
+            system=system,
             messages=[{"role": "user", "content": user_prompt}],
             **pinned,
         )

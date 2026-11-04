@@ -1952,3 +1952,12 @@ one pass, at the first job that writes. The versions that ask for a step:
     `DELETE FROM gated_migrations WHERE name = 'vectors'`. The npz is the index again,
     without the vectors written since the step: `python -m src.cli embed` adds back the
     emails, attachments and chunks, and the next teams-sync and whatsapp-sync theirs.
+- **Gated: `extraction_item_kind`** (issue 211, `src/store/extraction_fields.py`). Applied by
+  the same `--apply-gated` run, after the five above, with the same steps 1 to 5. ADD
+  COLUMN only: `emails.item_kind`, empty; the loader fills it from each v2 extraction it
+  loads or replaces afterwards, and history stays NULL (its kind is in the extraction files
+  under `data/extracted/`, for a backfill if wanted). On an APFS clone of the replica
+  (2026-11-04, schema 42, the three earlier gated steps already applied, before
+  `person_identity` and `vectors` existed) the dry run rolled back to no column, and the
+  applied step changed no row of the 55 tables besides its `gated_migrations` entry,
+  `integrity_check` ok, 3.4 s.

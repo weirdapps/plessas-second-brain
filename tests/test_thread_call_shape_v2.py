@@ -3,8 +3,9 @@
 Thinking counts toward max_tokens, and at 2,048 it cut 13% of Teams calls short; a
 thread cut short failed its parse and was sent again next run. v1 keeps the 2,048 calls as
 they were and asks once more at the route's budget after a max_tokens stop. v2 gives them 8,192, pins the effort, and asks once more at twice the budget
-after a max_tokens stop. Their prompts are unchanged, and too short to cache, so no
-schema and no cache marker are sent.
+after a max_tokens stop, with no schema; their system prompt is cached with worked
+examples only once BRAIN_EXTRACT_V2_ROUTES names the route (issue 211,
+tests/test_thread_cached_prompt.py).
 """
 
 from types import SimpleNamespace

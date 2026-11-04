@@ -8,6 +8,7 @@ data directory, unit or network (the one loopback test is marked as such).
 """
 
 import functools
+import http.client
 import importlib.util
 import json
 import os
@@ -941,12 +942,64 @@ def test_mcp_probe_fails_when_the_token_is_refused(hc, tmp_path):
     assert TOKEN not in json.dumps(r, default=str)
 
 
-def test_mcp_probe_fails_when_nothing_listens(hc, tmp_path):
+def test_mcp_probe_fails_when_nothing_listens(hc, tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(hc.time, "sleep", sleeps.append)
+
     class Refused:
+        calls = 0
+
         def open(self, request, timeout=None):
+            Refused.calls += 1
             raise urllib.error.URLError(ConnectionRefusedError(61, "Connection refused"))
 
     assert hc.check_mcp_stats(token_file=_token(tmp_path), opener=Refused())["status"] == "FAIL"
+    assert Refused.calls == 2  # one retry, then the failure stands
+    assert sleeps == [hc.MCP_PROBE_RETRY_SECONDS]
+
+
+class _DroppedOnce(_Server):
+    """A server the deploy restarts mid-probe: the first exchange is cut off mid-body
+    (IncompleteRead, which is not an OSError), the second is answered."""
+
+    def __init__(self, failures=1):
+        super().__init__()
+        self.failures = failures
+
+    def open(self, request, timeout=None):
+        if self.failures:
+            self.failures -= 1
+            raise http.client.IncompleteRead(b"")
+        return super().open(request, timeout)
+
+
+def test_mcp_probe_retries_once_when_a_restart_cuts_the_answer(hc, tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(hc.time, "sleep", sleeps.append)
+
+    r = hc.check_mcp_stats(token_file=_token(tmp_path), opener=_DroppedOnce())
+
+    assert r["status"] == "OK"
+    assert sleeps == [hc.MCP_PROBE_RETRY_SECONDS]
+
+
+def test_mcp_probe_reports_a_cut_answer_as_fail_not_a_crash(hc, tmp_path, monkeypatch):
+    monkeypatch.setattr(hc.time, "sleep", lambda _s: None)
+
+    r = hc.check_mcp_stats(token_file=_token(tmp_path), opener=_DroppedOnce(failures=2))
+
+    assert r["status"] == "FAIL"
+    assert "IncompleteRead" in r["note"]
+
+
+def test_mcp_probe_does_not_retry_a_refused_token(hc, tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(hc.time, "sleep", sleeps.append)
+
+    r = hc.check_mcp_stats(token_file=_token(tmp_path), opener=_Server(status=401))
+
+    assert r["status"] == "FAIL"
+    assert sleeps == []
 
 
 def test_mcp_probe_fails_on_a_token_file_others_can_read(hc, tmp_path):

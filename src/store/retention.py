@@ -493,7 +493,7 @@ def _npz_count(ids: set[int]) -> int:
     return int(gone.sum())
 
 
-def _files(conn: sqlite3.Connection, cutoff: str | None) -> list[Path]:
+def _files(conn: sqlite3.Connection, cutoff: str | None, staging: bool) -> list[Path]:
     """The files under the data home that held the chosen parents' content, and no kept
     row names. Read before the rows go."""
     from src import config
@@ -515,14 +515,28 @@ def _files(conn: sqlite3.Connection, cutoff: str | None) -> list[Path]:
         if key not in kept:
             out.append(att_root / key[0] / key[1])
     if "sharepoint_links" in _tables(conn):
+        # By name under the SharePoint directory, as attachments are matched: a stored path
+        # is the producer's spelling. A file a kept document's link names too stays.
         sp_root = Path(config.SHAREPOINT_DATA_DIR)
-        for (p,) in conn.execute(
-            "SELECT fetched_path FROM sharepoint_links WHERE fetched_path IS NOT NULL"
-            " AND document_message_id IN (SELECT message_id FROM emails"
+        gone_docs = (
+            "document_message_id IN (SELECT message_id FROM emails"
             " WHERE id IN (SELECT id FROM _f_emails))"
+        )
+        sp_kept = {
+            Path(p).name
+            for (p,) in conn.execute(
+                "SELECT fetched_path FROM sharepoint_links WHERE fetched_path IS NOT NULL"
+                f" AND (document_message_id IS NULL OR NOT {gone_docs})"
+            )
+        }
+        for (p,) in conn.execute(
+            f"SELECT fetched_path FROM sharepoint_links WHERE fetched_path IS NOT NULL AND {gone_docs}"
         ):
-            out.append(sp_root / Path(p).name if not Path(p).is_absolute() else Path(p))
-    if cutoff:
+            if Path(p).name not in sp_kept:
+                out.append(sp_root / Path(p).name)
+    if staging and cutoff:
+        # Staging holds mail, documents and conversations not yet loaded: only a forget of
+        # every source takes it, or a --source teams run would drop mail.
         limit = datetime.fromisoformat(cutoff).replace(tzinfo=UTC).timestamp()
         for root in (Path(config.DATA_ROOT) / "staging", Path(config.RAW_BATCH_DIR)):
             if root.is_dir():
@@ -593,7 +607,7 @@ def forget(
         _derive(conn)
         att_ids = [r[0] for r in conn.execute("SELECT id FROM _f_attachments")]
         vector_ids = _vector_ids(conn)
-        files = _files(conn, cutoff)
+        files = _files(conn, cutoff, staging=chosen == set(SOURCES))
         figures = _figure_counts(conn, att_ids)
         refs = _forgotten_refs(conn)
         result.tables = _delete_rows(conn)

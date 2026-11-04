@@ -315,6 +315,40 @@ def test_staging_batches_before_the_date_go(tmp_path, roots):
     assert not old.exists() and new.exists()
 
 
+def test_one_source_leaves_staging_alone(tmp_path, roots):
+    import os
+
+    conn = _store(tmp_path / "brain.db", vectors=False)
+    staging = roots / "staging"
+    staging.mkdir()
+    old = staging / "batch-00001.json"
+    old.write_text("{}")
+    os.utime(old, (1_700_000_000, 1_700_000_000))
+    result = retention.forget(conn, cutoff=CUTOFF, sources={"teams"}, apply=True)
+    assert result.files == 0 and old.exists()
+
+
+def test_sharepoint_copy_of_a_forgotten_document_goes(tmp_path, roots):
+    conn = _store(tmp_path / "brain.db", vectors=False)
+    _email(conn, roots, 1, OLD)
+    _email(conn, roots, 2, NEW)
+    sp = roots / "sharepoint"
+    sp.mkdir()
+    for name in ("old.docx", "new.docx"):
+        (sp / name).write_bytes(b"d")
+    for doc, name in (("M1", "old.docx"), ("M2", "new.docx")):
+        conn.execute(
+            "INSERT INTO sharepoint_links (url, message_id, fetched_path, document_message_id)"
+            " VALUES (?, 'G', ?, ?)",
+            (f"https://x/{name}", f"/producer/data/sharepoint/{name}", doc),
+        )
+    conn.commit()
+    retention.forget(conn, cutoff=CUTOFF, apply=True)
+    assert not (sp / "old.docx").exists() and (sp / "new.docx").exists()
+    # The link records stay: they keep the file from being fetched again.
+    assert conn.execute("SELECT COUNT(*) FROM sharepoint_links").fetchone()[0] == 2
+
+
 def test_topic_pages_citing_forgotten_items_go(tmp_path, roots):
     conn = _store(tmp_path / "brain.db", vectors=False)
     old = _email(conn, roots, 1, OLD)

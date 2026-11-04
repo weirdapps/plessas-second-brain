@@ -87,6 +87,7 @@ for _module in (
     "src.store.context",
     "src.store.conversation_query",
     "src.store.embeddings",
+    "src.store.extraction_fields",
     "src.store.figures",
     "src.store.findings",
     "src.store.greek",

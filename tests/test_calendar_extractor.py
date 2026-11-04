@@ -193,6 +193,8 @@ def test_extract_event_raises_diagnosably_on_a_thinking_only_response(monkeypatc
 
     from src.extract.calendar_extractor import extract_event
 
+    # v1's message; v2 asks once more and names the budget (test_calendar_call_shape_v2.py).
+    monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", "v1")
     _patch_llm(monkeypatch, _Response(_ThinkingBlock("..."), stop_reason="max_tokens"))
 
     with pytest.raises(ValueError, match="no text block"):

@@ -100,6 +100,30 @@ def build_prompt(thread: dict, messages: list[dict]) -> tuple[str, str]:
     return SYSTEM_PROMPT, user
 
 
+# Commitments (issue 168), asked of a thread only on a store that can hold them: schema
+# v43 (src/store/ledger.py), gated, so the prompts above go out unchanged until the owner
+# takes that step. Shared with the WhatsApp prompt.
+COMMITMENT_RULE = (
+    "Also write commitments, in the same language: a commitment is a promise a participant"
+    " makes to another in the thread ('I will send it by Friday'), with 'by' who made it"
+    " and 'to' who received it; a plan, a wish or a request is not one."
+)
+_COMMITMENTS_KEY = """  "commitments": [
+    {{"commitment": "<the promise>", "by": "<participant who made it or null>", "to": "<participant it was made to or null>", "due": "<ISO date or null>"}}
+  ],
+""".replace("{{", "{").replace("}}", "}")
+_KEY_FACTS_KEY = '  "key_facts": [\n'
+
+
+def with_commitments(system: str, user: str) -> tuple[str, str]:
+    """A thread prompt that also asks for commitments: the rule after the system prompt,
+    the key before key_facts in the JSON the user turn asks for."""
+    if _KEY_FACTS_KEY not in user:
+        raise ValueError("not a thread prompt: no key_facts key")
+    head, _, tail = user.rpartition(_KEY_FACTS_KEY)
+    return f"{system} {COMMITMENT_RULE}", head + _COMMITMENTS_KEY + _KEY_FACTS_KEY + tail
+
+
 def parse_response(text: str) -> dict:
     """Parse the LLM JSON response, with tolerance for code-fence wrappers."""
     s = text.strip()

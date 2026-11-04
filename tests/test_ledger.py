@@ -142,9 +142,9 @@ def test_the_migrations_jobs_run_stop_before_the_ledger(old):
     assert "item_hash" not in _columns(old, "action_items")
 
 
-def test_the_gated_step_takes_the_store_to_v42(old):
+def test_the_gated_steps_take_the_store_to_v43(old):
     run_migrations(old, gated=True)
-    assert get_schema_version(old) == config.CURRENT_SCHEMA_VERSION == 42
+    assert get_schema_version(old) == config.CURRENT_SCHEMA_VERSION == 43
     assert ledger.enabled(old)
     for table in ("decisions", "action_items", "commitments"):
         assert {"observed_at", "item_hash", "counterpart_person_id"} <= _columns(old, table)
@@ -153,9 +153,9 @@ def test_the_gated_step_takes_the_store_to_v42(old):
 
 
 def test_jobs_never_step_a_ledger_store_back(conn):
-    assert get_schema_version(conn) == 42
+    assert get_schema_version(conn) == 43
     run_migrations(conn)
-    assert get_schema_version(conn) == 42
+    assert get_schema_version(conn) == 43
 
 
 def test_a_new_store_has_the_ledger(conn):
@@ -446,7 +446,7 @@ def test_the_counterpart_of_an_action_owed_to_the_owner_is_its_owner(conn):
 # --- how the owner runs it, and where it runs after ----------------------------------------
 
 
-def test_maint_migrate_alone_stops_at_v41_and_with_ledger_takes_v42(
+def test_maint_migrate_alone_stops_at_v41_and_with_ledger_takes_the_gated_steps(
     tmp_path, owner, monkeypatch, capsys
 ):
     from tests.brain_cli import brain
@@ -463,10 +463,10 @@ def test_maint_migrate_alone_stops_at_v41_and_with_ledger_takes_v42(
     check.close()
 
     code, out, _ = brain(monkeypatch, capsys, "--db", str(path), "maint", "migrate", "--ledger")
-    assert code == 0 and "41 to 42" in out
+    assert code == 0 and "41 to 43" in out
     check = sqlite3.connect(path)
     check.row_factory = sqlite3.Row
-    assert get_schema_version(check) == 42
+    assert get_schema_version(check) == 43
     check.close()
 
 

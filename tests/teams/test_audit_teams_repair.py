@@ -182,7 +182,13 @@ def test_reset_empty_summaries_requeues_them_and_drops_their_facts(db):
     db.commit()
 
     dry = teams_repair.reset_empty_summaries(db, dry_run=True)
-    assert dry == {"threads": 1, "key_facts": 2, "decisions": 0, "action_items": 0}
+    assert dry == {
+        "threads": 1,
+        "key_facts": 2,
+        "decisions": 0,
+        "action_items": 0,
+        "commitments": 0,
+    }
     assert db.execute("SELECT COUNT(*) FROM key_facts").fetchone()[0] == 3
 
     done = teams_repair.reset_empty_summaries(db)
@@ -196,6 +202,7 @@ def test_reset_empty_summaries_requeues_them_and_drops_their_facts(db):
         "key_facts": 0,
         "decisions": 0,
         "action_items": 0,
+        "commitments": 0,
     }
 
 

@@ -532,6 +532,10 @@ def run_migrations(conn: sqlite3.Connection, gated: bool = False) -> None:
         from src.store.ledger import migrate as migrate_add_item_ledger
 
         migrate_add_item_ledger(conn)
+    if current < 43 and gated:
+        from src.store.ledger import migrate_commitment_parents
+
+        migrate_commitment_parents(conn)
 
     target = CURRENT_SCHEMA_VERSION if gated else AUTO_SCHEMA_VERSION
     if current < target:

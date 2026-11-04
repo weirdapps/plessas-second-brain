@@ -39,7 +39,7 @@ from src.extract.teams_threads import thread_participants
 # The prefix the old label gave every thread outside a channel.
 PLACEHOLDER_TITLE = "? / "
 # Item tables extraction writes per thread and deletes before it writes again.
-THREAD_ITEMS = ("decisions", "action_items", "key_facts")
+THREAD_ITEMS = ("decisions", "action_items", "commitments", "key_facts")
 
 
 def fill_participants(conn: sqlite3.Connection) -> dict:
@@ -150,6 +150,10 @@ def reset_empty_summaries(conn: sqlite3.Connection, *, dry_run: bool = False) ->
     marks = ",".join("?" * len(ids))
     try:
         for table in THREAD_ITEMS:
+            # commitments has teams_thread_id from v43 on (src/store/ledger.py).
+            if "teams_thread_id" not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
+                counts[table] = 0
+                continue
             counts[table] = (
                 conn.execute(
                     f"DELETE FROM {table} WHERE teams_thread_id IN ({marks})", ids

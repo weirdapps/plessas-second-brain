@@ -1926,3 +1926,26 @@ one pass, at the first job that writes. The versions that ask for a step:
     row of `person_merges` (rule, evidence, the row removed, every reference moved);
     `python -m src.cli maint people-unmerge ID` puts one back.
   - No step-wide revert: the backup of step 4 is the way back.
+- **Gated: `topic_registry`** (issue 180, `src/store/topic_registry.py`). Applied by the
+  same `--apply-gated` run, after the four above. It adds five empty tables and changes no
+  row: `canonical_topics` (a cluster's name, shown name, `named_by` `llm` or `rule`, head
+  topic), `topic_aliases` (every raw topic placed: its canonical, method `head`, `fold`,
+  `embedding` or `load`, score, fold key), and the topic links of chats and meetings,
+  `teams_thread_topics`, `whatsapp_thread_topics`, `event_topics`. On a copy of the
+  replica (2026-11-04) topics stayed 159,196 and `email_topics` 836,268. After it:
+
+  - Place the topics in batches, most used first, until `unplaced` reaches 0:
+    `python -m src.cli maint topic-registry --limit 5000` counts a batch,
+    `--apply` writes it, `--llm-calls N` lets the model name up to 40 clusters a call
+    (clusters of one folded form keep their most used name, no call). Names are
+    embedded once, at 256 dimensions in the store's model with the task `clustering`,
+    cached in `$BRAIN_DATA_DIR/topic_registry_vectors.npz`; a topic joins a canonical
+    by its folded words, else the nearest head at cosine 0.98 or more holding the same
+    numbers. On the copy: 3,000 topics in two batches gave 2,801 canonicals (132 fold,
+    67 embedding joins), 2 naming calls named 43; `competitor analysis` read 311 emails
+    before and 826 after, 13 of the 400 most used topics read more, none less.
+  - A topic the loader creates later joins a canonical by its folded words at once
+    (`load`); one with no match waits for the next batch.
+  - `topic_context` and every topic filter read the alias set beside the topic family,
+    and a query naming a canonical reads its head. To undo it, drop the five tables
+    and the `gated_migrations` row, or restore the backup of step 4.

@@ -3235,6 +3235,10 @@ def main():
     people_maint.add_maint_parsers(maint_subparsers)
     entities.add_maint_parser(maint_subparsers)
     topic_canon.add_maint_parser(maint_subparsers)
+    # topic-registry (src/store/topic_registry_maint.py, issue 180).
+    from src.store import topic_registry_maint
+
+    topic_registry_maint.add_maint_parser(maint_subparsers)
     # teams-repair, teams-empty-summaries (src/extract/teams_repair.py) and news-dedup
     # (src/export/news_export.py): maint-only.
     from src.export import news_export

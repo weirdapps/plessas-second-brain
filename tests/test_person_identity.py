@@ -75,9 +75,10 @@ def _roles(db, email_id):
 
 
 def test_the_step_is_named_and_last_and_waits_on_a_legacy_store():
-    assert GATED_MIGRATIONS[-1] == "person_identity"
+    # After the three before it; topic_registry (issue 180) came after.
+    assert GATED_MIGRATIONS.index("person_identity") == 3
     db = _legacy()
-    assert pending_gated(db) == ["person_identity"]
+    assert pending_gated(db)[0] == "person_identity"
     assert "person_identifiers" not in {
         r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }

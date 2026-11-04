@@ -8,7 +8,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
-from src.store import envelope
+from src.store import envelope, topic_registry
 from src.store.consolidate import current_sql, history_left_out, open_status_sql
 from src.store.directory import directory_card
 from src.store.entities import entity_person_ids
@@ -650,6 +650,9 @@ def get_topic_context(
         "family": family_names(conn, ids),
         "family_total": len(ids),
     }
+    canonical = topic_registry.canonical_name(conn, topic_id) if family else None
+    if canonical is not None:
+        topic_info["canonical"] = canonical
     family_ids = json.dumps(ids)
     # The emails tagged with any topic of the family, each once however many it carries.
     tagged = (

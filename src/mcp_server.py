@@ -99,6 +99,7 @@ for _module in (
     "src.store.thread_identity",
     "src.store.thread_rollups",
     "src.store.topic_pages",
+    "src.store.topic_registry",
     "src.store.whatsapp_query",
 ):
     importlib.import_module(_module)

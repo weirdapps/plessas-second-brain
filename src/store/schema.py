@@ -582,21 +582,29 @@ GATED_TABLE = """CREATE TABLE IF NOT EXISTS gated_migrations (
 
 
 def _gated_steps():
-    from src.store import ledger, person_identity, thread_identity
+    from src.store import ledger, person_identity, thread_identity, topic_registry
 
     # (name, function): the item ledger (v42 while numbered), then the parents a commitment
     # can have besides an email (v43), then the thread ids recomputed and the rollup table
     # (issue 179), then identities split from mentions with their identifiers, the enum
-    # header role and the merge log (issue 170).
+    # header role and the merge log (issue 170), then the canonical topics, their aliases
+    # and the topic links of chats and meetings (issue 180), empty until a batch fills them.
     return (
         ("item_ledger", ledger.migrate),
         ("commitment_parents", ledger.migrate_commitment_parents),
         ("thread_identity", thread_identity.migrate),
         ("person_identity", person_identity.migrate),
+        ("topic_registry", topic_registry.migrate),
     )
 
 
-GATED_MIGRATIONS = ("item_ledger", "commitment_parents", "thread_identity", "person_identity")
+GATED_MIGRATIONS = (
+    "item_ledger",
+    "commitment_parents",
+    "thread_identity",
+    "person_identity",
+    "topic_registry",
+)
 
 
 def _tables(conn: sqlite3.Connection) -> set[str]:

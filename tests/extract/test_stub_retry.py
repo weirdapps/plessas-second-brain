@@ -121,7 +121,9 @@ def test_a_stub_gets_its_extraction_in_place(store, model, tmp_path):
     roles = {
         r[0]
         for r in conn.execute(
-            "SELECT role_in_email FROM email_people WHERE email_id = ?", (email_id,)
+            # The model's words sit in role_text on a store with person_identity (issue 170).
+            "SELECT COALESCE(role_text, role_in_email) FROM email_people WHERE email_id = ?",
+            (email_id,),
         )
     }
     assert {"sender", "recipient", "approver"} <= roles

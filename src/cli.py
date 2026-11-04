@@ -1566,18 +1566,23 @@ def cmd_migrate(args):
     backup = None
     if not dry_run:
         backup = _gated_backup(conn, getattr(args, "backup", None))
-    from src.store import thread_identity, vector_store
+    from src.store import person_identity, thread_identity, vector_store
 
-    def _counts():
-        return ledger.counts(conn) | thread_identity.counts(conn) | vector_store.counts(conn)
+    def counts():
+        return (
+            ledger.counts(conn)
+            | thread_identity.counts(conn)
+            | person_identity.counts(conn)
+            | vector_store.counts(conn)
+        )
 
-    counts_before = _counts()
+    counts_before = counts()
     if conn.in_transaction:
         conn.commit()
     conn.execute("BEGIN IMMEDIATE")
     try:
         applied = apply_gated(conn, backup)
-        counts_after = _counts()
+        counts_after = counts()
         if dry_run:
             conn.rollback()
         else:
@@ -1760,7 +1765,9 @@ def cmd_import_people(args):
             ).fetchall()
             for ar in alias_rows:
                 if normalize_name(ar[1]) == norm_alias:
-                    merge_person(conn, primary_id, ar[0])
+                    merge_person(
+                        conn, primary_id, ar[0], method="import", evidence=f"name:{norm_alias}"
+                    )
                     merged += 1
 
     conn.commit()
@@ -3227,6 +3234,10 @@ def main():
     from src.store import thread_maint
 
     thread_maint.add_maint_parsers(maint_subparsers)
+    # people-review, people-unmerge (src/store/people_maint.py, issue 170).
+    from src.store import people_maint
+
+    people_maint.add_maint_parsers(maint_subparsers)
     entities.add_maint_parser(maint_subparsers)
     topic_canon.add_maint_parser(maint_subparsers)
     # teams-repair, teams-empty-summaries (src/extract/teams_repair.py) and news-dedup

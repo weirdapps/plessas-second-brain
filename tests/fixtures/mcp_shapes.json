@@ -309,7 +309,8 @@
       "item.people": [
         "email",
         "name",
-        "role"
+        "role",
+        "role_text"
       ],
       "item.thread": [
         "date",

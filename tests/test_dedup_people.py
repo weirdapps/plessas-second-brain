@@ -1,4 +1,8 @@
-"""Tests for phase 7 of people dedup — transliterated / reversed name variants."""
+"""Tests for phase 7 of people dedup — transliterated / reversed name variants.
+
+The store has no gated person_identity: with it these name-only matches are queued for
+review instead (issue 170, tests/test_person_identity.py).
+"""
 
 from src.store.dedup_people import phase7_merge_transliterated_variants
 from src.store.schema import create_database
@@ -15,7 +19,7 @@ def _count(conn):
 
 class TestPhase7Transliteration:
     def test_merges_order_reversed_name(self):
-        conn = create_database(":memory:")
+        conn = create_database(":memory:", gated=False)
         _add_person(conn, "Παπαδόπουλος Νίκος")  # emailless
         _add_person(conn, "Νίκος Παπαδόπουλος", "n.papadopoulos@example.com")
         conn.commit()
@@ -29,7 +33,7 @@ class TestPhase7Transliteration:
         )
 
     def test_merges_cross_script_variant(self):
-        conn = create_database(":memory:")
+        conn = create_database(":memory:", gated=False)
         _add_person(conn, "Νίκος Παπαδόπουλος")  # emailless Greek
         _add_person(conn, "Nikos Papadopoulos", "dp@example.com")  # Latin with email
         conn.commit()
@@ -40,7 +44,7 @@ class TestPhase7Transliteration:
 
     def test_does_not_merge_different_emails(self):
         # Same name, two DIFFERENT emails = two real people. Must NOT merge.
-        conn = create_database(":memory:")
+        conn = create_database(":memory:", gated=False)
         _add_person(conn, "Maria Papadopoulou", "a@example.com")
         _add_person(conn, "Papadopoulou Maria", "b@example.com")
         conn.commit()
@@ -49,7 +53,7 @@ class TestPhase7Transliteration:
         assert _count(conn) == 2
 
     def test_skips_single_token_names(self):
-        conn = create_database(":memory:")
+        conn = create_database(":memory:", gated=False)
         _add_person(conn, "Νίκος")
         _add_person(conn, "Nikos")
         conn.commit()
@@ -58,7 +62,7 @@ class TestPhase7Transliteration:
         assert _count(conn) == 2
 
     def test_reassigns_email_people_references(self):
-        conn = create_database(":memory:")
+        conn = create_database(":memory:", gated=False)
         _add_person(conn, "Νίκος Παπαδόπουλος", "dp@example.com")  # will survive
         remove = _add_person(conn, "Παπαδόπουλος Νίκος")  # emailless, will be removed
         conn.execute(

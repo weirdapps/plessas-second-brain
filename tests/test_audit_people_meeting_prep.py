@@ -8,6 +8,7 @@ held the word, so an email tagged with two of them repeated each of its items
 """
 
 from src.store.normalizer import find_or_create_person, find_or_create_topic
+from src.store.person_identity import link_role
 from src.store.query import meeting_prep
 from src.store.schema import create_database
 
@@ -19,11 +20,11 @@ def _store():
         "INSERT INTO emails (message_id, date_received, subject, summary, sentiment) "
         "VALUES (1, '2026-09-20T10:00:00', 'cards plan', 's', 'informational')"
     ).lastrowid
-    for role in ("recipient", "FYI"):
-        conn.execute(
-            "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, ?)",
-            (email_id, pid, role),
-        )
+    conn.execute(
+        "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, 'recipient')",
+        (email_id, pid),
+    )
+    link_role(conn, email_id, pid, "FYI")  # the model's words: a 'mentioned' row (issue 170)
     conn.execute(
         "INSERT INTO decisions (email_id, decision, decision_date) "
         "VALUES (?, 'go ahead', '2026-09-20')",
@@ -47,7 +48,7 @@ def test_an_attendee_dossier_lists_each_item_once():
 
     dossier = result["attendees"][0]
     assert len(dossier["emails"]) == 1
-    assert dossier["emails"][0]["role"] in ("recipient", "FYI")
+    assert dossier["emails"][0]["role"] in ("recipient", "mentioned")
     assert dossier["sentiment_summary"] == {"informational": 1}
     assert len(dossier["decisions"]) == 1
     assert len(dossier["open_actions"]) == 1

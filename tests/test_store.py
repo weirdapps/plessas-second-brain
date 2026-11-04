@@ -652,7 +652,7 @@ class TestLoader:
         # Check specific roles
         cursor = conn.execute(
             """
-            SELECT p.name, ep.role_in_email
+            SELECT p.name, COALESCE(ep.role_text, ep.role_in_email)
             FROM email_people ep
             JOIN people p ON p.id = ep.person_id
             ORDER BY p.name, ep.role_in_email
@@ -660,7 +660,8 @@ class TestLoader:
         )
         roles = cursor.fetchall()
         assert any(r[0] == "John Doe" and r[1] == "decision-maker" for r in roles)
-        assert any(r[0] == "Jane Smith" and r[1] == "reviewer" for r in roles)
+        # Several of the model's words for one person in one email share a row (issue 170).
+        assert any(r[0] == "Jane Smith" and "reviewer" in r[1].split("; ") for r in roles)
 
         conn.close()
 

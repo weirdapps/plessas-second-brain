@@ -115,6 +115,13 @@ def owner_person_id(conn: sqlite3.Connection, by_address: Iterable[int]) -> int 
     name alone: a display name is anyone's to write, an address he lists is his. With no
     row at his addresses there is no owner row, and rows named as him are ordinary people.
     """
+    # The gated person_identity (issue 170) fixes the owner's id once, so a merge or a
+    # mail count can no longer move him to another row.
+    from src.store.person_identity import owner_id
+
+    fixed = owner_id(conn)
+    if fixed is not None and conn.execute("SELECT 1 FROM people WHERE id = ?", (fixed,)).fetchone():
+        return fixed
     ids = list(by_address)
     if not ids:
         return None

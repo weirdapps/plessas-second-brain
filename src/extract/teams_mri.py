@@ -12,6 +12,7 @@ import sqlite3
 from datetime import UTC, datetime
 
 from src.export.teams_cli import TeamsCliAuthRequired, TeamsCliError, run_teams_cli
+from src.store import person_identity
 
 
 def resolve_mris(conn: sqlite3.Connection, max_per_run: int = 50) -> dict:
@@ -53,12 +54,19 @@ def resolve_mris(conn: sqlite3.Connection, max_per_run: int = 50) -> dict:
             display_name = payload.get("displayName") or display
 
             person_id = None
+            identities = person_identity.active(conn)
             if email:
-                pr = conn.execute(
-                    "SELECT id FROM people WHERE LOWER(email) = LOWER(?)", (email,)
-                ).fetchone()
-                if pr:
-                    person_id = pr["id"]
+                if identities:
+                    person_id = person_identity.person_by(conn, "address", email)
+                if person_id is None:
+                    pr = conn.execute(
+                        "SELECT id FROM people WHERE LOWER(email) = LOWER(?)", (email,)
+                    ).fetchone()
+                    if pr:
+                        person_id = pr["id"]
+            if identities and person_id is not None:
+                # The MRI is a hard identifier of the person (issue 170).
+                person_identity.record(conn, person_id, "mri", mri, "teams_mri_resolution")
 
             now = datetime.now(UTC).isoformat()
             conn.execute(

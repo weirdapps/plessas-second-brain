@@ -40,7 +40,7 @@ def conn():
         )
     # Α. appears on four emails, Μαρίνα on one: Α. is the likelier Παπαδοπούλου.
     c.executemany(
-        "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, 'to')",
+        "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, 'recipient')",
         [(1, 1), (2, 2), (3, 2), (4, 2), (5, 2), (1, 3)],
     )
     c.execute(
@@ -1074,7 +1074,7 @@ def test_both_person_plans_find_the_same_emails(conn, monkeypatch, dense_above, 
 
     assert [r["email_id"] for r in by_person] == [1, 13, 12]
     assert [r["email_id"] for r in combined] == [1, 13, 12]
-    assert {r["person_role"] for r in by_person} == {"to", "cc"}
+    assert {r["person_role"] for r in by_person} == {"recipient", "cc"}
 
 
 @pytest.mark.parametrize("name", ["%", "_", ".", "%%"])

@@ -40,7 +40,7 @@ def _email(conn, thread):
 def _link(conn, email_id, *person_ids):
     for pid in person_ids:
         conn.execute(
-            "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, 'to')",
+            "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, 'recipient')",
             (email_id, pid),
         )
 

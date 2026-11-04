@@ -223,7 +223,8 @@ def test_the_loader_finds_a_person_by_address_through_the_index(store):
     for sql in reads:
         plan = _plan(store, sql)
         assert "SCAN people" not in plan, (sql, plan)
-        assert "idx_people_email_lower" in plan, (sql, plan)
+        # The address as an identifier (gated person_identity, issue 170), then as a column.
+        assert "idx_people_email_lower" in plan or "idx_person_identifiers" in plan, (sql, plan)
 
 
 def test_the_loader_finds_a_person_by_name_through_the_index(store):

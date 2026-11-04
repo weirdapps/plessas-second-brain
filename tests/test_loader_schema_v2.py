@@ -13,6 +13,7 @@ extraction file on disk.
 import pytest
 
 from src.store.loader import load_single_email, replace_extraction
+from src.store.person_identity import ROLE_TEXT_SEPARATOR
 from src.store.schema import create_database
 
 
@@ -76,14 +77,17 @@ def conn():
 
 
 def _people(conn, role=None):
+    """(name, address, role) per link; a person the model named (role 'mentioned', issue
+    170) once for each of its words in role_text."""
     sql = (
-        "SELECT p.name, p.email, ep.role_in_email FROM email_people ep"
+        "SELECT p.name, p.email, ep.role_in_email, ep.role_text FROM email_people ep"
         " JOIN people p ON p.id = ep.person_id"
     )
-    rows = conn.execute(sql).fetchall()
-    return sorted(
-        (tuple(r) for r in rows if role is None or r[2] == role), key=lambda r: (r[0], r[2])
-    )
+    rows = []
+    for name, email, enum, text in conn.execute(sql).fetchall():
+        for word in text.split(ROLE_TEXT_SEPARATOR) if text else [enum]:
+            rows.append((name, email, word))
+    return sorted((r for r in rows if role is None or r[2] == role), key=lambda r: (r[0], r[2]))
 
 
 def _rows(conn, sql):

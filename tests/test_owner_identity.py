@@ -23,7 +23,7 @@ def _person(conn, name, email, links):
             (n, n),
         )
         conn.execute(
-            "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, 'to')",
+            "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, 'recipient')",
             (n, pid),
         )
     return pid

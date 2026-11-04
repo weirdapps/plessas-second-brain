@@ -69,7 +69,10 @@ def _document(
     ).lastrowid
     person = db.execute("INSERT INTO people (name) VALUES (?)", (f"p{message_id}",)).lastrowid
     db.execute("INSERT INTO email_topics (email_id, topic_id) VALUES (?, ?)", (email_id, topic))
-    db.execute("INSERT INTO email_people (email_id, person_id) VALUES (?, ?)", (email_id, person))
+    db.execute(
+        "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, 'mentioned')",
+        (email_id, person),
+    )
     db.execute("INSERT INTO key_facts (email_id, fact) VALUES (?, 'a fact')", (email_id,))
     db.execute("INSERT INTO decisions (email_id, decision) VALUES (?, 'a decision')", (email_id,))
     db.execute("INSERT INTO action_items (email_id, task) VALUES (?, 'a task')", (email_id,))

@@ -379,3 +379,62 @@ tables 67, emails 79,264, last_sync_date 2026-09-09T01:42:10
 That second run is the one that answers the question this page exists for: can
 this machine, alone, turn an archive back into a working brain. Until the keys
 were copied it could not, and nothing said so.
+
+## Forgetting: `brain maint forget` (issue 174)
+
+Retention is manual only (owner decision, 2026-11-04): no automatic cutoff, no
+per-source TTL that deletes by itself, no timer. Nothing is forgotten until the
+owner runs it.
+
+```bash
+# Stop the writers first, the dry run included: the run holds the write lock
+# throughout (4.5 minutes for 33,084 emails on a copy of the store).
+systemctl --user stop 'sb-*.timer'
+brain maint forget --before 2025-01-01                 # dry run: counts, rolled back
+brain maint forget --before 2025-01-01 --source teams  # one source (repeatable)
+brain maint forget --before 2025-01-01 --apply --backup ~/brain-pre-forget.db
+brain maint forget --deleted-at-source                 # what the mailbox reports deleted
+systemctl --user start 'sb-*.timer'
+```
+
+`--before DATE` forgets each parent older than the day: an email received before
+it (mail, automation, news, documents, session notes), a Teams thread or WhatsApp
+session that ended before it (a thread that straddles the day stays whole), a
+calendar event and a Claude Code conversation that ended before it. With each go
+everything it left: attachments, their text, chunks and figures, decisions,
+actions, commitments, key facts and their labels and ledger entries, topic and
+people links, HTML, aliases, thread-id map rows, inline-image occurrences (and an
+image no row names any more), messages, turns, attendees, the topic pages that
+cite one of them, the full-text rows (delete triggers; each touched index is
+merged on --apply, and deletes run with `secure_delete`), the vectors (the
+`vectors` table or `embeddings.npz`, whichever the store uses, chunks with their
+parent), and the files under the data home: attachment files no kept row names,
+fetched SharePoint copies of forgotten documents, and staging batches written
+before the day. `src/store/retention.py` lists every table as covered or kept on
+purpose, and a test fails when a new table is neither.
+
+`--deleted-at-source` takes the stored mail `mail-reconcile` recorded in Deleted
+Items or Junk Email, holding back the owner's own sent mail (a copy to himself:
+its Sent Items copy may still be in the mailbox). It also counts the Teams
+messages the service deleted; their text is blanked at sync, so the row left is
+empty and stays. Nothing is deleted at the source's word without this command.
+
+The dry run does every delete in one transaction and rolls it back, so its
+counts are the ones `--apply` produces. `--apply` needs `--backup PATH`, as
+`--apply-gated` does (a new file it writes with the online backup, or one under
+an hour old); on a store whose index is still `embeddings.npz` it copies the
+index beside the backup too. Attachment files are not in that backup.
+
+What a forget cannot reach, printed at the end of every run:
+
+| Copy | Until |
+| --- | --- |
+| Local snapshots (`--local-keep`, default 7) | they rotate out, or deleted by hand |
+| Offsite archives (GFS: 14 daily + 8 weekly) | they rotate out, or deleted by hand |
+| restic snapshots (store snapshots, `attachments/` when backed up) | `restic forget --prune` under the host's policy; history is never rewritten |
+| The `--backup` file of the run | deleted by the owner once the result is checked |
+| Replicas (`brain.db`, `embeddings.npz`) | their next hourly pull |
+| The sources (Outlook, Teams, WhatsApp, calendar, `~/.claude/projects`) | kept; a backfill reaching before the day loads them again |
+| Logs and the journal | not rewritten |
+| People, topics, entities; session-note and SharePoint link records | kept on purpose (names, and what stops a refetch) |
+| Free pages of `brain.db` | zeroed by `secure_delete`; the file shrinks at `VACUUM` |

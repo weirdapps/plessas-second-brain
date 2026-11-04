@@ -40,11 +40,11 @@ def test_a_tool_prints_the_answer_the_server_sends(store, monkeypatch, capsys):
     arguments = {"query": "okapi"}
 
     code, out, err = brain(
-        monkeypatch, capsys, "--db", str(store), "tool", "search_emails", json.dumps(arguments)
+        monkeypatch, capsys, "--db", str(store), "tool", "search", json.dumps(arguments)
     )
 
-    sent = registered_tool("search_emails").fn_metadata.convert_result(
-        mcp_server.search_emails(**arguments)
+    sent = registered_tool("search").fn_metadata.convert_result(
+        registered_tool("search").fn(**arguments)
     )
     assert (code, err) == (0, "")
     assert json.loads(out) == sent.structured_content
@@ -82,8 +82,8 @@ def test_the_answer_is_held_to_the_response_budget(store, monkeypatch, capsys):
         "--db",
         str(store),
         "tool",
-        "search_attachments",
-        '{"query": "okapi", "limit": 200}',
+        "search",
+        '{"query": "okapi", "source": "attachment", "limit": 200}',
     )
 
     answer = json.loads(out)
@@ -103,29 +103,27 @@ def test_an_unknown_tool_exits_2_and_names_the_tools(store, monkeypatch, capsys)
 
 
 def test_input_the_schema_rejects_exits_2_with_the_schema(store, monkeypatch, capsys):
-    code, out, err = brain(
-        monkeypatch, capsys, "--db", str(store), "tool", "email_thread", '{"email_id": "seven"}'
-    )
+    code, out, err = brain(monkeypatch, capsys, "--db", str(store), "tool", "read", '{"ref": 7}')
 
     assert (code, out) == (2, "")
-    assert "email_id" in err.splitlines()[0]
-    assert _schema_in(err) == listed_tools()["email_thread"].input_schema
+    assert "ref" in err.splitlines()[0]
+    assert _schema_in(err) == listed_tools()["read"].input_schema
 
 
 @pytest.mark.parametrize("raw", ["[1]", "not json", '"okapi"', "{"])
 def test_the_arguments_must_be_one_json_object(store, monkeypatch, capsys, raw):
-    code, out, err = brain(monkeypatch, capsys, "--db", str(store), "tool", "search_emails", raw)
+    code, out, err = brain(monkeypatch, capsys, "--db", str(store), "tool", "search", raw)
 
     assert (code, out) == (2, "")
-    assert _schema_in(err) == listed_tools()["search_emails"].input_schema
+    assert _schema_in(err) == listed_tools()["search"].input_schema
 
 
 def test_a_tool_that_refuses_exits_1_with_its_own_words(store, monkeypatch, capsys):
     """What the server sends a client as an error result, and nothing on stdout."""
-    code, out, err = brain(monkeypatch, capsys, "--db", str(store), "tool", "query_emails", "{}")
+    code, out, err = brain(monkeypatch, capsys, "--db", str(store), "tool", "search", "{}")
 
     assert (code, out) == (1, "")
-    assert "at least one filter" in err
+    assert "needs a query" in err
 
 
 def test_a_missing_store_exits_1_and_names_it(store, tmp_path, monkeypatch, capsys):

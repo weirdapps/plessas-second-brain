@@ -61,14 +61,16 @@ def test_matched_in_names_the_field_the_words_matched_and_source_stays(store):
 
 
 def test_the_thread_and_the_filters_list_rows_with_the_envelope(store):
-    thread = mcp_server.email_thread(email_id=1)["emails"]
+    thread = seeded_store.call("read", {"ref": "email:1"})["item"]["thread"]
     listed = mcp_server.query_emails(keyword="okapi")["result"]
 
-    for row in thread + listed:
+    for row in listed:
         assert ENVELOPE <= set(row), row
         assert row["ref"] == row["email_id"]
         assert "matched_in" not in row  # listed by filter, not matched
-    assert _by(thread, "email_id", 1)["who"] == seeded_store.ALICE
+    for row in thread:
+        assert {"kind", "ref", "date", "who"} <= set(row), row
+    assert _by(thread, "ref", 1)["who"] == seeded_store.ALICE
 
 
 # -------------------------------------------------------------- other kinds
@@ -221,12 +223,6 @@ def test_a_persons_teams_and_whatsapp_threads_carry_the_envelope(store):
     whatsapp = person["whatsapp"]["recent_threads"][0]
     assert (teams["kind"], teams["ref"]) == ("teams", 1)
     assert (whatsapp["kind"], whatsapp["ref"]) == ("whatsapp", 1)
-
-
-def test_a_chats_threads_carry_the_envelope(store):
-    thread = mcp_server.teams_chat_summary(chat_id=1, days=3650)["threads"][0]
-
-    assert (thread["kind"], thread["ref"], thread["who"]) == ("teams", 1, "Bob Jones")
 
 
 # ----------------------------------------------------------------- semantic rows

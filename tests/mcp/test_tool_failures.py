@@ -40,11 +40,11 @@ def test_a_crash_in_a_store_function_says_what_and_what_next(store, monkeypatch)
 
     monkeypatch.setattr("src.store.query.query_by_keyword", boom)
 
-    error = _failure("search_emails", {"query": "okapi"})
+    error = _failure("search", {"query": "okapi"})
 
     assert not isinstance(error, UnexpectedToolError)
     text = str(error)
-    assert text.startswith("Error executing tool search_emails: ")
+    assert text.startswith("Error executing tool search: ")
     assert "RuntimeError: the index is on fire" in text
     assert "not an empty answer" in text
     assert "Retry" in text
@@ -59,7 +59,7 @@ def test_code_changed_under_a_running_server_says_to_restart_it(store, monkeypat
 
     monkeypatch.setattr("src.store.query.search_attachments", stale)
 
-    text = str(_failure("search_attachments", {"query": "okapi"}))
+    text = str(_failure("search", {"query": "okapi", "source": "attachment"}))
 
     assert "ImportError: cannot import name 'query_stem'" in text
     assert "restart" in text.lower()
@@ -70,7 +70,7 @@ def test_a_result_that_breaks_the_output_schema_names_the_field(store, monkeypat
     catch, and failed as a bare error too."""
     monkeypatch.setattr(mcp_server, "_header", lambda conn: {})
 
-    text = str(_failure("query_decisions", {}))
+    text = str(_failure("query_items", {"kind": "decisions"}))
 
     assert "data_as_of" in text
     assert "output schema" in text
@@ -97,7 +97,7 @@ def test_a_live_search_without_a_session_says_to_sign_in(store, monkeypatch):
     text = str(_failure("outlook_live_search", {}))
 
     assert "sign" in text.lower()
-    assert "search_emails" in text
+    assert "search and recall" in text
 
 
 @pytest.mark.parametrize("name", sorted(seeded_store.CALLS))
@@ -125,7 +125,9 @@ def test_brain_tool_prints_the_same_words(store, monkeypatch, capsys):
     monkeypatch.setattr(cli, "install_llm_deadline_for_this_process", lambda: None)
     monkeypatch.setattr(mcp_server, "_header", lambda conn: {})
 
-    code, out, err = brain(monkeypatch, capsys, "--db", str(store), "tool", "query_decisions")
+    code, out, err = brain(
+        monkeypatch, capsys, "--db", str(store), "tool", "query_items", '{"kind": "decisions"}'
+    )
 
     assert (code, out) == (1, "")
     assert "data_as_of" in err

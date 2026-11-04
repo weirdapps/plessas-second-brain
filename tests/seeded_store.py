@@ -8,6 +8,7 @@ Every value is invented: example.com addresses, WhatsApp numbers from the
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from src.store.schema import create_database
 
@@ -167,36 +168,28 @@ def build(path: Path, *, synced: str | None = None) -> Path:
 
 
 # One call per tool, each finding something in the store above.
-CALLS = {
+# One sample call per tool a client lists (src/mcp_surface.py).
+CALLS: dict[str, dict[str, Any]] = {
+    "recall": {"query": "okapi", "include_context": True},
+    "search": {"query": "okapi"},
+    "read": {"ref": "email:1"},
     "person_context": {"name_or_email": "alice@example.com"},
     "topic_context": {"topic": "okapi"},
-    "topic_page": {"topic": "okapi"},
-    "sender_brief": {"name_or_email": "alice@example.com"},
-    "email_thread": {"email_id": 1},
-    "search_emails": {"query": "okapi"},
-    "recall": {"query": "okapi", "include_context": True},
-    "query_emails": {"keyword": "okapi"},
-    "query_decisions": {},
-    "query_actions": {},
-    "stale_threads": {},
-    "meeting_prep": {"people": "alice@example.com", "topic": "okapi"},
-    "search_attachments": {"query": "okapi"},
+    "meeting_prep": {"people": "alice@example.com", "filter": {"topic": "okapi"}},
+    "query_items": {"kind": "decisions"},
     "figures": {"query": "okapi"},
-    "query_calendar_events": {"keyword": "okapi"},
-    "stats": {},
-    "search_conversations": {"query": "okapi"},
-    "conversation_context": {"session_id": "s1"},
-    "sharepoint_index": {"operation": "list_stale"},
-    "attachment_image_search": {"query": "okapi"},
-    "outlook_live_search": {},
-    "search_teams": {"query": "okapi"},
-    "search_whatsapp": {"query": "okapi"},
-    "teams_thread_context": {"thread_id": 1},
-    "teams_chat_summary": {"chat_id": 1},
     "sql_query": {"sql": "SELECT id, subject FROM emails"},
-    "sql_schema": {"table": "emails"},
-    "get_item": {"kind": "email", "ref": 1},
+    "stats": {},
+    "outlook_live_search": {},
+    "sharepoint_index": {"operation": "list_stale"},
 }
+
+
+def call(name: str, arguments: dict | None = None):
+    """The tool `name` as tools/call runs it, with its sample arguments by default."""
+    from tests.mcp_listing import registered_tool
+
+    return registered_tool(name).fn(**(CALLS[name] if arguments is None else arguments))
 
 
 def serve(path: Path, monkeypatch) -> None:

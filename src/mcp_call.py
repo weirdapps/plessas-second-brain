@@ -162,7 +162,7 @@ def command(name: str | None, arguments: str | None, *, list_tools: bool, db) ->
             return 0
         print(
             "Error: name one tool and its arguments as JSON, as in "
-            'brain tool search_emails \'{"query": "budget"}\', or list them with '
+            'brain tool search \'{"query": "budget"}\', or list them with '
             "brain tool --list",
             file=sys.stderr,
         )

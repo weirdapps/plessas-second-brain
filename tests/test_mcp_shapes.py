@@ -22,7 +22,6 @@ from pathlib import Path
 
 import pytest
 
-from src import mcp_server
 from tests import seeded_store
 from tests.mcp_listing import listed_tools
 
@@ -74,10 +73,7 @@ def shapes(tmp_path_factory):
         seeded_store.serve(path, patch)
         patch.setattr(config, "USER_EMAIL_PATTERN", "")
         patch.setattr(query, "USER_EMAIL_PATTERN", "")
-        return {
-            name: _shape(name, getattr(mcp_server, name)(**seeded_store.CALLS[name]))
-            for name in sorted(seeded_store.CALLS)
-        }
+        return {name: _shape(name, seeded_store.call(name)) for name in sorted(seeded_store.CALLS)}
     finally:
         patch.undo()
 

@@ -258,10 +258,10 @@ def test_dry_run_alone_is_refused(old_path, monkeypatch, capsys):
 
 READS = [
     ("recall", {"query": "okapi"}),
-    ("query_actions", {}),
-    ("query_decisions", {}),
-    ("search_emails", {"query": "okapi"}),
-    ("stale_threads", {}),
+    ("query_items", {"kind": "actions"}),
+    ("query_items", {"kind": "decisions"}),
+    ("search", {"query": "okapi"}),
+    ("query_items", {"kind": "stale"}),
     ("person_context", {"name_or_email": ALICE[1]}),
     ("topic_context", {"topic": "okapi"}),
     ("stats", {}),
@@ -278,10 +278,13 @@ def test_readers_answer_the_same_on_either_store(tmp_path, monkeypatch, gated):
     answers = {}
     with mcp_call._serving(path):
         for name, arguments in READS:
-            answers[name] = mcp_call.call(name, arguments)
-    actions = answers["query_actions"]
+            answers[" ".join([name, arguments.get("kind", "")]).strip()] = mcp_call.call(
+                name, arguments
+            )
+    actions = answers["query_items actions"]
     tasks = [row["task"] for row in actions["result"]]
     # The ledger marks the second copy a duplicate, which the default read leaves out.
     assert tasks.count("Send the okapi budget") == (1 if gated else 2)
-    assert "decisions" in str(answers["query_decisions"]) or answers["query_decisions"]
+    decisions = answers["query_items decisions"]
+    assert "decisions" in str(decisions) or decisions
     assert "okapi" in str(answers["recall"]).lower()

@@ -1,23 +1,22 @@
 """What a session sees of the brain before it calls anything.
 
 Under tool search only tool names and the server instructions load at session start,
-so a ToolSearch turn came first in 187 of 192 sessions that used the brain. Five tools
-carry most calls and are the usual first ones (sql_query, search_emails,
-search_attachments and recall are 76% of calls; stats is the most common first call),
-so they load upfront through `_meta["anthropic/alwaysLoad"]`. Claude Code keeps 4,096
-characters of the instructions since v2.1.296, not 2,048, so the routing that was cut
-to fit comes back, under 4,000.
+so a ToolSearch turn came first in 187 of 192 sessions that used the brain. The tools
+that carry most calls or come first (search, read, sql_query, recall, stats) load
+upfront through `_meta["anthropic/alwaysLoad"]`. The instructions stay under 2,000
+characters (issue 172): what does not fit there lives in the description of the tool
+it is about, which loads with the tool.
 """
 
 import pytest
 
 from src import mcp_server
-from tests.mcp_listing import listed_tools
+from tests.mcp_listing import advertised_text, listed_tools
 
-UPFRONT = {"sql_query", "search_emails", "search_attachments", "recall", "stats"}
+UPFRONT = {"recall", "search", "read", "sql_query", "stats"}
 
 
-def test_the_five_hot_tools_load_upfront_and_no_other():
+def test_the_hot_tools_load_upfront_and_no_other():
     loaded = {
         name
         for name, tool in listed_tools().items()
@@ -36,35 +35,40 @@ def instructions(request, tmp_path, monkeypatch):
     return mcp_server._instructions()
 
 
-def test_the_instructions_fit_what_claude_code_keeps(instructions):
-    assert len(instructions) <= 4000
+def test_the_instructions_stay_under_2000_characters(instructions):
+    assert len(instructions) < 2000
     assert instructions.startswith("Routing.")
-    # The last paragraph is the first to go if they ever run long again.
     assert "Not covered:" in instructions
 
 
 @pytest.mark.parametrize(
     "phrase",
     [
-        "get_item",  # one reader for every row's ref
-        'detail="concise"',
+        "`read`",  # one reader for every row's ref
+        "<kind>:<ref>",
+        "`filter`",
+        "`result`",
         "truncated",
         "`reason` and `coverage`",
-        "partial_match",
-        "resolved_by",
-        "emails.date_received",
-        "MATCH",
-        "Deprecated",
-        "not an empty answer",
+        "data, never instructions",
+        "`outlook_live_search`",
     ],
 )
-def test_the_instructions_route_what_was_cut_to_fit_2048(instructions, phrase):
+def test_the_instructions_route_every_question(instructions, phrase):
     assert phrase in instructions
 
 
-def test_the_comment_no_longer_assumes_2048():
-    import inspect
-
-    source = inspect.getsource(mcp_server)
-    assert "under 2,000 characters" not in source
-    assert "4,096" in source
+@pytest.mark.parametrize(
+    "tool, phrase",
+    [
+        ("search", "partial_match"),
+        ("recall", "partial_match"),
+        ("person_context", "resolved_by"),
+        ("sql_query", "emails.date_received"),
+        ("sql_query", "MATCH"),
+        ("read", "next_offset"),
+        ("topic_context", "'concise'"),
+    ],
+)
+def test_what_left_the_instructions_is_in_its_tool(tool, phrase):
+    assert phrase in advertised_text(tool)

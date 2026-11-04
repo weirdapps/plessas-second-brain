@@ -112,7 +112,7 @@ class PersonContext(Fresh, total=False):
     reason: str
     coverage: Coverage
     truncated: Truncated
-    # detail="card": the card sender_brief gave, keyed as SenderBrief is.
+    # detail="card": a short card instead of the dossier.
     known: bool
 
 
@@ -152,36 +152,6 @@ class TopicContext(Fresh, total=False):
     reason: str
     coverage: Coverage
     truncated: Truncated
-
-
-@with_config(_OPEN)
-class SenderBrief(Fresh, total=False):
-    known: bool
-    query: str
-    name: Any
-    email: Any
-    role: Any
-    department: Any
-    manager: Any
-    email_count: int
-    top_topics: list[Any]
-    recent_decisions: int
-    open_actions_count: int
-    last_contact: Any
-    sentiment: dict[str, Any]
-    resolved_by: str | None
-    match_count: int
-    other_candidates: list[Any]
-    reason: str
-    coverage: Coverage
-
-
-@with_config(_OPEN)
-class EmailThread(Fresh):
-    email_id: int
-    emails: Rows
-    thread_total: int
-    truncated: NotRequired[Truncated]
 
 
 @with_config(_OPEN)
@@ -246,97 +216,12 @@ class CalendarEvents(Fresh):
 
 
 @with_config(_OPEN)
-class Stats(Fresh, total=False):
-    total_emails: int
-    total_news_articles: int
-    total_documents: int
-    total_topics: int
-    total_people: int
-    total_decisions: int
-    total_action_items: int
-    earliest_email: Any
-    latest_email: Any
-    source_class: dict[str, int] | str
-    coverage: dict[str, Any]
-    # data_as_of and stale come from Fresh, first.
-    age_hours: Any
-    stale_warning: str
-    total_attachments: int
-    attachments_extracted: int
-    attachments_awaiting_text: int
-    attachments_awaiting_text_oldest_hours: float | None
-    attachments_awaiting_summary: int
-    attachments_awaiting_summary_oldest_hours: float | None
-    total_key_facts: int
-    total_conversations: int
-    total_conversation_turns: int
-    embed_backend: str
-    last_embed_error: dict[str, str] | None
-
-
-@with_config(_OPEN)
-class ConversationContext(Fresh, total=False):
-    session_id: str
-    kind: str
-    summary: Any
-    turns: Rows
-    decisions: Rows
-    action_items: Rows
-    key_facts: list[Any]
-    topics: list[Any]
-    truncated: Truncated
-
-
-@with_config(_OPEN)
-class SharepointIndex(Fresh, total=False):
-    links: Rows
-    status: str
-    document_message_id: Any
-    reason: str
-    coverage: Coverage
-    truncated: Truncated
-
-
-@with_config(_OPEN)
 class ImageSearch(Fresh):
     results: Rows
     count: int
     reason: NotRequired[str]
     coverage: NotRequired[Coverage]
     truncated: NotRequired[Truncated]
-
-
-@with_config(_OPEN)
-class LiveMail(Fresh):
-    messages: Rows
-    count: int
-    since_minutes: int
-    clamped: bool
-    reason: NotRequired[str]
-    coverage: NotRequired[Coverage]
-    truncated: NotRequired[Truncated]
-
-
-@with_config(_OPEN)
-class TeamsThread(Fresh, total=False):
-    thread: dict[str, Any]
-    messages: Rows
-    decisions: Rows
-    action_items: Rows
-    key_facts: Rows
-    truncated: Truncated
-
-
-@with_config(_OPEN)
-class TeamsChat(Fresh, total=False):
-    chat: dict[str, Any]
-    threads: Rows
-    last_messages: Rows
-    top_senders: Rows
-    open_actions: Rows
-    reason: str
-    coverage: Coverage
-    truncated: Truncated
 
 
 @with_config(_OPEN)
@@ -365,21 +250,32 @@ class ItemResult(Fresh):
 
 
 @with_config(_OPEN)
-class FiguresResult(Fresh):
-    """figures: one row per matching metric, its latest held value and the one before it, or
-    in mode 'series' one row per report series; `reason` when a list is short or the period
-    asked is not held, `coverage` what the registry holds when nothing matched."""
-
-    mode: str
-    result: Rows
-    truncated: NotRequired[Truncated]
-    reason: NotRequired[str]
-    coverage: NotRequired[Coverage]
-
-
-@with_config(_OPEN)
 class SqlSchema(Fresh, total=False):
     tables: Rows
     table: str
     columns: Rows
     indexes: Rows
+
+
+@with_config(_OPEN)
+class Result(TypedDict):
+    """The one envelope every tool answers in (issue 172).
+
+    The header (`data_as_of`, `stale`, `_stale_warning`) always, after recall's
+    `summary`, which comes first on the wire so a preview shows it; a list answer's rows
+    under `result`; `truncated` when the budget cut a list, `reason` and `coverage` when
+    nothing matched, `excluded` and `history_left_out` when the default filter left rows
+    out. A dossier, a read or a count adds its own keys beside these.
+    """
+
+    summary: NotRequired[dict[str, Any]]
+    data_as_of: str | None
+    stale: bool
+    _stale_warning: NotRequired[str]
+    result: NotRequired[Rows]
+    # Each list the budget cut; sql_query says true when its row limit stopped it.
+    truncated: NotRequired[Truncated | bool]
+    reason: NotRequired[str]
+    coverage: NotRequired[Coverage]
+    excluded: NotRequired[Excluded]
+    history_left_out: NotRequired[dict[str, Any]]

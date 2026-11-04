@@ -96,14 +96,14 @@ def test_an_unknown_table_names_the_close_ones(db):
 
     assert "no such table: email" in text
     assert "emails" in text
-    assert "sql_schema" in text
+    assert "sql_query" in text
 
 
 def test_a_query_whose_tables_cannot_be_named_still_says_where_to_look(db):
     text = _error("WITH t(x) AS (VALUES (1)) SELECT y FROM t")
 
     assert "no such column: y" in text
-    assert "sql_schema" in text
+    assert "sql_query" in text
 
 
 def test_the_lookup_after_an_error_writes_nothing(db):

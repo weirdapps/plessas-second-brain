@@ -48,7 +48,6 @@ def store(tmp_path, monkeypatch):
         (lambda: mcp_server.search_conversations("zzyzx"), "result", {CONVERSATIONS}),
         (lambda: mcp_server.search_teams("zzyzx"), "results", {TEAMS}),
         (lambda: mcp_server.search_whatsapp("zzyzx"), "results", {WHATSAPP}),
-        (lambda: mcp_server.teams_chat_summary(chat_id=1, days=1), "threads", {TEAMS}),
         (
             lambda: mcp_server.sql_query(sql="SELECT id FROM emails WHERE id < 0"),
             "rows",
@@ -75,7 +74,7 @@ def test_an_empty_list_carries_a_reason_and_the_coverage_searched(store, call, k
         (lambda: mcp_server.recall("zzyzx", kinds=["teams", "calendar"]), {TEAMS, CALENDAR}),
         (lambda: mcp_server.person_context("Nobody"), {MAIL, TEAMS, WHATSAPP, CALENDAR}),
         (lambda: mcp_server.topic_context("zzyzx"), {MAIL}),
-        (lambda: mcp_server.sender_brief("nobody@example.com"), {MAIL}),
+        (lambda: mcp_server.person_context("nobody@example.com", detail="card"), {MAIL}),
         (lambda: mcp_server.meeting_prep("nobody@example.com"), {MAIL, CALENDAR}),
     ],
 )

@@ -141,4 +141,4 @@ def test_the_mcp_routing_text_no_longer_calls_whatsapp_uncovered():
     not_covered = _INSTRUCTIONS.split("Not covered:", 1)[1]
     assert "plus WhatsApp" not in not_covered
     assert "last hour" in not_covered  # only the unsynced tail sits elsewhere
-    assert "search_whatsapp" in _INSTRUCTIONS
+    assert "whatsapp" in _INSTRUCTIONS.split("`search`", 1)[1].split(";", 1)[0]

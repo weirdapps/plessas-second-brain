@@ -54,6 +54,7 @@ section 6 shows the same schedule from the pipeline's side):
 | `systemd/sb-auth-watch.sh` | `sb-auth-watch`, and `sb-outlook-sync.sh` before each run | every 4 hours | checks the Outlook and Teams sessions, renews them, and sets or clears the re-auth sentinels |
 | `systemd/sb-health-check.sh` | `sb-health-check` | 23:50 | `scripts/health_check.py --fix --email-if-issues`, then the `sb-brain-freshness` ping (`docs/DEPLOY.md`, section 7) |
 | `systemd/sb-topic-pages.sh` | `sb-topic-pages` | 03:30 | `topic-pages`: the pages of the live topics with new evidence (`docs/DEPLOY.md`, section 6) |
+| `systemd/sb-pages.sh` | `sb-pages` (not installed until the owner sets it up) | 04:10 | `pages`: the synthesis of the compiled pages marked dirty, at most `BRAIN_PAGES_LLM_CALLS` (40) calls (`docs/DEPLOY.md`, section 6) |
 | `systemd/sb-mcp.sh` | `sb-mcp` | always on | `python -m src.mcp_server --http` with `BRAIN_ROLE=replica` (`docs/DEPLOY.md`, section 9) |
 | `launchd/sb-db-pull.sh` | a LaunchAgent | :45 every hour | the replica pull, and the copy of the encrypted backup archives (`docs/DEPLOY.md`, section 5) |
 | `launchd/wait-for-vps.sh` | `sb-db-pull.sh` | before each pull | waits up to 180 s for the producer to answer ssh |

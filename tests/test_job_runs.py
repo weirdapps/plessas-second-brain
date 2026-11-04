@@ -198,3 +198,13 @@ def test_migrate_check_on_no_store_is_not_an_error(tmp_path, monkeypatch, capsys
         monkeypatch, capsys, "--db", str(tmp_path / "absent.db"), "maint", "migrate", "--check"
     )
     assert code == 0 and "no store" in out.lower()
+
+
+def test_a_failed_runs_error_is_redacted(store):
+    token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcDEFghiJKLmnoPQR"  # gitleaks:allow (invented)
+    with pytest.raises(RuntimeError), job_runs.record("sync", store):
+        raise RuntimeError(f"auth failed: Authorization: Bearer {token}")
+    (row,) = _rows(store)
+    assert token not in row["error"]
+    assert row["error"].startswith("RuntimeError: auth failed")
+    assert len(row["error"]) <= 500

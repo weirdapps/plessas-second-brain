@@ -33,7 +33,7 @@ def store(tmp_path, monkeypatch):
         "INSERT INTO emails (message_id, date_received, subject) VALUES (7, '2026-09-01', 'mail')"
     )
     conn.commit()
-    monkeypatch.setattr("src.store.embeddings.remove_vectors", lambda ids: len(ids))
+    monkeypatch.setattr("src.store.embeddings.remove_vectors", lambda ids, conn=None: len(ids))
     monkeypatch.setattr(
         attachment_pipeline,
         "_extract_one_attachment",

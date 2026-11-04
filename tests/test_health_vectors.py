@@ -124,3 +124,33 @@ def test_a_stalled_rebuild_is_a_warning(hc, tmp_path):
     assert result["rebuild"]["jobs_pending"] == 1
     assert result["status"] == "WARN"
     assert "vectors-rebuild --status" in result["note"]
+
+
+def test_a_store_whose_vectors_are_in_its_table_is_checked_there(hc, tmp_path, monkeypatch):
+    """After the gated step `vectors` (issue 171) the npz stops changing; the check reads the
+    table, and its age is the newest row's, not the retired file's mtime."""
+    from src.store import embeddings
+    from src.store.schema import apply_gated
+
+    npz = tmp_path / "embeddings.npz"
+    monkeypatch.setattr(embeddings, "EMBEDDINGS_FILE", npz)
+    conn = create_database(str(tmp_path / "brain.db"))
+    email_id = factories.email(conn, summary="harbour")
+    _save(npz, [email_id, TEAMS_THREAD_ID_OFFSET - 3], embedding_space())
+    conn.execute("BEGIN IMMEDIATE")
+    apply_gated(conn, "test")
+    conn.commit()
+    old = datetime.now().timestamp() - 30 * 86400
+    import os
+
+    os.utime(npz, (old, old))
+
+    result = hc.check_embeddings(conn)
+
+    assert result["status"] == "OK", result
+    assert result["embedded"] == 2
+    assert result["store"] == "table"
+    assert result["space"] == embedding_space()
+    assert result["by_kind"]["email"] == 1 and result["by_kind"]["teams"] == 1
+    assert result["age"] < timedelta(hours=1)
+    conn.close()

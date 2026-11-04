@@ -79,5 +79,5 @@ def forget_emails(conn: sqlite3.Connection, ids) -> dict:
         forget_attachments(conn, att_ids)
         stats["emails"] += len(email_ids)
         stats["attachments"] += len(att_ids)
-    stats["vectors"] = remove_vectors(vectors)
+    stats["vectors"] = remove_vectors(vectors, conn=conn)
     return stats

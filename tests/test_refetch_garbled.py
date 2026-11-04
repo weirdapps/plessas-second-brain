@@ -674,7 +674,7 @@ def test_the_sweep_keeps_a_fetched_original_until_reextract_reads_it(store, mail
             False,
         ),
     )
-    monkeypatch.setattr("src.store.embeddings.remove_vectors", lambda ids: len(ids))
+    monkeypatch.setattr("src.store.embeddings.remove_vectors", lambda ids, conn=None: len(ids))
     assert rx.reextract(str(path), {"garbled"}, root=str(root))["reread"] == 1
 
     swept = sweep_files(conn, root, SweepPolicy(apply=True))

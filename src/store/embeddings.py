@@ -31,6 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from src.config import DATA_ROOT, embed_backend
+from src.store import vector_store
 from src.store.chunks import chunk_texts, plan_chunks
 from src.store.schema import SUMMARISED_ATTACHMENT_IDS_SQL
 from src.store.source_class import hidden_ids_sql, with_source_class
@@ -339,8 +340,11 @@ def _normalise(vectors: np.ndarray) -> np.ndarray:
     return vectors
 
 
-def _load_index_and_space(index_path=None):
+def _load_index_and_space(index_path=None, conn: sqlite3.Connection | None = None):
     """Return (ids, unit_vectors, space) for the embedding index, cached by file mtime.
+
+    With `conn` on a store that took the step `vectors`, the store's table instead, cached
+    until a write changes it (vector_store.load): int8 rows, widened to float16 at load.
 
     Vectors are L2-normalized once at load, so cosine similarity at query time is a
     single matrix-vector product (_similarities), in the dtype the file holds. `space` is what
@@ -348,6 +352,8 @@ def _load_index_and_space(index_path=None):
     FileNotFoundError if no index exists. Concurrent callers share one load: the others wait
     for it, then read the cache.
     """
+    if _table(conn, index_path):
+        return vector_store.load(conn)  # type: ignore[arg-type]
     path = EMBEDDINGS_FILE if index_path is None else Path(index_path)
     if not path.exists():
         raise FileNotFoundError("No embedding index found. Run 'python -m src.cli embed' first.")
@@ -487,8 +493,24 @@ def _skip_for_rebuild(what: str) -> bool:
     return True
 
 
-def _index_state(index_path=None) -> tuple[set[int], dict]:
+def _table(conn: sqlite3.Connection | None, index_path=None) -> bool:
+    """Whether the index is the store's vectors table (the gated step `vectors`, issue 171):
+    a store is given, no file is named, and the store has taken the step."""
+    return index_path is None and conn is not None and vector_store.enabled(conn)
+
+
+def _table_state(conn: sqlite3.Connection) -> tuple[set[int], dict]:
+    """_index_state for a store whose vectors are in its table."""
+    space = vector_store.stored_space(conn) or embedding_space()
+    if not writable(space):
+        _refuse_unwritable(space)
+    return vector_store.held_ids(conn), space
+
+
+def _index_state(index_path=None, conn: sqlite3.Connection | None = None) -> tuple[set[int], dict]:
     """The ids in the index and the space a writer adds vectors in, read without the vectors.
+
+    With `conn` on a store that took the step `vectors`, the index is its table.
 
     The space is the index's own, so the producer keeps writing the space it holds until a
     rebuild swaps in another; an index saved before the space was recorded is in the legacy
@@ -496,6 +518,8 @@ def _index_state(index_path=None) -> tuple[set[int], dict]:
     for embeddings, a misaligned file (the vector count comes from the .npy header inside the
     archive, not the data) and a file in a space this code does not write.
     """
+    if _table(conn, index_path):
+        return _table_state(conn)  # type: ignore[arg-type]
     path = EMBEDDINGS_FILE if index_path is None else Path(index_path)
     if not path.exists():
         return set(), embedding_space()
@@ -1054,7 +1078,7 @@ def build_index(
         existing_ids: set[int] = set()
         space = embedding_space()
     else:
-        existing_ids, space = _index_state()
+        existing_ids, space = _index_state(conn=conn)
     indexed = None if force else existing_ids
 
     # Emails embed a metadata-enriched string (subject / sender / date + summary), not the
@@ -1121,6 +1145,9 @@ def build_index(
                 )
     offered = {**space, "dim": _width(new_vectors) or int(space["dim"])}
 
+    if vector_store.enabled(conn):
+        return _save_to_table(conn, ids, new_vectors, offered, gone_chunks, force)
+
     with _index_lock():
         # A force rebuild rewrites the file from what this function owns
         # (emails, attachments, conversations, chunks), in this code's space. Teams vectors
@@ -1174,6 +1201,44 @@ def build_index(
 
     _log(f"Saved {len(all_ids)} embeddings to {EMBEDDINGS_FILE}")
     _record_space(conn, offered)
+    return len(ids)
+
+
+def _save_to_table(
+    conn: sqlite3.Connection, ids: list[int], vectors, space: dict, gone_chunks: set[int], force
+) -> int:
+    """build_index's save on a store whose vectors are in its table: the rows it made, added in
+    one transaction, less those another writer added meanwhile; the chunk and conversation
+    vectors no row stands for any more, deleted. A force pass starts the table over."""
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if force:
+            vector_store.replace_all(conn, ids, vectors, int(space["template"]))
+        else:
+            stored = vector_store.stored_space(conn)
+            if stored is not None and len(vectors):
+                _merge_space(stored, int(stored.get("dim") or 0), space)
+            present = vector_store.held_ids(conn) - gone_chunks
+            fresh = [i for i, vid in enumerate(ids) if vid not in present]
+            gone_conversations = _conversation_vectors_gone(
+                conn, sorted(present) + [ids[i] for i in fresh]
+            )
+            fresh = [i for i in fresh if ids[i] not in gone_conversations]
+            gone = gone_conversations | gone_chunks
+            if gone:
+                _log(f"Dropping {len(gone)} vectors of items no longer stored or cut again")
+                vector_store.delete(conn, gone, with_chunks=False)
+            vector_store.write(
+                conn, [ids[i] for i in fresh], np.asarray(vectors)[fresh], int(space["template"])
+            )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    _log(f"Saved {len(ids)} embeddings to the vectors table")
+    _record_space(conn, space)
     return len(ids)
 
 
@@ -1473,7 +1538,7 @@ def query_semantic(
     """
     # Index load + unit-normalization is cached across calls (see _load_index_and_space),
     # so a long-lived process pays the read once, not per query.
-    ids, normalized, space = _load_index_and_space(index_path)
+    ids, normalized, space = _load_index_and_space(index_path, conn)
 
     try:
         query_norm, seeded = _query_vector(
@@ -1670,7 +1735,7 @@ def semantic_email_candidates(
     and with `classes` (recall's `kinds`) the emails of the other classes; recall drops
     a candidate an attachment folds onto one of those.
     """
-    ids, normalized, space = _load_index_and_space(index_path)
+    ids, normalized, space = _load_index_and_space(index_path, conn)
     query_norm, seeded = _query_vector(conn, query, ids, normalized, embed_fn or embed_query, space)
     similarities = _similarities(normalized, query_norm)
     hidden = _hidden_vector_ids(conn, include_news, include_automation, classes)
@@ -1748,7 +1813,9 @@ def _other_kinds(
     return found, chunks
 
 
-def _append_to_index(ids: list[int], vectors, space: dict | None = None) -> dict:
+def _append_to_index(
+    ids: list[int], vectors, space: dict | None = None, conn: sqlite3.Connection | None = None
+) -> dict:
     """Append (id, vector) rows to EMBEDDINGS_FILE; returns the space saved.
 
     EMBEDDINGS_FILE format: npz with arrays 'ids' (int64) and 'vectors' (float16 or float32),
@@ -1759,7 +1826,14 @@ def _append_to_index(ids: list[int], vectors, space: dict | None = None) -> dict
     `space` is the space the vectors were made in (the index's own when None), at their width.
     """
     vectors = np.asarray(vectors)
-    space = {**(space or _index_state()[1]), "dim": _width(vectors)}
+    space = {**(space or _index_state(conn=conn)[1]), "dim": _width(vectors)}
+    if conn is not None and vector_store.enabled(conn):
+        stored = vector_store.stored_space(conn)
+        if stored is not None:
+            _merge_space(stored, int(stored.get("dim") or 0), space)
+        vector_store.write(conn, ids, vectors, int(space["template"]))
+        conn.commit()
+        return space
     with _index_lock():
         if EMBEDDINGS_FILE.exists():
             existing = np.load(EMBEDDINGS_FILE, allow_pickle=False)
@@ -1806,7 +1880,7 @@ def _teams_threads_to_embed(
     EMBEDDINGS_FILE, ``space`` to the space a writer adds vectors in (_index_state).
     """
     if indexed is None or space is None:
-        held, writer = _index_state()
+        held, writer = _index_state(conn=conn)
         indexed = held if indexed is None else indexed
         space = writer if space is None else space
     texts = dict(_teams_rows(conn, space))
@@ -1844,7 +1918,7 @@ def build_teams_index(conn, force: bool = False, limit: int = 0) -> int:
     """
     if _skip_for_rebuild("teams-sync"):
         return 0
-    indexed, space = _index_state()
+    indexed, space = _index_state(conn=conn)
     if force:
         # Force rebuild = clear embedding_at so the query re-selects everything.
         conn.execute("UPDATE teams_threads SET embedding_at = NULL")
@@ -1870,6 +1944,7 @@ def build_teams_index(conn, force: bool = False, limit: int = 0) -> int:
         ids=[TEAMS_THREAD_ID_OFFSET - i for i in ids],
         vectors=vecs,
         space=space,
+        conn=conn,
     )
 
     now = datetime.now(UTC).isoformat()
@@ -1909,7 +1984,7 @@ def _whatsapp_threads_to_embed(
     what brings a session back after a force rebuild dropped it.
     """
     if indexed is None or space is None:
-        held, writer = _index_state()
+        held, writer = _index_state(conn=conn)
         indexed = held if indexed is None else indexed
         space = writer if space is None else space
     texts = dict(_whatsapp_rows(conn, space))
@@ -1945,7 +2020,7 @@ def build_whatsapp_index(conn, force: bool = False, limit: int = 0) -> int:
     """
     if _skip_for_rebuild("whatsapp-sync"):
         return 0
-    indexed, space = _index_state()
+    indexed, space = _index_state(conn=conn)
     if force:
         conn.execute("UPDATE whatsapp_threads SET embedding_at = NULL")
         conn.commit()
@@ -1957,7 +2032,7 @@ def build_whatsapp_index(conn, force: bool = False, limit: int = 0) -> int:
     with in_space(space):
         vecs = generate_embeddings([p[1] for p in pairs])
     saved = _append_to_index(
-        ids=[WHATSAPP_THREAD_ID_OFFSET - p[0] for p in pairs], vectors=vecs, space=space
+        ids=[WHATSAPP_THREAD_ID_OFFSET - p[0] for p in pairs], vectors=vecs, space=space, conn=conn
     )
     now = datetime.now(UTC).isoformat()
     for tid, _text in pairs:
@@ -1967,7 +2042,7 @@ def build_whatsapp_index(conn, force: bool = False, limit: int = 0) -> int:
     return len(pairs)
 
 
-def remove_vectors(ids) -> int:
+def remove_vectors(ids, conn: sqlite3.Connection | None = None) -> int:
     """Drop these vector ids from the index, atomically, under the index lock, and with an
     attachment's summary vector its chunks'.
 
@@ -1980,6 +2055,12 @@ def remove_vectors(ids) -> int:
     drop = {int(i) for i in ids}
     if not drop:
         return 0
+    if conn is not None and vector_store.enabled(conn):
+        removed = vector_store.delete(conn, drop)
+        conn.commit()
+        if removed:
+            _log(f"Removed {removed} vectors of forgotten rows")
+        return removed
     removed = 0
     with _index_lock():
         if not EMBEDDINGS_FILE.exists():
@@ -2032,6 +2113,23 @@ def install_index(conn: sqlite3.Connection, ids, vectors, space: dict) -> Path |
     if len(ids) != len(vectors):
         raise RuntimeError(f"refusing to install {len(ids)} ids for {len(vectors)} vectors")
     backup = None
+    if vector_store.enabled(conn):
+        if conn.execute("SELECT 1 FROM vectors LIMIT 1").fetchone():
+            backup = backup_path()
+            backup.unlink(missing_ok=True)
+            vector_store.export_npz(conn, backup)
+        if conn.in_transaction:
+            conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            vector_store.replace_all(conn, ids, vectors, int(space["template"]))
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        _record_space(conn, space)
+        _log(f"Installed {len(ids)} vectors in {space} in the vectors table")
+        return backup
     with _index_lock():
         if EMBEDDINGS_FILE.exists():
             backup = backup_path()
@@ -2076,6 +2174,8 @@ def slice_index(conn: sqlite3.Connection, dim: int = EMBEDDING_DIM) -> dict:
     0.9999999, for fresh vectors and for the stored ones. So the legacy index sliced to 768
     takes queries embedded at 768 as if it had been built so. Returns the new space.
     """
+    if vector_store.enabled(conn):
+        raise ValueError("the index is the store's vectors table, which slice_index never cuts")
     space = file_space()
     if space is None:
         raise FileNotFoundError(f"no index at {EMBEDDINGS_FILE} to slice")

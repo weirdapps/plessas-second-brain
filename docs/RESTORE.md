@@ -394,6 +394,8 @@ brain maint forget --before 2025-01-01                 # dry run: counts, rolled
 brain maint forget --before 2025-01-01 --source teams  # one source (repeatable)
 brain maint forget --before 2025-01-01 --apply --backup ~/brain-pre-forget.db
 brain maint forget --deleted-at-source                 # what the mailbox reports deleted
+brain maint forget-floor                               # the forget floor of each source
+brain maint forget-floor --clear teams                 # lift one (a backfill then reloads)
 systemctl --user start 'sb-*.timer'
 ```
 
@@ -434,7 +436,35 @@ What a forget cannot reach, printed at the end of every run:
 | restic snapshots (store snapshots, `attachments/` when backed up) | `restic forget --prune` under the host's policy; history is never rewritten |
 | The `--backup` file of the run | deleted by the owner once the result is checked |
 | Replicas (`brain.db`, `embeddings.npz`) | their next hourly pull |
-| The sources (Outlook, Teams, WhatsApp, calendar, `~/.claude/projects`) | kept; a backfill reaching before the day loads them again |
+| The sources (Outlook, Teams, WhatsApp, calendar, `~/.claude/projects`) | kept; the forget floor (below) stops a sync or backfill loading them again |
 | Logs and the journal | not rewritten |
 | People, topics, entities; session-note and SharePoint link records | kept on purpose (names, and what stops a refetch) |
 | Free pages of `brain.db` | zeroed by `secure_delete`; the file shrinks at `VACUUM` |
+
+### The forget floor (issue 286)
+
+`--before DATE --apply` records DATE as the forget floor of each source it ran
+on (`email`, `teams`, `whatsapp`, `calendar`, `conversation`; all five without
+`--source`), in `sync_metadata` under `forget_floor:<source>` and in the same
+transaction as the deletes. The dry run and `--deleted-at-source` set none. A
+floor only moves forward: a later forget with an earlier day leaves it.
+
+Every path that stores an item refuses one dated before its source's floor, and
+counts what it refused ("older than the forget floor" in its output):
+
+| Source | Paths | Dated by |
+| --- | --- | --- |
+| `email` | Outlook export (not fetched), mail extraction (not sent to the model), the mail load (its batch drains), `mail-reconcile` (kind `forgotten`, never refetched), documents ingested as mail (SharePoint, session notes, files) | received time; a document's date |
+| `teams` | `teams-sync`, `teams-backfill-replies` | the message's compose time |
+| `whatsapp` | `whatsapp-sync` | the message's sent time |
+| `calendar` | `calendar-sync`, `calendar-backfill` (not fetched) | the event's end, else its start |
+| `conversation` | the conversation export (not staged), the load (a staged copy is pruned) | the session's end, else its start |
+
+An item with no date is let through, as the forget leaves undated rows. A Teams
+message or WhatsApp message the store already holds (in a thread that straddled
+the day and so was kept whole) still takes its later edits. Attachments of mail
+follow their email: one is registered only for a stored email.
+
+`brain maint forget-floor` lists the floors. `--clear SOURCE` removes one, with a
+warning: a backfill or re-export reaching before that day then loads again what
+was forgotten. Both are the producer's; `--clear` refuses on a replica.

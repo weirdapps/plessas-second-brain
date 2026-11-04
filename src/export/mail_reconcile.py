@@ -17,7 +17,9 @@ A listed message counts as held when the store has it:
                      still covers a store not yet migrated.
     newer            received after the store's newest mail: not synced yet
 
-and as missing otherwise. Listing goes through outlook-cli; the store is opened
+A message the store does not hold and received before the email forget floor
+(src/store/forget_floor.py, issue 286) is forgotten: the owner forgot it, so it is
+counted and never refetched. Any other is missing. Listing goes through outlook-cli; the store is opened
 read-only, so the report runs on a replica. Three writes are the producer's alone:
 refetch() stages the missing messages by Graph id through the export's own path,
 so the next sync extracts and loads them, record_aliases() notes the Graph id
@@ -80,7 +82,8 @@ NOT_MAIL = ("News", "External")
 MAX_CONCURRENCY = 2
 REFETCH_CHUNK = 50
 
-KINDS = ("by_id", "by_rfc822_id", "staged", "by_subject_time", "newer", "missing")
+# "forgotten": older than the email forget floor (issue 286), so never refetched.
+KINDS = ("by_id", "by_rfc822_id", "staged", "by_subject_time", "newer", "forgotten", "missing")
 
 # Tags a mail gateway puts on a subject, on one side and not the other.
 _GATEWAY_TAG = re.compile(
@@ -167,6 +170,8 @@ class Store:
     email_of: dict[str, int] = field(default_factory=dict)
     mailbox_of: dict[int, str] = field(default_factory=dict)
     located: set[int] = field(default_factory=set)
+    # The email forget floor (src/store/forget_floor.py): mail older was forgotten on purpose.
+    forget_floor: str | None = None
 
     def near(self, subject: str, when: datetime | None) -> bool:
         """Whether a row without a Message-ID has this subject within the tolerance."""
@@ -220,6 +225,9 @@ def read_store(conn: sqlite3.Connection) -> Store:
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_metadata'"
     ).fetchone()
     if has_metadata:
+        from src.store.forget_floor import floor
+
+        store.forget_floor = floor(conn, "email")
         for (key,) in conn.execute(
             "SELECT key FROM sync_metadata WHERE key GLOB ?", (LOCATION_KEY + "*",)
         ):
@@ -303,6 +311,8 @@ def classify(
     cutoff: datetime | None = None,
 ) -> dict[str, list[dict]]:
     """The listed messages by how the store holds them (see the module docstring)."""
+    from src.store import forget_floor
+
     staged_ids, staged_imids = staged
     result: dict[str, list[dict]] = {kind: [] for kind in KINDS}
     for message in messages:
@@ -317,6 +327,8 @@ def classify(
             kind = "staged"
         elif store.near(normalize_subject(message.get("Subject")), when):
             kind = "by_subject_time"
+        elif forget_floor.refuse("email", store.forget_floor, message.get("ReceivedDateTime")):
+            kind = "forgotten"
         elif cutoff is not None and when is not None and when > cutoff:
             kind = "newer"
         else:

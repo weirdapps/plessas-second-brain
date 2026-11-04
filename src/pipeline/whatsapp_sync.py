@@ -65,6 +65,11 @@ def run(args):
             f"{i['chats']} chats"
             + (f"; {i['skipped']} with no usable time" if i["skipped"] else "")
             + (
+                f"; {i['below_floor']} older than the forget floor, not stored"
+                if i.get("below_floor")
+                else ""
+            )
+            + (
                 f"; {i['chats_merged']} chats under a number joined to the same"
                 " person's chat under an anonymous id"
                 if i.get("chats_merged")

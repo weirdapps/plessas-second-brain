@@ -22,6 +22,7 @@ from urllib.parse import quote
 
 from src.config import WHATSAPP_SNAPSHOT
 from src.redact import redact_secrets
+from src.store import forget_floor
 
 # WhatsApp's own "Status" stories: posts to everyone, not a conversation.
 _NOT_CONVERSATIONS = frozenset({"status@broadcast"})
@@ -139,8 +140,9 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
     """Upsert every chat and message in `snapshot`; return the counts.
 
     Returns {"chats", "messages_inserted", "messages_updated", "skipped",
-    "chats_merged"}. `skipped` counts rows whose timestamp is not a time, which
-    cannot be placed in a session or searched by date. `chats_merged` counts the
+    "below_floor", "chats_merged"}. `skipped` counts rows whose timestamp is not a
+    time, which cannot be placed in a session or searched by date; `below_floor`
+    the new ones older than the forget floor (issue 286). `chats_merged` counts the
     stored chats under a number joined to the same person's chat under an
     anonymous id (_moved_chats).
     """
@@ -169,7 +171,8 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
     }
 
     now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    inserted = updated = skipped = 0
+    inserted = updated = skipped = below_floor = 0
+    whatsapp_floor = forget_floor.floor(conn, "whatsapp")
     touched_threads: set[int] = set()
     chat_ids: dict[str, int] = {}
 
@@ -255,6 +258,11 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
             "WHERE chat_jid = ? AND message_id = ?",
             (jid, mid),
         ).fetchone()
+        # Older than the WhatsApp forget floor and not held (issue 286): forgotten, not
+        # stored again. One held, of a session that straddled the day, is kept current.
+        if existing is None and forget_floor.refuse("whatsapp", whatsapp_floor, sent_at):
+            below_floor += 1
+            continue
         if existing is None:
             conn.execute(
                 """
@@ -317,5 +325,6 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
         "messages_inserted": inserted,
         "messages_updated": updated,
         "skipped": skipped,
+        "below_floor": below_floor,
         "chats_merged": merged,
     }

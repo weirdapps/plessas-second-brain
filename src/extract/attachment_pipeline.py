@@ -1598,6 +1598,11 @@ def ingest_document(
             if held
             else str(ATTACHMENTS_DIR / str(abs(message_id)) / filename),
         }
+    # Dated before the email forget floor (issue 286): forgotten, not stored again. No
+    # file_path: no copy of its bytes is held, so a caller keeps its source.
+    if _below_floor(conn, file_mtime):
+        conn.close()
+        return {"skipped": True, "message_id": message_id, "reason": FLOOR_REASON}
 
     # The same bytes held as another attachment: a file saved from mail into a folder that is
     # then ingested was stored a second time, and search returned both
@@ -1697,6 +1702,17 @@ def ingest_document(
     }
 
 
+FLOOR_REASON = "older than the email forget floor"
+
+
+def _below_floor(conn: sqlite3.Connection, when: str | None) -> bool:
+    """Whether a document dated `when` is older than the email forget floor (issue 286):
+    documents are stored as mail, so they share its floor."""
+    from src.store import forget_floor
+
+    return forget_floor.refuse("email", forget_floor.floor(conn, "email"), when)
+
+
 def ingest_text_document(
     conn: sqlite3.Connection,
     *,
@@ -1729,6 +1745,8 @@ def ingest_text_document(
     existing = conn.execute("SELECT id FROM emails WHERE message_id = ?", (message_id,)).fetchone()
     if existing:
         return {"skipped": True, "message_id": message_id, "email_id": existing[0]}
+    if _below_floor(conn, date):
+        return {"skipped": True, "message_id": message_id, "reason": FLOOR_REASON}
     now = datetime.now().isoformat()  # attachments.exported_at, local time as its other writers
     extracted = utc_now()  # attachment_content.extracted_at, in UTC (src/store/stamps.py)
     # Its class (src/store/source_class.py): a session note or a document

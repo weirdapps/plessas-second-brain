@@ -509,6 +509,7 @@ def export_conversations(
     workspace_filter: str | None = None,
     loaded: dict[str, tuple[str | None, int | None]] | None = None,
     include_agents: bool = False,
+    floor: str | None = None,
 ) -> dict:
     """Export Claude Code conversations to staging directory.
 
@@ -529,11 +530,13 @@ def export_conversations(
             so extraction takes it again; the rest are skipped.
         include_agents: Stage agent sessions too (kind 'agent': a teammate's,
             a subagent's, or one the owner typed nothing into), left out by default
+        floor: The conversation forget floor (src/store/forget_floor.py): a session
+            that ended before it was forgotten and is not staged again (issue 286)
 
     Returns:
         Dict with 'exported', 'skipped', 'agents' (agent sessions left out),
-        'errors', 'pending' (staged before and not loaded yet, not read again) and
-        'staged' (the files written) keys
+        'errors', 'pending' (staged before and not loaded yet, not read again),
+        'below_floor' (older than the forget floor) and 'staged' (the files written) keys
     """
     CONVERSATION_STAGING_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -545,9 +548,11 @@ def export_conversations(
             "agents": 0,
             "errors": 0,
             "pending": 0,
+            "below_floor": 0,
             "staged": [],
         }
 
+    from src.store import forget_floor
     from src.store.loader import conversation_went_on
 
     loaded = loaded or {}
@@ -559,6 +564,7 @@ def export_conversations(
     agents = 0
     errors = 0
     pending = 0
+    below_floor = 0
 
     for jsonl_file in files:
         if limit and len(conversations) >= limit:
@@ -600,6 +606,12 @@ def export_conversations(
             agents += 1
             continue
 
+        if forget_floor.refuse(
+            "conversation", floor, conv.get("ended_at") or conv.get("started_at")
+        ):
+            below_floor += 1
+            continue
+
         previous = loaded.get(conv["session_id"])
         if previous is not None:
             if not conversation_went_on(conv, *previous):
@@ -622,5 +634,6 @@ def export_conversations(
         "agents": agents,
         "errors": errors,
         "pending": pending,
+        "below_floor": below_floor,
         "staged": staged,
     }

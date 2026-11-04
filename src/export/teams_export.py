@@ -16,6 +16,7 @@ from typing import Literal
 from src.export.teams_cli import TeamsCliAuthRequired, TeamsCliError, run_teams_cli
 from src.extract.html_text import html_to_text
 from src.redact import redact_payload, redact_secrets
+from src.store import forget_floor
 
 Scope = Literal["channel", "all"]
 
@@ -654,7 +655,7 @@ def _persist_messages(conn: sqlite3.Connection, chat_id: int, payload: dict) -> 
     return inserted
 
 
-StoreOutcome = Literal["inserted", "updated", "unchanged"]
+StoreOutcome = Literal["inserted", "updated", "unchanged", "below_floor"]
 
 
 def _replies_of(item: dict) -> list[dict]:
@@ -715,7 +716,9 @@ def _store_message(
     """Insert one message, or apply a later version of one already stored.
 
     `msg` is the message itself and `raw` what raw_json keeps: a channel post's
-    envelope, or the message for anything else.
+    envelope, or the message for anything else. A message older than the Teams forget
+    floor that the store does not hold is not stored (issue 286); one it holds, in a
+    thread that straddled the day and so was kept whole, still takes a later version.
     """
     msg_type = msg.get("messageType") or msg.get("messagetype")
     system = _is_system_message(msg_type)
@@ -729,6 +732,15 @@ def _store_message(
     sender_display = _sender_name(msg)
     sender_mri = _extract_mri(msg.get("from"))
     composite_id = f"{chat_id}::{upstream_id}"
+    teams_floor = forget_floor.floor(conn, "teams")
+    if (
+        forget_floor.below(teams_floor, composed_at)
+        and not conn.execute(
+            "SELECT 1 FROM teams_messages WHERE teams_message_id = ?", (composite_id,)
+        ).fetchone()
+    ):
+        forget_floor.refuse("teams", teams_floor, composed_at)
+        return "below_floor"
     # Teams never passes through data/staging, so the redaction that
     # write_json_atomic applies to every staging batch never saw it. All
     # three stored copies of the message are covered: text, HTML and raw.
@@ -840,6 +852,7 @@ def backfill_channel_replies(conn: sqlite3.Connection) -> dict:
         "replies_found": 0,
         "replies_stored": 0,
         "replies_updated": 0,
+        "replies_below_floor": 0,
         "posts_redated": 0,
     }
     # Ids first, so the replies written below never join the scan.
@@ -886,6 +899,8 @@ def backfill_channel_replies(conn: sqlite3.Connection) -> dict:
                 counts["replies_stored"] += 1
             elif outcome == "updated":
                 counts["replies_updated"] += 1
+            elif outcome == "below_floor":
+                counts["replies_below_floor"] += 1
         # Short transactions: the timers' writers wait on this one.
         if n % 100 == 0:
             conn.commit()

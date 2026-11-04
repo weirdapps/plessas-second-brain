@@ -391,6 +391,23 @@ def run_hourly_sync(
         to_fetch = [s for s in summaries if s["Id"] not in held]
         if held:
             logger.info("%s: %d listed messages already held, not fetched again", folder, len(held))
+        # 2d. Older than the email forget floor (issue 286): forgotten, never fetched again.
+        from src.store import forget_floor
+
+        email_floor = forget_floor.floor_at(db_path or DEFAULT_DB, "email")
+        kept = [
+            s
+            for s in to_fetch
+            if not forget_floor.refuse("email", email_floor, s.get("ReceivedDateTime"))
+        ]
+        below_floor = len(to_fetch) - len(kept)
+        to_fetch = kept
+        if below_floor:
+            logger.info(
+                "%s: %d listed messages older than the forget floor, not fetched",
+                folder,
+                below_floor,
+            )
         retry_ids = [i for i in state.fetch_retries if i not in listed][:FETCH_RETRIES_PER_RUN]
         if not to_fetch and not retry_ids:
             _advance_cursor(state, summaries)
@@ -398,7 +415,12 @@ def run_hourly_sync(
             state.messages_in_last_run = 0
             state.consecutive_failures = 0
             save_outlook_sync_state(state_path, state)
-            return {"messages": 0, "skipped": len(held), "status": "ok"}
+            return {
+                "messages": 0,
+                "skipped": len(held),
+                "below_floor": below_floor,
+                "status": "ok",
+            }
 
         # 3. Fetch full bodies concurrently, with the messages earlier runs could
         # not fetch. A failure comes back as None (logged): one bad message must
@@ -470,6 +492,7 @@ def run_hourly_sync(
             "failed": len(failed),
             "retried": len(retry_ids),
             "skipped": len(held),
+            "below_floor": below_floor,
             "attachments": attachment_summary,
             "status": "ok",
         }

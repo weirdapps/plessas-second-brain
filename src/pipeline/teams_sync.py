@@ -78,6 +78,9 @@ def run(args):
                 else ""
             )
         )
+        from src.store import forget_floor
+
+        forget_floor.print_skipped()
         # pull_messages re-raises only an expired session and counts every other
         # failure per chat, so a service-wide 403, 429 or 5xx arrives here as
         # errors with nothing pulled. That returned 0, and sb-teams-sync.sh wrote

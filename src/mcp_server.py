@@ -74,6 +74,7 @@ for _module in (
     "src.export.sharepoint_fetcher",
     "src.extract.sharepoint_ingest",
     "src.mcp_http",
+    "src.mcp_scope",
     "src.store.attachment_backlog",
     "src.store.calendar_coverage",
     "src.store.context",
@@ -152,8 +153,18 @@ says when). For mail newer than it, `outlook_live_search` (24 hours at most)."""
 
 def _instructions() -> str:
     """The server instructions for this host: REPLICA only where the pull stamp exists."""
+    from src import mcp_scope
+
     freshness = _REPLICA_FRESHNESS if REPLICA_STAMP.exists() else _STORE_FRESHNESS
-    return _INSTRUCTIONS_TEMPLATE.replace("{freshness}", freshness)
+    text = _INSTRUCTIONS_TEMPLATE.replace("{freshness}", freshness)
+    allowed = mcp_scope.scope()
+    if allowed is not None:
+        named = ", ".join(sorted(allowed)) or "nothing"
+        text = (
+            f"Scope. This server reads only: {named}. Every other source, and every tool "
+            "that mixes sources, is refused by name.\n\n" + text
+        )
+    return text
 
 
 _INSTRUCTIONS = _instructions()
@@ -1612,6 +1623,9 @@ def figures(
     gives the latest held, with "not held; latest held: <period>" in `reason`. Name the report
     and period with every figure, and never estimate one it does not hold.
     """
+    from src import mcp_scope
+
+    mcp_scope.require("figures", ["figures"])
     from src.store.figures import coverage as registry_coverage
     from src.store.figures import list_series, search_figures
 
@@ -1844,6 +1858,9 @@ def stats() -> Result:
     by their text or their summary; each `_oldest_hours` is how long the oldest
     has waited.
     """
+    from src import mcp_scope
+
+    mcp_scope.refuse_mixed("stats")
     from src.store.attachment_backlog import backlog_stats
     from src.store.query import get_stats
 
@@ -2032,6 +2049,9 @@ def sharepoint_index(
     or 'shared-with-me' (the backfill list). refetch accepts only a link already
     recorded, on the configured SharePoint host, and is refused on a replica.
     """
+    from src import mcp_scope
+
+    mcp_scope.refuse_mixed("sharepoint_index")
     from src.config import SHAREPOINT_HOST
     from src.export import sharepoint_fetcher
 
@@ -2217,6 +2237,9 @@ def outlook_live_search(
     `since_minutes` is the window searched and `clamped` says it was cut to 24
     hours, so a longer gap is not mistaken for no mail.
     """
+    from src import mcp_scope
+
+    mcp_scope.require("outlook_live_search", ["email"])
     from datetime import datetime, timedelta
 
     from src.export import outlook_cli
@@ -2566,6 +2589,9 @@ def get_item(
     mime_type="application/json",
 )
 def pages_index() -> str:
+    from src import mcp_scope
+
+    mcp_scope.refuse_mixed("brain://pages", resource=True)
     from src.store import pages
 
     conn = _get_conn()
@@ -2588,6 +2614,9 @@ def pages_index() -> str:
     mime_type="text/markdown",
 )
 def page_resource(kind: str, key: str) -> str:
+    from src import mcp_scope
+
+    mcp_scope.refuse_mixed("brain://pages/{kind}/{key}", resource=True)
     from urllib.parse import unquote
 
     from src.store import pages
@@ -2629,6 +2658,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     # stderr: on stdio, stdout is the protocol. Names the service, never the key.
     print(f"second-brain MCP: query embeddings through {embed_backend()}", file=sys.stderr)
+    from src import mcp_scope
+
+    allowed = mcp_scope.scope()
+    if allowed is not None:
+        print(
+            f"second-brain MCP: scoped to {', '.join(sorted(allowed)) or 'nothing'}",
+            file=sys.stderr,
+        )
     if args.http is None:
         mcp.run()
         return 0

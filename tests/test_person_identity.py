@@ -74,8 +74,9 @@ def _roles(db, email_id):
 # --- the step is gated --------------------------------------------------------------------
 
 
-def test_the_step_is_named_and_last_and_waits_on_a_legacy_store():
-    assert GATED_MIGRATIONS[-1] == "person_identity"
+def test_the_step_is_named_and_waits_on_a_legacy_store():
+    # extraction_item_kind (issue 211) came after it.
+    assert GATED_MIGRATIONS[-2:] == ("person_identity", "extraction_item_kind")
     db = _legacy()
     assert pending_gated(db) == ["person_identity"]
     assert "person_identifiers" not in {

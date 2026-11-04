@@ -1715,11 +1715,11 @@ def run_in_sync(db_path: str, deadline_s: float) -> RunStats:
     runs the rules alone."""
     from src.config import EXTRACT_ENGINE
     from src.llm_cost import TokenBudget
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     conn = get_connection(db_path)
     try:
-        run_migrations(conn)
+        ensure_schema(conn)
         # The ledger (gated migration item_ledger) first, so the items this hour's syncs extracted again get
         # back the status they held, then again for the labels this pass wrote. A no-op on
         # a store without it.
@@ -1752,10 +1752,10 @@ def cmd_consolidate(args) -> int:
     """`brain maint consolidate`: the backfill, a dry run unless --apply."""
     from src.config import EXTRACT_ENGINE
     from src.llm_cost import TokenBudget
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     conn = get_connection(str(args.db))
-    run_migrations(conn)
+    ensure_schema(conn)
     try:
         if args.revert:
             undone = revert(conn, args.revert)

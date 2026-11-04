@@ -67,7 +67,7 @@ def cmd_process_attachments(args):
         run_phase1,
         run_phase2,
     )
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     db_path = str(args.db)
     if not Path(db_path).exists():
@@ -76,7 +76,7 @@ def cmd_process_attachments(args):
 
     # Ensure schema is up to date
     conn = get_connection(db_path)
-    run_migrations(conn)
+    ensure_schema(conn)
     conn.close()
 
     phase = getattr(args, "phase", None)
@@ -379,11 +379,11 @@ def _print_reconcile(report) -> None:
 def cmd_ingest_session_notes(args):
     """Store what Claude sessions wrote to notes (src/export/session_notes.py)."""
     from src.export.session_notes import ingest_session_notes, transcripts_to_scan
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     conn = get_connection(str(args.db))
     try:
-        run_migrations(conn)
+        ensure_schema(conn)
         files = transcripts_to_scan(conn, all_files=args.all)
         stats = ingest_session_notes(conn, files)
     finally:
@@ -612,7 +612,7 @@ def _print_transcription(stats: dict) -> None:
 def cmd_transcribe_images(args) -> int:
     """Transcribe content images whose attachments hold no text from their file."""
     from src.extract.image_pipeline import run_transcription
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     db_path = str(args.db)
     if not Path(db_path).exists():
@@ -620,7 +620,7 @@ def cmd_transcribe_images(args) -> int:
         return 1
     conn = get_connection(db_path)
     try:
-        run_migrations(conn)
+        ensure_schema(conn)
         stats = run_transcription(
             conn,
             limit=args.limit or None,
@@ -647,7 +647,7 @@ def cmd_transcribe_images(args) -> int:
 def cmd_process_images(args):
     """Backfill image classification pipeline."""
     from src.extract.image_pipeline import run_backfill, run_transcription
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     db_path = str(args.db)
     if not Path(db_path).exists():
@@ -656,7 +656,7 @@ def cmd_process_images(args):
 
     # Ensure schema is up to date
     conn = get_connection(db_path)
-    run_migrations(conn)
+    ensure_schema(conn)
 
     # Run backfill
     print("Processing inline images...")
@@ -731,7 +731,7 @@ def cmd_split_html(args) -> int:
     from src.extract.html_text import LEADING
     from src.redact import redact_secrets
     from src.store.email_html import pack, split_body
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     db_path = str(args.db)
     if not Path(db_path).exists():
@@ -744,7 +744,7 @@ def cmd_split_html(args) -> int:
         ).fetchone()
     else:
         conn = get_connection(db_path)
-        run_migrations(conn)
+        ensure_schema(conn)
         conn.execute("PRAGMA secure_delete = ON")
         migrated = True
     # A prefilter in SQL, on the same opening looks_like_html reads; it decides.
@@ -1311,7 +1311,7 @@ def cmd_teams_drop_raw_json(args):
     """
     import sqlite3
 
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
     from src.store.teams_raw_json import drop_raw_json
 
     if args.limit < 0:
@@ -1334,7 +1334,7 @@ def cmd_teams_drop_raw_json(args):
         if not args.dry_run:
             # v34 first: under the triggers before it, each payload dropped re-indexed its
             # message's text.
-            run_migrations(conn)
+            ensure_schema(conn)
         c = drop_raw_json(conn, limit=args.limit, dry_run=args.dry_run)
     finally:
         conn.close()
@@ -1517,6 +1517,8 @@ def cmd_migrate(args):
     )
 
     db_path = str(args.db)
+    if getattr(args, "check", False):
+        return _migrate_check(db_path)
     if not Path(db_path).exists():
         print("Error: Database not found.")
         sys.exit(1)
@@ -1592,6 +1594,35 @@ def cmd_migrate(args):
         print(f"  {key}: {old:,} -> {new:,}{mark}")
 
 
+def _migrate_check(db_path: str) -> int:
+    """`brain maint migrate --check`, what scripts/deploy.sh asks before it migrates: 0 when
+    the store is at the code's version or ahead of it (or there is no store yet), 3 when the
+    code is ahead and the numbered migrations are pending. Opens the store read-only and
+    writes nothing. Gated migrations waiting are named, never counted as pending: only the
+    owner applies them (--apply-gated)."""
+    from src.config import CURRENT_SCHEMA_VERSION
+    from src.store.schema import get_schema_version, pending_gated
+    from src.store.sql_readonly import connect_read_only
+
+    if not Path(db_path).exists():
+        print(f"No store yet at {db_path}: nothing to migrate.")
+        return 0
+    conn = connect_read_only(db_path)
+    try:
+        current = get_schema_version(conn)
+        waiting = pending_gated(conn)
+    finally:
+        conn.close()
+    print(f"store v{current}, code v{CURRENT_SCHEMA_VERSION}")
+    if waiting:
+        print(f"Gated, not applied (the owner's step): {', '.join(waiting)}")
+    if current < CURRENT_SCHEMA_VERSION:
+        print("Numbered migrations pending: brain maint migrate")
+        return 3
+    print("The store is up to date.")
+    return 0
+
+
 def _gated_backup(conn, path) -> str:
     """The backup --apply-gated stands on: PATH written now with sqlite's online backup
     (the API behind the sqlite3 shell's .backup), or an existing PATH under an hour old
@@ -1640,7 +1671,7 @@ def cmd_classify_sources(args):
     a change that moves it, such as BRAIN_USER_EMAIL_PATTERN being set after the migration ran.
     Writes only the rows whose class changes.
     """
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
     from src.store.source_class import CLASSES, reclassify
 
     db_path = str(args.db)
@@ -1650,7 +1681,7 @@ def cmd_classify_sources(args):
 
     conn = get_connection(db_path)
     try:
-        run_migrations(conn)
+        ensure_schema(conn)
         if conn.in_transaction:
             conn.commit()
         conn.execute("BEGIN IMMEDIATE")
@@ -1778,7 +1809,7 @@ def cmd_query_semantic(args):
 def cmd_ingest(args):
     """Ingest standalone documents or URLs into the knowledge store."""
     from src.extract.attachment_pipeline import ingest_document, run_phase1, run_phase2
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     if not args.files and not args.url:
         print("Error: Provide file paths or --url arguments.")
@@ -1791,7 +1822,7 @@ def cmd_ingest(args):
 
     # Ensure schema is up to date
     conn = get_connection(db_path)
-    run_migrations(conn)
+    ensure_schema(conn)
     conn.close()
 
     all_attachment_ids = []
@@ -3018,6 +3049,12 @@ def main():
         help="With --apply-gated: run every step in one transaction, print what it "
         "changes, roll back",
     )
+    parser_migrate.add_argument(
+        "--check",
+        action="store_true",
+        help="Say whether numbered migrations are pending, write nothing: exit 3 when "
+        "they are, 0 when not (scripts/deploy.sh asks this first)",
+    )
     parser_migrate.set_defaults(func=cmd_migrate)
 
     parser_classify = subparsers.add_parser(
@@ -3261,7 +3298,15 @@ def main():
         # cannot fund one worst-case LLM call raises here, and exiting 1 with the
         # reason on stderr is the loud refusal that beats a SIGTERM later.
         install_llm_deadline_for_this_process()
-        rc = args.func(args)
+        # A job's run and its stages, with the tokens it spent (job_runs, issue 173).
+        from src.store import job_runs
+
+        if job_runs.should_record(command):
+            with job_runs.record(command, str(args.db)) as run:
+                rc = args.func(args)
+                run.exit_code = rc if isinstance(rc, int) and not isinstance(rc, bool) else 0
+        else:
+            rc = args.func(args)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

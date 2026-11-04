@@ -166,7 +166,7 @@ GEMINI_MODEL = os.environ.get("BRAIN_GEMINI_MODEL", "gemini-2.5-flash")
 # The Claude model and its Vertex region have no default: src/extract/claude_extract.py.
 
 # Schema version — bump when adding migrations (must match number of migrations in schema.py)
-CURRENT_SCHEMA_VERSION = 41
+CURRENT_SCHEMA_VERSION = 42
 # Gated migrations are not numbered: each has a name, is recorded in gated_migrations when
 # applied, and runs only through `brain maint migrate --apply-gated` (or on a new, empty
 # store), so a pull of new code changes no row until the owner runs that step, and a

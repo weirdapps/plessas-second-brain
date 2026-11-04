@@ -434,11 +434,11 @@ def date_undated_notes(conn: sqlite3.Connection, *, apply: bool) -> dict:
 
 
 def cmd_session_note_dates(args) -> int:
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     conn = get_connection(str(args.db))
     try:
-        run_migrations(conn)
+        ensure_schema(conn)
         stats = date_undated_notes(conn, apply=args.apply)
     finally:
         conn.close()

@@ -64,11 +64,11 @@ def strip_nul(conn: sqlite3.Connection, *, apply: bool) -> dict[str, int]:
 
 
 def cmd_strip_nul(args) -> int:
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     conn = get_connection(str(args.db))
     try:
-        run_migrations(conn)
+        ensure_schema(conn)
         stats = strip_nul(conn, apply=args.apply)
     finally:
         conn.close()

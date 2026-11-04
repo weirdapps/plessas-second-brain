@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import shutil
@@ -3418,6 +3419,7 @@ MCP_PROBE_SLUG = "sb-mcp-stats"
 MCP_PROBE_MAX_AGE = timedelta(hours=7)
 # An initialize-handshake revision every current server still speaks.
 MCP_PROTOCOL_VERSION = "2025-06-18"
+MCP_PROBE_RETRY_SECONDS = 20  # longer than sb-mcp takes to come back after a restart
 
 
 class McpProbeError(Exception):
@@ -3553,12 +3555,24 @@ def check_mcp_stats(url=None, token_file=None, opener=None):
     except ValueError as e:  # names the file and the fix, never the token
         return {**row, "status": "FAIL", "note": str(e)}
     opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    try:
-        stats = _mcp_stats(opener, url, token)
-    except McpProbeError as e:
-        return {**row, "status": "FAIL", "note": str(e)}
-    except (OSError, ValueError) as e:  # URLError is an OSError
-        return {**row, "status": "FAIL", "note": f"no answer from {url}: {getattr(e, 'reason', e)}"}
+    # The hourly pull's deploy restarts sb-mcp at the same minute this probe runs, so a
+    # connection refused or an answer cut off mid-body (IncompleteRead, an HTTPException,
+    # not an OSError) is retried once before it counts. A refused token or a protocol
+    # error is the server's real answer and is not.
+    for attempt in (1, 2):
+        try:
+            stats = _mcp_stats(opener, url, token)
+            break
+        except McpProbeError as e:
+            return {**row, "status": "FAIL", "note": str(e)}
+        except (OSError, http.client.HTTPException) as e:  # URLError is an OSError
+            if attempt == 1:
+                time.sleep(MCP_PROBE_RETRY_SECONDS)
+                continue
+            reason = getattr(e, "reason", None) or f"{type(e).__name__}: {e}"
+            return {**row, "status": "FAIL", "note": f"no answer from {url}: {reason}"}
+        except ValueError as e:
+            return {**row, "status": "FAIL", "note": f"no answer from {url}: {e}"}
     age = stats.get("age_hours")
     row.update(age_hours=age, embed_backend=stats.get("embed_backend"))
     try:

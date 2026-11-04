@@ -17,7 +17,8 @@ from src.extract.teams_prompt import THREAD_TEMPLATE
 @dataclass(frozen=True)
 class ThreadExample:
     """A thread (its THREAD_TEMPLATE fields and messages), the answer, and why. The
-    commitments are kept apart: they are shown only to a store that asks for them."""
+    commitments are kept apart: they are shown only to a store that asks for them, and so
+    are the topics (issue 281: only when BRAIN_EXTRACT_CHAT_TOPICS asks for them)."""
 
     title: str
     thread: dict
@@ -25,6 +26,7 @@ class ThreadExample:
     answer: dict
     why: str
     commitments: tuple[dict, ...] = field(default_factory=tuple)
+    topics: tuple[str, ...] = field(default_factory=tuple)
 
 
 def render(example: ThreadExample) -> str:
@@ -44,18 +46,21 @@ def render(example: ThreadExample) -> str:
     )
 
 
-def answer(example: ThreadExample, *, commitments: bool) -> dict:
-    """The example's answer in the order the keys are asked, with its commitments before
-    key_facts when the prompt asks for them (teams_prompt.with_commitments)."""
+def answer(example: ThreadExample, *, commitments: bool, topics: bool = False) -> dict:
+    """The example's answer in the order the keys are asked: its commitments, then its
+    topics, before key_facts when the prompt asks for them (teams_prompt.with_commitments,
+    then topic_registry.with_topics)."""
     out: dict = {}
     for key, value in example.answer.items():
         if key == "key_facts" and commitments:
             out["commitments"] = list(example.commitments)
+        if key == "key_facts" and topics:
+            out["topics"] = list(example.topics)
         out[key] = value
     return out
 
 
-def examples_text(route: str, *, commitments: bool) -> str:
+def examples_text(route: str, *, commitments: bool, topics: bool = False) -> str:
     """The cached block: the route's examples, each thread, its answer, and why."""
     parts = [
         "WORKED EXAMPLES\n"
@@ -63,7 +68,9 @@ def examples_text(route: str, *, commitments: bool) -> str:
         " as it would appear between the tags, then the answer, then why."
     ]
     for n, example in enumerate(EXAMPLES[route], start=1):
-        shown = json.dumps(answer(example, commitments=commitments), ensure_ascii=False, indent=2)
+        shown = json.dumps(
+            answer(example, commitments=commitments, topics=topics), ensure_ascii=False, indent=2
+        )
         parts.append(
             f"Example {n}: {example.title}.\n\n{render(example)}\n\n"
             f"Answer:\n{shown}\n\nWhy: {example.why}"
@@ -146,6 +153,7 @@ _TEAMS_GR = ThreadExample(
         "sentiment": "positive",
         "language": "el",
     },
+    topics=("καμπάνια cashback", "Νομική Υπηρεσία"),
     commitments=(
         {
             "commitment": "Θα στείλει το κείμενο στη Νομική Υπηρεσία μέχρι την Πέμπτη 5/3",
@@ -228,6 +236,7 @@ _TEAMS_EN = ThreadExample(
         "sentiment": "neutral",
         "language": "en",
     },
+    topics=("wallet UAT", "vendor change freeze"),
     commitments=(
         {
             "commitment": "Book the test environment today",
@@ -306,6 +315,7 @@ _WHATSAPP_GR = ThreadExample(
         "sentiment": "positive",
         "language": "el",
     },
+    topics=("επίσκεψη στη γιαγιά", "οικογενειακό Σάββατο"),
     commitments=(
         {
             "commitment": "Θα πάρει το γλυκό από το ζαχαροπλαστείο",
@@ -388,6 +398,7 @@ _WHATSAPP_EN = ThreadExample(
         "sentiment": "positive",
         "language": "en",
     },
+    topics=("sailing charter", "boat deposit", "provisioning list"),
     commitments=(
         {
             "commitment": "Do the provisioning list",

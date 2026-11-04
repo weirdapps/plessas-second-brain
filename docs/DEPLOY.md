@@ -1508,7 +1508,9 @@ environment the timers run with, in this order:
    `python -m src.cli maint topic-canon --apply --embed` embeds the 60,303 remaining
    names at 256 dimensions through the embedding client (the Gemini API key: about
    $0.05; the vectors are kept in `topic_vectors.npz` under the data root, so a second
-   run sends only new names) and writes the synonyms. Not beside another embedding job
+   run sends only new names; a cache from before issue 282, of gemini-embedding-001
+   vectors, is set aside and the names embedded again) and writes the synonyms, at cosine
+   0.98 since issue 282 (the floor measured on gemini-embedding-2). Not beside another embedding job
    (section 6): it holds about 70 MB of vectors and a 140 MB block of similarities.
 4. **Wait for `reextract-stacked`.** The backfill should read each thread's items once
    they are final: run step 5 after `maint reextract-stacked` counts 0.
@@ -1965,6 +1967,13 @@ one pass, at the first job that writes. The versions that ask for a step:
     vectors (no model call for those); `--apply --summaries --limit 5000` embeds that many
     768 summaries again at 1536. `maint vectors-rebuild` puts every summary back at 768
     and drops the email chunks; the backfill then adds them again.
+  - Recall's semantic candidates on such a store (part 3): each bucket still ranks its own
+    kind by each item's best vector, and an item under `BRAIN_SEMANTIC_FLOOR` (0.55) is
+    none. One pool fused by reciprocal rank across the summary and passage lists was
+    measured on the owner's 45 labelled questions and dropped: recall@10 of the bundle 0.807
+    -> 0.700, hybrid 0.869 -> 0.790. Once `--summaries` has lifted every summary to 1536,
+    `BRAIN_WIDE_SUMMARIES=1` scores them at that width; run `scripts/retrieval_eval.py
+    --run-qa` with and without it before leaving it on.
 - **Gated: `extraction_item_kind`** (issue 211, `src/store/extraction_fields.py`). Applied by
   the same `--apply-gated` run, after the five above, with the same steps 1 to 5. ADD
   COLUMN only: `emails.item_kind`, empty; the loader fills it from each v2 extraction it
@@ -2000,7 +2009,7 @@ one pass, at the first job that writes. The versions that ask for a step:
   - Topics of chats and meetings, off by default: `BRAIN_EXTRACT_CHAT_TOPICS=1` in the
     jobs' environment asks each Teams thread, WhatsApp session and calendar event the
     jobs extract from then on for 1 to 5 topic tags (one more key in the same call, no
-    extra call; the calendar only on its v1 route). History is not re-extracted: a
+    extra call; under a v2 route of `BRAIN_EXTRACT_V2_ROUTES` the worked examples and the calendar schema carry the key as well, issue 281). History is not re-extracted: a
     calendar event already stored is read again only when Outlook changes it. Check the
     extraction eval on a few days of it before widening; unset, the prompts are byte for
     byte as before.

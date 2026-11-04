@@ -176,3 +176,58 @@ def test_the_command_is_a_dry_run_by_default(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["brain", "--db", str(db), "maint", "topic-canon", "--apply"])
     cli.main()
     assert "'added': 1" in capsys.readouterr().out
+
+
+# --- embedding names (issue 282) ---------------------------------------------------------------
+
+
+class _Model2Client:
+    """embed_content as gemini-embedding-2 answers it: a plain list of strings is ONE text
+    (one aggregated vector); a list of Content gives one vector each."""
+
+    def __init__(self):
+        self.models = self
+        self.calls = 0
+
+    def embed_content(self, model, contents, config=None):
+        from types import SimpleNamespace
+
+        self.calls += 1
+        dim = getattr(config, "output_dimensionality", None) or 3072
+        n = 1 if all(isinstance(c, str) for c in contents) else len(contents)
+        rows = [
+            SimpleNamespace(values=list(np.random.default_rng(i).random(dim))) for i in range(n)
+        ]
+        return SimpleNamespace(embeddings=rows)
+
+
+def test_n_names_give_n_unit_vectors_on_the_current_model():
+    client = _Model2Client()
+    names = [f"topic {i}" for i in range(130)]
+
+    vectors = tc.embed_names(names, client=client)
+
+    assert vectors.shape == (130, 256)
+    assert np.allclose(np.linalg.norm(vectors, axis=1), 1, atol=1e-5)
+    assert client.calls == 2  # batches of 100
+
+
+def test_a_cache_of_another_space_is_not_reused(tmp_path):
+    path = tmp_path / tc.VECTORS_FILE
+    # A cache as topic-canon wrote it before: gemini-embedding-001 vectors, no space.
+    np.savez(path, names=np.array(["okapi"]), vectors=np.ones((1, 256), dtype=np.float32))
+    sent = []
+
+    def embed(names):
+        sent.append(list(names))
+        return np.eye(len(names), 256, dtype=np.float32)
+
+    tc.cached_vectors(path, embed=embed)(["okapi"])
+
+    assert sent == [["okapi"]]
+
+
+def test_the_synonym_floor_is_the_one_measured_on_the_current_model():
+    from src.store.topic_registry import TOPIC_FLOOR
+
+    assert tc.EMBED_FLOOR == TOPIC_FLOOR

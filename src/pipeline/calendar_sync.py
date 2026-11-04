@@ -204,7 +204,6 @@ def run(args):
     )
     from src.export.outlook_cli import OutlookCliAuthRequired
     from src.extract.calendar_extractor import event_body_text, event_prompt_hash, extract_event
-    from src.extract.call_shape import v2_route
     from src.extract.policy_bridge import classify_exception, is_transient
     from src.extract.vertex_auth import touch_sentinel
     from src.llm_policy import Outcome
@@ -238,9 +237,9 @@ def run(args):
         conn = get_connection(db_path)
         ensure_schema(conn)
 
-    # Topics (issue 180): asked of the v1 calendar route only, with BRAIN_EXTRACT_CHAT_TOPICS
-    # on a store with the gated topic_registry; a v2 route's prompts are left as they are.
-    asks_topics = not dry_run and topic_registry.asks_topics(conn) and not v2_route("calendar")
+    # Topics (issue 180), with BRAIN_EXTRACT_CHAT_TOPICS on a store with the gated
+    # topic_registry, on the v1 and (issue 281) the v2 calendar route alike.
+    asks_topics = not dry_run and topic_registry.asks_topics(conn)
 
     proxy_emails = None
     if not dry_run:

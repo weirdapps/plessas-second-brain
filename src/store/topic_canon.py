@@ -151,15 +151,15 @@ FREQUENT_USES = 5
 RARE_USES = 2
 # At most this many heads a rare topic is mapped under (the most specific ones).
 MAX_HEADS = 3
-# Embedding: gemini-embedding-001 at this many dimensions; a name within EMBED_FLOOR cosine
-# of a more used name, and holding the same numbers, is its synonym. Measured on the
-# replica of 2026-10-16, 3,000 names, each to its nearest more-used name, 12 pairs a band
-# judged by hand: at 0.94 and over 12 of 12 were one topic, 0.92-0.94 9 of 12 (the three
-# misses: two other quarters, which the number rule refuses, and one narrower topic),
-# 0.90-0.92 9 of 12, 0.88-0.90 7 of 12. 2% of names had a neighbour at 0.92 or more.
-EMBED_DIM = 256
-EMBED_FLOOR = 0.92
-EMBED_BATCH = 100
+# Embedding: a name within EMBED_FLOOR cosine of a more used name, and holding the same
+# numbers, is its synonym. The names are embedded as the topic registry embeds them
+# (src/store/topic_registry.py: the store's model, task 'clustering', 256 dimensions, a
+# cache that keeps only vectors of that space), and the floor is the one measured there on
+# gemini-embedding-2 (TOPIC_FLOOR, 0.98). The 0.92 used before was measured on
+# gemini-embedding-001, where 2% of names had a neighbour at 0.92 or more; on
+# gemini-embedding-2 the median nearest pair is at 0.936, and since the store moved to it
+# embed_names sent a plain list, which that model answers with one vector (issue 282).
+EMBED_FLOOR = 0.98
 # Rows of the similarity matrix computed at once: 512 x 70k float32 is about 140 MB.
 SIM_BLOCK = 512
 VECTORS_FILE = "topic_vectors.npz"
@@ -281,36 +281,11 @@ def write_rows(conn: sqlite3.Connection, rows) -> int:
 
 
 def embed_names(names: list[str], client=None):
-    """Unit vectors of `names` at EMBED_DIM dimensions, through the embedding client of
-    src/store/embeddings.py (the Gemini API with a key, else Vertex), in batches."""
-    import time
+    """Unit vectors of `names`, one each, in the topic registry's space
+    (topic_registry.embed_topic_names, through embeddings.generate_embeddings)."""
+    from src.store.topic_registry import embed_topic_names
 
-    import numpy as np
-    from google.genai import types
-
-    from src.store.embeddings import EMBEDDING_MODEL, _get_client
-
-    client = client or _get_client()
-    config = types.EmbedContentConfig(output_dimensionality=EMBED_DIM)
-    out = np.empty((len(names), EMBED_DIM), dtype=np.float32)
-    for start in range(0, len(names), EMBED_BATCH):
-        batch = names[start : start + EMBED_BATCH]
-        for attempt in range(5):
-            try:
-                result = client.models.embed_content(
-                    model=EMBEDDING_MODEL, contents=batch, config=config
-                )
-                break
-            except Exception as e:
-                if attempt == 4 or not ("429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)):
-                    raise
-                time.sleep(min(2**attempt * 5, 60))
-        vectors = [e.values for e in result.embeddings]
-        if len(vectors) != len(batch):
-            raise RuntimeError(f"{len(vectors)} vectors for {len(batch)} names")
-        out[start : start + len(batch)] = np.asarray(vectors, dtype=np.float32)
-    norms = np.linalg.norm(out, axis=1, keepdims=True)
-    return out / np.maximum(norms, 1e-12)
+    return embed_topic_names(names, client=client)
 
 
 def plan_embedding(
@@ -353,24 +328,13 @@ def plan_embedding(
     return rows
 
 
-def cached_vectors(path):
-    """vectors_of with a file cache keyed by name: a name embedded before is not sent
-    again."""
-    import numpy as np
+def cached_vectors(path, embed=None):
+    """vectors_of with a file cache keyed by name, kept only while it holds vectors of the
+    registry's space: a name embedded before is not sent again
+    (topic_registry.cached_topic_vectors)."""
+    from src.store.topic_registry import cached_topic_vectors
 
-    def vectors_of(names):
-        cache: dict[str, object] = {}
-        if path.exists():
-            data = np.load(path, allow_pickle=False)
-            cache = dict(zip(data["names"].tolist(), data["vectors"], strict=True))
-        missing = [n for n in dict.fromkeys(names) if n not in cache]
-        if missing:
-            cache.update(zip(missing, embed_names(missing), strict=True))
-            keys = list(cache)
-            np.savez(path, names=np.array(keys), vectors=np.stack([cache[k] for k in keys]))
-        return np.stack([cache[n] for n in names])
-
-    return vectors_of
+    return cached_topic_vectors(path, embed=embed or embed_names)
 
 
 def cmd_topic_canon(args) -> int:

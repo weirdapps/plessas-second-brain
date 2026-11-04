@@ -130,14 +130,14 @@ def topic_space() -> dict:
     }
 
 
-def embed_topic_names(names: list[str]):
+def embed_topic_names(names: list[str], client=None):
     """Unit vectors of topic names in topic_space(), through embeddings.generate_embeddings
-    (the store's client, batching, retries and row check)."""
+    (the store's client unless one is given, batching, retries and row check)."""
     import numpy as np
 
     space = topic_space()
     rows = embeddings.generate_embeddings(
-        [embeddings.query_text(space, n) for n in names], space=space
+        [embeddings.query_text(space, n) for n in names], client, space=space
     )
     norms = np.linalg.norm(rows, axis=1, keepdims=True)
     return rows / np.maximum(norms, 1e-12)
@@ -154,7 +154,8 @@ def cached_topic_vectors(path, embed: Callable = embed_topic_names) -> Callable:
         cache: dict[str, object] = {}
         if path.exists():
             data = np.load(path, allow_pickle=False)
-            if str(data["space"]) == space:
+            # A file without a space (topic-canon's cache before issue 282) is another one.
+            if "space" in data.files and str(data["space"]) == space:
                 cache = dict(zip(data["names"].tolist(), data["vectors"], strict=True))
         missing = [n for n in dict.fromkeys(names) if n not in cache]
         if missing:

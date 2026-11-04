@@ -4,7 +4,6 @@ Reads JSON files from data/extracted/ and data/staging/, normalizes entities,
 and inserts into the knowledge store with proper deduplication.
 """
 
-import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -17,7 +16,6 @@ from src.redact import redact_secrets
 from .email_html import save_html, split_body
 from .greek import search_fold
 from .normalizer import find_or_create_person, find_or_create_topic, normalize_topic
-from .schema import normalize_subject
 from .source_class import stored_class
 
 
@@ -309,18 +307,9 @@ def conversation_id_of(metadata: dict) -> str:
     Fallback: references/in_reply_to/subject normalization (handles Greek
     Re:/Fwd:/Απ: when ConversationId is missing — rare for Outlook, common for
     legacy Apple Mail exports)."""
-    in_reply_to = metadata.get("in_reply_to", "")
-    references = metadata.get("references", "")
-    outlook_conv_id = metadata.get("conversation_id", "")
-    if outlook_conv_id:
-        return outlook_conv_id
-    if references:
-        root_msg_id = references.strip().split()[0]
-        return hashlib.sha256(root_msg_id.encode()).hexdigest()[:16]
-    if in_reply_to:
-        return hashlib.sha256(in_reply_to.strip().encode()).hexdigest()[:16]
-    normalized = normalize_subject(metadata.get("subject", ""))
-    return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+    from .thread_identity import fallback_id
+
+    return fallback_id(metadata)
 
 
 def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict) -> bool:
@@ -351,7 +340,11 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
 
     in_reply_to = metadata.get("in_reply_to", "")
     references = metadata.get("references", "")
-    conversation_id = conversation_id_of(metadata)
+    # Outlook's ConversationId, else the fallback; with the gated step thread_identity the
+    # fallback re-roots on a held Message-ID and cuts a subject at a silence (issue 179).
+    from .thread_identity import thread_id
+
+    conversation_id, thread_rule = thread_id(conn, metadata)
 
     # The body as the text a reader sees; an HTML body is kept beside it.
     body, html = split_body(metadata.get("content"))
@@ -394,6 +387,10 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
     assert email_id is not None  # mypy: INSERT always sets it
     if html is not None and email_id is not None:
         save_html(conn, email_id, html)
+    if thread_rule is not None:
+        from .thread_identity import record as record_thread
+
+        record_thread(conn, email_id, metadata, conversation_id, thread_rule)
 
     commitments = _write_extraction(conn, email_id, metadata, extraction)
 
@@ -442,6 +439,10 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
     from .thread_updates import apply as apply_thread_updates
 
     apply_thread_updates(conn, email_id, conversation_id, extraction)
+    # The thread's rollup, now that it holds this email (a no-op before the gated step).
+    from .thread_rollups import refresh as refresh_rollup
+
+    refresh_rollup(conn, conversation_id)
 
     # Forward hook: Stage 1 image classification for inline images
     try:

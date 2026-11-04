@@ -16,6 +16,7 @@ from src.redact import redact_secrets
 from .email_html import save_html, split_body
 from .greek import search_fold
 from .normalizer import find_or_create_person, find_or_create_topic, normalize_topic
+from .person_identity import link_role
 from .source_class import stored_class
 
 
@@ -638,13 +639,9 @@ def _write_extraction(
                 role = role.get("role", str(role))
             if not isinstance(role, str):
                 role = str(role)
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO email_people (email_id, person_id, role_in_email)
-                VALUES (?, ?, ?)
-                """,
-                (email_id, person_id, role),
-            )
+            # The model's words: the role itself on a legacy store, role_text beside the
+            # enum 'mentioned' with the gated person_identity (issue 170).
+            link_role(conn, email_id, person_id, role)
 
     # Load commitments (extracted by the LLM; previously parsed then dropped)
     pending: list[_Pending] = []

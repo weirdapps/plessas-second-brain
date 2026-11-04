@@ -20,6 +20,7 @@ import unicodedata
 from datetime import UTC, datetime, timedelta
 
 from src.config import DEFAULT_DB
+from src.store import person_identity
 from src.store.normalizer import looks_garbled, recover_garbled_greek
 from src.store.transliterate import canonical_name
 
@@ -137,8 +138,21 @@ def clean_name(name: str) -> str:
     return name.strip()
 
 
-def merge_person(conn: sqlite3.Connection, keep_id: int, remove_id: int):
-    """Merge remove_id into keep_id: reassign all references, then delete."""
+def merge_person(
+    conn: sqlite3.Connection,
+    keep_id: int,
+    remove_id: int,
+    *,
+    method: str = "dedup",
+    evidence: str | None = None,
+):
+    """Merge remove_id into keep_id: reassign all references, then delete.
+
+    With the gated person_identity (issue 170) the merge is logged, with what it moved,
+    and can be undone (src/store/person_identity.py); `method` and `evidence` say why."""
+    if person_identity.active(conn):
+        person_identity.merge(conn, keep_id, remove_id, method=method, evidence=evidence)
+        return
     conn.execute(
         """
         UPDATE OR IGNORE email_people
@@ -183,6 +197,18 @@ def merge_person(conn: sqlite3.Connection, keep_id: int, remove_id: int):
         )
         conn.execute("UPDATE entities SET person_id = ? WHERE person_id = ?", (keep_id, remove_id))
     conn.execute("DELETE FROM people WHERE id = ?", (remove_id,))
+
+
+def _merge_or_queue(
+    conn: sqlite3.Connection, keep_id: int, remove_id: int, rule: str, evidence: str
+) -> bool:
+    """A match on a name alone: merged on a legacy store; with the gated person_identity
+    (issue 170) queued for the owner instead, never merged. True when it merged."""
+    if person_identity.active(conn):
+        person_identity.queue(conn, keep_id, remove_id, rule, evidence)
+        return False
+    merge_person(conn, keep_id, remove_id, method=rule, evidence=evidence)
+    return True
 
 
 # A phase given a scope (a set of person ids) acts only on the groups that hold one of
@@ -268,7 +294,8 @@ def phase2_merge_no_email_exact(conn: sqlite3.Connection, scope: set[int] | None
             continue
         match = email_by_norm.get(norm)
         if match and match["id"] != p["id"]:
-            merge_person(conn, match["id"], p["id"])
+            if not _merge_or_queue(conn, match["id"], p["id"], "phase2", f"name:{norm}"):
+                continue
             merged.add(p["id"])
             count += 1
             _keep(scope, match["id"])
@@ -289,7 +316,7 @@ def phase3_merge_no_email_dupes(conn: sqlite3.Connection, scope: set[int] | None
             groups[norm].append(p)
 
     count = 0
-    for _norm, members in groups.items():
+    for norm, members in groups.items():
         if len(members) < 2 or not _in_scope(scope, members):
             continue
         best_name = pick_best_name([m["name"] for m in members])
@@ -297,8 +324,7 @@ def phase3_merge_no_email_dupes(conn: sqlite3.Connection, scope: set[int] | None
         conn.execute("UPDATE people SET name = ? WHERE id = ?", (best_name, keep["id"]))
         _keep(scope, keep["id"])
         for m in members[1:]:
-            merge_person(conn, keep["id"], m["id"])
-            count += 1
+            count += _merge_or_queue(conn, keep["id"], m["id"], "phase3", f"name:{norm}")
 
     return count
 
@@ -333,7 +359,7 @@ def phase4_merge_same_name_diff_email(
             groups[norm].append(p)
 
     count = 0
-    for _norm, members in groups.items():
+    for norm, members in groups.items():
         if len(members) < 2 or not _in_scope(scope, members):
             continue
         # Only merge if ALL emails are personal
@@ -348,8 +374,7 @@ def phase4_merge_same_name_diff_email(
         conn.execute("UPDATE people SET name = ? WHERE id = ?", (best_name, keep["id"]))
         _keep(scope, keep["id"])
         for m in members[1:]:
-            merge_person(conn, keep["id"], m["id"])
-            count += 1
+            count += _merge_or_queue(conn, keep["id"], m["id"], "phase4", f"name:{norm}")
 
     return count
 
@@ -389,7 +414,9 @@ def phase5_merge_email_as_name(conn: sqlite3.Connection, scope: set[int] | None 
         ).fetchone()
 
         if match:
-            merge_person(conn, match["id"], p["id"])
+            merge_person(
+                conn, match["id"], p["id"], method="address", evidence=f"address:{name_email}"
+            )
             count += 1
             _keep(scope, match["id"])
         elif p["email"] and p["email"].lower() == name_email:
@@ -423,7 +450,7 @@ def phase6_normalize_best_names(conn: sqlite3.Connection, scope: set[int] | None
         by_email[p["email"].lower().strip()].append(p)
 
     count = 0
-    for _email, members in by_email.items():
+    for address, members in by_email.items():
         if len(members) < 2 or not _in_scope(scope, members):
             continue
         best_name = pick_best_name([m["name"] for m in members])
@@ -431,7 +458,7 @@ def phase6_normalize_best_names(conn: sqlite3.Connection, scope: set[int] | None
         conn.execute("UPDATE people SET name = ? WHERE id = ?", (best_name, keep["id"]))
         _keep(scope, keep["id"])
         for m in members[1:]:
-            merge_person(conn, keep["id"], m["id"])
+            merge_person(conn, keep["id"], m["id"], method="address", evidence=f"address:{address}")
             count += 1
 
     return count
@@ -460,7 +487,7 @@ def phase7_merge_transliterated_variants(
             groups[key].append(p)
 
     count = 0
-    for _key, members in groups.items():
+    for key, members in groups.items():
         if len(members) < 2 or not _in_scope(scope, members):
             continue
         distinct_emails = {
@@ -477,9 +504,12 @@ def phase7_merge_transliterated_variants(
 
         # Merge (and delete) the others FIRST, so reassigning keep's email can't
         # collide with a soon-to-be-deleted duplicate on the UNIQUE(email) index.
+        merged = 0
         for m in members_sorted[1:]:
-            merge_person(conn, keep["id"], m["id"])
-            count += 1
+            merged += _merge_or_queue(conn, keep["id"], m["id"], "phase7", f"name:{key}")
+        count += merged
+        if not merged:
+            continue
         conn.execute(
             "UPDATE people SET name = ?, email = ? WHERE id = ?",
             (best_name, keep_email, keep["id"]),
@@ -487,6 +517,10 @@ def phase7_merge_transliterated_variants(
         _keep(scope, keep["id"])
 
     return count
+
+
+def _queued(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) FROM person_review").fetchone()[0]
 
 
 def _top_id(conn: sqlite3.Connection) -> int:
@@ -551,6 +585,8 @@ def run_dedup(
 
     before = conn.execute("SELECT COUNT(*) FROM people").fetchone()[0]
     results: dict = {"scope": None if scope is None else len(scope)}
+    identities = person_identity.active(conn)
+    queued_before = _queued(conn) if identities else 0
 
     print(f"Before: {before} people")
     if scope is not None:
@@ -595,9 +631,13 @@ def run_dedup(
     results["before"] = before
     results["after"] = after
     results["total_reduced"] = before - after
+    # Name-only matches waiting for the owner (gated person_identity, issue 170).
+    results["queued"] = _queued(conn) - queued_before if identities else 0
 
     print()
     print(f"After: {after} people ({before - after} removed)")
+    if results["queued"]:
+        print(f"Queued for review: {results['queued']} (brain maint people-review)")
 
     if keeps_marks:
         marks = [(HIGH_WATER_KEY, str(min(top_before, _top_id(conn))))]

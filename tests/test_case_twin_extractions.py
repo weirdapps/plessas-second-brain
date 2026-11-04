@@ -229,7 +229,7 @@ def _rows(conn, email_id):
             " WHERE et.email_id = ?"
         ),
         "people": column(
-            "SELECT p.name || ':' || ep.role_in_email FROM email_people ep"
+            "SELECT p.name || ':' || COALESCE(ep.role_text, ep.role_in_email) FROM email_people ep"
             " JOIN people p ON p.id = ep.person_id WHERE ep.email_id = ?"
         ),
     }

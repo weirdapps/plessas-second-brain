@@ -122,7 +122,7 @@ def test_due_addresses_are_colleagues_never_looked_up_most_mailed_first(conn):
             (f"m{n}", "2026-10-01T10:00:00"),
         ).lastrowid
         conn.execute(
-            "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, 'to')",
+            "INSERT INTO email_people (email_id, person_id, role_in_email) VALUES (?, ?, 'recipient')",
             (email_id, busy),
         )
     assert quiet != busy

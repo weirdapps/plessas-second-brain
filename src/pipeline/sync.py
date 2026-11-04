@@ -501,9 +501,12 @@ def run(args):
             r["session_id"]: (r["ended_at"], r["turn_count"])
             for r in conn_conv.execute("SELECT session_id, ended_at, turn_count FROM conversations")
         }
+        from src.store import forget_floor
+
+        conv_floor = forget_floor.floor(conn_conv, "conversation")
         conn_conv.close()
 
-        conv_export = export_conversations(days=7, loaded=loaded)
+        conv_export = export_conversations(days=7, loaded=loaded, floor=conv_floor)
         # Staged before and not loaded yet: the export no longer stages those again, and
         # one sb-conversation-sync extracted waits for a load here.
         waiting = conv_export.get("pending", 0)
@@ -684,6 +687,10 @@ def run(args):
         print(f"\nSync complete. {count} emails added. Sync timestamp left at {last_sync}.")
     else:
         print(f"\nSync complete. {count} emails added. Sync timestamp: {now}")
+    # What the forget floor kept out this run (issue 286): mail, documents, conversations.
+    from src.store import forget_floor
+
+    forget_floor.print_skipped()
 
     # Everything else ran and the rest of the mail stays pending, but extraction
     # did not finish. Before the deadline existed the same pause slept past the

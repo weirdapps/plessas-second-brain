@@ -362,6 +362,9 @@ def _print_reconcile(report) -> None:
         f"Missing: {len(report.missing):,}"
         + (f" by month {dict(sorted(months.items()))}" if months else "")
     )
+    forgotten = sum(counts.get("forgotten", 0) for counts in report.counts.values())
+    if forgotten:
+        print(f"Older than the forget floor, not refetched: {forgotten:,}")
     for m in report.missing[:20]:
         print(
             f"  {str(m.get('ReceivedDateTime') or '')[:16]}  {m['folder']:<10}"
@@ -932,13 +935,17 @@ def cmd_export_conversations(args):
 
     # The sessions in the database, with the end and turn count they were loaded
     # at: each is skipped unless it has gone on since.
+    from src.store import forget_floor
+
     loaded = {}
+    floor = None
     db_path = str(args.db)
     if Path(db_path).exists():
         try:
             conn = get_connection(db_path)
             rows = conn.execute("SELECT session_id, ended_at, turn_count FROM conversations")
             loaded = {r[0]: (r[1], r[2]) for r in rows}
+            floor = forget_floor.floor(conn, "conversation")
             conn.close()
             if loaded:
                 print(f"  {len(loaded)} conversations already in database (skipped unless grown)")
@@ -955,6 +962,7 @@ def cmd_export_conversations(args):
         workspace_filter=getattr(args, "workspace", None),
         loaded=loaded,
         include_agents=getattr(args, "include_agents", False),
+        floor=floor,
     )
 
     print(f"\nExported: {result['exported']}")
@@ -962,6 +970,8 @@ def cmd_export_conversations(args):
     if result["agents"]:
         print(f"Agent sessions left out: {result['agents']} (--include-agents keeps them)")
     print(f"Errors: {result['errors']}")
+    if result.get("below_floor"):
+        print(f"Older than the forget floor, not staged: {result['below_floor']}")
     if result["pending"]:
         print(f"Staged before, not loaded yet: {result['pending']}")
     if result["staged"]:
@@ -1272,7 +1282,9 @@ def cmd_teams_backfill_replies(args):
         print(
             f"Replies found: {c['replies_found']:,}; {c['replies_stored']:,} stored, "
             f"{c['replies_updated']:,} updated to a later version, "
-            f"{c['replies_found'] - c['replies_stored'] - c['replies_updated']:,} already stored"
+            f"{c['replies_below_floor']:,} older than the forget floor, not stored, "
+            f"{c['replies_found'] - c['replies_stored'] - c['replies_updated'] - c['replies_below_floor']:,}"
+            " already stored"
         )
         print(f"Posts dated by their own compose time: {c['posts_redated']:,}")
         b = bound_threads(conn)
@@ -3245,6 +3257,10 @@ def main():
     from src.store.retention import add_maint_parsers as add_retention_parsers
 
     add_retention_parsers(maint_subparsers)
+    # forget-floor: the date floor per source a forget --apply sets (issue 286).
+    from src.store.forget_floor import add_maint_parsers as add_floor_parsers
+
+    add_floor_parsers(maint_subparsers)
     # New with the numbers registry (schema v37): no old spelling to keep.
     parser_figures = maint_subparsers.add_parser(
         "figures-backfill",

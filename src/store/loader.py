@@ -133,6 +133,15 @@ def load_extractions(
     for msgid, im in staging_im.items():
         if im and im in db_imids:
             resolved.add(msgid)
+    # Older than the forget floor (issue 286): never loads, so its batch drains too.
+    from . import forget_floor
+
+    email_floor = forget_floor.floor(conn, "email")
+    resolved.update(
+        msgid
+        for msgid, metadata in staging_index.items()
+        if forget_floor.below(email_floor, metadata.get("date_received"))
+    )
     pruned, freed = _prune_loaded_batches(batch_to_msgids, resolved)
     if pruned > 0:
         print(f"  Pruned {pruned} fully-loaded batch files ({freed / 1024 / 1024:.1f} MB freed)")
@@ -329,6 +338,14 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
 
     # A duplicate: its move and alias are noted (see _note_stored).
     if _note_stored(conn, metadata):
+        return False
+
+    # Older than the email forget floor (issue 286): forgotten, so not stored again.
+    from . import forget_floor
+
+    if forget_floor.refuse(
+        "email", forget_floor.floor(conn, "email"), metadata.get("date_received")
+    ):
         return False
 
     # Not stored: about to write, so the checks again under the write lock.
@@ -936,8 +953,11 @@ def load_conversations(db_path: str) -> int:
         row[0]: (row[1], row[2])
         for row in conn.execute("SELECT session_id, ended_at, turn_count FROM conversations")
     }
+    from . import forget_floor
+
+    floor = forget_floor.floor(conn, "conversation")
     conn.close()
-    pruned, freed = _prune_staged_conversations(staging_dir, held_by, newest, read, stored)
+    pruned, freed = _prune_staged_conversations(staging_dir, held_by, newest, read, stored, floor)
     if pruned:
         print(f"  Pruned {pruned} staged conversation files ({freed / 1024 / 1024:.1f} MB freed)")
     return loaded_count
@@ -959,6 +979,7 @@ def _prune_staged_conversations(
     newest: dict[str, tuple[Path, int, dict]],
     read: dict[str, tuple[Path, int, dict]],
     stored: dict[str, tuple[str | None, int | None]],
+    floor: str | None = None,
 ) -> tuple[int, int]:
     """Remove the staged copies nothing can use any more, and split each batch written
     before one file per session into those files. Returns (files removed, bytes freed).
@@ -967,15 +988,17 @@ def _prune_staged_conversations(
     one its extraction read (the load pairs those), and the store holds neither it nor a
     later version: load_single_conversation loads only a copy that went on past what the
     store holds. So a loaded copy goes, and so does one a newer copy replaced before any
-    extraction read it.
+    extraction read it, and one older than the forget `floor`, which never loads (issue 286).
     """
     from src.export.conversation_export import staged_path
+
+    from .forget_floor import below
 
     usable = {(path, index): conv for path, index, conv in [*newest.values(), *read.values()]}
 
     def of_use(path: Path, session_id: str, index: int) -> dict | None:
         conv = usable.get((path, index))
-        if conv is None:
+        if conv is None or below(floor, _conversation_time(conv)):
             return None
         in_store = stored.get(session_id)
         return conv if in_store is None or conversation_went_on(conv, *in_store) else None
@@ -1011,6 +1034,11 @@ def conversation_went_on(metadata: dict, ended_at: str | None, turns: int | None
     return (metadata.get("ended_at") or "") > ended_at and count > (turns or 0)
 
 
+def _conversation_time(metadata: dict) -> str | None:
+    """What a conversation is dated by, as forget dates it: its end, else its start."""
+    return metadata.get("ended_at") or metadata.get("started_at") or None
+
+
 def delete_conversation(conn: sqlite3.Connection, conversation_id: int) -> None:
     """A conversation and everything loaded from it; the triggers update the
     full-text indexes. Its vector goes the next time build_index saves."""
@@ -1040,6 +1068,13 @@ def load_single_conversation(
         True if loaded, False if the store holds it and it has not gone on since
     """
     session_id = metadata["session_id"]
+    # Older than the conversation forget floor (issue 286): forgotten, not stored again.
+    from . import forget_floor
+
+    if forget_floor.refuse(
+        "conversation", forget_floor.floor(conn, "conversation"), _conversation_time(metadata)
+    ):
+        return False
 
     existing = conn.execute(
         "SELECT id, ended_at, turn_count FROM conversations WHERE session_id = ?", (session_id,)

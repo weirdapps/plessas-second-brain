@@ -379,8 +379,11 @@ def _without_stored_copies(
     pending, or extracted and on disk awaiting the load: one recorded as extracted
     whose file is gone never loads, and must not hold the other back. The ids are
     compared exactly, as the loader compares them, so a copy skipped here is one the
-    loader finds.
+    loader finds. An email older than the email forget floor is left out too: the
+    loader refuses it (issue 286), so the model would read it for nothing.
     """
+    from src.store import forget_floor
+
     extracted_copies: dict[str, list[str]] = {}
     for e in staged:
         if e.get("internet_message_id") and str(e.get("message_id", "")) in processed_ids:
@@ -390,12 +393,15 @@ def _without_stored_copies(
     claimed: set[str] = set()
     conn = sqlite3.connect(str(db_path), timeout=60) if db_path and Path(db_path).exists() else None
     kept: list[dict] = []
-    stored = held = 0
+    stored = held = forgotten = 0
     try:
+        email_floor = forget_floor.floor(conn, "email") if conn is not None else None
         for email in pending:
             message_id = str(email.get("message_id", ""))
             imid = email.get("internet_message_id") or None
-            if conn is not None and _is_stored(conn, message_id, imid):
+            if forget_floor.refuse("email", email_floor, email.get("date_received")):
+                forgotten += 1
+            elif conn is not None and _is_stored(conn, message_id, imid):
                 stored += 1
             elif imid and (
                 imid in claimed or any(map(_has_extraction, extracted_copies.get(imid, ())))
@@ -412,6 +418,8 @@ def _without_stored_copies(
         log(f"Skipped {stored} staged copies of emails already stored")
     if held:
         log(f"Held back {held} staged copies of messages already being extracted")
+    if forgotten:
+        log(f"Left out {forgotten} staged emails older than the forget floor")
     return kept
 
 

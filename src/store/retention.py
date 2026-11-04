@@ -30,6 +30,10 @@ throughout (4.5 minutes for 33,084 emails on a copy of the owner's store, 2026-1
 sb-* timers first, the dry run included, or the jobs wait for it. Cleanup that commits on its own (figure series
 read again) and files run only on --apply.
 
+--apply also sets the forget floor of each source it ran on (issue 286,
+src/store/forget_floor.py), in the same transaction: no sync or backfill stores an item older
+than it again. The dry run and --deleted-at-source set none.
+
 What this cannot reach is printed at the end of every run (UNREACHABLE): the backup tiers
 taken before it, the replicas until their next pull, the sources themselves.
 """
@@ -156,7 +160,8 @@ UNREACHABLE = (
     "- The --backup file this run wrote (or named): delete it once the result is checked.",
     "- Replicas (the Mac's brain.db and embeddings.npz) until their next hourly pull.",
     "- The sources: Outlook, Teams, WhatsApp, the calendar and ~/.claude/projects keep their "
-    "copies; a backfill or a re-export that reaches before the date would load them again.",
+    "copies. --apply sets each source's forget floor (src/store/forget_floor.py), so no sync "
+    "or backfill stores them again; `brain maint forget-floor --clear SOURCE` lifts it.",
     "- Logs under the data home and the journal may quote subjects; they are not rewritten.",
     "- People, topics and entities stay (names only), and so do session-note and SharePoint "
     "link records, which keep a forgotten note or file from being fetched again.",
@@ -175,6 +180,7 @@ class Result:
     files: int = 0
     file_bytes: int = 0
     skipped_undated: dict[str, int] = field(default_factory=dict)
+    floors: dict[str, str] = field(default_factory=dict)
 
 
 def parse_cutoff(text: str) -> str:
@@ -648,6 +654,11 @@ def forget(
         if not apply:
             conn.rollback()
             return result
+        # In the same transaction as the deletes (issue 286): what goes stays gone.
+        if cutoff is not None:
+            from src.store import forget_floor
+
+            result.floors = forget_floor.raise_floors(conn, chosen, cutoff)
         conn.commit()
     except BaseException:
         if conn.in_transaction:
@@ -767,6 +778,9 @@ def _print_result(result: Result) -> None:
     for table, n in result.skipped_undated.items():
         if n:
             print(f"Left alone, no date: {table} {n:,}")
+    if result.floors:
+        floors = ", ".join(f"{s} {d}" for s, d in sorted(result.floors.items()))
+        print(f"Forget floor (nothing older is stored again): {floors}")
 
 
 def cmd_forget(args) -> int:

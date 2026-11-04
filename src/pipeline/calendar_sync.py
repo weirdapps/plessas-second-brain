@@ -266,7 +266,13 @@ def run(args):
         "deferred": 0,
         "fetch_failed": 0,
         "fetch_failed_known": 0,
+        "below_floor": 0,
     }
+    # An event that ended before the calendar forget floor was forgotten (issue 286): the
+    # sync and the backfill neither fetch nor store it again.
+    from src.store import forget_floor
+
+    calendar_floor = forget_floor.floor(conn, "calendar")
 
     # Consecutive runs each event has failed get-event, kept beside the database.
     # They count the hourly window's runs: a backfill or a dry run leaves them alone.
@@ -341,6 +347,11 @@ def run(args):
         fetch_failures_before = len(failed_fetch_runs)
         for index, raw in enumerate(raw_events):
             event = parse_event(raw)
+            if forget_floor.refuse(
+                "calendar", calendar_floor, event.get("end_at") or event.get("start_at")
+            ):
+                stats["below_floor"] += 1
+                continue
             # Stored with the row, because the next run compares its list entry to it.
             list_change_key = event.get("change_key")
 
@@ -659,6 +670,8 @@ def run(args):
     print(f"  Failed:     {stats['failed']}")
     print(f"  Deferred:   {stats['deferred']}")
     print(f"  Fetch fail: {stats['fetch_failed']}")
+    if stats["below_floor"]:
+        print(f"  Older than the forget floor, not stored: {stats['below_floor']}")
     if stats["fetch_failed_known"]:
         print(
             f"  Still unfetchable after {CALENDAR_FETCH_ALERT_RUNS} runs (not failing the "

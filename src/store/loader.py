@@ -355,14 +355,19 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
         conn, mailbox, sender_address, metadata.get("subject"), _header_addresses(metadata)
     )
 
-    # Insert email record
+    # Insert email record. With the gated extraction_item_kind (issue 211), what a v2
+    # extraction says the email is goes in the same INSERT, so no UPDATE re-indexes it.
+    from .extraction_fields import applied as kind_applied
+    from .extraction_fields import item_kind
+
+    kind = (", item_kind", ", ?", (item_kind(extraction),)) if kind_applied(conn) else ("", "", ())
     cursor = conn.execute(
-        """
+        f"""
         INSERT INTO emails (
             message_id, internet_message_id, date_received, sender_name, sender_address,
             subject, summary, sentiment, urgency, language, mailbox_name, content,
-            in_reply_to, "references", conversation_id, source_class
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            in_reply_to, "references", conversation_id, source_class{kind[0]}
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?{kind[1]})
         """,
         (
             message_id,
@@ -381,6 +386,7 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
             references or None,
             conversation_id,
             source_class,
+            *kind[2],
         ),
     )
     email_id = cursor.lastrowid
@@ -753,13 +759,19 @@ def replace_extraction(
     have one, and they stay. The email keeps its id, and with it its attachments,
     HTML and thread; its vector is the caller's to drop.
     """
+    from .extraction_fields import applied as kind_applied
+    from .extraction_fields import item_kind
+
+    kind = (", item_kind = ?", (item_kind(right),)) if kind_applied(conn) else ("", ())
     conn.execute(
-        "UPDATE emails SET summary = ?, sentiment = ?, urgency = ?, language = ? WHERE id = ?",
+        "UPDATE emails SET summary = ?, sentiment = ?, urgency = ?, language = ?"
+        f"{kind[0]} WHERE id = ?",
         (
             right.get("summary"),
             right.get("sentiment"),
             right.get("urgency"),
             right.get("language"),
+            *kind[1],
             email_id,
         ),
     )

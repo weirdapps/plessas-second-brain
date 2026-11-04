@@ -170,6 +170,29 @@ ATTACHMENT_SCHEMA_V2 = _object(
         "key_facts": _TEXTS,
     }
 )
+# A calendar event's two answer shapes (issue 203, kept by issue 211's v2 route): an
+# invitation's purpose, agenda and who is expected, with no items; and a past meeting's
+# summary, decisions and action items, from its notes, each with the quote it rests on.
+# Their keys are the ones the calendar loader reads (src/store/calendar_loader.py).
+CALENDAR_INVITATION_SCHEMA_V2 = _object({"purpose": _TEXT, "agenda": _TEXTS, "expected": _TEXT})
+CALENDAR_MEETING_SCHEMA_V2 = _object(
+    {
+        "body_summary": _TEXT,
+        "decisions": _array(
+            _object(
+                {
+                    "evidence": _TEXT,
+                    "decision": _TEXT,
+                    "decided_by": _TEXT,
+                    "decision_date": _DATE_OR_NULL,
+                }
+            )
+        ),
+        "action_items": _array(
+            _object({"evidence": _TEXT, "task": _TEXT, "owner": _TEXT, "deadline": _DATE_OR_NULL})
+        ),
+    }
+)
 SCHEMAS = {"email": EMAIL_SCHEMA_V2, "attachment": ATTACHMENT_SCHEMA_V2}
 
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")

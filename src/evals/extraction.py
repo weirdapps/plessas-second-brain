@@ -1534,6 +1534,27 @@ def _judge_summary(rows: list[dict]) -> dict:
     return out
 
 
+def sweep_table(records: list[dict]) -> list[str]:
+    """An effort sweep's runs, one line each after a header (issue 211): the effort, the
+    pass rate of applicable checks, the rows graded, cut short, refused and failed, the
+    output and thinking tokens, and the cost. The thinking tokens are what an effort moves;
+    0 where the platform reported none (the usage log keeps those as null)."""
+    out = [
+        f"{'effort':<8} {'pass':>7} {'rows':>5} {'cut':>4} {'refused':>7} {'errors':>6}"
+        f" {'output':>10} {'thinking':>10} {'cost':>8}"
+    ]
+    for record in records:
+        rows, usage = record["rows"], record.get("usage") or {}
+        rate = record.get("pass_rate")
+        out.append(
+            f"{record['effort']:<8} {(f'{rate:.1%}' if rate is not None else 'n/a'):>7}"
+            f" {rows['scored']:>5} {rows['truncated']:>4} {rows['refused']:>7}"
+            f" {rows['errors']:>6} {usage.get('output_tokens', 0):>10,}"
+            f" {usage.get('thinking_tokens', 0):>10,} {'$' + format(record['cost_usd'], '.2f'):>8}"
+        )
+    return out
+
+
 def _usage_total(usages: list[dict]) -> dict[str, int]:
     return {key: sum(u.get(key, 0) for u in usages) for key in USAGE_KEYS}
 

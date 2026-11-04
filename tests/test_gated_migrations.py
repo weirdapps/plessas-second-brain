@@ -116,8 +116,9 @@ def test_a_store_stamped_43_by_the_numbered_build_is_renumbered(tmp_path):
     run_migrations(db)
 
     assert get_schema_version(db) == CURRENT_SCHEMA_VERSION
-    # The two steps that build held are recorded; thread_identity (issue 179) came after it.
-    assert pending_gated(db) == ["thread_identity"]
+    # The two steps that build held are recorded; thread_identity (issue 179) and
+    # extraction_item_kind (issue 211) came after it.
+    assert pending_gated(db) == ["thread_identity", "extraction_item_kind"]
     db.close()
 
 

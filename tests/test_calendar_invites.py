@@ -17,6 +17,14 @@ import pytest
 from src.extract import calendar_extractor
 from src.extract.calendar_extractor import event_prompt_hash, extract_event
 
+
+@pytest.fixture(autouse=True)
+def _v1(monkeypatch):
+    """These tests read the v1 prompt; call shapes v2 and v2-text have their own
+    (tests/test_calendar_call_shape_v2.py)."""
+    monkeypatch.setenv("BRAIN_EXTRACT_CALL_SHAPE", "v1")
+
+
 _AGENDA = "Agenda: review the third quarter figures, agree the card budget, assign the follow-ups."
 
 

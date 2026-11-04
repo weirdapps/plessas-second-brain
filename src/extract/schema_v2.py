@@ -193,6 +193,18 @@ CALENDAR_MEETING_SCHEMA_V2 = _object(
         ),
     }
 )
+
+
+def with_topics(schema: dict) -> dict:
+    """A calendar answer shape that also holds the event's topic tags (issue 281), asked
+    only with BRAIN_EXTRACT_CHAT_TOPICS on a store with the gated topic_registry."""
+    return {
+        **schema,
+        "required": [*schema["required"], "topics"],
+        "properties": {**schema["properties"], "topics": _TEXTS},
+    }
+
+
 SCHEMAS = {"email": EMAIL_SCHEMA_V2, "attachment": ATTACHMENT_SCHEMA_V2}
 
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")

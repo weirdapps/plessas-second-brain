@@ -144,7 +144,11 @@ def cached_prompt(route: str, system: str, user: str) -> tuple[list[dict], str]:
     thread, mark, keys = user.partition(_KEYS_MARK)
     instructions = f"{system}{mark}{keys}".rstrip() if mark else system
     commitments = '"commitments"' in keys
-    blocks = system_blocks(instructions, examples_text(route, commitments=commitments))
+    # Topics (issue 281), when topic_registry.with_topics asked for them (issue 180).
+    topics = '"topics"' in keys
+    blocks = system_blocks(
+        instructions, examples_text(route, commitments=commitments, topics=topics)
+    )
     return blocks, f"{thread.rstrip()}\n\n{RESTATE}"
 
 

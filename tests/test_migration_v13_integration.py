@@ -47,7 +47,7 @@ def test_run_migrations_v12_to_v13():
 
         # Verify version bumped to the current schema version (migrations run forward
         # through every pending step, not just v13).
-        assert schema.get_schema_version(conn) == schema.CURRENT_SCHEMA_VERSION
+        assert schema.get_schema_version(conn) == schema.AUTO_SCHEMA_VERSION
 
         # Verify calendar tables exist
         tables = {

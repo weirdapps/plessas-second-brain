@@ -91,6 +91,7 @@ for _module in (
     "src.store.findings",
     "src.store.greek",
     "src.store.items",
+    "src.store.ledger",
     "src.store.query",
     "src.store.recall",
     "src.store.teams_query",

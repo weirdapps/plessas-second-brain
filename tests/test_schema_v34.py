@@ -12,7 +12,7 @@ import sqlite3
 
 import pytest
 
-from src.config import CURRENT_SCHEMA_VERSION
+from src.config import AUTO_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION
 from src.store.dedup_people import phase5_merge_email_as_name
 from src.store.normalizer import find_or_create_person
 from src.store.schema import (
@@ -294,7 +294,7 @@ def test_a_v33_store_migrates_to_what_a_fresh_store_is(tmp_path):
 
     run_migrations(old)
 
-    assert get_schema_version(old) == CURRENT_SCHEMA_VERSION
+    assert get_schema_version(old) == AUTO_SCHEMA_VERSION
     assert _schema(old) == _schema(fresh)
     fresh.close()
     old.close()

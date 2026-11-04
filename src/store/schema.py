@@ -13,15 +13,18 @@ from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from src.config import CURRENT_SCHEMA_VERSION
+from src.config import AUTO_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION
 from src.store.greek import register_sql_functions
 
 
-def create_database(db_path: str) -> sqlite3.Connection:
+def create_database(db_path: str, gated: bool = True) -> sqlite3.Connection:
     """Create a new SQLite database with all tables and indexes.
 
     Args:
         db_path: Path to the SQLite database file
+        gated: Take the gated migrations too (run_migrations), as a new store has no
+            rows for them to change. False builds a store as a producer holds it before
+            the owner runs `brain maint migrate --ledger`.
 
     Returns:
         sqlite3.Connection object
@@ -391,7 +394,7 @@ def create_database(db_path: str) -> sqlite3.Connection:
     conn.execute("INSERT INTO schema_version (version) VALUES (0)")
     conn.commit()
 
-    run_migrations(conn)
+    run_migrations(conn, gated=gated)
     conn.commit()
     return conn
 
@@ -430,8 +433,14 @@ def set_schema_version(conn: sqlite3.Connection, version: int) -> None:
     conn.commit()
 
 
-def run_migrations(conn: sqlite3.Connection) -> None:
-    """Run all pending migrations based on schema version."""
+def run_migrations(conn: sqlite3.Connection, gated: bool = False) -> None:
+    """Run all pending migrations based on schema version.
+
+    Every job that writes calls this on opening the store, so a migration merged reaches the
+    producer's store at its next pull. Those past AUTO_SCHEMA_VERSION are gated: they run
+    only with `gated`, which `brain maint migrate --ledger` and create_database pass, and a
+    store already past them is never stepped back.
+    """
     current = get_schema_version(conn)
 
     if current < 1:
@@ -519,9 +528,14 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 41:
         migrate_received_times_utc(conn)
         migrate_mail_hygiene(conn)
+    if current < 42 and gated:
+        from src.store.ledger import migrate as migrate_add_item_ledger
 
-    if current < CURRENT_SCHEMA_VERSION:
-        set_schema_version(conn, CURRENT_SCHEMA_VERSION)
+        migrate_add_item_ledger(conn)
+
+    target = CURRENT_SCHEMA_VERSION if gated else AUTO_SCHEMA_VERSION
+    if current < target:
+        set_schema_version(conn, target)
 
 
 # A received time stored with no zone: the retired Apple Mail exporter wrote its Mac's wall

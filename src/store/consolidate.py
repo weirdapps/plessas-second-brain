@@ -897,6 +897,7 @@ def revert(conn: sqlite3.Connection, target: str) -> int:
         f" WHERE {column} = ? AND undone_at IS NULL ORDER BY id DESC",
         (target,),
     ).fetchall()
+    reverted: dict[str, set[int]] = {}
     for label_id, table, item_id, prior in rows:
         values = {
             key: value for key, value in json.loads(prior or "{}").items() if key in _PRIOR_COLUMNS
@@ -906,6 +907,12 @@ def revert(conn: sqlite3.Connection, target: str) -> int:
         sets = ", ".join(f"{column} = ?" for column in values)
         conn.execute(f"UPDATE {table} SET {sets} WHERE id = ?", (*values.values(), item_id))
         conn.execute("UPDATE item_labels SET undone_at = ? WHERE id = ?", (_now(), label_id))
+        reverted.setdefault(table, set()).add(item_id)
+    # The ledger (schema v42) follows: a revert is the one way an entry goes back to open.
+    from src.store import ledger
+
+    for table, ids in reverted.items():
+        ledger.resync(conn, table, ids)
     if column == "thread_key" and rows:
         # A thread put back is not called again on the same items until someone looks.
         conn.execute(
@@ -1713,14 +1720,24 @@ def run_in_sync(db_path: str, deadline_s: float) -> RunStats:
     conn = get_connection(db_path)
     try:
         run_migrations(conn)
+        # The ledger (schema v42) first, so the items this hour's syncs extracted again get
+        # back the status they held, then again for the labels this pass wrote. A no-op on
+        # a store without it.
+        from src.store import ledger
+
+        ledger.reconcile(conn)
+        conn.commit()
         tokens = sync_token_budget()
         model = tokens > 0 and EXTRACT_ENGINE == "claude"
-        return consolidate(
+        stats = consolidate(
             conn,
             budget=TokenBudget(tokens) if model else None,
             deadline_s=deadline_s,
             model=model,
         )
+        ledger.reconcile(conn)
+        conn.commit()
+        return stats
     finally:
         conn.close()
 

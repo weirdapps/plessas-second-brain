@@ -3064,6 +3064,9 @@ def main():
     from src.store import consolidate, entities, topic_canon
 
     consolidate.add_maint_parser(maint_subparsers)
+    from src.store import entity_pass
+
+    entity_pass.add_maint_parser(maint_subparsers)
     entities.add_maint_parser(maint_subparsers)
     topic_canon.add_maint_parser(maint_subparsers)
     # teams-repair, teams-empty-summaries (src/extract/teams_repair.py) and news-dedup

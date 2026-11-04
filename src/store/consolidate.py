@@ -1737,6 +1737,12 @@ def run_in_sync(db_path: str, deadline_s: float) -> RunStats:
         )
         ledger.reconcile(conn)
         conn.commit()
+        # Then the pass per entity (src/store/entity_pass.py): the same item asked in
+        # another thread of one counterpart. Rule only; a no-op without the ledger.
+        from src.store import entity_pass
+
+        entity_pass.run_hourly(conn)
+        conn.commit()
         return stats
     finally:
         conn.close()

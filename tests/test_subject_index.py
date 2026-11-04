@@ -9,7 +9,7 @@ import sqlite3
 
 import pytest
 
-from src.config import AUTO_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION
+from src.config import CURRENT_SCHEMA_VERSION
 from src.store.query import _sanitize_fts5_query, query_by_keyword
 from src.store.schema import (
     create_database,
@@ -71,7 +71,7 @@ def test_an_upgraded_store_indexes_the_subjects_it_already_held(tmp_path):
 
     run_migrations(conn)
 
-    assert get_schema_version(conn) == AUTO_SCHEMA_VERSION
+    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION
     assert _subject_hits(conn, "zebrafinch") == 1
     conn.execute(_EMAIL, (2, "Okapi budget"))
     conn.execute("DELETE FROM emails WHERE message_id = 1")

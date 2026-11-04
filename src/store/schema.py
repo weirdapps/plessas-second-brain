@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from src.config import AUTO_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION
+from src.config import CURRENT_SCHEMA_VERSION
 from src.store.greek import register_sql_functions
 
 
@@ -22,9 +22,9 @@ def create_database(db_path: str, gated: bool = True) -> sqlite3.Connection:
 
     Args:
         db_path: Path to the SQLite database file
-        gated: Take the gated migrations too (run_migrations), as a new store has no
+        gated: Apply the gated migrations too (GATED_MIGRATIONS), as a new store has no
             rows for them to change. False builds a store as a producer holds it before
-            the owner runs `brain maint migrate --ledger`.
+            the owner runs `brain maint migrate --apply-gated`.
 
     Returns:
         sqlite3.Connection object
@@ -436,11 +436,14 @@ def set_schema_version(conn: sqlite3.Connection, version: int) -> None:
 def run_migrations(conn: sqlite3.Connection, gated: bool = False) -> None:
     """Run all pending migrations based on schema version.
 
-    Every job that writes calls this on opening the store, so a migration merged reaches the
-    producer's store at its next pull. Those past AUTO_SCHEMA_VERSION are gated: they run
-    only with `gated`, which `brain maint migrate --ledger` and create_database pass, and a
-    store already past them is never stepped back.
+    Every job that writes calls this on opening the store, so a numbered migration merged
+    reaches the producer's store at its next pull. The gated ones (GATED_MIGRATIONS) are
+    named, not numbered: they run only with `gated`, which `brain maint migrate
+    --apply-gated` and create_database pass, and whether they are applied is recorded in
+    gated_migrations, not in schema_version. So a numbered migration added later runs on a
+    store whose gated ones wait, and they apply cleanly after it.
     """
+    _unnumber_gated(conn)
     current = get_schema_version(conn)
 
     if current < 1:
@@ -528,18 +531,99 @@ def run_migrations(conn: sqlite3.Connection, gated: bool = False) -> None:
     if current < 41:
         migrate_received_times_utc(conn)
         migrate_mail_hygiene(conn)
-    if current < 42 and gated:
-        from src.store.ledger import migrate as migrate_add_item_ledger
 
-        migrate_add_item_ledger(conn)
-    if current < 43 and gated:
-        from src.store.ledger import migrate_commitment_parents
+    if current < CURRENT_SCHEMA_VERSION:
+        set_schema_version(conn, CURRENT_SCHEMA_VERSION)
+    if gated:
+        apply_gated(conn)
+        conn.commit()
 
-        migrate_commitment_parents(conn)
 
-    target = CURRENT_SCHEMA_VERSION if gated else AUTO_SCHEMA_VERSION
-    if current < target:
-        set_schema_version(conn, target)
+# --- gated migrations ---------------------------------------------------------------------
+#
+# A migration the owner runs by hand, after a backup and a dry run (issue 168): named, in
+# order, each recorded in gated_migrations when it is applied. Not part of schema_version,
+# so it neither blocks nor reorders the numbered ones.
+
+GATED_TABLE = """CREATE TABLE IF NOT EXISTS gated_migrations (
+    name TEXT PRIMARY KEY,
+    applied_at TEXT NOT NULL,
+    backup TEXT
+)"""
+
+
+def _gated_steps():
+    from src.store import ledger
+
+    # (name, function): the item ledger (v42 while numbered), then the parents a commitment
+    # can have besides an email (v43).
+    return (
+        ("item_ledger", ledger.migrate),
+        ("commitment_parents", ledger.migrate_commitment_parents),
+    )
+
+
+GATED_MIGRATIONS = ("item_ledger", "commitment_parents")
+
+
+def _tables(conn: sqlite3.Connection) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+
+
+def applied_gated(conn: sqlite3.Connection) -> set[str]:
+    """The gated migrations this store has taken."""
+    if "gated_migrations" not in _tables(conn):
+        return set()
+    return {r[0] for r in conn.execute("SELECT name FROM gated_migrations")}
+
+
+def pending_gated(conn: sqlite3.Connection) -> list[str]:
+    """The gated migrations this store has not taken, in the order they apply."""
+    done = applied_gated(conn)
+    return [name for name in GATED_MIGRATIONS if name not in done]
+
+
+def apply_gated(conn: sqlite3.Connection, backup: str | None = None) -> list[str]:
+    """Apply the pending gated migrations in order and record each; the names applied.
+    Nothing is committed here: the caller commits, or rolls back for a dry run (DDL is
+    transactional in SQLite)."""
+    pending = set(pending_gated(conn))
+    if not pending:
+        return []
+    conn.execute(GATED_TABLE)
+    applied = []
+    for name, step in _gated_steps():
+        if name not in pending:
+            continue
+        step(conn)
+        conn.execute(
+            "INSERT INTO gated_migrations (name, applied_at, backup) VALUES (?, ?, ?)",
+            (name, datetime.now(UTC).isoformat(timespec="seconds"), backup),
+        )
+        applied.append(name)
+    return applied
+
+
+def _unnumber_gated(conn: sqlite3.Connection) -> None:
+    """A store a build of 2026-11-04 stamped 42 or 43 for the gated steps, when they were
+    numbered (only new stores and test copies: no producer ran them): schema_version back
+    to the numbered head, and the steps it holds recorded as applied. Recognised by the
+    item_ledger table with no gated_migrations beside it."""
+    tables = _tables(conn)
+    if "item_ledger" not in tables or "gated_migrations" in tables:
+        return
+    if get_schema_version(conn) not in (42, 43):
+        return
+    conn.execute(GATED_TABLE)
+    held = ["item_ledger"]
+    if "teams_thread_id" in {r[1] for r in conn.execute("PRAGMA table_info(commitments)")}:
+        held.append("commitment_parents")
+    for name in held:
+        conn.execute(
+            "INSERT OR IGNORE INTO gated_migrations (name, applied_at, backup) VALUES (?, ?, ?)",
+            (name, datetime.now(UTC).isoformat(timespec="seconds"), "renumbered"),
+        )
+    set_schema_version(conn, CURRENT_SCHEMA_VERSION)
 
 
 # A received time stored with no zone: the retired Apple Mail exporter wrote its Mac's wall

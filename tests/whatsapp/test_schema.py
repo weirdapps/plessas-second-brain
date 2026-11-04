@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from src.config import AUTO_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION
+from src.config import CURRENT_SCHEMA_VERSION
 from src.store.query import _sanitize_fts5_query
 from src.store.schema import (
     create_database,
@@ -88,7 +88,7 @@ def test_a_v25_store_migrates_to_v26(tmp_path):
         conn.execute(f"DROP TABLE {table}")
     set_schema_version(conn, 25)
     run_migrations(conn)
-    assert get_schema_version(conn) == AUTO_SCHEMA_VERSION
+    assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION
     assert _columns(conn, "whatsapp_messages")
     conn.close()
 
@@ -97,4 +97,4 @@ def test_running_the_migrations_twice_is_a_no_op(db):
     run_migrations(db)
     set_schema_version(db, 25)
     run_migrations(db)
-    assert get_schema_version(db) == AUTO_SCHEMA_VERSION
+    assert get_schema_version(db) == CURRENT_SCHEMA_VERSION

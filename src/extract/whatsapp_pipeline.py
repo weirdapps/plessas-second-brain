@@ -160,7 +160,7 @@ def _extract_one(conn: sqlite3.Connection, thread_id: int) -> str:
                 "VALUES (?, ?, ?, 'open', ?)",
                 (redact_secrets(a.get("task", "")), a.get("owner"), a.get("deadline"), thread_id),
             )
-        # Commitments, on a store at v43 (src/store/ledger.py); none before, as ever.
+        # Commitments, on a store with the gated commitment parents (src/store/ledger.py); none before, as ever.
         ledger.write_thread_commitments(
             conn, "whatsapp_thread_id", thread_id, data.get("commitments")
         )

@@ -101,7 +101,7 @@ def build_prompt(thread: dict, messages: list[dict]) -> tuple[str, str]:
 
 
 # Commitments (issue 168), asked of a thread only on a store that can hold them: schema
-# v43 (src/store/ledger.py), gated, so the prompts above go out unchanged until the owner
+# the gated commitment_parents migration (src/store/ledger.py), so the prompts above go out unchanged until the owner
 # takes that step. Shared with the WhatsApp prompt.
 COMMITMENT_RULE = (
     "Also write commitments, in the same language: a commitment is a promise a participant"

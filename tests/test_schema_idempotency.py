@@ -186,7 +186,7 @@ def test_migrating_again_from_a_version_changes_nothing(reference, tmp_path, ver
 
     for _ in range(2):
         set_schema_version(conn, version)
-        # The whole chain, the gated v42 included, as `brain maint migrate --ledger` runs it.
+        # The whole chain, the gated steps included, as `brain maint migrate --apply-gated` runs it.
         run_migrations(conn, gated=True)
 
     assert get_schema_version(conn) == CURRENT_SCHEMA_VERSION

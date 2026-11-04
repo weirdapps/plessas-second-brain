@@ -1499,32 +1499,133 @@ def cmd_news_sync(args):
 
 
 def cmd_migrate(args):
-    """Run all database migrations."""
-    from src.store.schema import get_connection, get_schema_version, run_migrations
+    """Run the numbered migrations; with --apply-gated, the gated ones too.
+
+    --apply-gated refuses without --backup PATH: it writes PATH with sqlite's online
+    backup first, or takes an existing PATH less than an hour old. --dry-run runs the
+    numbered and gated steps in one transaction, prints the counts they change, and rolls
+    back: it needs no backup and writes nothing.
+    """
+    from src.config import CURRENT_SCHEMA_VERSION, is_replica, replica_refusal
+    from src.store import ledger
+    from src.store.schema import (
+        apply_gated,
+        get_connection,
+        get_schema_version,
+        pending_gated,
+        run_migrations,
+    )
 
     db_path = str(args.db)
     if not Path(db_path).exists():
         print("Error: Database not found.")
         sys.exit(1)
+    gated = getattr(args, "apply_gated", False)
+    dry_run = getattr(args, "dry_run", False)
+    if dry_run and not gated:
+        print("Error: --dry-run goes with --apply-gated.", file=sys.stderr)
+        sys.exit(2)
+    if gated and is_replica():
+        print(replica_refusal("migrate --apply-gated"), file=sys.stderr)
+        sys.exit(2)
 
     conn = get_connection(db_path)
-
     before = get_schema_version(conn)
     print(f"Current schema version: {before}")
-    print("Running migrations...")
+    if not gated:
+        print("Running migrations...")
+        run_migrations(conn)
+        after = get_schema_version(conn)
+        waiting = pending_gated(conn)
+        conn.close()
+        if after > before:
+            print(f"Migrated from version {before} to {after}.")
+        else:
+            print("Database is already up to date.")
+        if waiting:
+            print(f"Gated, not applied: {', '.join(waiting)} (brain maint migrate --apply-gated)")
+        return
 
-    # --ledger takes the gated migrations (src/store/schema.py run_migrations): v42, the
-    # item ledger, which stamps every stored decision, action and commitment. Take a
-    # snapshot first (docs/DEPLOY.md section 12).
-    run_migrations(conn, gated=getattr(args, "ledger", False))
-
-    after = get_schema_version(conn)
-    conn.close()
-
-    if after > before:
-        print(f"Migrated from version {before} to {after}.")
+    if dry_run:
+        if before < CURRENT_SCHEMA_VERSION:
+            print(
+                f"Error: numbered migrations are pending ({before} < {CURRENT_SCHEMA_VERSION}): "
+                "run `brain maint migrate` first, so the dry run shows the gated steps alone.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
     else:
-        print("Database is already up to date.")
+        run_migrations(conn)
+    pending = pending_gated(conn)
+    if not pending:
+        conn.close()
+        print("No gated migration is pending.")
+        return
+    backup = None
+    if not dry_run:
+        backup = _gated_backup(conn, getattr(args, "backup", None))
+    counts_before = ledger.counts(conn)
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        applied = apply_gated(conn, backup)
+        counts_after = ledger.counts(conn)
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    print(("Dry run, rolled back: " if dry_run else "Applied: ") + ", ".join(applied))
+    for key in sorted(set(counts_before) | set(counts_after)):
+        old, new = counts_before.get(key, 0), counts_after.get(key, 0)
+        mark = f"  ({new - old:+,})" if new != old else ""
+        print(f"  {key}: {old:,} -> {new:,}{mark}")
+
+
+def _gated_backup(conn, path) -> str:
+    """The backup --apply-gated stands on: PATH written now with sqlite's online backup
+    (the API behind the sqlite3 shell's .backup), or an existing PATH under an hour old
+    that opens as a store. Exits 2 without one."""
+    import sqlite3
+    import time
+
+    if not path:
+        print(
+            "Error: --apply-gated needs --backup PATH (a new file it writes first, or a "
+            "backup under an hour old). --dry-run shows what it would change.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    target = Path(path).expanduser()
+    if target.exists():
+        age = time.time() - target.stat().st_mtime
+        if age > 3600:
+            print(f"Error: {target} is {age / 3600:.1f} h old; take a new backup.", file=sys.stderr)
+            sys.exit(2)
+        try:
+            check = sqlite3.connect(str(target))
+            check.execute("SELECT version FROM schema_version").fetchone()
+            check.close()
+        except sqlite3.Error as exc:
+            print(f"Error: {target} is not a readable store ({exc}).", file=sys.stderr)
+            sys.exit(2)
+        print(f"Backup: {target} (taken {age / 60:.0f} min ago)")
+        return str(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if conn.in_transaction:
+        conn.commit()
+    copy = sqlite3.connect(str(target))
+    try:
+        conn.backup(copy)
+    finally:
+        copy.close()
+    print(f"Backup: {target} (written now)")
+    return str(target)
 
 
 def cmd_classify_sources(args):
@@ -2892,10 +2993,22 @@ def main():
     # Migrate command
     parser_migrate = subparsers.add_parser("migrate", help="Run database migrations")
     parser_migrate.add_argument(
-        "--ledger",
+        "--apply-gated",
         action="store_true",
-        help="Also run the gated v42 migration: the item ledger (issue 168), which stamps "
-        "every stored decision, action and commitment. Snapshot the store first.",
+        help="Also apply the gated migrations (the item ledger and commitments from Teams "
+        "and WhatsApp, issue 168). Needs --backup, or --dry-run first.",
+    )
+    parser_migrate.add_argument(
+        "--backup",
+        metavar="PATH",
+        help="With --apply-gated: a new file to back the store up to first, or a backup "
+        "under an hour old",
+    )
+    parser_migrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="With --apply-gated: run every step in one transaction, print what it "
+        "changes, roll back",
     )
     parser_migrate.set_defaults(func=cmd_migrate)
 

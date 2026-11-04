@@ -168,6 +168,13 @@ def _log_usage(
             "effort": effort,
             "prompt_hash": prompt_hash,
         }
+        # The run this call fell in (issue 173): its tokens are added to job_runs too.
+        from src.store import job_runs
+
+        run_id = job_runs.current_run_id()
+        if run_id is not None:
+            record["run_id"] = run_id
+            job_runs.add_usage(usage)
         if batch_job is not None:
             record["batch_job"] = batch_job
             record["custom_id"] = custom_id

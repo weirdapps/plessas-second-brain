@@ -48,7 +48,7 @@ def run(args):
     from src.extract.teams_pipeline import extract_threads
     from src.extract.teams_threads import bound_threads
     from src.store.embeddings import build_teams_index
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     db_path = str(args.db)
     if not Path(db_path).exists():
@@ -56,7 +56,7 @@ def run(args):
         sys.exit(1)
 
     conn = get_connection(db_path)
-    run_migrations(conn)
+    ensure_schema(conn)
 
     pull_failed = False
     if not getattr(args, "skip_pull", False):

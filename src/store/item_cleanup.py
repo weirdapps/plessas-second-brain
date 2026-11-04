@@ -421,10 +421,10 @@ def reextract_stacked(
 
 
 def _connect(args) -> sqlite3.Connection:
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     conn = get_connection(str(args.db))
-    run_migrations(conn)
+    ensure_schema(conn)
     return conn
 
 

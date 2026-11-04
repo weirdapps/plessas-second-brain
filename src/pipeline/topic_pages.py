@@ -410,7 +410,7 @@ def cmd(args) -> int:
     import sys
 
     from src import config
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
     from src.store.sql_readonly import connect_read_only
 
     if not args.estimate and config.is_replica():
@@ -420,7 +420,7 @@ def cmd(args) -> int:
         conn = connect_read_only(args.db, immutable=config.is_pulled_copy())
     else:
         conn = get_connection(str(args.db))
-        run_migrations(conn)
+        ensure_schema(conn)
     try:
         topics = select_live_topics(conn)
         if args.topic:

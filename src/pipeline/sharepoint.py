@@ -69,7 +69,7 @@ def run(args):
     from src.extract.sharepoint_url_scanner import extract_sharepoint_urls
     from src.extract.teams_file_links import message_urls
     from src.store.email_html import markup_or_text
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     db_path = str(args.db)
     if not Path(db_path).exists():
@@ -83,7 +83,7 @@ def run(args):
         from src.extract.sharepoint_ingest import ingest_fetched_backlog
 
         conn = get_connection(db_path)
-        run_migrations(conn)
+        ensure_schema(conn)
         try:
             backlog = ingest_fetched_backlog(
                 conn, [SHAREPOINT_DATA_DIR, ATTACHMENTS_DIR / "sharepoint-refetch"]
@@ -99,7 +99,7 @@ def run(args):
         from src.export.sharepoint_repair import reread_pages, rescan_links, unheld_files
 
         conn = get_connection(db_path)
-        run_migrations(conn)
+        ensure_schema(conn)
         try:
             links = rescan_links(conn, apply=not args.dry_run)
             pages = reread_pages(conn, apply=not args.dry_run)
@@ -154,7 +154,7 @@ def run(args):
 
     # Ensure schema is up to date
     conn = get_connection(db_path)
-    run_migrations(conn)
+    ensure_schema(conn)
 
     # Build query. Links are read from the markup: an HTML body is kept in
     # email_html, the text in content has no hrefs.

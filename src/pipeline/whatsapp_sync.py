@@ -43,7 +43,7 @@ def run(args):
     from src.extract.whatsapp_pipeline import extract_threads
     from src.extract.whatsapp_threads import bound_threads
     from src.store.embeddings import build_whatsapp_index
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     db_path = str(args.db)
     if not Path(db_path).exists():
@@ -51,7 +51,7 @@ def run(args):
         sys.exit(1)
 
     conn = get_connection(db_path)
-    run_migrations(conn)
+    ensure_schema(conn)
     try:
         snapshot = Path(args.snapshot) if args.snapshot else WHATSAPP_SNAPSHOT
         print("Step 1/4: ingesting the snapshot...")

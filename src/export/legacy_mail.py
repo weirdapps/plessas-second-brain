@@ -579,10 +579,10 @@ def _open(db_path, dry_run: bool) -> sqlite3.Connection:
         from src.store.sql_readonly import connect_read_only
 
         return connect_read_only(db_path)
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     conn = get_connection(str(db_path))
-    run_migrations(conn)
+    ensure_schema(conn)
     return conn
 
 

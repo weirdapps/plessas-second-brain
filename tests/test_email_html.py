@@ -10,6 +10,8 @@ import argparse
 import sqlite3
 from unittest.mock import patch
 
+import pytest
+
 from src.config import CURRENT_SCHEMA_VERSION
 from src.store.email_html import markup_or_text, pack, split_body, unpack
 from src.store.schema import create_database, get_connection, run_migrations
@@ -471,15 +473,28 @@ def _kept(path):
     return row[0], row[1] is not None and unpack(row[1]) == HTML, version
 
 
-def test_loading_emails_migrates_an_older_store_first(tmp_path):
+def test_loading_emails_into_an_older_store_refuses_until_it_is_migrated(tmp_path, monkeypatch):
     """Loaded into a v22 store, an HTML body was converted, and saving its HTML
-    failed: pulled before the migration ran, the code would lose it."""
+    failed: pulled before the migration ran, the code would lose it. The load now
+    refuses the older store and writes nothing (issue 173); once migrated, it loads."""
     from src.store.loader import load_extractions
+    from src.store.schema import SchemaBehind, get_connection, run_migrations
 
+    monkeypatch.setenv("BRAIN_MIGRATE_ON_OPEN", "0")
     db = tmp_path / "b.db"
     _older_store(db)
     staging, extracted = _staged(tmp_path)
 
+    with pytest.raises(SchemaBehind):
+        load_extractions(str(db), str(extracted), str(staging))
+    probe = sqlite3.connect(db)
+    assert probe.execute("SELECT version FROM schema_version").fetchone()[0] == 22
+    assert probe.execute("SELECT COUNT(*) FROM emails").fetchone()[0] == 0
+    probe.close()
+
+    conn = get_connection(str(db))
+    run_migrations(conn)
+    conn.close()
     assert load_extractions(str(db), str(extracted), str(staging)) == 1
 
     assert _kept(db) == (TEXT, True, CURRENT_SCHEMA_VERSION)

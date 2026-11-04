@@ -349,13 +349,13 @@ def cmd_topic_canon(args) -> int:
     from pathlib import Path
 
     from src.config import DATA_ROOT
-    from src.store.schema import get_connection, run_migrations
+    from src.store.schema import ensure_schema, get_connection
 
     if args.embed and not args.apply:
         print("--embed needs --apply: its rows depend on the rows before it", file=sys.stderr)
         return 2
     conn = get_connection(str(args.db))
-    run_migrations(conn)
+    ensure_schema(conn)
     try:
         rows = plan_fold_and_containment(conn)
         counts = Counter(method for _t, _h, method, _s in rows)

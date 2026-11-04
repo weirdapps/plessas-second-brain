@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from src.config import ATTACHMENTS_DIR, DATA_ROOT, EXTRACT_ENGINE, IMAGE_CLASSIFY_BUDGET_S
+from src.store import job_runs
 from src.store.stamps import utc_now
 
 # Attachments registered per sync run. Step 6 runs Phase 1 (local parse) and
@@ -302,10 +303,12 @@ def run(args):
     # Step 1: sync stages no mail. `python -m src.export.outlook_export` does,
     # through outlook-cli, on every host. On a Mac this step used to run the
     # Apple Mail exporter, which force-quit Mail.app; it was removed.
+    job_runs.mark_stage("staged_batches")
     print("\nStep 1: mail is staged by outlook_export (outlook-cli); using the staged batches.")
 
     # Step 2: Extract (local mode)
     engine = getattr(args, "engine", None) or EXTRACT_ENGINE
+    job_runs.mark_stage("extract")
     print(f"\nStep 2: Extracting new emails (engine: {engine})...")
     from src.extract.local import run_extraction, stop_requested
 
@@ -342,6 +345,7 @@ def run(args):
     )
 
     # Step 3: Load into DB
+    job_runs.mark_stage("load")
     print("\nStep 3: Loading into database...")
     from src.store.loader import load_extractions
     from src.store.schema import get_connection as get_conn
@@ -362,6 +366,7 @@ def run(args):
         # this the files are invisible — 7,387 of them accumulated unseen between
         # the 2026-06-30 VPS cutover and 2026-08-17. Bounded per run because
         # Step 6 below runs Phase 1/2 unbounded over whatever becomes visible.
+        job_runs.mark_stage("attachments_register")
         print("\nStep 3b: Registering attachments outlook-cli downloaded...")
         from datetime import UTC, timedelta
 
@@ -396,6 +401,7 @@ def run(args):
     # --full-dedup takes the whole table, and runs whether or not mail loaded.
     full_dedup = bool(getattr(args, "full_dedup", False))
     if count > 0 or full_dedup:
+        job_runs.mark_stage("people_dedup")
         print("\nStep 4: Deduplicating people" + (" (whole table)" if full_dedup else "") + "...")
         from src.store.dedup_people import run_dedup
 
@@ -407,6 +413,7 @@ def run(args):
 
     seeded = _seed_entities_nightly(db_path)
     if seeded is not None:
+        job_runs.mark_stage("entities")
         print(f"\nStep 4b: Entities: {seeded['entities']} new, {seeded['aliases']} aliases written")
 
     # Step 5, the embeddings, waits for the end of the run: Step 9.
@@ -420,7 +427,7 @@ def run(args):
     )
 
     # Ensure attachment_content table exists
-    from src.store.schema import run_migrations as run_mig
+    from src.store.schema import ensure_schema as run_mig
 
     conn_mig = get_conn(db_path)
     run_mig(conn_mig)
@@ -432,6 +439,7 @@ def run(args):
     defer_heavy = not read_heavy and text_pass_is_recent(conn_mig)
     conn_mig.close()
 
+    job_runs.mark_stage("attachments")
     print("\nStep 6: Processing new attachment content...")
     # Phase 1 runs UNSCOPED so the deadline can converge: anything deferred for time has no
     # content row, and `ac.id IS NULL` offers it again next run. Newest mail first: in
@@ -478,6 +486,7 @@ def run(args):
 
     # Step 7: Sync conversations from Claude Code sessions. --skip-conversations leaves it
     # out; no scheduled unit passes it.
+    job_runs.mark_stage("conversations")
     print("\nStep 7: Syncing Claude Code conversations...")
     conv_loaded = 0
     if getattr(args, "skip_conversations", False):
@@ -517,6 +526,7 @@ def run(args):
             print("  No new conversations to sync")
 
     # Step 8: Classify new inline images (Stage 1 heuristic + Stage 3 vision LLM)
+    job_runs.mark_stage("inline_images")
     print("\nStep 8: Classifying new inline images...")
     try:
         from src.extract.image_pipeline import run_backfill
@@ -565,6 +575,7 @@ def run(args):
     # Step 8b: consolidation (src/store/consolidate.py): the threads with new items from any
     # source, this run's mail and the Teams and WhatsApp syncs' since the last run. Marks
     # items duplicate, superseded or done; deletes nothing. A failure here fails no sync.
+    job_runs.mark_stage("consolidate")
     print("\nStep 8b: Consolidating the threads with new items...")
     try:
         from src.store.consolidate import run_in_sync
@@ -592,6 +603,7 @@ def run(args):
     # its vectors to the next run's pass. The new long documents' chunks go in the same save,
     # within CHUNK_EMBED_SYNC_DEADLINE_S; while a vector rebuild runs the pass adds nothing.
     if count > 0 or conv_loaded:
+        job_runs.mark_stage("embeddings")
         print("\nStep 9: Updating embeddings...")
         from src.store.embeddings import build_index
 

@@ -609,6 +609,8 @@ No credentials are printed by the code. All secrets are read from environment or
 - `BRAIN_QUERY_RANKING`: `relevance` ranks keyword search by text relevance alone, collapses no editions, and fuses only `recall`'s email bucket with semantic search, as before ([Newest first, one row a report](#newest-first-one-row-a-report)). Recency and editions when unset.
 - `BRAIN_QUERY_NAMES`: `0` searches a name only in the script typed ([Names in either script](#names-in-either-script)). On when unset.
 - `BRAIN_RECALL_WORKERS`: how many of `recall`'s buckets run at once, each on its own read-only connection; `1` runs them one after another. Default 6.
+- `BRAIN_SEMANTIC_FLOOR`: the cosine under which a vector is no semantic candidate of `recall`, on a store whose vectors are in its table (gated step `vectors`). `0.55` when unset: on the owner's 45 labelled questions the lowest gold item stood at 0.59, and 0.55 and 0.65 left every figure unchanged.
+- `BRAIN_WIDE_SUMMARIES`: `1` scores summaries at their full 1536 dimensions in `recall` once every summary is that wide (`brain maint vectors-backfill --summaries`); off when unset, read on the shared 768 prefix. Measure with `scripts/retrieval_eval.py --run-qa` before leaving it on.
 - `BRAIN_RECALL_ENTITY_LIST`: `1` fuses the entity list, the items linked to the people, topics and organisations a query names, into `recall`'s email, Teams and WhatsApp buckets ([Unified recall](#unified-recall)). Off when unset.
 
 These five are read at each call, where the searching process reads its environment.

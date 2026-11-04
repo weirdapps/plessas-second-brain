@@ -350,6 +350,52 @@ def load(conn: sqlite3.Connection) -> tuple[np.ndarray, np.ndarray, dict | None]
         return value
 
 
+SUMMARY_KINDS = ("email", "attachment", "conversation", "teams_thread", "whatsapp_thread")
+_WIDE_CACHE: dict = {"key": None, "value": None}
+
+
+def load_wide(conn: sqlite3.Connection) -> tuple[np.ndarray, np.ndarray] | None:
+    """(ids, unit vectors in float16) of the summary rows at their full width, when every
+    summary row is wider than the narrowest row of the table; None otherwise (summaries are
+    then read on the shared prefix with everything else, load). Cached as load is."""
+    from src.store import embeddings as emb
+
+    key = _cache_key(conn)
+    with _CACHE_LOCK:
+        if key[0] and _WIDE_CACHE["key"] == key:
+            return _WIDE_CACHE["value"]
+        marks = ", ".join("?" * len(SUMMARY_KINDS))
+        low, high, n = conn.execute(
+            f"SELECT MIN(dim), MAX(dim), COUNT(*) FROM vectors WHERE kind IN ({marks})",
+            SUMMARY_KINDS,
+        ).fetchone()
+        narrowest = conn.execute("SELECT MIN(dim) FROM vectors").fetchone()[0]
+        value = None
+        if n and low == high and low > narrowest:
+            dim = int(low)
+            ids = np.empty(n, dtype=np.int64)
+            unit = np.empty((n, dim), dtype=emb.STORE_DTYPE)
+            done = 0
+            cursor = conn.execute(
+                f"SELECT id, vec FROM vectors WHERE kind IN ({marks}) ORDER BY id", SUMMARY_KINDS
+            )
+            while rows := cursor.fetchmany(emb.SCAN_BLOCK)[: n - done]:
+                take = len(rows)
+                ids[done : done + take] = [r[0] for r in rows]
+                part = (
+                    np.frombuffer(b"".join(r[1] for r in rows), dtype=np.int8)
+                    .reshape(take, dim)
+                    .astype(np.float32)
+                )
+                norms = np.sqrt(np.einsum("ij,ij->i", part, part))[:, None]
+                norms[norms == 0] = 1
+                unit[done : done + take] = part / norms
+                done += take
+            value = (ids[:done], unit[:done])
+        _WIDE_CACHE.update({"key": key, "value": value})
+        return value
+
+
 def export_npz(conn: sqlite3.Connection, path: Path) -> int:
     """Write the table's rows to an npz in the index's own format (float16, unit rows): the
     copy install_index keeps for a rollback. The number written."""

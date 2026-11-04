@@ -1661,6 +1661,23 @@ def _query_vector(
     return vector / (np.linalg.norm(vector) or 1), seeded
 
 
+# recall's semantic candidates on a store whose vectors are in its table (issue 171): an item
+# below this cosine is not one. On the owner's 45 labelled questions (2026-11-04) the lowest gold
+# item stood at 0.590 and the 200th item of a query at 0.597 or more (median 0.694), so 0.55
+# keeps every gold item and cuts only the tail of a query nothing answers. BRAIN_SEMANTIC_FLOOR
+# overrides it, read at each call.
+SIMILARITY_FLOOR = 0.55
+FLOOR_ENV = "BRAIN_SEMANTIC_FLOOR"
+
+
+def similarity_floor() -> float:
+    raw = os.environ.get(FLOOR_ENV, "").strip()
+    try:
+        return float(raw) if raw else SIMILARITY_FLOOR
+    except ValueError:
+        return SIMILARITY_FLOOR
+
+
 class SemanticCandidates(list):
     """Ranked email ids, with `semantic` saying how the query vector was made:
     'ok', or 'keyword_seeded: <error type>' when the model could not embed it.
@@ -1954,8 +1971,17 @@ def semantic_email_candidates(
     a candidate an attachment folds onto one of those.
     """
     ids, normalized, space = _load_index_and_space(index_path, conn)
-    query_norm, seeded = _query_vector(conn, query, ids, normalized, embed_fn or embed_query, space)
-    similarities = _similarities(normalized, query_norm)
+    floor = None
+    if _table(conn, index_path):
+        similarities, seeded = _table_scores(
+            conn, query, ids, normalized, space, embed_fn or embed_query
+        )
+        floor = similarity_floor()
+    else:
+        query_norm, seeded = _query_vector(
+            conn, query, ids, normalized, embed_fn or embed_query, space
+        )
+        similarities = _similarities(normalized, query_norm)
     hidden = _hidden_vector_ids(conn, include_news, include_automation, classes)
     # Over-fetch: several attachment vectors can collapse onto one email, so we
     # need headroom to fill `limit` emails. Other kinds, and the classes a read
@@ -1963,6 +1989,8 @@ def semantic_email_candidates(
     order = _top_indices(
         similarities, ids, max(limit * 4, limit), {"email", "attachment"}, excluded_ids=hidden
     )
+    if floor is not None:
+        order = order[similarities[order] >= floor]
     out: list[int] = []
     seen: set[int] = set()
     for idx in order:
@@ -1973,12 +2001,59 @@ def semantic_email_candidates(
         out.append(email_id)
         if len(out) >= limit:
             break
-    by_kind, chunks = _other_kinds(conn, similarities, ids, limit, hidden)
+    by_kind, chunks = _other_kinds(conn, similarities, ids, limit, hidden, floor)
     return SemanticCandidates(out, semantic=seeded or "ok", by_kind=by_kind, chunks=chunks)
 
 
+def _wide_query(embed, query: str, space: dict, wide_dim: int):
+    """The query at the summaries' full width and at the index's: one embedding call at
+    `wide_dim`, whose first dimensions, scaled to unit length, are the narrower query.
+    (None, None) when the call does not come back at that width."""
+    with in_space({**space, "dim": wide_dim}):
+        vector = np.asarray(embed([query])[0], dtype=np.float32)
+    if vector.shape != (wide_dim,):
+        return None, None
+    narrow = vector[: int(space["dim"])]
+    return vector / (np.linalg.norm(vector) or 1), narrow / (np.linalg.norm(narrow) or 1)
+
+
+# Full-width summary scoring (vector_store.load_wide) is opt-in: it changes the order of every
+# recall, and the owner's qa set cannot measure it until the summaries are all at 1536
+# (`maint vectors-backfill --summaries`). BRAIN_WIDE_SUMMARIES=1 turns it on, read at each
+# call; measure with `scripts/retrieval_eval.py --run-qa` before leaving it on.
+WIDE_SUMMARIES_ENV = "BRAIN_WIDE_SUMMARIES"
+
+
+def wide_summaries() -> bool:
+    return os.environ.get(WIDE_SUMMARIES_ENV, "").strip() == "1"
+
+
+def _table_scores(conn: sqlite3.Connection, query: str, ids, unit, space, embed):
+    """Each row's cosine with the query on a store whose vectors are in its table, and how the
+    query vector was made. With wide_summaries() and every summary at full width, the query is
+    embedded once at that width: summary rows are scored on it, every other row on its first
+    dimensions scaled (the narrower query, Matryoshka). Otherwise as the npz index is scored."""
+    space = space or legacy_space(_width(unit))
+    wide = vector_store.load_wide(conn) if wide_summaries() else None
+    if wide is not None:
+        try:
+            _require_query_space(space)
+            q_wide, q = _wide_query(embed, query, space, int(wide[1].shape[1]))
+        except Exception:
+            q_wide = q = None
+        if q is not None and q_wide is not None:
+            scores = _similarities(unit, q)
+            wide_ids, wide_unit = wide
+            rows = np.searchsorted(ids, wide_ids)
+            ok = (rows < len(ids)) & (ids[np.minimum(rows, len(ids) - 1)] == wide_ids)
+            scores[rows[ok]] = _similarities(wide_unit, q_wide)[ok]
+            return scores, None
+    q, seeded = _query_vector(conn, query, ids, unit, embed, space)
+    return _similarities(unit, q), seeded
+
+
 def _other_kinds(
-    conn: sqlite3.Connection, similarities, ids, limit: int, hidden
+    conn: sqlite3.Connection, similarities, ids, limit: int, hidden, floor: float | None = None
 ) -> tuple[dict[str, list[int]], dict[int, dict]]:
     """The `limit` best attachments, Teams threads, WhatsApp sessions and owner
     conversations by the similarities already computed, as their tables' ids; and for each
@@ -1990,10 +2065,12 @@ def _other_kinds(
     owner's sessions, as recall's keyword bucket reads them (conversation_query)."""
     found: dict[str, list[int]] = {}
     chunks: dict[int, dict] = {}
-    best = [
-        int(ids[i])
-        for i in _top_indices(similarities, ids, limit, {"attachment"}, excluded_ids=hidden)
-    ]
+
+    def _top(*args, **kwargs):
+        rows = _top_indices(similarities, ids, *args, **kwargs)
+        return rows if floor is None else rows[similarities[rows] >= floor]
+
+    best = [int(ids[i]) for i in _top(limit, {"attachment"}, excluded_ids=hidden)]
     texts = [chunk_of(v)[0] if is_attachment_chunk(v) else -v for v in best]
     if texts:
         attachment_of = dict(
@@ -2013,9 +2090,7 @@ def _other_kinds(
         ("teams", "teams_thread", TEAMS_THREAD_ID_OFFSET),
         ("whatsapp", "whatsapp_thread", WHATSAPP_THREAD_ID_OFFSET),
     ):
-        found[kind] = [
-            offset - int(ids[i]) for i in _top_indices(similarities, ids, limit, {vector_kind})
-        ]
+        found[kind] = [offset - int(ids[i]) for i in _top(limit, {vector_kind})]
     try:
         from src.store.conversation_query import conversation_ids_in_workspace
 
@@ -2025,8 +2100,7 @@ def _other_kinds(
     if owner:
         allowed = {CONVERSATION_ID_OFFSET - cid for cid in owner}
         found["conversation"] = [
-            CONVERSATION_ID_OFFSET - int(ids[i])
-            for i in _top_indices(similarities, ids, limit, {"conversation"}, allowed)
+            CONVERSATION_ID_OFFSET - int(ids[i]) for i in _top(limit, {"conversation"}, allowed)
         ]
     return found, chunks
 

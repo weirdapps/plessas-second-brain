@@ -256,8 +256,9 @@ def test_a_search_ranks_the_same_from_the_table_as_from_the_npz(store):
     assert {r["email_id"] for r in from_table} == set(ids)
 
 
-def test_a_search_sees_a_vector_added_after_it_loaded_the_table(store):
+def test_a_search_sees_a_vector_added_after_it_loaded_the_table(store, monkeypatch):
     conn, path, _client = store
+    monkeypatch.setenv("BRAIN_SEMANTIC_FLOOR", "-1")  # random vectors: the cache is the subject
     _save(path, [OLD], [_vector("old", 768)], SPACE, np.float16)
     _apply(conn)
 

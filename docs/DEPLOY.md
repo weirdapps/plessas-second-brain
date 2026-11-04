@@ -1820,11 +1820,14 @@ one pass, at the first job that writes. The versions that ask for a step:
      exporter's folders, and search would return both.
   6. `python -m src.cli maint calendar-backfill --since 2026-02-01 --until 2026-03-01`: the
      calendar event offered again is in a month the backfill had recorded as listed.
-- **v42 (gated).** The item ledger (issue 168, `src/store/ledger.py`): `observed_at`,
+- **v42 and v43 (gated).** The item ledger (issue 168, `src/store/ledger.py`): `observed_at`,
   `item_hash` and `counterpart_person_id` on decisions, action items and commitments,
   `due_date` and `owner_role` on the last two, and `item_ledger`, one status per (kind,
   parent, normalised-text hash) so extracting a parent again cannot reopen what was closed.
-  **No job takes it**: they stop at v41, and the code runs as before until the step below.
+  v43 adds `commitments.teams_thread_id` and `whatsapp_thread_id` (ADD COLUMN, two
+  indexes, milliseconds): from then on a Teams thread or WhatsApp session extracted is asked
+  for commitments too, and history is not extracted again.
+  **No job takes either**: they stop at v41, and the code runs as before until the step below.
   The step stamps every stored item (271,699 rows) in one write transaction, 139 s on
   a copy of the replica, and labels 522 exact duplicates within one parent (`item_labels`
   method `ledger`, revertable with `maint consolidate --revert <run_id>`); it deletes no

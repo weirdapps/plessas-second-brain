@@ -25,10 +25,12 @@ from src.extract.teams_pipeline import (
     MIN_SUBSTANTIVE_MESSAGES,
     MIN_SUBSTANTIVE_TOTAL_CHARS,
 )
+from src.extract.teams_prompt import with_commitments
 from src.extract.vertex_auth import touch_sentinel
 from src.extract.whatsapp_prompt import build_prompt, parse_response
 from src.llm_policy import Outcome
 from src.redact import redact_secrets
+from src.store import ledger
 
 
 def _render(content: str | None, media_type: str | None, filename: str | None) -> str:
@@ -113,6 +115,8 @@ def _extract_one(conn: sqlite3.Connection, thread_id: int) -> str:
         },
         messages,
     )
+    if ledger.takes_thread_commitments(conn, "whatsapp_thread_id"):
+        system_prompt, user_prompt = with_commitments(system_prompt, user_prompt)
 
     # Nothing uncommitted may be held across the call: see the module docstring.
     conn.commit()
@@ -156,6 +160,10 @@ def _extract_one(conn: sqlite3.Connection, thread_id: int) -> str:
                 "VALUES (?, ?, ?, 'open', ?)",
                 (redact_secrets(a.get("task", "")), a.get("owner"), a.get("deadline"), thread_id),
             )
+        # Commitments, on a store at v43 (src/store/ledger.py); none before, as ever.
+        ledger.write_thread_commitments(
+            conn, "whatsapp_thread_id", thread_id, data.get("commitments")
+        )
         for f in data.get("key_facts", []):
             conn.execute(
                 "INSERT INTO key_facts (fact, whatsapp_thread_id) VALUES (?, ?)",

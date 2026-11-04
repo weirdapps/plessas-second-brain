@@ -349,7 +349,12 @@ def _counterpart(table: str, row: dict, people: _People) -> int | None:
     if table == "commitments":
         if direction == "owner_owes":
             return row.get("to_person_id")
-        return row.get("by_person_id") or row.get("to_person_id")
+        found = row.get("by_person_id") or row.get("to_person_id")
+        if found or row.get("email_id"):
+            return found
+        # A Teams or WhatsApp commitment names its people only: the one who is not the owner.
+        by, to = row.get("by_person"), row.get("to_person")
+        return people.by_name(to) if people.is_owner_name(by) else people.by_name(by)
     owner = row.get("owner")
     if direction == "owed_to_owner":
         return people.by_name(owner)
@@ -374,6 +379,9 @@ def _stamp(conn: sqlite3.Connection, table: str, people: _People) -> list[dict]:
             "due",
             "by_person_id",
             "to_person_id",
+            "by_person",
+            "to_person",
+            "email_id",
             "status",
             "closed_by",
             "closed_at",
@@ -599,6 +607,75 @@ def resync(conn: sqlite3.Connection, table: str, ids) -> int:
             (item_id, _now(), table, item_id),
         ).rowcount
     return changed
+
+
+# v43: the parents a commitment can have besides an email (issue 168).
+COMMITMENT_PARENTS = (
+    ("teams_thread_id", "teams_threads"),
+    ("whatsapp_thread_id", "whatsapp_threads"),
+)
+
+
+def migrate_commitment_parents(conn: sqlite3.Connection) -> None:
+    """v43: commitments from Teams threads and WhatsApp sessions, under a parent column of
+    their own as decisions and actions have. ADD COLUMN with no default and two indexes on
+    columns that start empty: no row rewritten, milliseconds."""
+    have = _columns(conn, "commitments")
+    for column, parent in COMMITMENT_PARENTS:
+        if column not in have:
+            conn.execute(
+                f"ALTER TABLE commitments ADD COLUMN {column} INTEGER REFERENCES {parent}(id)"
+            )
+        conn.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_commitments_{column} ON commitments({column})"
+        )
+    conn.commit()
+
+
+def takes_thread_commitments(conn: sqlite3.Connection, column: str) -> bool:
+    """Whether the store holds commitments under `column` (v43), so a Teams or WhatsApp
+    extraction asks for them."""
+    return column in dict(COMMITMENT_PARENTS) and column in _columns(conn, "commitments")
+
+
+def _field(item: dict, key: str) -> str | None:
+    """A name or date of an extracted item as text: a list joined, blank as None."""
+    value = item.get(key)
+    if isinstance(value, list):
+        value = ", ".join(str(v) for v in value)
+    return (str(value).strip() or None) if value else None
+
+
+def write_thread_commitments(
+    conn: sqlite3.Connection, column: str, thread_id: int, commitments
+) -> int:
+    """Replace the commitments of a Teams thread or WhatsApp session (`column` its parent
+    column) with `commitments`, the extraction's list; the rows written. Nothing on a store
+    before v43, which has no such column: its thread extractions keep writing none. The
+    texts are masked as the loader masks an email's. The caller holds the transaction."""
+    from src.redact import redact_secrets
+
+    if not takes_thread_commitments(conn, column):
+        return 0
+    conn.execute(f"DELETE FROM commitments WHERE {column} = ?", (thread_id,))
+    written = 0
+    for item in commitments if isinstance(commitments, list) else []:
+        if not isinstance(item, dict) or not str(item.get("commitment") or "").strip():
+            continue
+
+        conn.execute(
+            f"INSERT INTO commitments (commitment, by_person, to_person, due, status, {column})"
+            " VALUES (?, ?, ?, ?, 'open', ?)",
+            (
+                redact_secrets(str(item["commitment"])),
+                _field(item, "by"),
+                _field(item, "to"),
+                _field(item, "due"),
+                thread_id,
+            ),
+        )
+        written += 1
+    return written
 
 
 def migrate(conn: sqlite3.Connection) -> None:

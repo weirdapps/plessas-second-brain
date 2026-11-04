@@ -22,10 +22,11 @@ import time
 from datetime import UTC, datetime
 
 from src.extract.policy_bridge import classify_exception
-from src.extract.teams_prompt import build_prompt, parse_response
+from src.extract.teams_prompt import build_prompt, parse_response, with_commitments
 from src.extract.vertex_auth import touch_sentinel
 from src.llm_policy import Outcome
 from src.redact import redact_secrets
+from src.store import ledger
 
 # A "substantive" message is a non-system message above MIN_SUBSTANTIVE_LENGTH chars.
 # Channel posts are commonly single-message announcements (a post nobody replied to;
@@ -172,6 +173,8 @@ def _extract_one_thread(conn: sqlite3.Connection, thread_id: int) -> str:
         for m in substantive
     ]
     system_prompt, user_prompt = build_prompt(prompt_thread, prompt_messages)
+    if ledger.takes_thread_commitments(conn, "teams_thread_id"):
+        system_prompt, user_prompt = with_commitments(system_prompt, user_prompt)
 
     try:
         raw = _call_llm(system_prompt, user_prompt)
@@ -234,6 +237,8 @@ def _extract_one_thread(conn: sqlite3.Connection, thread_id: int) -> str:
                 "VALUES (?, ?, ?, 'open', ?)",
                 (redact_secrets(a.get("task", "")), a.get("owner"), a.get("deadline"), thread_id),
             )
+        # Commitments, on a store at v43 (src/store/ledger.py); none before, as ever.
+        ledger.write_thread_commitments(conn, "teams_thread_id", thread_id, data.get("commitments"))
         for f in data.get("key_facts", []):
             conn.execute(
                 "INSERT INTO key_facts(fact, teams_thread_id) VALUES (?, ?)",

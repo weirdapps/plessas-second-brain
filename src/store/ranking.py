@@ -10,14 +10,18 @@ lists by reciprocal rank fusion (src/store/fusion.py), the recency list at
 RECENCY_WEIGHT. Recency reorders the matches it is given, the best `pool` by
 relevance, and nothing else: it never brings in a row the words do not find.
 
-A search whose matches come in stages, keyword search_emails' subject, then
-summary, then body (src/store/query.py), keeps them: recency reorders the rows
-inside each stage, so an old email whose subject holds the words still comes before
-a newer one that only mentions them in the body.
+A search whose matches come in stages may keep them (`stage`: recency reorders the
+rows inside each) or fuse them (`lists`: each stage's ranking a list in the fusion,
+beside the recency list). Keyword search_emails fuses its subject, summary, body,
+whole-row, key-fact and attachment stages (src/store/query.py), the subject and the
+summary weighed above the rest, so an email that matches in several no longer waits
+behind every subject match.
 
 Editions. Items whose name differs only by a date or a period are one series: an
 attachment's filename, an email's subject with its Re:/Fwd: prefixes off
-(series_key). The series is ranked once, by its best-ranked member and its newest
+(series_key). Rows a caller says are one item (`same`: query.shell_key, the
+unthreaded documents filed under one subject) are one series too, shown by their best
+match. The series is ranked once, by its best-ranked member and its newest
 date, and shown by its newest member, which says `older_editions: n` and lists the
 others' refs in `editions`, newest first. A query that names a date (31.05.2026)
 shows the member whose name holds it instead. The page is cut after the collapse,
@@ -189,10 +193,11 @@ def _groups(
     name: Callable[[dict], str | None] | None,
     copy: Callable[[dict], str | None] | None,
     subject: bool,
+    same: Callable[[dict], Hashable | None] | None = None,
 ) -> list[list[int]]:
     """Row indexes by series, each in the order given, the series in order of their
-    first row: rows sharing a copy hash, and rows sharing a base where one of them is
-    marked (series_parts)."""
+    first row: rows sharing a copy hash, rows sharing a `same` key, and rows sharing a
+    base where one of them is marked (series_parts)."""
     parent = list(range(len(rows)))
 
     def find(i: int) -> int:
@@ -206,13 +211,16 @@ def _groups(
         if a != b:
             parent[max(a, b)] = min(a, b)
 
-    by_copy: dict[str, int] = {}
+    by_copy: dict[Hashable, int] = {}
     by_base: dict[str, list[int]] = {}
     marked_bases: set[str] = set()
     for n, row in enumerate(rows):
         digest = copy(row) if copy else None
         if digest:
-            join(by_copy.setdefault(digest, n), n)
+            join(by_copy.setdefault(("copy", digest), n), n)
+        alike = same(row) if same else None
+        if alike is not None:
+            join(by_copy.setdefault(("same", alike), n), n)
         if name:
             base, marked = series_parts(name(row), subject=subject)
             if base:
@@ -240,6 +248,9 @@ def editions_ranked(
     copy: Callable[[dict], str | None] | None = None,
     query: str = "",
     subject: bool = False,
+    same: Callable[[dict], Hashable | None] | None = None,
+    lists: Sequence[Sequence[int]] | None = None,
+    weights: Sequence[float] | None = None,
 ) -> list[dict]:
     """`rows`, best match first, ranked again with recency and their editions collapsed.
 
@@ -255,6 +266,13 @@ def editions_ranked(
         query: the query, for the dates it names (query_periods).
         subject: names are email subjects (their Re: and Fwd: prefixes go, and no
             version mark is read).
+        same: a key rows share when they are one item on the page whatever their
+            dates: such a group, joined by nothing else, is shown by its best-ranked
+            member, the first in `rows`.
+        lists: in place of `stage`, several rankings of the rows (indexes into
+            `rows`, best first; a row may be in several or in none), fused with the
+            recency list by reciprocal rank fusion, each at its `weights` (1 when
+            None) and the recency list at RECENCY_WEIGHT.
 
     A series is shown by its newest member; on the newest day, by one whose name says
     final; with a query naming dates, by the newest member whose name holds them all.
@@ -265,7 +283,7 @@ def editions_ranked(
         return [dict(r) for r in rows[:limit]]
     ref = ref or id
     periods = query_periods(query)
-    groups = _groups(rows, name, copy, subject)
+    groups = _groups(rows, name, copy, subject, same)
 
     def when(n: int) -> str:
         return date(rows[n]) or ""
@@ -273,7 +291,15 @@ def editions_ranked(
     def name_of(n: int) -> str:
         return (name(rows[n]) if name else None) or ""
 
+    def alike(group: list[int]) -> bool:
+        if not same:
+            return False
+        keys = {same(rows[n]) for n in group}
+        return len(keys) == 1 and None not in keys
+
     def shown(group: list[int]) -> int:
+        if alike(group):
+            return min(group)
         named = [n for n in group if all(p in _folded(name_of(n)) for p in periods)]
         pick = named if periods and named else group
         # An edition's own mail before a reply: a reply to August's report sent after
@@ -295,7 +321,15 @@ def editions_ranked(
 
     order: list[int] = []
     numbered = range(len(groups))
-    for level in sorted({stage_of(g) for g in groups}):
+    if lists is not None:
+        by_recency = sorted(numbered, key=lambda g: max(when(n) for n in groups[g]), reverse=True)
+        group_of = {n: g for g, members in enumerate(groups) for n in members}
+        rankings: list[list[int]] = [list(dict.fromkeys(group_of[n] for n in lst)) for lst in lists]
+        weighed = list(weights) if weights is not None else [1.0] * len(rankings)
+        fused = reciprocal_rank_fusion([*rankings, by_recency], weights=[*weighed, RECENCY_WEIGHT])
+        order = [cast(int, g) for g, _score in fused]
+    levels = sorted({stage_of(g) for g in groups}) if lists is None else []
+    for level in levels:
         inside = [g for g in numbered if stage_of(groups[g]) == level]
         by_date = sorted(inside, key=lambda g: max(when(n) for n in groups[g]), reverse=True)
         fused = reciprocal_rank_fusion([inside, by_date], weights=[1.0, RECENCY_WEIGHT])

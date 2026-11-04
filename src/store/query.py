@@ -8,7 +8,7 @@ optimized for CLI display.
 import json
 import logging
 import sqlite3
-from collections.abc import Callable, Hashable
+from collections.abc import Hashable
 from typing import Any
 
 from src.config import USER_EMAIL_PATTERN
@@ -16,6 +16,7 @@ from src.store import envelope, ranking
 from src.store.consolidate import current_sql, history_left_out, open_status_sql
 from src.store.cross_script import NameForms, name_forms
 from src.store.entities import entity_person_ids
+from src.store.fusion import reciprocal_rank_fusion
 from src.store.greek import register_sql_functions, search_fold
 from src.store.item_cleanup import not_boilerplate_sql
 from src.store.normalizer import normalize_topic
@@ -440,6 +441,7 @@ def query_by_keyword(
     include_news: bool = False,
     include_automation: bool = False,
     classes: tuple[str, ...] | None = None,
+    probe: bool = False,
 ) -> list[dict]:
     """Full-text search using FTS5 on email subjects, summaries, content, key facts
     and attachments.
@@ -453,44 +455,46 @@ def query_by_keyword(
             automation mail, left out by default (src/store/source_class.py)
         classes: Only emails of these source classes (a search's `kinds`,
             envelope.classes_for), applied in the query before its limit
+        probe: Rows for counting only (a tool's `excluded`): each match's
+            email_id, source and source_class by the stage waterfall, which stops
+            once its page is full, with no snippet of an attachment, no
+            thread_matches, no summary filled in and no envelope
 
     Returns:
         List of dicts with keys: email_id, date, subject, summary, snippet, source,
         source_class, where source is 'subject', 'summary', 'content', 'mixed'
         (every word, but across those three fields), 'key_fact' or 'attachment';
         a row whose thread has more than one email matching across its subject,
-        summary and body adds thread_matches, that count. When no row carries
+        summary and body adds thread_matches, that count. source is the first
+        stage, in that order, that matched the row's thread. Every stage is ranked
+        on its own and the stages fused with recency (_keyword_fused); one row a
+        series of dated subjects, a set of unthreaded documents of one subject, or
+        one file mailed to several threads, with older_editions and editions. A row
+        with no summary of its own (a document) carries its attachment's.
+        BRAIN_QUERY_RANKING=relevance keeps the stage waterfall (_keyword_waterfall). When no row carries
         every token, rows matching any meaningful token come back instead, each
         flagged partial_match. Each row carries the envelope
         (src/store/envelope.py), matched_in repeating source.
     """
     visible = visible_sql(conn, "e.id", include_news, include_automation, classes)
-    # Each stage's best threads by relevance are ranked again with recency, their dated
-    # subjects collapsed to one row a series (src/store/ranking.py).
-    fused = ranking.fused_ranking()
+    fused = ranking.fused_ranking() and not probe
     for expression, partial in fts5_query_variants(keyword, name_forms(conn)):
-        found, thread_of = _keyword_waterfall(
-            conn,
-            expression,
-            limit,
-            search_content_only,
-            visible,
-            widen=ranking.POOL_PER_ROW if fused else 1,
-            series=_subject_series if fused else None,
-        )
-        if found:
-            results = ranking.editions_ranked(
-                found,
-                limit,
-                name=lambda r: r.get("subject"),
-                date=lambda r: r.get("date"),
-                ref=lambda r: r["email_id"],
-                stage=lambda r: _STAGES.index(r["source"]),
-                query=keyword,
-                subject=True,
+        if fused:
+            results, thread_of = _keyword_fused(
+                conn, expression, limit, search_content_only, visible, keyword
             )
+        else:
+            results, thread_of = _keyword_waterfall(
+                conn, expression, limit, search_content_only, visible
+            )
+        if results and probe:
+            for r in results:
+                r.pop("content_id", None)
+            return with_source_class(conn, _mark_partial(results, partial))
+        if results:
             _count_thread_matches(conn, expression, results, thread_of, search_content_only)
             _attachment_snippets(conn, expression, results)
+            document_summaries(conn, results)
             return envelope.emails(conn, with_source_class(conn, _mark_partial(results, partial)))
     return []
 
@@ -513,15 +517,9 @@ def _attachment_snippets(conn: sqlite3.Connection, expression: str, rows: list[d
         wanted[content_id]["snippet"] = snippet
 
 
-# The waterfall's stages, in the order they fill a page: recency reorders the rows
-# inside each and keeps the order between them.
+# The keyword stages, in the order a waterfall fills a page and a fused row names the
+# stage that found it first.
 _STAGES = ("subject", "summary", "content", "mixed", "key_fact", "attachment")
-
-
-def _subject_series(row: dict) -> Hashable:
-    """The series of editions an email row counts as on the page: its dated subject's,
-    else the email itself."""
-    return ranking.series_key(row.get("subject"), subject=True) or row["email_id"]
 
 
 def _count_thread_matches(
@@ -624,80 +622,23 @@ def thread_keys(conn: sqlite3.Connection, email_ids) -> dict:
     return {row[0]: row[1] for row in rows}
 
 
-def _keyword_waterfall(
-    conn: sqlite3.Connection,
-    safe_keyword: str,
-    limit: int,
-    search_content_only: bool,
-    visible: str = "1",
-    *,
-    widen: int = 1,
-    series: Callable[[dict], Hashable] | None = None,
-) -> tuple[list[dict], dict[int, str]]:
-    """query_by_keyword's source waterfall for one sanitized MATCH expression, and each
-    row's thread.
+# --- the keyword stages ---------------------------------------------------------------------
+#
+# Each stage is one MATCH over one source, one row per thread, best match first. The
+# subject stage takes (expression, cap); the others (expression, taken, cap) and, the
+# ones that pick their rows before a snippet, the expression again. `taken` is the JSON
+# list of threads already on a waterfall's page (_NOT_TAKEN); a fused search passes "[]".
 
-    One row per thread, from whichever source found the thread first: a thread's
-    emails share its subject and quote each other, and one thread filled the
-    page. email_thread shows the rest of it. `visible` is a condition on e, the
-    email, that every source applies (source_class.visible_sql).
 
-    For a ranking that reorders each stage's rows (src/store/ranking.py), each stage
-    is asked for `widen` times the rows the page still misses, and the page is full
-    when it holds `limit` distinct `series` (a row's series of editions). Stages keep
-    their order there, so a stage after the one that fills the page could place no
-    row, and is not run. With widen 1 and no series, a page of `limit` rows.
-    """
-    results: list[dict] = []
-    seen_ids: set[int] = set()
-    taken_threads: set[str] = set()
-    thread_of: dict[int, str] = {}
-
-    def missing() -> int:
-        held = len({series(r) for r in results}) if series else len(results)
-        return limit - held
-
-    def stage_cap() -> int:
-        """How many rows the next stage asks for, and may bring the page to: within
-        the ranking's pool when it widens, and always room for the rows missing."""
-        if widen == 1:
-            return len(results) + missing()
-        wanted = max(widen * missing(), ranking.POOL_MIN)
-        ceiling = max(ranking.pool_size(limit), len(results) + missing())
-        return min(len(results) + wanted, ceiling)
-
-    def take(rows, cap: int) -> None:
-        """Append the rows not found already, until the page holds `cap`.
-
-        Every source asks for a whole page of threads not yet on it: of what it
-        returns, only an unthreaded email taken by an earlier source can be here
-        already, so the rest still fills the page, where asking only for the
-        slots left gave them away.
-        """
-        for row in rows:
-            if len(results) >= cap:
-                return
-            r = dict(row)
-            thread = r.pop("thread", None)
-            if r["email_id"] in seen_ids:
-                continue
-            seen_ids.add(r["email_id"])
-            if thread is not None:
-                taken_threads.add(thread)
-                thread_of[r["email_id"]] = thread
-            results.append(r)
-
-    def taken() -> str:
-        return json.dumps(sorted(taken_threads))
-
-    if not search_content_only and _has_subject_index(conn):
-        # The subject first: the words someone remembers an email by, and until
-        # v22 not indexed at all. snippet() is not needed; the subject is the row.
-        # The thread ranks by its best match and is shown by its newest email,
-        # where it stands now; within a thread the ranks differ only by how many
-        # RE:/FW: prefixes a subject carries. Equal ranks (a recurring subject)
-        # go newest first.
-        query_subjects = f"""
+def _stage_sql(conn: sqlite3.Connection, stage: str, visible: str) -> str:
+    """The query of one keyword stage, its conditions in place."""
+    if stage == "subject":
+        # The words someone remembers an email by, and until v22 not indexed at all.
+        # snippet() is not needed; the subject is the row. The thread ranks by its best
+        # match and is shown by its newest email, where it stands now; within a thread
+        # the ranks differ only by how many RE:/FW: prefixes a subject carries. Equal
+        # ranks (a recurring subject) go newest first.
+        return f"""
             SELECT email_id, date, subject, summary, snippet, source, thread FROM (
                 SELECT
                     e.id as email_id,
@@ -718,17 +659,10 @@ def _keyword_waterfall(
             ORDER BY score, date DESC, email_id DESC
             LIMIT ?
         """
-        cap = stage_cap()
-        take(conn.execute(query_subjects, (safe_keyword, cap)), cap)
-
-    if missing() > 0 and not search_content_only:
-        # Search in email summaries
-        # Rank by FTS5 BM25 relevance (ORDER BY rank), not recency. rank is only
-        # comparable within a single MATCH query, so each source is ranked on its
-        # own; the source-priority waterfall (subject -> summary -> content ->
-        # mixed -> key_fact -> attachment) plus seen_ids dedup preserves the
-        # cross-source order.
-        query_summaries = f"""
+    if stage == "summary":
+        # Ranked by FTS5 BM25 relevance (ORDER BY rank), not recency. rank is only
+        # comparable within a single MATCH query, so each source is ranked on its own.
+        return f"""
             SELECT email_id, date, subject, summary, snippet, source, thread FROM (
                 SELECT
                     e.id as email_id,
@@ -751,16 +685,16 @@ def _keyword_waterfall(
             ORDER BY score, date DESC, email_id DESC
             LIMIT ?
         """
-
-        cap = stage_cap()
-        take(conn.execute(query_summaries, (safe_keyword, taken(), cap)), cap)
-
-    # Search in email content. Here and below, the page's picks are MATERIALIZED:
-    # as a co-routine SQLite ran them again for every row the outer MATCH yields, so
-    # a stage cost the square of its matches (17 s for one query on a replica whose
-    # picks took 15 ms), which Greek stems, matching more forms, made common.
-    if missing() > 0:
-        query_content = f"""
+    if stage in ("content", "mixed"):
+        # The body, or the whole row: every word somewhere in the email, but not all in
+        # one field. The commonest query names a person and a subject, and those split:
+        # the name in the summary or the subject line, the subject words in the body.
+        # Here and below, the page's picks are MATERIALIZED: as a co-routine SQLite ran
+        # them again for every row the outer MATCH yields, so a stage cost the square of
+        # its matches (17 s for one query on a replica whose picks took 15 ms), which
+        # Greek stems, matching more forms, made common.
+        column = "emails_fts.content_f" if stage == "content" else "emails_fts"
+        return f"""
             WITH picked AS MATERIALIZED (
                 SELECT email_id FROM (
                     SELECT
@@ -770,7 +704,7 @@ def _keyword_waterfall(
                         {_best_of_each_thread("emails_fts.rank")} as nth
                     FROM emails e
                     JOIN emails_fts ON emails_fts.rowid = e.id
-                    WHERE emails_fts.content_f MATCH ? {_NOT_TAKEN} AND {visible}
+                    WHERE {column} MATCH ? {_NOT_TAKEN} AND {visible}
                 )
                 WHERE nth = 1
                 ORDER BY score, date DESC, email_id DESC
@@ -782,61 +716,16 @@ def _keyword_waterfall(
                 e.subject,
                 e.summary,
                 snippet(emails_fts, 1, '<b>', '</b>', '...', 30) as snippet,
-                'content' as source,
+                '{stage}' as source,
                 {_THREAD} as thread
             FROM emails e
             JOIN picked ON picked.email_id = e.id
             JOIN emails_fts ON emails_fts.rowid = e.id
-            WHERE emails_fts.content_f MATCH ?
+            WHERE {column} MATCH ?
             ORDER BY rank, e.date_received DESC, e.id DESC
         """
-
-        cap = stage_cap()
-        take(conn.execute(query_content, (safe_keyword, taken(), cap, safe_keyword)), cap)
-
-    # The whole row: every word somewhere in the email, but not all in one field.
-    # The commonest query names a person and a subject, and those split: the name
-    # in the summary or the subject line, the subject words in the body. Matched
-    # one column at a time, that email was missed and the search fell back to
-    # partial rows holding one word each.
-    if missing() > 0 and not search_content_only:
-        query_mixed = f"""
-            WITH picked AS MATERIALIZED (
-                SELECT email_id FROM (
-                    SELECT
-                        e.id as email_id,
-                        emails_fts.rank as score,
-                        e.date_received as date,
-                        {_best_of_each_thread("emails_fts.rank")} as nth
-                    FROM emails e
-                    JOIN emails_fts ON emails_fts.rowid = e.id
-                    WHERE emails_fts MATCH ? {_NOT_TAKEN} AND {visible}
-                )
-                WHERE nth = 1
-                ORDER BY score, date DESC, email_id DESC
-                LIMIT ?
-            )
-            SELECT
-                e.id as email_id,
-                e.date_received as date,
-                e.subject,
-                e.summary,
-                snippet(emails_fts, 1, '<b>', '</b>', '...', 30) as snippet,
-                'mixed' as source,
-                {_THREAD} as thread
-            FROM emails e
-            JOIN picked ON picked.email_id = e.id
-            JOIN emails_fts ON emails_fts.rowid = e.id
-            WHERE emails_fts MATCH ?
-            ORDER BY rank, e.date_received DESC, e.id DESC
-        """
-
-        cap = stage_cap()
-        take(conn.execute(query_mixed, (safe_keyword, taken(), cap, safe_keyword)), cap)
-
-    # Search in key facts (only if we haven't hit the limit and not content-only)
-    if missing() > 0 and not search_content_only:
-        query_facts = f"""
+    if stage == "key_fact":
+        return f"""
             SELECT email_id, date, subject, summary, snippet, source, thread FROM (
                 SELECT
                     e.id as email_id,
@@ -857,65 +746,229 @@ def _keyword_waterfall(
             ORDER BY score, date DESC, email_id DESC
             LIMIT ?
         """
-
-        cap = stage_cap()
-        take(conn.execute(query_facts, (safe_keyword, taken(), cap)), cap)
-
-    # Search in attachment content (PDF/Office text + LLM summary).
-    # Surfaces attachment-only matches as the parent email row, with
-    # source='attachment' and the matched filename for caller transparency.
-    # The snippet is taken later, for the rows shown (_attachment_snippets): it reads
-    # the extracted text, up to 2M characters, about 6 ms a row on the replica.
-    if missing() > 0 and not search_content_only and _has_attachment_fts(conn):
-        query_attachments = f"""
-            WITH picked AS MATERIALIZED (
-                SELECT content_id FROM (
-                    SELECT
-                        ac.id as content_id,
-                        attachment_content_fts.rank as score,
-                        e.date_received as date,
-                        e.id as email_id,
-                        {_best_of_each_thread("attachment_content_fts.rank", then="ac.id DESC")} as nth
-                    FROM attachment_content_fts
-                    JOIN attachment_content ac ON ac.id = attachment_content_fts.rowid
-                    JOIN attachments a ON a.id = ac.attachment_id
-                    JOIN emails e ON e.id = a.email_id
-                    WHERE attachment_content_fts MATCH ? {_NOT_TAKEN} AND {visible}
-                )
-                WHERE nth = 1
-                ORDER BY score, date DESC, email_id DESC
-                LIMIT ?
+    # Attachment content (PDF/Office text + LLM summary), as the parent email row with
+    # the matched filename and the file's content hash. The snippet is taken later, for
+    # the rows shown (_attachment_snippets): it reads the extracted text, up to 2M
+    # characters, about 6 ms a row on the replica.
+    return f"""
+        WITH picked AS MATERIALIZED (
+            SELECT content_id FROM (
+                SELECT
+                    ac.id as content_id,
+                    attachment_content_fts.rank as score,
+                    e.date_received as date,
+                    e.id as email_id,
+                    {_best_of_each_thread("attachment_content_fts.rank", then="ac.id DESC")} as nth
+                FROM attachment_content_fts
+                JOIN attachment_content ac ON ac.id = attachment_content_fts.rowid
+                JOIN attachments a ON a.id = ac.attachment_id
+                JOIN emails e ON e.id = a.email_id
+                WHERE attachment_content_fts MATCH ? {_NOT_TAKEN} AND {visible}
             )
-            SELECT
-                e.id as email_id,
-                e.date_received as date,
-                e.subject,
-                e.summary,
-                NULL as snippet,
-                'attachment' as source,
-                a.filename as attachment_filename,
-                ac.id as content_id,
-                {_THREAD} as thread
-            FROM attachment_content_fts
-            JOIN picked ON picked.content_id = attachment_content_fts.rowid
-            JOIN attachment_content ac ON ac.id = attachment_content_fts.rowid
-            JOIN attachments a ON a.id = ac.attachment_id
-            JOIN emails e ON e.id = a.email_id
-            WHERE attachment_content_fts MATCH ?
-            ORDER BY rank, e.date_received DESC, e.id DESC
-        """
+            WHERE nth = 1
+            ORDER BY score, date DESC, email_id DESC
+            LIMIT ?
+        )
+        SELECT
+            e.id as email_id,
+            e.date_received as date,
+            e.subject,
+            e.summary,
+            NULL as snippet,
+            'attachment' as source,
+            a.filename as attachment_filename,
+            ac.id as content_id,
+            a.sha256 as sha256,
+            {_THREAD} as thread
+        FROM attachment_content_fts
+        JOIN picked ON picked.content_id = attachment_content_fts.rowid
+        JOIN attachment_content ac ON ac.id = attachment_content_fts.rowid
+        JOIN attachments a ON a.id = ac.attachment_id
+        JOIN emails e ON e.id = a.email_id
+        WHERE attachment_content_fts MATCH ?
+        ORDER BY rank, e.date_received DESC, e.id DESC
+    """
 
-        cap = stage_cap()
-        take(conn.execute(query_attachments, (safe_keyword, taken(), cap, safe_keyword)), cap)
 
-    # Results are relevance-ranked within each source (ORDER BY rank) and appended
-    # in source-priority order (subject -> summary -> content -> mixed ->
-    # key_fact -> attachment); keep that order rather than re-sorting by date, so BM25
-    # relevance is not discarded. (True cross-source ranking via score fusion / RRF
-    # is a later change.) take() stops at the requested number.
+def _stages(conn: sqlite3.Connection, search_content_only: bool) -> list[str]:
+    """The stages a search runs, in _STAGES order: a content-only search the body alone."""
+    if search_content_only:
+        return ["content"]
+    skip = set()
+    if not _has_subject_index(conn):
+        skip.add("subject")
+    if not _has_attachment_fts(conn):
+        skip.add("attachment")
+    return [s for s in _STAGES if s not in skip]
 
-    # Each row's thread, for _count_thread_matches once the page is cut.
+
+def _run_stage(
+    conn: sqlite3.Connection,
+    stage: str,
+    expression: str,
+    visible: str,
+    taken: str,
+    cap: int,
+) -> list[dict]:
+    """One stage's rows, best first, at most `cap`."""
+    sql = _stage_sql(conn, stage, visible)
+    if stage == "subject":
+        params: tuple = (expression, cap)
+    elif stage in ("summary", "key_fact"):
+        params = (expression, taken, cap)
+    else:
+        params = (expression, taken, cap, expression)
+    return [dict(row) for row in conn.execute(sql, params)]
+
+
+def _keyword_waterfall(
+    conn: sqlite3.Connection,
+    safe_keyword: str,
+    limit: int,
+    search_content_only: bool,
+    visible: str = "1",
+) -> tuple[list[dict], dict[int, str]]:
+    """query_by_keyword's source waterfall for one sanitized MATCH expression, and each
+    row's thread: the ranking by relevance alone (BRAIN_QUERY_RANKING=relevance).
+
+    One row per thread, from whichever source found the thread first: a thread's
+    emails share its subject and quote each other, and one thread filled the
+    page. email_thread shows the rest of it. `visible` is a condition on e, the
+    email, that every source applies (source_class.visible_sql). The sources fill
+    the page in _STAGES order, each ranked by its own BM25, and a source after the
+    one that fills the page is not run.
+    """
+    results: list[dict] = []
+    seen_ids: set[int] = set()
+    taken_threads: set[str] = set()
+    thread_of: dict[int, str] = {}
+
+    # Every source asks for a whole page of threads not yet on it: of what it returns,
+    # only an unthreaded email taken by an earlier source can be here already, so the
+    # rest still fills the page, where asking only for the slots left gave them away.
+    for stage in _stages(conn, search_content_only):
+        if len(results) >= limit:
+            break
+        taken = json.dumps(sorted(taken_threads))
+        for r in _run_stage(conn, stage, safe_keyword, visible, taken, limit):
+            if len(results) >= limit:
+                break
+            thread = r.pop("thread", None)
+            r.pop("sha256", None)
+            if r["email_id"] in seen_ids:
+                continue
+            seen_ids.add(r["email_id"])
+            if thread is not None:
+                taken_threads.add(thread)
+                thread_of[r["email_id"]] = thread
+            results.append(r)
     return results, thread_of
+
+
+# Each stage's weight in the fusion across stages, against 1 for the others: a subject
+# match is the name an email is remembered by, so it counts twice, and the summary says
+# what the email is about, where the body may only mention the words. The order the
+# waterfall gave the stages, as a prior rather than a wall. The recency list counts at
+# ranking.RECENCY_WEIGHT.
+STAGE_WEIGHTS = {"subject": 2.0, "summary": 1.5}
+
+# The classes whose unthreaded rows sharing a subject are one item (shell_key): mail
+# and automation with no thread are separate emails that happen to share a subject.
+_SHELL_CLASSES = frozenset({"document", "session_note", "news"})
+
+
+def shell_key(row: dict) -> Hashable | None:
+    """The key an unthreaded row shares with the others of its subject and source class:
+    a standalone document's anchor, whose subject is its folder or site ('[Document]
+    Research'), a session note, or a news item a second feed carried. None for a
+    threaded row and for mail (_SHELL_CLASSES)."""
+    if row.get("thread") is not None or row.get("source_class") not in _SHELL_CLASSES:
+        return None
+    subject = search_fold(row.get("subject") or "").strip()
+    return ("shell", row.get("source_class"), subject) if subject else None
+
+
+def _keyword_fused(
+    conn: sqlite3.Connection,
+    safe_keyword: str,
+    limit: int,
+    search_content_only: bool,
+    visible: str,
+    query: str,
+) -> tuple[list[dict], dict[int, str]]:
+    """query_by_keyword's ranking for one sanitized MATCH expression: every stage ranked
+    on its own, fused by reciprocal rank fusion with a recency list, and each row's
+    thread.
+
+    Each stage gives its best `pool` threads (ranking.pool_size). A thread is one row,
+    shown by the email of the first stage in _STAGES order that found it, which names
+    that stage in `source`; it scores in every stage that found it, so an email matching
+    in its summary, its body and its key facts is no longer placed after every subject
+    match. Rows are one item on the page (src/store/ranking.py editions_ranked) when
+    their subjects are dated editions of one series, when they are unthreaded rows of
+    one subject and source class (shell_key: shown by the best match), and when an
+    attachment-only match is the same file, by content hash, as another's.
+    """
+    pool = ranking.pool_size(limit)
+    by_key: dict[Hashable, dict] = {}
+    lists: list[list[Hashable]] = []
+    weights: list[float] = []
+    for stage in _stages(conn, search_content_only):
+        ranked: list[Hashable] = []
+        for r in _run_stage(conn, stage, safe_keyword, visible, "[]", pool):
+            key = ("thread", r["thread"]) if r["thread"] is not None else ("email", r["email_id"])
+            by_key.setdefault(key, r)
+            ranked.append(key)
+        if ranked:
+            lists.append(ranked)
+            weights.append(STAGE_WEIGHTS.get(stage, 1.0))
+    if not by_key:
+        return [], {}
+    # The pool by the stages alone, best first: the order a shell's best member is read from.
+    keys = [k for k, _ in reciprocal_rank_fusion(lists, weights=weights)]
+    rows = [by_key[k] for k in keys]
+    with_source_class(conn, rows)
+    index = {k: n for n, k in enumerate(keys)}
+    picked = ranking.editions_ranked(
+        rows,
+        limit,
+        name=lambda r: r.get("subject"),
+        date=lambda r: r.get("date"),
+        ref=lambda r: r["email_id"],
+        copy=lambda r: r.get("sha256") if r["source"] == "attachment" else None,
+        same=shell_key,
+        lists=[[index[k] for k in ranked] for ranked in lists],
+        weights=weights,
+        query=query,
+        subject=True,
+    )
+    thread_of = {}
+    for r in picked:
+        thread = r.pop("thread", None)
+        r.pop("sha256", None)
+        r.pop("source_class", None)
+        if thread is not None:
+            thread_of[r["email_id"]] = thread
+    return picked, thread_of
+
+
+def document_summaries(conn: sqlite3.Connection, rows: list[dict]) -> None:
+    """Give a row with no summary of its own its attachment's: a standalone document's
+    anchor row holds none, and its file's summary is what it is about."""
+    wanted = {r["email_id"]: r for r in rows if not (r.get("summary") or "").strip()}
+    if not wanted:
+        return
+    found = conn.execute(
+        """
+        SELECT a.email_id, ac.summary FROM attachments a
+        JOIN attachment_content ac ON ac.attachment_id = a.id
+        WHERE a.email_id IN (SELECT value FROM json_each(?)) AND TRIM(COALESCE(ac.summary, '')) != ''
+        ORDER BY a.id DESC
+        """,
+        (json.dumps(sorted(wanted)),),
+    )
+    for email_id, summary in found:
+        wanted[email_id]["summary"] = summary
 
 
 def query_by_date_range(

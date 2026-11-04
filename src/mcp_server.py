@@ -976,15 +976,16 @@ def search_emails(
 
     Keyword mode wants every word but stopwords (the, what, και, για); when no row
     holds them all it falls back to any meaningful word and flags those rows
-    partial_match. One email per thread: a subject match shows the thread's
-    newest, and thread_matches counts its other matching emails, which
-    get_item reads. Keyword rows rank by relevance and recency, a report's dated
-    editions as one row (`older_editions`); names match in Latin or Greek letters.
+    partial_match. One email per thread (a subject match shows its newest);
+    thread_matches counts the thread's other matches, which get_item reads.
+    Ranked by relevance and recency; one row is a report's editions, one
+    subject's documents or a file's copies (`older_editions`); names match in
+    Latin or Greek.
     Semantic mode can also return attachment, Teams, WhatsApp
     and conversation rows; when the query cannot be embedded it ranks around the
     best keyword matches and marks each row `semantic: keyword_seeded: <error>`.
-    Each row says its `kind` (email, news, document...), and `kinds` keeps only
-    those. News and the owner's automation mail are left out unless included, and
+    Each row says its `kind` (email, news, document...); `kinds` filters them.
+    News and the owner's automation mail are left out unless included, and
     `excluded` counts the matches of each left out (by keyword in either mode).
     """
     from src.store.query import query_by_keyword
@@ -1033,6 +1034,7 @@ def search_emails(
                 classes=left_out,
                 include_news=True,
                 include_automation=True,
+                probe=True,
             )
             excluded = _excluded(left_out, probe)
         head = _header(conn)
@@ -1154,6 +1156,7 @@ def recall(
                         classes=email_left,
                         include_news=True,
                         include_automation=True,
+                        probe=True,
                     )
                 )
             if attachment_left:

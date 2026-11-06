@@ -49,7 +49,109 @@ class OutlookCliAuthRequired(OutlookCliError):
 _RETRYABLE_EXIT_CODES = {5}  # upstream API errors
 
 
+_BACKENDS = {"outlook-cli", "graph", "auto", "shadow"}
+_SHADOWED = {"list-mail", "get-mail"}
+
+
+def _backend() -> str:
+    name = (os.environ.get("SB_MAIL_BACKEND") or "outlook-cli").strip().lower()
+    return name if name in _BACKENDS else "outlook-cli"
+
+
+def _record(event: dict) -> None:
+    """One line per fallback or shadow comparison, for the health checks. Never raises."""
+    try:
+        from datetime import UTC, datetime
+
+        from src import config
+
+        event = {"at": datetime.now(UTC).isoformat(timespec="seconds"), **event}
+        path = config.DATA_ROOT / "mail_backend_events.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event) + "\n")
+    except Exception:
+        pass
+
+
+def _compare(verb: str, ours: Any, theirs: Any) -> dict:
+    """What a shadow read found: ids only, never content."""
+    if verb == "list-mail":
+        a = {m["Id"] for m in ours or [] if isinstance(m, dict) and m.get("Id")}
+        b = {m["Id"] for m in theirs or [] if isinstance(m, dict) and m.get("Id")}
+        if a == b:
+            return {"outcome": "match", "count": len(a)}
+        return {
+            "outcome": "mismatch",
+            "count": len(a),
+            "only_outlook_cli": sorted(a - b)[:50],
+            "only_graph": sorted(b - a)[:50],
+        }
+    keys = ("Id", "InternetMessageId", "ConversationId", "Subject")
+    diff = [k for k in keys if (ours or {}).get(k) != (theirs or {}).get(k)]
+    a_len = len(((ours or {}).get("Body") or {}).get("Content") or "")
+    b_len = len(((theirs or {}).get("Body") or {}).get("Content") or "")
+    if a_len != b_len:
+        diff.append("Body")
+    return {"outcome": "mismatch", "fields": diff} if diff else {"outcome": "match"}
+
+
 def run_outlook_cli(args: list[str], timeout_sec: int = 60) -> Any:
+    """
+    Answer an outlook-cli invocation through the backend SB_MAIL_BACKEND names.
+
+    outlook-cli (default, and any unknown name): outlook-cli only.
+    graph:  the Graph CLI (graph_cli.py); a call it cannot serve goes to outlook-cli,
+            and its errors come back as this module's error types.
+    auto:   the Graph CLI first, outlook-cli for that call whenever it fails.
+    shadow: outlook-cli answers; reads are repeated through the Graph CLI and the
+            comparison recorded. Downloads are never repeated.
+
+    Either way the result is outlook-cli's JSON shape, and message ids are the same
+    on both, so switching backends mid-run never duplicates a row.
+    """
+    backend = _backend()
+    if backend == "outlook-cli":
+        return _run_binary(args, timeout_sec)
+
+    from src.export import graph_cli
+
+    verb = args[0] if args else ""
+    if backend == "shadow":
+        result = _run_binary(args, timeout_sec)
+        if verb in _SHADOWED:
+            try:
+                theirs = graph_cli.translate(args, timeout_sec)
+                _record({"backend": "shadow", "verb": verb, **_compare(verb, result, theirs)})
+            except graph_cli.GraphCliUnsupported:
+                pass
+            except Exception as e:  # a shadow must never cost the real call
+                _record(
+                    {
+                        "backend": "shadow",
+                        "verb": verb,
+                        "outcome": "graph_error",
+                        "error": str(e)[:300],
+                    }
+                )
+        return result
+
+    try:
+        return graph_cli.translate(args, timeout_sec)
+    except graph_cli.GraphCliUnsupported:
+        return _run_binary(args, timeout_sec)
+    except (graph_cli.GraphCliError, subprocess.TimeoutExpired) as e:
+        if backend == "auto":
+            _record({"backend": "auto", "verb": verb, "outcome": "fallback", "error": str(e)[:300]})
+            return _run_binary(args, timeout_sec)
+        if isinstance(e, graph_cli.GraphCliAuthRequired):
+            raise OutlookCliAuthRequired(f"graph cli needs a new sign-in: {e.stderr}") from e
+        if isinstance(e, subprocess.TimeoutExpired):
+            raise
+        raise OutlookCliError(exit_code=e.exit_code, stderr=e.stderr, retryable=False) from e
+
+
+def _run_binary(args: list[str], timeout_sec: int = 60) -> Any:
     """
     Invoke outlook-cli with the given args. Always appends --no-auto-reauth
     and --json. Returns parsed JSON on exit 0; raises typed errors otherwise.

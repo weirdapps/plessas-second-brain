@@ -70,6 +70,7 @@ from src.store.sql_readonly import connect_read_only
 # list complete. About 0.1 s.
 for _module in (
     "src.bridge",
+    "src.export.graph_cli",
     "src.export.outlook_cli",
     "src.export.sharepoint_fetcher",
     "src.extract.sharepoint_ingest",

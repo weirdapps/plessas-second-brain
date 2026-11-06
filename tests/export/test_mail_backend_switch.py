@@ -17,6 +17,7 @@ from src import config
 from src.export import outlook_cli
 from src.export.graph_cli import GraphCliAuthRequired, GraphCliError, GraphCliUnsupported
 from src.export.outlook_cli import OutlookCliAuthRequired, OutlookCliError, run_outlook_cli
+from tests.patching import unset_env
 
 
 def _events():
@@ -35,7 +36,7 @@ def _clean_events():
 
 
 def test_default_is_outlook_cli_and_never_touches_graph(monkeypatch):
-    monkeypatch.delenv("SB_MAIL_BACKEND", raising=False)
+    unset_env(monkeypatch, "SB_MAIL_BACKEND")
     with (
         patch.object(outlook_cli, "_run_binary", return_value=[{"Id": "o"}]) as oc,
         patch("src.export.graph_cli.translate") as g,

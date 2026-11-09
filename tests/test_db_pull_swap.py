@@ -52,6 +52,15 @@ if [ -n "${FAKE_SSH_DOWN:-}" ]; then
   echo "ssh: connect to host: No route to host" >&2
   exit 255
 fi
+# The connection drops under the snapshot, once: the network moved mid-run.
+if [ -n "${FAKE_SSH_DROP_SNAPSHOT:-}" ] && [[ "$*" == *".backup("* ]]; then
+  n=$(cat "$FAKE_SSH_DROP_SNAPSHOT" 2>/dev/null || echo 0)
+  if [ "$n" -lt "${FAKE_SSH_DROPS:-1}" ]; then
+    echo $((n + 1)) > "$FAKE_SSH_DROP_SNAPSHOT"
+    echo "Timeout, server 192.0.2.1 not responding." >&2
+    exit 255
+  fi
+fi
 cd "$FAKE_REMOTE" && HOME="$FAKE_REMOTE" exec bash -c "$*"
 """
 
@@ -370,3 +379,23 @@ def test_an_unreachable_producer_is_skipped_within_the_configured_wait(world):
     assert out.returncode == 0
     assert "SKIP" in world.log()
     assert (world.replica / "brain.db").read_bytes() == before
+
+
+def test_a_connection_dropped_under_the_snapshot_is_retried_once(world, tmp_path):
+    """Three red hours in a week were one dropped ssh each; the next hour passed."""
+    out = world.run(FAKE_SSH_DROP_SNAPSHOT=str(tmp_path / "drops"))
+
+    assert out.returncode == 0, world.log()
+    assert _subjects(world.replica / "brain.db") == _subjects(world.producer / "brain.db")
+    assert world.stamp.is_file()
+    assert "retrying once" in world.log()
+
+
+def test_a_snapshot_that_drops_twice_still_fails_the_run(world, tmp_path):
+    before = (world.replica / "brain.db").read_bytes()
+
+    out = world.run(FAKE_SSH_DROP_SNAPSHOT=str(tmp_path / "drops"), FAKE_SSH_DROPS="2")
+
+    assert out.returncode == 1
+    assert (world.replica / "brain.db").read_bytes() == before
+    assert not world.stamp.exists()

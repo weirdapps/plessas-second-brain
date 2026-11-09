@@ -219,8 +219,23 @@ else
   # an existing file keeps that file's mode, so an old 0644 copy stays 0644 unless
   # it is set here. Double quotes around the path, so the producer's shell expands the
   # escaped $HOME in it; single quotes left chmod a literal path and failed the step.
-  ssh $SSH_OPTS "$VPS" "umask 077; mkdir -p \$HOME/.second-brain && python3 -c '$SNAPSHOT_PY' \"\$HOME/$REMOTE_DATA/brain.db\" \"$REMOTE_SNAP\" && chmod 600 \"$REMOTE_SNAP\"" 2>> "$LOG_FILE"
+  take_snapshot() {
+    ssh $SSH_OPTS "$VPS" "umask 077; mkdir -p \$HOME/.second-brain && python3 -c '$SNAPSHOT_PY' \"\$HOME/$REMOTE_DATA/brain.db\" \"$REMOTE_SNAP\" && chmod 600 \"$REMOTE_SNAP\"" 2>> "$LOG_FILE"
+  }
+  take_snapshot
   SNAP_RC=$?
+  # 255 is ssh's own code: the connection, not the snapshot, failed. Every red
+  # pull of 5-8 Nov 2026 was one of these ("Timeout, server ... not responding",
+  # the Pro's network moving mid-run) and the next hour's run passed. So wait for
+  # the producer again and try once more; the backup is a fresh one-step copy, so
+  # repeating it is safe. A second drop still fails the run.
+  if [ $SNAP_RC -eq 255 ]; then
+    log "WARN: connection dropped during the VPS snapshot, retrying once"
+    if "$WAIT_GATE" "$VPS" "${SB_PULL_WAIT_BUDGET:-180}" "${SB_PULL_WAIT_INTERVAL:-10}" 2>> "$LOG_FILE"; then
+      take_snapshot
+      SNAP_RC=$?
+    fi
+  fi
 fi
 if [ $SNAP_RC -ne 0 ]; then
   log "ERROR: VPS snapshot FAILED (rc=$SNAP_RC), NOT copying a live database; keeping the existing local file"

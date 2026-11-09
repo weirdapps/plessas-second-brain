@@ -217,6 +217,25 @@ def cmd_hash_attachments(args):
     return 0
 
 
+def cmd_mail_backend_report(args) -> int:
+    """Counts per backend, verb and outcome from data/mail_backend_events.jsonl, with
+    the shadow's non-matches and auto's fallback rate. Reads the file only."""
+    import json
+    from datetime import UTC, datetime
+
+    from src import config
+    from src.export.mail_backend_report import render, summarise
+
+    since = None
+    if args.since:
+        since = datetime.fromisoformat(args.since.replace("Z", "+00:00"))
+        since = since if since.tzinfo else since.replace(tzinfo=UTC)
+    path = args.path or config.DATA_ROOT / "mail_backend_events.jsonl"
+    summary = summarise(path, since)
+    print(json.dumps(summary, indent=2) if args.json else render(summary))
+    return 0
+
+
 def cmd_mail_reconcile(args):
     """List the Outlook messages the store lacks; on the producer, stage them again.
 
@@ -1928,6 +1947,7 @@ def cmd_stats(args):
 # there until it is added here.
 READ_ONLY_COMMANDS = frozenset(
     {
+        "mail-backend-report",
         # The MCP tools read through the read-only connection; sharepoint_index's
         # refetch, the one that writes, refuses on a replica itself, as on the server.
         "tool",
@@ -2297,6 +2317,20 @@ def main():
         " fails (producer only; default path: <data home>/state/mail_loss.json)",
     )
     parser_reconcile.set_defaults(func=cmd_mail_reconcile)
+
+    parser_mbr = subparsers.add_parser(
+        "mail-backend-report",
+        help="Count the mail backend's shadow comparisons and auto fallbacks (reads only)",
+    )
+    parser_mbr.add_argument("--since", default=None, help="Only events from this ISO time")
+    parser_mbr.add_argument(
+        "--path",
+        type=Path,
+        default=None,
+        help="Events file (default: <data>/mail_backend_events.jsonl)",
+    )
+    parser_mbr.add_argument("--json", action="store_true", help="The summary as JSON")
+    parser_mbr.set_defaults(func=cmd_mail_backend_report)
 
     parser_stubs = subparsers.add_parser(
         "retry-stubs",

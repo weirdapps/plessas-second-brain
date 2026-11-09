@@ -32,6 +32,15 @@ EVENTS = [
     {"at": "2026-11-13T01:00:01+00:00", "backend": "auto", "verb": "get-mail", "outcome": "ok"},
     {"at": "2026-11-13T01:00:02+00:00", "backend": "auto", "verb": "get-mail", "outcome": "ok"},
     {
+        "at": "2026-11-13T01:30:00+00:00",
+        "backend": "adapter",
+        "verb": "list-mail",
+        "outcome": "vanished",
+        "mode": "auto",
+        "count": 2,
+        "ids": ["a", "b"],
+    },
+    {
         "at": "2026-11-13T02:00:00+00:00",
         "backend": "auto",
         "verb": "list-mail",
@@ -52,7 +61,9 @@ def test_counts_non_matches_and_the_fallback_rate(tmp_path):
     assert {"backend": "shadow", "verb": "list-mail", "outcome": "graph_error", "n": 1} in s[
         "counts"
     ]
+    assert s["vanished"] == 2
     text = render(s)
+    assert "vanished: 2" in text
     assert "1 not matching" in text and "(25.00%)" in text and "auth 1" in text
 
 

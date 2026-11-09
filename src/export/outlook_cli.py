@@ -74,14 +74,43 @@ def _record(event: dict) -> None:
         pass
 
 
-def _compare(verb: str, ours: Any, theirs: Any) -> dict:
-    """What a shadow read found: ids only, never content."""
+def _graph(args: list[str], timeout_sec: int, mode: str) -> tuple[Any, list[str]]:
+    """The Graph CLI's answer, and the ids it left out because they vanished.
+
+    A message moved or deleted between the Graph listing and its read is no
+    disagreement between the backends, so it gets its own line, outcome `vanished`,
+    under backend `adapter` (the estate grader reads `shadow` lines only), and
+    `brain mail-backend-report` counts it apart."""
+    from src.export import graph_cli
+
+    result = graph_cli.translate(args, timeout_sec)
+    gone = graph_cli.take_vanished()
+    if gone:
+        _record(
+            {
+                "backend": "adapter",
+                "verb": args[0] if args else "",
+                "outcome": "vanished",
+                "mode": mode,
+                "count": len(gone),
+                "ids": gone[:50],
+            }
+        )
+    return result, gone
+
+
+def _compare(verb: str, ours: Any, theirs: Any, vanished: list[str] | None = None) -> dict:
+    """What a shadow read found: ids only, never content. Ids Exchange no longer had
+    when the Graph CLI read them are left out of the comparison and counted."""
     if verb == "list-mail":
-        a = {m["Id"] for m in ours or [] if isinstance(m, dict) and m.get("Id")}
+        gone = set(vanished or [])
+        a = {m["Id"] for m in ours or [] if isinstance(m, dict) and m.get("Id")} - gone
         b = {m["Id"] for m in theirs or [] if isinstance(m, dict) and m.get("Id")}
+        extra = {"vanished": len(gone)} if gone else {}
         if a == b:
-            return {"outcome": "match", "count": len(a)}
+            return {"outcome": "match", "count": len(a), **extra}
         return {
+            **extra,
             "outcome": "mismatch",
             "count": len(a),
             "only_outlook_cli": sorted(a - b)[:50],
@@ -121,8 +150,8 @@ def run_outlook_cli(args: list[str], timeout_sec: int = 60) -> Any:
         result = _run_binary(args, timeout_sec)
         if verb in _SHADOWED:
             try:
-                theirs = graph_cli.translate(args, timeout_sec)
-                _record({"backend": "shadow", "verb": verb, **_compare(verb, result, theirs)})
+                theirs, gone = _graph(args, timeout_sec, backend)
+                _record({"backend": "shadow", "verb": verb, **_compare(verb, result, theirs, gone)})
             except graph_cli.GraphCliUnsupported:
                 pass
             except Exception as e:  # a shadow must never cost the real call
@@ -140,7 +169,7 @@ def run_outlook_cli(args: list[str], timeout_sec: int = 60) -> Any:
         return _auto(args, verb, timeout_sec)
 
     try:
-        return graph_cli.translate(args, timeout_sec)
+        return _graph(args, timeout_sec, backend)[0]
     except graph_cli.GraphCliUnsupported:
         return _run_binary(args, timeout_sec)
     except (graph_cli.GraphCliError, subprocess.TimeoutExpired) as e:
@@ -176,7 +205,7 @@ def _auto(args: list[str], verb: str, timeout_sec: int) -> Any:
     from src.export import graph_cli
 
     try:
-        result = graph_cli.translate(args, timeout_sec)
+        result = _graph(args, timeout_sec, "auto")[0]
     except graph_cli.GraphCliUnsupported:
         return _run_binary(args, timeout_sec)
     except Exception as e:  # a Graph failure must cost one fallback, never the call

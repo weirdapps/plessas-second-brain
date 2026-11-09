@@ -2,7 +2,8 @@
 
 `run_outlook_cli` writes one line per shadow comparison (`match`, `mismatch`,
 `graph_error`) and, under SB_MAIL_BACKEND=auto, one per call the Graph CLI was asked
-to serve (`ok`, or `fallback` with its `reason`). This counts them per backend, verb
+to serve (`ok`, or `fallback` with its `reason`), plus `vanished` lines (backend
+`adapter`) for messages Exchange no longer had when the Graph CLI read them. This counts them per backend, verb
 and outcome, and gives the two figures the plan's gates name: the shadow's
 non-matches and auto's fallback rate. Reads only; a line it cannot parse is counted,
 never fatal.
@@ -29,6 +30,7 @@ def summarise(path: Path, since: datetime | None = None) -> dict:
     counts: Counter[tuple[str, str, str]] = Counter()
     reasons: Counter[str] = Counter()
     unreadable = 0
+    vanished_events: list[dict] = []
     first = last = None
     if path.exists():
         for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -48,6 +50,8 @@ def summarise(path: Path, since: datetime | None = None) -> dict:
             first = at if first is None or at < first else first
             last = at if last is None or at > last else last
             counts[(str(e.get("backend")), str(e.get("verb")), str(e.get("outcome")))] += 1
+            if e.get("outcome") == "vanished":
+                vanished_events.append(e)
             if e.get("outcome") == "fallback":
                 reasons[str(e.get("reason") or "unknown")] += 1
 
@@ -55,7 +59,7 @@ def summarise(path: Path, since: datetime | None = None) -> dict:
         return sum(n for (b, _, o), n in counts.items() if b == backend and outcome in (None, o))
 
     shadow = total("shadow")
-    auto = total("auto")
+    auto = total("auto", "ok") + total("auto", "fallback")
     fallbacks = total("auto", "fallback")
     return {
         "path": str(path),
@@ -67,6 +71,7 @@ def summarise(path: Path, since: datetime | None = None) -> dict:
             {"backend": b, "verb": v, "outcome": o, "n": n}
             for (b, v, o), n in sorted(counts.items())
         ],
+        "vanished": sum(int(n.get("count") or 1) for n in vanished_events),
         "shadow": {"events": shadow, "non_match": shadow - total("shadow", "match")},
         "auto": {
             "calls": auto,
@@ -93,6 +98,10 @@ def render(summary: dict) -> str:
     rate = "n/a" if a["fallback_rate"] is None else f"{a['fallback_rate'] * 100:.2f}%"
     why = ", ".join(f"{k} {v}" for k, v in a["reasons"].items()) or "none"
     lines.append(f"auto:   {a['calls']} calls, {a['fallbacks']} fallbacks ({rate}); {why}")
+    lines.append(
+        f"vanished: {summary['vanished']} messages gone between a Graph listing and its read"
+        " (not counted as mismatches or fallbacks)"
+    )
     if summary["unreadable_lines"]:
         lines.append(f"unreadable lines: {summary['unreadable_lines']}")
     return "\n".join(lines)

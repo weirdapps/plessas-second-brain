@@ -105,6 +105,8 @@ def test_auto_falls_back_to_outlook_cli_on_any_graph_failure_and_records_it(monk
     oc.assert_called_once()
     ev = _events()
     assert ev and ev[-1]["outcome"] == "fallback" and ev[-1]["verb"] == "get-mail"
+    assert ev[-1]["exit_code"] == failure.exit_code
+    assert ev[-1]["reason"] == ("auth" if failure.exit_code == 2 else "error")
 
 
 def test_auto_routes_an_unsupported_call_to_outlook_cli_without_calling_it_a_fallback(monkeypatch):
@@ -129,9 +131,25 @@ def test_auto_falls_back_when_graph_times_out(monkeypatch):
     ):
         assert run_outlook_cli(["list-mail"]) == []
     oc.assert_called_once()
+    assert _events()[-1]["reason"] == "timeout"
 
 
-def test_auto_success_does_not_call_outlook_cli(monkeypatch):
+@pytest.mark.parametrize("failure", [ValueError("bad json"), KeyError("id"), OSError("disk")])
+def test_auto_falls_back_on_an_unexpected_graph_exception_too(monkeypatch, failure):
+    # A parse or shape bug in the adapter must cost one fallback, never the sync run.
+    monkeypatch.setenv("SB_MAIL_BACKEND", "auto")
+    with (
+        patch.object(outlook_cli, "_run_binary", return_value=[]) as oc,
+        patch("src.export.graph_cli.translate", side_effect=failure),
+    ):
+        assert run_outlook_cli(["list-mail"]) == []
+    oc.assert_called_once()
+    ev = _events()[-1]
+    assert ev["outcome"] == "fallback" and ev["reason"] == "unexpected"
+
+
+def test_auto_success_does_not_call_outlook_cli_and_is_recorded(monkeypatch):
+    # The fallback rate needs a denominator: every call Graph served is one line.
     monkeypatch.setenv("SB_MAIL_BACKEND", "auto")
     with (
         patch.object(outlook_cli, "_run_binary") as oc,
@@ -139,6 +157,9 @@ def test_auto_success_does_not_call_outlook_cli(monkeypatch):
     ):
         assert run_outlook_cli(["list-mail"]) == [{"Id": "g"}]
     oc.assert_not_called()
+    assert _events() == [
+        {"at": _events()[0]["at"], "backend": "auto", "verb": "list-mail", "outcome": "ok"}
+    ]
 
 
 def test_auto_when_both_fail_raises_outlook_clis_error(monkeypatch):

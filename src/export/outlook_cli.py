@@ -136,19 +136,63 @@ def run_outlook_cli(args: list[str], timeout_sec: int = 60) -> Any:
                 )
         return result
 
+    if backend == "auto":
+        return _auto(args, verb, timeout_sec)
+
     try:
         return graph_cli.translate(args, timeout_sec)
     except graph_cli.GraphCliUnsupported:
         return _run_binary(args, timeout_sec)
     except (graph_cli.GraphCliError, subprocess.TimeoutExpired) as e:
-        if backend == "auto":
-            _record({"backend": "auto", "verb": verb, "outcome": "fallback", "error": str(e)[:300]})
-            return _run_binary(args, timeout_sec)
         if isinstance(e, graph_cli.GraphCliAuthRequired):
             raise OutlookCliAuthRequired(f"graph cli needs a new sign-in: {e.stderr}") from e
         if isinstance(e, subprocess.TimeoutExpired):
             raise
         raise OutlookCliError(exit_code=e.exit_code, stderr=e.stderr, retryable=False) from e
+
+
+def _fallback_reason(e: Exception) -> str:
+    """auth: the Graph CLI exited 2, sign it in again. error: it exited 1 (network,
+    Graph, anything else it reports). timeout: it never answered. unexpected: the
+    adapter itself broke (a parse or shape bug), which is ours to fix."""
+    from src.export import graph_cli
+
+    if isinstance(e, graph_cli.GraphCliAuthRequired):
+        return "auth"
+    if isinstance(e, graph_cli.GraphCliError):
+        return "error"
+    if isinstance(e, subprocess.TimeoutExpired):
+        return "timeout"
+    return "unexpected"
+
+
+def _auto(args: list[str], verb: str, timeout_sec: int) -> Any:
+    """The Graph CLI first; outlook-cli for this call whenever it fails, for any reason.
+
+    Every call the Graph CLI was asked to serve leaves one line, `ok` or `fallback`, so
+    `brain mail-backend-report` can give the fallback rate. A call it cannot serve by
+    design (GraphCliUnsupported: calendar verbs, --body none) goes to outlook-cli
+    unrecorded, since it is no failure and a line each would bury the real ones."""
+    from src.export import graph_cli
+
+    try:
+        result = graph_cli.translate(args, timeout_sec)
+    except graph_cli.GraphCliUnsupported:
+        return _run_binary(args, timeout_sec)
+    except Exception as e:  # a Graph failure must cost one fallback, never the call
+        event: dict[str, Any] = {
+            "backend": "auto",
+            "verb": verb,
+            "outcome": "fallback",
+            "reason": _fallback_reason(e),
+            "error": f"{type(e).__name__}: {e}"[:300],
+        }
+        if isinstance(e, graph_cli.GraphCliError):
+            event["exit_code"] = e.exit_code
+        _record(event)
+        return _run_binary(args, timeout_sec)
+    _record({"backend": "auto", "verb": verb, "outcome": "ok"})
+    return result
 
 
 def _run_binary(args: list[str], timeout_sec: int = 60) -> Any:

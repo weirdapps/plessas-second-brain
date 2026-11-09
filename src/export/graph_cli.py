@@ -194,6 +194,33 @@ def _read(message_id: str, timeout_sec: int) -> dict:
     return msg
 
 
+# Exchange's answer for an item that is no longer there (moved to another folder, or
+# deleted); the Graph CLI exits 1 with it, as it does for every other failure.
+_GONE_MARKERS = ("not found in the store", "ErrorItemNotFound", "itemNotFound")
+
+
+def _gone(e: GraphCliError) -> bool:
+    return type(e) is GraphCliError and any(m in e.stderr for m in _GONE_MARKERS)
+
+
+def _enrich(rows: list[dict], fields: list[str], timeout_sec: int) -> list[dict]:
+    """One read per row for the fields a listing lacks.
+
+    A message moved or deleted between the listing and its read is left out, as a
+    listing taken a moment later would leave it out: on the VPS (2026-11-09 10:13Z)
+    one such message failed the whole listing. Any other failure still fails it."""
+    out = []
+    for r in rows:
+        try:
+            msg = _read(r["id"], timeout_sec)
+        except GraphCliError as e:
+            if _gone(e):
+                continue
+            raise
+        out.append({f: msg.get(f) for f in fields})
+    return out
+
+
 def _get_mail(pos: list[str], flags: dict, timeout_sec: int) -> dict:
     body = flags.get("body", "html")
     if body != "html":
@@ -240,7 +267,7 @@ def _list_mail(flags: dict, timeout_sec: int) -> list[dict]:
     cap = int(os.environ.get("SB_GRAPH_ENRICH_MAX") or DEFAULT_ENRICH_MAX)
     if len(rows) > cap:
         raise GraphCliUnsupported(f"{len(rows)} messages need a read each (cap {cap})")
-    return [{f: _read(r["id"], timeout_sec).get(f) for f in fields} for r in rows]
+    return _enrich(rows, fields, timeout_sec)
 
 
 def _download(pos: list[str], flags: dict, timeout_sec: int) -> dict:

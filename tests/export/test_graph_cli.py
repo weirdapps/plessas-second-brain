@@ -342,3 +342,31 @@ def test_enum_values_come_back_pascal_case_as_outlook_cli_writes_them(mock_run):
     assert out["Importance"] == "Normal"
     assert out["InferenceClassification"] == "Focused"
     assert out["Flag"] == {"FlagStatus": "NotFlagged"}
+
+
+_GONE = (
+    "Graph API Error: Request to /me/messages/m2 failed: "
+    "The specified object was not found in the store., The process failed to get th"
+)
+
+
+@patch("src.export.graph_cli._spawn")
+def test_a_message_gone_between_listing_and_read_is_dropped_not_fatal(mock_run):
+    # VPS 2026-11-09 10:13Z: one message moved or deleted after the Graph listing and
+    # before its enrichment read, and that one 404 failed the whole listing.
+    listing = {"data": [{"id": "m1", "date": "d"}, {"id": "m2", "date": "d"}], "nextSkip": None}
+    mock_run.side_effect = [
+        _proc(listing),
+        _proc({"data": _full("m1")}),
+        _proc("", returncode=1, stderr=_GONE),
+    ]
+    out = translate(["list-mail", "--select", "Id,InternetMessageId", "--all", "--max", "9"])
+    assert out == [{"Id": "m1", "InternetMessageId": "<m1@x>"}]
+
+
+@patch("src.export.graph_cli._spawn")
+def test_any_other_read_failure_during_enrichment_still_fails_the_listing(mock_run):
+    listing = {"data": [{"id": "m1", "date": "d"}], "nextSkip": None}
+    mock_run.side_effect = [_proc(listing), _proc("", returncode=1, stderr="network down")]
+    with pytest.raises(GraphCliError):
+        translate(["list-mail", "--select", "Id,InternetMessageId", "--all", "--max", "9"])

@@ -56,6 +56,17 @@ _NATIVE = {
 _READ_CACHE: dict[str, dict] = {}
 _CACHE_LOCK = threading.Lock()
 
+# Ids a listing left out because Exchange no longer had them at read time, for the
+# dispatcher to log as `vanished` (take_vanished). Per thread: listings run in parallel.
+_VANISHED = threading.local()
+
+
+def take_vanished() -> list[str]:
+    """The ids the last call on this thread dropped as vanished, then forgotten."""
+    ids = list(getattr(_VANISHED, "ids", None) or [])
+    _VANISHED.ids = []
+    return ids
+
 
 class GraphCliError(Exception):
     def __init__(self, exit_code: int, stderr: str):
@@ -215,6 +226,7 @@ def _enrich(rows: list[dict], fields: list[str], timeout_sec: int) -> list[dict]
             msg = _read(r["id"], timeout_sec)
         except GraphCliError as e:
             if _gone(e):
+                _VANISHED.ids = [*(getattr(_VANISHED, "ids", None) or []), r["id"]]
                 continue
             raise
         out.append({f: msg.get(f) for f in fields})
@@ -302,6 +314,7 @@ def translate(args: list[str], timeout_sec: int = 60) -> Any:
     verb, rest = args[0], [a for a in args[1:] if a not in ("--json", "--no-auto-reauth")]
     _binary()
     pos, flags = _flags(rest)
+    _VANISHED.ids = []
     if verb == "auth-check":
         _run(["status"], timeout_sec)
         return {"ok": True}

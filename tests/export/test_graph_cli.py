@@ -362,6 +362,9 @@ def test_a_message_gone_between_listing_and_read_is_dropped_not_fatal(mock_run):
     ]
     out = translate(["list-mail", "--select", "Id,InternetMessageId", "--all", "--max", "9"])
     assert out == [{"Id": "m1", "InternetMessageId": "<m1@x>"}]
+    # The dispatcher hears which ones, once, so it can log them as vanished.
+    assert graph_cli.take_vanished() == ["m2"]
+    assert graph_cli.take_vanished() == []
 
 
 @patch("src.export.graph_cli._spawn")

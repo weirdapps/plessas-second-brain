@@ -219,3 +219,59 @@ def test_shadow_swallows_graph_failures(monkeypatch):
     ):
         assert run_outlook_cli(["list-mail"]) == []
     assert _events()[-1]["outcome"] == "graph_error"
+
+
+def _vanishing_translate(rows, gone):
+    """A Graph listing that lost `gone` because Exchange no longer had them at read time."""
+    from src.export import graph_cli
+
+    def fake(args, timeout_sec=60):
+        graph_cli._VANISHED.ids = list(gone)
+        return rows
+
+    return fake
+
+
+def test_shadow_does_not_count_a_vanished_message_as_a_mismatch(monkeypatch):
+    # VPS 2026-11-09 10:13Z: outlook-cli listed m2, Graph listed it too, and Exchange
+    # answered "not found in the store" when Graph read it a moment later.
+    monkeypatch.setenv("SB_MAIL_BACKEND", "shadow")
+    with (
+        patch.object(outlook_cli, "_run_binary", return_value=[{"Id": "m1"}, {"Id": "m2"}]),
+        patch("src.export.graph_cli.translate", _vanishing_translate([{"Id": "m1"}], ["m2"])),
+    ):
+        run_outlook_cli(["list-mail", "--select", "Id,InternetMessageId"])
+    ev = _events()
+    shadow = [e for e in ev if e["backend"] == "shadow"]
+    assert [e["outcome"] for e in shadow] == ["match"]
+    assert shadow[0]["vanished"] == 1
+    gone = [e for e in ev if e["outcome"] == "vanished"]
+    assert gone and gone[0]["ids"] == ["m2"] and gone[0]["mode"] == "shadow"
+    # Never a shadow line: the estate grader reads only those, and a vanished
+    # message is no disagreement between the backends.
+    assert gone[0]["backend"] != "shadow"
+
+
+def test_shadow_still_flags_a_real_disagreement_beside_a_vanished_one(monkeypatch):
+    monkeypatch.setenv("SB_MAIL_BACKEND", "shadow")
+    with (
+        patch.object(
+            outlook_cli, "_run_binary", return_value=[{"Id": "m1"}, {"Id": "m2"}, {"Id": "m3"}]
+        ),
+        patch("src.export.graph_cli.translate", _vanishing_translate([{"Id": "m1"}], ["m2"])),
+    ):
+        run_outlook_cli(["list-mail", "--select", "Id,InternetMessageId"])
+    shadow = [e for e in _events() if e["backend"] == "shadow"]
+    assert shadow[0]["outcome"] == "mismatch" and shadow[0]["only_outlook_cli"] == ["m3"]
+
+
+def test_auto_logs_vanished_messages_without_counting_them_as_calls(monkeypatch):
+    monkeypatch.setenv("SB_MAIL_BACKEND", "auto")
+    with (
+        patch.object(outlook_cli, "_run_binary") as oc,
+        patch("src.export.graph_cli.translate", _vanishing_translate([{"Id": "m1"}], ["m2"])),
+    ):
+        assert run_outlook_cli(["list-mail"]) == [{"Id": "m1"}]
+    oc.assert_not_called()
+    outcomes = sorted(e["outcome"] for e in _events())
+    assert outcomes == ["ok", "vanished"]

@@ -111,6 +111,94 @@ def test_a_failed_reconcile_keeps_when_the_last_one_succeeded(home):
     assert second["fetch_gave_up"] == 3, "the counts stay fresh when the reconcile fails"
 
 
+# --- A give-up the reconcile shows is held --------------------------------------
+#
+# On 2026-11-09 the Inbox export gave up on a message that had been moved to Archive:
+# its Inbox id no longer resolved, the store held it under its Archive id, and the
+# 7-day reconcile listed 1,948 messages with none missing. The health check still
+# warned "1 messages given up" for a week.
+
+
+def _give_up(home, folder_file, entry):
+    path = home / "state" / folder_file
+    raw = json.loads(path.read_text())
+    raw["fetch_gave_up"] = [entry]
+    path.write_text(json.dumps(raw))
+
+
+def _week(cutoff=NOW, missing=()):
+    report = mr.Report(since=NOW - timedelta(days=7), until=NOW, cutoff=cutoff)
+    report.missing = [{"folder": "Inbox", "Id": i} for i in missing]
+    return report
+
+
+MOVED = {
+    "id": "AAMk-moved",
+    "received": "2026-10-09T10:06:53Z",
+    "attempts": 5,
+    "gave_up_at": "2026-10-09T14:15:10Z",
+}
+
+
+def test_a_give_up_the_reconcile_does_not_list_as_missing_is_not_mail_loss(home):
+    _give_up(home, "outlook_sync.json", MOVED)
+
+    written = mr.write_mail_loss(report=_week())
+
+    assert written["settled_give_ups"] == ["AAMk-moved"]
+    assert written["folders"]["Inbox"]["fetch_gave_up"] == 0
+    assert written["fetch_gave_up"] == 3, "the Archive and Sent give-ups were never dated"
+    assert written["last_gave_up_at"] is None
+
+
+def test_a_give_up_the_reconcile_still_lists_as_missing_stays_mail_loss(home):
+    _give_up(home, "outlook_sync.json", MOVED)
+
+    written = mr.write_mail_loss(report=_week(missing=["AAMk-moved"]))
+
+    assert written["settled_give_ups"] == []
+    assert written["folders"]["Inbox"]["fetch_gave_up"] == 1
+    assert written["last_gave_up_at"] == MOVED["gave_up_at"]
+
+
+@pytest.mark.parametrize(
+    ("received", "cutoff", "why"),
+    [
+        ("2026-09-20T10:00:00Z", NOW, "received before the window the reconcile listed"),
+        ("2026-10-10T10:00:00Z", NOW - timedelta(days=2), "newer than the store: not judged"),
+        (None, NOW, "no received time to place it in the window"),
+    ],
+)
+def test_a_give_up_the_reconcile_could_not_see_stays_mail_loss(home, received, cutoff, why):
+    _give_up(home, "outlook_sync.json", {**MOVED, "received": received})
+
+    written = mr.write_mail_loss(report=_week(cutoff=cutoff))
+
+    assert written["settled_give_ups"] == [], why
+    assert written["folders"]["Inbox"]["fetch_gave_up"] == 1, why
+
+
+def test_a_settled_give_up_stays_settled_when_the_next_reconcile_fails(home):
+    _give_up(home, "outlook_sync.json", MOVED)
+    mr.write_mail_loss(report=_week())
+
+    written = mr.write_mail_loss(error="outlook-cli needs re-authentication (exit 4)")
+
+    assert written["settled_give_ups"] == ["AAMk-moved"]
+    assert written["folders"]["Inbox"]["fetch_gave_up"] == 0
+
+
+def test_a_settled_id_the_cursor_no_longer_keeps_is_dropped(home):
+    _give_up(home, "outlook_sync.json", MOVED)
+    mr.write_mail_loss(report=_week())
+    _give_up(home, "outlook_sync.json", {**MOVED, "id": "AAMk-other", "received": None})
+
+    written = mr.write_mail_loss()
+
+    assert written["settled_give_ups"] == []
+    assert written["folders"]["Inbox"]["fetch_gave_up"] == 1
+
+
 # --- The command ---------------------------------------------------------------
 
 

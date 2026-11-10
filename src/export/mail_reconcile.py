@@ -489,10 +489,49 @@ def mail_loss_path() -> Path:
     return DATA_ROOT / "state" / MAIL_LOSS_FILE
 
 
-def mail_loss_counts(state_dir: Path, staging_dir: Path) -> dict:
+def _gave_up_entries(state_dir: Path) -> list[dict]:
+    """Every give-up the cursor files keep that names its message id."""
+    entries: list[dict] = []
+    for path in sorted(state_dir.glob("outlook_sync*.json")):
+        try:
+            state = load_outlook_sync_state(path)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        entries += [g for g in state.fetch_gave_up if isinstance(g, dict) and g.get("id")]
+    return entries
+
+
+def settled_give_ups(entries: list[dict], report: Report) -> set[str]:
+    """The give-ups a finished reconcile shows are not lost.
+
+    The reconcile lists every message in the walked folders over [since, until] and
+    names each one the store lacks. A given-up id received inside that window, no
+    later than the store's newest mail (the cutoff), and not named missing is either
+    held under another id (a message moved between folders gets a new Graph id: the
+    Inbox give-up of 2026-11-09 was in the store under its Archive id) or no longer
+    in any walked folder. A give-up outside the window, or with no received time,
+    is not judged.
+    """
+    if report.cutoff is None:
+        return set()
+    missing = {str(m.get("Id")) for m in report.missing}
+    settled = set()
+    for entry in entries:
+        received = parse_when(entry.get("received"))
+        if received is None or not report.since <= received <= report.cutoff:
+            continue
+        if str(entry["id"]) not in missing:
+            settled.add(str(entry["id"]))
+    return settled
+
+
+def mail_loss_counts(
+    state_dir: Path, staging_dir: Path, settled: set[str] | frozenset[str] = frozenset()
+) -> dict:
     """What the export has stopped chasing: per folder, the messages it gave up
     fetching and those still on the retry list (its cursor files), and the
-    staging batches quarantined as unreadable."""
+    staging batches quarantined as unreadable. A give-up in `settled` (see
+    settled_give_ups) is not counted."""
     folders: dict[str, dict] = {}
     for path in sorted(state_dir.glob("outlook_sync*.json")):
         try:
@@ -500,11 +539,16 @@ def mail_loss_counts(state_dir: Path, staging_dir: Path) -> dict:
         except (OSError, ValueError, TypeError, AttributeError) as e:  # not JSON, or not an object
             folders[path.name] = {"unreadable": type(e).__name__}
             continue
+        gave_up = [
+            g
+            for g in state.fetch_gave_up
+            if not (isinstance(g, dict) and str(g.get("id")) in settled)
+        ]
         # The cursor keeps the last FETCH_GAVE_UP_KEPT for good, so a count alone
         # never falls back to zero; the newest give-up's time says whether it is news.
-        dated = [g.get("gave_up_at") for g in state.fetch_gave_up if isinstance(g, dict)]
+        dated = [g.get("gave_up_at") for g in gave_up if isinstance(g, dict)]
         folders[state.folder or path.name] = {
-            "fetch_gave_up": len(state.fetch_gave_up),
+            "fetch_gave_up": len(gave_up),
             "fetch_retries": len(state.fetch_retries),
             "last_gave_up_at": max((d for d in dated if isinstance(d, str)), default=None),
         }
@@ -528,7 +572,9 @@ def write_mail_loss(
     """Write the counters the health check reads, atomically, and return them.
 
     {updated_at, fetch_gave_up, quarantined} are what it judges; `folders` and
-    `reconcile` say where they come from and how the reconcile went. The counts
+    `reconcile` say where they come from and how the reconcile went, and
+    `settled_give_ups` the given-up ids a reconcile showed are not lost, which
+    fetch_gave_up leaves out. The counts
     are read from disk every time, so they stay fresh when the reconcile fails;
     `reconcile.ok_at`, when one last finished, is carried over from the file
     until one does.
@@ -536,11 +582,19 @@ def write_mail_loss(
     path = path or mail_loss_path()
     now = _iso(datetime.now(UTC))
     previous_ok = None
+    previous_settled: set[str] = set()
     try:
         previous = json.loads(path.read_text(encoding="utf-8"))
         previous_ok = (previous.get("reconcile") or {}).get("ok_at")
-    except (OSError, ValueError, AttributeError):
+        previous_settled = {str(i) for i in previous.get("settled_give_ups") or []}
+    except (OSError, ValueError, AttributeError, TypeError):
         pass
+    state_dir = DATA_ROOT / "state"
+    entries = _gave_up_entries(state_dir)
+    # Carried over, so a failed reconcile does not bring back a settled give-up, and
+    # kept only while a cursor still holds the id.
+    settled = previous_settled | (settled_give_ups(entries, report) if report else set())
+    settled &= {str(g["id"]) for g in entries}
     status = "failed" if error else ("ok" if report is not None else "not run")
     reconcile_part: dict = {"status": status, "ok_at": now if status == "ok" else previous_ok}
     if error:
@@ -559,7 +613,8 @@ def write_mail_loss(
         )
     payload = {
         "updated_at": now,
-        **mail_loss_counts(DATA_ROOT / "state", DATA_ROOT / "staging"),
+        **mail_loss_counts(state_dir, DATA_ROOT / "staging", settled),
+        "settled_give_ups": sorted(settled),
         "reconcile": reconcile_part,
     }
     write_json_atomic(path, payload)

@@ -48,7 +48,7 @@ if [ -z "$unplaced" ]; then
   failed=1
 elif [ "$unplaced" -gt 0 ]; then
   log "topic registry: $unplaced unplaced; one batch"
-  cli maint topic-registry --limit 5000 --llm-calls 20 --apply || failed=1
+  cli maint topic-registry --limit 25000 --llm-calls 20 --apply || failed=1
 fi
 
 # 2. Vectors: email chunks and copy chunks first, then the 768 summaries.

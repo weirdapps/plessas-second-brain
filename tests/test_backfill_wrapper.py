@@ -15,7 +15,7 @@ import pytest
 WRAPPER = Path(__file__).parent.parent / "scripts" / "wrappers" / "systemd" / "sb-backfill.sh"
 
 REGISTRY_DRY = "-m src.cli maint topic-registry --limit 1 --llm-calls 0 --show 0"
-REGISTRY_APPLY = "-m src.cli maint topic-registry --limit 5000 --llm-calls 20 --apply"
+REGISTRY_APPLY = "-m src.cli maint topic-registry --limit 25000 --llm-calls 20 --apply"
 VECTORS_DRY = "-m src.cli maint vectors-backfill --summaries --limit 1"
 VECTORS_APPLY = "-m src.cli maint vectors-backfill --apply --limit 2000"
 SUMMARIES_APPLY = "-m src.cli maint vectors-backfill --apply --summaries --limit 5000"

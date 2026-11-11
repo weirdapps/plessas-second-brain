@@ -251,18 +251,125 @@ def _two_nikos(db):
     return a, b, mail
 
 
-def test_a_name_only_match_is_queued_never_merged_on_a_gated_store(tmp_path):
+def _ambiguous_nikos(db):
+    """Two addressed people share the name, so the name-only row is queued, not merged."""
+    a, b, mail = _two_nikos(db)
+    db.execute("INSERT INTO people (name, email) VALUES ('Nikos Papadopoulos', 'np2@corp.example')")
+    db.commit()
+    return a, b, mail
+
+
+def test_a_name_matching_one_addressed_person_merges_by_itself_and_is_logged(tmp_path):
+    """The owner's rule of 2026-11-11: a name-only row whose name belongs to exactly one
+    person with an address is that person; 119 such pairs sat in the queue, all correct."""
     path = tmp_path / "b.db"
     db = create_database(str(path))
     a, b, _ = _two_nikos(db)
     db.close()
     results = dedup_people.run_dedup(str(path))
     db = sqlite3.connect(path)
+    assert _people(db) & {a, b} == {a}
+    assert db.execute("SELECT kept_id, merged_id, method FROM person_merges").fetchone() == (
+        a,
+        b,
+        "phase2",
+    )
+    assert results["queued"] == 0
+    assert db.execute("SELECT COUNT(*) FROM person_review").fetchone()[0] == 0
+
+
+def test_a_script_variant_of_one_addressed_person_merges_by_itself(tmp_path):
+    path = tmp_path / "b.db"
+    db = create_database(str(path))
+    a = db.execute(
+        "INSERT INTO people (name, email) VALUES ('Παύλος Μυλωνάς', 'pm@corp.example')"
+    ).lastrowid
+    b = find_or_create_person(db, "Pavlos Mylonas")
+    db.commit()
+    db.close()
+    dedup_people.run_dedup(str(path))
+    db = sqlite3.connect(path)
+    assert _people(db) & {a, b} == {a}
+    assert db.execute("SELECT method FROM person_merges").fetchone()[0] == "phase7"
+
+
+def test_a_pending_pair_is_closed_by_the_automatic_merge(tmp_path):
+    path = tmp_path / "b.db"
+    db = create_database(str(path))
+    a, b, _ = _two_nikos(db)
+    person_identity.queue(db, a, b, "phase2", "name:nikos papadopoulos")
+    db.commit()
+    db.close()
+    dedup_people.run_dedup(str(path))
+    db = sqlite3.connect(path)
+    assert _people(db) & {a, b} == {a}
+    assert db.execute("SELECT status FROM person_review").fetchone()[0] == "merged"
+
+
+@pytest.mark.parametrize(
+    ("addressed", "name_only"),
+    [
+        ("Nikos Papadopoulos", "Nikos"),  # one word
+        ("N. Papadopoulos", "N. PAPADOPOULOS"),  # an initial
+    ],
+)
+def test_a_short_name_never_merges_by_itself(tmp_path, addressed, name_only):
+    path = tmp_path / "b.db"
+    db = create_database(str(path))
+    a = db.execute(
+        "INSERT INTO people (name, email) VALUES (?, 'np@corp.example')", (addressed,)
+    ).lastrowid
+    b = find_or_create_person(db, name_only)
+    db.commit()
+    db.close()
+    dedup_people.run_dedup(str(path))
+    db = sqlite3.connect(path)
     assert {a, b} <= _people(db)
-    queued = db.execute("SELECT person_a, person_b, rule, status FROM person_review").fetchall()
-    assert [tuple(r) for r in queued] == [(a, b, "phase2", "pending")]
+    assert db.execute("SELECT COUNT(*) FROM person_merges").fetchone()[0] == 0
+
+
+def test_a_name_shared_by_two_addressed_people_is_queued_never_merged(tmp_path):
+    path = tmp_path / "b.db"
+    db = create_database(str(path))
+    a, b, _ = _ambiguous_nikos(db)
+    db.close()
+    results = dedup_people.run_dedup(str(path))
+    db = sqlite3.connect(path)
+    assert {a, b} <= _people(db)
+    queued = db.execute("SELECT person_b, rule, status FROM person_review").fetchall()
+    assert [tuple(r) for r in queued] == [(b, "phase2", "pending")]
     assert results["queued"] == 1
     assert db.execute("SELECT COUNT(*) FROM person_merges").fetchone()[0] == 0
+
+
+def test_two_rows_without_an_address_are_still_queued(tmp_path):
+    path = tmp_path / "b.db"
+    db = create_database(str(path))
+    a = find_or_create_person(db, "Nikos Papadopoulos")
+    b = db.execute("INSERT INTO people (name) VALUES ('NIKOS PAPADOPOULOS')").lastrowid
+    db.commit()
+    db.close()
+    dedup_people.run_dedup(str(path))
+    db = sqlite3.connect(path)
+    assert {a, b} <= _people(db)
+    assert db.execute("SELECT status FROM person_review").fetchone()[0] == "pending"
+
+
+def test_an_undone_merge_is_not_made_again(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "b.db"
+    db = create_database(str(path))
+    a, b, _ = _two_nikos(db)
+    db.close()
+    dedup_people.run_dedup(str(path))
+    merge = sqlite3.connect(path).execute("SELECT id FROM person_merges").fetchone()[0]
+    code, out, _ = brain(
+        monkeypatch, capsys, "--db", str(path), "maint", "people-unmerge", str(merge)
+    )
+    assert code == 0, out
+    dedup_people.run_dedup(str(path))
+    db = sqlite3.connect(path)
+    assert {a, b} <= _people(db)
+    assert db.execute("SELECT COUNT(*) FROM person_merges").fetchone()[0] == 1
 
 
 def test_a_shared_address_merges_by_itself_and_is_logged(tmp_path):
@@ -296,7 +403,7 @@ def test_the_legacy_store_still_merges_by_name(tmp_path):
 def test_a_rejected_pair_is_not_queued_again(tmp_path, monkeypatch, capsys):
     path = tmp_path / "b.db"
     db = create_database(str(path))
-    _two_nikos(db)
+    _ambiguous_nikos(db)
     db.close()
     dedup_people.run_dedup(str(path))
     db = sqlite3.connect(path)
@@ -316,9 +423,10 @@ def test_the_owner_clears_the_queue_with_one_command_and_every_merge_is_logged(
 ):
     path = tmp_path / "b.db"
     db = create_database(str(path))
-    a, b, mail = _two_nikos(db)
+    _, b, mail = _ambiguous_nikos(db)
     db.close()
     dedup_people.run_dedup(str(path))
+    a = sqlite3.connect(path).execute("SELECT person_a FROM person_review").fetchone()[0]
     code, out, _ = brain(monkeypatch, capsys, "--db", str(path), "maint", "people-review")
     assert code == 0 and "NIKOS PAPADOPOULOS" in out
     code, out, _ = brain(

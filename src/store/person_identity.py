@@ -610,6 +610,38 @@ def queue(
     return True
 
 
+def auto_merge(
+    conn: sqlite3.Connection, keep_id: int, other_id: int, rule: str, evidence: str | None = None
+) -> bool | None:
+    """Merge a name-only match by itself, the owner's rule of 2026-11-11 for a name that
+    belongs to exactly one person with an address (the caller decides that). True when it
+    merged, closing the pair's pending review if one was queued. None when the owner has
+    spoken on the pair already, by rejecting it or by undoing its merge: it is left alone,
+    neither merged nor queued again. False when nothing was merged (a row gone)."""
+    a, b = keep_id, other_id
+    if conn.execute(
+        "SELECT 1 FROM person_merges WHERE undone_at IS NOT NULL"
+        " AND ((kept_id = ? AND COALESCE(restored_id, merged_id) = ?)"
+        " OR (kept_id = ? AND COALESCE(restored_id, merged_id) = ?))",
+        (a, b, b, a),
+    ).fetchone():
+        return None
+    review = conn.execute(
+        "SELECT id, status FROM person_review WHERE (person_a = ? AND person_b = ?)"
+        " OR (person_a = ? AND person_b = ?)",
+        (a, b, b, a),
+    ).fetchone()
+    if review is not None and review[1] != "pending":
+        return None
+    merge_id = merge(conn, a, b, method=rule, evidence=evidence)
+    if review is not None:
+        conn.execute(
+            "UPDATE person_review SET status = ?, decided_at = ?, merge_id = ? WHERE id = ?",
+            ("merged" if merge_id is not None else "gone", _now(), merge_id, review[0]),
+        )
+    return merge_id is not None
+
+
 def pending(conn: sqlite3.Connection) -> list[dict]:
     """The pairs waiting, with the names and addresses of both rows."""
     rows = conn.execute(

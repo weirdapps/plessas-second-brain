@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 
 from src.store.action_lifecycle import (
     dedup_exact_open_actions,
+    expire_aged_actions,
     expire_stale_actions,
     expire_undated_actions,
     run_action_lifecycle,
@@ -173,6 +174,46 @@ class TestExpire:
             "no parent": "expired",
             "meeting next month": "open",
             "far-future parent": "expired",
+        }
+        conn.close()
+
+
+class TestExpireAged:
+    """An action whose parent went quiet over 180 days ago is closed, whatever its deadline
+    says, unless that deadline is still to come: on 2026-11-11 1,784 such actions were open
+    because their deadline had passed, but by less than 180 days."""
+
+    def test_expires_old_parents_unless_the_deadline_is_ahead(self):
+        conn = create_database(":memory:")
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received) VALUES (1, 1, ?), (2, 2, ?)",
+            (OLD, _now()),
+        )
+        conn.execute("UPDATE emails SET date_received = date('now', '-200 days') WHERE id = 1")
+        conn.execute("UPDATE emails SET date_received = date('now', '-100 days') WHERE id = 2")
+        conn.execute(
+            "INSERT INTO action_items (email_id, task, deadline, status) "
+            "VALUES (1, 'recent deadline', date('now', '-30 days'), 'open')"
+        )
+        _add(conn, "free text", deadline="ASAP")
+        _add(conn, "no deadline")
+        _add(conn, "deadline ahead", deadline="2099-01-01")
+        _add(conn, "names a coming year", deadline="by 31/12/2027")
+        _add(conn, "already done", deadline="ASAP", status="done")
+        _add(conn, "young parent", deadline="ASAP", email_id=2)
+        _add(conn, "no parent", deadline="ASAP", email_id=None)
+        conn.commit()
+
+        assert expire_aged_actions(conn, days=180) == 3
+        assert dict(conn.execute("SELECT task, status FROM action_items")) == {
+            "recent deadline": "expired",
+            "free text": "expired",
+            "no deadline": "expired",
+            "deadline ahead": "open",
+            "names a coming year": "open",
+            "already done": "done",
+            "young parent": "open",
+            "no parent": "open",
         }
         conn.close()
 
@@ -375,3 +416,21 @@ class TestRunLifecycle:
 
         assert kept["expired_undated"] == 0
         assert (res["expired_undated"], res["after_open"]) == (1, 0)
+
+    def test_reports_aged_expiry(self, tmp_path):
+        db = str(tmp_path / "b.db")
+        conn = create_database(db)
+        conn.execute(
+            "INSERT INTO emails (id, message_id, date_received) "
+            "VALUES (1, 1, date('now', '-200 days'))"
+        )
+        conn.execute(
+            "INSERT INTO action_items (email_id, task, deadline, status) "
+            "VALUES (1, 't', date('now', '-30 days'), 'open')"
+        )
+        conn.commit()
+        conn.close()
+
+        res = run_action_lifecycle(db)
+
+        assert (res["expired"], res["expired_aged"], res["after_open"]) == (0, 1, 0)

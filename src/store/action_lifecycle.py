@@ -10,6 +10,8 @@ gives the 'open actions' view (query_action_items, stale_threads) a lifecycle:
     (a soft close: NOT 'done', since we can't prove completion, but no longer
     surfaced by the default status='open' queries). An action with no date ages
     with the email, thread, meeting or conversation it came from instead.
+  * aged-out: any open action whose parent went quiet over 180 days ago, unless its
+    deadline is still to come.
   * completion (schema v35): complete_action marks an action 'done', with what closed
     it (closed_by) and when (closed_at), for the consolidation pass or a person to call.
     Both passes above touch open actions only, so a done one stays done.
@@ -165,6 +167,35 @@ def expire_undated_actions(
     return cur.rowcount
 
 
+def expire_aged_actions(conn: sqlite3.Connection, days: int = DEFAULT_EXPIRE_DAYS) -> int:
+    """Mark OPEN actions as 'expired' once their parent has been quiet for `days`.
+
+    The owner's rule of 2026-11-11: an action older than 180 days is stale whatever its
+    deadline says. expire_stale_actions needs the deadline itself 180 days gone, so a
+    year-old mail with a deadline missed last month stayed open. Kept open: a deadline
+    still to come (an ISO date from today on, or free text naming this year or a later one,
+    as in expire_undated_actions), and a parent with no ISO date. Returns the number of
+    rows expired.
+    """
+    conn.create_function("sb_names_coming_year", 2, _names_a_coming_year, deterministic=True)
+    cur = conn.execute(
+        f"""
+        UPDATE action_items
+        SET status = 'expired'
+        WHERE status = 'open'
+          AND {_PARENT_LAST_ACTIVE} GLOB {_ISO_DATE}
+          AND substr({_PARENT_LAST_ACTIVE}, 1, 10) < date('now', '-' || ? || ' day')
+          AND NOT COALESCE(deadline GLOB {_ISO_DATE}
+              AND date(substr(deadline, 1, 10)) >= date('now'), 0)
+          AND NOT (deadline IS NOT NULL
+              AND (deadline NOT GLOB {_ISO_DATE} OR date(substr(deadline, 1, 10)) IS NULL)
+              AND sb_names_coming_year(deadline, ?))
+        """,
+        (days, date.today().year),
+    )
+    return cur.rowcount
+
+
 def complete_action(
     conn: sqlite3.Connection, action_id: int, closed_by: str | None, closed_at: str | None = None
 ) -> bool:
@@ -198,6 +229,7 @@ def run_action_lifecycle(
     deduped = dedup_exact_open_actions(conn)
     expired = expire_stale_actions(conn, expire_days)
     expired_undated = expire_undated_actions(conn, undated_expire_days)
+    expired_aged = expire_aged_actions(conn, expire_days)
     # The ledger (gated migration item_ledger) records what this run expired, and what a sync extracted
     # again since; a no-op on a store without it.
     from src.store import ledger
@@ -212,6 +244,7 @@ def run_action_lifecycle(
         "deduped": deduped,
         "expired": expired,
         "expired_undated": expired_undated,
+        "expired_aged": expired_aged,
         "after_open": after_open,
     }
 

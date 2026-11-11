@@ -752,7 +752,8 @@ itself. `sb-backfill.sh` reads each command's dry run first (`maint topic-regist
 --limit 1`, its emails, copy chunks and summaries left), then runs one batch of what is
 left:
 
-1. `maint topic-registry --limit 5000 --llm-calls 20 --apply`, while topics are unplaced;
+1. `maint topic-registry --limit 25000 --llm-calls 20 --apply`, while topics are unplaced
+   (about 12 minutes a batch: 5,000 took 2.5 on 2026-11-11);
 2. `maint vectors-backfill --apply --limit 2000`, while email or copy chunks are left,
    and only then `maint vectors-backfill --apply --summaries --limit 5000`.
 

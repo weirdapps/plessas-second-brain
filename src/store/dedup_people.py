@@ -200,15 +200,33 @@ def merge_person(
 
 
 def _merge_or_queue(
-    conn: sqlite3.Connection, keep_id: int, remove_id: int, rule: str, evidence: str
+    conn: sqlite3.Connection,
+    keep_id: int,
+    remove_id: int,
+    rule: str,
+    evidence: str,
+    *,
+    unique: bool = False,
 ) -> bool:
-    """A match on a name alone: merged on a legacy store; with the gated person_identity
-    (issue 170) queued for the owner instead, never merged. True when it merged."""
+    """A match on a name alone: merged on a legacy store. With the gated person_identity
+    (issue 170) queued for the owner instead, unless `unique`: the name belongs to exactly
+    one person with an address and is not short (see _short), which merges by itself, the
+    owner's rule of 2026-11-11. True when it merged."""
     if person_identity.active(conn):
+        if unique:
+            merged = person_identity.auto_merge(conn, keep_id, remove_id, rule, evidence)
+            if merged is not False:
+                return bool(merged)
         person_identity.queue(conn, keep_id, remove_id, rule, evidence)
         return False
     merge_person(conn, keep_id, remove_id, method=rule, evidence=evidence)
     return True
+
+
+def _short(norm: str) -> bool:
+    """A name too thin to stand for one person by itself: one word, or an initial."""
+    words = norm.replace(".", " ").split()
+    return len(words) < 2 or any(len(w) < 2 for w in words)
 
 
 # A phase given a scope (a set of person ids) acts only on the groups that hold one of
@@ -271,9 +289,11 @@ def phase2_merge_no_email_exact(conn: sqlite3.Connection, scope: set[int] | None
 
     # Build normalized lookup for email-people
     email_by_norm = {}
+    addressed: dict[str, int] = {}
     for p in with_email:
         norm = normalize_name(p["name"])
         if norm and len(norm) > 1:
+            addressed[norm] = addressed.get(norm, 0) + 1
             # Keep the one with more references if there are dupes
             if norm not in email_by_norm:
                 email_by_norm[norm] = p
@@ -294,7 +314,10 @@ def phase2_merge_no_email_exact(conn: sqlite3.Connection, scope: set[int] | None
             continue
         match = email_by_norm.get(norm)
         if match and match["id"] != p["id"]:
-            if not _merge_or_queue(conn, match["id"], p["id"], "phase2", f"name:{norm}"):
+            unique = addressed[norm] == 1 and not _short(norm)
+            if not _merge_or_queue(
+                conn, match["id"], p["id"], "phase2", f"name:{norm}", unique=unique
+            ):
                 continue
             merged.add(p["id"])
             count += 1
@@ -506,7 +529,10 @@ def phase7_merge_transliterated_variants(
         # collide with a soon-to-be-deleted duplicate on the UNIQUE(email) index.
         merged = 0
         for m in members_sorted[1:]:
-            merged += _merge_or_queue(conn, keep["id"], m["id"], "phase7", f"name:{key}")
+            unique = bool(keep["email"]) and not m["email"] and not _short(key)
+            merged += _merge_or_queue(
+                conn, keep["id"], m["id"], "phase7", f"name:{key}", unique=unique
+            )
         count += merged
         if not merged:
             continue

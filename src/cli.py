@@ -861,7 +861,10 @@ def cmd_reverse_ingest(args):
 
     Explicit paths only. The scheduled scan of the OneDrive document trees was retired on
     2026-10-07: document text comes from mail, and a file saved from mail into those trees
-    was ingested a second time as a twin of its attachment.
+    was ingested a second time as a twin of its attachment. ingest_document now skips a
+    file whose bytes a mail attachment holds (attachments.sha256), so the Mac pushes the
+    files changed since its last run to a document inbox, which sb-attachment-pass reads
+    with --remove-ingested --no-summary (2026-11-11).
     """
     from src.extract.attachment_pipeline import ingest_document, run_phase1, run_phase2
     from src.ingest.reverse_scan import scan_roots, select_files_to_ingest, topic_label
@@ -897,6 +900,8 @@ def cmd_reverse_ingest(args):
     new_attachment_ids: list[int] = []
     already = 0
     failed = 0
+    remove = getattr(args, "remove_ingested", False)
+    done: list[Path] = [p for p in scanned if p not in set(selected)] if remove else []
 
     for path in selected:
         label = topic_label(path, roots)
@@ -904,6 +909,7 @@ def cmd_reverse_ingest(args):
             print(f"  ingest: {path}  (source={label})")
         try:
             result = ingest_document(str(path), db_path=db_path, source=label)
+            done.append(path)
             if result.get("skipped"):
                 already += 1
                 continue
@@ -916,6 +922,16 @@ def cmd_reverse_ingest(args):
         f"Ingest: {len(new_attachment_ids)} newly created, "
         f"{already} already in DB, {failed} failed."
     )
+    if remove:
+        # ingest_document keeps its own copy, so a file stored, held already or superseded
+        # by a later version has served; a failed one stays for the next run.
+        for path in done:
+            path.unlink(missing_ok=True)
+        for root in roots:
+            for folder in sorted(root.rglob("*"), key=lambda d: len(d.parts), reverse=True):
+                if folder.is_dir() and not any(folder.iterdir()):
+                    folder.rmdir()
+        print(f"Removed: {len(done)} file(s) from the inbox.")
 
     if new_attachment_ids:
         # Phase 1 = local text extraction (PDF/Word/Excel/PPT parsers).
@@ -930,6 +946,9 @@ def cmd_reverse_ingest(args):
             f"skipped={p1.get('skipped', 0)}"
         )
 
+        if getattr(args, "no_summary", False):
+            print("Phase 2: left to the attachment pass (--no-summary).")
+            return
         print(f"Phase 2: LLM-summarizing extracted attachments with {args.workers} workers...")
         p2 = run_phase2(
             db_path=db_path,
@@ -2797,6 +2816,16 @@ def main():
         "--verbose",
         action="store_true",
         help="Per-file log lines",
+    )
+    parser_reverse.add_argument(
+        "--remove-ingested",
+        action="store_true",
+        help="Delete each file once stored, held already or superseded (an inbox; failures stay)",
+    )
+    parser_reverse.add_argument(
+        "--no-summary",
+        action="store_true",
+        help="Stop after text extraction; the attachment pass's Phase 2 summarises",
     )
     parser_reverse.set_defaults(func=cmd_reverse_ingest)
 

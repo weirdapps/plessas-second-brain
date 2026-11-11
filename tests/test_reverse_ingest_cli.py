@@ -132,3 +132,68 @@ def test_reverse_ingest_without_a_root_is_refused(tmp_path, capsys):
 
     assert stopped.value.code == 2
     assert "--root" in capsys.readouterr().err
+
+
+def _inbox_args(root: Path, tmp_path: Path, **extra):
+    fields = {
+        "root": [root],
+        "workers": 1,
+        "dry_run": False,
+        "verbose": False,
+        "db": tmp_path / "brain.db",
+        "remove_ingested": True,
+        "no_summary": True,
+    }
+    fields.update(extra)
+    return type("Args", (), fields)()
+
+
+def test_an_inbox_run_removes_what_it_ingested_skipped_or_superseded(tmp_path):
+    """The document inbox the Mac pushes to (sb-attachment-pass): ingest_document keeps
+    its own copy, so the pushed file goes once it is stored, held already (a twin of a
+    mail attachment), or superseded by a later version. A failed file stays for the next
+    night, and so does the root."""
+    root = tmp_path / "doc-inbox" / "National"
+    new = _touch(root / "units" / "cards" / "new.pdf", "202611100900")
+    twin = _touch(root / "units" / "cards" / "twin.pdf", "202611100900")
+    old = _touch(root / "deck" / "202610010900_plan.pdf", "202610010900")
+    latest = _touch(root / "deck" / "202611010900_plan.pdf", "202611010900")
+    broken = _touch(root / "broken" / "bad.pdf", "202611100900")
+
+    def ingest(path, db_path, source):
+        if path.endswith("bad.pdf"):
+            raise RuntimeError("unreadable")
+        if path.endswith("twin.pdf"):
+            return {"skipped": True, "reason": "already ingested"}
+        return {"email_id": 1, "attachment_id": 7, "message_id": -1}
+
+    with (
+        patch("src.extract.attachment_pipeline.ingest_document", side_effect=ingest),
+        patch("src.extract.attachment_pipeline.run_phase1") as phase1,
+        patch("src.extract.attachment_pipeline.run_phase2") as phase2,
+    ):
+        phase1.return_value = {"extracted": 2, "failed": 0, "skipped": 0}
+        cmd_reverse_ingest(_inbox_args(root, tmp_path))
+
+    assert [p.exists() for p in (new, twin, old, latest)] == [False] * 4
+    assert broken.exists()
+    assert not (root / "units").exists() and not (root / "deck").exists()
+    assert root.is_dir()
+    phase1.assert_called_once()
+    phase2.assert_not_called()  # --no-summary: the pass's own Phase 2 stage summarises
+
+
+def test_without_the_flag_nothing_is_removed(tmp_path):
+    root = tmp_path / "National"
+    kept = _touch(root / "cards" / "manual.pdf", "202401151430")
+    with (
+        patch("src.extract.attachment_pipeline.ingest_document") as ingest,
+        patch("src.extract.attachment_pipeline.run_phase1") as phase1,
+        patch("src.extract.attachment_pipeline.run_phase2") as phase2,
+    ):
+        ingest.return_value = {"email_id": 1, "attachment_id": 1, "message_id": -1}
+        phase1.return_value = {"extracted": 1, "failed": 0, "skipped": 0}
+        phase2.return_value = {"extracted": 1, "failed": 0, "processed": 1}
+        cmd_reverse_ingest(_inbox_args(root, tmp_path, remove_ingested=False, no_summary=False))
+    assert kept.exists()
+    phase2.assert_called_once()

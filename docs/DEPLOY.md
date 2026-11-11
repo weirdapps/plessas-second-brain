@@ -372,6 +372,22 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.plessas.whatsapp-syn
 launchctl kickstart gui/$(id -u)/com.plessas.whatsapp-sync-vps   # the first push
 ```
 
+**Documents** (since 2026-11-11). On the **Mac that holds the OneDrive tree**, the
+push sends the files changed in `National` since its last success (the first run: since
+2026-10-07, `SB_DOCS_SINCE`) to `~/.second-brain/doc-inbox/National/` on the producer,
+and the nightly `sb-attachment-pass` ingests them (`reverse-ingest --remove-ingested
+--no-summary`), skipping a file whose bytes a mail attachment holds:
+
+```bash
+install -m 755 scripts/wrappers/launchd/push-documents-to-vps.sh ~/.local/bin/
+sed -e "s|__HOME__|$HOME|g" scripts/wrappers/launchd/com.plessas.document-push-vps.plist \
+  > ~/Library/LaunchAgents/com.plessas.document-push-vps.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.plessas.document-push-vps.plist
+```
+
+The health report's Documents line is judged by the push's stamp (WARN after 2 days,
+STALE after 7, STALE at once on a failure marker newer than it).
+
 **First backfill**: `systemctl --user start sb-whatsapp-sync.service` on the
 producer once the first push has landed. Extraction is deadline-bounded (300 s a
 run), so a large first backlog drains over a few hourly runs; starting the
@@ -525,7 +541,7 @@ every subcommand.
 | `sb-conversation-sync` | 08:45, 14:45, 20:45 | `export-conversations --days 7`, `extract-conversations`, `ingest-session-notes` |
 | `sb-daily-sync` | 07:05 | `scripts/backup_db.py` (section 8), `sync` with a 900 s extraction slice, `action_lifecycle` |
 | `sb-noon-catchup` | 13:17 | `sync` with a 900 s extraction slice |
-| `sb-attachments` | 02:00 | `sb-attachment-pass.sh`: `register-attachments`, Phase 1 (900 s), Phase 2 (1,800 s), `process-images --limit 500`, `process-sharepoint`, the orphan reaper, `sweep-files`, `mail-reconcile --since 7d` |
+| `sb-attachments` | 02:00 | `sb-attachment-pass.sh`: the document inbox (`reverse-ingest`), `register-attachments`, Phase 1 (900 s), Phase 2 (1,800 s), `process-images --limit 500`, `process-sharepoint`, the orphan reaper, `sweep-files`, `mail-reconcile --since 7d` |
 | `sb-auth-watch` | every 4 hours, before each `sb-outlook-sync` run, and whenever a pushed credential file changes (`sb-creds-arrived.path`) | `sb-auth-watch.sh`: checks the Outlook, Teams and gcloud credentials, clears the sentinels they no longer justify, and queues the syncs those held back or that ended failed waiting on a credential that now probes healthy |
 | `sb-health-check` | 23:50 | `scripts/health_check.py --fix --email-if-issues`, then the freshness ping (section 7) |
 | `sb-topic-pages` | 03:30 | `topic-pages`: the live topics' pages with new evidence (below) |

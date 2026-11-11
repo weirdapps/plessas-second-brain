@@ -1475,6 +1475,36 @@ def test_check_documents_exposes_age_to_the_report(hc):
     assert hc.check_documents(db)["age"] is not None
 
 
+@pytest.mark.parametrize(
+    ("stamp_hours", "failed_hours", "status"),
+    [
+        (5, None, "OK"),
+        (60, None, "WARN"),  # over 2 days: the Mac asleep or away
+        (24 * 8, None, "STALE"),
+        (None, None, "WARN"),  # never pushed: cannot be told from never installed
+        (5, 1, "STALE"),  # a failure after the last success outranks it
+        (1, 5, "OK"),  # a failure the next success superseded
+    ],
+)
+def test_check_documents_is_judged_by_the_document_push(
+    hc, tmp_path, stamp_hours, failed_hours, status
+):
+    from datetime import datetime
+
+    now = datetime(2026, 11, 12, 12, 0, tzinfo=UTC)
+    stamp, fail = tmp_path / "document-push.stamp", tmp_path / "document-push.fail"
+    if stamp_hours is not None:
+        stamp.write_text((now - timedelta(hours=stamp_hours)).isoformat() + "\n")
+    if failed_hours is not None:
+        fail.write_text((now - timedelta(hours=failed_hours)).isoformat() + "\nrsync failed\n")
+    db = _emails_db([(-1, "2026-08-01T10:00:00Z", None)])
+
+    result = hc.check_documents(db, stamp=stamp, fail_marker=fail, now=now)
+
+    assert result["status"] == status
+    assert result["stale"] == (status == "STALE")
+
+
 def test_check_sentinels_discovers_sentinels_added_later(hc, tmp_path):
     """Two filenames were hardcoded, so any sentinel a future job writes is
     invisible. Discovery must be by pattern, not by list."""

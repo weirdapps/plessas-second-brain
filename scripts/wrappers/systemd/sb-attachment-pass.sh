@@ -61,6 +61,19 @@ run_stage() {
   return 0
 }
 
+# Document inbox: the files the Mac changed in its National OneDrive tree since its last
+# push (scripts/wrappers/launchd/push-documents-to-vps.sh, every 6h). Stored as documents
+# with text extracted; a file whose bytes a mail attachment holds is skipped as its twin;
+# each file leaves the inbox once stored, skipped or superseded, and a failed one stays
+# for tomorrow. --no-summary: the Phase 2 stage below summarises them with the backlog.
+# First, so tonight's Phase 1 and Phase 2 stages see what it stored.
+DOC_INBOX="$HOME/.second-brain/doc-inbox/National"
+if [ -d "$DOC_INBOX" ]; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - starting document inbox" >> "$LOG_FILE"
+  run_stage "document inbox" "$PYTHON" -m src.cli reverse-ingest --root "$DOC_INBOX" \
+    --remove-ingested --no-summary
+fi
+
 # Bulk registration. outlook-cli downloads attachment binaries hourly but does
 # not record them, and the only writer that did was macOS-only, so the VPS
 # accumulated ~9k unregistered files after the 2026-06-30 cutover. The hourly

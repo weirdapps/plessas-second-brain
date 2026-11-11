@@ -70,6 +70,8 @@ DB_PULL_STAMP = STATE_DIR / "db-pull.stamp"
 # job failing on every run would emit no signal until its window expired.
 WHATSAPP_SYNC_STAMP = STATE_DIR / "whatsapp-sync.stamp"
 WHATSAPP_SYNC_FAIL = STATE_DIR / "whatsapp-sync.fail"
+DOCUMENT_PUSH_STAMP = STATE_DIR / "document-push.stamp"
+DOCUMENT_PUSH_FAIL = STATE_DIR / "document-push.fail"
 WHATSAPP_SNAPSHOT_PATH = WHATSAPP_SNAPSHOT
 
 # Upstream news database — same path `brain news-sync` reads (honours BRAIN_NEWS_DB).
@@ -150,6 +152,8 @@ STALE_THRESHOLDS = {
     # STALE and fails the freshness ping.
     "whatsapp_push_warn": timedelta(hours=24),
     "whatsapp_push": timedelta(days=7),
+    "document_push_warn": timedelta(days=2),
+    "document_push": timedelta(days=7),
     "attachments_llm": timedelta(days=3),
     # The Mac's own pull. The plist fires 16x/day from 07:45 to 22:45, so the
     # widest legitimate gap is the 22:45 -> 07:45 overnight window; eleven hours
@@ -2058,20 +2062,43 @@ def check_sharepoint_token(path: Path = SHAREPOINT_SESSION, now: datetime | None
     }
 
 
-def check_documents(db):
+def check_documents(db, stamp: Path | None = None, fail_marker: Path | None = None, now=None):
+    """Documents held, judged by the Mac's document push (push-documents-to-vps.sh, since
+    2026-11-11): its stamp says when it last reached the producer, and a failure marker
+    newer than that outranks it. The newest document's date is no gate: a quiet week
+    files nothing, and the push still runs every 6 hours. No stamp is WARN, never OK:
+    a push that was never installed cannot be told from one that died before its first run.
+    """
+    stamp = DOCUMENT_PUSH_STAMP if stamp is None else Path(stamp)
+    fail_marker = DOCUMENT_PUSH_FAIL if fail_marker is None else Path(fail_marker)
+    now = now or datetime.now(UTC)
     total = db.execute("SELECT COUNT(*) FROM emails WHERE message_id < 0").fetchone()[0]
     latest = db.execute("SELECT MAX(date_received) FROM emails WHERE message_id < 0").fetchone()[0]
+    try:
+        pushed_at = _utc(Path(stamp).read_text(errors="replace").strip())
+    except OSError:
+        pushed_at = None
+    push_age = None if pushed_at is None else max(timedelta(0), now - pushed_at)
+    failing, reason = _read_push_failure(fail_marker, pushed_at)
+    if failing:
+        status, note = "STALE", (f"push FAILING: {reason}" if reason else "push FAILING")
+    elif push_age is None:
+        status, note = "WARN", "document push never recorded here"
+    elif push_age > STALE_THRESHOLDS["document_push"]:
+        status, note = "STALE", "no document push for over a week"
+    elif push_age > STALE_THRESHOLDS["document_push_warn"]:
+        status, note = "WARN", "no document push for over 2 days: the Mac may be asleep or away"
+    else:
+        status, note = "OK", None
     return {
         "name": "Documents",
         "total": total,
         "latest": latest,
         "age": _age(latest),
-        # Deliberately not a staleness gate. OneDrive ingestion (the reverse-ingest scan
-        # and the laptop push) was retired on 2026-10-07, so what is left here is the
-        # frozen OneDrive documents plus the session notes and web imports that still
-        # arrive, and none of them has a cadence worth paging on. The age is exposed
-        # for the report only.
-        "status": "OK",
+        "note": note,
+        "stale": status == "STALE",
+        "push_failing": failing,
+        "status": status,
     }
 
 

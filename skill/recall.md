@@ -1,6 +1,6 @@
 ---
 name: second-brain
-description: Answer questions from the owner's own work history (mail, attachments, figures from recurring reports, Teams, WhatsApp, calendar, decisions, actions, people, live topics, past Claude Code sessions) through the second-brain MCP tools. Use it whenever a task needs a fact, a document, a number, a status or a person from that history, including research teammates grounding a deliverable.
+description: Answers questions from the owner's own work history (mail, attachments, figures from recurring reports, Teams, WhatsApp, calendar, decisions, actions, people, live topics, past Claude Code sessions) through the second-brain MCP tools. Use it whenever a task needs a fact, a document, a number as it was reported, a status or a person from that history, including research teammates grounding a deliverable. Do NOT use as the source of a current figure when a dedicated live metrics tool is connected (use that tool); add it for the context around that figure.
 ---
 
 # second-brain: how to ask it, and how to answer from it

@@ -72,6 +72,10 @@ WHATSAPP_SYNC_STAMP = STATE_DIR / "whatsapp-sync.stamp"
 WHATSAPP_SYNC_FAIL = STATE_DIR / "whatsapp-sync.fail"
 DOCUMENT_PUSH_STAMP = STATE_DIR / "document-push.stamp"
 DOCUMENT_PUSH_FAIL = STATE_DIR / "document-push.fail"
+# The Mac's Teams transcript push (push-meeting-transcripts-to-vps.sh, since 2026-11-13).
+MEETING_TRANSCRIPT_PUSH_STAMP = STATE_DIR / "meeting-transcript-push.stamp"
+MEETING_TRANSCRIPT_PUSH_FAIL = STATE_DIR / "meeting-transcript-push.fail"
+TRANSCRIPT_SENDER = "teams-transcript@documents.local"  # src/export/teams_transcripts.py
 WHATSAPP_SNAPSHOT_PATH = WHATSAPP_SNAPSHOT
 
 # Upstream news database — same path `brain news-sync` reads (honours BRAIN_NEWS_DB).
@@ -2102,6 +2106,47 @@ def check_documents(db, stamp: Path | None = None, fail_marker: Path | None = No
     }
 
 
+def check_meetings(db, stamp: Path | None = None, fail_marker: Path | None = None, now=None):
+    """Teams meeting transcripts held, judged by the Mac's transcript push
+    (push-meeting-transcripts-to-vps.sh, hourly, since 2026-11-13) as Documents is by its push: a
+    week with no meeting transcribed stores nothing and is no fault, while a push that
+    stopped, or a fetch that fails (an expired M365 CLI session writes the failure marker
+    with its reason), is. The same thresholds as the document push: the Mac sleeps."""
+    stamp = MEETING_TRANSCRIPT_PUSH_STAMP if stamp is None else Path(stamp)
+    fail_marker = MEETING_TRANSCRIPT_PUSH_FAIL if fail_marker is None else Path(fail_marker)
+    now = now or datetime.now(UTC)
+    total, latest = db.execute(
+        "SELECT COUNT(*), MAX(date_received) FROM emails WHERE sender_address = ?",
+        (TRANSCRIPT_SENDER,),
+    ).fetchone()
+    try:
+        pushed_at = _utc(Path(stamp).read_text(errors="replace").strip())
+    except OSError:
+        pushed_at = None
+    push_age = None if pushed_at is None else max(timedelta(0), now - pushed_at)
+    failing, reason = _read_push_failure(fail_marker, pushed_at)
+    if failing:
+        status, note = "STALE", (f"push FAILING: {reason}" if reason else "push FAILING")
+    elif push_age is None:
+        status, note = "WARN", "transcript push never recorded here"
+    elif push_age > STALE_THRESHOLDS["document_push"]:
+        status, note = "STALE", "no transcript push for over a week"
+    elif push_age > STALE_THRESHOLDS["document_push_warn"]:
+        status, note = "WARN", "no transcript push for over 2 days: the Mac may be asleep or away"
+    else:
+        status, note = "OK", None
+    return {
+        "name": "Meetings",
+        "total": total,
+        "latest": latest,
+        "age": _age(latest),
+        "note": note,
+        "stale": status == "STALE",
+        "push_failing": failing,
+        "status": status,
+    }
+
+
 def _read_push_failure(marker: Path, last_success):
     """(failing, reason) from the push job's failure marker.
 
@@ -3743,6 +3788,7 @@ def main():
         # Its own connection, as the MCP tools open one; it also loads the whole index.
         check_golden_query(),
         check_documents(db),
+        check_meetings(db),
         check_whatsapp(db),
         check_news(db),
         check_sharepoint(db),

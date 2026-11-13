@@ -388,6 +388,29 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.plessas.document-pus
 The health report's Documents line is judged by the push's stamp (WARN after 2 days,
 STALE after 7, STALE at once on a failure marker newer than it).
 
+**Teams meeting transcripts** (since 2026-11-13). On the **Mac that holds the
+M365 CLI session**, the push runs `brain meetings-fetch` hourly: Microsoft Search lists
+every Teams recording and transcript file the owner can open, in his OneDrive and the
+organizers', and each new transcript is read through the SharePoint media API with a
+token minted from M365 CLI's cache (read only) and written as a JSON record. The
+records go to `~/.second-brain/meeting-transcript-inbox/` on the producer, and the nightly
+`sb-attachment-pass` stores them as documents (`brain meetings-ingest
+--remove-ingested`) before Phase 2 summarises them. `~/.second-brain/meeting-transcripts-fetched.json`
+on the Mac records what is settled (written, too short, no transcript, deleted or locked);
+delete it to fetch everything again, which the producer then holds as already stored.
+
+```bash
+install -m 755 scripts/wrappers/launchd/push-meeting-transcripts-to-vps.sh ~/.local/bin/
+sed -e "s|__HOME__|$HOME|g" scripts/wrappers/launchd/com.plessas.meeting-transcript-push-vps.plist \
+  > ~/Library/LaunchAgents/com.plessas.meeting-transcript-push-vps.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.plessas.meeting-transcript-push-vps.plist
+```
+
+The health report's Meetings line is judged by the push's stamp as Documents is; an expired
+M365 CLI session writes the failure marker ("log in to M365 again on the Mac") and turns it
+STALE. No retention: transcripts stay until `brain maint forget`, as Teams chats do (owner
+decision 2026-11-13, to revisit once the store holds two years).
+
 **First backfill**: `systemctl --user start sb-whatsapp-sync.service` on the
 producer once the first push has landed. Extraction is deadline-bounded (300 s a
 run), so a large first backlog drains over a few hourly runs; starting the
@@ -541,7 +564,7 @@ every subcommand.
 | `sb-conversation-sync` | 08:45, 14:45, 20:45 | `export-conversations --days 7`, `extract-conversations`, `ingest-session-notes` |
 | `sb-daily-sync` | 07:05 | `scripts/backup_db.py` (section 8), `sync` with a 900 s extraction slice, `action_lifecycle` |
 | `sb-noon-catchup` | 13:17 | `sync` with a 900 s extraction slice |
-| `sb-attachments` | 02:00 | `sb-attachment-pass.sh`: the document inbox (`reverse-ingest`), `register-attachments`, Phase 1 (900 s), Phase 2 (1,800 s), `process-images --limit 500`, `process-sharepoint`, the orphan reaper, `sweep-files`, `mail-reconcile --since 7d` |
+| `sb-attachments` | 02:00 | `sb-attachment-pass.sh`: the document inbox (`reverse-ingest`), the meeting transcript inbox (`meetings-ingest`), `register-attachments`, Phase 1 (900 s), Phase 2 (1,800 s), `process-images --limit 500`, `process-sharepoint`, the orphan reaper, `sweep-files`, `mail-reconcile --since 7d` |
 | `sb-auth-watch` | every 4 hours, before each `sb-outlook-sync` run, and whenever a pushed credential file changes (`sb-creds-arrived.path`) | `sb-auth-watch.sh`: checks the Outlook, Teams and gcloud credentials, clears the sentinels they no longer justify, and queues the syncs those held back or that ended failed waiting on a credential that now probes healthy |
 | `sb-health-check` | 23:50 | `scripts/health_check.py --fix --email-if-issues`, then the freshness ping (section 7) |
 | `sb-topic-pages` | 03:30 | `topic-pages`: the live topics' pages with new evidence (below) |

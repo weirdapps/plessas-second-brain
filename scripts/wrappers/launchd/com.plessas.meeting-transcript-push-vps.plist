@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for the Mac that holds the M365 CLI session. launchd expands neither ~ nor
+  $HOME, so install it with the placeholder replaced:
+
+    install -m 755 scripts/wrappers/launchd/push-meeting-transcripts-to-vps.sh ~/.local/bin/
+    sed -e "s|__HOME__|$HOME|g" scripts/wrappers/launchd/com.plessas.meeting-transcript-push-vps.plist \
+      > ~/Library/LaunchAgents/com.plessas.meeting-transcript-push-vps.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.plessas.meeting-transcript-push-vps.plist
+
+  Hourly; the wrapper writes its own log (~/Library/Logs/meeting-transcript-push-vps.log).
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.plessas.meeting-transcript-push-vps</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/zsh</string>
+		<string>__HOME__/.local/bin/push-meeting-transcripts-to-vps.sh</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>3600</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>Umask</key>
+	<integer>63</integer>
+	<key>StandardOutPath</key>
+	<string>__HOME__/Library/Logs/meeting-transcript-push-vps.out</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/Library/Logs/meeting-transcript-push-vps.err</string>
+</dict>
+</plist>

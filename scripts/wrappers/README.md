@@ -60,6 +60,7 @@ section 6 shows the same schedule from the pipeline's side):
 | `launchd/sb-db-pull.sh` | a LaunchAgent | :45 every hour | the replica pull, and the copy of the encrypted backup archives (`docs/DEPLOY.md`, section 5) |
 | `launchd/wait-for-vps.sh` | `sb-db-pull.sh` | before each pull | waits up to 180 s for the producer to answer ssh |
 | `launchd/sync-whatsapp-to-vps.sh` | the LaunchAgent template beside it, `com.plessas.whatsapp-sync-vps.plist` | :50 every hour | the WhatsApp snapshot push (`docs/DEPLOY.md`, section 5) |
+| `launchd/push-meeting-transcripts-to-vps.sh` | the LaunchAgent template beside it, `com.plessas.meeting-transcript-push-vps.plist` | hourly | `brain meetings-fetch` (Teams meeting transcripts, through the M365 CLI session), then the records to the producer's meeting transcript inbox, which `sb-attachment-pass` ingests nightly (`docs/DEPLOY.md`, section 5) |
 | `launchd/push-documents-to-vps.sh` | the LaunchAgent template beside it, `com.plessas.document-push-vps.plist` | every 6 hours | the files changed in the National OneDrive tree, to the producer's document inbox, which `sb-attachment-pass` ingests nightly (`docs/DEPLOY.md`, section 5) |
 | `launchd/sync-transcripts-to-vps.sh` | the SessionEnd hook `scripts/hooks/session-end-push.sh` | when a session ends | that session's transcript, to the producer (`docs/DEPLOY.md`, section 5) |
 

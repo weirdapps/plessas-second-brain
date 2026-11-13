@@ -74,6 +74,18 @@ if [ -d "$DOC_INBOX" ]; then
     --remove-ingested --no-summary
 fi
 
+# Teams meeting transcripts the Mac fetched and pushed since last night
+# (scripts/wrappers/launchd/push-meeting-transcripts-to-vps.sh, hourly), stored as text
+# documents (src/export/teams_transcripts.py); a record leaves the inbox once stored or held,
+# a failed one stays. Before Phase 2, which summarises them and takes their decisions and
+# action items with the rest of the backlog.
+MEETING_INBOX="$HOME/.second-brain/meeting-transcript-inbox"
+if [ -d "$MEETING_INBOX" ]; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - starting meeting transcript inbox" >> "$LOG_FILE"
+  run_stage "meeting transcript inbox" "$PYTHON" -m src.cli meetings-ingest \
+    --inbox "$MEETING_INBOX" --remove-ingested
+fi
+
 # Bulk registration. outlook-cli downloads attachment binaries hourly but does
 # not record them, and the only writer that did was macOS-only, so the VPS
 # accumulated ~9k unregistered files after the 2026-06-30 cutover. The hourly

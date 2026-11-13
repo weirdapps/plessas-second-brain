@@ -856,6 +856,45 @@ def cmd_sharepoint_refused(args):
     )
 
 
+def cmd_meetings_fetch(args):
+    """Write each Teams transcript not fetched before to the outbox (the Mac; no store
+    touched). src/export/teams_transcripts.py. Exit 2: the M365 CLI session is gone."""
+    from src.export import teams_transcripts as tt
+
+    try:
+        counts = tt.fetch_new(tt.Api(tt.TokenSource()), args.outbox, args.state)
+    except tt.AuthRequired as e:
+        print(f"meetings-fetch: {e}", file=sys.stderr)
+        sys.exit(2)
+    except tt.TranscriptError as e:  # the search itself failed: nothing was read
+        print(f"meetings-fetch: search failed: {e}", file=sys.stderr)
+        sys.exit(4)
+    print("meetings-fetch: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+    if counts["failed"]:
+        sys.exit(1)
+
+
+def cmd_meetings_ingest(args):
+    """Store the transcript records in the inbox as documents (the producer); Phase 2 of
+    the attachment pass summarises them. src/export/teams_transcripts.py."""
+    from src.export.teams_transcripts import ingest_inbox
+    from src.store.schema import ensure_schema, get_connection
+
+    inbox = Path(args.inbox).expanduser()
+    if not inbox.is_dir():
+        print(f"meetings-ingest: no inbox at {inbox}; nothing to do")
+        return
+    conn = get_connection(str(args.db))
+    try:
+        ensure_schema(conn)
+        counts = ingest_inbox(conn, inbox, remove=args.remove_ingested)
+    finally:
+        conn.close()
+    print("meetings-ingest: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+    if counts["failed"]:
+        sys.exit(1)
+
+
 def cmd_reverse_ingest(args):
     """Scan the directories you name, dedup latest-version-per-logical-name, ingest survivors.
 
@@ -1998,6 +2037,8 @@ READ_ONLY_COMMANDS = frozenset(
         # run reads; without it each refuses on a replica itself (exit 2).
         "mail-times",
         "mail-attachments",
+        # Writes an outbox of Teams transcripts on the Mac and never opens the store.
+        "meetings-fetch",
     }
 )
 
@@ -2828,6 +2869,39 @@ def main():
         help="Stop after text extraction; the attachment pass's Phase 2 summarises",
     )
     parser_reverse.set_defaults(func=cmd_reverse_ingest)
+
+    # Teams meeting transcripts: fetched on the Mac, ingested on the producer
+    state_home = Path.home() / ".second-brain"
+    parser_tfetch = subparsers.add_parser(
+        "meetings-fetch",
+        help="Write the Teams transcripts not fetched before to an outbox (Mac; reads no store)",
+    )
+    parser_tfetch.add_argument(
+        "--outbox",
+        type=Path,
+        default=state_home / "meeting-transcript-outbox",
+        help="Records go here",
+    )
+    parser_tfetch.add_argument(
+        "--state",
+        type=Path,
+        default=state_home / "meeting-meetings-fetched.json",
+        help="The items settled before (written, too short, no transcript)",
+    )
+    parser_tfetch.set_defaults(func=cmd_meetings_fetch)
+    parser_tingest = subparsers.add_parser(
+        "meetings-ingest",
+        help="Store the transcript records in an inbox as documents (producer)",
+    )
+    parser_tingest.add_argument(
+        "--inbox", type=Path, default=Path.home() / ".second-brain" / "meeting-transcript-inbox"
+    )
+    parser_tingest.add_argument(
+        "--remove-ingested",
+        action="store_true",
+        help="Delete each record once stored or held (failures stay)",
+    )
+    parser_tingest.set_defaults(func=cmd_meetings_ingest)
 
     # Load command
     parser_load = subparsers.add_parser("load", help="Load extractions into database")

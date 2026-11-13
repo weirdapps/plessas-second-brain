@@ -1505,6 +1505,47 @@ def test_check_documents_is_judged_by_the_document_push(
     assert result["stale"] == (status == "STALE")
 
 
+@pytest.mark.parametrize(
+    ("stamp_hours", "failed_hours", "status"),
+    [
+        (5, None, "OK"),
+        (60, None, "WARN"),  # the Mac asleep or away over 2 days
+        (24 * 8, None, "STALE"),
+        (None, None, "WARN"),  # never pushed
+        (5, 1, "STALE"),  # e.g. the M365 CLI session expired after the last push
+        (1, 5, "OK"),
+    ],
+)
+def test_check_meetings_is_judged_by_the_transcript_push(
+    hc, tmp_path, stamp_hours, failed_hours, status
+):
+    from datetime import datetime
+
+    now = datetime(2026, 11, 13, 12, 0, tzinfo=UTC)
+    stamp, fail = (
+        tmp_path / "meeting-transcript-push.stamp",
+        tmp_path / "meeting-transcript-push.fail",
+    )
+    if stamp_hours is not None:
+        stamp.write_text((now - timedelta(hours=stamp_hours)).isoformat() + "\n")
+    if failed_hours is not None:
+        fail.write_text((now - timedelta(hours=failed_hours)).isoformat() + "\nM365 login\n")
+    db = _emails_db([(-1, "2026-11-12T10:00:00Z", None), (-2, "2026-11-12T11:00:00Z", None)])
+    db.execute("ALTER TABLE emails ADD COLUMN sender_address TEXT")
+    db.execute(
+        "UPDATE emails SET sender_address = 'teams-transcript@documents.local' WHERE message_id = -1"
+    )
+
+    result = hc.check_meetings(db, stamp=stamp, fail_marker=fail, now=now)
+
+    assert result["name"] == "Meetings"
+    assert result["status"] == status
+    assert result["total"] == 1
+    assert result["stale"] == (status == "STALE")
+    if failed_hours == 1:
+        assert "M365 login" in result["note"]
+
+
 def test_check_sentinels_discovers_sentinels_added_later(hc, tmp_path):
     """Two filenames were hardcoded, so any sentinel a future job writes is
     invisible. Discovery must be by pattern, not by list."""

@@ -22,11 +22,31 @@ def _stub(path: Path, body: str) -> Path:
     return path
 
 
+# Behaves as rsync does with a directory source: without -r it skips the directory, sends
+# nothing and exits 0 (the bug of 2026-11-13: "pushed 49", inbox empty). With -r and
+# --remove-source-files it sends the files and deletes them. A stub that accepted any
+# flags hid that bug; this one makes the wrapper prove the files left.
+_RSYNC = """
+echo "rsync $*" >> "{calls}"
+rec=0; rm=0; src=""
+for a in "$@"; do
+  case "$a" in
+    --remove-source-files) rm=1 ;;
+    --*) ;;
+    -*r*) rec=1 ;;
+    */) [ -z "$src" ] && src="$a" ;;
+  esac
+done
+[ "$rec" = 1 ] && [ "$rm" = 1 ] && rm -f "$src"*.json
+exit 0
+"""
+
+
 def _env(tmp_path: Path, fetch_rc: int = 0, ssh_rc: int = 0, records: int = 1) -> dict:
     calls = tmp_path / "calls"
     state = tmp_path / "state"
     ssh = _stub(tmp_path / "ssh", f'echo "ssh $*" >> "{calls}"\nexit {ssh_rc}\n')
-    rsync = _stub(tmp_path / "rsync", f'echo "rsync $*" >> "{calls}"\n')
+    rsync = _stub(tmp_path / "rsync", _RSYNC.format(calls=calls))
     writes = "".join(
         f'echo "{{}}" > "{state}/meeting-transcript-outbox/r{i}.json"\n' for i in range(records)
     )
@@ -113,3 +133,19 @@ def test_an_unreachable_producer_pages_after_a_day(tmp_path):
 
     assert _run(env) == 1  # no stamp at all: last success is beyond 24h
     assert "unreachable" in (tmp_path / "state" / "meeting-transcript-push.fail").read_text()
+
+
+def test_the_outbox_is_empty_after_a_push(tmp_path):
+    env = _env(tmp_path, records=3)
+
+    assert _run(env) == 0
+    assert not list((tmp_path / "state" / "meeting-transcript-outbox").glob("*.json"))
+
+
+def test_records_left_behind_after_rsync_are_a_failure(tmp_path):
+    env = _env(tmp_path, records=2)
+    _stub(Path(env["SB_TX_RSYNC"]), "exit 0\n")  # claims success, sends nothing
+
+    assert _run(env) == 1
+    assert "left in the outbox" in (tmp_path / "state" / "meeting-transcript-push.fail").read_text()
+    assert not (tmp_path / "state" / "meeting-transcript-push.stamp").exists()

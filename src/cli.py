@@ -870,8 +870,8 @@ def cmd_meetings_fetch(args):
         print(f"meetings-fetch: search failed: {e}", file=sys.stderr)
         sys.exit(4)
     print("meetings-fetch: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
-    if counts["failed"]:
-        sys.exit(1)
+    if code := tt.exit_code(counts):
+        sys.exit(code)
 
 
 def cmd_meetings_ingest(args):

@@ -339,6 +339,16 @@ def _pick(transcripts: list[dict]) -> dict:
     return next((t for t in transcripts if t.get("isDefault")), transcripts[0])
 
 
+def exit_code(counts: dict) -> int:
+    """0 when nothing failed; 1 when some items failed but others moved; 4 (temporary, no
+    success stamped) when every attempt failed and nothing settled: on 2026-11-13 a DNS
+    outage failed all 105 items and the run still counted as a success."""
+    if not counts.get("failed"):
+        return 0
+    moved = sum(counts.get(k, 0) for k in ("written", "too_short", "no_transcript", "unavailable"))
+    return 1 if moved else 4
+
+
 def fetch_new(api, outbox: Path, state_path: Path, now: datetime | None = None) -> dict:
     """Write a record for each transcript not settled before; return the counts."""
     now = now or datetime.now(UTC)

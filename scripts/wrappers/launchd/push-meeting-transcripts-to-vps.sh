@@ -94,7 +94,7 @@ case "$rc" in
   1) log "some transcripts failed; they are asked again next run" ;;
   2) fail "M365 CLI session expired: log in to M365 again on the Mac" ;;
   4)
-    log "search failed for now (rc 4); next run asks again"
+    log "the search, or every transcript, failed for now (rc 4); no success stamped, next run asks again"
     exit 0
     ;;
   *) fail "meetings-fetch exited $rc" ;;
@@ -104,13 +104,19 @@ count=$(find "$OUTBOX" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')
 if [ "$count" -gt 0 ]; then
   "$SSH" "${SSH_OPTS[@]}" "$VPS" "umask 077; mkdir -p ~/$REMOTE_DIR" 2>>"$LOG" ||
     fail "could not create the inbox on the producer"
-  sent=$("$RSYNC" -t --remove-source-files --partial --chmod=Fu=rw --include='*.json' --exclude='*' \
+  # -r: without it rsync skips a directory source, sends nothing and still exits 0 (the
+  # first deploy, 2026-11-13, logged "pushed 49" with an empty inbox). --exclude='*' keeps it
+  # to the top-level records.
+  sent=$("$RSYNC" -rt --remove-source-files --partial --chmod=Fu=rw --include='*.json' --exclude='*' \
     -e "$SSH ${SSH_OPTS[*]}" "$OUTBOX/" "$VPS:$REMOTE_DIR/" 2>&1)
   rrc=$?
   if [ "$rrc" -ne 0 ]; then
     log "rsync failed (rc=$rrc): $(printf '%s\n' "$sent" | head -3 | tr '\n' ' ')"
     fail "rsync failed for $count transcript records"
   fi
+  # --remove-source-files deletes only what arrived, so what is left did not.
+  left=$(find "$OUTBOX" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')
+  [ "$left" -eq 0 ] || fail "$left of $count transcript records left in the outbox after rsync"
 fi
 
 rm -f "$FAIL"

@@ -396,3 +396,17 @@ def test_header_fields_are_one_line_and_capped():
     assert all(len(line) <= 30 + tt.MAX_SPEAKERS * (tt.FIELD_CHARS + 2) for line in head)
     assert len(head[0]) <= len("Teams meeting transcript: ") + tt.FIELD_CHARS
     assert head[4].count(",") == tt.MAX_SPEAKERS - 1
+
+
+@pytest.mark.parametrize(
+    ("counts", "code"),
+    [
+        ({"written": 2, "failed": 0}, 0),
+        ({"written": 0, "failed": 0, "pending": 1}, 0),  # nothing new is not a failure
+        ({"written": 1, "failed": 3}, 1),  # some progress: the rest are asked again
+        ({"written": 0, "too_short": 0, "no_transcript": 0, "unavailable": 0, "failed": 105}, 4),
+    ],
+)
+def test_a_run_where_every_attempt_failed_is_no_success(counts, code):
+    # 2026-11-13 18:56: a DNS outage failed all 105 and the run still stamped success.
+    assert tt.exit_code(counts) == code

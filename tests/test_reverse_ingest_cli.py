@@ -173,8 +173,9 @@ def test_an_inbox_run_removes_what_it_ingested_skipped_or_superseded(tmp_path):
         patch("src.extract.attachment_pipeline.run_phase2") as phase2,
     ):
         phase1.return_value = {"extracted": 2, "failed": 0, "skipped": 0}
-        cmd_reverse_ingest(_inbox_args(root, tmp_path))
+        rc = cmd_reverse_ingest(_inbox_args(root, tmp_path))
 
+    assert rc == 1  # a file failed: the stage must not read green while it is retried nightly
     assert [p.exists() for p in (new, twin, old, latest)] == [False] * 4
     assert broken.exists()
     assert not (root / "units").exists() and not (root / "deck").exists()
@@ -194,6 +195,9 @@ def test_without_the_flag_nothing_is_removed(tmp_path):
         ingest.return_value = {"email_id": 1, "attachment_id": 1, "message_id": -1}
         phase1.return_value = {"extracted": 1, "failed": 0, "skipped": 0}
         phase2.return_value = {"extracted": 1, "failed": 0, "processed": 1}
-        cmd_reverse_ingest(_inbox_args(root, tmp_path, remove_ingested=False, no_summary=False))
+        rc = cmd_reverse_ingest(
+            _inbox_args(root, tmp_path, remove_ingested=False, no_summary=False)
+        )
+    assert not rc
     assert kept.exists()
     phase2.assert_called_once()

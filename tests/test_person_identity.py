@@ -504,3 +504,31 @@ def test_the_merge_log_records_the_row_it_removed():
     ).fetchone()
     assert json.loads(row[0])["name"] == "NIKOS PAPADOPOULOS"
     assert json.loads(row[1])["email_people"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "value"),
+    [
+        ("phone", "+30000000001"),
+        ("jid", "30000000001@s.whatsapp.net"),
+        ("mri", "8:orgid:00000000-0000-0000-0000-000000000001"),
+    ],
+)
+def test_a_row_with_a_hard_identifier_is_not_name_only(tmp_path, kind, value):
+    """The rule of 2026-11-11 merges a NAME-ONLY row by itself. A WhatsApp or Teams contact
+    has no email but holds a phone, a JID or an MRI: another person with the same name is
+    as likely as the same one, so the pair waits for the owner."""
+    path = tmp_path / "b.db"
+    db = create_database(str(path))
+    a = db.execute(
+        "INSERT INTO people (name, email) VALUES ('Nikos Papadopoulos', 'np@ext.example')"
+    ).lastrowid
+    b = db.execute("INSERT INTO people (name) VALUES ('Nikos Papadopoulos')").lastrowid
+    person_identity.record(db, b, kind, value, "test")
+    db.commit()
+    db.close()
+    results = dedup_people.run_dedup(str(path))
+    db = sqlite3.connect(path)
+    assert {a, b} <= _people(db)
+    assert db.execute("SELECT COUNT(*) FROM person_merges").fetchone()[0] == 0
+    assert results["queued"] == 1

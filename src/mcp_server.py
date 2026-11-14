@@ -404,15 +404,21 @@ def _budget_dossiers(out: dict, key: str, max_chars: int | None = None) -> dict:
     budget_response keeps or drops a row whole, and a meeting_prep attendee is one
     row of the attendees list, so three heavy attendees came back as one. Each
     dossier is held to its share first and says what it lost in its own `truncated`;
-    the whole is then held to the budget as any answer is.
+    the rest (the meetings between them, the series pages) is held to its share too,
+    or the last pass, finding the whole still over, cut the heaviest list: the
+    attendees. The whole is then held to the budget as any answer is.
     """
     limit = max_chars or mcp_budget.RESPONSE_BUDGET_CHARS
     dossiers = out.get(key) or []
     if dossiers and mcp_budget.json_chars(out) > limit:
         # A share each, one for the topic's dossier, and one for the rest.
         topic = out.get("topic_context")
-        share = limit // (len(dossiers) + (2 if topic else 1))
-        out = {**out, key: [budget_response(d, share) for d in dossiers]}
+        # of a little under the limit: the shares' own `truncated` notes and the keys
+        # around them must fit too, or the last pass still takes an attendee.
+        share = (limit * 19 // 20) // (len(dossiers) + (2 if topic else 1))
+        rest = {k: v for k, v in out.items() if k not in (key, "topic_context")}
+        out = {**out, **budget_response(rest, share)}
+        out[key] = [budget_response(d, share) for d in dossiers]
         if topic:
             out["topic_context"] = budget_response(topic, share)
     return budget_response(out, limit)
@@ -1700,32 +1706,8 @@ def query_calendar_events(
     meeting to come, or any occurrence of a series) gives its purpose, agenda and
     who is expected. Cancelled meetings are left out.
     """
-    from datetime import datetime, timedelta
-    from zoneinfo import ZoneInfo
-
-    from src.store.calendar_query import athens_time, capped_attendees
+    from src.store.calendar_query import athens_time, capped_attendees, utc_bound
     from src.store.greek import search_fold
-
-    athens = ZoneInfo("Europe/Athens")
-
-    def utc_bound(value: str, *, upper: bool) -> str | None:
-        """since/until as the UTC second start_at is compared with, None if malformed.
-
-        start_at is UTC, and a bare date used to be compared with it as it stood,
-        so the Athens day began at 03:00 (02:00 in winter). An upper bound is
-        exclusive: the next day for a date, the next second for a date-time.
-        """
-        try:
-            moment = datetime.fromisoformat(value)
-        except ValueError:
-            return None
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
-            moment += timedelta(days=1 if upper else 0)
-        else:
-            moment = moment.replace(microsecond=0) + timedelta(seconds=1 if upper else 0)
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=athens)
-        return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
     bounds: dict[str, str] = {}
     for name, value in (("since", since), ("until", until)):
@@ -2358,7 +2340,7 @@ def search_teams(
         _rows(
             head,
             rows,
-            "No Teams thread or message matched; try other words or kind='both'.",
+            "No Teams thread or message matched; try other words.",
             "results",
             coverage=cover,
         ),

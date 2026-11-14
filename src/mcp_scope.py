@@ -13,7 +13,9 @@ Unset, the server is unscoped, as every shared server is. Set, it fails closed: 
 empty value or an unknown source name refuses every call.
 """
 
+import json
 import os
+import sqlite3
 from collections.abc import Iterable
 
 from mcp.server.mcpserver.exceptions import ResourceError, ToolError
@@ -46,6 +48,47 @@ def scope() -> frozenset[str] | None:
     if not named or named - set(SOURCES):
         return frozenset()
     return frozenset(named)
+
+
+# An emails row filed as a document can come from a source a scope names apart: a Teams
+# meeting transcript (src/export/teams_transcripts.py) is Teams, and a session note
+# (src/export/session_notes.py) is the owner's past sessions. Each also has an attachment
+# row with its text. The sender address ingest_text_document stamps says which.
+ORIGIN_OF_SENDER = {
+    "teams-transcript@documents.local": "teams",
+    "session-note@documents.local": "conversation",
+}
+_EMAIL_TABLE_KINDS = ("email", "news", "document")
+_ORIGIN_SQL = {
+    "email": "SELECT id, lower(sender_address) FROM emails"
+    " WHERE id IN (SELECT value FROM json_each(?))",
+    "attachment": "SELECT a.id, lower(e.sender_address) FROM attachments a"
+    " JOIN emails e ON e.id = a.email_id WHERE a.id IN (SELECT value FROM json_each(?))",
+}
+
+
+def origins(conn: sqlite3.Connection, refs: Iterable[tuple[str, object]]) -> dict:
+    """(kind, ref) -> the source outside the scope that the row came from, for each of
+    `refs` (email, news, document and attachment rows) that has one. Empty when unscoped."""
+    allowed = scope()
+    if allowed is None:
+        return {}
+    blocked = {sender: src for sender, src in ORIGIN_OF_SENDER.items() if src not in allowed}
+    # (table, row id) -> the refs that name that row
+    rows: dict[tuple[str, int], list[tuple[str, object]]] = {}
+    for kind, ref in refs:
+        table = "email" if kind in _EMAIL_TABLE_KINDS else kind
+        if table in _ORIGIN_SQL and str(ref).isdigit():
+            rows.setdefault((table, int(str(ref))), []).append((kind, ref))
+    found = {}
+    for table, sql in _ORIGIN_SQL.items():
+        wanted = sorted(row_id for name, row_id in rows if name == table)
+        if not wanted or not blocked:
+            continue
+        for row_id, sender in conn.execute(sql, (json.dumps(wanted),)):
+            if sender in blocked:
+                found.update(dict.fromkeys(rows[table, row_id], blocked[sender]))
+    return found
 
 
 def _named(found: frozenset[str]) -> str:

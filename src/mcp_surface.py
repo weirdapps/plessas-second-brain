@@ -119,7 +119,30 @@ def _as_result(out: Any, key: str | None = None) -> Result:
         cut = out.get("truncated")
         if isinstance(cut, dict) and key in cut:
             out["truncated"] = {("result" if k == key else k): v for k, v in cut.items()}
+    if allowed is not None and isinstance(out.get("result"), list):
+        _drop_outside_scope(out)
     return cast(Result, budget_response(out))
+
+
+def _row_ref(row: Any) -> tuple[str, object] | None:
+    if isinstance(row, dict) and row.get("kind") and row.get("ref") is not None:
+        return str(row["kind"]), row["ref"]
+    return None
+
+
+def _drop_outside_scope(out: dict) -> None:
+    """Take out of `result` the rows a scoped server may not give: a document or an
+    attachment that came from a source outside the scope (mcp_scope.origins). The count
+    goes in `outside_scope`, so an answer cut this way does not read as nothing found."""
+    refs = [ref for ref in map(_row_ref, out["result"]) if ref]
+    conn = h._get_conn()
+    try:
+        outside = mcp_scope.origins(conn, refs)
+    finally:
+        conn.close()
+    if outside:
+        out["result"] = [row for row in out["result"] if _row_ref(row) not in outside]
+        out["outside_scope"] = len(outside)
 
 
 @_tool(upfront=True, name="recall")
@@ -140,9 +163,10 @@ def recall(
     Opens with `summary` (semantic status, kinds_with_results), then buckets: emails,
     attachments, conversations, decisions, actions, commitments, inline_images, teams,
     whatsapp, calendar_events, and `pages` (compiled entity cards). A bucket where no row
-    held every word falls back to some of them, flagged partial_match. Filter: days
-    (default 365), kinds, include_news, include_automation, include_history. read(ref)
-    opens any row.
+    held every word falls back to some of them, flagged partial_match. Filter: kinds,
+    include_news, include_automation, include_history, and days (default 365), the
+    lookback of the dossiers include_context attaches: the buckets have no date window,
+    so use search with since/until for one. read(ref) opens any row.
     """
     mcp_scope.refuse_mixed("recall")
     f = _take("recall", filter, ("days", "kinds", *_INCLUDES))
@@ -386,6 +410,14 @@ def read(
         mcp_scope.refuse_mixed("read of a compiled page")
     else:
         mcp_scope.require(f"read {kind}:{key}", [kind])
+        if mcp_scope.scope() is not None:
+            conn = h._get_conn()
+            try:
+                origin = mcp_scope.origins(conn, [(kind, key)]).get((kind, key))
+            finally:
+                conn.close()
+            if origin:
+                mcp_scope.require(f"read {kind}:{key} (it came from {origin})", [origin])
     if kind == "page":
         found = _read_page(str(key))
         text = found["text"]

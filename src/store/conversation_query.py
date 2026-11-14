@@ -11,7 +11,7 @@ from collections.abc import Callable
 from typing import Any
 
 from src.store.greek import register_sql_functions, search_fold, search_phrase
-from src.store.query import _sanitize_fts5_query, fts5_query_variants
+from src.store.query import AGENT_SESSION, _sanitize_fts5_query, fts5_query_variants
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +31,7 @@ _IN_WORKSPACE = (
 # conversation stored with no turns says nothing either way and is read as
 # before. The unary + keeps SQLite on the conversation_id index. `c` is the
 # conversations row.
-_AGENT_SESSION = (
-    "(NOT EXISTS (SELECT 1 FROM conversation_turns k WHERE k.conversation_id = c.id"
-    " AND +k.speaker = 'user')"
-    " AND EXISTS (SELECT 1 FROM conversation_turns k WHERE k.conversation_id = c.id"
-    " AND +k.speaker = 'agent'))"
-)
+_AGENT_SESSION = AGENT_SESSION
 
 
 def _owner_sessions(include_agents: bool) -> str:

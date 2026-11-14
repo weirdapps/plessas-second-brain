@@ -20,7 +20,18 @@ on emails alone passes EMAIL_DATE as the parent's date.
 
 # An ISO date this store can sort and compare. The model also writes free text where a date
 # belongs ('null', 'Q3 2026', '1 day before'), which sorted after every date.
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 ISO_DATE = "GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'"
+
+
+def today_sql() -> str:
+    """Today in Athens, as a quoted SQL date. A deadline is a day in the owner's zone, and
+    SQLite's date('now') is the UTC day: until 02:00 or 03:00 in Athens an action due
+    yesterday read as due today, not overdue."""
+    return f"'{datetime.now(ZoneInfo('Europe/Athens')).date().isoformat()}'"
+
 
 # The parent's date with every parent kind LEFT JOINed, and with emails alone.
 PARENT_DATE = "COALESCE(e.date_received, tt.started_at, wt.started_at, ce.start_at, c.started_at)"
@@ -64,9 +75,10 @@ def action_order(parent_date: str = PARENT_DATE, alias: str = "a") -> str:
     items missed long ago.
     """
     deadline = f"{alias}.deadline"
-    upcoming = f"{deadline} {ISO_DATE} AND {deadline} >= date('now')"
+    today = today_sql()
+    upcoming = f"{deadline} {ISO_DATE} AND {deadline} >= {today}"
     return f"""CASE WHEN {upcoming} THEN 0 WHEN {deadline} {ISO_DATE} THEN 2 ELSE 1 END ASC,
                CASE WHEN {upcoming} THEN {deadline} END ASC,
-               CASE WHEN {deadline} {ISO_DATE} AND {deadline} < date('now')
+               CASE WHEN {deadline} {ISO_DATE} AND {deadline} < {today}
                     THEN {deadline} END DESC,
                {parent_date} DESC, {alias}.id DESC"""

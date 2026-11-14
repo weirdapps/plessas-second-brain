@@ -208,3 +208,21 @@ def test_a_failed_runs_error_is_redacted(store):
     assert token not in row["error"]
     assert row["error"].startswith("RuntimeError: auth failed")
     assert len(row["error"]) <= 500
+
+
+def test_a_run_that_fails_with_a_write_open_is_still_closed(store, monkeypatch):
+    """A job that raises with an uncommitted write on its own connection held the lock
+    while the run's last row was written through another: that write gave up after its
+    timeout, the error was swallowed, and the row read 'running' for ever (three
+    teams-sync runs and one process-images, 2026-11-09 to 2026-11-14)."""
+    monkeypatch.setenv("BRAIN_ROLE", "producer")
+    from src.store.schema import get_connection
+
+    with pytest.raises(RuntimeError), job_runs.record("teams-sync", store):
+        conn = get_connection(store)
+        conn.execute("INSERT INTO sync_metadata (key, value) VALUES ('k', 'v')")
+        raise RuntimeError("Graph 429")
+    (row,) = _rows(store)
+    assert (row["status"], row["exit_code"]) == ("failed", 1)
+    assert row["finished_at"]
+    conn.close()

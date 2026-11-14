@@ -36,6 +36,7 @@ from src.store.person_resolve import IDENTIFIER_KINDS, resolve_identity
 from src.store.query import (
     document_summaries,
     fts5_query_variants,
+    owner_item_sql,
     query_by_keyword,
     search_attachments,
     shell_key,
@@ -952,8 +953,13 @@ def recall(
     news, automation = switches["include_news"], switches["include_automation"]
     parents = None if wanted is None else _parents_sql(conn, wanted, news, automation)
     by_email = None if wanted is None else _email_parent_sql(conn, classes, news, automation)
-    on_decisions = _and(visible_sql(conn, "d.email_id", news, automation), parents)
-    on_actions = _and(visible_sql(conn, "a.email_id", news, automation), parents)
+    # Never from an agent session: `read` refuses that parent, as every conversation read does.
+    on_decisions = _and(
+        _and(visible_sql(conn, "d.email_id", news, automation), owner_item_sql("d")), parents
+    )
+    on_actions = _and(
+        _and(visible_sql(conn, "a.email_id", news, automation), owner_item_sql("a")), parents
+    )
     on_commitments = _and(visible_sql(conn, "c.email_id", news, automation), by_email)
     # Current items only unless include_history (src/store/consolidate.py).
     current = recall_filters(conn, include_history)

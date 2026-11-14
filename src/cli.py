@@ -987,7 +987,7 @@ def cmd_reverse_ingest(args):
 
         if getattr(args, "no_summary", False):
             print("Phase 2: left to the attachment pass (--no-summary).")
-            return
+            return int(failed > 0)
         print(f"Phase 2: LLM-summarizing extracted attachments with {args.workers} workers...")
         p2 = run_phase2(
             db_path=db_path,
@@ -1001,6 +1001,9 @@ def cmd_reverse_ingest(args):
         )
     else:
         print("Phases 1+2: nothing new to process.")
+    # A file that failed stays in the inbox for the next run: the stage must say so, or a
+    # file that fails every night is retried for ever under a green run.
+    return int(failed > 0)
 
 
 def cmd_export_conversations(args):

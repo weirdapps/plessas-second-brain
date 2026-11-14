@@ -8,6 +8,7 @@ A calendar answer now lists a dozen attendees per event, the owner and the
 organiser always among them.
 """
 
+import re
 import sqlite3
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
@@ -34,6 +35,27 @@ def athens_time(value: str | None) -> str | None:
         return None
     # Every stored time is UTC, the few written without the 'Z' included.
     return moment.replace(tzinfo=moment.tzinfo or UTC).astimezone(_ATHENS).isoformat()
+
+
+def utc_bound(value: str, *, upper: bool) -> str | None:
+    """since/until as the UTC second a stored time is compared with, None if malformed.
+
+    Stored times are UTC, and a bare date compared with one as it stood made the Athens
+    day begin at 03:00 (02:00 in winter). A date or a date-time without an offset is
+    Athens time. An upper bound is exclusive: the next day for a date, the next second
+    for a date-time.
+    """
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        moment += timedelta(days=1 if upper else 0)
+    else:
+        moment = moment.replace(microsecond=0) + timedelta(seconds=1 if upper else 0)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=_ATHENS)
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def capped_attendees(

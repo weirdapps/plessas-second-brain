@@ -166,3 +166,78 @@ def test_a_scoped_server_says_so_first_in_its_instructions(monkeypatch):
 
     assert text.startswith("Scope. This server reads only: attachment, document, email, figures.")
     assert len(text) < 2048
+
+
+def _file_as_documents(path):
+    """A meeting transcript and a session note, stored as every other document is: an
+    emails row of class document or session_note, and an attachment row with its text."""
+    from src.export import teams_transcripts
+    from src.extract.attachment_pipeline import ingest_text_document
+    from src.store.schema import get_connection
+
+    conn = get_connection(str(path))
+    transcript = teams_transcripts.ingest_one(
+        conn,
+        {
+            "schema": teams_transcripts.RECORD_SCHEMA,
+            "key": "drive-1:item-1",
+            "title": "Quagga steering",
+            "started_at": "2026-11-10T09:00:00Z",
+            "text": "Alice: the quagga budget is agreed. " * 20,
+        },
+    )
+    note = ingest_text_document(
+        conn,
+        source="session-note",
+        key="note-1",
+        filename="quagga.md",
+        mime_type="text/markdown",
+        text="A session's note about the quagga plan. " * 20,
+        sha256="0" * 64,
+        method="session-note",
+        status="extracted",
+        error=None,
+        subject="[Session note] quagga.md",
+        sender_name="Claude session",
+        date="2026-11-10T09:00:00Z",
+    )
+    conn.commit()
+    conn.close()
+    return transcript, note
+
+
+def test_a_transcript_or_a_session_note_follows_the_scope_of_its_origin(store, monkeypatch):
+    """Both are filed as documents, and each has an attachment row. A meeting transcript is
+    Teams and a session note is the owner's past sessions: a scope without teams or
+    conversation gives neither, as a row or by its ref (49 transcripts and 2,512 notes
+    answered the ask-data scope on 2026-11-14)."""
+    transcript, note = _file_as_documents(store)
+    refs = [
+        f"document:{transcript['email_id']}",
+        f"email:{transcript['email_id']}",
+        f"attachment:{transcript['attachment_id']}",
+        f"document:{note['email_id']}",
+        f"attachment:{note['attachment_id']}",
+    ]
+    for arguments in ({"query": "quagga"}, {"query": "quagga", "source": "attachment"}):
+        assert len(_call("search", **arguments)["result"]) == 2  # unscoped: both answer
+
+    monkeypatch.setenv(mcp_scope.SCOPE_ENV, ASK_DATA)
+    for arguments in (
+        {"query": "quagga"},
+        {"query": "quagga", "source": "attachment"},
+        {"query": "", "filter": {"since": "2026-11-01", "kinds": ["document"]}},
+    ):
+        out = _call("search", **arguments)
+        assert out["result"] == []
+        assert out["outside_scope"] == 2
+    for ref in refs:
+        with pytest.raises(ToolError, match="outside this server's scope"):
+            _call("read", ref=ref)
+
+    monkeypatch.setenv(mcp_scope.SCOPE_ENV, ASK_DATA + ",teams")
+    kept = _call("search", query="quagga", source="attachment")["result"]
+    assert [row["ref"] for row in kept] == [transcript["attachment_id"]]
+    assert _call("read", ref=refs[0])["item"]["kind"] == "document"
+    with pytest.raises(ToolError, match="reads conversation, outside"):
+        _call("read", ref=refs[3])

@@ -13,6 +13,7 @@ from typing import Any
 
 from src.config import USER_EMAIL_PATTERN
 from src.store import envelope, pages, ranking
+from src.store.calendar_query import utc_bound
 from src.store.consolidate import current_sql, history_left_out, open_status_sql
 from src.store.cross_script import NameForms, name_forms
 from src.store.entities import entity_person_ids
@@ -30,6 +31,7 @@ from src.store.ordering import (
     decision_order,
     fact_order,
     parent_dates,
+    today_sql,
 )
 from src.store.owner import owner_address_sql
 from src.store.schema import subject_to_conversation_id
@@ -43,6 +45,54 @@ _ENTITY_EMAILS = (
 )
 
 logger = logging.getLogger(__name__)
+
+# An agent session: none of its turns is the owner's and some are another's
+# (src/export/conversation_export.py), a teammate's or a subagent's session or one
+# the owner typed nothing into. A conversation stored with no turns says nothing
+# either way. The unary + keeps SQLite on the conversation_id index. `c` is the
+# conversations row.
+AGENT_SESSION = (
+    "(NOT EXISTS (SELECT 1 FROM conversation_turns k WHERE k.conversation_id = c.id"
+    " AND +k.speaker = 'user')"
+    " AND EXISTS (SELECT 1 FROM conversation_turns k WHERE k.conversation_id = c.id"
+    " AND +k.speaker = 'agent'))"
+)
+
+
+def name_like_sql(conn: sqlite3.Connection, column: str, name: str, params: list) -> str:
+    """The condition that a free-text name column (an action's owner, a decision's
+    decided_by) holds `name`, in either script; its values go onto `params`.
+
+    The column is what the model wrote, Greek in one item and Latin in the next: a folded
+    LIKE found 174 actions for one person's surname in Latin and 179 in Greek, of the
+    349 that were theirs. Every word must be there, as written or in a form the store's names give it in
+    the other script (cross_script.name_forms).
+    """
+    folded = search_fold(name)
+    params.append(f"%{folded}%")
+    phrase = f"sb_fold({column}) LIKE ?"
+    forms = name_forms(conn)
+    words = folded.split()
+    spellings = [(word, *forms.alternatives(word)[:3]) for word in words] if forms else []
+    if not any(len(group) > 1 for group in spellings):
+        return phrase
+    each = []
+    for group in spellings:
+        each.append("(" + " OR ".join(f"sb_fold({column}) LIKE ?" for _ in group) + ")")
+        params.extend(f"%{spelling}%" for spelling in group)
+    return f"({phrase} OR ({' AND '.join(each)}))"
+
+
+def owner_item_sql(alias: str) -> str:
+    """The condition that leaves out a decision or action taken from an agent session,
+    as every read of conversations leaves those sessions out: what a subagent told its
+    lead to do is not what the owner owes or decided, and `read` refuses its parent."""
+    return (
+        f"({alias}.conversation_turn_id IS NULL OR NOT EXISTS ("
+        "SELECT 1 FROM conversation_turns act JOIN conversations c ON c.id = act.conversation_id"
+        f" WHERE act.id = {alias}.conversation_turn_id AND {AGENT_SESSION}))"
+    )
+
 
 # The loader threads an email with no conversation id and no references by the
 # hash of its normalized subject, so every blank subject shares this id: 92
@@ -1103,10 +1153,10 @@ def query_decisions(
         params.append(f"%{normalize_topic(topic)}%")
 
     if person:
-        where_clauses.append("sb_fold(d.decided_by) LIKE ?")
-        params.append(f"%{search_fold(person)}%")
+        where_clauses.append(name_like_sql(conn, "d.decided_by", person, params))
 
     where_clauses.append(visible_sql(conn, "d.email_id", include_news, include_automation))
+    where_clauses.append(owner_item_sql("d"))
     where_clauses.append(current_sql(conn, "d", "decisions", include_history))
 
     # Nothing has been decided at a date still to come. A meeting next week
@@ -1209,7 +1259,7 @@ def query_action_items(
             END as source,
             CASE
                 WHEN a.deadline GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*'
-                     AND a.deadline < date('now') THEN 1 ELSE 0
+                     AND a.deadline < {today_sql()} THEN 1 ELSE 0
             END as overdue
         FROM action_items a
         LEFT JOIN emails e ON a.email_id = e.id
@@ -1230,10 +1280,10 @@ def query_action_items(
         params.append(status)
 
     if owner:
-        where_clauses.append("sb_fold(a.owner) LIKE ?")
-        params.append(f"%{search_fold(owner)}%")
+        where_clauses.append(name_like_sql(conn, "a.owner", owner, params))
 
     where_clauses.append(visible_sql(conn, "a.email_id", include_news, include_automation))
+    where_clauses.append(owner_item_sql("a"))
     where_clauses.append(current_sql(conn, "a", "action_items", include_history))
 
     wanted = set(sources)
@@ -1353,13 +1403,16 @@ def query_combined(
         where_clauses.append("(" + " OR ".join(or_branches) + ")")
 
     # Date range filter
-    if start_date:
-        where_clauses.append("DATE(e.date_received) >= DATE(?)")
-        params.append(start_date)
-
-    if end_date:
-        where_clauses.append("DATE(e.date_received) <= DATE(?)")
-        params.append(end_date)
+    # date_received is UTC and the bounds are Athens days or instants (utc_bound): compared
+    # as DATE() against DATE(), 'since 10 Nov' missed that day's first two hours and
+    # 'until 10 Nov' took in the 11th's, and a date-time was cut down to its day.
+    for value, op, upper in ((start_date, ">=", False), (end_date, "<", True)):
+        if value:
+            bound = utc_bound(value, upper=upper)
+            if bound is None:
+                raise ValueError(f"not a date or an ISO 8601 date-time: {value!r}")
+            where_clauses.append(f"e.date_received {op} ?")
+            params.append(bound)
 
     where_clauses.append(visible_sql(conn, "e.id", include_news, include_automation, classes))
 
@@ -1825,8 +1878,9 @@ def _overdue_where(
     return f"""
     {open_status_sql("ai", include_history)} AND ai.deadline {_ISO_DATE}
       AND date(substr(ai.deadline, 1, 10)) IS NOT NULL
-      AND substr(ai.deadline, 1, 10) < date('now')
+      AND substr(ai.deadline, 1, 10) < {today_sql()}
       AND {visible_sql(conn, "ai.email_id", include_news, include_automation)}
+      AND {owner_item_sql("ai")}
       AND {current_sql(conn, "ai", "action_items", include_history)}
 """
 

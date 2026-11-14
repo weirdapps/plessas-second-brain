@@ -213,7 +213,8 @@ def _merge_or_queue(
     one person with an address and is not short (see _short), which merges by itself, the
     owner's rule of 2026-11-11. True when it merged."""
     if person_identity.active(conn):
-        if unique:
+        # A row with a phone, a JID or an MRI is an identity of its own, not a bare name.
+        if unique and not person_identity.has_hard_identifier(conn, remove_id):
             merged = person_identity.auto_merge(conn, keep_id, remove_id, rule, evidence)
             if merged is not False:
                 return bool(merged)

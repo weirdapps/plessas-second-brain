@@ -152,6 +152,17 @@ def record(
         conn.execute("DELETE FROM person_mentions WHERE person_id = ?", (person_id,))
 
 
+def has_hard_identifier(conn: sqlite3.Connection, person_id: int) -> bool:
+    """Whether the person holds an address, MRI, JID or phone: an identity, not a mention."""
+    return (
+        conn.execute(
+            f"SELECT 1 FROM person_identifiers WHERE person_id = ? AND kind IN ({_HARD_SQL})",  # noqa: S608
+            (person_id,),
+        ).fetchone()
+        is not None
+    )
+
+
 def person_by(conn: sqlite3.Connection, kind: str, value: str) -> int | None:
     """The person a hard identifier belongs to, if the row is still there."""
     row = conn.execute(

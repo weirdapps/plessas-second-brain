@@ -18,7 +18,9 @@ from __future__ import annotations
 import os
 import socket
 import sqlite3
+import sys
 import threading
+import traceback
 import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -106,10 +108,26 @@ def _write(db_path: str, rows: list[dict[str, Any]], update: bool) -> None:
                     f"VALUES ({', '.join('?' * len(cols))})",
                     [row[c] for c in cols],
                 )
-    except sqlite3.Error:
-        pass
+    except sqlite3.Error as exc:
+        # Never into the job, but never silent either: a run row left 'running' is a lie.
+        print(f"job_runs: not recorded ({type(exc).__name__}: {exc})", file=sys.stderr)
     finally:
         conn.close()
+
+
+def _release_writes(exc: BaseException) -> None:
+    """Roll back the write a failed job left open. The traceback keeps the job's frames,
+    and so its connection, alive until the process ends: an uncommitted write there holds
+    the lock, the run's last row waits out its timeout behind it, and the row read
+    'running' for ever. The process is exiting on the error, so the write was lost anyway."""
+    for frame, _ in traceback.walk_tb(exc.__traceback__):
+        for value in list(frame.f_locals.values()):
+            if isinstance(value, sqlite3.Connection):
+                try:
+                    if value.in_transaction:
+                        value.rollback()
+                except sqlite3.Error:  # closed, or another thread's
+                    pass
 
 
 def _close_stage(state: dict[str, Any], at: str) -> None:
@@ -145,8 +163,10 @@ def record(job: str, db_path: str) -> Generator[Run]:
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else int(exc.code is not None)
         status = "ok" if code == 0 else "failed"
+        _release_writes(exc)
         raise
     except BaseException as exc:
+        _release_writes(exc)
         # The row replicates and is readable through sql_query: credentials masked, and
         # the text kept short, since an exception can quote what it failed on.
         from src.redact import redact_secrets

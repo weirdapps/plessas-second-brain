@@ -902,6 +902,8 @@ python -m src.cli maint forget-itemless [--apply]          # count, then delete,
 python -m src.cli maint mark-boilerplate [--apply] [--min-threads 5]   # count, then mark, key-fact text that recurs in 5+ distinct threads; nothing deleted
 python -m src.cli maint reextract-stacked                  # price extracting again the bodies of emails with stacked attachment facts; changes nothing
 python -m src.cli maint reextract-stacked --apply --token-budget 20000000 --limit 2500   # do it, resumable; its untagged items replaced, summary and vector kept
+python -m src.cli maint reextract-mail --since 2026-10-16  # price extracting again the bodies of a period's mail (notifications, bulk and invites left out); changes nothing
+python -m src.cli maint reextract-mail --since 2026-10-16 --apply --token-budget 20000000 [--until ...] [--shard 0/3]   # do it, resumable; --shard I/N lets N runs share the period
 python -m src.cli maint consolidate [--since YYYY-MM-DD]   # price the backfill: threads, duplicates by rule, calls, tokens, cost; changes nothing
 python -m src.cli maint consolidate --apply --rules-only   # mark the duplicates the rules find, no model call
 python -m src.cli maint consolidate --apply --token-budget 12000000 --limit 1600   # and the model's labels, resumable (DEPLOY section 12)
@@ -1026,7 +1028,7 @@ src/
     transliterate.py           Greek to Latin transliteration, spelling keys and name agreement
     fuzzy_people.py            Review-gated fuzzy name candidates; never auto-merges
     action_lifecycle.py        Dedups action items, ages out stale ones, marks one done
-    item_cleanup.py            One-off item clean-ups: forget-itemless, mark-boilerplate, reextract-stacked
+    item_cleanup.py            One-off item clean-ups: forget-itemless, mark-boilerplate, reextract-stacked, reextract-mail
     consolidate.py             Marks items duplicate, superseded or done per thread, never deletes; the current-state filter
     thread_updates.py          A new email's thread updates, written through the consolidation checks
     extraction_fields.py       Gated `extraction_item_kind`: emails.item_kind from v2 extractions

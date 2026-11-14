@@ -331,6 +331,81 @@ def test_the_body_is_extracted_again_and_its_untagged_items_replaced(
     assert len(list(tmp_path.glob("**/*.json"))) == 2
 
 
+@pytest.fixture
+def period(conn):
+    """Mail of five days, a news item among it, and one email with an old decision."""
+    ids = {
+        "before": _email(conn, "m1", days=1),
+        "first": _email(conn, "m2", days=3, content="We approved the pilot budget."),
+        "news": _email(conn, "m3", days=4, source_class="news"),
+        "second": _email(conn, "m4", days=5, content="We approved the pilot budget."),
+        "after": _email(conn, "m5", days=8),
+    }
+    conn.execute(
+        "INSERT INTO decisions (email_id, decision) VALUES (?, 'old decision')", (ids["first"],)
+    )
+    conn.commit()
+    return ids
+
+
+def test_the_mail_of_a_period_is_taken_newest_first(conn, period):
+    """_email dates a message 2026-10-(10 + days): the period is the 13th up to the 18th."""
+    taken = ic.mail_emails(conn, "2026-10-13", "2026-10-18")
+    assert taken == [period["second"], period["first"]]
+    assert ic.mail_emails(conn, "2026-10-13") == [period["after"], *taken]
+    assert ic.mail_emails(conn, "2026-10-13", "2026-10-18", limit=1) == [period["second"]]
+    thirds = [ic.mail_emails(conn, "2026-10-13", "2026-10-18", shard=(i, 3)) for i in range(3)]
+    assert thirds == [[i for i in taken if i % 3 == n] for n in range(3)]
+    assert sorted(sum(thirds, [])) == sorted(taken) and len([t for t in thirds if t]) == 2
+
+
+def test_the_kinds_that_give_no_items_are_left_out(conn, period):
+    from src.store import extraction_fields
+
+    if not extraction_fields.applied(conn):
+        pytest.skip("a store without item_kind takes every mail")
+    conn.execute("UPDATE emails SET item_kind = 'notification' WHERE id = ?", (period["second"],))
+    conn.execute("UPDATE emails SET item_kind = 'work_thread' WHERE id = ?", (period["first"],))
+    assert ic.mail_emails(conn, "2026-10-13", "2026-10-18") == [period["first"]]
+
+
+def test_a_period_is_extracted_again_under_its_own_marks(conn, period, model):
+    def emails(limit):
+        return ic.mail_emails(conn, "2026-10-13", "2026-10-18", limit)
+
+    stats = ic.reextract_stacked(
+        conn, budget=TokenBudget(10**9), emails=emails, marker=ic.MAIL_MARKER
+    )
+
+    assert (stats["done"], stats["failed"], stats["left"]) == (2, 0, 0)
+    decisions = [
+        r[0]
+        for r in conn.execute(
+            "SELECT decision FROM decisions WHERE email_id = ?", (period["first"],)
+        )
+    ]
+    assert decisions == ["Approve the pilot budget"]
+    assert len(model.calls) == 2
+    # Done under its own marks: a second run takes nothing, and the stacked run's are untouched.
+    assert emails(0) == []
+    assert _count(conn, "SELECT COUNT(*) FROM sync_metadata WHERE key LIKE 'mail_reextract:%'") == 2
+    assert _count(conn, "SELECT COUNT(*) FROM sync_metadata WHERE key LIKE 'stacked_%'") == 0
+
+
+def test_reextract_mail_is_a_dry_run_and_needs_a_budget_to_apply(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "brain.db"
+    store = create_database(str(db))
+    _email(store, "m", days=3)
+    store.commit()
+    store.close()
+
+    assert _run(monkeypatch, db, "reextract-mail", "--since", "2026-10-13") == 0
+    assert "dry run" in capsys.readouterr().out and "1 emails" not in capsys.readouterr().err
+    assert _run(monkeypatch, db, "reextract-mail", "--since", "2026-10-13", "--apply") == 2
+    assert "--token-budget" in capsys.readouterr().err
+    assert _run(monkeypatch, db, "reextract-mail", "--since", "2026-10-13", "--shard", "3/3") == 2
+
+
 def test_an_email_whose_message_id_the_store_holds_as_a_number_is_extracted(conn, model, tmp_path):
     """emails.message_id is declared INTEGER, so an id of digits is stored as a number: 55,029
     on the producer on 2026-10-16. Its extraction file is named by the id's text, as staging

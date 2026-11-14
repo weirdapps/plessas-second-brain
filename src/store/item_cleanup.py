@@ -35,6 +35,16 @@ reextract-stacked
     failed three times is not offered again. --token-budget bounds a run (required with
     --apply); --limit bounds the emails it takes; the dry run prints the calls, tokens and
     cost. Stops at a quota, timeout or credential failure, leaving the rest for the next run.
+
+reextract-mail
+    The same replacement for the mail of a period: every email of class mail received from
+    --since (to --until), less the kinds that give no items (notification, bulk,
+    invite_logistics, where the store holds item_kind). For a period extracted under
+    instructions since corrected: from 2026-10-16 to 2026-11-15 the v2 email instructions
+    asked for precision over coverage and gave half the action items of a message (PR 312).
+    Recorded as mail_reextract:<email id>, apart from reextract-stacked's marks, and resumed
+    the same way. --shard I/N takes the emails whose id leaves I when divided by N, so N
+    runs side by side share the period without meeting.
 """
 
 import argparse
@@ -45,6 +55,7 @@ import re
 import sqlite3
 import sys
 import unicodedata
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -254,13 +265,13 @@ STACKED_SQL = """SELECT email_id FROM key_facts WHERE email_id IS NOT NULL
     HAVING SUM(attachment_id IS NULL) > 0 AND SUM(attachment_id IS NOT NULL) > 0"""
 
 
-def _marks(conn: sqlite3.Connection) -> dict[int, dict]:
+def _marks(conn: sqlite3.Connection, marker: str = MARKER) -> dict[int, dict]:
     out = {}
     for key, value in conn.execute(
-        "SELECT key, value FROM sync_metadata WHERE key LIKE ?", (MARKER + "%",)
+        "SELECT key, value FROM sync_metadata WHERE key LIKE ?", (marker + "%",)
     ):
         try:
-            out[int(key[len(MARKER) :])] = json.loads(value)
+            out[int(key[len(marker) :])] = json.loads(value)
         except (ValueError, TypeError):
             continue
     return out
@@ -269,13 +280,18 @@ def _marks(conn: sqlite3.Connection) -> dict[int, dict]:
 def stacked_emails(conn: sqlite3.Connection, limit: int = 0) -> list[int]:
     """The emails still to take, newest first: those STACKED_SQL selects, less those done and
     those that failed MAX_ATTEMPTS times."""
-    marks = _marks(conn)
     rows = conn.execute(
         f"SELECT e.id FROM emails e WHERE e.id IN ({STACKED_SQL})"
         " ORDER BY e.date_received DESC, e.id DESC"
     ).fetchall()
+    return _still_to_take(conn, [r[0] for r in rows], MARKER, limit)
+
+
+def _still_to_take(conn: sqlite3.Connection, ids: list[int], marker: str, limit: int) -> list[int]:
+    """`ids` in their order, less those `marker` records done or failed MAX_ATTEMPTS times."""
+    marks = _marks(conn, marker)
     out = []
-    for (email_id,) in rows:
+    for email_id in ids:
         mark = marks.get(email_id) or {}
         if mark.get("state") == "done" or int(mark.get("attempts") or 0) >= MAX_ATTEMPTS:
             continue
@@ -283,6 +299,44 @@ def stacked_emails(conn: sqlite3.Connection, limit: int = 0) -> list[int]:
         if limit and len(out) >= limit:
             break
     return out
+
+
+MAIL_MARKER = "mail_reextract:"
+# The kinds whose instructions give no decisions and no action items (src/extract/prompt.py).
+QUIET_KINDS = ("notification", "bulk", "invite_logistics")
+
+
+def mail_emails(
+    conn: sqlite3.Connection,
+    since: str,
+    until: str | None = None,
+    limit: int = 0,
+    shard: tuple[int, int] | None = None,
+) -> list[int]:
+    """The mail of a period still to extract again, newest first: class mail, received from
+    `since` and before `until` (compared as the store holds them, in UTC), less the quiet
+    kinds where the store holds item_kind, less those done and those that failed
+    MAX_ATTEMPTS times. `shard` (i, n) keeps the ids that leave i when divided by n."""
+    from src.store.extraction_fields import applied
+
+    where = ["e.source_class = 'mail'", "e.date_received >= ?"]
+    params: list = [since]
+    if until:
+        where.append("e.date_received < ?")
+        params.append(until)
+    if applied(conn):
+        marks = ", ".join("?" * len(QUIET_KINDS))
+        where.append(f"COALESCE(e.item_kind, '') NOT IN ({marks})")
+        params += QUIET_KINDS
+    if shard:
+        where.append("e.id % ? = ?")
+        params += [shard[1], shard[0]]
+    rows = conn.execute(
+        f"SELECT e.id FROM emails e WHERE {' AND '.join(where)}"  # noqa: S608
+        " ORDER BY e.date_received DESC, e.id DESC",
+        params,
+    ).fetchall()
+    return _still_to_take(conn, [r[0] for r in rows], MAIL_MARKER, limit)
 
 
 def _request_chars(email: dict) -> tuple[int, int]:
@@ -341,10 +395,10 @@ def estimate_stacked(conn: sqlite3.Connection, email_ids: list[int]) -> dict:
     }
 
 
-def _record(conn: sqlite3.Connection, email_id: int, mark: dict) -> None:
+def _record(conn: sqlite3.Connection, email_id: int, mark: dict, marker: str = MARKER) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO sync_metadata (key, value) VALUES (?, ?)",
-        (f"{MARKER}{email_id}", json.dumps(mark)),
+        (f"{marker}{email_id}", json.dumps(mark)),
     )
 
 
@@ -354,11 +408,16 @@ def reextract_stacked(
     budget,
     extracted_dir: Path | None = None,
     limit: int = 0,
+    emails: Callable[[int], list[int]] | None = None,
+    marker: str = MARKER,
 ) -> dict:
     """Extract the bodies of the stacked emails again and give each the new items, newest
     first, until the budget (src/llm_cost.py TokenBudget) refuses a call, `limit` emails are
     done, or the service fails. One commit per email. The new extraction is written to the
-    email's extraction file under `extracted_dir` when one is given, as stub_retry does."""
+    email's extraction file under `extracted_dir` when one is given, as stub_retry does.
+
+    `emails`, given a limit, names the emails to take in place of the stacked ones, and
+    `marker` is where their progress is recorded (reextract-mail)."""
     from src.export.state import write_json_atomic
     from src.extract import claude_extract
     from src.extract.call_shape import call_shape
@@ -369,10 +428,11 @@ def reextract_stacked(
     from src.store.loader import replace_items, stored_email
 
     shape = call_shape()
-    marks = _marks(conn)
+    marks = _marks(conn, marker)
+    take = emails or (lambda limit: stacked_emails(conn, limit))
     stats: dict = {"selected": 0, "done": 0, "failed": 0, "facts_before": 0, "facts_after": 0}
     stats["stopped"] = stats["stop_kind"] = None
-    for email_id in stacked_emails(conn, limit):
+    for email_id in take(limit):
         stats["selected"] += 1
         email = stored_email(conn, email_id)
         try:
@@ -386,7 +446,8 @@ def reextract_stacked(
                 stats["stop_kind"] = "service"
                 break
             attempts = int((marks.get(email_id) or {}).get("attempts") or 0) + 1
-            _record(conn, email_id, {"state": "failed", "attempts": attempts, "at": _now()})
+            failed = {"state": "failed", "attempts": attempts, "at": _now()}
+            _record(conn, email_id, failed, marker)
             conn.commit()
             stats["failed"] += 1
             continue
@@ -405,6 +466,7 @@ def reextract_stacked(
                 conn,
                 email_id,
                 {"state": "done", "at": _now(), "shape": shape, **counts},
+                marker,
             )
             conn.execute("COMMIT")
         except BaseException:
@@ -413,7 +475,7 @@ def reextract_stacked(
         stats["done"] += 1
         stats["facts_before"] += counts["facts_before"]
         stats["facts_after"] += counts["facts_after"]
-    stats["left"] = len(stacked_emails(conn))
+    stats["left"] = len(take(0))
     return stats
 
 
@@ -504,8 +566,66 @@ def cmd_reextract_stacked(args) -> int:
     return 75 if stats["stop_kind"] == "service" else 0
 
 
+def _shard(value: str) -> tuple[int, int]:
+    try:
+        i, n = (int(part) for part in value.split("/"))
+    except ValueError:
+        raise argparse.ArgumentTypeError("--shard is I/N, e.g. 0/3") from None
+    if not 0 <= i < n:
+        raise argparse.ArgumentTypeError("--shard I/N needs 0 <= I < N")
+    return i, n
+
+
+def cmd_reextract_mail(args) -> int:
+    from src.config import DATA_ROOT, EXTRACT_ENGINE
+    from src.extract.call_shape import call_shape
+    from src.llm_cost import TokenBudget
+
+    if EXTRACT_ENGINE != "claude":
+        print("reextract-mail runs on the claude engine only", file=sys.stderr)
+        return 2
+    conn = _connect(args)
+    shape = call_shape()
+
+    def emails(limit: int) -> list[int]:
+        return mail_emails(conn, args.since, args.until, limit, args.shard)
+
+    if not args.apply:
+        est = estimate_stacked(conn, emails(args.limit))
+        conn.close()
+        print(
+            f"dry run, call shape {shape}: {est['emails']:,} emails to extract again,"
+            f" about {est['input_tokens']:,} input tokens and at most"
+            f" {est['output_tokens']:,} output tokens: ${est['cost_usd']:.2f} with every"
+            f" system prompt in full, ${est['cost_usd_cached']:.2f} with it cached."
+            " --apply --token-budget N runs it."
+        )
+        return 0
+    if not args.token_budget or args.token_budget <= 0:
+        conn.close()
+        print("reextract-mail --apply needs --token-budget N (tokens, N > 0)", file=sys.stderr)
+        return 2
+    budget = TokenBudget(args.token_budget)
+    stats = reextract_stacked(
+        conn,
+        budget=budget,
+        extracted_dir=Path(DATA_ROOT) / "extracted",
+        limit=args.limit,
+        emails=emails,
+        marker=MAIL_MARKER,
+    )
+    conn.close()
+    print(
+        f"call shape {shape}: {stats['done']:,} emails given new items, {stats['failed']:,}"
+        f" failed, {stats['left']:,} left; {budget.spent:,} tokens in {budget.calls:,} calls"
+    )
+    if stats["stopped"]:
+        print(f"stopped: {stats['stopped']}")
+    return 75 if stats["stop_kind"] == "service" else 0
+
+
 def add_maint_parsers(maint_subparsers) -> None:
-    """The three commands, under `brain maint`."""
+    """The four commands, under `brain maint`."""
     forget = maint_subparsers.add_parser(
         "forget-itemless",
         help="Delete the decisions, actions and commitments of news and automation mail",
@@ -545,3 +665,21 @@ def add_maint_parsers(maint_subparsers) -> None:
     )
     stacked.add_argument("--limit", type=int, default=0, help="Emails a run takes (0: all)")
     stacked.set_defaults(func=cmd_reextract_stacked)
+
+    mail = maint_subparsers.add_parser(
+        "reextract-mail",
+        help="Extract again the bodies of the mail of a period",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    mail.add_argument("--since", required=True, help="Received from this date or UTC instant")
+    mail.add_argument("--until", help="Received before this date or UTC instant")
+    mail.add_argument(
+        "--apply", action="store_true", help="Call the model and replace (default: estimate)"
+    )
+    mail.add_argument(
+        "--token-budget", type=int, default=0, help="Tokens a run may spend (required with --apply)"
+    )
+    mail.add_argument("--limit", type=int, default=0, help="Emails a run takes (0: all)")
+    mail.add_argument("--shard", type=_shard, help="I/N: only the emails whose id %% N is I")
+    mail.set_defaults(func=cmd_reextract_mail)

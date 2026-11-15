@@ -941,26 +941,49 @@ def cmd_reverse_ingest(args):
     failed = 0
     remove = getattr(args, "remove_ingested", False)
     done: list[Path] = [p for p in scanned if p not in set(selected)] if remove else []
+    # The document inbox: a newer revision replaces the older (src/store/document_revisions.py).
+    revisions = None
+    older = replaced = 0
+    if getattr(args, "replace_revisions", False):
+        from src.store import document_revisions
+        from src.store.schema import ensure_schema, get_connection
 
-    for path in selected:
-        label = topic_label(path, roots)
-        if args.verbose:
-            print(f"  ingest: {path}  (source={label})")
-        try:
-            result = ingest_document(str(path), db_path=db_path, source=label)
-            done.append(path)
-            if result.get("skipped"):
-                already += 1
-                continue
-            new_attachment_ids.append(result["attachment_id"])
-        except Exception as e:
-            failed += 1
-            print(f"  FAIL {path}: {e}", file=sys.stderr)
+        revisions = get_connection(db_path)
+        ensure_schema(revisions)
+
+    try:
+        for path in selected:
+            label = topic_label(path, roots)
+            if args.verbose:
+                print(f"  ingest: {path}  (source={label})")
+            try:
+                if revisions is not None and document_revisions.newer_held(revisions, label, path):
+                    done.append(path)
+                    older += 1
+                    continue
+                result = ingest_document(str(path), db_path=db_path, source=label)
+                done.append(path)
+                if revisions is not None:
+                    replaced += document_revisions.replace_older(
+                        revisions, label, path.name, result
+                    )
+                if result.get("skipped"):
+                    already += 1
+                    continue
+                new_attachment_ids.append(result["attachment_id"])
+            except Exception as e:
+                failed += 1
+                print(f"  FAIL {path}: {e}", file=sys.stderr)
+    finally:
+        if revisions is not None:
+            revisions.close()
 
     print(
         f"Ingest: {len(new_attachment_ids)} newly created, "
         f"{already} already in DB, {failed} failed."
     )
+    if revisions is not None:
+        print(f"Revisions: {replaced} older forgotten, {older} file(s) older than the one held.")
     if remove:
         # ingest_document keeps its own copy, so a file stored, held already or superseded
         # by a later version has served; a failed one stays for the next run.
@@ -2871,6 +2894,12 @@ def main():
         action="store_true",
         help="Stop after text extraction; the attachment pass's Phase 2 summarises",
     )
+    parser_reverse.add_argument(
+        "--replace-revisions",
+        action="store_true",
+        help="A newer revision of a file (same folder and name) forgets the older document "
+        "(the document inbox; src/store/document_revisions.py)",
+    )
     parser_reverse.set_defaults(func=cmd_reverse_ingest)
 
     # Teams meeting transcripts: fetched on the Mac, ingested on the producer
@@ -3397,6 +3426,10 @@ def main():
     from src.store.retention import add_maint_parsers as add_retention_parsers
 
     add_retention_parsers(maint_subparsers)
+    # document-revisions: forget the older revisions stored before (schema v43).
+    from src.store.document_revisions import add_maint_parsers as add_revision_parsers
+
+    add_revision_parsers(maint_subparsers)
     # forget-floor: the date floor per source a forget --apply sets (issue 286).
     from src.store.forget_floor import add_maint_parsers as add_floor_parsers
 

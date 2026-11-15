@@ -66,12 +66,14 @@ run_stage() {
 # with text extracted; a file whose bytes a mail attachment holds is skipped as its twin;
 # each file leaves the inbox once stored, skipped or superseded, and a failed one stays
 # for tomorrow. --no-summary: the Phase 2 stage below summarises them with the backlog.
+# --replace-revisions: a newer revision of a file forgets the document its older one became
+# (src/store/document_revisions.py, owner decision 2026-11-15).
 # First, so tonight's Phase 1 and Phase 2 stages see what it stored.
 DOC_INBOX="$HOME/.second-brain/doc-inbox/National"
 if [ -d "$DOC_INBOX" ]; then
   echo "$(date '+%Y-%m-%d %H:%M:%S') - starting document inbox" >> "$LOG_FILE"
   run_stage "document inbox" "$PYTHON" -m src.cli reverse-ingest --root "$DOC_INBOX" \
-    --remove-ingested --no-summary
+    --remove-ingested --no-summary --replace-revisions
 fi
 
 # Teams meeting transcripts the Mac fetched and pushed since last night

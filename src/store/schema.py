@@ -534,6 +534,8 @@ def run_migrations(conn: sqlite3.Connection, gated: bool = False) -> None:
         migrate_mail_hygiene(conn)
     if current < 42:
         migrate_add_job_runs(conn)
+    if current < 43:
+        migrate_add_document_paths(conn)
 
     if current < CURRENT_SCHEMA_VERSION:
         set_schema_version(conn, CURRENT_SCHEMA_VERSION)
@@ -1329,6 +1331,26 @@ def migrate_add_item_state(conn: sqlite3.Connection) -> None:
         )"""
     )
     conn.commit()
+
+
+def migrate_add_document_paths(conn: sqlite3.Connection) -> None:
+    """v43: document_paths, a document inbox file's current document.
+
+    The key is the file's folder label and logical name (src/store/document_revisions.py);
+    `reverse-ingest --replace-revisions` maps it to the document its newest revision became,
+    so the next revision forgets that one. An empty table: milliseconds, and running it
+    again changes nothing. Not gated: nothing reads it until the inbox passes the flag.
+    """
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS document_paths (
+            path TEXT PRIMARY KEY,
+            message_id INTEGER NOT NULL,
+            updated_at TEXT
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_document_paths_message_id ON document_paths(message_id)"
+    )
 
 
 def migrate_add_job_runs(conn: sqlite3.Connection) -> None:

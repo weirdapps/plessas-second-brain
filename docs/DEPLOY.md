@@ -376,7 +376,12 @@ launchctl kickstart gui/$(id -u)/com.plessas.whatsapp-sync-vps   # the first pus
 push sends the files changed in `National` since its last success (the first run: since
 2026-10-07, `SB_DOCS_SINCE`) to `~/.second-brain/doc-inbox/National/` on the producer,
 and the nightly `sb-attachment-pass` ingests them (`reverse-ingest --remove-ingested
---no-summary`), skipping a file whose bytes a mail attachment holds:
+--no-summary --replace-revisions`), skipping a file whose bytes a mail attachment holds. A
+newer revision of a file (same folder, same name less a dated `YYYYMMDDHHMM_` prefix)
+forgets the document its older revision became (`document_paths`, schema v43,
+`src/store/document_revisions.py`). The revisions stored before that are the owner's to
+forget once: `brain maint document-revisions` (a dry run; `--apply --backup PATH` forgets
+them, timers stopped as for `maint forget`):
 
 ```bash
 install -m 755 scripts/wrappers/launchd/push-documents-to-vps.sh ~/.local/bin/

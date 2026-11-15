@@ -26,9 +26,14 @@ password by the key in front of it. A candidate that fails is left exactly as it
 was. The mask keeps what tells a reader which one was meant: a card's first six and
 last four digits, an IBAN's country and last four characters, a password's key.
 
+Greek tax ids (AFM, 9 digits) and social security numbers (AMKA, 11 digits) are
+masked only with their label, in Greek or Latin letters, beside them (security audit of 2026-11-01): a bare run
+of 9 or 11 digits is an amount, a phone number or a reference as often as not. The
+label stays and the digits go, as with a password.
+
 This is a containment measure, not a scanner: it will not catch a bare hex string,
-a password written without its key or a tax number, and it is not a reason to relax
-any other control.
+a password written without its key, or a tax number written without its label, and
+it is not a reason to relax any other control.
 """
 
 import re
@@ -37,6 +42,29 @@ from collections.abc import Callable
 # What groups a card number's digits: one space, no-break space or narrow no-break
 # space (word processors and number formatting set the last two), or a hyphen.
 _GROUP = "[ \u00a0\u202f-]"
+
+# A Greek id's label, letter by letter: either script and either case (a Greek capital
+# alpha and a Latin A look the same and are typed interchangeably), the alpha with or
+# without its accent, each letter maybe followed by a full stop and a space
+# ("Α.Φ.Μ.", "Α. Φ. Μ."). Not inside a longer word, though the digits may follow
+# with no space.
+_DOT = r"(?:\.[ \u00a0]?)?"
+
+
+def _label(*letters: str) -> str:
+    return r"(?<!\w)" + _DOT.join(letters) + r"\.?(?![^\W\d_])"
+
+
+_A, _F, _M, _K = "[AaΑαΆά]", "[FfΦφ]", "[MmΜμ]", "[KkΚκ]"
+
+
+def _greek_id(label: str, digits: int) -> re.Pattern[str]:
+    """The label, then maybe ":", "=" or "-", then exactly ``digits`` digits."""
+    return re.compile(
+        rf"(?P<key>{label})(?P<sep>[ \t\u00a0]{{0,4}}(?:[:=-][ \t\u00a0]{{0,4}})?)"
+        rf"(?P<value>(?<!\d)[0-9]{{{digits}}}(?![0-9]))"
+    )
+
 
 # (name, compiled pattern). The replacement names what was there: a credential
 # becomes [REDACTED:<name>], and the entries at the end are masked in part (_MASKS).
@@ -120,6 +148,9 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
             rf"[0-9]*(?:{_GROUP}[0-9]+)*(?![0-9A-Za-z])"
         ),
     ),
+    # Greek tax id (AFM) and social security number (AMKA), only beside their label.
+    ("afm", _greek_id(_label(_A, _F, _M), 9)),
+    ("amka", _greek_id(_label(_A, _M, _K, _A), 11)),
     # Password: a password, passcode or «κωδικός πρόσβασης» key, then ":" or "=",
     # maybe across HTML tags, then the value. «κωδικός» alone also means a product
     # or customer code, so it is not a key. A value already redacted is left alone.
@@ -270,12 +301,19 @@ def _mask_password(match: re.Match[str]) -> str:
     return f"{match.group('key')}{match.group('sep')}{quote}[REDACTED:password]{quote}"
 
 
+def _mask_labelled(name: str) -> Callable[[re.Match[str]], str]:
+    """The label and what joins it to the value stay; the digits go."""
+    return lambda m: f"{m.group('key')}{m.group('sep')}[REDACTED:{name}]"
+
+
 # How the checked entries are replaced. Every other entry is replaced whole by
 # [REDACTED:<name>].
 _MASKS: dict[str, Callable[[re.Match[str]], str]] = {
     "iban": _mask_ibans,
     "card": _mask_cards,
     "password": _mask_password,
+    "afm": _mask_labelled("afm"),
+    "amka": _mask_labelled("amka"),
 }
 
 # The extraction prompts' rule for the same values: the model is told not to copy
@@ -288,7 +326,7 @@ PROMPT_RULE = (
 
 def redact_secrets(text: str) -> str:
     """Return `text` with credential-shaped substrings replaced by a marker, and
-    card numbers, IBANs and password values masked."""
+    card numbers, IBANs, password values and labelled AFM and AMKA numbers masked."""
     if not text or not isinstance(text, str):
         return text
     for name, pattern in _PATTERNS:

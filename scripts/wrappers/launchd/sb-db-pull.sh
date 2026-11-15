@@ -35,7 +35,14 @@ SSH_OPTS="-o ConnectTimeout=10 -o BatchMode=yes -o ServerAliveInterval=15"
 log() { echo "[db-pull] $(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"; }
 
 # --- Concurrency guard (PID-aware, same pattern as other sb-* wrappers) ---
-LOCK_DIR="${SB_PULL_LOCK:-/tmp/sb-db-pull.lock}"
+# Not /tmp: any local user can create a lock there first and hold this job off
+# (security audit 2026-11-01). XDG_RUNTIME_DIR is this user's own directory, 0700 and
+# cleared at boot, under systemd and a login session; without it, a 0700 directory
+# under ~/.second-brain. A lock an older copy of this wrapper left in /tmp is no longer
+# looked at.
+LOCK_ROOT="${XDG_RUNTIME_DIR:-$HOME/.second-brain/locks}"
+mkdir -p "$LOCK_ROOT" && chmod 700 "$LOCK_ROOT"
+LOCK_DIR="${SB_PULL_LOCK:-$LOCK_ROOT/sb-db-pull.lock}"
 if [ -d "$LOCK_DIR" ]; then
   stored_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
   if [ -n "$stored_pid" ] && kill -0 "$stored_pid" 2>/dev/null; then
@@ -358,7 +365,11 @@ chmod 600 "$LOCAL_DATA/brain.db" "$LOCAL_DATA/embeddings.npz" 2>/dev/null
 # rather than assuming: rsync will not create a two-level destination on its own.
 OFFSITE_LOCAL="$HOME/second-brain-backups/offsite"
 mkdir -p "$OFFSITE_LOCAL" && chmod 700 "$OFFSITE_LOCAL"
-"$RSYNC" $RSYNC_OPTS "$VPS:~/$REMOTE_DATA/backups/offsite/brain-*.db.zst.enc" \
+# The trailing * takes each archive's MAC sidecar (brain-*.db.zst.enc.mac) with it: the
+# restore drill checks it on this side, and the prune below removes the two together.
+# The producer writes an archive under a hidden name and renames it after its sidecar,
+# so no pull sees one without the other.
+"$RSYNC" $RSYNC_OPTS "$VPS:~/$REMOTE_DATA/backups/offsite/brain-*.db.zst.enc*" \
   "$OFFSITE_LOCAL/" 2>> "$LOG_FILE"
 OFF_RC=$?
 if [ "$OFF_RC" -eq 0 ]; then

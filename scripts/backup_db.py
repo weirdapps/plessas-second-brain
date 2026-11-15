@@ -12,11 +12,18 @@ Retention:
   * offsite — GFS: ``--gfs-daily`` daily + ``--gfs-weekly`` weekly (newest per
     ISO week)
 
-Encryption uses ``openssl enc -aes-256-cbc -pbkdf2`` — universal and zero-install
-(``age``/``rclone crypt`` are absent on both hosts). The key file holds a
+Encryption uses ``openssl enc -aes-256-cbc -pbkdf2 -iter 600000`` — universal and
+zero-install (``age``/``rclone crypt`` are absent on both hosts). The key file holds a
 passphrase; keep a copy OFF every offsite target or the backups are
-unrecoverable. ``_compress_encrypt`` is the single swap point if age is ever
+unrecoverable. ``compress_encrypt`` is the single swap point if age is ever
 installed on both hosts.
+
+``openssl enc`` carries no MAC, so each archive gets a sidecar ``<archive>.mac``: an
+HMAC-SHA256 over the encrypted bytes, under a key derived from the passphrase by its
+own PBKDF2 pass (another salt, so it is not the encryption key). Decryption checks it
+before anything is decrypted. Archives written before 2026-11-15 have no sidecar and
+used openssl's default 10,000 iterations; they still decrypt, and the log says they
+were not verified (security audit 2026-11-01).
 
 Offsite is scoped by key-file presence: a host without the key (e.g. the Mac
 replica) silently skips the encrypted copy, so only the authoritative host (the
@@ -39,6 +46,8 @@ Usage (Mac, weekly: the restore drill on the newest pulled archive, docs/RESTORE
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import os
 import shutil
 import sqlite3
@@ -54,6 +63,20 @@ from typing import NamedTuple
 LOCAL_PATTERN = "brain-*.db"
 OFFSITE_SUFFIX = ".db.zst.enc"
 OFFSITE_PATTERN = "brain-*.db.zst.enc"
+
+# PBKDF2 iterations for the encryption key. Archives up to 2026-11-15 took openssl's
+# default for -pbkdf2, 10,000; new ones take 600,000, and decryption reads both.
+PBKDF2_ITER = 600_000
+LEGACY_PBKDF2_ITER = 10_000
+
+# The integrity sidecar beside each archive: "v1 hmac-sha256 iter=<n> <hex digest>".
+MAC_SUFFIX = ".mac"
+MAC_VERSION = "v1"
+# The salt of the MAC key's own PBKDF2 pass. openssl draws a random salt for the
+# encryption key, so the two keys never coincide.
+MAC_SALT = b"second-brain backup archive mac v1"
+# zstd's frame magic: what a correctly decrypted archive starts with.
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 
 # What the restore drill counts in the restored copy and in the database it is
 # compared with: the four tables every other one hangs off.
@@ -146,46 +169,128 @@ def tools_available() -> bool:
     return bool(shutil.which("zstd") and shutil.which("openssl"))
 
 
+def _passphrase(key_file: str) -> bytes:
+    """The passphrase as ``openssl -pass file:`` reads it: the file's first line."""
+    with open(key_file, "rb") as f:
+        return f.readline().rstrip(b"\r\n")
+
+
+def mac_key(key_file: str) -> bytes:
+    """The HMAC key of the archives' sidecars: PBKDF2-SHA256 of the passphrase under
+    MAC_SALT, at the encryption's iteration count. Stretched as hard as the encryption
+    key, so a sidecar is no cheaper a target for guessing the passphrase."""
+    return hashlib.pbkdf2_hmac("sha256", _passphrase(key_file), MAC_SALT, PBKDF2_ITER)
+
+
+def archive_mac(path: str, key: bytes) -> str:
+    """HMAC-SHA256 of the file at ``path``, hex."""
+    digest = hmac.new(key, digestmod=hashlib.sha256)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_mac(enc_path: str) -> tuple[int, str] | None:
+    """(iterations, hex digest) from ``enc_path``'s sidecar, None when it has none."""
+    try:
+        with open(enc_path + MAC_SUFFIX, encoding="ascii") as f:
+            fields = f.read().split()
+    except FileNotFoundError:
+        return None
+    try:
+        version, algorithm, iterations, digest = fields
+        if version != MAC_VERSION or algorithm != "hmac-sha256":
+            raise ValueError(version)
+        return int(iterations.removeprefix("iter=")), digest
+    except ValueError:
+        raise RuntimeError(f"unreadable MAC sidecar: {enc_path}{MAC_SUFFIX}") from None
+
+
+def _openssl_dec(key_file: str, iterations: int) -> list[str]:
+    return [
+        "openssl",
+        "enc",
+        "-d",
+        "-aes-256-cbc",
+        "-pbkdf2",
+        "-iter",
+        str(iterations),
+        "-pass",
+        f"file:{key_file}",
+    ]
+
+
 def compress_encrypt(src_path: str, dest_path: str, key_file: str) -> str:
-    """zstd-compress then AES-256-encrypt ``src_path`` -> ``dest_path`` (streamed)."""
+    """zstd-compress then AES-256-encrypt ``src_path`` -> ``dest_path`` (streamed), and
+    write its MAC sidecar ``dest_path + MAC_SUFFIX``.
+
+    Written under a hidden name the archive pattern does not match, and renamed into
+    place after its sidecar, so a pull never sees the archive without it.
+    """
     Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
-    _private_file(dest_path)
-    with open(dest_path, "wb") as out:
-        zst = subprocess.Popen(["zstd", "-q", "-c", src_path], stdout=subprocess.PIPE)
-        enc = subprocess.Popen(
-            ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt", "-pass", f"file:{key_file}"],
-            stdin=zst.stdout,
-            stdout=out,
-        )
-        assert zst.stdout is not None
-        zst.stdout.close()  # let zstd get SIGPIPE if openssl exits early
-        enc_rc = enc.wait()
-        zst_rc = zst.wait()
-    if zst_rc != 0 or enc_rc != 0:
-        if os.path.exists(dest_path):
-            os.unlink(dest_path)
-        raise RuntimeError(f"compress/encrypt failed (zstd={zst_rc}, openssl={enc_rc})")
+    folder, name = os.path.split(dest_path)
+    tmp = os.path.join(folder, f".{name}.tmp")
+    tmp_mac = os.path.join(folder, f".{name}{MAC_SUFFIX}.tmp")
+    _private_file(tmp)
+    try:
+        with open(tmp, "wb") as out:
+            zst = subprocess.Popen(["zstd", "-q", "-c", src_path], stdout=subprocess.PIPE)
+            enc = subprocess.Popen(
+                [
+                    "openssl",
+                    "enc",
+                    "-aes-256-cbc",
+                    "-pbkdf2",
+                    "-iter",
+                    str(PBKDF2_ITER),
+                    "-salt",
+                    "-pass",
+                    f"file:{key_file}",
+                ],
+                stdin=zst.stdout,
+                stdout=out,
+            )
+            assert zst.stdout is not None
+            zst.stdout.close()  # let zstd get SIGPIPE if openssl exits early
+            enc_rc = enc.wait()
+            zst_rc = zst.wait()
+        if zst_rc != 0 or enc_rc != 0:
+            raise RuntimeError(f"compress/encrypt failed (zstd={zst_rc}, openssl={enc_rc})")
+        _private_file(tmp_mac)
+        with open(tmp_mac, "w", encoding="ascii") as f:
+            digest = archive_mac(tmp, mac_key(key_file))
+            f.write(f"{MAC_VERSION} hmac-sha256 iter={PBKDF2_ITER} {digest}\n")
+        os.replace(tmp_mac, dest_path + MAC_SUFFIX)
+        os.replace(tmp, dest_path)
+    finally:
+        for leftover in (tmp, tmp_mac):
+            if os.path.exists(leftover):
+                os.unlink(leftover)
     return dest_path
 
 
-def decrypt_decompress(enc_path: str, dest_path: str, key_file: str) -> str:
-    """Reverse of :func:`compress_encrypt` — for verification and restore."""
-    Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+def _decrypts_at(enc_path: str, key_file: str, iterations: int) -> bool:
+    """Whether ``enc_path`` decrypts at ``iterations``: openssl's padding check holds
+    and what comes out starts as a zstd frame. Nothing is written."""
+    dec = subprocess.Popen(
+        [*_openssl_dec(key_file, iterations), "-in", enc_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    assert dec.stdout is not None
+    head = dec.stdout.read(len(ZSTD_MAGIC))
+    while dec.stdout.read(1 << 20):
+        pass
+    dec.stdout.close()
+    return dec.wait() == 0 and head == ZSTD_MAGIC
+
+
+def _decrypt_at(enc_path: str, dest_path: str, key_file: str, iterations: int) -> None:
     _private_file(dest_path)
     with open(dest_path, "wb") as out:
         dec = subprocess.Popen(
-            [
-                "openssl",
-                "enc",
-                "-d",
-                "-aes-256-cbc",
-                "-pbkdf2",
-                "-pass",
-                f"file:{key_file}",
-                "-in",
-                enc_path,
-            ],
-            stdout=subprocess.PIPE,
+            [*_openssl_dec(key_file, iterations), "-in", enc_path], stdout=subprocess.PIPE
         )
         unz = subprocess.Popen(["zstd", "-q", "-d"], stdin=dec.stdout, stdout=out)
         assert dec.stdout is not None
@@ -196,6 +301,39 @@ def decrypt_decompress(enc_path: str, dest_path: str, key_file: str) -> str:
         if os.path.exists(dest_path):
             os.unlink(dest_path)
         raise RuntimeError(f"decrypt/decompress failed (openssl={dec_rc}, zstd={unz_rc})")
+
+
+def decrypt_decompress(enc_path: str, dest_path: str, key_file: str) -> str:
+    """Reverse of :func:`compress_encrypt`, for verification and restore.
+
+    With a sidecar, its MAC must hold before anything is decrypted. Without one, the
+    archive must be a legacy one (it decrypts only at LEGACY_PBKDF2_ITER): an archive
+    that decrypts at PBKDF2_ITER was written with a sidecar, so a missing one is
+    refused rather than read as unverified. A legacy archive is restored, and the log
+    says it was not verified.
+    """
+    Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+    name = os.path.basename(enc_path)
+    sidecar = _read_mac(enc_path)
+    if sidecar is not None:
+        iterations, expected = sidecar
+        if not hmac.compare_digest(archive_mac(enc_path, mac_key(key_file)), expected):
+            raise RuntimeError(
+                f"MAC mismatch on {name}: the archive or its {MAC_SUFFIX} changed, or the "
+                "key is not the one it was written with; nothing was decrypted"
+            )
+        _decrypt_at(enc_path, dest_path, key_file, iterations)
+        return dest_path
+    if _decrypts_at(enc_path, key_file, PBKDF2_ITER):
+        raise RuntimeError(
+            f"no MAC sidecar for {name}, which was written with {PBKDF2_ITER:,} iterations "
+            "and so with a sidecar; refusing to trust it"
+        )
+    _decrypt_at(enc_path, dest_path, key_file, LEGACY_PBKDF2_ITER)
+    _log(
+        f"{name}: no MAC sidecar, a legacy archive ({LEGACY_PBKDF2_ITER:,} iterations); "
+        "decrypted, integrity not verified by MAC"
+    )
     return dest_path
 
 
@@ -256,6 +394,10 @@ def prune_gfs(directory: str, pattern: str, daily: int, weekly: int) -> list[str
         if p not in keep:
             os.unlink(p)
             removed.append(p)
+    # An archive's MAC sidecar goes with it, and so does one whose archive is gone.
+    for sidecar in glob(os.path.join(directory, pattern + MAC_SUFFIX)):
+        if not os.path.exists(sidecar[: -len(MAC_SUFFIX)]):
+            os.unlink(sidecar)
     return removed
 
 

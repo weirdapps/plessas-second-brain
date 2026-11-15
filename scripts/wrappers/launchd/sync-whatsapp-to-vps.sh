@@ -45,7 +45,12 @@ REMOTE_DIR=".second-brain/whatsapp"
 REMOTE_PART="$REMOTE_DIR/.whatsapp-snapshot.db.part"
 REMOTE_FILE="$REMOTE_DIR/whatsapp-snapshot.db"
 SSH_OPTS=(-o ConnectTimeout=10 -o BatchMode=yes)
-LOCK="${TMPDIR:-/tmp}/.whatsapp-sync-vps.lock"
+# Not $TMPDIR: launchd does not always set it, which left the lock in /tmp, where any
+# local user can create it first and hold this job off, and an interactive run and a
+# launchd run then used different locks (security audit 2026-11-01).
+LOCK_ROOT="$STATE/locks"
+mkdir -p "$LOCK_ROOT" && chmod 700 "$LOCK_ROOT"
+LOCK="$LOCK_ROOT/whatsapp-sync-vps.lock"
 
 mkdir -p "$STATE" "$(dirname "$LOG")"
 log() { echo "[whatsapp-sync] $(date '+%Y-%m-%d %H:%M:%S') $*" >>"$LOG"; }

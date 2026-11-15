@@ -258,3 +258,43 @@ def test_a_drill_without_what_it_needs_is_a_usage_error(argv):
     with pytest.raises(SystemExit) as exc:
         backup_db.main(argv)
     assert exc.value.code == 2
+
+
+class TestArchiveIntegrityInTheDrill:
+    """The drill reads archives through decrypt_decompress, so it checks the MAC
+    sidecar first and still restores the archives written before it existed."""
+
+    def test_a_changed_archive_fails_the_drill(self, drill):
+        enc = drill.archive()
+        with enc.open("r+b") as fh:
+            fh.seek(64)
+            byte = fh.read(1)
+            fh.seek(64)
+            fh.write(bytes([byte[0] ^ 0x01]))
+
+        assert drill.run() == 1
+
+        assert not drill.stamp.exists()
+        assert drill.pings == [("drill", "/fail")]
+
+    def test_a_legacy_archive_without_a_mac_passes_the_drill(self, drill, capsys):
+        import subprocess
+
+        enc = drill.archive()
+        Path(f"{enc}{backup_db.MAC_SUFFIX}").unlink()
+        plain = drill.tmp / "legacy.db"
+        snap = drill.tmp / "snapshot-legacy.db"
+        backup_db.snapshot(str(_store(plain, COUNTS)), str(snap))
+        zst = subprocess.run(["zstd", "-q", "-c", str(snap)], capture_output=True, check=True)
+        key = drill.tmp / "backup.key"
+        subprocess.run(
+            ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt", "-pass", f"file:{key}"]
+            + ["-out", str(enc)],
+            input=zst.stdout,
+            check=True,
+        )
+
+        assert drill.run() == 0
+
+        assert drill.pings == [("drill", "")]
+        assert "no MAC" in capsys.readouterr().out

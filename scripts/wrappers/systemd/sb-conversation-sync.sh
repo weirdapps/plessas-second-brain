@@ -11,7 +11,14 @@ mkdir -p "$LOG_DIR"
 # Overridable so the wrapper tests never touch a lock a real run may hold. The
 # lock is removed with rm -rf after a cd, so the override must be an absolute
 # path to a *.lock directory.
-LOCK_DIR="${SB_CONVERSATION_SYNC_LOCK:-/tmp/sb-conversation-sync.lock}"
+# Not /tmp: any local user can create a lock there first and hold this job off
+# (security audit 2026-11-01). XDG_RUNTIME_DIR is this user's own directory, 0700 and
+# cleared at boot, under systemd and a login session; without it, a 0700 directory
+# under ~/.second-brain. A lock an older copy of this wrapper left in /tmp is no longer
+# looked at.
+LOCK_ROOT="${XDG_RUNTIME_DIR:-$HOME/.second-brain/locks}"
+mkdir -p "$LOCK_ROOT" && chmod 700 "$LOCK_ROOT"
+LOCK_DIR="${SB_CONVERSATION_SYNC_LOCK:-$LOCK_ROOT/sb-conversation-sync.lock}"
 case "$LOCK_DIR" in
   /*.lock) ;;
   *)

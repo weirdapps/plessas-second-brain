@@ -105,3 +105,73 @@ def test_news_and_automation_mail_take_no_decision_or_action_from_an_attachment(
         ]
         assert counts == [0, 0, 2], source_class
         conn.close()
+
+
+V2_EXTRACTION = {
+    "extraction_schema": 2,
+    "summary": "s",
+    "language": "en",
+    "topics": [],
+    "decisions": [
+        {
+            "decision": "go ahead",
+            "decided_by": "board",
+            "status": "made",
+            "owner_role": "third_party",
+            "evidence": "The board approved the plan.",
+            "evidence_found": True,
+        },
+        {
+            "decision": "hire two analysts",
+            "status": "proposed",
+            "owner_role": "owner_decided",
+            "evidence": "a paraphrase the text does not hold",
+            "evidence_found": False,
+        },
+    ],
+    "action_items": [
+        {
+            "task": "send the deck",
+            "owner": "me",
+            "direction": "owner_owes",
+            "evidence": "Please send the deck by Friday.",
+            "evidence_found": True,
+        }
+    ],
+    "key_facts": [],
+}
+
+
+def _rows(conn, sql):
+    return sorted(tuple(r) for r in conn.execute(sql))
+
+
+def test_a_v2_summary_keeps_the_v2_fields_the_email_loader_keeps(tmp_path, monkeypatch):
+    """Status, owner role and quote of a decision, direction and quote of an action, as
+    src/store/loader.py stores them for an email's body: a quote only when the parser found
+    it in the document's text."""
+    path, conn = _db(tmp_path)
+
+    _summarise(path, monkeypatch, V2_EXTRACTION)
+
+    assert _rows(conn, "SELECT decision, status, owner_role, evidence FROM decisions") == [
+        ("go ahead", "made", "third_party", "The board approved the plan."),
+        ("hire two analysts", "proposed", "owner_decided", None),
+    ]
+    assert _rows(conn, "SELECT task, direction, evidence FROM action_items") == [
+        ("send the deck", "owner_owes", "Please send the deck by Friday.")
+    ]
+
+
+def test_a_v1_summary_stores_no_v2_field(tmp_path, monkeypatch):
+    """A v1 reply has no extraction_schema: keys it happens to carry are not v2 fields."""
+    path, conn = _db(tmp_path)
+    v1 = {key: value for key, value in V2_EXTRACTION.items() if key != "extraction_schema"}
+
+    _summarise(path, monkeypatch, v1)
+
+    assert _rows(conn, "SELECT status, owner_role, evidence FROM decisions") == [
+        (None, None, None),
+        (None, None, None),
+    ]
+    assert _rows(conn, "SELECT direction, evidence FROM action_items") == [(None, None)]

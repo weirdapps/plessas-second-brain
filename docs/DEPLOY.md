@@ -1283,7 +1283,10 @@ it at batch rates.
 A `git pull` changes the code and nothing else. `scripts/deploy.sh` does the rest, as one
 reconciliation: run it from the checkout after a pull (the reference deployment's hourly
 pull runs it as the repository's hook whenever new commits arrive), and run it again at
-any time, since a second run changes nothing. In order, it stops at the first step that
+any time, since a second run changes nothing. That hourly pull goes through
+`scripts/deploy-gate.sh pull`, which fast-forwards only to the newest commit of master
+whose required CI checks all passed on GitHub (read with `gh api`), holds a newer one, and
+fails once a held commit is two hours old; its header lists the verdicts. In order, it stops at the first step that
 fails and exits non-zero, and logs to `~/.second-brain/logs/deploy.log`:
 
 1. `uv sync --frozen --no-dev --inexact` into `UV_PROJECT_ENVIRONMENT`

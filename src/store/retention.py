@@ -4,6 +4,9 @@ The owner's decision (2026-11-04) is manual only: no automatic cutoff, no per-so
 deletes on its own, no timer. This module is the one path a forget takes, whatever chose the
 rows: a cutoff (`--before`), or the mail the mailbox reports deleted (`--deleted-at-source`,
 src/export/inbox_reconcile.py records it; nothing here acts on it unless the owner asks).
+The forgets in passing (src/store/forget.py) are not this: a replaced session note, a document
+inbox file's older revision (src/store/document_revisions.py) or a duplicate document, whose
+content the store still holds in its newer or twin copy, goes through the same path.
 
 A forget picks PARENTS and takes everything they left:
 
@@ -133,6 +136,7 @@ KEPT = frozenset(
         "consolidation_threads",
         "session_notes",
         "session_note_transcripts",
+        "document_paths",
         "sharepoint_links",
         "findings",
         # The page layer's bookkeeping: entity keys, ids and the owner's own corrections.

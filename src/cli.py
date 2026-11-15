@@ -1781,10 +1781,15 @@ def cmd_classify_sources(args):
 
     The v33 migration and the loader set the class; this sets it again for rows stored before
     a change that moves it, such as BRAIN_USER_EMAIL_PATTERN being set after the migration ran.
-    Writes only the rows whose class changes.
+    Writes only the rows whose class changes. With --dry-run it says what would change and
+    rolls back. The decisions, actions and commitments of mail it moves to a class that takes
+    none stay until `brain maint forget-itemless --apply` (src/store/item_cleanup.py).
     """
     from src.store.schema import ensure_schema, get_connection
     from src.store.source_class import CLASSES, reclassify
+
+    dry_run = bool(getattr(args, "dry_run", False))
+    moves: dict = {}
 
     db_path = str(args.db)
     if not Path(db_path).exists():
@@ -1798,8 +1803,8 @@ def cmd_classify_sources(args):
             conn.commit()
         conn.execute("BEGIN IMMEDIATE")
         try:
-            counts = reclassify(conn)
-            conn.execute("COMMIT")
+            counts = reclassify(conn, moves=moves)
+            conn.execute("ROLLBACK" if dry_run else "COMMIT")
         except BaseException:
             conn.rollback()
             raise
@@ -1807,6 +1812,10 @@ def cmd_classify_sources(args):
         conn.close()
     for name in CLASSES:
         print(f"{name}: {counts.get(name, 0)}")
+    for (old, new), rows in sorted(moves.items(), key=lambda m: (str(m[0][0]), m[0][1])):
+        print(f"{old} -> {new}: {rows}")
+    if dry_run:
+        print("dry run: nothing written; run it without --dry-run to write")
 
 
 def cmd_import_people(args):
@@ -3271,7 +3280,12 @@ def main():
     parser_classify = subparsers.add_parser(
         "classify-sources",
         help="Set every email's source_class again by today's rules "
-        "(after BRAIN_USER_EMAIL_PATTERN is set or changed)",
+        "(after BRAIN_USER_EMAIL_PATTERN or BRAIN_AUTOMATION_RECIPIENTS is set or changed)",
+    )
+    parser_classify.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Say how many rows would move from each class to each other, write nothing",
     )
     parser_classify.set_defaults(func=cmd_classify_sources)
 

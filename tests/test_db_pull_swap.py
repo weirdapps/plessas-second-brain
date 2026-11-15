@@ -13,6 +13,7 @@ What these pin (issue #149):
   * the DEFER guard sees the conversation sync's writers as well.
 """
 
+import os
 import re
 import shutil
 import sqlite3
@@ -399,3 +400,30 @@ def test_a_snapshot_that_drops_twice_still_fails_the_run(world, tmp_path):
     assert out.returncode == 1
     assert (world.replica / "brain.db").read_bytes() == before
     assert not world.stamp.exists()
+
+
+def test_each_archive_is_pulled_with_its_mac_sidecar(world):
+    """Security audit 2026-11-01: archives carry an HMAC sidecar, brain-*.db.zst.enc.mac,
+    which the restore drill checks on this side. An archive pulled without it reads as
+    unverified, so the pull takes both."""
+    offsite = world.producer / "backups" / "offsite"
+    (offsite / "brain-20261010.db.zst.enc.mac").write_text("v1 600000 " + "0" * 64 + "\n")
+
+    world.run()
+
+    pulled = world.home / "second-brain-backups" / "offsite"
+    assert sorted(p.name for p in pulled.iterdir()) == [
+        "brain-20261010.db.zst.enc",
+        "brain-20261010.db.zst.enc.mac",
+    ]
+
+
+def test_the_default_pull_lock_is_private(world):
+    """The lock defaulted to /tmp, where any local user could create it first."""
+    lock = world.home / ".second-brain" / "locks" / "sb-db-pull.lock"
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(str(os.getpid()))
+
+    world.run(SB_PULL_LOCK="")
+
+    assert "SKIP: another instance running" in world.log()

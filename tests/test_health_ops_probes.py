@@ -1026,13 +1026,8 @@ def test_hourly_mcp_probe_pings_its_own_check_and_never_prints_the_token(
     hc, tmp_path, monkeypatch, capsys
 ):
     pinged = []
-
-    def run(cmd, **kwargs):
-        pinged.append(cmd[-1])
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-
     monkeypatch.setenv("HC_PING_URL", "https://hc.example.invalid/ping/key")
-    monkeypatch.setattr(hc.subprocess, "run", run)
+    monkeypatch.setattr(hc, "_hc_post", lambda url, data: pinged.append(url))
 
     rc = hc.run_mcp_probe(ping=True, token_file=_token(tmp_path), opener=_Server(status=401))
 
@@ -1046,7 +1041,7 @@ def test_hourly_mcp_probe_pings_its_own_check_and_never_prints_the_token(
 def test_hourly_mcp_probe_does_not_ping_without_the_flag(hc, tmp_path, monkeypatch):
     pinged = []
     monkeypatch.setenv("HC_PING_URL", "https://hc.example.invalid/ping/key")
-    monkeypatch.setattr(hc.subprocess, "run", lambda cmd, **kw: pinged.append(cmd))
+    monkeypatch.setattr(hc, "_hc_post", lambda url, data: pinged.append(url))
 
     assert hc.run_mcp_probe(ping=False, token_file=_token(tmp_path), opener=_Server()) == 0
     assert pinged == []

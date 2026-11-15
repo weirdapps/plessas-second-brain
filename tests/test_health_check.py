@@ -1906,7 +1906,7 @@ def test_ping_freshness_is_a_no_op_without_hc_ping_url(hc, monkeypatch):
     """The Mac runs this script too, and CI runs the tests. Neither may ping."""
     unset_env(monkeypatch, "HC_PING_URL")
     called = []
-    monkeypatch.setattr(hc.subprocess, "run", lambda *a, **k: called.append(a))
+    monkeypatch.setattr(hc, "_hc_post", lambda *a, **k: called.append(a))
 
     assert hc.ping_freshness(True, "2 sources fresh") is False
     assert called == []
@@ -1916,17 +1916,16 @@ def test_ping_freshness_posts_the_success_url(hc, monkeypatch):
     monkeypatch.setenv("HC_PING_URL", "http://127.0.0.1:8000/ping/KEY")
     seen = {}
 
-    def _fake_run(cmd, **kwargs):
-        seen["cmd"] = cmd
-        seen["input"] = kwargs.get("input")
-        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    def _fake_post(url, data):
+        seen["url"] = url
+        seen["data"] = data
 
-    monkeypatch.setattr(hc.subprocess, "run", _fake_run)
+    monkeypatch.setattr(hc, "_hc_post", _fake_post)
 
     assert hc.ping_freshness(True, "12 sources fresh") is True
-    assert seen["cmd"][-1] == "http://127.0.0.1:8000/ping/KEY/sb-brain-freshness"
-    assert seen["input"] == "12 sources fresh"
-    assert "?create=1" not in seen["cmd"][-1], (
+    assert seen["url"] == "http://127.0.0.1:8000/ping/KEY/sb-brain-freshness"
+    assert seen["data"] == b"12 sources fresh"
+    assert "?create=1" not in seen["url"], (
         "auto-provision left eleven checks on the wrong default; do not add a twelfth"
     )
 
@@ -1934,50 +1933,78 @@ def test_ping_freshness_posts_the_success_url(hc, monkeypatch):
 def test_ping_freshness_posts_the_fail_url_when_stale(hc, monkeypatch):
     monkeypatch.setenv("HC_PING_URL", "http://127.0.0.1:8000/ping/KEY/")
     seen = {}
-
-    def _fake_run(cmd, **kwargs):
-        seen["cmd"] = cmd
-        return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-
-    monkeypatch.setattr(hc.subprocess, "run", _fake_run)
+    monkeypatch.setattr(hc, "_hc_post", lambda url, data: seen.setdefault("url", url))
 
     assert hc.ping_freshness(False, "stale: Emails") is True
-    assert seen["cmd"][-1] == "http://127.0.0.1:8000/ping/KEY/sb-brain-freshness/fail", (
+    assert seen["url"] == "http://127.0.0.1:8000/ping/KEY/sb-brain-freshness/fail", (
         "a trailing slash on HC_PING_URL must not produce a double slash"
     )
 
 
-def test_ping_freshness_never_raises_and_never_echoes_curl_stderr(hc, monkeypatch, capsys):
-    """curl -fsS writes the failing URL to stderr, and that URL carries the ping key.
+def test_ping_freshness_never_runs_a_process(hc, monkeypatch):
+    """Security audit 2026-11-01: curl took the ping URL, the secret, in argv, where
+    every process listing on the host could read it. The ping is urllib now."""
+    monkeypatch.setenv("HC_PING_URL", "http://127.0.0.1:8000/ping/KEY")
+    monkeypatch.setattr(hc, "_hc_post", lambda url, data: None)
+
+    def _no_process(*a, **k):
+        raise AssertionError("ping_freshness started a process")
+
+    monkeypatch.setattr(hc.subprocess, "run", _no_process)
+    assert hc.ping_freshness(True, "ok") is True
+
+
+def test_hc_post_sends_a_post_with_the_detail_and_retries(hc, monkeypatch):
+    attempts = []
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"OK"
+
+    def _urlopen(request, timeout):
+        attempts.append((request.full_url, request.get_method(), request.data, timeout))
+        if len(attempts) < 3:
+            raise hc.urllib.error.URLError("connection refused")
+        return _Response()
+
+    monkeypatch.setattr(hc.urllib.request, "urlopen", _urlopen)
+    monkeypatch.setattr(hc.time, "sleep", lambda s: None)
+
+    hc._hc_post("http://127.0.0.1:8000/ping/KEY/x", b"detail")
+
+    assert len(attempts) == 3
+    assert attempts[-1] == ("http://127.0.0.1:8000/ping/KEY/x", "POST", b"detail", 10)
+
+
+def test_ping_freshness_never_raises_and_never_echoes_the_url(hc, monkeypatch, capsys):
+    """An error can carry the failing URL, and that URL carries the ping key.
 
     A ping is best-effort: an exception here must not take down the nightly
     report, and the failing URL must never reach the log.
     """
     monkeypatch.setenv("HC_PING_URL", "http://127.0.0.1:8000/ping/SECRETKEY")
 
-    def _boom(*a, **k):
-        raise OSError("network down")
+    def _boom(url, data):
+        raise OSError(f"network down for {url}")
 
-    monkeypatch.setattr(hc.subprocess, "run", _boom)
+    monkeypatch.setattr(hc, "_hc_post", _boom)
     assert hc.ping_freshness(True, "ok") is False
 
-    def _curl_fails(*a, **k):
-        return type(
-            "R",
-            (),
-            {
-                "returncode": 22,
-                "stdout": "",
-                "stderr": "curl: (22) http://127.0.0.1:8000/ping/SECRETKEY/x returned 404",
-            },
-        )()
+    def _http_404(url, data):
+        raise hc.urllib.error.HTTPError(url, 404, "Not Found", {}, None)
 
-    monkeypatch.setattr(hc.subprocess, "run", _curl_fails)
+    monkeypatch.setattr(hc, "_hc_post", _http_404)
     assert hc.ping_freshness(True, "ok") is False
 
     captured = capsys.readouterr()
     assert "SECRETKEY" not in captured.err + captured.out
-    assert "curl exit 22" in captured.err
+    assert "HTTP 404" in captured.err
 
 
 # --- The migration marker did not survive a LaunchAgents rebuild -------------

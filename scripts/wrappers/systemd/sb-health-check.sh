@@ -51,6 +51,8 @@ if [ -f "$PING_ENV" ]; then
   # shellcheck source=/dev/null
   . "$PING_ENV"
 fi
+# Each ping hands curl its URL as a config line on stdin (-K -), never in argv, where
+# every process listing on the host could read the ping key (security audit 2026-11-01).
 if [ -n "${HC_PING_URL:-}" ]; then
   _fresh_block="$(printf '%s\n' "$REPORT" \
     | awk '/^DATA SOURCES/{b=1;next} /^SCHEDULED JOBS/{b=0} b')"
@@ -58,9 +60,11 @@ if [ -n "${HC_PING_URL:-}" ]; then
     echo "$(ts) sb-brain-freshness: no DATA SOURCES block in report, no ping sent" >> "$LOG"
   elif printf '%s\n' "$_fresh_block" | grep -qE '(^|[[:space:]])(STALE|FAIL)([[:space:]]|$)'; then
     echo "$(ts) sb-brain-freshness: STALE/FAIL present, sending fail ping" >> "$LOG"
-    curl -fsS -m 10 --retry 2 -o /dev/null "${HC_PING_URL}/sb-brain-freshness/fail" 2>/dev/null || true
+    curl -fsS -m 10 --retry 2 -o /dev/null -K - \
+      <<<"url = \"${HC_PING_URL}/sb-brain-freshness/fail\"" 2>/dev/null || true
   else
-    curl -fsS -m 10 --retry 2 -o /dev/null "${HC_PING_URL}/sb-brain-freshness" 2>/dev/null || true
+    curl -fsS -m 10 --retry 2 -o /dev/null -K - \
+      <<<"url = \"${HC_PING_URL}/sb-brain-freshness\"" 2>/dev/null || true
   fi
 fi
 # -----------------------------------------------------------------------------

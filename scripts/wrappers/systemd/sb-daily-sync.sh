@@ -31,7 +31,14 @@ mkdir -p "$LOG_DIR"
 # Overridable so the wrapper tests never touch a lock a real run may hold. The
 # lock is removed with rm -rf after a cd, so the override must be an absolute
 # path to a *.lock directory.
-LOCK_DIR="${SB_DAILY_SYNC_LOCK:-/tmp/sb-daily-sync.lock}"
+# Not /tmp: any local user can create a lock there first and hold this job off
+# (security audit 2026-11-01). XDG_RUNTIME_DIR is this user's own directory, 0700 and
+# cleared at boot, under systemd and a login session; without it, a 0700 directory
+# under ~/.second-brain. A lock an older copy of this wrapper left in /tmp is no longer
+# looked at.
+LOCK_ROOT="${XDG_RUNTIME_DIR:-$HOME/.second-brain/locks}"
+mkdir -p "$LOCK_ROOT" && chmod 700 "$LOCK_ROOT"
+LOCK_DIR="${SB_DAILY_SYNC_LOCK:-$LOCK_ROOT/sb-daily-sync.lock}"
 case "$LOCK_DIR" in
   /*.lock) ;;
   *)
@@ -113,7 +120,10 @@ if [ -f "$DATA_DIR/backups/brain-$TODAY.db" ] \
   # the slot takes the snapshot and pings ahead of it, so without a ping here the check
   # went down at 08:10 on 2026-10-24 with the day's snapshot on disk. The ping stands on
   # the same files the skip does.
-  [ -n "$HC_PING_URL" ] && curl -fsS -m 10 --retry 2 -o /dev/null "${HC_PING_URL}/brain-backup" 2>/dev/null || true
+  # The URL goes to curl as a config line on stdin, never in argv, where every process
+  # listing on the host could read the ping key (security audit 2026-11-01).
+  [ -n "$HC_PING_URL" ] && curl -fsS -m 10 --retry 2 -o /dev/null -K - \
+    <<<"url = \"${HC_PING_URL}/brain-backup\"" 2>/dev/null || true
 else
   # Retention on this host (2026-11-15, the disk at 78%): 3 plain snapshots, as restic takes
   # the newest each night and keeps its own history; 7 daily + 4 weekly archives, as the Mac

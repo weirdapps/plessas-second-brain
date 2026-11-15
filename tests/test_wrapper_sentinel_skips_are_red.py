@@ -328,7 +328,10 @@ def test_a_second_daily_run_still_pings_the_backup_check(tmp_path):
     the snapshot, skipped the backup, sent nothing, and the check went down at 08:10
     with a good snapshot on disk. The skip stands on today's file, so it says so."""
     home = _home(tmp_path)
-    (home / "tools" / "curl").write_text('#!/bin/bash\necho "curl $*" >> "$HOME/calls.log"\n')
+    # The URL reaches curl as a config line on stdin (-K -), never in argv.
+    (home / "tools" / "curl").write_text(
+        '#!/bin/bash\necho "curl $* $(cat | tr -d \'\\n\')" >> "$HOME/calls.log"\n'
+    )
     (home / "tools" / "curl").chmod(0o755)
     stamp = subprocess.run(["date", "+%Y%m%d"], capture_output=True, text=True).stdout.strip()
     backups = home / "SourceCode" / "plessas-second-brain" / "data" / "backups"
@@ -338,4 +341,4 @@ def test_a_second_daily_run_still_pings_the_backup_check(tmp_path):
     _run("sb-daily-sync.sh", home, HC_PING_URL="https://hc.invalid/ping/key")
 
     pings = [c for c in _calls(home) if c.startswith("curl ")]
-    assert any(c.endswith("https://hc.invalid/ping/key/brain-backup") for c in pings), pings
+    assert any(c.endswith('url = "https://hc.invalid/ping/key/brain-backup"') for c in pings), pings

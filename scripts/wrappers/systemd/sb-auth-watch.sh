@@ -308,7 +308,10 @@ hc_report() {  # hc_report <slug> <ok|fail>
     # second failure of the month alerts as if it were the second in a row.
     rm -f "$state" 2>/dev/null || true
   fi
-  curl -fsS -m 10 --retry 2 -o /dev/null "${HC_PING_URL}/$1${suffix}?create=1" 2>/dev/null || true
+  # The URL goes to curl as a config line on stdin, never in argv, where every process
+  # listing on the host could read the ping key (security audit 2026-11-01).
+  curl -fsS -m 10 --retry 2 -o /dev/null -K - \
+    <<<"url = \"${HC_PING_URL}/$1${suffix}?create=1\"" 2>/dev/null || true
   return 0
 }
 

@@ -14,6 +14,7 @@ Two artefacts, from one run:
 | --- | --- | --- |
 | Local snapshot | `--local-dir`, named `brain-YYYYMMDD.db` | plain SQLite |
 | Offsite snapshot | `--offsite-dir`, named `brain-YYYYMMDD.db.zst.enc` | zstd, then AES-256-CBC |
+| Its MAC sidecar | beside it, named `brain-YYYYMMDD.db.zst.enc.mac` | HMAC-SHA256 of the archive |
 
 The local snapshot comes from SQLite's online-backup API, not `cp`. Raw-copying
 a live WAL-mode database can capture a torn write that will not open, which is
@@ -22,7 +23,20 @@ the failure this replaced. Every snapshot is validated with
 corrupt snapshot never sits on disk pretending to be a good one.
 
 The offsite copy is that snapshot piped through
-`zstd -q -c | openssl enc -aes-256-cbc -pbkdf2 -salt -pass file:<key>`. Both
+`zstd -q -c | openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -pass file:<key>`.
+Beside it goes `<archive>.mac`, one line `v1 hmac-sha256 iter=600000 <hex>`: an
+HMAC-SHA256 over the encrypted file, under a key derived from the same passphrase by
+a PBKDF2-SHA256 pass of its own (600,000 iterations, a fixed salt of its own), so it
+is not the encryption key and is no cheaper a target for guessing the passphrase. The
+archive is written under a hidden name and renamed into place after its sidecar, so
+the pull never finds one without the other, and the GFS prune removes the two
+together on both hosts.
+
+Archives written before 2026-11-15 used openssl's default 10,000 iterations and
+have no sidecar. They still restore: `decrypt_decompress()` and the drill try the
+new count, fall back to the old one, and log that the archive was not verified by a
+MAC. An archive that decrypts at 600,000 iterations without its sidecar is refused,
+since it was written with one (security audit 2026-11-01). Both
 binaries must be on `PATH`: `tools_available()` checks for them and quietly
 skips the offsite copy when either is missing, so a missing offsite file is not
 by itself something you will be told about.
@@ -60,10 +74,10 @@ rotation date in its filename.
 and on the consumer, and the consumer keeps them beside the archives it pulls, so
 the encryption keeps the archives from neither host. Confirm a copy of each key is
 held off both hosts and off every backup target (a password manager or a hardware
-key), so neither host holds the only copy. `openssl enc` also carries no MAC:
-damage to an archive shows only after it is decrypted, in `quick_check`, which the
-drill below now runs weekly. `age`, or restic, would authenticate what they
-decrypt. Delete the retired key once the last archive it opens has left the GFS
+key), so neither host holds the only copy. `openssl enc` carries no MAC of its
+own; since 2026-11-15 the `.mac` sidecar above stands in for one, and is checked
+before anything is decrypted. `age`, or restic, would authenticate what they
+decrypt in one format. Delete the retired key once the last archive it opens has left the GFS
 window. (Audit 2026-10-11, security-privacy-10.)
 
 ## Restore
@@ -84,13 +98,27 @@ next commits go into the unlinked old inode and are lost, and deleting a live
 `-wal` under it (step 4) throws away what it had not checkpointed yet.
 
 ```bash
-# 1. Decrypt, then decompress. Note the -d on both.
+# 1. Check the MAC, then decrypt and decompress, in one call. The .mac sidecar must
+#    sit beside the archive; an archive from before 2026-11-15 has none, and the
+#    log says it was not verified.
+.venv/bin/python -c 'import runpy, sys; runpy.run_path("scripts/backup_db.py")["decrypt_decompress"](*sys.argv[1:])' \
+  brain-20260101.db.zst.enc brain.db /path/to/backup.key
+```
+
+Without the repo, the same by hand, which checks no MAC. Note the -d on both:
+
+```bash
+# Archives from 2026-11-15 on:
+openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -pass file:/path/to/backup.key \
+  -in brain-20261120.db.zst.enc | zstd -q -d > brain.db
+# Archives before 2026-11-15 (openssl's default, 10,000 iterations):
 openssl enc -d -aes-256-cbc -pbkdf2 -pass file:/path/to/backup.key \
   -in brain-20260101.db.zst.enc | zstd -q -d > brain.db
 ```
 
-A wrong key fails right here, loudly, with `bad decrypt`. It cannot produce a
-plausible-looking but wrong database.
+A wrong key fails right here, loudly: a MAC mismatch in the first form, `bad decrypt`
+in the second (or the wrong iteration count, which looks the same). It cannot produce
+a plausible-looking but wrong database.
 
 ```bash
 # 2. Verify before trusting it. Both must be clean.
@@ -202,9 +230,8 @@ systemctl --user start sb-mcp.service
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/<db-pull plist>
 ```
 
-`scripts/backup_db.py` also exposes `decrypt_decompress()` if you would rather
-do step 1 in Python than in a shell pipeline. It is the exact inverse of the
-`compress_encrypt()` that wrote the file.
+Step 1's first form is `decrypt_decompress()` from `scripts/backup_db.py`, the
+exact inverse of the `compress_encrypt()` that wrote the file, MAC check included.
 
 ## restic: the copy off both hosts
 
@@ -276,8 +303,10 @@ path by hand now and then.
 ## Exercise it
 
 An untested restore is a hypothesis, so the drill is a scheduled job.
-`scripts/backup_db.py --drill` decrypts the newest archive in `--offsite-dir` into
-a private temporary directory, runs `PRAGMA quick_check` on it, and compares the
+`scripts/backup_db.py --drill` checks the newest archive in `--offsite-dir` against
+its `.mac` sidecar, decrypts it into a private temporary directory (an archive from
+before 2026-11-15 has no sidecar, is decrypted at the old iteration count, and the
+log says it was not verified), runs `PRAGMA quick_check` on it, and compares the
 row counts of `emails`, `attachments`, `teams_messages` and `decisions` with the
 database named by `--db`, each within 10% of the larger of the two
 (`--drill-tolerance`, a share of at least 0 and below 1; the archive is up to a

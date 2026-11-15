@@ -3434,15 +3434,34 @@ def freshness_verdict(checks, sentinels):
     return True, f"{len(checks)} sources fresh"
 
 
+def _hc_post(url: str, data: bytes, attempts: int = 4, timeout: float = 10) -> None:
+    """POST ``data`` to a Healthchecks ping URL: up to ``attempts`` tries, ``timeout``
+    seconds each, a growing pause between them. Raises the last error.
+
+    urllib, not curl: curl took the URL in argv, where every process listing on the
+    host could read the ping key (security audit 2026-11-01).
+    """
+    for attempt in range(attempts):
+        try:
+            request = urllib.request.Request(url, data=data, method="POST")
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                response.read()
+            return
+        except (urllib.error.URLError, OSError) as e:
+            client_error = isinstance(e, urllib.error.HTTPError) and e.code < 500
+            if client_error or attempt == attempts - 1:
+                raise
+            time.sleep(attempt + 1)
+
+
 def ping_freshness(ok, detail, slug=FRESHNESS_SLUG, create=False):
     """Fire-and-forget freshness ping. Never raises, never changes the exit code.
 
-    Same curl invocation as hc-success@.service, so the retry and timeout
-    behaviour is identical to every other ping on the box. `create` provisions a
-    check that does not exist yet, as sb-auth-watch.sh does for its own slugs.
+    A POST of ``detail`` with retries (:func:`_hc_post`). `create` provisions a check
+    that does not exist yet, as sb-auth-watch.sh does for its own slugs.
 
-    curl's own stderr is never printed: -fsS writes the failing URL into it, and
-    that URL carries the Healthchecks ping key. Only the exit code is logged.
+    An error's text is never printed: it can carry the URL, and that URL carries the
+    Healthchecks ping key. Only the HTTP status or the error's type is logged.
     """
     base = os.environ.get("HC_PING_URL")
     if not base:
@@ -3451,30 +3470,12 @@ def ping_freshness(ok, detail, slug=FRESHNESS_SLUG, create=False):
 
     url = f"{base.rstrip('/')}/{slug}" + ("" if ok else "/fail") + ("?create=1" if create else "")
     try:
-        result = subprocess.run(
-            [
-                "curl",
-                "-fsS",
-                "-m",
-                "10",
-                "--retry",
-                "3",
-                "-o",
-                "/dev/null",
-                "--data-binary",
-                "@-",
-                url,
-            ],
-            input=detail[:10000],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
+        _hc_post(url, detail[:10000].encode("utf-8"))
+    except urllib.error.HTTPError as e:
+        print(f"Freshness ping failed: HTTP {e.code}", file=sys.stderr)
+        return False
     except Exception as e:
         print(f"Freshness ping failed: {type(e).__name__}", file=sys.stderr)
-        return False
-    if result.returncode != 0:
-        print(f"Freshness ping failed: curl exit {result.returncode}", file=sys.stderr)
         return False
     return True
 

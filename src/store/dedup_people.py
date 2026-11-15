@@ -211,10 +211,15 @@ def _merge_or_queue(
     """A match on a name alone: merged on a legacy store. With the gated person_identity
     (issue 170) queued for the owner instead, unless `unique`: the name belongs to exactly
     one person with an address and is not short (see _short), which merges by itself, the
-    owner's rule of 2026-11-11. True when it merged."""
+    owner's rule of 2026-11-11, when that address is trusted (person_identity.trusted_address,
+    2026-11-15). True when it merged."""
     if person_identity.active(conn):
         # A row with a phone, a JID or an MRI is an identity of its own, not a bare name.
-        if unique and not person_identity.has_hard_identifier(conn, remove_id):
+        if (
+            unique
+            and not person_identity.has_hard_identifier(conn, remove_id)
+            and person_identity.trusted_address(conn, keep_id)
+        ):
             merged = person_identity.auto_merge(conn, keep_id, remove_id, rule, evidence)
             if merged is not False:
                 return bool(merged)

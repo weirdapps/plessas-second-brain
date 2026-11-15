@@ -278,6 +278,49 @@ def test_a_name_matching_one_addressed_person_merges_by_itself_and_is_logged(tmp
     assert db.execute("SELECT COUNT(*) FROM person_review").fetchone()[0] == 0
 
 
+def _outside_nikos(db, mails: int):
+    """Nikos at an outside domain, the sender of `mails` emails, and a name-only Nikos."""
+    for n in range(mails):
+        f.email(db, subject=f"Okapi {n}", sender=("Nikos Papadopoulos", "np@outside.example"))
+    a = db.execute("SELECT id FROM people WHERE email = 'np@outside.example'").fetchone()[0]
+    b = find_or_create_person(db, "NIKOS PAPADOPOULOS")
+    db.commit()
+    return a, b
+
+
+def test_a_name_matching_one_new_outside_address_is_queued_not_merged(tmp_path):
+    """One outside mail whose display name matches a colleague's must not absorb the
+    name-only rows of that name: an address outside the owner's domain is trusted only
+    once it has been in TRUSTED_MIN_EMAILS mails."""
+    path = tmp_path / "b.db"
+    db = create_database(str(path))
+    a, b = _outside_nikos(db, mails=person_identity.TRUSTED_MIN_EMAILS - 1)
+    db.close()
+    results = dedup_people.run_dedup(str(path))
+    db = sqlite3.connect(path)
+    assert {a, b} <= _people(db)
+    assert db.execute("SELECT COUNT(*) FROM person_merges").fetchone()[0] == 0
+    assert results["queued"] == 1
+
+
+def test_a_name_matching_one_long_standing_outside_address_merges_by_itself(tmp_path):
+    path = tmp_path / "b.db"
+    db = create_database(str(path))
+    a, b = _outside_nikos(db, mails=person_identity.TRUSTED_MIN_EMAILS)
+    db.close()
+    dedup_people.run_dedup(str(path))
+    db = sqlite3.connect(path)
+    assert _people(db) & {a, b} == {a}
+
+
+def test_an_address_at_the_owners_domain_is_trusted_from_its_first_mail(tmp_path):
+    db = create_database(str(tmp_path / "b.db"))
+    inside = db.execute("INSERT INTO people (name, email) VALUES ('X Y', 'xy@CORP.example')")
+    outside = db.execute("INSERT INTO people (name, email) VALUES ('X Z', 'xz@other.example')")
+    assert person_identity.trusted_address(db, inside.lastrowid)
+    assert not person_identity.trusted_address(db, outside.lastrowid)
+
+
 def test_a_script_variant_of_one_addressed_person_merges_by_itself(tmp_path):
     path = tmp_path / "b.db"
     db = create_database(str(path))

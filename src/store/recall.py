@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from src.store import envelope, ranking
+from src.store.calendar_query import utc_bound
 from src.store.consolidate import recall_filters
 from src.store.context import get_person_context, get_topic_context
 from src.store.conversation_query import search_conversations_keyword
@@ -339,6 +340,37 @@ def _maybe_topic_context(
 # into one: the pool held about 11 threads. With room for three per slot, collapsed
 # first and cut after, it holds its 20.
 SIBLING_HEADROOM = 3
+
+# With a date window (since, until) each bucket is ranked as without one but over this
+# many rows, then keeps those dated inside and is cut to limit_per_kind: the window reads
+# each row's envelope `date`, which every bucket fills, rather than a date column of each
+# of the ten queries. A match ranked below this many newer ones is not reached.
+WINDOW_FETCH = 50
+
+
+def _utc_moment(value: object) -> str | None:
+    """A stored date as the UTC second calendar_query.utc_bound compares with; a bare date is
+    that day's start, a time without an offset is UTC (as the store keeps them). None when
+    there is no date or it cannot be read."""
+    from datetime import UTC, datetime
+
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(UTC)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _in_window(row: dict, low: str | None, high: str | None) -> bool:
+    """Whether `row` is dated on or after `low` and before `high` (utc_bound's bounds); an
+    undated row is never inside a window."""
+    moment = _utc_moment(row.get("date"))
+    return moment is not None and (low is None or moment >= low) and (high is None or moment < high)
+
 
 # The entity list (src/store/entities.py entity_ranked_ids): the emails, Teams threads and
 # WhatsApp sessions linked to the people, topics and organisations a query names, fused as
@@ -880,6 +912,8 @@ def recall(
     include_automation: bool = False,
     kinds: Iterable[str] | None = None,
     include_history: bool = False,
+    since: str | None = None,
+    until: str | None = None,
 ) -> dict:
     """Unified search across every text-bearing index in the brain.
 
@@ -913,6 +947,11 @@ def recall(
             emails bucket keeps the email kinds named, and decisions, actions and
             commitments those taken from an item of a kind named. Naming news
             includes it whatever include_news says. None (default) is every kind.
+        since, until: A date window, as search takes it (calendar_query.utc_bound: a
+            date or a date-time, Athens time without an offset, until inclusive). Each
+            bucket is ranked over WINDOW_FETCH rows and keeps those whose `date` falls
+            inside; summary.window names it. The dossiers keep `days`. ValueError for a
+            bound that is not a date.
 
     The buckets run in parallel, each on its own read-only connection, with the
     semantic half first (recall_workers, _run); the result is the serial run's.
@@ -939,7 +978,15 @@ def recall(
         return wanted is None or not wanted.isdisjoint(names)
 
     classes = classes_for(None if wanted is None else wanted & set(EMAIL_KINDS))
-    limit = limit_per_kind
+    bounds = {}
+    for name, value, upper in (("since", since, False), ("until", until, True)):
+        if value:
+            bound = utc_bound(value, upper=upper)
+            if bound is None:
+                raise ValueError(f"{name}: not a date or an ISO 8601 date-time: {value!r}")
+            bounds[name] = bound
+    windowed = bool(bounds)
+    limit = max(limit_per_kind, WINDOW_FETCH) if windowed else limit_per_kind
     pool = max(limit * 4, limit)
     fused = ranking.fused_ranking()
     hybrid = semantic_candidates is not None
@@ -1097,6 +1144,12 @@ def recall(
         "whatsapp": whatsapp,
         "calendar_events": done.get("calendar_events", []),
     }
+    if windowed:
+        low, high = bounds.get("since"), bounds.get("until")
+        text_kinds = {
+            k: [r for r in v if _in_window(r, low, high)][:limit_per_kind]
+            for k, v in text_kinds.items()
+        }
     total_hits = sum(len(v) for v in text_kinds.values())
     kinds_with_results = [k for k, v in text_kinds.items() if v]
     # Kinds whose every row came from the any-token fallback: nothing there held
@@ -1121,6 +1174,8 @@ def recall(
         kinds_with_results=kinds_with_results,
         partial_kinds=partial_kinds,
     )
+    if windowed:
+        summary["window"] = {k: v for k, v in (("since", since), ("until", until)) if v}
     out: dict = {"query": query, **text_kinds}
     if include_context:
         person_context = done.get("person_context")

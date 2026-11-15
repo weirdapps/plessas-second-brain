@@ -60,6 +60,10 @@ def select_files_to_ingest(scanned: list[Path]) -> list[Path]:
 def scan_roots(roots: list[Path], extensions: set[str]) -> list[Path]:
     """Recursively walk each root, returning files whose suffix (lowercased)
     is in `extensions`. Missing roots are silently skipped.
+
+    A file or folder below a root whose name starts with a dot is skipped: the document
+    push leaves an interrupted transfer in .rsync-partial/ and rsync writes each file to a
+    hidden temporary name before renaming it, so a half-sent file is never ingested.
     """
     out: list[Path] = []
     lower_exts = {e.lower() for e in extensions}
@@ -67,6 +71,8 @@ def scan_roots(roots: list[Path], extensions: set[str]) -> list[Path]:
         if not root.exists() or not root.is_dir():
             continue
         for path in root.rglob("*"):
+            if any(part.startswith(".") for part in path.relative_to(root).parts):
+                continue
             if path.is_file() and path.suffix.lower() in lower_exts:
                 out.append(path)
     return out

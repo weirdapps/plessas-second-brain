@@ -1005,6 +1005,12 @@ def recall(
     kinds: RecallKinds = None,
     detail: Detail = "full",
     include_history: IncludeHistory = False,
+    since: Annotated[
+        str | None, Field(description="YYYY-MM-DD or an ISO date-time: on or after.")
+    ] = None,
+    until: Annotated[
+        str | None, Field(description="YYYY-MM-DD or an ISO date-time, inclusive.")
+    ] = None,
 ) -> RecallResult:
     """Tell me everything we know about X: one search across every index, the default first call.
 
@@ -1019,8 +1025,10 @@ def recall(
     where nothing held the whole query falls back to rows holding some of its
     words, flagged partial_match (`summary.partial_kinds`). News and the owner's
     automation mail are left out unless included, and `excluded` counts the emails
-    and attachments that left out. Summaries are cut to about 300 characters;
-    detail='concise' sends a short line per row.
+    and attachments that left out. `since` and `until` keep the rows dated inside
+    the window (`summary.window`); each bucket ranks its best 50 before it is cut.
+    Summaries are cut to about 300 characters; detail='concise' sends a short line
+    per row.
     """
     from functools import partial
 
@@ -1031,6 +1039,8 @@ def recall(
     from src.store.recall import recall as _recall
 
     _check_choice("detail", detail, ("full", "concise"))
+    _check_date("since", since)
+    _check_date("until", until)
     # Naming news asks for it; the semantic candidates are held to the same kinds.
     include_news = include_news or "news" in (kinds or ())
     email_kinds = None if kinds is None else [k for k in kinds if k in envelope.EMAIL_KINDS]
@@ -1062,6 +1072,8 @@ def recall(
             include_automation=include_automation,
             kinds=kinds,
             include_history=include_history,
+            since=since,
+            until=until,
         )
         fresh = _header(conn)
         # The entity card on search (issue 169): the compiled pages the query names.

@@ -17,6 +17,17 @@
 # successful run, so a file saved during a run goes next time. Additive: nothing is
 # deleted on either side by this script.
 #
+# Since the stamp, "changed" means a newer mtime OR a newer status-change time (ctime): a
+# file copied or synced in keeping its original date has an old mtime, and was never
+# pushed while the scan read mtime alone. The ctime moves on a chmod or an xattr too, so
+# each candidate is checked against a manifest of what went (path -> size:mtime,
+# NUL-separated, document-push.manifest), written only after rsync succeeded: a file
+# already sent unchanged is not sent again. The first run (no stamp) reads mtime alone.
+#
+# rsync keeps an interrupted file in .rsync-partial/ inside the inbox (--partial-dir) and
+# writes each file under a hidden temporary name; reverse-ingest skips hidden paths
+# (src/ingest/reverse_scan.py scan_roots), so a half-sent file is never ingested.
+#
 # Two lessons kept from the retired mirror:
 #   - launchd children cannot read a dataless OneDrive placeholder (EDEADLK) unless the
 #     process opts in to materialising it; the re-exec below sets that io-policy once,
@@ -133,30 +144,52 @@ ls "$SRC" >/dev/null 2>&1 || fail "DENIED reading National (grant Full Disk Acce
 MARK="$WORK/mark"
 touch "$MARK"
 REF="$STAMP"
+CHANGED=(-newer "$REF" -o -cnewer "$REF")
 if [ ! -f "$REF" ]; then
   REF="$WORK/since"
   touch -t "$SINCE" "$REF" || fail "bad SB_DOCS_SINCE"
+  CHANGED=(-newer "$REF")
 fi
 
 # The extensions reverse-ingest reads; Office lock files, temp files and hidden files never.
 LIST="$WORK/files"
-(cd "$SRC" && find . -type f -newer "$REF" \
+(cd "$SRC" && find . -type f \( "${CHANGED[@]}" \) \
   \( -iname '*.pdf' -o -iname '*.pptx' -o -iname '*.xlsx' -o -iname '*.docx' \
   -o -iname '*.md' -o -iname '*.txt' \) \
   ! -name '~$*' ! -name '.*' ! -name '*.tmp' ! -path '*/.git/*' -print0) >"$LIST" ||
   fail "scan of National failed"
-count=$(tr -cd '\0' <"$LIST" | wc -c | tr -d ' ')
+
+# Leave out a candidate the manifest says went already with this size and mtime.
+MANIFEST="$STATE/document-push.manifest"
+zmodload -F zsh/stat b:zstat || fail "zsh/stat unavailable"
+typeset -A sent going st
+if [ -s "$MANIFEST" ]; then
+  while IFS= read -r -d '' k && IFS= read -r -d '' v; do sent[$k]=$v; done <"$MANIFEST"
+fi
+SEND="$WORK/send"
+: >"$SEND"
+while IFS= read -r -d '' f; do
+  zstat -H st -- "$SRC/$f" 2>/dev/null || continue
+  sig="$st[size]:$st[mtime]"
+  [ "${sent[$f]-}" = "$sig" ] && continue
+  going[$f]=$sig
+  print -rN -- "$f" >>"$SEND"
+done <"$LIST"
+count=${#going}
 
 if [ "$count" -gt 0 ]; then
   "$SSH" "${SSH_OPTS[@]}" "$VPS" "umask 077; mkdir -p ~/$REMOTE_DIR" 2>>"$LOG" ||
     fail "could not create the inbox on the producer"
-  out=$("$RSYNC" -rt --from0 --files-from="$LIST" --partial --chmod=Du=rwx,Fu=rw \
-    -e "$SSH ${SSH_OPTS[*]}" "$SRC/" "$VPS:$REMOTE_DIR/" 2>&1)
+  out=$("$RSYNC" -rt --from0 --files-from="$SEND" --partial-dir=.rsync-partial \
+    --chmod=Du=rwx,Fu=rw -e "$SSH ${SSH_OPTS[*]}" "$SRC/" "$VPS:$REMOTE_DIR/" 2>&1)
   rc=$?
   if [ "$rc" -ne 0 ]; then
     log "rsync failed (rc=$rc): $(printf '%s\n' "$out" | grep -iE 'rsync|error|failed' | head -5 | tr '\n' ' ')"
     fail "rsync failed with rc $rc for $count files"
   fi
+  sent+=("${(@kv)going}")
+  for k v in "${(@kv)sent}"; do print -rN -- "$k" "$v"; done >"$MANIFEST.tmp" &&
+    mv "$MANIFEST.tmp" "$MANIFEST" || log "WARN: manifest write failed; these files may go again"
 fi
 
 # Success: the mark becomes the stamp, on both hosts the stamp says when.

@@ -159,6 +159,19 @@ def test_scan_roots_extension_filter_is_case_insensitive(tmp_path):
     assert len(result) == 1
 
 
+def test_scan_roots_skips_hidden_files_and_dirs_below_the_root(tmp_path):
+    """rsync's partial dir and temp files are hidden: a half-sent file is never ingested."""
+    root = tmp_path / ".inbox-root"  # a hidden root itself is fine
+    (root / ".rsync-partial").mkdir(parents=True)
+    (root / ".rsync-partial" / "big.pdf").write_bytes(b"x")
+    (root / "units").mkdir()
+    (root / "units" / ".big.pdf.Xy12Ab").write_bytes(b"x")
+    (root / "units" / ".hidden.pdf").write_bytes(b"x")
+    (root / "units" / "kept.pdf").write_bytes(b"x")
+    result = [p.name for p in scan_roots([root], INGESTABLE_EXTENSIONS)]
+    assert result == ["kept.pdf"]
+
+
 def test_topic_label_strips_root_prefix(tmp_path):
     root = tmp_path / "Documents" / "National"
     file_path = root / "units" / "cards" / "202504171123_q2.pdf"

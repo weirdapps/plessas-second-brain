@@ -163,13 +163,14 @@ def recall(
     Opens with `summary` (semantic status, kinds_with_results), then buckets: emails,
     attachments, conversations, decisions, actions, commitments, inline_images, teams,
     whatsapp, calendar_events, and `pages` (compiled entity cards). A bucket where no row
-    held every word falls back to some of them, flagged partial_match. Filter: kinds,
-    include_news, include_automation, include_history, and days (default 365), the
-    lookback of the dossiers include_context attaches: the buckets have no date window,
-    so use search with since/until for one. read(ref) opens any row.
+    held every word falls back to some of them, flagged partial_match. Filter: since
+    and until (a date window over every bucket: each ranks its best 50, then keeps
+    those dated inside), kinds, include_news, include_automation, include_history, and
+    days (default 365), the lookback of the dossiers include_context attaches.
+    read(ref) opens any row.
     """
     mcp_scope.refuse_mixed("recall")
-    f = _take("recall", filter, ("days", "kinds", *_INCLUDES))
+    f = _take("recall", filter, ("since", "until", "days", "kinds", *_INCLUDES))
     return cast(
         Result,
         h.recall(
@@ -182,6 +183,8 @@ def recall(
             kinds=f.get("kinds"),
             detail=detail,
             include_history=f.get("include_history", False),
+            since=f.get("since"),
+            until=f.get("until"),
         ),
     )
 

@@ -12,7 +12,7 @@ from collections.abc import Hashable
 from typing import Any
 
 from src.config import USER_EMAIL_PATTERN
-from src.store import envelope, pages, ranking
+from src.store import envelope, pages, ranking, sender_trust
 from src.store.calendar_query import utc_bound
 from src.store.consolidate import current_sql, history_left_out, open_status_sql
 from src.store.cross_script import NameForms, name_forms
@@ -1702,9 +1702,13 @@ def meeting_prep(
     for dossier in result["attendees"]:
         for key in ("emails", "decisions", "open_actions"):
             envelope.emails(conn, dossier[key])
+        for key in ("decisions", "open_actions"):
+            sender_trust.label(conn, dossier[key])  # who wrote the email it was taken from
     if result["topic_context"]:
         for key in ("decisions", "key_facts", "action_items"):
             envelope.emails(conn, result["topic_context"][key])
+        for key in ("decisions", "action_items"):
+            sender_trust.label(conn, result["topic_context"][key])
     for meetings in result["meetings"].values():
         envelope.calendar(conn, meetings)
     return result

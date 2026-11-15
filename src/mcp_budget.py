@@ -42,6 +42,7 @@ CONCISE_KEYS = frozenset(
         "message_count",
         "thread_matches",
         "older_editions",
+        "sender_trust",
     }
 )
 # ...and the first of these it has, cut to CONCISE_TITLE_CHARS: the line that says

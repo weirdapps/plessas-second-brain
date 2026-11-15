@@ -166,20 +166,25 @@ def has_hard_identifier(conn: sqlite3.Connection, person_id: int) -> bool:
 TRUSTED_MIN_EMAILS = 3
 
 
+def owner_domains() -> frozenset[str]:
+    """The domains of the owner's whole addresses (BRAIN_USER_EMAIL_PATTERN): an address
+    at one of them is a colleague's."""
+    from src import config
+    from src.store.owner import owner_addresses
+
+    return frozenset(a.partition("@")[2] for a in owner_addresses(config.USER_EMAIL_PATTERN)[0])
+
+
 def trusted_address(conn: sqlite3.Connection, person_id: int) -> bool:
     """Whether the person's address may absorb a name-only row by itself (auto_merge): it is
     at a domain of one of the owner's addresses, or it has been the sender or a recipient of
     at least TRUSTED_MIN_EMAILS emails. One outside mail whose display name matches a
     colleague's is not yet that colleague, and its pairs wait for the owner."""
-    from src import config
-    from src.store.owner import owner_addresses
-
     row = conn.execute("SELECT email FROM people WHERE id = ?", (person_id,)).fetchone()
     address = (row[0] or "").strip().lower() if row else ""
     if "@" not in address:
         return False
-    owned = {a.partition("@")[2] for a in owner_addresses(config.USER_EMAIL_PATTERN)[0]}
-    if address.partition("@")[2] in owned:
+    if address.partition("@")[2] in owner_domains():
         return True
     seen = conn.execute(
         "SELECT COUNT(DISTINCT email_id) FROM email_people WHERE person_id = ?"

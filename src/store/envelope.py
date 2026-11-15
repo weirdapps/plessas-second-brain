@@ -43,6 +43,7 @@ import json
 import sqlite3
 from collections.abc import Callable, Iterable
 
+from src.store import sender_trust
 from src.store.source_class import (
     AUTOMATION,
     CLASSES,
@@ -382,15 +383,16 @@ _PARENTS = (
 def extracted(conn: sqlite3.Connection, rows: list[dict], table: str, key: str) -> list[dict]:
     """Rows of decisions, action_items, commitments or key_facts, keyed by their own id
     at `key`, each given the envelope of the item it was extracted from: an email, a
-    Teams or WhatsApp thread, a meeting, or a conversation. A row whose parent is gone
-    says kind null, as its `source` says 'orphan'."""
+    Teams or WhatsApp thread, a meeting, or a conversation, and the `sender_trust` of
+    who wrote it (src/store/sender_trust.py). A row whose parent is gone says kind null,
+    as its `source` says 'orphan', and sender_trust 'unknown'."""
     if table not in _EXTRACTED:
         raise ValueError(f"not a table of extracted items: {table}")
     ids = _ids(rows, key)
     if not ids:
         for row in rows:
             _put(row, _UNKNOWN)
-        return rows
+        return sender_trust.label(conn, rows)
     columns = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
     select = [f"x.{name}" if name in columns else "NULL" for name, _ in _PARENTS]
     if "conversation_turn_id" in columns:
@@ -432,4 +434,4 @@ def extracted(conn: sqlite3.Connection, rows: list[dict], table: str, key: str) 
                 chosen = found[slot][parent]
                 break
         _put(row, chosen or _UNKNOWN)
-    return rows
+    return sender_trust.label(conn, rows)

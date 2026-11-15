@@ -115,12 +115,15 @@ if [ -f "$DATA_DIR/backups/brain-$TODAY.db" ] \
   # the same files the skip does.
   [ -n "$HC_PING_URL" ] && curl -fsS -m 10 --retry 2 -o /dev/null "${HC_PING_URL}/brain-backup" 2>/dev/null || true
 else
+  # Retention on this host (2026-11-15, the disk at 78%): 3 plain snapshots, as restic takes
+  # the newest each night and keeps its own history; 7 daily + 4 weekly archives, as the Mac
+  # pulls every archive and keeps 14 + 8 itself (sb-db-pull.sh).
   "$PYTHON" "$REPO_DIR/scripts/backup_db.py" \
     --db "$DB" \
-    --local-dir "$DATA_DIR/backups" --local-keep 7 \
+    --local-dir "$DATA_DIR/backups" --local-keep 3 \
     --offsite-dir "$DATA_DIR/backups/offsite" \
     --key-file "$BACKUP_KEY" \
-    --gfs-daily 14 --gfs-weekly 8 \
+    --gfs-daily 7 --gfs-weekly 4 \
     --hc-slug brain-backup \
     >> "$LOG_FILE" 2>&1 \
     || echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: backup step failed (non-fatal)" >> "$LOG_FILE"

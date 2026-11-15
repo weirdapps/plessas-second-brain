@@ -30,7 +30,8 @@ by itself something you will be told about.
 Retention differs by tier. Local is a rolling `--local-keep` most recent
 (default 7). Offsite is grandfather-father-son: `--gfs-daily` dailies (default
 14) plus the newest snapshot of each of the last `--gfs-weekly` ISO weeks
-(default 8).
+(default 8). The producer's daily run (`sb-daily-sync.sh`) keeps 3 local snapshots and
+7 daily + 4 weekly archives; the Mac keeps 14 + 8 of the archives it pulls.
 
 ## The key
 
@@ -431,8 +432,8 @@ What a forget cannot reach, printed at the end of every run:
 
 | Copy | Until |
 | --- | --- |
-| Local snapshots (`--local-keep`, default 7) | they rotate out, or deleted by hand |
-| Offsite archives (GFS: 14 daily + 8 weekly) | they rotate out, or deleted by hand |
+| Local snapshots (`--local-keep`, 3 on the producer) | they rotate out, or deleted by hand |
+| Offsite archives (GFS: 7 daily + 4 weekly on the producer, 14 + 8 on the Mac) | they rotate out, or deleted by hand |
 | restic snapshots (store snapshots, `attachments/` when backed up) | `restic forget --prune` under the host's policy; history is never rewritten |
 | The `--backup` file of the run | deleted by the owner once the result is checked |
 | Replicas (`brain.db`, `embeddings.npz`) | their next hourly pull |

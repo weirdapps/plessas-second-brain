@@ -217,7 +217,7 @@ A word no name holds in the other script is searched as before: of 180 common qu
 
 ### Unified recall
 
-- `recall(query, limit_per_kind, days, include_context, include_news, include_automation, kinds, detail)`. Fan-out across every text-bearing index. This is the default "tell me everything you know about X" entry point. `detail="concise"` gives a short line per row ([`detail`](#mcp-tools)), and `excluded` counts the emails and attachments the class filter left out.
+- `recall(query, limit_per_kind, days, include_context, include_news, include_automation, kinds, detail)`. Fan-out across every text-bearing index. This is the default "tell me everything you know about X" entry point. `detail="concise"` gives a short line per row ([`detail`](#mcp-tools)), and `excluded` counts the emails and attachments the class filter left out. `since` and `until` (as `search` reads them: Athens dates, `until` inclusive) keep each bucket's rows dated inside the window, named in `summary.window`; each bucket ranks its best 50 (`WINDOW_FETCH`) before the cut, so a match ranked below 50 newer ones is not reached.
 
   Ten result buckets, keyed exactly as returned: `emails` (which also covers standalone documents and news, since they share the `emails` table), `attachments`, `conversations`, `decisions`, `actions`, `commitments`, `inline_images`, `teams`, `whatsapp`, `calendar_events`. `summary.kinds_with_results` names the ones that matched.
 

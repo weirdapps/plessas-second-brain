@@ -104,3 +104,65 @@ def test_a_missing_tree_fails_and_says_so(tmp_path):
 
     assert _run(env) == 1
     assert "MISSING" in (tmp_path / "state" / "document-push.fail").read_text()
+
+
+def test_a_file_that_arrives_with_an_old_mtime_goes_next_run(tmp_path):
+    # Copied or synced in keeping its original date: its mtime is long before the stamp,
+    # but its status-change time is the day it arrived.
+    root = tmp_path / "National"
+    _file(root, "a.pdf", "202611010900")
+    env = _env(tmp_path)
+    assert _run(env) == 0
+    (tmp_path / "sent").unlink()
+
+    _file(root, "units/cards/copied.pdf", "202501010900")
+    assert _run(env) == 0
+    assert _sent(tmp_path) == ["./units/cards/copied.pdf"]
+
+
+def test_a_pushed_file_whose_status_alone_changed_is_not_sent_again(tmp_path):
+    root = tmp_path / "National"
+    _file(root, "a.pdf", "202611010900")
+    env = _env(tmp_path)
+    assert _run(env) == 0
+    (tmp_path / "sent").unlink()
+
+    (root / "a.pdf").chmod(0o600)  # a new ctime, same size and mtime
+    assert _run(env) == 0
+    assert _sent(tmp_path) == []
+
+
+def test_a_pushed_file_that_changed_goes_again(tmp_path):
+    root = tmp_path / "National"
+    _file(root, "a.pdf", "202611010900")
+    env = _env(tmp_path)
+    assert _run(env) == 0
+    (tmp_path / "sent").unlink()
+
+    (root / "a.pdf").write_text("revised")
+    subprocess.run(["touch", "-t", "202611010900", str(root / "a.pdf")], check=True)
+    assert _run(env) == 0
+    assert _sent(tmp_path) == ["./a.pdf"]
+
+
+def test_a_failed_push_is_not_recorded_as_sent(tmp_path):
+    root = tmp_path / "National"
+    _file(root, "a.pdf", "202611010900")
+    env = _env(tmp_path)
+    failing = _stub(tmp_path / "rsync-fail", "exit 12\n")
+    assert _run({**env, "SB_DOCS_RSYNC": str(failing)}) == 1
+
+    assert _run(env) == 0
+    assert _sent(tmp_path) == ["./a.pdf"]
+
+
+def test_partial_transfers_wait_in_a_hidden_dir_the_ingest_skips(tmp_path):
+    _file(tmp_path / "National", "a.pdf", "202611010900")
+    env = _env(tmp_path)
+    assert _run(env) == 0
+
+    rsync_line = next(
+        line for line in (tmp_path / "calls").read_text().splitlines() if line.startswith("rsync")
+    )
+    assert "--partial-dir=.rsync-partial" in rsync_line
+    assert "--partial " not in rsync_line

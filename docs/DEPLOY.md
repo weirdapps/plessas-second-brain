@@ -105,20 +105,12 @@ not listed is not the owner's (README, "Identity"). After changing it, run
 refreshes the self flags of the meetings it lists (the week behind and the 30 days
 ahead); `python -m src.cli maint calendar-backfill` re-lists older months.
 
-`BRAIN_AUTOMATION_RECIPIENTS` (optional) lists, the same way, the addresses outside
-the owner's that his jobs mail a report to; a new mail he sends to them and to no
-one else but himself is stored as `automation` and gives no items (README,
-"Identity"). Set it in the private env file the timers read, and in
-`~/.config/second-brain/env` if you like, never in the repo. After setting it, on the
-producer: `python -m src.cli maint classify-sources --dry-run`, then without
-`--dry-run`, then `python -m src.cli maint forget-itemless --apply`.
-
 Nothing in the code reads `.env`: the scheduling recipes in section 6 source it
 (`set -a; . ./.env`, `EnvironmentFile=`). The MCP server inherits the
 environment `claude` was launched with, which sources no `.env` and, from a GUI
 or an IDE, no shell profile, so put the identity settings
 (`BRAIN_USER_NAME`, `BRAIN_USER_ROLE`, `BRAIN_USER_EMAIL_PATTERN`,
-`BRAIN_AUTOMATION_RECIPIENTS`, `SHAREPOINT_HOST`) in `~/.config/second-brain/env` too; `src/config.py` reads
+`SHAREPOINT_HOST`) in `~/.config/second-brain/env` too; `src/config.py` reads
 that file at import, and ignores any other key in it. The server's own settings,
 such as `GEMINI_API_KEY` and `BRAIN_EMBED_BACKEND`, go in the owner-only file
 `run_mcp.sh` sources, `$BRAIN_DATA_DIR/env` or else `~/.second-brain/env`

@@ -370,7 +370,12 @@ def load_single_email(conn: sqlite3.Connection, metadata: dict, extraction: dict
     # What the row is (src/store/source_class.py), stored with it so no read has to work it out.
     mailbox = metadata.get("mailbox_name", metadata.get("mailbox"))
     source_class = stored_class(
-        conn, mailbox, sender_address, metadata.get("subject"), _header_addresses(metadata)
+        conn,
+        mailbox,
+        sender_address,
+        metadata.get("subject"),
+        _header_addresses(metadata),
+        (in_reply_to, references),
     )
 
     # Insert email record. With the gated extraction_item_kind (issue 211), what a v2

@@ -16,7 +16,13 @@ from pathlib import Path
 # credential, a backend switch (BRAIN_EXTRACT_ENGINE) or a relocated data home
 # (BRAIN_DATA_DIR) pasted into it must not be picked up silently.
 _CONFIG_FILE_KEYS = frozenset(
-    {"BRAIN_USER_NAME", "BRAIN_USER_ROLE", "BRAIN_USER_EMAIL_PATTERN", "SHAREPOINT_HOST"}
+    {
+        "BRAIN_USER_NAME",
+        "BRAIN_USER_ROLE",
+        "BRAIN_USER_EMAIL_PATTERN",
+        "BRAIN_AUTOMATION_RECIPIENTS",
+        "SHAREPOINT_HOST",
+    }
 )
 
 
@@ -151,6 +157,10 @@ DEFAULT_DB = DATA_ROOT / "brain.db"
 USER_NAME = os.environ.get("BRAIN_USER_NAME", "")
 USER_ROLE = os.environ.get("BRAIN_USER_ROLE", "")
 USER_EMAIL_PATTERN = os.environ.get("BRAIN_USER_EMAIL_PATTERN", "")
+# BRAIN_AUTOMATION_RECIPIENTS lists, read as the owner pattern is, the addresses outside his
+# own that his jobs mail: a new mail (no reply or forward) he sends to them, and to no one
+# else but himself, is automation (src/store/source_class.py). Unset, it changes nothing.
+AUTOMATION_RECIPIENTS = os.environ.get("BRAIN_AUTOMATION_RECIPIENTS", "")
 
 # Extraction engine: "claude" (default) or "gemini". Normalised, and anything
 # else stops here: systemd's EnvironmentFile= keeps an inline comment as part of

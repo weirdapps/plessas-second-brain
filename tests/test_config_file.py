@@ -55,10 +55,17 @@ def test_the_environment_wins_over_the_file(tmp_path):
     assert env["SHAREPOINT_HOST"] == "contoso.sharepoint.com"
 
 
+def test_the_automation_recipients_are_read(tmp_path):
+    path = _write(tmp_path, "BRAIN_AUTOMATION_RECIPIENTS=family@example.org\n")
+    env: dict[str, str] = {}
+    load_config_file(path, env)
+    assert env == {"BRAIN_AUTOMATION_RECIPIENTS": "family@example.org"}
+
+
 def test_keys_outside_the_allowlist_are_ignored(tmp_path):
     """The file carries identity and tenant settings only. A credential, a
     backend switch or a relocated data home pasted into it must not be picked up
-    silently, so only four named keys are honoured."""
+    silently, so only five named keys are honoured."""
     path = _write(
         tmp_path,
         "ANTHROPIC_API_KEY=sk-test\nPATH=/tmp\nBRAIN_CONFIG_FILE=/elsewhere\n"

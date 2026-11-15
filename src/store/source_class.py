@@ -17,7 +17,10 @@ the first that matches:
     automation    mail the owner (BRAIN_USER_EMAIL_PATTERN, matched as src/store/owner.py
                   says) sent to no one but himself, not a reply or a forward, whose subject a
                   job stamped, a bracketed tag first ('[VPS] ...', '[nightly] ...') or an ISO
-                  date ('... 2026-05-28'), and which names something besides the stamp
+                  date ('... 2026-05-28'), and which names something besides the stamp;
+                  or mail the owner sent to one or more addresses BRAIN_AUTOMATION_RECIPIENTS
+                  lists and to no one else but himself, not a reply or a forward (by its
+                  subject, or an In-Reply-To or References header)
     mail          everything else, including whatever the rules are unsure of
 
 The rule was read off the data: of the mail the owner sent to himself alone, every stamped one
@@ -25,6 +28,13 @@ was a report (a job puts its host or name in brackets, or the run's date, in the
 the unstamped rest mixes reports with his own notes, so it stays mail. A tag alone proves
 nothing: anyone can send '[ALERT] ...', and a tagged mail the owner also sent to someone else
 is mail someone may answer.
+
+The listed recipients are for a job that mails its report to someone outside work, with a copy
+to the owner: one job's daily digests ('δηλώσεις: 1 νέα (02/11)') went to one personal
+address, carried no stamp, and were stored as work mail giving action items.
+Who such a job writes to is the owner's to say, in configuration, never in the code. A new mail
+the owner writes by hand to a listed address alone is taken for a report too; the answers in
+the same exchange ('RE: ...') stay mail.
 
 There is one implementation: classify(), used when a row is stored and by the v33 backfill.
 Every read path leaves out news and automation unless the caller passes include_news or
@@ -129,13 +139,20 @@ def hidden_classes(include_news: bool = False, include_automation: bool = False)
     )
 
 
+def _answered(subject: str) -> bool:
+    """Whether a subject says someone answered or passed the mail on: 'Re:', 'FW:', 'Απ:'
+    and the like at its start."""
+    head = subject.strip()  # tabs and no-break spaces too
+    return normalize_subject(head) != head.lower()
+
+
 def _stamped(subject: str) -> bool:
     """Whether a subject reads as a job's report: not a reply or a forward, stamped with a
     bracketed tag first or a date (_STAMP_DATE), and naming something besides the stamp. A
     subject that is only a date or a tag is how a person titles a note as easily as a job."""
     head = subject.strip()  # tabs and no-break spaces too
-    if normalize_subject(head) != head.lower():
-        return False  # 'Re:', 'FW:', 'Απ:' and the like: someone answered or passed it on
+    if _answered(head):
+        return False
     tag = _STAMP_TAG.match(head)
     if not tag and not _STAMP_DATE.search(head):
         return False
@@ -149,6 +166,9 @@ def classify(
     subject: str | None,
     recipients: Iterable[str | None] = (),
     owner_pattern: str | None = None,
+    *,
+    automation_recipients: str | None = None,
+    reply_headers: Iterable[str | None] = (),
 ) -> str:
     """The class of an emails row, by the rules in the module docstring.
 
@@ -158,6 +178,10 @@ def classify(
         subject: emails.subject
         recipients: the To and Cc addresses
         owner_pattern: the owner's address pattern; BRAIN_USER_EMAIL_PATTERN when None
+        automation_recipients: the addresses his jobs mail besides his own, listed as the
+            owner pattern is; BRAIN_AUTOMATION_RECIPIENTS when None
+        reply_headers: the In-Reply-To and References headers; one that holds anything makes
+            the mail an answer, which the listed recipients' rule never takes
     """
     if mailbox == NEWS_MAILBOX:
         return NEWS
@@ -167,11 +191,21 @@ def classify(
         return DOCUMENT
     pattern = config.USER_EMAIL_PATTERN if owner_pattern is None else owner_pattern
     addresses = [address for address in recipients if address]
+    if not addresses or not is_owner_address(sender_address, pattern):
+        return MAIL
+    if all(is_owner_address(address, pattern) for address in addresses):
+        return AUTOMATION if _stamped(subject or "") else MAIL
+    listed = (
+        config.AUTOMATION_RECIPIENTS if automation_recipients is None else automation_recipients
+    )
     if (
-        is_owner_address(sender_address, pattern)
-        and addresses
-        and all(is_owner_address(address, pattern) for address in addresses)
-        and _stamped(subject or "")
+        listed
+        and all(
+            is_owner_address(address, pattern) or is_owner_address(address, listed)
+            for address in addresses
+        )
+        and not _answered(subject or "")
+        and not any((header or "").strip() for header in reply_headers)
     ):
         return AUTOMATION
     return MAIL
@@ -372,13 +406,14 @@ def stored_class(
     sender_address: str | None,
     subject: str | None,
     recipients: Iterable[str | None] = (),
+    reply_headers: Iterable[str | None] = (),
 ) -> str:
     """The class a writer stores with a new emails row. Raises SourceClassMissing on a store
     without the column: writers run where the store is built, after the migrations
     (load_extractions and every command that writes run them first), so there it means the
     store was never migrated."""
     _require_column(conn)
-    return classify(mailbox, sender_address, subject, recipients)
+    return classify(mailbox, sender_address, subject, recipients, reply_headers=reply_headers)
 
 
 def _recipients(conn: sqlite3.Connection, email_ids: list) -> dict:
@@ -396,7 +431,23 @@ def _recipients(conn: sqlite3.Connection, email_ids: list) -> dict:
     return out
 
 
-def reclassify(conn: sqlite3.Connection, owner_pattern: str | None = None) -> dict:
+def _reply_headers(conn: sqlite3.Connection, email_ids: list) -> dict:
+    """email id -> its In-Reply-To and References, for the owner's mail alone: the two sit
+    behind the body in the table, so reading them for every row read every body."""
+    rows = conn.execute(
+        'SELECT id, in_reply_to, "references" FROM emails'
+        " WHERE id IN (SELECT value FROM json_each(?))",
+        (json.dumps(email_ids),),
+    )
+    return {row[0]: (row[1], row[2]) for row in rows}
+
+
+def reclassify(
+    conn: sqlite3.Connection,
+    owner_pattern: str | None = None,
+    automation_recipients: str | None = None,
+    moves: dict | None = None,
+) -> dict:
     """Give every emails row the class classify() gives it, writing only the rows that change;
     how many rows each class holds after.
 
@@ -407,6 +458,9 @@ def reclassify(conn: sqlite3.Connection, owner_pattern: str | None = None) -> di
     though the class is no text the index holds: on a copy of the replica that was four times
     the work and half as much WAL again. So it is set aside for these updates and put back, as
     it was, inside the same transaction.
+
+    `automation_recipients` defaults to BRAIN_AUTOMATION_RECIPIENTS. `moves`, when given, is
+    filled with how many rows go from each class to each other: {(old, new): rows}.
     """
     _require_column(conn)
     pattern = config.USER_EMAIL_PATTERN if owner_pattern is None else owner_pattern
@@ -424,6 +478,10 @@ def reclassify(conn: sqlite3.Connection, owner_pattern: str | None = None) -> di
         name if name in columns else "NULL"
         for name in ("mailbox_name", "sender_address", "subject")
     )
+    listed = (
+        config.AUTOMATION_RECIPIENTS if automation_recipients is None else automation_recipients
+    )
+    with_headers = bool(listed) and {"in_reply_to", "references"} <= columns
     # From the index: in the table the class sits behind the body.
     stored = {row[0]: row[1] for row in conn.execute("SELECT id, source_class FROM emails")}
     trigger = conn.execute(
@@ -441,11 +499,23 @@ def reclassify(conn: sqlite3.Connection, owner_pattern: str | None = None) -> di
         last = rows[-1][0]
         owned = [r[0] for r in rows if with_recipients and is_owner_address(r[2], pattern)]
         recipients = _recipients(conn, owned) if owned else {}
+        headers = _reply_headers(conn, owned) if owned and with_headers else {}
         changes = []
         for email_id, mailbox, sender, subject in rows:
-            wanted = classify(mailbox, sender, subject, recipients.get(email_id, ()), pattern)
+            wanted = classify(
+                mailbox,
+                sender,
+                subject,
+                recipients.get(email_id, ()),
+                pattern,
+                automation_recipients=listed,
+                reply_headers=headers.get(email_id, ()),
+            )
             if stored.get(email_id) != wanted:
                 changes.append((wanted, email_id))
+                if moves is not None:
+                    move = (stored.get(email_id), wanted)
+                    moves[move] = moves.get(move, 0) + 1
         if changes:
             if trigger and not set_aside:
                 conn.execute("DROP TRIGGER emails_au")

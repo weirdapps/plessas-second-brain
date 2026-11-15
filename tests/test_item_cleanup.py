@@ -406,6 +406,23 @@ def test_reextract_mail_is_a_dry_run_and_needs_a_budget_to_apply(tmp_path, monke
     assert _run(monkeypatch, db, "reextract-mail", "--since", "2026-10-13", "--shard", "3/3") == 2
 
 
+def test_reextract_mail_waits_for_another_jobs_write(tmp_path, monkeypatch):
+    """The hourly sync holds the write lock for minutes; a run of hours must outwait it."""
+    db = tmp_path / "brain.db"
+    create_database(str(db)).close()
+    waits = []
+
+    def loop(conn, **_):
+        waits.append(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        return {"done": 0, "failed": 0, "left": 0, "stopped": None, "stop_kind": None}
+
+    monkeypatch.setattr(ic, "reextract_stacked", loop)
+    args = ("reextract-mail", "--since", "2026-10-13", "--apply", "--token-budget", "1000")
+
+    assert _run(monkeypatch, db, *args) == 0
+    assert waits == [ic.LOCK_WAIT_MS] and ic.LOCK_WAIT_MS >= 10 * 60 * 1000
+
+
 def test_an_email_whose_message_id_the_store_holds_as_a_number_is_extracted(conn, model, tmp_path):
     """emails.message_id is declared INTEGER, so an id of digits is stored as a number: 55,029
     on the producer on 2026-10-16. Its extraction file is named by the id's text, as staging

@@ -302,6 +302,7 @@ def _still_to_take(conn: sqlite3.Connection, ids: list[int], marker: str, limit:
 
 
 MAIL_MARKER = "mail_reextract:"
+LOCK_WAIT_MS = 30 * 60 * 1000  # how long reextract-mail waits for another job's write
 # The kinds whose instructions give no decisions and no action items (src/extract/prompt.py).
 QUIET_KINDS = ("notification", "bulk", "invite_logistics")
 
@@ -606,6 +607,9 @@ def cmd_reextract_mail(args) -> int:
         print("reextract-mail --apply needs --token-budget N (tokens, N > 0)", file=sys.stderr)
         return 2
     budget = TokenBudget(args.token_budget)
+    # A run of hours meets every hourly sync, whose pages stage holds the write lock for
+    # minutes: the 60 s of get_connection ended all three shards of 2026-11-15 at once.
+    conn.execute(f"PRAGMA busy_timeout = {LOCK_WAIT_MS}")
     stats = reextract_stacked(
         conn,
         budget=budget,

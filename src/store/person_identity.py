@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterable
 from datetime import UTC, datetime
 
 NAME = "person_identity"
@@ -166,27 +167,44 @@ def has_hard_identifier(conn: sqlite3.Connection, person_id: int) -> bool:
 TRUSTED_MIN_EMAILS = 3
 
 
-def trusted_address(conn: sqlite3.Connection, person_id: int) -> bool:
-    """Whether the person's address may absorb a name-only row by itself (auto_merge): it is
-    at a domain of one of the owner's addresses, or it has been the sender or a recipient of
-    at least TRUSTED_MIN_EMAILS emails. One outside mail whose display name matches a
-    colleague's is not yet that colleague, and its pairs wait for the owner."""
+def owner_domains() -> frozenset[str]:
+    """The domains of the owner's whole addresses (BRAIN_USER_EMAIL_PATTERN): an address
+    at one of them is a colleague's."""
     from src import config
     from src.store.owner import owner_addresses
 
+    return frozenset(a.partition("@")[2] for a in owner_addresses(config.USER_EMAIL_PATTERN)[0])
+
+
+def well_seen(conn: sqlite3.Connection, addresses: Iterable[str | None]) -> set[str]:
+    """Those of `addresses`, lower-cased, whose person has been the sender or a recipient
+    of at least TRUSTED_MIN_EMAILS emails: one query for all of them."""
+    wanted = sorted({(a or "").strip().lower() for a in addresses} - {""})
+    if not wanted:
+        return set()
+    rows = conn.execute(
+        "SELECT lower(p.email) FROM people p JOIN email_people ep ON ep.person_id = p.id"
+        " WHERE lower(p.email) IN (SELECT value FROM json_each(?))"
+        " AND ep.role_in_email IN ('sender', 'recipient', 'cc', 'bcc')"
+        " GROUP BY p.id HAVING COUNT(DISTINCT ep.email_id) >= ?",
+        (json.dumps(wanted), TRUSTED_MIN_EMAILS),
+    )
+    return {r[0] for r in rows}
+
+
+def trusted_address(conn: sqlite3.Connection, person_id: int) -> bool:
+    """Whether the person's address may absorb a name-only row by itself (auto_merge): it is
+    at a domain of one of the owner's addresses (owner_domains), or it has been the sender
+    or a recipient of at least TRUSTED_MIN_EMAILS emails (well_seen). One outside mail
+    whose display name matches a colleague's is not yet that colleague, and its pairs wait
+    for the owner. The same rule labels an item `known` (src/store/sender_trust.py)."""
     row = conn.execute("SELECT email FROM people WHERE id = ?", (person_id,)).fetchone()
     address = (row[0] or "").strip().lower() if row else ""
     if "@" not in address:
         return False
-    owned = {a.partition("@")[2] for a in owner_addresses(config.USER_EMAIL_PATTERN)[0]}
-    if address.partition("@")[2] in owned:
+    if address.partition("@")[2] in owner_domains():
         return True
-    seen = conn.execute(
-        "SELECT COUNT(DISTINCT email_id) FROM email_people WHERE person_id = ?"
-        " AND role_in_email IN ('sender', 'recipient', 'cc', 'bcc')",
-        (person_id,),
-    ).fetchone()[0]
-    return seen >= TRUSTED_MIN_EMAILS
+    return address in well_seen(conn, [address])
 
 
 def person_by(conn: sqlite3.Connection, kind: str, value: str) -> int | None:

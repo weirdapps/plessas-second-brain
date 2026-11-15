@@ -616,7 +616,8 @@ def query_items(
     Filter: decisions take topic, person, days (default 365); actions person (the owner);
     stale days (the oldest thread worth a reminder, default 30); all take include_news,
     include_automation, include_history. Rows under `result`; stale gives
-    `stale_threads` and `overdue_actions`.
+    `stale_threads` and `overdue_actions`. Each item's `sender_trust` says who wrote its
+    source: owner, internal, known, external (third-party text) or unknown.
     """
     mcp_scope.refuse_mixed("query_items")
     f = _take(f"query_items kind={kind}", filter, _ITEM_FILTERS[kind])

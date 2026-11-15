@@ -8,7 +8,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 
-from src.store import envelope, topic_registry
+from src.store import envelope, sender_trust, topic_registry
 from src.store.consolidate import current_sql, history_left_out, open_status_sql
 from src.store.directory import directory_card
 from src.store.entities import entity_person_ids
@@ -296,6 +296,8 @@ def get_person_context(
     for rows in (recent_emails, decisions, open_actions):
         # Each says what it stands for: its email, or the one it was taken from.
         envelope.emails(conn, with_source_class(conn, rows))
+    for rows in (decisions, open_actions):
+        sender_trust.label(conn, rows)  # who wrote the email an item was taken from
 
     # Communication pattern
     pattern_row = conn.execute(
@@ -800,6 +802,8 @@ def get_topic_context(
     key_facts_total = int(key_facts_total)
     for rows in (recent_emails, decisions, open_actions, key_facts):
         envelope.emails(conn, with_source_class(conn, rows))
+    for rows in (decisions, open_actions):
+        sender_trust.label(conn, rows)  # who wrote the email an item was taken from
 
     out = {
         "topic": topic_info,

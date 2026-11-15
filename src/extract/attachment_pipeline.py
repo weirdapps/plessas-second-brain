@@ -1110,6 +1110,7 @@ def store_phase2_result(
     policy uses. Re-deriving it here from ``error`` — which is a string by the time it
     arrives — is what made a surviving 401 permanent: see _extract_one_attachment.
     """
+    from src.store.loader import _evidence, _v2_field
     from src.store.normalizer import find_or_create_topic
 
     if auth_error == DEFERRED:
@@ -1194,21 +1195,27 @@ def store_phase2_result(
                 )
 
             # The texts are masked as the loader masks an email's
-            # (src/store/loader.py), and compared masked with what the email holds.
+            # (src/store/loader.py), and compared masked with what the email holds. A v2
+            # extraction also fills the loader's v35 columns, by the loader's own rules: a
+            # quote only when the parser found it in the document's text; v1 leaves them NULL.
             with_items = _takes_items(conn, email_id)
+            schema2 = extraction.get("extraction_schema") == 2
             for decision in extraction.get("decisions", []) if with_items else []:
                 if isinstance(decision, dict) and decision.get("decision"):
                     text = redact_secrets(decision["decision"])
                     if _held(conn, "decisions", "decision", email_id, text):
                         continue
                     conn.execute(
-                        "INSERT INTO decisions (email_id, decision, decided_by, attachment_id)"
-                        " VALUES (?, ?, ?, ?)",
+                        "INSERT INTO decisions (email_id, decision, decided_by, attachment_id,"
+                        " status, owner_role, evidence) VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (
                             email_id,
                             text,
                             decision.get("decided_by"),
                             att_id,
+                            _v2_field(decision, "status", schema2),
+                            _v2_field(decision, "owner_role", schema2),
+                            _evidence(decision, schema2),
                         ),
                     )
 
@@ -1219,14 +1226,16 @@ def store_phase2_result(
                         continue
                     conn.execute(
                         "INSERT INTO action_items"
-                        " (email_id, task, owner, deadline, status, attachment_id)"
-                        " VALUES (?, ?, ?, ?, 'open', ?)",
+                        " (email_id, task, owner, deadline, status, attachment_id,"
+                        " direction, evidence) VALUES (?, ?, ?, ?, 'open', ?, ?, ?)",
                         (
                             email_id,
                             task,
                             action.get("owner"),
                             action.get("deadline"),
                             att_id,
+                            _v2_field(action, "direction", schema2),
+                            _evidence(action, schema2),
                         ),
                     )
 

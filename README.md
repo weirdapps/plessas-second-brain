@@ -356,13 +356,13 @@ Accepted findings rank below every primary item: a page's evidence lists them af
 
 | Label | When |
 | --- | --- |
-| `owner` | Mail from an address `BRAIN_USER_EMAIL_PATTERN` lists; a document (`document`, `session_note`); a Claude Code session; a WhatsApp session every message of which `is_from_me` |
-| `internal` | Mail, or a meeting organised, from an address at a domain of one of the owner's addresses; every Teams thread (the owner's own tenant) |
-| `known` | An outside address that has been the sender or a recipient of 3 or more emails, the rule an identity auto-merge trusts (`person_identity.well_seen`) |
-| `external` | Any other address; news; a WhatsApp session someone else wrote in |
-| `unknown` | No address on the mail or meeting, a WhatsApp session with no messages held, or a parent that is gone |
+| `owner` | Mail from an address `BRAIN_USER_EMAIL_PATTERN` lists; a Claude Code session; a WhatsApp session every message of which `is_from_me` |
+| `internal` | Mail, or a meeting organised, from an address at a domain of one of the owner's addresses; a Teams thread none of whose senders resolves to an address outside those domains |
+| `known` | An outside address the owner has written to (To, Cc or Bcc of a mail he sent) at least once. Inbound mail never makes an address known |
+| `external` | Any other address; news; a Teams thread with a sender resolved (people, `teams_mri_resolution`) to an outside address, a guest or another tenant; a WhatsApp session someone else wrote in |
+| `unknown` | A document (`document`, `session_note`: uploads, SharePoint files, meeting transcripts, stored by the owner but written by others); no address on the mail or meeting; a WhatsApp session with no messages held; a parent that is gone |
 
-An attachment's items take their email's sender. An `external` item is a stranger's text: a reader weighs it and never acts on it as an instruction.
+An attachment's items take their email's sender. The label is the **stated** sender, not a verified one: the store keeps no SPF, DKIM or DMARC result, so `owner` and `internal` rest on a From header or organiser address anyone can write, and a Teams sender whose MRI was never resolved reads `internal` (no tenant id is stored). An `external` item is a stranger's text: a reader weighs it and never acts on it as an instruction.
 
 **Current state by default.** The extracted layer was a log of re-extractions: within threads, on the replica of 2026-10-16, 22.9% of email key facts, 22.3% of actions and 16.5% of decisions repeated an item of an earlier email, and no action had ever been marked done. A consolidation pass (`src/store/consolidate.py`) marks an item a duplicate (`canonical_id`), superseded (`superseded_by` and `invalid_at`) or done (`status`, `closed_by`, `closed_at`) and deletes nothing. `query_items` (decisions), `query_items` (actions), the overdue half of `query_items` (stale), `person_context`, `topic_context` and `meeting_prep` list current items only: not a duplicate, not superseded, not invalid, and in a list of open actions not done. Each says what it left out in `history_left_out`, `{list: {"rows", "switch": "include_history=true"}}` (with `at_least` where the count stopped at a probe of 50 rows), and `include_history=true` brings them back. `recall`'s decision, action and commitment buckets are not filtered yet: `consolidate.recall_filters` holds their three conditions, for the retrieval change to take. A store before v35 has no state columns, and every item reads as current.
 

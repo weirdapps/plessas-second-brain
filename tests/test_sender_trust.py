@@ -5,11 +5,15 @@ reader can tell a decision the owner or a colleague wrote from an "action" a str
 mail planted. Tag only: nothing is hidden or filtered, extraction and storage are
 unchanged, and the label is computed when the item is read, from its parent:
 
-    owner     the owner wrote it (his address; his Claude Code sessions and documents)
+    owner     the owner wrote it (his address; his Claude Code sessions)
     internal  a colleague: an address at one of the owner's domains, or a Teams thread
-    known     an outside address seen in TRUSTED_MIN_EMAILS mails or more
-    external  anyone else: a new outside address, news, a WhatsApp session not all his
-    unknown   no sender can be told (no address, no parent)
+              with no sender resolved outside them
+    known     an outside address the owner has written to; inbound mail never counts
+    external  anyone else: a new outside address, news, a Teams guest, a WhatsApp
+              session not all his
+    unknown   no sender can be told (a document, no address, no parent)
+
+The label is the stated sender's: a From header is not authenticated.
 
 Every value is invented.
 """
@@ -42,9 +46,8 @@ def owner(monkeypatch):
 def db(tmp_path):
     conn = create_database(str(tmp_path / "brain.db"))
     conn.row_factory = sqlite3.Row
-    # Rita has written to the owner often enough to be known; Sam once.
-    for n in range(person_identity.TRUSTED_MIN_EMAILS):
-        f.email(conn, subject=f"Partner note {n}", sender=REGULAR, to=(OWNER,))
+    # The owner has written to Rita, so she is known.
+    f.email(conn, subject="Partner note", sender=OWNER, to=(REGULAR,))
     return conn
 
 
@@ -77,13 +80,30 @@ def test_an_alias_domain_is_not_internal(db):
     assert labels["x@corp.example.net"] == "external"
 
 
-def test_known_is_the_rule_trusted_address_uses(db):
-    """One rule for a trusted outside address: seen in TRUSTED_MIN_EMAILS mails."""
-    rita = db.execute("SELECT id FROM people WHERE email = ?", (REGULAR[1],)).fetchone()[0]
-    assert person_identity.trusted_address(db, rita)
-    assert person_identity.well_seen(db, [REGULAR[1].upper()]) == {REGULAR[1]}
-    f.email(db, subject="Hello", sender=STRANGER, to=(OWNER,))
-    assert person_identity.well_seen(db, [STRANGER[1]]) == set()
+def test_inbound_mail_never_makes_an_address_known(db):
+    """An attacker can send three mails; only the owner writing to them makes them known."""
+    for n in range(person_identity.TRUSTED_MIN_EMAILS + 2):
+        f.email(db, subject=f"Urgent {n}", sender=STRANGER, to=(OWNER,), cc=(COLLEAGUE,))
+    f.email(db, subject="Fwd", sender=COLLEAGUE, to=(STRANGER,))  # a colleague, not him
+
+    assert sender_trust.of_addresses(db, [STRANGER[1]]) == {STRANGER[1]: "external"}
+    assert sender_trust.written_to(db, [REGULAR[1].upper(), STRANGER[1]]) == {REGULAR[1]}
+
+
+def test_a_cc_from_the_owner_makes_an_address_known(db):
+    f.email(db, subject="Intro", sender=OWNER, to=(COLLEAGUE,), cc=(STRANGER,))
+
+    assert sender_trust.of_addresses(db, [STRANGER[1]]) == {STRANGER[1]: "known"}
+
+
+def test_auto_merge_trust_is_unchanged(db):
+    """person_identity.trusted_address keeps its own rule (inbound volume counts there)."""
+    for n in range(person_identity.TRUSTED_MIN_EMAILS):
+        f.email(db, subject=f"Note {n}", sender=STRANGER, to=(OWNER,))
+    sam = db.execute("SELECT id FROM people WHERE email = ?", (STRANGER[1],)).fetchone()[0]
+
+    assert person_identity.trusted_address(db, sam)
+    assert sender_trust.of_addresses(db, [STRANGER[1]]) == {STRANGER[1]: "external"}
 
 
 # ------------------------------------------------------------ by parent kind
@@ -120,21 +140,40 @@ def test_an_attachment_item_takes_its_emails_sender(db):
     assert _labels(db, {decision}) == {decision: "external"}
 
 
-def test_news_is_external_and_documents_are_the_owners(db):
+def test_news_is_external_and_documents_are_unknown(db):
+    """A document (an upload, a meeting transcript) is stored by the owner, not his words."""
     news = _decision_from(
         db, email_id=f.email(db, sender=COLLEAGUE, source_class="news", mailbox_name="News")
     )
     document = _decision_from(db, email_id=f.email(db, sender=STRANGER, source_class="document"))
 
-    assert _labels(db, {news, document}) == {news: "external", document: "owner"}
+    assert _labels(db, {news, document}) == {news: "external", document: "unknown"}
 
 
-def test_teams_items_are_internal(db):
-    chat = f.teams_chat(db)
-    thread = f.teams_thread(db, chat_id=chat)
-    decision = _decision_from(db, teams_thread_id=thread)
+def test_a_teams_thread_is_internal_unless_a_sender_resolves_outside(db):
+    colleague_only = f.teams_thread(db)
+    f.teams_message(db, thread_id=colleague_only, sender_person_id=f.person(db, *COLLEAGUE))
+    f.teams_message(db, thread_id=colleague_only, sender_mri="8:orgid:unresolved")
+    with_guest = f.teams_thread(db)
+    f.teams_message(db, thread_id=with_guest, sender_person_id=f.person(db, *COLLEAGUE))
+    f.teams_message(db, thread_id=with_guest, sender_person_id=f.person(db, *STRANGER))
+    by_mri = f.teams_thread(db)
+    db.execute(
+        "INSERT INTO teams_mri_resolution (mri, email, status) VALUES (?, ?, 'resolved')",
+        ("8:orgid:guest", REGULAR[1]),
+    )
+    f.teams_message(db, thread_id=by_mri, sender_mri="8:orgid:guest")
+    ids = {
+        "internal": _decision_from(db, teams_thread_id=colleague_only),
+        "external": _decision_from(db, teams_thread_id=with_guest),
+        "by_mri": _decision_from(db, teams_thread_id=by_mri),
+    }
 
-    assert _labels(db, {decision}) == {decision: "internal"}
+    labels = _labels(db, set(ids.values()))
+
+    assert labels[ids["internal"]] == "internal"
+    assert labels[ids["external"]] == "external"
+    assert labels[ids["by_mri"]] == "external"  # a known outsider is still not a colleague
 
 
 def _whatsapp_thread(db, *from_me: int) -> int:
@@ -284,3 +323,8 @@ def test_meeting_prep_labels_its_items(store):
 def test_the_instructions_say_what_the_label_means():
     assert "sender_trust" in mcp_server._INSTRUCTIONS
     assert "`external`" in mcp_server._INSTRUCTIONS
+    assert "stated sender, not a verified one" in mcp_server._INSTRUCTIONS
+
+
+def test_the_module_says_the_sender_is_not_verified():
+    assert "STATED sender, not a verified one" in (sender_trust.__doc__ or "")

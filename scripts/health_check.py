@@ -177,6 +177,13 @@ STALE_THRESHOLDS = {
     "backup_offsite": timedelta(hours=26),
     # A restore drill is a person's job, monthly at best: a WARN past five weeks.
     "restore_drill_warn": timedelta(days=35),
+    # restic-backup.service runs once a night (timer about 02:45), so at 23:50 the last
+    # good one is about 21 hours old. Past a day and a half a night was missed.
+    "restic": timedelta(hours=36),
+    # job_runs: a failed run is news for a day; a run still 'running' after twelve hours
+    # was killed (SIGKILL leaves the row open for ever) or is stuck. WARN only.
+    "job_runs_failed": timedelta(hours=24),
+    "job_run_hung_warn": timedelta(hours=12),
     # The 02:00 pass rewrites the mail-loss counts; an older file is not trusted.
     "mail_loss_file": timedelta(hours=48),
     # A message given up this recently is news; an older give-up is history.
@@ -1148,6 +1155,162 @@ def backups_detail(c: dict) -> str:
     if c.get("note"):
         parts.append(c["note"])
     return f" ({'; '.join(parts)})" if parts else ""
+
+
+# The nightly restic run: a ROOT system unit, not one of the sb-* user units, whose script
+# (restic-backup.sh) logs "backup completed <ISO time>" when it succeeds. The health check's
+# user reads the system journal through the systemd-journal group, with no sudo.
+RESTIC_UNIT = "restic-backup.service"
+RESTIC_DONE = "backup completed "
+# How far back the journal is read: a week of nights, so a dead backup reads as days old.
+RESTIC_LOOKBACK = timedelta(days=7)
+
+
+def _restic_completions(text: str) -> list[datetime]:
+    """The times named by the "backup completed <ISO time>" lines; a line without one is
+    skipped, so only a stated time counts as a backup."""
+    stamps = []
+    for line in text.splitlines():
+        if RESTIC_DONE not in line:
+            continue
+        words = line.split(RESTIC_DONE, 1)[1].split()
+        when = _utc(words[0]) if words else None
+        if when is not None:
+            stamps.append(when)
+    return stamps
+
+
+def check_restic(run=None, now=None):
+    """Age of the newest restic backup, from the "backup completed" line its unit logs.
+
+    restic ran every night and nothing read its journal, so a repository that stopped
+    accepting snapshots would have gone unseen like the backups before check_backups.
+    STALE past a day and a half, or with no completed backup in the last week, which fails
+    the freshness ping. A host without the unit (a replica, a Mac, CI) is not judged. A
+    journal that cannot be read is a WARN; nothing here raises into the report.
+    """
+    run = run or subprocess.run
+    now = now or datetime.now(UTC)
+    row: dict = {"name": "Restic", "total": "?", "age": None}
+    try:
+        unit = run(
+            [systemctl_bin(), "cat", RESTIC_UNIT], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {**row, "status": "N/A", "note": "no systemctl on this host"}
+    if unit.returncode != 0:
+        return {**row, "status": "N/A", "note": f"no {RESTIC_UNIT} on this host"}
+    since = now - RESTIC_LOOKBACK
+    cmd = [
+        _journalctl_bin(),
+        "-u",
+        RESTIC_UNIT,
+        f"--since=@{int(since.timestamp())}",
+        "-o",
+        "cat",
+        "--no-pager",
+    ]
+    try:
+        result = run(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {
+            **row,
+            "status": "WARN",
+            "note": f"the journal could not be read ({type(e).__name__})",
+        }
+    if result.returncode != 0:
+        return {
+            **row,
+            "status": "WARN",
+            "note": f"the journal could not be read (exit {result.returncode})",
+        }
+    stamps = _restic_completions(result.stdout or "")
+    if not stamps:
+        days = RESTIC_LOOKBACK.days
+        return {
+            **row,
+            "total": 0,
+            "status": "STALE",
+            "note": f"no '{RESTIC_DONE.strip()}' in the journal for {days} days",
+        }
+    age = max(timedelta(0), now - max(stamps))
+    stale = age > STALE_THRESHOLDS["restic"]
+    return {
+        **row,
+        "total": len(stamps),
+        "age": age,
+        "note": f"newest backup {format_age(age)} old" if stale else None,
+        "status": "STALE" if stale else "OK",
+    }
+
+
+def check_job_runs(db, now=None):
+    """The job_runs ledger (issue 173): runs that failed in the last day, and runs still
+    'running' twelve hours after they started.
+
+    Every `brain` command opens a run and closes it ok or failed, so a failure shows here
+    even when the unit's next run made it good, and a run its unit killed with SIGKILL stays
+    'running' for ever. Both are a WARN naming the jobs. Read only, judged on the stamps; a
+    store without the table is not judged.
+    """
+    now = now or datetime.now(UTC)
+    row: dict = {"name": "Job runs", "total": "?", "age": None}
+    try:
+        held = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'job_runs'"
+        ).fetchone()
+        if not held:
+            return {**row, "status": "N/A", "note": "no job_runs table in this store"}
+        started = instant_sql("started_at")
+        day = (now - STALE_THRESHOLDS["job_runs_failed"]).isoformat()
+        hung_before = (now - STALE_THRESHOLDS["job_run_hung_warn"]).isoformat()
+        total, newest = db.execute(
+            f"SELECT COUNT(*), {iso_sql(f'MAX({started})')} FROM job_runs"
+            f" WHERE stage = 'run' AND {started} >= julianday(?)",
+            (day,),
+        ).fetchone()
+        failed = dict(
+            db.execute(
+                f"SELECT job, COUNT(*) FROM job_runs WHERE stage = 'run' AND status = 'failed'"
+                f" AND {started} >= julianday(?) GROUP BY job ORDER BY COUNT(*) DESC, job",
+                (day,),
+            ).fetchall()
+        )
+        hung = [
+            {"job": job, "started_at": at, "host": host, "pid": pid}
+            for job, at, host, pid in db.execute(
+                f"SELECT job, started_at, host, pid FROM job_runs WHERE stage = 'run'"
+                f" AND status = 'running' AND {started} < julianday(?) ORDER BY {started}",
+                (hung_before,),
+            ).fetchall()
+        ]
+    except sqlite3.Error as e:
+        return {**row, "status": "WARN", "note": f"unreadable: {e}"}
+    newest_at = _utc(newest)
+    if newest_at is not None:
+        row["age"] = max(timedelta(0), now - newest_at)
+    parts = []
+    if failed:
+        parts.append(
+            "failed in the last 24h: " + ", ".join(f"{job} {n}" for job, n in failed.items())
+        )
+    if hung:
+        parts.append(
+            "running for over 12h: "
+            + ", ".join(
+                f"{h['job']} since {str(h['started_at'])[:16]}"
+                + (f" (pid {h['pid']} on {h['host']})" if h["pid"] else "")
+                for h in hung
+            )
+        )
+    return {
+        **row,
+        "total": total,
+        "failed": failed,
+        "hung": hung,
+        "note": "; ".join(parts) or None,
+        "status": "WARN" if parts else "OK",
+    }
 
 
 MAIL_LOSS_FILE = "mail_loss.json"
@@ -3134,7 +3297,7 @@ def build_report(checks, jobs, logs, sentinels, fix_actions, wrappers=None, auth
                     f" {c.get('semantic_rows', 0)}, query embeddings via {c.get('embed_backend')})"
                 )
             )
-        elif c["name"] == "Mail loss" and c.get("note"):
+        elif c["name"] in ("Mail loss", "Restic", "Job runs") and c.get("note"):
             extra = f" ({c['note']})"
         elif c["name"] == "Inline Images":
             # Counts, not a percentage. The old "87% classified" was a ceiling,
@@ -3795,7 +3958,9 @@ def main():
         check_sharepoint_token(),
         check_llm_spend(db),
         check_backups(),
+        check_restic(),
         check_mail_loss(),
+        check_job_runs(db),
     ]
     db.close()
 

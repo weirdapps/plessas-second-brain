@@ -6,7 +6,8 @@
 # The hourly puller (repo-autoupdate, in the owner's config repo) calls this in place of
 # `git pull --ff-only` for this repository. It fetches master, then fast-forwards the
 # checkout to the NEWEST first-parent commit of origin/master whose required checks
-# (REQUIRED_CHECKS) all concluded `success` on GitHub, read with `gh api`. A commit that
+# (REQUIRED_CHECKS) all concluded `success` on GitHub, read with `gh api` (for an
+# auto-merged squash commit, on its PR head: see verified()). A commit that
 # is newer but not yet verified (CI running, red, or never run) is held. The puller runs
 # scripts/deploy.sh only when HEAD moved, as before.
 #
@@ -39,8 +40,9 @@ REPO_SLUG="${DEPLOY_GATE_REPO:-weirdapps/plessas-second-brain}"
 
 short() { printf '%s' "${1:0:9}"; }
 
-# verified <sha>: rc 0 when every required check has a run on <sha> that concluded success.
-verified() {
+# checks_passed <sha>: rc 0 when every required check has a run on <sha> that concluded
+# success.
+checks_passed() {
   local sha="$1" passed name
   passed="$(gh api "repos/$REPO_SLUG/commits/$sha/check-runs?per_page=100" \
     --jq '.check_runs[] | select(.conclusion == "success") | .name' 2>/dev/null)" || return 1
@@ -51,6 +53,35 @@ verified() {
 $REQUIRED_CHECKS
 EOF
   return 0
+}
+
+# verified <sha>: its own checks passed, or it is the squash merge of a pull request whose
+# head passed them with the same content.
+#
+# Auto-merge pushes the squash commit with GITHUB_TOKEN, and GitHub starts no workflow for
+# such a push, so a Dependabot merge never gets a check run of its own and the gate held it
+# until someone dispatched CI by hand (#327, held 12h on 2026-11-16). The PR's checks
+# count for the squash commit only when all of these hold:
+#   - GitHub names a pull request whose merge_commit_sha IS <sha>;
+#   - the PR head has the same tree as <sha>: the merged files are the tested files;
+#   - <sha>'s parent is an ancestor of the PR head (compare status ahead or identical), so
+#     the head already held the base it landed on and CI's merge ref equals that tree;
+#   - every required check passed on the PR head.
+verified() {
+  local sha="$1" pr_head tree status
+  checks_passed "$sha" && return 0
+  pr_head="$(gh api "repos/$REPO_SLUG/commits/$sha/pulls" \
+    --jq ".[] | select(.merge_commit_sha == \"$sha\") | .head.sha" 2>/dev/null | head -n 1)"
+  [ -n "$pr_head" ] || return 1
+  tree="$(gh api "repos/$REPO_SLUG/commits/$pr_head" --jq .commit.tree.sha 2>/dev/null)" || return 1
+  [ -n "$tree" ] && [ "$tree" = "$(git rev-parse "$sha^{tree}")" ] || return 1
+  status="$(gh api "repos/$REPO_SLUG/compare/$(git rev-parse "$sha^")...$pr_head" \
+    --jq .status 2>/dev/null)" || return 1
+  case "$status" in
+    ahead | identical) ;;
+    *) return 1 ;;
+  esac
+  checks_passed "$pr_head"
 }
 
 pull() {

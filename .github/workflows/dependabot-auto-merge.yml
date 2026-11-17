@@ -17,3 +17,34 @@ jobs:
     with:
       # A merged commit reaches the producer within the hour: a major waits for review.
       allow_major_in_group: false
+
+  verify-master:
+    # A merge made with GITHUB_TOKEN raises no push event, so CI never ran on the
+    # merged tip and the VPS deploy gate held it as "not verified": #327 merged at
+    # 2026-11-16 09:35Z and sat held for 12h37m, failing repo-autoupdate every hour,
+    # until CI was dispatched by hand. workflow_dispatch is the one event that token
+    # may raise, so dispatch ci.yml on master once this PR has merged (the same
+    # remedy plessas-trading-stack's ci.yml automerge job uses).
+    needs: auto-merge
+    if: always() && github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      pull-requests: read
+    steps:
+      - name: Dispatch CI on master if this PR merged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          merged=$(gh pr view "$PR_URL" --json mergedAt --jq '.mergedAt // ""')
+          if [ -z "$merged" ]; then
+            echo "Not merged, nothing to verify."
+            exit 0
+          fi
+          gh workflow run ci.yml --ref "$BASE_REF"
+          echo "Dispatched ci.yml on $BASE_REF for the merged tip."

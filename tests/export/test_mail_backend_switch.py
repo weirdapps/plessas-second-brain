@@ -275,3 +275,41 @@ def test_auto_logs_vanished_messages_without_counting_them_as_calls(monkeypatch)
     oc.assert_not_called()
     outcomes = sorted(e["outcome"] for e in _events())
     assert outcomes == ["ok", "vanished"]
+
+
+def test_shadow_settles_a_message_that_arrived_between_the_two_reads(monkeypatch):
+    # VPS 2026-11-17 11:15Z: Graph listed one id outlook-cli had not, read seconds later.
+    monkeypatch.setenv("SB_MAIL_BACKEND", "shadow")
+    with (
+        patch.object(
+            outlook_cli, "_run_binary", side_effect=[[{"Id": "a"}], [{"Id": "new"}, {"Id": "a"}]]
+        ),
+        patch("src.export.graph_cli.translate", return_value=[{"Id": "new"}, {"Id": "a"}]),
+    ):
+        assert run_outlook_cli(["list-mail"]) == [{"Id": "a"}]
+    ev = [e for e in _events() if e["backend"] == "shadow"][-1]
+    assert ev["outcome"] == "match" and ev["settled"] == 1
+
+
+def test_shadow_settles_a_full_page_that_shifted_by_one(monkeypatch):
+    # VPS 2026-11-10 20:13Z: one id on each side, the newest arrival pushing the oldest off.
+    monkeypatch.setenv("SB_MAIL_BACKEND", "shadow")
+    first, later = [{"Id": "a"}, {"Id": "old"}], [{"Id": "new"}, {"Id": "a"}]
+    with (
+        patch.object(outlook_cli, "_run_binary", side_effect=[first, later]),
+        patch("src.export.graph_cli.translate", return_value=later),
+    ):
+        run_outlook_cli(["list-mail", "--top", "2"])
+    ev = [e for e in _events() if e["backend"] == "shadow"][-1]
+    assert ev["outcome"] == "match" and ev["settled"] == 2
+
+
+def test_shadow_keeps_a_disagreement_both_reads_confirm(monkeypatch):
+    monkeypatch.setenv("SB_MAIL_BACKEND", "shadow")
+    with (
+        patch.object(outlook_cli, "_run_binary", side_effect=[[{"Id": "a"}], [{"Id": "a"}]]),
+        patch("src.export.graph_cli.translate", return_value=[{"Id": "a"}, {"Id": "ghost"}]),
+    ):
+        run_outlook_cli(["list-mail"])
+    ev = [e for e in _events() if e["backend"] == "shadow"][-1]
+    assert ev["outcome"] == "mismatch" and ev["only_graph"] == ["ghost"]

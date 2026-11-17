@@ -108,6 +108,16 @@ def _no_network(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _gcloud_refusals_are_confirmed(monkeypatch):
+    """touch_sentinel re-asks gcloud before raising the sentinel, with sleeps. A
+    test must never shell out to the developer's gcloud or wait on it, so every
+    refusal counts as confirmed unless a test patches this itself."""
+    from src.extract import vertex_auth
+
+    monkeypatch.setattr(vertex_auth, "_refusal_confirmed", lambda: True)
+
+
+@pytest.fixture(autouse=True)
 def _own_attachment_parts(tmp_path, monkeypatch):
     """The parts a long document has finished are saved under the data root, keyed by
     row id. Shared across the session, one test's parts would be handed to the next

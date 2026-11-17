@@ -125,6 +125,38 @@ def _compare(verb: str, ours: Any, theirs: Any, vanished: list[str] | None = Non
     return {"outcome": "mismatch", "fields": diff} if diff else {"outcome": "match"}
 
 
+def _settle(verdict: dict, args: list[str], timeout_sec: int) -> dict:
+    """Re-read a disagreeing listing through outlook-cli and drop what moved meanwhile.
+
+    The Graph read runs seconds after the outlook-cli one, so a message that arrives,
+    is sent or is moved in between is on one side only although both backends are
+    right. Three such single-id mismatches in ~4,400 shadow reads (2026-11-10, 11-12,
+    11-17) each restarted the 14-day trust clock. An id only Graph listed that the
+    second outlook-cli read also lists arrived in the gap; an id only the first read
+    listed that the second no longer does left in the gap. What remains disagrees on
+    both sides of the race and is reported. A failed re-read settles nothing.
+    """
+    try:
+        again = _run_binary(args, timeout_sec)
+    except Exception:  # a shadow must never cost the real call
+        return verdict
+    now = {m["Id"] for m in again or [] if isinstance(m, dict) and m.get("Id")}
+    only_graph = [i for i in verdict["only_graph"] if i not in now]
+    only_oc = [i for i in verdict["only_outlook_cli"] if i in now]
+    settled = (
+        len(verdict["only_graph"])
+        + len(verdict["only_outlook_cli"])
+        - len(only_graph)
+        - len(only_oc)
+    )
+    if not settled:
+        return verdict
+    if not only_graph and not only_oc:
+        rest = {k: v for k, v in verdict.items() if k not in ("only_graph", "only_outlook_cli")}
+        return {**rest, "outcome": "match", "settled": settled}
+    return {**verdict, "only_graph": only_graph, "only_outlook_cli": only_oc, "settled": settled}
+
+
 def run_outlook_cli(args: list[str], timeout_sec: int = 60) -> Any:
     """
     Answer an outlook-cli invocation through the backend SB_MAIL_BACKEND names.
@@ -151,7 +183,10 @@ def run_outlook_cli(args: list[str], timeout_sec: int = 60) -> Any:
         if verb in _SHADOWED:
             try:
                 theirs, gone = _graph(args, timeout_sec, backend)
-                _record({"backend": "shadow", "verb": verb, **_compare(verb, result, theirs, gone)})
+                verdict = _compare(verb, result, theirs, gone)
+                if verb == "list-mail" and verdict["outcome"] == "mismatch":
+                    verdict = _settle(verdict, args, timeout_sec)
+                _record({"backend": "shadow", "verb": verb, **verdict})
             except graph_cli.GraphCliUnsupported:
                 pass
             except Exception as e:  # a shadow must never cost the real call

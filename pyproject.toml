@@ -14,6 +14,10 @@ dependencies = [
     # temperature/top_p/top_k, and src/extract/web_ingest.py's httpx use never crosses
     # the SDK boundary). Floor raised so a fresh resolve cannot land back on 0.x.
     "anthropic[vertex]>=1.7.0",
+    # Imported directly (src/extract/web_ingest.py, src/extract/policy_bridge.py) and
+    # never declared: anthropic 1.x and google-genai 3.x both moved to httpx2, so the
+    # genai 3.0 bump took httpx out of the lock and every import of it failed (2026-11-22).
+    "httpx>=0.28.1",
     "numpy>=2.5.2",
     # v2 removed mcp.server.fastmcp; the server uses mcp.server.MCPServer.
     "mcp[cli]>=2.0.0",

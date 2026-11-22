@@ -50,3 +50,10 @@ updates:
     commit-message:
       prefix: "ci"
       include: "scope"
+    groups:
+      # github/codeql-action/init and /analyze must stay on the same version,
+      # or the run fails with "Loaded a configuration file for version X, but
+      # running version Y". One group keeps them in one PR.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"

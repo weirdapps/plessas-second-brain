@@ -127,6 +127,26 @@ def test_is_transient_knows_the_gemini_engines_service_failures():
         assert is_transient(genai_errors.ClientError(code, {"error": {}})), code
 
 
+def test_is_transient_knows_httpx2s_transport_errors_which_gemini_now_raises():
+    """google-genai 3.x sends through httpx2 by default and re-raises its transport
+    errors unwrapped, and httpx2's classes are not httpx's: a dropped Gemini
+    connection read as the item's own failure."""
+    import httpx2
+
+    from src.extract.policy_bridge import is_transient
+
+    request = httpx2.Request("POST", "https://example.invalid")
+    cases = [
+        httpx2.ConnectError("connection refused", request=request),
+        httpx2.ReadError("connection reset", request=request),
+        httpx2.RemoteProtocolError("server disconnected", request=request),
+        httpx2.ConnectTimeout("connect", request=request),
+        httpx2.ReadTimeout("read", request=request),
+    ]
+
+    assert [is_transient(e) for e in cases] == [True] * len(cases)
+
+
 def test_is_transient_knows_the_statuses_the_sdk_itself_retries():
     from src.extract.policy_bridge import is_transient
 
@@ -203,6 +223,8 @@ def test_a_timeout_of_the_request_is_told_apart_from_one_reaching_the_service():
         _sdk_timeout(),
         _sdk_timeout(httpx2.ReadTimeout("read", request=request2)),
         httpx.ReadTimeout("read", request=request),
+        # Unwrapped, as google-genai 3.x raises it.
+        httpx2.ReadTimeout("read", request=request2),
         _status_error(anthropic.APIStatusError, 408),
         _status_error(anthropic.InternalServerError, 504),
         genai_errors.ClientError(408, {"error": {}}),
@@ -215,6 +237,7 @@ def test_a_timeout_of_the_request_is_told_apart_from_one_reaching_the_service():
         httpx.ConnectTimeout("connect", request=request),
         httpx.PoolTimeout("pool", request=request),
         httpx.WriteTimeout("write", request=request),
+        httpx2.ConnectTimeout("connect", request=request2),
     ]
     not_timeouts = [
         _status_error(anthropic.InternalServerError, 500),

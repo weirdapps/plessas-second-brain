@@ -36,8 +36,21 @@ try:
         httpx2.PoolTimeout,
         httpx2.WriteTimeout,
     )
+    # google-genai 3.0 sends through httpx2 by default too, and re-raises its
+    # transport errors unwrapped (google/genai/_api_client.py, _request_once);
+    # httpx2's classes are not httpx's, so each check takes both (2026-11-22).
+    _TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+        httpx.TransportError,
+        httpx2.TransportError,
+    )
+    _HTTP_TIMEOUTS: tuple[type[BaseException], ...] = (
+        httpx.TimeoutException,
+        httpx2.TimeoutException,
+    )
 except ImportError:  # an SDK back on plain httpx
     _NETWORK_TIMEOUTS = (httpx.ConnectTimeout, httpx.PoolTimeout, httpx.WriteTimeout)
+    _TRANSPORT_ERRORS = (httpx.TransportError,)
+    _HTTP_TIMEOUTS = (httpx.TimeoutException,)
 
 _RATE_LIMIT_PATTERNS = ("429", "resource_exhausted")
 
@@ -144,9 +157,9 @@ def is_transient(exc: BaseException) -> bool:
     # classify_exception): the item is fine, so it stays pending.
     if isinstance(exc, gauth.RefreshError) and exc.retryable:
         return True
-    # The Gemini engine raises its SDK's own 5xx, and httpx's transport errors
-    # unwrapped.
-    if isinstance(exc, genai_errors.ServerError | httpx.TransportError):
+    # The Gemini engine raises its SDK's own 5xx, and its transport's errors
+    # (httpx2 since google-genai 3.0, or httpx) unwrapped.
+    if isinstance(exc, genai_errors.ServerError) or isinstance(exc, _TRANSPORT_ERRORS):
         return True
     # Worth offering again, below the 5xx line: a request timeout, a conflict, a
     # client-closed request. Anthropic's SDK retries 408 and 409 itself; the
@@ -199,7 +212,7 @@ def is_item_timeout(exc: BaseException) -> bool:
         return False
     if classify_exception(exc, None) is Outcome.TIMEOUT:
         return True
-    if isinstance(exc, TimeoutError | httpx.TimeoutException):
+    if isinstance(exc, TimeoutError) or isinstance(exc, _HTTP_TIMEOUTS):
         return True
     if isinstance(exc, anthropic.APIStatusError) and getattr(exc, "status_code", 0) in (408, 504):
         return True

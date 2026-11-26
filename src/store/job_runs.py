@@ -8,7 +8,8 @@ that extraction starts, so the state is module-level behind a lock rather than a
 variable (which a thread pool does not inherit).
 
 The run row is written 'running' when the run opens, so a run its unit's timeout killed
-stays visible, and finished with the stage rows when it ends. Every write is its own short
+stays visible, and finished with the stage rows when it ends; one left 'running' by a dead
+process is closed 'failed' by the next run on its host (_reap). Every write is its own short
 transaction on its own connection, apart from the job's. Nothing here raises into the job:
 a store without the table (behind the code, or a test store) or a busy one records nothing.
 """
@@ -139,20 +140,65 @@ def _close_stage(state: dict[str, Any], at: str) -> None:
     state["stage"] = None
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # EPERM: alive, someone else's
+        return True
+    return True
+
+
+def _reap(db_path: str, host: str, at: str) -> None:
+    """Close this host's 'running' run rows whose process is gone.
+
+    A run whose closing write lost the lock (2026-11-18: "database is locked") or that
+    SIGKILL ended leaves its row 'running' for ever, a WARN in every daily health report.
+    Only this host's rows, since a pid means nothing on another machine. A reused pid
+    keeps its row open: wrong the safe way round."""
+    conn = _connect(db_path)
+    if conn is None:
+        return
+    try:
+        rows = conn.execute(
+            "SELECT run_id, pid FROM job_runs WHERE stage = 'run' AND status = 'running'"
+            " AND host = ? AND pid IS NOT NULL",
+            (host,),
+        ).fetchall()
+        dead = [run_id for run_id, pid in rows if not _pid_alive(pid)]
+        if dead:
+            with conn:
+                conn.executemany(
+                    "UPDATE job_runs SET status = 'failed', finished_at = ?, error = ?"
+                    " WHERE run_id = ? AND stage = 'run' AND status = 'running'",
+                    [
+                        (at, "process gone, run never closed; closed by a later run", r)
+                        for r in dead
+                    ],
+                )
+    except sqlite3.Error as exc:
+        print(f"job_runs: orphans not closed ({type(exc).__name__}: {exc})", file=sys.stderr)
+    finally:
+        conn.close()
+
+
 @contextmanager
 def record(job: str, db_path: str) -> Generator[Run]:
     """Record one run of `job` against the store at db_path."""
     global _state
     run = Run(uuid.uuid4().hex)
     started = _now()
+    host = socket.gethostname()
     base = {
         "run_id": run.run_id,
         "job": job,
-        "host": socket.gethostname(),
+        "host": host,
         "pid": os.getpid(),
     }
     with _lock:
         _state = {"run_id": run.run_id, "totals": _zero(), "stage": None, "stages": []}
+    _reap(db_path, host, started)
     _write(db_path, [{**base, "stage": "run", "started_at": started, "status": "running"}], False)
     status, code, error = "ok", None, None
     try:

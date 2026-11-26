@@ -1250,7 +1250,8 @@ def check_job_runs(db, now=None):
 
     Every `brain` command opens a run and closes it ok or failed, so a failure shows here
     even when the unit's next run made it good, and a run its unit killed with SIGKILL stays
-    'running' for ever. Both are a WARN naming the jobs. Read only, judged on the stamps; a
+    'running' until the next run on its host closes it (job_runs._reap). Both are a WARN
+    naming the jobs. Read only, judged on the stamps; a
     store without the table is not judged.
     """
     now = now or datetime.now(UTC)

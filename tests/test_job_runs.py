@@ -226,3 +226,48 @@ def test_a_run_that_fails_with_a_write_open_is_still_closed(store, monkeypatch):
     assert (row["status"], row["exit_code"]) == ("failed", 1)
     assert row["finished_at"]
     conn.close()
+
+
+def _orphan(store, run_id, pid, host):
+    db = sqlite3.connect(store)
+    db.execute(
+        "INSERT INTO job_runs (run_id, job, stage, started_at, status, host, pid)"
+        " VALUES (?, 'whatsapp-sync', 'run', '2026-11-18T10:55:10+00:00', 'running', ?, ?)",
+        (run_id, host, pid),
+    )
+    db.commit()
+    db.close()
+
+
+def test_a_new_run_closes_a_running_row_whose_process_on_this_host_is_gone(store, monkeypatch):
+    # 2026-11-18: the closing write lost a "database is locked", the process exited, and
+    # the row read 'running' for a week, a WARN in every daily report.
+    monkeypatch.setattr(job_runs.socket, "gethostname", lambda: "vps")
+    monkeypatch.setattr(job_runs, "_pid_alive", lambda pid: pid != 111)
+    _orphan(store, "dead", 111, "vps")
+    _orphan(store, "alive", 222, "vps")
+    _orphan(store, "elsewhere", 111, "pro")
+    with job_runs.record("sync", store) as run:
+        run.exit_code = 0
+    by_id = {r["run_id"]: r for r in _rows(store)}
+    assert by_id["dead"]["status"] == "failed"
+    assert by_id["dead"]["finished_at"]
+    assert "process gone" in by_id["dead"]["error"]
+    assert by_id["alive"]["status"] == "running"
+    assert by_id["elsewhere"]["status"] == "running"
+
+
+def test_a_row_without_a_pid_is_left_alone(store, monkeypatch):
+    monkeypatch.setattr(job_runs.socket, "gethostname", lambda: "vps")
+    monkeypatch.setattr(job_runs, "_pid_alive", lambda pid: False)
+    _orphan(store, "nopid", None, "vps")
+    with job_runs.record("sync", store) as run:
+        run.exit_code = 0
+    assert {r["run_id"]: r for r in _rows(store)}["nopid"]["status"] == "running"
+
+
+def test_pid_alive_reads_the_process_table():
+    import os
+
+    assert job_runs._pid_alive(os.getpid())
+    assert not job_runs._pid_alive(2**22 + 12345)

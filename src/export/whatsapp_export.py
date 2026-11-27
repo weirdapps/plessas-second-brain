@@ -222,6 +222,22 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
             conn.execute("DELETE FROM whatsapp_chats WHERE id = ?", (old[0],))
             merged += 1
 
+    # A message the bridge filed under both the number and the id was stored twice
+    # before the alias match below existed (2026-11-26): the copy with no session goes,
+    # or bound_threads fails on its id, already an anchor in the merged chat.
+    duplicates_removed = conn.execute(
+        """
+        DELETE FROM whatsapp_messages
+        WHERE thread_id IS NULL AND EXISTS (
+            SELECT 1 FROM whatsapp_messages y
+            WHERE y.chat_id = whatsapp_messages.chat_id
+              AND y.message_id = whatsapp_messages.message_id
+              AND y.id <> whatsapp_messages.id
+              AND (y.thread_id IS NOT NULL OR y.id < whatsapp_messages.id)
+        )
+        """
+    ).rowcount
+
     for mid, jid, sender, content, ts, from_me, media_type, filename in messages:
         if not mid or not jid or jid in _NOT_CONVERSATIONS:
             continue
@@ -258,6 +274,16 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
             "WHERE chat_jid = ? AND message_id = ?",
             (jid, mid),
         ).fetchone()
+        # The same message under the other JID of a merged chat is already held: that
+        # copy is the one kept current, by the row filed under its own JID.
+        if (
+            existing is None
+            and conn.execute(
+                "SELECT 1 FROM whatsapp_messages WHERE chat_id = ? AND message_id = ?",
+                (row[2], mid),
+            ).fetchone()
+        ):
+            continue
         # Older than the WhatsApp forget floor and not held (issue 286): forgotten, not
         # stored again. One held, of a session that straddled the day, is kept current.
         if existing is None and forget_floor.refuse("whatsapp", whatsapp_floor, sent_at):
@@ -327,4 +353,5 @@ def ingest_snapshot(conn: sqlite3.Connection, snapshot: Path | str = WHATSAPP_SN
         "skipped": skipped,
         "below_floor": below_floor,
         "chats_merged": merged,
+        "duplicates_removed": duplicates_removed,
     }
